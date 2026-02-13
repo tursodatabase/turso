@@ -22,6 +22,8 @@ use crate::{
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
 
+mod sort_key;
+
 #[derive(Debug, Clone, Copy)]
 enum SortState {
     Start,
@@ -85,6 +87,18 @@ pub struct Sorter {
     pending_completion: Option<(Completion, usize)>,
     /// Temp storage mode (memory vs file) for spilled data
     temp_store: crate::TempStore,
+    /// Whether to build and compare byte sort keys (binary collations only).
+    use_sort_key: bool,
+    /// Benchmark-only sort algorithm selection.
+    #[cfg(feature = "bench")]
+    bench_sort_algorithm: BenchSortAlgorithm,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Debug, Clone, Copy)]
+pub enum BenchSortAlgorithm {
+    StdCmp,
+    StdSortKey,
 }
 
 impl Sorter {
@@ -97,6 +111,7 @@ impl Sorter {
         temp_store: crate::TempStore,
     ) -> Self {
         assert_eq!(order.len(), collations.len());
+        let use_sort_key = collations.iter().all(|c| *c == CollationSeq::Binary);
         Self {
             arena: Bump::new(),
             records: Vec::new(),
@@ -126,7 +141,29 @@ impl Sorter {
             init_chunk_heap_state: InitChunkHeapState::Start,
             pending_completion: None,
             temp_store,
+            use_sort_key,
+            #[cfg(feature = "bench")]
+            bench_sort_algorithm: BenchSortAlgorithm::StdCmp,
         }
+    }
+
+    #[cfg(feature = "bench")]
+    pub fn set_bench_sort_algorithm(&mut self, algorithm: BenchSortAlgorithm) {
+        assert!(
+            self.records.is_empty() && self.chunks.is_empty(),
+            "bench sort algorithm must be set before inserting records"
+        );
+        if matches!(algorithm, BenchSortAlgorithm::StdSortKey) {
+            let all_binary = self
+                .index_key_info
+                .iter()
+                .all(|info| info.collation == CollationSeq::Binary);
+            assert!(all_binary, "sort keys require binary collations");
+            self.use_sort_key = true;
+        } else {
+            self.use_sort_key = false;
+        }
+        self.bench_sort_algorithm = algorithm;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -147,8 +184,7 @@ impl Sorter {
                         // NOTE: We can't just sort descending because stable sort preserves insertion
                         // order for equal elements, and descending sort doesn't reverse equal elements.
                         // SAFETY: All pointers in records are valid (arena hasn't been reset).
-                        self.records
-                            .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
+                        self.sort_records_in_memory();
                         self.records.reverse();
                         self.sort_state = SortState::Next;
                     } else {
@@ -267,6 +303,7 @@ impl Sorter {
                         record,
                         self.key_len,
                         &self.index_key_info,
+                        self.use_sort_key,
                     )?;
                     let record_ref = self.arena.alloc(sortable_record);
                     // SAFETY: arena.alloc returns a valid, aligned, non-null pointer
@@ -389,8 +426,7 @@ impl Sorter {
         }
 
         // SAFETY: All pointers are valid (arena not reset).
-        self.records
-            .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
+        self.sort_records_in_memory();
 
         let chunk_file = match &self.temp_file {
             Some(temp_file) => temp_file.file.clone(),
@@ -433,6 +469,33 @@ impl Sorter {
 
         Ok(Some(c))
     }
+
+    fn sort_records_in_memory(&mut self) {
+        #[cfg(feature = "bench")]
+        match self.bench_sort_algorithm {
+            BenchSortAlgorithm::StdCmp => {
+                self.records
+                    .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
+            }
+            BenchSortAlgorithm::StdSortKey => {
+                sort_records_by_key(&mut self.records);
+            }
+        }
+
+        #[cfg(not(feature = "bench"))]
+        {
+            if self.use_sort_key {
+                sort_records_by_key(&mut self.records);
+            } else {
+                self.records
+                    .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
+            }
+        }
+    }
+}
+
+fn sort_records_by_key(records: &mut [NonNull<ArenaSortableRecord>]) {
+    records.sort_by(|a, b| unsafe { a.as_ref().sort_key().cmp(b.as_ref().sort_key()) });
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -731,6 +794,8 @@ struct ArenaSortableRecord {
     payload: NonNull<[u8]>,
     /// Pre-computed key values in arena. Points into `payload`.
     key_values: NonNull<[ValueRef<'static>]>,
+    /// Byte-sortable key used for binary-collation fast path.
+    sort_key: Option<NonNull<[u8]>>,
     /// Shared KeyInfo owned by Sorter. Avoids Rc refcount overhead that would
     /// leak when arena.reset() skips Drop.
     index_key_info: NonNull<[KeyInfo]>,
@@ -742,6 +807,7 @@ impl ArenaSortableRecord {
         record: &ImmutableRecord,
         key_len: usize,
         index_key_info: &[KeyInfo],
+        build_sort_key: bool,
     ) -> Result<Self> {
         let payload = arena.alloc_slice_copy(record.get_payload());
 
@@ -760,9 +826,18 @@ impl ArenaSortableRecord {
             key_values.push(value);
         }
 
+        let sort_key = if build_sort_key {
+            let sort_key_slice =
+                sort_key::encode_sort_key_in(arena, key_values.as_slice(), index_key_info);
+            Some(NonNull::from(sort_key_slice))
+        } else {
+            None
+        };
+
         Ok(Self {
             payload: NonNull::from(payload),
             key_values: NonNull::from(key_values.into_bump_slice()),
+            sort_key,
             index_key_info: NonNull::from(index_key_info),
         })
     }
@@ -777,6 +852,15 @@ impl ArenaSortableRecord {
     fn payload(&self) -> &[u8] {
         // SAFETY: valid from construction, arena not reset
         unsafe { self.payload.as_ref() }
+    }
+
+    #[inline]
+    fn sort_key(&self) -> &[u8] {
+        let key = self
+            .sort_key
+            .expect("sort_key missing: binary sort keys not enabled");
+        // SAFETY: valid from construction, arena not reset
+        unsafe { key.as_ref() }
     }
 
     /// Create an ImmutableRecord by copying payload bytes out of the arena.
@@ -941,7 +1025,7 @@ enum SortedChunkIOState {
 mod tests {
     use super::*;
     use crate::translate::collate::CollationSeq;
-    use crate::types::{ImmutableRecord, Value, ValueRef, ValueType};
+    use crate::types::{ImmutableRecord, KeyInfo, Text, Value, ValueRef, ValueType};
     use crate::util::IOExt;
     use crate::PlatformIO;
     use rand_chacha::{
@@ -1017,6 +1101,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fuzz_sort_key_vs_std_sort_binary() {
+        let seed = get_seed();
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+        let attempts = 64;
+        for attempt in 0..attempts {
+            let key_len = (rng.next_u64() % 4 + 1) as usize;
+            let mut key_info = Vec::with_capacity(key_len);
+            for _ in 0..key_len {
+                let sort_order = if rng.next_u64() % 2 == 0 {
+                    SortOrder::Asc
+                } else {
+                    SortOrder::Desc
+                };
+                key_info.push(KeyInfo {
+                    sort_order,
+                    collation: CollationSeq::Binary,
+                });
+            }
+
+            let num_records = (rng.next_u64() % 256 + 1) as usize;
+            let arena = Bump::new();
+            let mut records = Vec::with_capacity(num_records);
+
+            for _ in 0..num_records {
+                let mut values = Vec::with_capacity(key_len);
+                for _ in 0..key_len {
+                    values.push(random_value(&mut rng));
+                }
+                let record = ImmutableRecord::from_values(&values, values.len());
+                let sortable = ArenaSortableRecord::new(&arena, &record, key_len, &key_info, true)
+                    .expect("Failed to build sortable record");
+                let record_ref = arena.alloc(sortable);
+                records.push(NonNull::from(record_ref));
+            }
+
+            let mut expected = records.clone();
+            expected.sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
+
+            let mut actual = records;
+            super::sort_records_by_key(&mut actual);
+
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "seed {seed} attempt {attempt}"
+            );
+            for (idx, (actual_ptr, expected_ptr)) in actual.iter().zip(expected.iter()).enumerate()
+            {
+                let actual_key = unsafe { actual_ptr.as_ref().sort_key() };
+                let expected_key = unsafe { expected_ptr.as_ref().sort_key() };
+                assert_eq!(
+                    actual_key, expected_key,
+                    "seed {seed} attempt {attempt} index {idx}"
+                );
+            }
+        }
+    }
+
     fn generate_value_types<R: RngCore>(rng: &mut R, num_values: usize) -> Vec<ValueType> {
         let mut value_types = Vec::with_capacity(num_values);
 
@@ -1055,5 +1199,34 @@ mod tests {
             values.push(value);
         }
         values
+    }
+
+    fn random_value<R: RngCore>(rng: &mut R) -> Value {
+        match rng.next_u64() % 5 {
+            0 => Value::Null,
+            1 => Value::Integer(rng.next_u64() as i64),
+            2 => {
+                let scale = (rng.next_u64() as f64) / (u64::MAX as f64);
+                let value = (scale * 2.0 - 1.0) * 1_000_000.0;
+                Value::Float(value)
+            }
+            3 => Value::Text(random_text(rng)),
+            _ => {
+                let len = (rng.next_u64() % 32) as usize;
+                let mut blob = vec![0u8; len];
+                rng.fill_bytes(&mut blob);
+                Value::Blob(blob)
+            }
+        }
+    }
+
+    fn random_text<R: RngCore>(rng: &mut R) -> Text {
+        let len = (rng.next_u64() % 32) as usize;
+        let mut bytes = Vec::with_capacity(len);
+        for _ in 0..len {
+            let byte = (rng.next_u64() % 128) as u8;
+            bytes.push(byte);
+        }
+        Text::new(String::from_utf8(bytes).expect("Generated invalid UTF-8"))
     }
 }
