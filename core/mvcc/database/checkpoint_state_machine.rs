@@ -1361,7 +1361,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
         let res = self.step_inner(&());
         match res {
             Err(err) => {
-                tracing::info!("Error in checkpoint state machine: {err}");
+                tracing::debug!("Error in checkpoint state machine: {err}");
                 if self.lock_states.pager_write_tx {
                     self.pager.rollback_tx(self.connection.as_ref());
                     if self.update_transaction_state {
