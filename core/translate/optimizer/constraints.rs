@@ -1108,7 +1108,12 @@ pub fn constraints_from_where_clause(
                         // doesn't necessarily match the custom type's semantic ordering, so
                         // range constraints (>, <, >=, <=) can't use the index. Equality (=)
                         // still works because encoded(A) == encoded(B) iff A == B.
-                        if schema.get_type_def(&constrained_column.ty_str).is_some()
+                        if schema
+                            .get_type_def(
+                                &constrained_column.ty_str,
+                                table_reference.table.is_strict(),
+                            )
+                            .is_some()
                             && constraint.operator != ast::Operator::Equals.into()
                         {
                             continue;

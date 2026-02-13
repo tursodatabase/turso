@@ -473,7 +473,20 @@ impl Schema {
         }
     }
 
-    pub fn get_type_def(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
+    /// Look up a custom type definition by name.
+    /// Custom types are only valid on STRICT tables; pass `is_strict` from the
+    /// owning table so that non-STRICT tables never resolve a custom type.
+    pub fn get_type_def(&self, type_name: &str, is_strict: bool) -> Option<&Arc<TypeDef>> {
+        if !is_strict {
+            return None;
+        }
+        self.type_registry.get(&type_name.to_lowercase())
+    }
+
+    /// Look up a custom type definition by name without a strictness check.
+    /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
+    /// CREATE TABLE validation, CAST).
+    pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
         self.type_registry.get(&type_name.to_lowercase())
     }
 
@@ -1844,6 +1857,14 @@ impl Table {
         }
     }
 
+    pub fn is_strict(&self) -> bool {
+        match self {
+            Self::BTree(table) => table.is_strict,
+            Self::Virtual(_) => false,
+            Self::FromClauseSubquery(_) => false,
+        }
+    }
+
     pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match self {
             Self::BTree(table) => Some(table.clone()),
@@ -1933,13 +1954,13 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| schema.get_type_def(&c.ty_str).is_some());
+            .any(|c| schema.get_type_def(&c.ty_str, table.is_strict).is_some());
         if !has_custom {
             return Arc::clone(table);
         }
         let mut modified = (**table).clone();
         for col in &mut modified.columns {
-            if let Some(type_def) = schema.get_type_def(&col.ty_str) {
+            if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
                 col.ty_str = type_def.base.to_uppercase();
             }
         }

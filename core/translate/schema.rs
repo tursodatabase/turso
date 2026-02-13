@@ -180,18 +180,35 @@ fn validate(
                     _ => false,
                 });
 
-                if !is_builtin {
-                    let is_custom = resolver.schema.get_type_def(type_name).is_some();
-                    if is_custom && !is_strict {
-                        bail_parse_error!("custom type \"{}\" requires a STRICT table", type_name);
-                    }
-                    if is_strict && !is_custom {
-                        bail_parse_error!(
-                            "unknown datatype for {}.{}: \"{}\"",
-                            table_name,
-                            c.col_name,
-                            type_name
-                        );
+                if !is_builtin && is_strict {
+                    let type_def = resolver.schema.get_type_def_unchecked(type_name);
+                    match type_def {
+                        None => {
+                            bail_parse_error!(
+                                "unknown datatype for {}.{}: \"{}\"",
+                                table_name,
+                                c.col_name,
+                                type_name
+                            );
+                        }
+                        Some(td) if !td.params.is_empty() => {
+                            // Parametric type: verify the column provides the right
+                            // number of parameters (e.g. numeric(10,2)).
+                            let provided = match &col_type.size {
+                                Some(ast::TypeSize::TypeSize(_, _)) => 2,
+                                Some(ast::TypeSize::MaxSize(_)) => 1,
+                                None => 0,
+                            };
+                            if provided != td.params.len() {
+                                bail_parse_error!(
+                                    "type \"{}\" requires {} parameter(s), got {}",
+                                    type_name,
+                                    td.params.len(),
+                                    provided
+                                );
+                            }
+                        }
+                        Some(_) => {}
                     }
                 }
             }
@@ -1323,7 +1340,11 @@ pub fn translate_create_type(
     let normalized_name = normalize_ident(type_name);
 
     // Check if type already exists
-    if resolver.schema.get_type_def(&normalized_name).is_some() {
+    if resolver
+        .schema
+        .get_type_def_unchecked(&normalized_name)
+        .is_some()
+    {
         if if_not_exists {
             return Ok(program);
         }
@@ -1446,7 +1467,7 @@ pub fn translate_drop_type(
     let normalized_name = normalize_ident(type_name);
 
     // Check if type exists
-    let type_def = resolver.schema.get_type_def(&normalized_name);
+    let type_def = resolver.schema.get_type_def_unchecked(&normalized_name);
     if type_def.is_none() {
         if if_exists {
             return Ok(program);

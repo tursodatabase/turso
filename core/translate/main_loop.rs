@@ -2808,7 +2808,10 @@ fn encode_seek_keys_for_custom_types(
             Some(c) => c,
             None => continue,
         };
-        let type_def = match resolver.schema.get_type_def(&table_col.ty_str) {
+        let type_def = match resolver
+            .schema
+            .get_type_def(&table_col.ty_str, table.is_strict())
+        {
             Some(td) => td,
             None => continue,
         };

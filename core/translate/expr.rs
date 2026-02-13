@@ -881,7 +881,9 @@ pub fn translate_expr(
                         referenced_tables.find_table_by_internal_id(*table_ref_id)
                     {
                         if let Some(col) = table.get_column_at(*column) {
-                            if let Some(type_def) = resolver.schema.get_type_def(&col.ty_str) {
+                            if let Some(type_def) =
+                                resolver.schema.get_type_def(&col.ty_str, table.is_strict())
+                            {
                                 if let Some(ref decode_expr) = type_def.decode {
                                     let skip_label = program.allocate_label();
                                     program.emit_insn(Insn::IsNull {
@@ -1297,7 +1299,7 @@ pub fn translate_expr(
 
             // Check if casting to a custom type
             if let Some(ref tn) = type_name {
-                if let Some(type_def) = resolver.schema.get_type_def(&tn.name) {
+                if let Some(type_def) = resolver.schema.get_type_def_unchecked(&tn.name) {
                     // Build ty_params from AST TypeSize so parametric types
                     // (e.g. numeric(10,2)) get their parameters passed through.
                     let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
@@ -1307,43 +1309,49 @@ pub fn translate_expr(
                         }
                         None => Vec::new(),
                     };
-                    let mut cast_col = crate::schema::Column::new(
-                        None,
-                        tn.name.clone(),
-                        None,
-                        None,
-                        crate::schema::Type::Null,
-                        None,
-                        crate::schema::ColDef::default(),
-                    );
-                    cast_col.ty_params = ty_params;
 
-                    // CAST to custom type: encode then decode to produce the
-                    // normalized user-facing form (matching PostgreSQL semantics).
-                    // e.g. CAST(42 AS numeric(10,2)) → '42.00'
-                    if let Some(ref encode_expr) = type_def.encode {
-                        emit_type_expr(
-                            program,
-                            encode_expr,
-                            target_register,
-                            target_register,
-                            &cast_col,
-                            type_def,
-                            resolver,
-                        )?;
+                    // If the custom type requires parameters but the CAST
+                    // doesn't provide them (e.g. CAST(x AS NUMERIC) vs
+                    // CAST(x AS numeric(10,2))), fall through to regular CAST.
+                    if type_def.params.is_empty() || ty_params.len() == type_def.params.len() {
+                        let mut cast_col = crate::schema::Column::new(
+                            None,
+                            tn.name.clone(),
+                            None,
+                            None,
+                            crate::schema::Type::Null,
+                            None,
+                            crate::schema::ColDef::default(),
+                        );
+                        cast_col.ty_params = ty_params;
+
+                        // CAST to custom type: encode then decode to produce the
+                        // normalized user-facing form (matching PostgreSQL semantics).
+                        // e.g. CAST(42 AS numeric(10,2)) → '42.00'
+                        if let Some(ref encode_expr) = type_def.encode {
+                            emit_type_expr(
+                                program,
+                                encode_expr,
+                                target_register,
+                                target_register,
+                                &cast_col,
+                                type_def,
+                                resolver,
+                            )?;
+                        }
+                        if let Some(ref decode_expr) = type_def.decode {
+                            emit_type_expr(
+                                program,
+                                decode_expr,
+                                target_register,
+                                target_register,
+                                &cast_col,
+                                type_def,
+                                resolver,
+                            )?;
+                        }
+                        return Ok(target_register);
                     }
-                    if let Some(ref decode_expr) = type_def.decode {
-                        emit_type_expr(
-                            program,
-                            decode_expr,
-                            target_register,
-                            target_register,
-                            &cast_col,
-                            type_def,
-                            resolver,
-                        )?;
-                    }
-                    return Ok(target_register);
                 }
             }
 
@@ -2919,7 +2927,10 @@ pub fn translate_expr(
                             let col_ref = table.get_column_at(column);
                             if let Some(col) = col_ref {
                                 if col.default.is_some()
-                                    && resolver.schema.get_type_def(&col.ty_str).is_some()
+                                    && resolver
+                                        .schema
+                                        .get_type_def(&col.ty_str, table.is_strict())
+                                        .is_some()
                                 {
                                     program.suppress_column_default = true;
                                 }
@@ -2934,7 +2945,10 @@ pub fn translate_expr(
                         // Decode custom type columns (skipped when building ORDER BY sort keys
                         // for types without a `<` operator, so the sorter sorts on encoded values)
                         if !program.suppress_custom_type_decode {
-                            if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str) {
+                            if let Some(type_def) = resolver
+                                .schema
+                                .get_type_def(&column.ty_str, table.is_strict())
+                            {
                                 // For custom type columns with a default, the Column
                                 // instruction returns NULL for pre-existing rows
                                 // (since we suppressed the default). Load the default
@@ -6193,7 +6207,11 @@ fn expr_custom_type_name<'a>(
         let (_, table) = tables.find_table_by_internal_id(*table_ref_id)?;
         let col = table.get_column_at(*column)?;
         let type_name = &col.ty_str;
-        if resolver.schema.get_type_def(type_name).is_some() {
+        if resolver
+            .schema
+            .get_type_def(type_name, table.is_strict())
+            .is_some()
+        {
             return Some(type_name.to_lowercase());
         }
     }
@@ -6276,7 +6294,7 @@ fn find_custom_type_operator(
 
     // Try to find operator on lhs type first.
     if let Some(ref lhs_ty) = lhs_type {
-        if let Some(type_def) = resolver.schema.get_type_def(lhs_ty) {
+        if let Some(type_def) = resolver.schema.get_type_def_unchecked(lhs_ty) {
             let rhs_ty = rhs_type.as_deref().unwrap_or(lhs_ty);
             if let Some(resolved) = find_in_type_def(type_def, rhs_ty) {
                 return Some(resolved);
@@ -6287,7 +6305,7 @@ fn find_custom_type_operator(
     // Try rhs type: handles `literal OP custom_type`.
     if let Some(ref rhs_ty) = rhs_type {
         if lhs_type.is_none() {
-            if let Some(type_def) = resolver.schema.get_type_def(rhs_ty) {
+            if let Some(type_def) = resolver.schema.get_type_def_unchecked(rhs_ty) {
                 if let Some(resolved) = find_in_type_def(type_def, rhs_ty) {
                     return Some(resolved);
                 }
@@ -6372,7 +6390,7 @@ pub(crate) fn emit_trigger_decode_registers(
         .iter()
         .enumerate()
         .map(|(i, col)| -> Result<usize> {
-            let type_def = resolver.schema.get_type_def(&col.ty_str);
+            let type_def = resolver.schema.get_type_def_unchecked(&col.ty_str);
             if let Some(type_def) = type_def {
                 if let Some(ref decode_expr) = type_def.decode {
                     let src = source_regs(i);
@@ -6429,7 +6447,7 @@ pub(crate) fn emit_custom_type_encode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Some(type_def) = resolver.schema.get_type_def(type_name) else {
+        let Some(type_def) = resolver.schema.get_type_def_unchecked(type_name) else {
             continue;
         };
         let Some(ref encode_expr) = type_def.encode else {
