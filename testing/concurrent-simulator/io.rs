@@ -132,7 +132,11 @@ impl IO for SimulatorIO {
             }
         }
 
-        let file = Arc::new(SimulatorFile::new(path, self.file_sizes.clone(), self.pending.clone()));
+        let file = Arc::new(SimulatorFile::new(
+            path,
+            self.file_sizes.clone(),
+            self.pending.clone(),
+        ));
 
         let mut files = self.files.lock().unwrap();
         files.push((path.to_string(), file.clone()));
@@ -229,7 +233,11 @@ struct SimulatorFile {
 }
 
 impl SimulatorFile {
-    fn new(file_path: &str, file_sizes: Arc<Mutex<HashMap<String, u64>>>, pending: PendingQueue) -> Self {
+    fn new(
+        file_path: &str,
+        file_sizes: Arc<Mutex<HashMap<String, u64>>>,
+        pending: PendingQueue,
+    ) -> Self {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -285,7 +293,10 @@ impl File for SimulatorFile {
         } else {
             0
         };
-        self.pending.lock().unwrap().push(PendingCompletion { completion: c.clone(), result });
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result,
+        });
         Ok(c)
     }
 
@@ -313,7 +324,10 @@ impl File for SimulatorFile {
         } else {
             0
         };
-        self.pending.lock().unwrap().push(PendingCompletion { completion: c.clone(), result });
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result,
+        });
         Ok(c)
     }
 
@@ -353,13 +367,19 @@ impl File for SimulatorFile {
             }
         }
 
-        self.pending.lock().unwrap().push(PendingCompletion { completion: c.clone(), result: total_written as i32 });
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result: total_written as i32,
+        });
         Ok(c)
     }
 
     fn sync(&self, c: Completion, _sync_type: turso_core::io::FileSyncType) -> Result<Completion> {
         // No-op for memory files
-        self.pending.lock().unwrap().push(PendingCompletion { completion: c.clone(), result: 0 });
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result: 0,
+        });
         Ok(c)
     }
 
@@ -368,7 +388,10 @@ impl File for SimulatorFile {
         *size = len as usize;
         let mut sizes = self.file_sizes.lock().unwrap();
         sizes.insert(self.path.clone(), len);
-        self.pending.lock().unwrap().push(PendingCompletion { completion: c.clone(), result: 0 });
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result: 0,
+        });
         Ok(c)
     }
 
