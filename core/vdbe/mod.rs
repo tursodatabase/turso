@@ -1205,8 +1205,12 @@ impl Program {
                 Ok(InsnFunctionStepResult::IO(io)) => {
                     // Instruction not complete - waiting for I/O, will resume at same PC
                     io.set_waker(waker);
+                    let finished = io.finished();
                     state.io_completions = Some(io);
-                    // just continue the outer loop so that if IO already completed tursodb will continue execution immediately
+                    if !finished {
+                        return Ok(StepResult::IO);
+                    }
+                    // just continue the outer loop if IO is finished so db will continue execution immediately
                 }
                 Ok(InsnFunctionStepResult::Row) => {
                     // Instruction completed (ResultRow already incremented PC)
