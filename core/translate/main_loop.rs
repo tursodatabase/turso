@@ -1640,10 +1640,11 @@ pub fn open_loop(
                 });
                 let build_table_is_live = live_table_ids.contains(&build_table.internal_id);
                 if payload_info.allow_seek && !payload_has_build_rowid && !build_table_is_live {
-                    t_ctx
-                        .resolver
-                        .expr_to_reg_cache
-                        .push((Cow::Owned(rowid_expr), match_reg, false));
+                    t_ctx.resolver.expr_to_reg_cache.push((
+                        Cow::Owned(rowid_expr),
+                        match_reg,
+                        false,
+                    ));
                 }
                 if let Some(payload_reg) = payload_dest_reg {
                     for (i, payload) in payload_columns.iter().enumerate() {
@@ -1676,10 +1677,11 @@ pub fn open_loop(
                         }
                         // Payload columns contain raw encoded values; mark them
                         // for decode so custom type DECODE is applied when read.
-                        t_ctx
-                            .resolver
-                            .expr_to_reg_cache
-                            .push((Cow::Owned(expr), payload_reg + i, is_column));
+                        t_ctx.resolver.expr_to_reg_cache.push((
+                            Cow::Owned(expr),
+                            payload_reg + i,
+                            is_column,
+                        ));
                     }
                 } else if payload_info.allow_seek && !build_table_is_live {
                     // When payload doesn't contain all needed columns, SeekRowid to the build table.
