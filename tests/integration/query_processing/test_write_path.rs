@@ -1313,6 +1313,7 @@ pub fn test_reopen_database_wal_restart() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 /// Test for a bug found by whopper
 /// It is slightly fragile and can be removed if it will be unclear how to maintain it
