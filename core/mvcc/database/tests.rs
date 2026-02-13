@@ -1277,11 +1277,9 @@ fn test_meta_recovery_case_1_no_wal_no_log_metadata_present_clean_boot() {
             &conn,
             "SELECT k, v FROM __turso_internal_mvcc_meta ORDER BY rowid",
         );
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0].to_string(), "persistent_tx_ts_max");
         assert_eq!(rows[0][1].as_int().unwrap(), 0);
-        assert_eq!(rows[1][0].to_string(), "persistent_tx_ts_max_shadow");
-        assert_eq!(rows[1][1].as_int().unwrap(), 0);
     }
 
     db.restart();
@@ -1290,11 +1288,9 @@ fn test_meta_recovery_case_1_no_wal_no_log_metadata_present_clean_boot() {
         &conn,
         "SELECT k, v FROM __turso_internal_mvcc_meta ORDER BY rowid",
     );
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].to_string(), "persistent_tx_ts_max");
     assert_eq!(rows[0][1].as_int().unwrap(), 0);
-    assert_eq!(rows[1][0].to_string(), "persistent_tx_ts_max_shadow");
-    assert_eq!(rows[1][1].as_int().unwrap(), 0);
 
     let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
     assert_eq!(
@@ -1540,47 +1536,6 @@ fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
     }
 }
 
-/// What this test checks: Downward tamper of `persistent_tx_ts_max` is detected as corruption.
-/// Why this matters: Tamper can force duplicate replay and violate correctness.
-#[test]
-#[cfg_attr(
-    feature = "checksum",
-    ignore = "byte-level tamper caught by checksum layer"
-)]
-fn test_meta_recovery_case_8_metadata_row_tampered_downward_fails_closed() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
-    let db_path = db.path.as_ref().unwrap().clone();
-    let metadata_root_page = {
-        let conn = db.connect();
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
-        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
-        metadata_root_page(&conn)
-    };
-    force_close_for_artifact_tamper(&mut db);
-    tamper_db_metadata_row_value(&db_path, metadata_root_page, 1);
-    let wal_path = wal_path_for_db(&db_path);
-    let _ = std::fs::remove_file(&wal_path);
-    overwrite_file_with_junk(&wal_path, 0, 0);
-
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
-    let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path) {
-        Ok(db2) => match db2.connect() {
-            Ok(_) => panic!("expected connect to fail closed"),
-            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
-        },
-        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
-    }
-}
-
 /// What this test checks: Deletion of metadata row is detected and rejected.
 /// Why this matters: Missing boundary metadata makes replay decision ambiguous.
 #[test]
@@ -1763,12 +1718,6 @@ fn test_meta_recovery_case_12_replay_gate_skips_at_or_below_metadata_boundary() 
             &db_path,
             root_page,
             MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
-            ts3 as i64,
-        );
-        tamper_db_metadata_row_value_by_key(
-            &db_path,
-            root_page,
-            MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW,
             ts3 as i64,
         );
         ts3

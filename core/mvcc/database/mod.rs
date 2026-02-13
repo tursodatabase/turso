@@ -1508,10 +1508,6 @@ pub(crate) const MVCC_META_TABLE_NAME: &str = "__turso_internal_mvcc_meta";
 /// Used to determine the replay boundary for recovery; only records with a higher timestamp
 /// are replayed.
 pub(crate) const MVCC_META_KEY_PERSISTENT_TX_TS_MAX: &str = "persistent_tx_ts_max";
-/// Shadow copy of persistent_tx_ts_max. Both rows are updated atomically in the same
-/// pager transaction during checkpoint. On recovery, if primary != shadow the metadata
-/// write was partially applied and the database fails closed as corrupt.
-pub(crate) const MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW: &str = "persistent_tx_ts_max_shadow";
 
 #[derive(Debug)]
 pub struct RowidAllocator {
@@ -1694,10 +1690,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
-    /// Creates the `__turso_internal_mvcc_meta` table and seeds it with the
-    /// `persistent_tx_ts_max` and shadow rows (both initialized to 0). This table
-    /// stores the durable replay boundary: on recovery, only logical-log frames with
-    /// `commit_ts > persistent_tx_ts_max` are replayed. Called once during first MVCC bootstrap.
+    /// Creates the `__turso_internal_mvcc_meta` table and seeds it with
+    /// `persistent_tx_ts_max` (initialized to 0). This table stores the durable replay
+    /// boundary: on recovery, only logical-log frames with `commit_ts > persistent_tx_ts_max`
+    /// are replayed. Called once during first MVCC bootstrap.
     fn initialize_mvcc_metadata_table(&self, connection: &Arc<Connection>) -> Result<()> {
         connection.execute(format!(
             "CREATE TABLE IF NOT EXISTS {MVCC_META_TABLE_NAME}(k TEXT, v INTEGER NOT NULL)"
@@ -1705,18 +1701,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         connection.execute(format!(
             "INSERT OR IGNORE INTO {MVCC_META_TABLE_NAME}(rowid, k, v) VALUES (1, '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}', 0)"
         ))?;
-        connection.execute(format!(
-            "INSERT OR IGNORE INTO {MVCC_META_TABLE_NAME}(rowid, k, v) VALUES (2, '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW}', 0)"
-        ))?;
         Ok(())
     }
 
     /// Read the persistent transaction timestamp maximum from the MVCC metadata table.
     fn try_read_persistent_tx_ts_max(&self, connection: &Arc<Connection>) -> Result<Option<u64>> {
-        let mut rows: HashMap<String, i64> = HashMap::default();
         let query_result = connection.query(format!(
-            "SELECT k, v FROM {MVCC_META_TABLE_NAME}
-             WHERE k IN ('{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}', '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW}')"
+            "SELECT v FROM {MVCC_META_TABLE_NAME}
+             WHERE k = '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}'"
         ));
         let maybe_stmt = match query_result {
             Ok(stmt) => stmt,
@@ -1727,55 +1719,26 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 )))
             }
         };
+        let mut value: Option<i64> = None;
         if let Some(mut stmt) = maybe_stmt {
             stmt.run_with_row_callback(|row| {
-                rows.insert(row.get::<String>(0)?, row.get::<i64>(1)?);
+                value = Some(row.get::<i64>(0)?);
                 Ok(())
             })?;
         }
 
-        if rows.len() != 2 {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid MVCC metadata table shape: expected exactly two metadata rows, got {}",
-                rows.len()
-            )));
-        }
+        let value = value.ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "Missing MVCC metadata row for key {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}"
+            ))
+        })?;
 
-        let value = rows
-            .get(MVCC_META_KEY_PERSISTENT_TX_TS_MAX)
-            .ok_or_else(|| {
-                LimboError::Corrupt(format!(
-                    "Missing MVCC metadata row for key {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}"
-                ))
-            })?;
-        let shadow = rows
-            .get(MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW)
-            .ok_or_else(|| {
-                LimboError::Corrupt(format!(
-                    "Missing MVCC metadata row for key {MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW}"
-                ))
-            })?;
-
-        if *value < 0 {
+        if value < 0 {
             return Err(LimboError::Corrupt(format!(
-                "Invalid MVCC metadata value for {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}: {}",
-                *value
+                "Invalid MVCC metadata value for {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}: {value}"
             )));
         }
-        if *shadow < 0 {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid MVCC metadata value for {MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW}: {}",
-                *shadow
-            )));
-        }
-        if value != shadow {
-            return Err(LimboError::Corrupt(format!(
-                "MVCC metadata attestation mismatch: {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}={} != {MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW}={}",
-                *value,
-                *shadow
-            )));
-        }
-        Ok(Some(*value as u64))
+        Ok(Some(value as u64))
     }
 
     /// Bootstrap the MV store from the SQLite schema table and logical log.

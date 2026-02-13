@@ -1,8 +1,8 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, TxTimestampOrID,
-    WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
-    MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW, MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
+    SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::schema::Index;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
@@ -598,7 +598,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         for (row_version, _special_write) in &self.write_set {
             let row_id = &row_version.row.id;
             let Some(entry) = self.mvstore.rows.get(row_id) else {
-                // The MVCC metadata table rows (persistent_tx_ts_max, shadow) are staged
+                // The MVCC metadata table row (persistent_tx_ts_max) is staged
                 // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
                 // have a backing in-memory MVCC version chain. Skip GC for these.
                 assert!(
@@ -642,8 +642,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
-    /// Stages synthetic `persistent_tx_ts_max` and shadow rows into the checkpoint write set
-    /// so they are committed atomically with all other data in the same pager transaction.
+    /// Stages synthetic `persistent_tx_ts_max` row into the checkpoint write set
+    /// so it is committed atomically with all other data in the same pager transaction.
     /// This is the mechanism that advances the durable replay boundary; on recovery, only
     /// logical-log frames with `commit_ts > persistent_tx_ts_max` are replayed.
     /// No-op when metadata hasn't advanced or when running in-memory (no durable metadata).
@@ -683,28 +683,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 begin: Some(TxTimestampOrID::Timestamp(new)),
                 end: None,
                 row,
-                btree_resident: true,
-            },
-            None,
-        ));
-        let shadow_record = ImmutableRecord::from_values(
-            &[
-                Value::build_text(MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW),
-                Value::from_i64(new_i64),
-            ],
-            2,
-        );
-        let shadow_row = Row::new_table_row(
-            RowID::new(table_id, RowKey::Int(2)),
-            shadow_record.get_payload().to_vec(),
-            num_columns,
-        );
-        self.write_set.push((
-            RowVersion {
-                id: 0,
-                begin: Some(TxTimestampOrID::Timestamp(new)),
-                end: None,
-                row: shadow_row,
                 btree_resident: true,
             },
             None,
