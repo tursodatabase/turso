@@ -428,3 +428,9 @@ expect {
     3600000000000
 }
 
+test strftime_integer_overflow {
+    SELECT strftime('%Y', 99999999999999);
+}
+expect {
+    
+}
