@@ -1104,6 +1104,15 @@ pub fn constraints_from_where_clause(
                         if table_collation != index_collation {
                             continue;
                         }
+                        // Custom type columns encode values as blobs. Blob ordering (memcmp)
+                        // doesn't necessarily match the custom type's semantic ordering, so
+                        // range constraints (>, <, >=, <=) can't use the index. Equality (=)
+                        // still works because encoded(A) == encoded(B) iff A == B.
+                        if schema.get_type_def(&constrained_column.ty_str).is_some()
+                            && constraint.operator != ast::Operator::Equals.into()
+                        {
+                            continue;
+                        }
                     }
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
                         if candidate.index.as_ref().is_some_and(|i| {

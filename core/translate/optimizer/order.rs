@@ -1,5 +1,6 @@
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
+    schema::Schema,
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         optimizer::access_method::AccessMethodParams,
@@ -173,6 +174,7 @@ pub fn plan_satisfies_order_target(
     access_methods_arena: &[AccessMethod],
     joined_tables: &[JoinedTable],
     order_target: &OrderTarget,
+    schema: &Schema,
 ) -> bool {
     // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
     for (_, access_method_index) in plan.data.iter() {
@@ -255,6 +257,17 @@ pub fn plan_satisfies_order_target(
                         };
                         if !column_matches {
                             break;
+                        }
+
+                        // Custom type columns store encoded blobs. The B-tree's
+                        // blob ordering (memcmp) doesn't match the custom type's
+                        // semantic ordering, so the index can't satisfy ORDER BY.
+                        if let ColumnTarget::Column(col_no) = &target_col.target {
+                            if let Some(col) = table_ref.table.columns().get(*col_no) {
+                                if schema.get_type_def(&col.ty_str).is_some() {
+                                    break;
+                                }
+                            }
                         }
 
                         // If ORDER BY collation doesn't match index collation, this index can't satisfy the ordering

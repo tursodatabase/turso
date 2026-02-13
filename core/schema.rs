@@ -2988,9 +2988,21 @@ impl TryFrom<&ColumnDefinition> for Column {
             .map(|t| t.name.to_string())
             .unwrap_or_default();
 
+        let ty_params: Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
+            Some(ast::Type {
+                size: Some(ast::TypeSize::MaxSize(ref expr)),
+                ..
+            }) => vec![expr.clone()],
+            Some(ast::Type {
+                size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
+                ..
+            }) => vec![e1.clone(), e2.clone()],
+            _ => Vec::new(),
+        };
+
         let hidden = ty_str.contains("HIDDEN");
 
-        Ok(Column::new(
+        let mut col = Column::new(
             Some(normalize_ident(name)),
             ty_str,
             default,
@@ -3004,7 +3016,9 @@ impl TryFrom<&ColumnDefinition> for Column {
                 unique,
                 hidden,
             },
-        ))
+        );
+        col.ty_params = ty_params;
+        col
     }
 }
 

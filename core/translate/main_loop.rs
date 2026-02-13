@@ -2773,6 +2773,63 @@ fn index_seek_affinities(
         .collect()
 }
 
+/// Encodes seek key registers for custom type index columns.
+/// Index entries store encoded values, so seek keys must be encoded to match.
+/// `idx_col_offset` is the starting index column position (0 for start keys,
+/// `prefix.len()` for end key's last component).
+fn encode_seek_keys_for_custom_types(
+    program: &mut ProgramBuilder,
+    tables: &TableReferences,
+    seek_index: &Arc<Index>,
+    start_reg: usize,
+    num_keys: usize,
+    idx_col_offset: usize,
+    resolver: &super::emitter::Resolver,
+) -> crate::Result<()> {
+    let table = tables.find_table_by_identifier(&seek_index.table_name);
+    let table = match table {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let columns = table.columns();
+    for i in 0..num_keys {
+        let idx_col_pos = idx_col_offset + i;
+        if idx_col_pos >= seek_index.columns.len() {
+            break;
+        }
+        let idx_col = &seek_index.columns[idx_col_pos];
+        let table_col = match columns.get(idx_col.pos_in_table) {
+            Some(c) => c,
+            None => continue,
+        };
+        let type_def = match resolver.schema.get_type_def(&table_col.ty_str) {
+            Some(td) => td,
+            None => continue,
+        };
+        let encode_expr = match &type_def.encode {
+            Some(e) => e,
+            None => continue,
+        };
+        let reg = start_reg + i;
+        let skip_label = program.allocate_label();
+        program.emit_insn(crate::vdbe::insn::Insn::IsNull {
+            reg,
+            target_pc: skip_label,
+        });
+        super::expr::emit_type_expr(
+            program,
+            encode_expr,
+            reg,
+            reg,
+            table_col,
+            type_def,
+            resolver,
+        )?;
+        program.resolve_label(skip_label, program.offset());
+    }
+    Ok(())
+}
+
 /// Emits instructions for an index seek. See e.g. [crate::translate::plan::SeekDef]
 /// for more details about the seek definition.
 ///
@@ -2874,6 +2931,20 @@ fn emit_seek(
         }
     }
     let num_regs = seek_def.size(&seek_def.start);
+
+    // Encode seek keys for custom type columns so they match the encoded
+    // values stored in the index.
+    if let Some(idx) = seek_index {
+        encode_seek_keys_for_custom_types(
+            program,
+            tables,
+            idx,
+            start_reg,
+            num_regs,
+            0,
+            &t_ctx.resolver,
+        )?;
+    }
 
     if let Some(idx) = seek_index {
         let affinities = index_seek_affinities(idx, tables, seek_def, &seek_def.start);
@@ -3002,6 +3073,19 @@ fn emit_seek_termination(
                 &t_ctx.resolver,
                 NoConstantOptReason::RegisterReuse,
             )?;
+            // Encode the end key for custom type columns (prefix keys were
+            // already encoded in emit_seek, only the last component is new).
+            if let Some(idx) = seek_index {
+                encode_seek_keys_for_custom_types(
+                    program,
+                    tables,
+                    idx,
+                    last_reg,
+                    1,
+                    seek_def.prefix.len(),
+                    &t_ctx.resolver,
+                )?;
+            }
             // Apply affinity to the end key (same as we do for start key).
             // Without this, e.g. BETWEEN '15' AND '35' on a numeric column would
             // compare '35' as a string against numeric values, causing incorrect results.

@@ -732,16 +732,45 @@ pub fn translate_insert(
         .collect()
     });
     if !relevant_after_triggers.is_empty() {
-        // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
+        // Build NEW registers for AFTER triggers. For custom type columns,
+        // the register values are encoded blobs at this point. Copy and
+        // decode them so triggers see user-facing values.
         let new_registers_after: Vec<usize> = insertion
             .col_mappings
             .iter()
             .map(|col_mapping| {
                 if col_mapping.column.is_rowid_alias() {
-                    insertion.key_register()
-                } else {
-                    col_mapping.register
+                    return insertion.key_register();
                 }
+                let type_def = resolver.schema.get_type_def(&col_mapping.column.ty_str);
+                if let Some(type_def) = type_def {
+                    if let Some(ref decode_expr) = type_def.decode {
+                        let decoded_reg = program.alloc_register();
+                        program.emit_insn(Insn::Copy {
+                            src_reg: col_mapping.register,
+                            dst_reg: decoded_reg,
+                            extra_amount: 0,
+                        });
+                        let skip_label = program.allocate_label();
+                        program.emit_insn(Insn::IsNull {
+                            reg: decoded_reg,
+                            target_pc: skip_label,
+                        });
+                        super::expr::emit_type_expr(
+                            &mut program,
+                            decode_expr,
+                            decoded_reg,
+                            decoded_reg,
+                            col_mapping.column,
+                            type_def,
+                            resolver,
+                        )
+                        .expect("decode should succeed");
+                        program.resolve_label(skip_label, program.offset());
+                        return decoded_reg;
+                    }
+                }
+                col_mapping.register
             })
             .chain(std::iter::once(insertion.key_register()))
             .collect();

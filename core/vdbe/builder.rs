@@ -178,6 +178,10 @@ pub struct ProgramBuilder {
     /// This is used when building ORDER BY sort keys for custom types without a `<` operator,
     /// so the sorter sorts on the encoded (on-disk) values.
     pub suppress_custom_type_decode: bool,
+    /// When true, the next `emit_column` call will not bake the default value
+    /// into the Column instruction. Used for custom type columns where the default
+    /// needs to be encoded before use.
+    pub suppress_column_default: bool,
     /// Hash join build signatures keyed by hash table id.
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
@@ -425,6 +429,7 @@ impl ProgramBuilder {
             cursor_overrides: HashMap::default(),
             id_register_overrides: HashMap::default(),
             suppress_custom_type_decode: false,
+            suppress_column_default: false,
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: HashSet::default(),
             subquery_result_regs: HashMap::default(),
@@ -1565,6 +1570,13 @@ impl ProgramBuilder {
             }
 
             Some(value)
+        };
+
+        let default = if self.suppress_column_default {
+            self.suppress_column_default = false;
+            None
+        } else {
+            default
         };
 
         self.emit_insn(Insn::Column {

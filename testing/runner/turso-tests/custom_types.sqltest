@@ -119,7 +119,31 @@ test cast-to-custom-type {
     SELECT CAST('hello' AS test_reverse);
 }
 expect {
-    olleh
+    hello
+}
+
+@requires strict "uses STRICT tables"
+test cast-to-parametric-type {
+    SELECT CAST(42 AS numeric(10,2));
+}
+expect {
+    42.00
+}
+
+@requires strict "uses STRICT tables"
+test cast-to-varchar {
+    SELECT CAST('hello' AS varchar(3));
+}
+expect error {
+    value too long for varchar
+}
+
+@requires strict "uses STRICT tables"
+test cast-varchar-within-limit {
+    SELECT CAST('hi' AS varchar(5));
+}
+expect {
+    hi
 }
 
 @requires strict "uses STRICT tables"
@@ -315,6 +339,50 @@ test add-column-custom-type {
 }
 expect {
     1|42
+    2|100
+}
+
+@requires strict "uses STRICT tables"
+test add-column-numeric-default-preexisting {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t1 VALUES (2);
+    ALTER TABLE t1 ADD COLUMN val numeric(10,2) DEFAULT 42;
+    SELECT id, val FROM t1;
+}
+expect {
+    1|42.00
+    2|42.00
+}
+
+@requires strict "uses STRICT tables"
+test add-column-numeric-default-mixed {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t1 VALUES (2);
+    ALTER TABLE t1 ADD COLUMN val numeric(10,2) DEFAULT 42;
+    INSERT INTO t1 VALUES (3, 99);
+    INSERT INTO t1(id) VALUES (4);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|42.00
+    2|42.00
+    3|99.00
+    4|42.00
+}
+
+@requires strict "uses STRICT tables"
+test add-column-custom-type-default-preexisting {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t1 VALUES (2);
+    ALTER TABLE t1 ADD COLUMN val test_uint DEFAULT 100;
+    SELECT id, val FROM t1;
+}
+expect {
+    1|100
     2|100
 }
 
@@ -748,4 +816,335 @@ expect {
     z|-5.00
     y|9.00
     x|100.00
+}
+
+# --- INDEX TESTS ---
+
+@requires strict "uses STRICT tables"
+test index-equality-seek-custom-type {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
+    INSERT INTO t1 VALUES (1, 'hello');
+    INSERT INTO t1 VALUES (2, 'world');
+    INSERT INTO t1 VALUES (3, 'test');
+    CREATE INDEX idx_val ON t1(val);
+    SELECT id, val FROM t1 WHERE val = 'hello';
+}
+expect {
+    1|hello
+}
+
+@requires strict "uses STRICT tables"
+test index-equality-seek-numeric {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    INSERT INTO t1 VALUES (4, -5);
+    CREATE INDEX idx_val ON t1(val);
+    SELECT id, val FROM t1 WHERE val = 9;
+}
+expect {
+    2|9.00
+}
+
+@requires strict "uses STRICT tables"
+test index-range-scan-numeric {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    INSERT INTO t1 VALUES (4, -5);
+    CREATE INDEX idx_val ON t1(val);
+    SELECT id, val FROM t1 WHERE val > 10 ORDER BY val;
+}
+expect {
+    3|50.00
+    1|100.00
+}
+
+@requires strict "uses STRICT tables"
+test index-range-scan-numeric-le {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    INSERT INTO t1 VALUES (4, -5);
+    CREATE INDEX idx_val ON t1(val);
+    SELECT id, val FROM t1 WHERE val <= 50 ORDER BY val;
+}
+expect {
+    4|-5.00
+    2|9.00
+    3|50.00
+}
+
+@requires strict "uses STRICT tables"
+test index-range-scan-numeric-between {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    INSERT INTO t1 VALUES (4, -5);
+    INSERT INTO t1 VALUES (5, 25);
+    CREATE INDEX idx_val ON t1(val);
+    SELECT id, val FROM t1 WHERE val >= 9 AND val <= 50 ORDER BY val;
+}
+expect {
+    2|9.00
+    5|25.00
+    3|50.00
+}
+
+@requires strict "uses STRICT tables"
+test index-equality-seek-numeric-no-match {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    CREATE INDEX idx_val ON t1(val);
+    SELECT count(*) FROM t1 WHERE val = 999;
+}
+expect {
+    0
+}
+
+@requires strict "uses STRICT tables"
+test index-equality-seek-null {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, NULL);
+    INSERT INTO t1 VALUES (3, 50);
+    CREATE INDEX idx_val ON t1(val);
+    SELECT id, val FROM t1 WHERE val = 100;
+}
+expect {
+    1|100.00
+}
+
+@requires strict "uses STRICT tables"
+test index-multiple-matches-numeric {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    INSERT INTO t1 VALUES (2, 42);
+    INSERT INTO t1 VALUES (3, 99);
+    INSERT INTO t1 VALUES (4, 42);
+    CREATE INDEX idx_val ON t1(val);
+    SELECT id, val FROM t1 WHERE val = 42 ORDER BY id;
+}
+expect {
+    1|42.00
+    2|42.00
+    4|42.00
+}
+
+@requires strict "uses STRICT tables"
+test index-order-by-with-index-numeric {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    INSERT INTO t1 VALUES (4, -5);
+    CREATE INDEX idx_val ON t1(val);
+    SELECT id, val FROM t1 ORDER BY val;
+}
+expect {
+    4|-5.00
+    2|9.00
+    3|50.00
+    1|100.00
+}
+
+@requires strict "uses STRICT tables"
+test index-composite-with-custom-type {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, category TEXT, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 'a', 100);
+    INSERT INTO t1 VALUES (2, 'b', 9);
+    INSERT INTO t1 VALUES (3, 'a', 50);
+    INSERT INTO t1 VALUES (4, 'b', 75);
+    CREATE INDEX idx_cat_val ON t1(category, val);
+    SELECT id, val FROM t1 WHERE category = 'a' ORDER BY val;
+}
+expect {
+    3|50.00
+    1|100.00
+}
+
+# --- DERIVED OPERATOR TESTS ---
+
+@requires strict "uses STRICT tables"
+test derived-operator-greater-than {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    INSERT INTO t1 VALUES (4, -5);
+    SELECT id, val FROM t1 WHERE val > 9 ORDER BY val;
+}
+expect {
+    3|50.00
+    1|100.00
+}
+
+@requires strict "uses STRICT tables"
+test derived-operator-greater-equals {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    INSERT INTO t1 VALUES (4, -5);
+    SELECT id, val FROM t1 WHERE val >= 9 ORDER BY val;
+}
+expect {
+    2|9.00
+    3|50.00
+    1|100.00
+}
+
+@requires strict "uses STRICT tables"
+test derived-operator-less-equals {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    INSERT INTO t1 VALUES (4, -5);
+    SELECT id, val FROM t1 WHERE val <= 50 ORDER BY val;
+}
+expect {
+    4|-5.00
+    2|9.00
+    3|50.00
+}
+
+@requires strict "uses STRICT tables"
+test derived-operator-not-equals {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    SELECT id, val FROM t1 WHERE val != 9 ORDER BY val;
+}
+expect {
+    3|50.00
+    1|100.00
+}
+
+@requires strict "uses STRICT tables"
+test derived-operator-between-numeric {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    INSERT INTO t1 VALUES (4, -5);
+    INSERT INTO t1 VALUES (5, 25);
+    SELECT id, val FROM t1 WHERE val >= 9 AND val <= 50 ORDER BY val;
+}
+expect {
+    2|9.00
+    5|25.00
+    3|50.00
+}
+
+@requires strict "uses STRICT tables"
+test derived-operator-greater-with-literal {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, 50);
+    SELECT id, val FROM t1 WHERE val > 50 ORDER BY val;
+}
+expect {
+    1|100.00
+}
+
+@requires strict "uses STRICT tables"
+test derived-operator-not-equals-with-uint {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (2, 20);
+    INSERT INTO t1 VALUES (3, 30);
+    SELECT id, val FROM t1 WHERE val != 20 ORDER BY id;
+}
+expect {
+    1|10
+    3|30
+}
+
+@requires strict "uses STRICT tables"
+test derived-operator-greater-with-uint {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (2, 20);
+    INSERT INTO t1 VALUES (3, 30);
+    SELECT id, val FROM t1 WHERE val > 20 ORDER BY id;
+}
+expect {
+    3|30
+}
+
+@requires strict "uses STRICT tables"
+test derived-operator-less-equals-with-uint {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (2, 20);
+    INSERT INTO t1 VALUES (3, 30);
+    SELECT id, val FROM t1 WHERE val <= 20 ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+# --- TRIGGER TESTS ---
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test trigger-after-insert-sees-decoded {
+    CREATE TABLE log(id INTEGER PRIMARY KEY, val TEXT) STRICT;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    CREATE TRIGGER after_ins AFTER INSERT ON t1
+    BEGIN INSERT INTO log VALUES (NULL, CAST(NEW.val AS TEXT)); END;
+    INSERT INTO t1 VALUES (1, 42);
+    SELECT val FROM log;
+}
+expect {
+    42.00
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test trigger-before-insert-sees-raw {
+    CREATE TABLE log(id INTEGER PRIMARY KEY, val TEXT) STRICT;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    CREATE TRIGGER before_ins BEFORE INSERT ON t1
+    BEGIN INSERT INTO log VALUES (NULL, CAST(NEW.val AS TEXT)); END;
+    INSERT INTO t1 VALUES (1, 42);
+    SELECT val FROM log;
+}
+expect {
+    42
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test trigger-after-update-sees-decoded {
+    CREATE TABLE log(id INTEGER PRIMARY KEY, val TEXT) STRICT;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    CREATE TRIGGER after_upd AFTER UPDATE ON t1
+    BEGIN INSERT INTO log VALUES (NULL, CAST(NEW.val AS TEXT)); END;
+    INSERT INTO t1 VALUES (1, 42);
+    UPDATE t1 SET val = 99 WHERE id = 1;
+    SELECT val FROM log;
+}
+expect {
+    99.00
 }
