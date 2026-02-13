@@ -116,6 +116,31 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
 }
 
+fn is_jsonb_blob(slice: &[u8]) -> bool {
+    let Ok((header, header_offset)) = JsonbHeader::from_slice(0, slice) else {
+        return false;
+    };
+    let payload_size = header.payload_size();
+    let Some(total_expected) = header_offset.checked_add(payload_size) else {
+        return false;
+    };
+    if total_expected != slice.len() {
+        return false;
+    }
+
+    let jsonb = Jsonb::from_raw_data(slice);
+    match header.is_scalar() {
+        Ok(is_scalar) => {
+            if is_scalar || payload_size <= 7 {
+                jsonb.is_valid()
+            } else {
+                jsonb.element_type().is_ok()
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
     match val {
         ValueRef::Text(text) => {
@@ -156,9 +181,6 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                         if total_expected != slice.len() {
                             parse_as_json_text(slice, strict)?
                         } else {
-                            if header.is_scalar()? {
-                                return Err(LimboError::ParseError("malformed JSON".to_string()));
-                            }
                             let jsonb = Jsonb::from_raw_data(slice);
                             let is_valid_json = if payload_size <= 7 {
                                 jsonb.is_valid()
@@ -797,12 +819,26 @@ where
 /// succeeded, and Value::from_i64(0) if it didn't.
 pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
     let json_value = json_value.as_value_ref();
-    if matches!(json_value, ValueRef::Null) {
-        return Value::Null;
+    match json_value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Blob(blob) => {
+            let index = blob
+                .iter()
+                .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                .unwrap_or(blob.len());
+            let slice = &blob[index..];
+            if is_jsonb_blob(slice) {
+                Value::from_i64(0)
+            } else {
+                parse_as_json_text(slice, Conv::Strict)
+                    .map(|_| Value::from_i64(1))
+                    .unwrap_or_else(|_| Value::from_i64(0))
+            }
+        }
+        _ => convert_dbtype_to_jsonb(json_value, Conv::Strict)
+            .map(|_| Value::from_i64(1))
+            .unwrap_or_else(|_| Value::from_i64(0)),
     }
-    convert_dbtype_to_jsonb(json_value, Conv::Strict)
-        .map(|_| Value::from_i64(1))
-        .unwrap_or_else(|_| Value::from_i64(0))
 }
 
 pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
