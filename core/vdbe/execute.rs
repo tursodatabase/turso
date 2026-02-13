@@ -446,13 +446,17 @@ pub fn op_null(
 }
 
 pub fn op_null_row(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NullRow { cursor_id }, insn);
-    state.get_cursor(*cursor_id).set_null_flag(true);
+    {
+        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "NullRow");
+        let cursor = cursor.as_btree_mut();
+        cursor.set_null_flag(true);
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3263,9 +3267,9 @@ pub fn seek_internal(
                         match &temp_value {
                             Value::Numeric(Numeric::Float(f)) => {
                                 let int_key_as_float = int_key as f64;
-                                let c = if int_key_as_float > f64::from(*f) {
+                                let c = if int_key_as_float > *f {
                                     1
-                                } else if int_key_as_float < f64::from(*f) {
+                                } else if int_key_as_float < *f {
                                     -1
                                 } else {
                                     0
@@ -3875,7 +3879,11 @@ fn update_agg_payload(
                     "Avg: payload too short".to_string(),
                 ));
             };
-            let r_err = r_err_val.as_float();
+            let Value::Numeric(Numeric::Float(_r_err)) = r_err_val else {
+                return Err(LimboError::InternalError(
+                    "Avg: payload[1] is not a float".to_string(),
+                ));
+            };
             let Value::Numeric(Numeric::Integer(count)) = count_val else {
                 return Err(LimboError::InternalError(
                     "Avg: payload[2] is not an integer".to_string(),
@@ -3889,12 +3897,15 @@ fn update_agg_payload(
                     ParsedNumber::Float(f) => f,
                     ParsedNumber::None => 0.0,
                 },
-                Value::Blob(b) => match try_for_float(&b).1 {
-                    ParsedNumber::Integer(i) => i as f64,
-                    ParsedNumber::Float(f) => f,
-                    ParsedNumber::None => 0.0,
+                Value::Blob(b) => match std::str::from_utf8(&b) {
+                    Ok(s) => match try_for_float(s.as_bytes()).1 {
+                        ParsedNumber::Integer(i) => i as f64,
+                        ParsedNumber::Float(f) => f,
+                        ParsedNumber::None => 0.0,
+                    },
+                    Err(_) => 0.0,
                 },
-                _ => unreachable!(),
+                Value::Null => unreachable!(),
             };
             // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
             let s = sum_val.as_float();
@@ -3904,6 +3915,7 @@ fn update_agg_payload(
             } else {
                 (val - t) + s
             };
+            let r_err = r_err_val.as_float();
             *r_err_val = Value::from_f64(r_err + correction);
             *sum_val = Value::from_f64(t);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
@@ -3916,7 +3928,11 @@ fn update_agg_payload(
                     "Sum/Total: payload too short".to_string(),
                 ));
             };
-            let r_err_f = r_err_val.as_float();
+            let Value::Numeric(Numeric::Float(_r_err)) = r_err_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total: payload[1] is not a float".to_string(),
+                ));
+            };
             let Value::Numeric(Numeric::Integer(approx_i)) = approx_val else {
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload[2] is not an integer".to_string(),
@@ -3928,7 +3944,7 @@ fn update_agg_payload(
                 ));
             };
             let mut sum_state = SumAggState {
-                r_err: r_err_f,
+                r_err: r_err_val.as_float(),
                 approx: *approx_i != 0,
                 ovrfl: *ovrfl_i != 0,
             };
@@ -3959,7 +3975,7 @@ fn update_agg_payload(
                 },
                 Value::Numeric(Numeric::Float(f)) => match acc {
                     Value::Null => {
-                        *acc = Value::Numeric(Numeric::Float(f));
+                        *acc = Value::from_f64(f64::from(f));
                         sum_state.approx = true;
                     }
                     Value::Numeric(Numeric::Integer(i)) => {
@@ -4927,7 +4943,7 @@ pub fn op_function(
                     Some(value) => match value.get_value() {
                         Value::Text(text) => text.as_str(),
                         Value::Numeric(Numeric::Integer(val)) => &val.to_string(),
-                        Value::Numeric(Numeric::Float(val)) => &f64::from(*val).to_string(),
+                        Value::Numeric(Numeric::Float(val)) => &val.to_string(),
                         Value::Blob(val) => &String::from_utf8_lossy(val),
                         _ => "    ",
                     },
@@ -6160,15 +6176,15 @@ pub fn op_function(
                                                 );
                                             }
                                         }
-                                    }
 
-                                    for col in &mut columns {
-                                        rewrite_column_references_if_needed(
-                                            col,
-                                            &normalized_tbl_name,
-                                            &rename_from,
-                                            column_def.col_name.as_str(),
-                                        );
+                                        for col in &mut columns {
+                                            rewrite_column_references_if_needed(
+                                                col,
+                                                &normalized_tbl_name,
+                                                &rename_from,
+                                                column_def.col_name.as_str(),
+                                            );
+                                        }
                                     }
                                 } else {
                                     // This is a different table, check if it has FKs referencing the renamed column
@@ -7444,7 +7460,7 @@ pub fn op_must_be_int(
     load_insn!(MustBeInt { reg }, insn);
     match &state.registers[*reg].get_value() {
         Value::Numeric(Numeric::Integer(_)) => {}
-        Value::Numeric(Numeric::Float(f)) => match cast_real_to_integer(f64::from(*f)) {
+        Value::Numeric(Numeric::Float(f)) => match cast_real_to_integer((*f).into()) {
             Ok(i) => state.registers[*reg] = Register::Value(Value::from_i64(i)),
             Err(_) => bail_constraint_error!("datatype mismatch"),
         },
@@ -8571,8 +8587,8 @@ pub fn op_is_true(
         insn
     );
     let value = state.registers[*reg].get_value();
-    // Use Numeric::try_into_bool which handles the conversion of text/blob to numbers
-    let final_result = match Numeric::from_value(value).map(|val| val.to_bool()) {
+    // Use Numeric::from_value which handles the conversion of text/blob to numbers
+    let final_result = match Numeric::from_value(value).map(|n| n.to_bool()) {
         // For NULL, store null_value directly (no inversion)
         None => {
             if *null_value {
@@ -10274,7 +10290,6 @@ pub fn op_rename_table(
                 }
             }
         }
-
         Ok(())
     })?;
 
@@ -10329,6 +10344,7 @@ pub fn op_drop_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns.remove(*column_index);
+
         // Remove column-level CHECK constraints for the dropped column
         let col_name = column_name.clone();
         btree.check_constraints.retain(|c| {
@@ -10521,7 +10537,7 @@ pub fn op_alter_column(
             btree.columns[*column_index].set_rowid_alias(new_column.is_rowid_alias());
         }
 
-        // Update this table's OWN foreign keys
+        // Update this table’s OWN foreign keys
         for fk_arc in &mut btree.foreign_keys {
             let fk = Arc::make_mut(fk_arc);
             // child side: rename child column if it matches
@@ -10599,7 +10615,7 @@ pub fn op_if_neg(
         Register::Value(Value::Numeric(Numeric::Integer(i))) if *i < 0 => {
             state.pc = target_pc.as_offset_int();
         }
-        Register::Value(Value::Numeric(Numeric::Float(f))) if f64::from(*f) < 0.0 => {
+        Register::Value(Value::Numeric(Numeric::Float(f))) if *f < 0.0 => {
             state.pc = target_pc.as_offset_int();
         }
         Register::Value(Value::Null) => {
@@ -11211,7 +11227,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                             if affinity == Affinity::Numeric {
                                 return try_float_to_integer_affinity(value, f64::from(fl));
                             } else {
-                                *value = Value::Numeric(Numeric::Float(fl));
+                                *value = Value::from_f64(f64::from(fl));
                                 return true;
                             }
                         }
@@ -11236,14 +11252,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                         return false;
                     }
                     if let Ok(num) = checked_cast_text_to_numeric(s, false) {
-                        match num {
-                            Value::Numeric(Numeric::Integer(i)) => {
-                                *value = Value::from_f64(i as f64);
-                            }
-                            other => {
-                                *value = other;
-                            }
-                        }
+                        *value = num;
                         return true;
                     } else {
                         return false;
@@ -11292,7 +11301,7 @@ pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     match value {
         ValueRef::Numeric(Numeric::Integer(i)) => i,
         ValueRef::Numeric(Numeric::Float(f)) => {
-            let f = f64::from(f);
+            let f: f64 = f.into();
             // Use sqlite3RealToI64 equivalent
             if f < -9223372036854774784.0 {
                 i64::MIN
@@ -11975,9 +11984,8 @@ fn op_vacuum_into_inner(
                 let schema_rows_len = vacuum_state.schema_rows.len();
                 turso_assert!(
                     idx <= schema_rows_len,
-                    "idx {} incremented past end of schema_rows (len {})",
-                    idx,
-                    schema_rows_len
+                    "idx incremented past end of schema_rows",
+                    { "idx": idx, "schema_rows_len": schema_rows_len }
                 );
                 if idx == schema_rows_len {
                     // Done creating schema, start copying data
@@ -11991,8 +11999,8 @@ fn op_vacuum_into_inner(
                 let row = &vacuum_state.schema_rows[idx];
                 turso_assert!(
                     row.len() == 4,
-                    "schema row should have exactly 4 columns (type, name, tbl_name, sql), got {}",
-                    row.len()
+                    "schema row should have exactly 4 columns (type, name, tbl_name, sql)",
+                    { "row_len": row.len() }
                 );
 
                 // Skip triggers and views - they'll be created after data copy
@@ -12077,9 +12085,8 @@ fn op_vacuum_into_inner(
                 let table_names_len = vacuum_state.table_names.len();
                 turso_assert!(
                     table_idx <= table_names_len,
-                    "table_idx {} incremented past end of table_names (len {})",
-                    table_idx,
-                    table_names_len
+                    "table_idx incremented past end of table_names",
+                    { "table_idx": table_idx, "table_names_len": table_names_len }
                 );
                 if table_idx == table_names_len {
                     // Done copying all tables, now copy meta values
@@ -12288,9 +12295,8 @@ fn op_vacuum_into_inner(
                 let schema_rows_len = vacuum_state.schema_rows.len();
                 turso_assert!(
                     idx <= schema_rows_len,
-                    "idx {} incremented past end of schema_rows (len {})",
-                    idx,
-                    schema_rows_len
+                    "idx incremented past end of schema_rows",
+                    { "idx": idx, "schema_rows_len": schema_rows_len }
                 );
                 if idx == schema_rows_len {
                     // Done creating triggers and views

@@ -2,6 +2,7 @@ use crate::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use crate::{turso_assert, turso_assert_eq};
 
 use crate::{
     storage::sqlite3_ondisk::finish_read_page, Buffer, Completion, CompletionError, PageRef, Result,
@@ -35,7 +36,7 @@ impl Subjournal {
         let result = self
             .in_use
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
-        assert!(
+        turso_assert!(
             result.is_ok(),
             "try_start_use must succeed before stop_use call"
         );
@@ -56,16 +57,18 @@ impl Subjournal {
         buffer: Arc<Buffer>,
         c: Completion,
     ) -> Result<Completion> {
-        assert!(
-            buffer.len() == page_size + 4,
+        turso_assert_eq!(
+            buffer.len(),
+            page_size + 4,
             "buffer length should be page_size + 4 bytes for page id"
         );
         self.file.pwrite(offset, buffer, c)
     }
 
     pub fn read_page_number(&self, offset: u64, page_id_buffer: Arc<Buffer>) -> Result<Completion> {
-        assert!(
-            page_id_buffer.len() == 4,
+        turso_assert_eq!(
+            page_id_buffer.len(),
+            4,
             "page_id_buffer length should be 4 bytes"
         );
         let c = Completion::new_read(
@@ -99,10 +102,7 @@ impl Subjournal {
         page: PageRef,
         page_size: usize,
     ) -> Result<Completion> {
-        assert!(
-            buffer.len() == page_size,
-            "buffer length should be page_size"
-        );
+        turso_assert_eq!(buffer.len(), page_size, "buffer length should be page_size");
         let c = Completion::new_read(
             buffer,
             move |res: Result<(Arc<Buffer>, i32), CompletionError>| {

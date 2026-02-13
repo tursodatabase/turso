@@ -666,37 +666,17 @@ fn emit_condition_assert(
     let prefixed = prefix_message(file_path, &msg);
     let details = details_json(&input.details);
 
-    let (assert_call, exit_msg) = if let Some(fmt_args) = &input.format_args {
-        let assert_call = match kind {
-            ConditionAssertKind::Assert => quote! { assert!(__turso_cond, #msg, #fmt_args); },
-            ConditionAssertKind::DebugAssert => {
-                quote! { debug_assert!(__turso_cond, #msg, #fmt_args); }
-            }
-        };
-        (
-            assert_call,
-            quote! {
-                eprint!("[antithesis] assertion failed: ");
-                eprintln!(#msg, #fmt_args);
-                eprintln!("exiting with code 0 because antithesis already captured this failure");
-            },
-        )
-    } else {
-        let fmt_args = details_format_args(&msg, &input.details);
-        let assert_call = match kind {
-            ConditionAssertKind::Assert => quote! { assert!(__turso_cond, #fmt_args); },
-            ConditionAssertKind::DebugAssert => {
-                quote! { debug_assert!(__turso_cond, #fmt_args); }
-            }
-        };
-        (
-            assert_call,
-            quote! {
-                eprint!("[antithesis] assertion failed: ");
-                eprintln!(#fmt_args);
-                eprintln!("exiting with code 0 because antithesis already captured this failure");
-            },
-        )
+    let fmt_args = details_format_args(&msg, &input.details);
+    let assert_call = match kind {
+        ConditionAssertKind::Assert => quote! { assert!(__turso_cond, #fmt_args); },
+        ConditionAssertKind::DebugAssert => {
+            quote! { debug_assert!(__turso_cond, #fmt_args); }
+        }
+    };
+    let exit_msg = quote! {
+        eprint!("[antithesis] assertion failed: ");
+        eprintln!(#fmt_args);
+        eprintln!("exiting with code 0 because antithesis already captured this failure");
     };
 
     let env_check = antithesis_env_check();

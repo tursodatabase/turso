@@ -4,7 +4,8 @@ use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::sync::Mutex;
-use crate::{turso_assert, CompletionError, LimboError, Result};
+use crate::turso_assert;
+use crate::{CompletionError, LimboError, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
 use std::{

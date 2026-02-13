@@ -24,10 +24,15 @@ use crate::sync::{Mutex, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
-    io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
-    IOResult, LimboError, Result, TransactionState,
+    io::CompletionGroup, return_if_io, types::WalFrameInfo, Completion, Connection, IOResult,
+    LimboError, Result, TransactionState,
 };
 use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
+#[allow(unused_imports)]
+use crate::{
+    turso_assert, turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
+    turso_assert_less_than, turso_assert_ne, turso_debug_assert, turso_soft_unreachable,
+};
 use arc_swap::ArcSwapOption;
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
@@ -287,7 +292,7 @@ impl PageInner {
     }
 
     pub fn write_cell_content_area(&self, value: usize) {
-        debug_assert!(value <= PageSize::MAX as usize);
+        turso_debug_assert!(value <= PageSize::MAX as usize);
         let value = value as u16;
         self.write_u16(BTREE_CELL_CONTENT_AREA, value);
     }
@@ -372,9 +377,9 @@ impl PageInner {
         let buf = self.as_ptr();
 
         let ncells = self.cell_count();
-        assert!(
-            idx < ncells,
-            "cell_get: idx out of bounds: idx={idx}, ncells={ncells}"
+        turso_assert_less_than!(idx, ncells,
+            "cell_get: idx out of bounds",
+            {"idx": idx, "ncells": ncells}
         );
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -386,7 +391,7 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
-        debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
+        turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -398,7 +403,7 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_interior_read_left_child_page(&self, idx: usize) -> crate::Result<u32> {
-        debug_assert!(matches!(
+        turso_debug_assert!(matches!(
             self.page_type(),
             Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
         ));
@@ -424,7 +429,7 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
-        debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
+        turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -556,7 +561,7 @@ impl PageInner {
         page_type: PageType,
     ) -> (usize, usize) {
         let buf = self.as_ptr();
-        assert!(idx < cell_count, "cell_get: idx out of bounds");
+        turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
         let len = match page_type {
             PageType::IndexInterior => {
@@ -703,7 +708,7 @@ const PAGE_SPILLED: usize = 0b100000;
 
 impl Page {
     pub fn new(id: i64) -> Self {
-        assert!(id >= 0, "page id should be positive");
+        turso_assert_greater_than_or_equal!(id, 0);
         Self {
             inner: UnsafeCell::new(PageInner {
                 flags: AtomicUsize::new(0),
@@ -725,10 +730,10 @@ impl Page {
     /// Panics if the page buffer is not loaded.
     pub fn get_contents(&self) -> &mut PageInner {
         let inner = self.get();
-        debug_assert!(
+        turso_debug_assert!(
             inner.buffer.is_some(),
-            "page {} buffer not loaded",
-            inner.id
+            "page buffer not loaded",
+            { "page_id": inner.id }
         );
         inner
     }
@@ -836,8 +841,8 @@ impl Page {
 
         turso_assert!(
             was_pinned,
-            "Attempted to unpin page {} that was not pinned",
-            self.get().id
+            "Attempted to unpin page that was not pinned",
+            { "page_id": self.get().id }
         );
     }
 
@@ -1567,7 +1572,7 @@ impl Pager {
         let subjournal = subjournal.as_ref().unwrap();
 
         let c = subjournal.write_page(write_offset, page_size, buffer, c)?;
-        assert!(c.succeeded(), "memory IO should complete immediately");
+        turso_assert!(c.succeeded(), "memory IO should complete immediately");
         Ok(())
     }
 
@@ -1615,8 +1620,8 @@ impl Pager {
         let mut savepoints = self.savepoints.write();
         turso_assert!(
             savepoints.is_empty(),
-            "savepoints should be empty, but had {} savepoints open",
-            savepoints.len()
+            "savepoints should be empty",
+            { "savepoints_count": savepoints.len() }
         );
         savepoints.push(savepoint);
         Ok(())
@@ -1637,7 +1642,7 @@ impl Pager {
         // opened at any given time.
         turso_assert!(start_offset == 0, "start offset should be 0");
         let c = subjournal.truncate(start_offset)?;
-        assert!(c.succeeded(), "memory IO should complete immediately");
+        turso_assert!(c.succeeded(), "memory IO should complete immediately");
         Ok(())
     }
 
@@ -1648,7 +1653,7 @@ impl Pager {
             return Ok(());
         };
         let c = subjournal.truncate(0)?;
-        assert!(c.succeeded(), "memory IO should complete immediately");
+        turso_assert!(c.succeeded(), "memory IO should complete immediately");
         Ok(())
     }
 
@@ -1680,7 +1685,7 @@ impl Pager {
             // Read 4 bytes for page id
             let page_id_buffer = Arc::new(self.buffer_pool.allocate(4));
             let c = subjournal.read_page_number(current_offset, page_id_buffer.clone())?;
-            assert!(c.succeeded(), "memory IO should complete immediately");
+            turso_assert!(c.succeeded(), "memory IO should complete immediately");
             let page_id = u32::from_be_bytes(page_id_buffer.as_slice()[0..4].try_into().unwrap());
             current_offset += 4;
 
@@ -1715,7 +1720,7 @@ impl Pager {
                 page.clone(),
                 page_size as usize,
             )?;
-            assert!(c.succeeded(), "memory IO should complete immediately");
+            turso_assert!(c.succeeded(), "memory IO should complete immediately");
             current_offset += page_size;
 
             // Add page to rollback bitset
@@ -1726,7 +1731,7 @@ impl Pager {
         }
 
         let truncate_completion = subjournal.truncate(journal_start_offset)?;
-        assert!(
+        turso_assert!(
             truncate_completion.succeeded(),
             "memory IO should complete immediately"
         );
@@ -1918,6 +1923,7 @@ impl Pager {
                     if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
                         || is_ptrmap_page(db_page_no_to_update, page_size)
                     {
+                        turso_soft_unreachable!("Cannot set ptrmap entry for header/ptrmap page or invalid page", { "page": db_page_no_to_update });
                         return Err(LimboError::InternalError(format!(
                         "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
                     )));
@@ -2028,14 +2034,22 @@ impl Pager {
                                         )
                                     }));
 
-                                assert!(root_page_num > 0); //  Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled
+                                turso_assert_greater_than!(root_page_num, 0, "Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
                                 root_page_num += 1;
-                                assert!(root_page_num >= FIRST_PTRMAP_PAGE_NO); //  can never be less than 2 because we have already incremented
+                                turso_assert_greater_than_or_equal!(
+                                    root_page_num,
+                                    FIRST_PTRMAP_PAGE_NO,
+                                    "can never be less than 2 because we have already incremented"
+                                );
 
                                 while is_ptrmap_page(root_page_num, page_size as usize) {
                                     root_page_num += 1;
                                 }
-                                assert!(root_page_num >= 3); //  the very first root page is page 3
+                                turso_assert_greater_than_or_equal!(
+                                    root_page_num,
+                                    3,
+                                    "root page must be >= 3 (number of the first root page)"
+                                );
                                 self.vacuum_state.write().btree_create_vacuum_full_state =
                                     BtreeCreateVacuumFullState::AllocatePage { root_page_num };
                             }
@@ -2118,13 +2132,11 @@ impl Pager {
         _alloc_mode: BtreePageAllocMode,
     ) -> Result<IOResult<PageRef>> {
         let page = return_if_io!(self.allocate_page());
-        debug_assert_eq!(
+        #[cfg(debug_assertions)]
+        turso_assert_eq!(
             offset,
             page.get_contents().offset(),
-            "offset parameter {} doesn't match computed offset {} for page {}",
-            offset,
-            page.get_contents().offset(),
-            page.get().id
+            "offset doesn't match computed offset for page"
         );
         btree_init_page(&page, page_type, offset, self.usable_space());
         tracing::debug!(
@@ -2167,7 +2179,7 @@ impl Pager {
 
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
-        assert!(!self.db_initialized());
+        turso_assert!(!self.db_initialized());
         let IOResult::Done(_) = self.with_header_mut(|header| {
             header.page_size = size;
         })?
@@ -2191,7 +2203,7 @@ impl Pager {
     /// Get the current page size, panicking if not set.
     pub fn get_page_size_unchecked(&self) -> PageSize {
         let value = self.page_size.load(Ordering::SeqCst);
-        assert_ne!(value, 0, "page size not set");
+        turso_assert_ne!(value, 0);
         PageSize::new(value).expect("invalid page size stored")
     }
 
@@ -2424,7 +2436,7 @@ impl Pager {
         frame_watermark: Option<u64>,
         allow_empty_read: bool,
     ) -> Result<(PageRef, Completion)> {
-        assert!(page_idx >= 0);
+        turso_assert_greater_than_or_equal!(page_idx, 0);
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = self.io_ctx.read();
@@ -2459,7 +2471,7 @@ impl Pager {
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::TRACE)]
     pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
-        assert!(page_idx >= 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
+        turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page(page_idx = {})", page_idx);
 
         // First check if page is in cache
@@ -2469,8 +2481,8 @@ impl Pager {
             if let Some(page) = page_cache.get(&page_key)? {
                 turso_assert!(
                     page_idx as usize == page.get().id,
-                    "attempted to read page {page_idx} but got page {}",
-                    page.get().id
+                    "attempted to read page but got different page",
+                    { "expected_page": page_idx, "actual_page": page.get().id }
                 );
                 return Ok((page, None));
             }
@@ -2593,8 +2605,8 @@ impl Pager {
     pub fn add_dirty(&self, page: &Page) -> Result<()> {
         turso_assert!(
             page.is_loaded(),
-            "page {} must be loaded in add_dirty() so its contents can be subjournaled",
-            page.get().id
+            "page must be loaded in add_dirty() so its contents can be subjournaled",
+            { "page_id": page.get().id }
         );
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
@@ -2611,6 +2623,7 @@ impl Pager {
 
     pub fn wal_state(&self) -> Result<WalState> {
         let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("wal_state() called on database without WAL");
             return Err(LimboError::InternalError(
                 "wal_state() called on database without WAL".to_string(),
             ));
@@ -3165,6 +3178,7 @@ impl Pager {
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
         let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("commit_dirty_pages() called without WAL");
             return Err(LimboError::InternalError(
                 "commit_dirty_pages() called without WAL".into(),
             ));
@@ -3448,6 +3462,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<Completion> {
         let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("wal_get_frame() called on database without WAL");
             return Err(LimboError::InternalError(
                 "wal_get_frame() called on database without WAL".to_string(),
             ));
@@ -3458,6 +3473,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
         let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("wal_insert_frame() called on database without WAL");
             return Err(LimboError::InternalError(
                 "wal_insert_frame() called on database without WAL".to_string(),
             ));
@@ -3552,6 +3568,7 @@ impl Pager {
         clear_page_cache: bool,
     ) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("checkpoint() called on database without WAL");
             return Err(LimboError::InternalError(
                 "checkpoint() called on database without WAL".to_string(),
             ));
@@ -3801,6 +3818,7 @@ impl Pager {
         let mut attempts = 0;
         {
             let Some(wal) = self.wal.as_ref() else {
+                turso_soft_unreachable!("checkpoint_shutdown() called on database without WAL");
                 return Err(LimboError::InternalError(
                     "checkpoint_shutdown() called on database without WAL".to_string(),
                 ));
@@ -3873,12 +3891,11 @@ impl Pager {
 
                     let (page, c) = match page.take() {
                         Some(page) => {
-                            assert_eq!(
+                            turso_assert_eq!(
                                 page.get().id,
                                 page_id,
-                                "Pager::free_page: Page id mismatch: expected {} but got {}",
-                                page_id,
-                                page.get().id
+                                "free_page page id mismatch",
+                                { "expected": page_id, "actual": page.get().id }
                             );
                             if page.is_loaded() {
                                 let page_contents = page.get_contents();
@@ -3978,14 +3995,14 @@ impl Pager {
         let state = self.allocate_page1_state.read().clone();
         match state {
             AllocatePage1State::Start => {
-                assert!(!self.db_initialized());
+                turso_assert!(!self.db_initialized());
                 tracing::trace!("allocate_page1(Start)");
 
                 let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
                     panic!("DB should not be initialized and should not do any IO");
                 };
 
-                assert_eq!(default_header.database_size.get(), 0);
+                turso_assert_eq!(default_header.database_size.get(), 0);
                 default_header.database_size = 1.into();
 
                 // Use cached reserved_space if set (e.g., by sync engine before page allocation),
@@ -4124,8 +4141,8 @@ impl Pager {
                 AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
                     turso_assert!(
                         trunk_page.is_loaded(),
-                        "Freelist trunk page {} is not loaded",
-                        trunk_page.get().id
+                        "Freelist trunk page is not loaded",
+                        { "page_id": trunk_page.get().id }
                     );
                     let page_contents = trunk_page.get_contents();
                     let next_trunk_page_id =
@@ -4143,8 +4160,8 @@ impl Pager {
 
                         turso_assert!(
                             number_of_freelist_leaves > 0,
-                            "Freelist trunk page {} has no leaves",
-                            trunk_page.get().id
+                            "Freelist trunk page has no leaves",
+                            { "page_id": trunk_page.get().id }
                         );
 
                         // Pin leaf_page to prevent eviction while stored in state machine
@@ -4171,8 +4188,8 @@ impl Pager {
                     // zero out the page
                     turso_assert!(
                         trunk_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist leaf page {} has overflow cells",
-                        trunk_page.get().id
+                        "Freelist trunk page has overflow cells",
+                        { "page_id": trunk_page.get().id }
                     );
                     trunk_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(trunk_page.get().id);
@@ -4180,8 +4197,8 @@ impl Pager {
                         let page_cache = self.page_cache.read();
                         turso_assert!(
                             page_cache.contains_key(&page_key),
-                            "page {} is not in cache",
-                            trunk_page.get().id
+                            "page is not in cache",
+                            { "page_id": trunk_page.get().id }
                         );
                     }
                     // Unpin trunk_page before returning - caller takes ownership
@@ -4197,16 +4214,16 @@ impl Pager {
                 } => {
                     turso_assert!(
                         leaf_page.is_loaded(),
-                        "Leaf page {} is not loaded",
-                        leaf_page.get().id
+                        "Leaf page is not loaded",
+                        { "page_id": leaf_page.get().id }
                     );
                     let page_contents = trunk_page.get_contents();
                     self.add_dirty(leaf_page)?;
                     // zero out the page
                     turso_assert!(
                         leaf_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist leaf page {} has overflow cells",
-                        leaf_page.get().id
+                        "Freelist leaf page has overflow cells",
+                        { "page_id": leaf_page.get().id }
                     );
                     leaf_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(leaf_page.get().id);
@@ -4214,8 +4231,8 @@ impl Pager {
                         let page_cache = self.page_cache.read();
                         turso_assert!(
                             page_cache.contains_key(&page_key),
-                            "page {} is not in cache",
-                            leaf_page.get().id
+                            "page is not in cache",
+                            { "page_id": leaf_page.get().id }
                         );
                     }
 
@@ -4307,7 +4324,7 @@ impl Pager {
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
         if dirty_page_must_exist {
-            assert!(page.is_dirty());
+            turso_assert!(page.is_dirty(), "page must be dirty for upsert", { "page_id": id });
         }
         cache.upsert_page(page_key, page.clone()).map_err(|e| {
             LimboError::InternalError(format!(
@@ -4550,7 +4567,9 @@ impl CreateBTreeFlags {
 */
 #[cfg(not(feature = "omit_autovacuum"))]
 pub(crate) mod ptrmap {
+    #[allow(unused_imports)]
     use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
+    use crate::{turso_assert_greater_than_or_equal, turso_soft_unreachable};
 
     // Constants
     pub const PTRMAP_ENTRY_SIZE: usize = 5;
@@ -4618,14 +4637,14 @@ pub(crate) mod ptrmap {
     /// Calculates how many database pages are mapped by a single pointer map page.
     /// This is based on the total page size, as ptrmap pages are filled with entries.
     pub fn entries_per_ptrmap_page(page_size: usize) -> usize {
-        assert!(page_size >= PageSize::MIN as usize);
+        turso_assert_greater_than_or_equal!(page_size, PageSize::MIN as usize);
         page_size / PTRMAP_ENTRY_SIZE
     }
 
     /// Calculates the cycle length of pointer map pages
     /// The cycle length is the number of database pages that are mapped by a single pointer map page.
     pub fn ptrmap_page_cycle_length(page_size: usize) -> usize {
-        assert!(page_size >= PageSize::MIN as usize);
+        turso_assert_greater_than_or_equal!(page_size, PageSize::MIN as usize);
         (page_size / PTRMAP_ENTRY_SIZE) + 1
     }
 
@@ -4675,11 +4694,13 @@ pub(crate) mod ptrmap {
         if db_page_no_to_query < first_data_page_mapped
             || db_page_no_to_query > last_data_page_mapped
         {
+            turso_soft_unreachable!("Page is not mapped by ptrmap data range", { "page": db_page_no_to_query, "range_start": first_data_page_mapped, "range_end": last_data_page_mapped, "ptrmap_page": ptrmap_page_no });
             return Err(LimboError::InternalError(format!(
                 "Page {db_page_no_to_query} is not mapped by the data page range [{first_data_page_mapped}, {last_data_page_mapped}] of ptrmap page {ptrmap_page_no}"
             )));
         }
         if is_ptrmap_page(db_page_no_to_query, page_size) {
+            turso_soft_unreachable!("Page is a pointer map page and should not have an entry calculated this way", { "page": db_page_no_to_query });
             return Err(LimboError::InternalError(format!(
                 "Page {db_page_no_to_query} is a pointer map page and should not have an entry calculated this way."
             )));

@@ -1,3 +1,4 @@
+use crate::turso_assert;
 use turso_parser::ast::Name;
 
 use crate::{
@@ -10,7 +11,7 @@ pub fn translate_rollback(
     txn_name: Option<Name>,
     savepoint_name: Option<Name>,
 ) -> Result<ProgramBuilder> {
-    assert!(
+    turso_assert!(
         txn_name.is_none() && savepoint_name.is_none(),
         "txn_name and savepoint not supported yet"
     );
