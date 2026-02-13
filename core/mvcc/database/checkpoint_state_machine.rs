@@ -416,7 +416,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     sqlite_schema_rowid,
                                 });
                             } else {
-                                // ALTER INDEX-style sqlite_schema update. No special write needed.
+                                // Index schema row update (e.g. ALTER TABLE RENAME COLUMN propagates
+                                // to index SQL). No B-tree creation needed; the row itself is written
+                                // to sqlite_schema below. See: test_checkpoint_allows_index_schema_update_after_rename_column.
                             }
                         } else if type_str.as_str() == "table" {
                             // This is a table schema change (existing logic)
@@ -596,8 +598,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         for (row_version, _special_write) in &self.write_set {
             let row_id = &row_version.row.id;
             let Some(entry) = self.mvstore.rows.get(row_id) else {
-                // Synthetic checkpoint writes (e.g. metadata row) are persisted directly to pager
-                // and do not have a backing in-memory MVCC version chain.
+                // The MVCC metadata table rows (persistent_tx_ts_max, shadow) are staged
+                // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
+                // have a backing in-memory MVCC version chain. Skip GC for these.
+                assert!(
+                    self.mvcc_meta_table
+                        .is_some_and(|(tid, _)| tid == row_id.table_id),
+                    "row {row_id:?} missing from MVCC store but is not an MVCC metadata table row"
+                );
                 continue;
             };
             let is_now_empty = {
@@ -634,6 +642,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
+    /// Stages synthetic `persistent_tx_ts_max` and shadow rows into the checkpoint write set
+    /// so they are committed atomically with all other data in the same pager transaction.
+    /// This is the mechanism that advances the durable replay boundary; on recovery, only
+    /// logical-log frames with `commit_ts > persistent_tx_ts_max` are replayed.
+    /// No-op when metadata hasn't advanced or when running in-memory (no durable metadata).
     fn maybe_stage_mvcc_metadata_write(&mut self) -> Result<()> {
         if !self.durable_mvcc_metadata {
             return Ok(());
@@ -1223,6 +1236,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::CommitPagerTxn => {
+                // If commit_tx fails, the `?` propagates to step() which rolls back
+                // the pager transaction. durable_txid_max is NOT advanced (only happens
+                // on success below), so a retry will re-stage from the previous boundary.
+                // The logical log is also unaffected — its offset is not advanced here.
                 tracing::debug!("Committing pager transaction");
                 let result = self
                     .pager

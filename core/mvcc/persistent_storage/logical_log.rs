@@ -71,9 +71,10 @@
 //! Recovery (reader + MVCC replay) does this:
 //! - validates header first;
 //! - accepts a valid header with no frames (size `<= LOG_HDR_SIZE`);
+//! - reads `persistent_tx_ts_max` from `__turso_internal_mvcc_meta` (the durable replay boundary);
 //! - streams frames in commit order until first torn tail;
-//! - applies only validated frames;
-//! - sets clock to `max_commit_ts_seen + 1`;
+//! - applies only validated frames whose `commit_ts > persistent_tx_ts_max`;
+//! - sets clock to `max(persistent_tx_ts_max, max_replayed_commit_ts) + 1`;
 //! - restores writer offset to `last_valid_offset` so torn-tail bytes are overwritten.
 //!
 //! ## Durability and checkpoint ordering
@@ -266,6 +267,12 @@ impl LogicalLog {
         self.header.as_ref()
     }
 
+    /// Serializes a transaction record and writes it to the log file.
+    /// `advance_offset_immediately`: when true, the writer offset advances right after
+    /// issuing the pwrite (used by `log_tx` for fire-and-forget appends). When false,
+    /// the offset stays behind until the caller confirms success via
+    /// `advance_offset_after_success` (used by `log_tx_deferred_offset` for two-phase
+    /// commit, where the offset must not advance if the commit is later aborted).
     fn serialize_and_pwrite_tx(
         &mut self,
         tx: &LogRecord,
@@ -333,11 +340,18 @@ impl LogicalLog {
         Ok((c, buffer_len as u64))
     }
 
+    /// Writes a transaction to the log and immediately advances the writer offset.
+    /// Used for checkpoint-initiated writes where no two-phase commit is needed.
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
         let (c, _) = self.serialize_and_pwrite_tx(tx, true)?;
         Ok(c)
     }
 
+    /// Writes a transaction to the log but does NOT advance the writer offset.
+    /// Returns `(completion, bytes_written)`. The caller must call
+    /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
+    /// Used by the MVCC commit path where the offset must not advance if the
+    /// transaction is later aborted (the un-advanced bytes get overwritten by the next write).
     pub fn log_tx_deferred_offset(&mut self, tx: &LogRecord) -> Result<(Completion, u64)> {
         self.serialize_and_pwrite_tx(tx, false)
     }
@@ -460,7 +474,7 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
     match tag {
         OP_UPSERT_TABLE => {
             let RowKey::Int(rowid) = row_version.row.id.row_id else {
-                unreachable!()
+                unreachable!("table ops must have RowKey::Int")
             };
             let record_bytes = row_version.row.payload();
             let rowid_u64 = rowid as u64;
@@ -472,7 +486,7 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
         }
         OP_DELETE_TABLE => {
             let RowKey::Int(rowid) = row_version.row.id.row_id else {
-                unreachable!()
+                unreachable!("table ops must have RowKey::Int")
             };
             let rowid_u64 = rowid as u64;
             let rowid_len = varint_len(rowid_u64);
@@ -485,9 +499,9 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
             buffer.extend_from_slice(key_bytes);
         }
         _ => {
-            return Err(LimboError::InternalError(
-                "invalid logical log op tag".to_string(),
-            ));
+            return Err(LimboError::InternalError(format!(
+                "invalid logical log op tag: {tag}"
+            )));
         }
     }
 
@@ -527,10 +541,14 @@ enum StreamingState {
     NeedTransactionStart,
 }
 
+/// Result of attempting to read and validate the logical log file header.
 #[derive(Debug, Clone)]
 pub(crate) enum HeaderReadResult {
+    /// Header is well-formed: magic, version, flags, reserved, and CRC all valid.
     Valid(LogHeader),
+    /// File is smaller than `LOG_HDR_SIZE` — no log exists (first run or truncated to zero).
     NoLog,
+    /// Header exists but is corrupt (bad magic, version, flags, CRC, non-zero reserved, or truncated).
     Invalid,
 }
 
@@ -546,7 +564,11 @@ pub struct StreamingLogicalLogReader {
     buffer_offset: usize,
     file_size: usize,
     state: StreamingState,
+    /// Buffer of parsed ops from the current transaction frame. `parse_next_transaction`
+    /// fills this; `next_record` drains one op at a time. Empty between transactions.
     pending_ops: std::collections::VecDeque<ParsedOp>,
+    /// Byte offset of the end of the last fully validated transaction frame. Used during
+    /// recovery to set the writer offset so that torn-tail bytes are overwritten on next append.
     last_valid_offset: usize,
 }
 
@@ -570,6 +592,9 @@ impl StreamingLogicalLogReader {
         self.header.as_ref()
     }
 
+    /// Returns the byte offset just past the last fully validated transaction frame.
+    /// After recovery, the log writer should resume from this offset so any torn-tail
+    /// bytes beyond it are overwritten by the next append.
     pub fn last_valid_offset(&self) -> usize {
         self.last_valid_offset
     }
@@ -624,6 +649,9 @@ impl StreamingLogicalLogReader {
         }
     }
 
+    /// Scans all valid transaction frames without fully decoding op payloads.
+    /// Returns the maximum `commit_ts` among all validated frames. Used during recovery
+    /// to reseed the MVCC logical clock to `max(persistent_tx_ts_max, scan_result) + 1`.
     pub fn scan_max_commit_ts(&mut self, io: &Arc<dyn crate::IO>) -> Result<u64> {
         let mut max_ts = 0u64;
 
@@ -743,6 +771,10 @@ impl StreamingLogicalLogReader {
         }
     }
 
+    /// Advances the read position by `amount` bytes without returning them, while
+    /// feeding each byte into `running_crc`. Returns false if there are not enough
+    /// remaining bytes (EOF). Used by `scan_max_commit_ts` to skip over op payloads
+    /// while still computing CRC for frame validation.
     fn try_skip_bytes_with_crc(
         &mut self,
         io: &Arc<dyn crate::IO>,
@@ -800,7 +832,9 @@ impl StreamingLogicalLogReader {
 
                     let ops = match self.parse_next_transaction(io)? {
                         ParseResult::Ops(ops) => ops,
-                        ParseResult::Eof => return Ok(StreamingResult::Eof),
+                        ParseResult::Eof | ParseResult::InvalidFrame => {
+                            return Ok(StreamingResult::Eof);
+                        }
                     };
 
                     if ops.is_empty() {
@@ -840,7 +874,7 @@ impl StreamingLogicalLogReader {
         ]);
         if frame_magic != FRAME_MAGIC {
             self.last_valid_offset = frame_start;
-            return Ok(ParseResult::Eof);
+            return Ok(ParseResult::InvalidFrame);
         }
         let op_count = u16::from_le_bytes([header_bytes[4], header_bytes[5]]);
         let commit_ts = u64::from_le_bytes([
@@ -868,13 +902,13 @@ impl StreamingLogicalLogReader {
             let flags = op_bytes[1];
             if flags & !OP_FLAG_BTREE_RESIDENT != 0 {
                 self.last_valid_offset = frame_start;
-                return Ok(ParseResult::Eof);
+                return Ok(ParseResult::InvalidFrame);
             }
             let table_id_i32 =
                 i32::from_le_bytes([op_bytes[2], op_bytes[3], op_bytes[4], op_bytes[5]]);
             if table_id_i32 >= 0 {
                 self.last_valid_offset = frame_start;
-                return Ok(ParseResult::Eof);
+                return Ok(ParseResult::InvalidFrame);
             }
             let table_id = MVTableId::from(table_id_i32 as i64);
             let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
@@ -890,7 +924,7 @@ impl StreamingLogicalLogReader {
                 Ok(v) => v,
                 Err(_) => {
                     self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::Eof);
+                    return Ok(ParseResult::InvalidFrame);
                 }
             };
 
@@ -908,7 +942,7 @@ impl StreamingLogicalLogReader {
                 Some(v) => v,
                 None => {
                     self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::Eof);
+                    return Ok(ParseResult::InvalidFrame);
                 }
             };
 
@@ -918,13 +952,13 @@ impl StreamingLogicalLogReader {
                         Ok(v) => v,
                         Err(_) => {
                             self.last_valid_offset = frame_start;
-                            return Ok(ParseResult::Eof);
+                            return Ok(ParseResult::InvalidFrame);
                         }
                     };
                     let rowid_i64 = rowid_u64 as i64;
                     if rowid_len > payload.len() {
                         self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::Eof);
+                        return Ok(ParseResult::InvalidFrame);
                     }
                     let mut payload = payload;
                     let record_bytes = payload.split_off(rowid_len);
@@ -942,12 +976,12 @@ impl StreamingLogicalLogReader {
                         Ok(v) => v,
                         Err(_) => {
                             self.last_valid_offset = frame_start;
-                            return Ok(ParseResult::Eof);
+                            return Ok(ParseResult::InvalidFrame);
                         }
                     };
                     if rowid_len != payload.len() {
                         self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::Eof);
+                        return Ok(ParseResult::InvalidFrame);
                     }
                     let rowid_i64 = rowid_u64 as i64;
                     let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
@@ -971,7 +1005,7 @@ impl StreamingLogicalLogReader {
                 },
                 _ => {
                     self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::Eof);
+                    return Ok(ParseResult::InvalidFrame);
                 }
             };
 
@@ -1004,15 +1038,15 @@ impl StreamingLogicalLogReader {
 
         if payload_size != payload_bytes_read {
             self.last_valid_offset = frame_start;
-            return Ok(ParseResult::Eof);
+            return Ok(ParseResult::InvalidFrame);
         }
         if crc32c_expected != running_crc {
             self.last_valid_offset = frame_start;
-            return Ok(ParseResult::Eof);
+            return Ok(ParseResult::InvalidFrame);
         }
         if end_magic != END_MAGIC {
             self.last_valid_offset = frame_start;
-            return Ok(ParseResult::Eof);
+            return Ok(ParseResult::InvalidFrame);
         }
 
         self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
@@ -1149,6 +1183,12 @@ impl StreamingLogicalLogReader {
         Ok(Some(r))
     }
 
+    /// Reads a SQLite-format varint one byte at a time from the streaming reader.
+    /// Returns `(decoded_value, raw_bytes, byte_count)`. The raw bytes are returned
+    /// so callers can feed them into the CRC computation without re-encoding.
+    /// Unlike `read_varint` from sqlite3_ondisk (which requires a contiguous buffer),
+    /// this reads byte-by-byte via `try_consume_u8` to handle streaming I/O where
+    /// the varint may span a buffer boundary. Returns `None` on EOF (short read).
     fn consume_varint_bytes(
         &mut self,
         io: &Arc<dyn crate::IO>,
@@ -1299,8 +1339,15 @@ impl StreamingLogicalLogReader {
 }
 
 enum ParseResult {
+    /// A fully validated transaction frame was parsed.
     Ops(Vec<ParsedOp>),
+    /// True end-of-file: not enough bytes remain to form a complete frame.
     Eof,
+    /// An invalid frame was encountered (bad magic, CRC mismatch, structural error).
+    /// Handled the same as EOF (stop scanning, keep previously validated frames),
+    /// but semantically distinct: the data exists but is not a valid frame.
+    /// `last_valid_offset` is set to the start of the invalid frame before returning this.
+    InvalidFrame,
 }
 
 enum ParsedOp {

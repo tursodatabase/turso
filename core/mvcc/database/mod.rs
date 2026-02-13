@@ -880,14 +880,12 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     }
                 }
                 Some(TxTimestampOrID::Timestamp(begin_ts)) => {
-                    // Committed version - check if it was inserted after we started
-                    if begin_ts >= tx.begin_ts {
-                        // Duplicate! A version was committed after we started
-                        return Err(LimboError::WriteWriteConflict);
-                    }
-                    // A committed current version from before our begin_ts still exists.
-                    // In this state our write cannot be serialized safely, so abort this commit
-                    // as a write-write conflict instead of panicking.
+                    // A live committed version with this rowid exists.
+                    // begin_ts >= tx.begin_ts: a concurrent transaction committed a row
+                    //   with this rowid after our snapshot — invisible to NotExists.
+                    // begin_ts < tx.begin_ts: the row predates our snapshot. NotExists
+                    //   should have seen it at INSERT time, so this is a defensive guard.
+                    let _ = begin_ts;
                     return Err(LimboError::WriteWriteConflict);
                 }
                 None => {
@@ -1214,6 +1212,25 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
+                // Order of operations matters here:
+                // 1. Advance logical log writer offset (makes the written bytes "owned")
+                // 2. Mark transaction Committed (publishes versions to readers)
+                // 3. Release commit lock (allows next committer)
+                // 4. Update cached global header
+                //
+                // (1) must precede (3): the commit lock serializes log writes, and
+                // log_tx() writes at the current offset. If we released the lock before
+                // advancing, the next committer would overwrite our bytes.
+                //
+                // (2) must precede (3): the next committer's validation (CommitState::Commit)
+                // checks our transaction state. If it still sees Preparing instead of
+                // Committed, the tie-breaking logic (lower end_ts wins) applies instead
+                // of the definitive "already committed = conflict" path.
+                //
+                // pending_log_append_bytes is set in BeginCommitLogicalLog after log_tx
+                // writes to disk. If the commit fails before reaching here (e.g. during
+                // sync), the bytes are never consumed and the in-memory writer offset
+                // stays behind — the next write overwrites the uncommitted bytes.
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
@@ -1487,7 +1504,13 @@ impl DeleteRowStateMachine {
 
 pub const SQLITE_SCHEMA_MVCC_TABLE_ID: MVTableId = MVTableId(-1);
 pub(crate) const MVCC_META_TABLE_NAME: &str = "__turso_internal_mvcc_meta";
+/// Indicates the maximum transaction timestamp that has been made durable in the WAL.
+/// Used to determine the replay boundary for recovery; only records with a higher timestamp
+/// are replayed.
 pub(crate) const MVCC_META_KEY_PERSISTENT_TX_TS_MAX: &str = "persistent_tx_ts_max";
+/// Shadow copy of persistent_tx_ts_max. Both rows are updated atomically in the same
+/// pager transaction during checkpoint. On recovery, if primary != shadow the metadata
+/// write was partially applied and the database fails closed as corrupt.
 pub(crate) const MVCC_META_KEY_PERSISTENT_TX_TS_MAX_SHADOW: &str = "persistent_tx_ts_max_shadow";
 
 #[derive(Debug)]
@@ -1564,6 +1587,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         !connection.db.path.starts_with(":memory:")
     }
 
+    /// Captures table-valued functions (e.g. generate_series) from the schema before
+    /// reparse_schema() drops them. Built-in TVFs are registered programmatically and
+    /// don't survive schema re-parsing from sqlite_schema; we save and re-inject them.
     fn capture_table_valued_functions(schema: &Schema) -> Vec<Arc<crate::vtab::VirtualTable>> {
         schema
             .tables
@@ -1668,6 +1694,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Creates the `__turso_internal_mvcc_meta` table and seeds it with the
+    /// `persistent_tx_ts_max` and shadow rows (both initialized to 0). This table
+    /// stores the durable replay boundary: on recovery, only logical-log frames with
+    /// `commit_ts > persistent_tx_ts_max` are replayed. Called once during first MVCC bootstrap.
     fn initialize_mvcc_metadata_table(&self, connection: &Arc<Connection>) -> Result<()> {
         connection.execute(format!(
             "CREATE TABLE IF NOT EXISTS {MVCC_META_TABLE_NAME}(k TEXT, v INTEGER NOT NULL)"
@@ -1681,6 +1711,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(())
     }
 
+    /// Read the persistent transaction timestamp maximum from the MVCC metadata table.
     fn try_read_persistent_tx_ts_max(&self, connection: &Arc<Connection>) -> Result<Option<u64>> {
         let mut rows: HashMap<String, i64> = HashMap::default();
         let query_result = connection.query(format!(
@@ -1840,6 +1871,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         // Recover logical log while bootstrap connection still reads from pager-backed schema.
         // This lets recovery merge checkpointed sqlite_schema rows with non-checkpointed rows from log replay.
+        // Return value indicates whether recovery replayed any frames; unused here because
+        // global_header initialization below is unconditional (guarded by is_none() instead).
+        // The return value is still used by tests to verify recovery behavior.
         let _recovered = self.maybe_recover_logical_log(bootstrap_conn.clone())?;
 
         // Recovery is done, switch back to regular MVCC reads.
@@ -2204,14 +2238,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 Ok(false)
             }
         }
-    }
-
-    /// Same as insert_tombstone_to_table_or_index() but specialcased for tables only.
-    /// This is invoked during logical log recovery process to make sure transactions do not see
-    /// records that exist in btree but have been deleted according to the logical log.
-    #[allow(dead_code)]
-    fn insert_tombstone_to_table(&self, tx_id: TxID, rowid: RowID, row: Row) -> Result<()> {
-        self.insert_tombstone_to_table_or_index(tx_id, rowid, row, None)
     }
 
     /// Retrieves a row from the table with the given `id`.
@@ -3429,11 +3455,19 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Runs during bootstrap to reconcile WAL state left by a prior crash or incomplete
+    /// checkpoint. Classifies startup state by WAL frame count and logical-log header
+    /// validity, then either completes the interrupted checkpoint (backfill WAL → DB,
+    /// sync, truncate) or fails closed on corrupt/inconsistent artifacts.
+    /// See RECOVERY_SEMANTICS.md "Startup Case Classification" for the full case table.
     fn maybe_complete_interrupted_checkpoint(&self, connection: &Arc<Connection>) -> Result<()> {
         let pager = connection.pager.load().clone();
         let Some(wal) = &pager.wal else {
             return Ok(());
         };
+        // The bootstrap connection may have acquired a WAL read lock during earlier
+        // bootstrap steps (e.g. schema parsing). Drop it so the TRUNCATE checkpoint
+        // below isn't blocked by our own read lock.
         if wal.holds_read_lock() {
             wal.end_read_tx();
         }
@@ -3503,6 +3537,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             pager.io.wait_for_completion(c)?;
         }
 
+        // Write a fresh log header (distinct from the checkpoint state machine which no
+        // longer rewrites the header). This is bootstrap-only: we need a valid header on
+        // disk before truncating WAL. CRC verify + retry guards against torn header writes.
         let mut retried_crc = false;
         loop {
             let c = self.storage.update_header()?;
@@ -3531,8 +3568,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(())
     }
 
-    // Recovers the logical log if there is any content.
-    // Returns true if the logical log was recovered, false otherwise.
+    /// Replays committed logical-log frames into the in-memory MVCC store.
+    /// Only frames with `commit_ts > persistent_tx_ts_max` (the durable replay boundary
+    /// from the metadata table) are applied; earlier frames were already checkpointed.
+    /// On success, reseeds the MVCC clock to `max(persistent_tx_ts_max, max_replayed_commit_ts) + 1`
+    /// and sets the log writer offset to `last_valid_offset` so torn-tail bytes are overwritten.
+    /// Returns true if any frames were replayed, false otherwise.
     pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
         let pager = connection.pager.load().clone();
         let file = self.get_logical_log_file();
@@ -3805,6 +3846,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                     assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map: {}", rowid.table_id);
                     if let Some(versions) = self.rows.get(&rowid) {
+                        // Row exists in memory — try to find the current (non-ended) version
+                        // that was committed before this delete, and mark it as ended. If no
+                        // such version exists (e.g. it was already GC'd or this is a B-tree
+                        // resident row not yet in memory), insert a tombstone instead.
                         let mut versions = versions.value().write();
                         if let Some(existing) = versions.iter_mut().rev().find(|rv| {
                             rv.end.is_none()
