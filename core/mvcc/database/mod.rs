@@ -1042,7 +1042,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let tx = tx.value();
 
                 for id in &self.write_set {
-                    // TODO: check for conflicts with indices, check for uniqueness too.
                     if id.row_id.is_int_key() {
                         self.check_rowid_for_conflicts(id, *end_ts, tx, mvcc_store)?;
                     } else {
