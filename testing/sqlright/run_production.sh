@@ -93,6 +93,20 @@ echo "Binary:   $TURSODB"
 echo "Resume:   $RESUME"
 echo ""
 
+# Limit cores to avoid using CPU 0 (reserved for system) and leave safety margin
+RESERVED_CORES=2  # Reserve CPU 0 for system + 1 extra for safety
+MAX_CORES=62
+AVAILABLE_CORES=$(($(nproc) - RESERVED_CORES))
+if [ "$AVAILABLE_CORES" -gt "$MAX_CORES" ]; then
+    AVAILABLE_CORES=$MAX_CORES
+fi
+if [ "$CORES" -gt "$AVAILABLE_CORES" ]; then
+    echo "WARNING: Requested $CORES cores, limiting to $AVAILABLE_CORES (CPU 0 reserved, max $MAX_CORES for safety)"
+    CORES=$AVAILABLE_CORES
+fi
+echo "Using $CORES cores (CPUs 1-$CORES), CPU 0 reserved for system"
+echo ""
+
 # Set up base working directory
 BASE_WORK_DIR=$(mktemp -d /tmp/sqlright_work_XXXXXX)
 
@@ -146,17 +160,19 @@ setup_work_dir() {
 
 # Launch primary instance with its own working directory
 PRIMARY_WORK_DIR=$(setup_work_dir "primary")
-(cd "$PRIMARY_WORK_DIR" && $AFL_CMD -M primary -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET) &
+PRIMARY_CPU=1
+(cd "$PRIMARY_WORK_DIR" && taskset -c $PRIMARY_CPU $AFL_CMD -M primary -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET) &
 PIDS+=($!)
-echo "  primary (PID $!) started in $PRIMARY_WORK_DIR"
+echo "  primary (PID $!, CPU $PRIMARY_CPU) started in $PRIMARY_WORK_DIR"
 
 if [ "$CORES" -gt 1 ]; then
     sleep 2
     for i in $(seq 2 "$CORES"); do
         SEC_WORK_DIR=$(setup_work_dir "secondary_$i")
-        (cd "$SEC_WORK_DIR" && $AFL_CMD -S "secondary_$i" -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET) &
+        SEC_CPU=$i
+        (cd "$SEC_WORK_DIR" && taskset -c $SEC_CPU $AFL_CMD -S "secondary_$i" -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET) &
         PIDS+=($!)
-        echo "  secondary_$i (PID $!) started in $SEC_WORK_DIR"
+        echo "  secondary_$i (PID $!, CPU $SEC_CPU) started in $SEC_WORK_DIR"
     done
 fi
 
@@ -164,6 +180,22 @@ echo ""
 echo "Stats: cat $OUTPUT/primary/fuzzer_stats"
 echo "Stop:  Ctrl+C"
 echo ""
+
+# Verify CPU affinity
+verify_affinity() {
+    sleep 3
+    echo "=== Verifying CPU Affinity ==="
+    for pid in "${PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            affinity=$(taskset -cp "$pid" 2>/dev/null | awk '{print $NF}')
+            instance=$(ps -o args= -p "$pid" 2>/dev/null | grep -oP '(-M|-S) \K\S+' || echo "unknown")
+            echo "  $instance (PID $pid): CPU affinity = $affinity"
+        fi
+    done
+    echo ""
+}
+
+verify_affinity
 
 # If timeout, wait then cleanup; otherwise wait for primary
 if [ "$TIMEOUT" -gt 0 ] 2>/dev/null; then
