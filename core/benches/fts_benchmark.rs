@@ -72,7 +72,14 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let opts = DatabaseOpts::new().with_index_method(true);
-    let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), OpenFlags::default(), opts, None).unwrap();
+    let db = Database::open_file_with_flags(
+        io,
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    )
+    .unwrap();
     let conn = db.connect().unwrap();
 
     // Create table and FTS index
@@ -141,7 +148,9 @@ fn bench_fts_cold_query(criterion: &mut Criterion) {
                         let conn = db.connect().unwrap();
                         let start = std::time::Instant::now();
                         let mut stmt = conn
-                            .query("SELECT id, title FROM docs WHERE (title, body) MATCH 'database'")
+                            .query(
+                                "SELECT id, title FROM docs WHERE (title, body) MATCH 'database'",
+                            )
                             .unwrap()
                             .unwrap();
                         let _rows = run_and_count_rows(&mut stmt, &db).unwrap();
@@ -185,7 +194,9 @@ fn bench_fts_warm_query(criterion: &mut Criterion) {
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
                         let mut stmt = conn
-                            .query("SELECT id, title FROM docs WHERE (title, body) MATCH 'database'")
+                            .query(
+                                "SELECT id, title FROM docs WHERE (title, body) MATCH 'database'",
+                            )
                             .unwrap()
                             .unwrap();
                         let _rows = run_and_count_rows(&mut stmt, &db).unwrap();
@@ -228,9 +239,7 @@ fn bench_fts_query_selectivity(criterion: &mut Criterion) {
     ];
 
     for (name, query_term) in queries {
-        let sql = format!(
-            "SELECT id, title FROM docs WHERE (title, body) MATCH '{query_term}'"
-        );
+        let sql = format!("SELECT id, title FROM docs WHERE (title, body) MATCH '{query_term}'");
 
         group.bench_function(BenchmarkId::new("selectivity", name), |b| {
             b.iter_custom(|iters| {
