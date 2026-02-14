@@ -19,9 +19,7 @@ expect {
 test non-strict-trigger-no-decode {
     CREATE TABLE t_src(x boolean);
     CREATE TABLE t_log(val TEXT);
-    CREATE TRIGGER tr_src AFTER INSERT ON t_src BEGIN
-        INSERT INTO t_log VALUES (CAST(NEW.x AS TEXT));
-    END;
+    CREATE TRIGGER tr_src AFTER INSERT ON t_src BEGIN INSERT INTO t_log VALUES (CAST(NEW.x AS TEXT)); END;
     INSERT INTO t_src VALUES (42);
     SELECT val FROM t_log;
 }
@@ -33,9 +31,7 @@ expect {
 test non-strict-update-trigger-no-decode {
     CREATE TABLE t_upd(id INTEGER PRIMARY KEY, x boolean);
     CREATE TABLE t_upd_log(old_val TEXT, new_val TEXT);
-    CREATE TRIGGER tr_upd AFTER UPDATE ON t_upd BEGIN
-        INSERT INTO t_upd_log VALUES (CAST(OLD.x AS TEXT), CAST(NEW.x AS TEXT));
-    END;
+    CREATE TRIGGER tr_upd AFTER UPDATE ON t_upd BEGIN INSERT INTO t_upd_log VALUES (CAST(OLD.x AS TEXT), CAST(NEW.x AS TEXT)); END;
     INSERT INTO t_upd VALUES (1, 0);
     UPDATE t_upd SET x = 99 WHERE id = 1;
     SELECT old_val, new_val FROM t_upd_log;
