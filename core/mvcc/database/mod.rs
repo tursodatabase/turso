@@ -596,6 +596,12 @@ pub enum CommitState<Clock: LogicalClock> {
     CommitEnd {
         end_ts: u64,
     },
+    /// Postprocessing: rewrite TxID→Timestamp in row versions.
+    /// Runs after Committed is set, so readers already see correct visibility
+    /// via tx state lookup. This is a pure optimization for GC + faster reads.
+    Postprocess {
+        end_ts: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -912,40 +918,32 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
 
-                // Now update timestamps
+                // Build log record WITHOUT mutating in-memory versions.
+                // Versions keep TxID until postprocessing (after Committed is set).
+                // During that window, readers resolve visibility via tx state lookup
+                // which gives the same answer as the eventual Timestamp.
+                // See Hekaton paper Section 3.3 (Postprocessing).
                 let mut log_record = LogRecord::new(*end_ts);
                 for id in &self.write_set {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
-                        let mut row_versions = row_versions.value().write();
-                        for row_version in row_versions.iter_mut() {
-                            if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
-                                if id == self.tx_id {
-                                    // New version is valid STARTING FROM committing transaction's end timestamp
-                                    // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                    row_version.begin = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                    mvcc_store.insert_version_raw(
-                                        &mut log_record.row_versions,
-                                        row_version.clone(),
-                                    ); // FIXME: optimize cloning out
-
-                                    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                        self.did_commit_schema_change = true;
-                                    }
+                        let row_versions = row_versions.value().read();
+                        for row_version in row_versions.iter() {
+                            let is_our_begin = matches!(row_version.begin, Some(TxTimestampOrID::TxID(id)) if id == self.tx_id);
+                            let is_our_end = matches!(row_version.end, Some(TxTimestampOrID::TxID(id)) if id == self.tx_id);
+                            if is_our_begin || is_our_end {
+                                let mut rv_clone = row_version.clone();
+                                if is_our_begin {
+                                    rv_clone.begin = Some(TxTimestampOrID::Timestamp(*end_ts));
                                 }
-                            }
-                            if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
-                                if id == self.tx_id {
-                                    // Old version is valid UNTIL committing transaction's end timestamp
-                                    // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                    row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                    mvcc_store.insert_version_raw(
-                                        &mut log_record.row_versions,
-                                        row_version.clone(),
-                                    ); // FIXME: optimize cloning out
-
-                                    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                        self.did_commit_schema_change = true;
-                                    }
+                                if is_our_end {
+                                    rv_clone.end = Some(TxTimestampOrID::Timestamp(*end_ts));
+                                }
+                                mvcc_store.insert_version_raw(
+                                    &mut log_record.row_versions,
+                                    rv_clone,
+                                );
+                                if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                                    self.did_commit_schema_change = true;
                                 }
                             }
                         }
@@ -956,36 +954,28 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                             panic!("Index writes must have a record key");
                         };
                         if let Some(row_versions) = index.get(index_key) {
-                            let mut row_versions = row_versions.value().write();
-                            for row_version in row_versions.iter_mut() {
-                                if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
-                                    if id == self.tx_id {
-                                        // New version is valid STARTING FROM committing transaction's end timestamp
-                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                        row_version.begin =
-                                            Some(TxTimestampOrID::Timestamp(*end_ts));
-                                        mvcc_store.insert_version_raw(
-                                            &mut log_record.row_versions,
-                                            row_version.clone(),
-                                        ); // FIXME: optimize cloning out
+                            let row_versions = row_versions.value().read();
+                            for row_version in row_versions.iter() {
+                                let is_our_begin = matches!(row_version.begin, Some(TxTimestampOrID::TxID(id)) if id == self.tx_id);
+                                let is_our_end = matches!(row_version.end, Some(TxTimestampOrID::TxID(id)) if id == self.tx_id);
+                                if is_our_begin || is_our_end {
+                                    let mut rv_clone = row_version.clone();
+                                    if is_our_begin {
+                                        rv_clone.begin = Some(TxTimestampOrID::Timestamp(*end_ts));
                                     }
-                                }
-                                if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
-                                    if id == self.tx_id {
-                                        // Old version is valid UNTIL committing transaction's end timestamp
-                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                        row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                        mvcc_store.insert_version_raw(
-                                            &mut log_record.row_versions,
-                                            row_version.clone(),
-                                        ); // FIXME: optimize cloning out
+                                    if is_our_end {
+                                        rv_clone.end = Some(TxTimestampOrID::Timestamp(*end_ts));
                                     }
+                                    mvcc_store.insert_version_raw(
+                                        &mut log_record.row_versions,
+                                        rv_clone,
+                                    );
                                 }
                             }
                         }
                     }
                 }
-                tracing::trace!("updated(tx_id={})", self.tx_id);
+                tracing::trace!("log_record_built(tx_id={})", self.tx_id);
 
                 if log_record.row_versions.is_empty() {
                     // Nothing to do, just end commit.
@@ -1060,6 +1050,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .get(&self.tx_id)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
+
+                // Atomic flip: all versions with TxID(self.tx_id) become visible
+                // simultaneously. Readers resolve TxID → Committed(end_ts) via
+                // the tx state lookup, giving the same answer as Timestamp(end_ts).
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
@@ -1077,14 +1071,60 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .store(*end_ts, Ordering::Release);
                 }
 
-                // We have now updated all the versions with a reference to the
-                // transaction ID to a timestamp and can, therefore, remove the
-                // transaction. Please note that when we move to lockless, the
-                // invariant doesn't necessarily hold anymore because another thread
-                // might have speculatively read a version that we want to remove.
-                // But that's a problem for another day.
-                // FIXME: it actually just become a problem for today!!!
-                // TODO: test that reproduces this failure, and then a fix
+                // Proceed to postprocessing: rewrite TxID→Timestamp in row
+                // versions. This is a pure optimization (enables tx GC + faster
+                // visibility checks). Readers are already correct via state lookup.
+                self.state = CommitState::Postprocess { end_ts: *end_ts };
+                Ok(TransitionResult::Continue)
+            }
+            CommitState::Postprocess { end_ts } => {
+                // Hekaton Section 3.3: Postprocessing phase.
+                // Replace TxID references with Timestamps in all row versions.
+                // The tx is already Committed, so this doesn't affect correctness —
+                // it just converts the slow path (SkipMap lookup) to the fast path
+                // (direct u64 comparison) and allows the tx to be removed from the map.
+                for id in &self.write_set {
+                    if let Some(row_versions) = mvcc_store.rows.get(id) {
+                        let mut row_versions = row_versions.value().write();
+                        for row_version in row_versions.iter_mut() {
+                            if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                                if id == self.tx_id {
+                                    row_version.begin = Some(TxTimestampOrID::Timestamp(*end_ts));
+                                }
+                            }
+                            if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                                if id == self.tx_id {
+                                    row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
+                        let index = index.value();
+                        let RowKey::Record(ref index_key) = id.row_id else {
+                            panic!("Index writes must have a record key");
+                        };
+                        if let Some(row_versions) = index.get(index_key) {
+                            let mut row_versions = row_versions.value().write();
+                            for row_version in row_versions.iter_mut() {
+                                if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                                    if id == self.tx_id {
+                                        row_version.begin =
+                                            Some(TxTimestampOrID::Timestamp(*end_ts));
+                                    }
+                                }
+                                if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                                    if id == self.tx_id {
+                                        row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tracing::trace!("postprocessed(tx_id={}, end_ts={})", self.tx_id, *end_ts);
+
+                // Now all versions use Timestamps — safe to remove the tx entry.
                 mvcc_store.remove_tx(self.tx_id);
 
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
@@ -1102,7 +1142,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     self.state = CommitState::Checkpoint { state_machine };
                     return Ok(TransitionResult::Continue);
                 }
-                tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
                 self.finalize(mvcc_store)?;
                 Ok(TransitionResult::Done(()))
             }
@@ -2796,6 +2835,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.clock.get_timestamp()
     }
 
+    /// Returns true if the given transaction is in the Preparing state.
+    #[cfg(test)]
+    pub fn is_tx_preparing(&self, tx_id: TxID) -> bool {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
+        matches!(tx.value().state.load(), TransactionState::Preparing(_))
+    }
+
     /// Compute the low-water mark: the minimum begin_ts of all active or
     /// preparing transactions. Returns u64::MAX if no transactions are active.
     /// Used by GC to determine which row versions are safe to reclaim.
@@ -3465,9 +3514,21 @@ impl RowVersion {
                 tx.begin_ts >= end_ts
             }
             Some(TxTimestampOrID::TxID(end_tx_id)) => {
-                // Row is being deleted/updated by another transaction
                 // If it's OUR transaction, the B-tree row is invalid (we deleted/updated it)
-                end_tx_id == tx.tx_id
+                if end_tx_id == tx.tx_id {
+                    return true;
+                }
+                // During postprocessing, a committed tx's versions still have TxID
+                // before being rewritten to Timestamp. Check if the deleting tx
+                // has committed with an end_ts that means the row is deleted for us.
+                if let Some(other_tx) = txs.get(&end_tx_id) {
+                    if let TransactionState::Committed(committed_ts) =
+                        other_tx.value().state.load()
+                    {
+                        return tx.begin_ts >= committed_ts;
+                    }
+                }
+                false
             }
             None => false,
         }
@@ -3520,8 +3581,11 @@ fn is_end_visible(
                 // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
                 // Source: https://avi.im/blag/2023/hekaton-paper-typo/
                 TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                // Table 2 (Hekaton): If TS > RT, V is visible. If TS < RT, T speculatively ignores V.
-                TransactionState::Preparing(end_ts) => current_tx.begin_ts < end_ts,
+                // Snapshot isolation without commit dependencies: the deletion
+                // hasn't committed yet, so the old version is still visible.
+                // Hekaton Table 2 would speculatively ignore here (begin_ts < end_ts)
+                // and take a commit dependency, but we don't track commit deps.
+                TransactionState::Preparing(_) => true,
                 TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
                 TransactionState::Aborted => true,
                 // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
@@ -3560,6 +3624,9 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
             Self::Checkpoint { state_machine: _ } => f.debug_struct("Checkpoint").finish(),
             Self::CommitEnd { end_ts } => {
                 f.debug_struct("CommitEnd").field("end_ts", end_ts).finish()
+            }
+            Self::Postprocess { end_ts } => {
+                f.debug_struct("Postprocess").field("end_ts", end_ts).finish()
             }
         }
     }
