@@ -1842,4 +1842,3 @@ test insert-or-replace-data-correctness {
 expect {
     133|a133
 }
-

@@ -594,4 +594,3 @@ test select-param-zero-invalid {
 expect error {
     .*variable number must be between.*
 }
-

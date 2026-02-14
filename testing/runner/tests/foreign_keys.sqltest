@@ -2441,4 +2441,3 @@ test fk-drop-column-composite-fk-fails {
 }
 expect error {
 }
-

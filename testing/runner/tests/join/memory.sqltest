@@ -476,4 +476,3 @@ test left-join-materialized-subquery-nullrow-bug {
 expect {
     32|10089|20016|
 }
-

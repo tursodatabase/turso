@@ -15,7 +15,29 @@
  *   numbers are IEEE 754 doubles with 53 bits of mantissa precision.
  */
 
-import { connect } from '@tursodatabase/database';
+import { pathToFileURL } from 'node:url';
+
+const ReadState = Object.freeze({
+    Invalid: 'Invalid',
+    Start: 'Start',
+    Normal: 'Normal',
+    Explain: 'Explain',
+    Create: 'Create',
+    Trigger: 'Trigger',
+    Semi: 'Semi',
+    End: 'End',
+});
+
+const Token = Object.freeze({
+    TkSemi: 'TkSemi',
+    TkWhitespace: 'TkWhitespace',
+    TkOther: 'TkOther',
+    TkExplain: 'TkExplain',
+    TkCreate: 'TkCreate',
+    TkTemp: 'TkTemp',
+    TkTrigger: 'TkTrigger',
+    TkEnd: 'TkEnd',
+});
 
 async function readStdin() {
     const chunks = [];
@@ -81,6 +103,7 @@ async function main() {
 
     let db;
     try {
+        const { connect } = await import('@tursodatabase/database');
         db = await connect(dbPath, { readonly, experimental: ['triggers', 'attach'] });
         // Enable safe integers to preserve precision for large integers
         db.defaultSafeIntegers(true);
@@ -94,29 +117,17 @@ async function main() {
         const statements = splitStatements(sql);
 
         // Accumulate results from ALL queries (matches Rust backend behavior)
-        let allResults = [];
+        const allResults = [];
 
         for (const stmt of statements) {
             const trimmed = stmt.trim();
             if (!trimmed) continue;
 
-            // Check if this is a query that returns rows (includes RETURNING clauses)
-            // Note: WITH (CTEs) can contain either SELECT or DML statements.
-            // We include WITH here because even CTE-wrapped DML returns empty
-            // from .all() (unless RETURNING is used), which is fine.
-            const isQuery = /^\s*(SELECT|PRAGMA|EXPLAIN|WITH|VALUES)/i.test(trimmed) ||
-                           /\bRETURNING\b/i.test(trimmed);
-
-            if (isQuery) {
-                const prepared = db.prepare(trimmed);
-                prepared.raw(true);
-                const rows = await prepared.all();
-                allResults.push(...rows);
-                await prepared.close();
-            } else {
-                // Non-query statement (INSERT, UPDATE, DELETE, CREATE, etc.)
-                await db.exec(trimmed);
-            }
+            const prepared = db.prepare(trimmed);
+            prepared.raw(true);
+            const rows = await prepared.all();
+            allResults.push(...rows);
+            prepared.close();
         }
 
         // Output all accumulated results
@@ -135,78 +146,283 @@ async function main() {
     }
 }
 
-/**
- * Split SQL text into individual statements.
- *
- * NOTE: This manual splitting is necessary because the JS bindings don't expose
- * an ergonomic way to execute multiple statements while capturing results from
- * the last one. The bindings provide:
- * - db.exec(sql) - executes multiple statements but doesn't return row data
- * - db.prepare(sql) - returns rows but only handles a single statement
- *
- * The native BatchExecutor uses Turso's parser internally (conn.consume_stmt)
- * but doesn't expose a row() method. Adding that would allow us to remove this
- * manual splitting. See: bindings/javascript/src/lib.rs BatchExecutor impl.
- */
-function splitStatements(sql) {
-    const statements = [];
-    let current = '';
-    let inString = false;
-    let stringChar = '';
+function isAsciiWhitespace(char) {
+    const code = char.charCodeAt(0);
+    return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0b || code === 0x0c || code === 0x0d;
+}
 
-    for (let i = 0; i < sql.length; i++) {
+function isAsciiAlpha(char) {
+    const code = char.charCodeAt(0);
+    return (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a);
+}
+
+function isAsciiAlnum(char) {
+    const code = char.charCodeAt(0);
+    return isAsciiAlpha(char) || (code >= 0x30 && code <= 0x39);
+}
+
+function classifyKeyword(word) {
+    switch (word) {
+        case 'EXPLAIN':
+            return Token.TkExplain;
+        case 'CREATE':
+            return Token.TkCreate;
+        case 'TEMP':
+        case 'TEMPORARY':
+            return Token.TkTemp;
+        case 'TRIGGER':
+            return Token.TkTrigger;
+        case 'END':
+            return Token.TkEnd;
+        default:
+            return Token.TkOther;
+    }
+}
+
+function nextToken(sql, start) {
+    let i = start;
+
+    while (i < sql.length) {
         const char = sql[i];
         const nextChar = sql[i + 1];
 
-        if (inString) {
-            current += char;
-            // Check for escape sequences
-            if (char === stringChar) {
-                if (nextChar === stringChar) {
-                    // Escaped quote
-                    current += nextChar;
-                    i++;
-                } else {
-                    inString = false;
+        if (char === '\'' || char === '"' || char === '`' || char === '[') {
+            const endChar = char === '[' ? ']' : char;
+            i++;
+            while (i < sql.length) {
+                const current = sql[i];
+                i++;
+                if (current === endChar) {
+                    break;
                 }
             }
-        } else if (char === "'" || char === '"') {
-            inString = true;
-            stringChar = char;
-            current += char;
-        } else if (char === '-' && nextChar === '-') {
-            // Skip single-line comment (don't add to current statement)
-            i++; // skip second '-'
+            continue;
+        }
+
+        if (char === '-' && nextChar === '-') {
+            i += 2;
             while (i < sql.length && sql[i] !== '\n') {
                 i++;
             }
-            // i now points to '\n' or end; the for loop will increment past it
-        } else if (char === '/' && nextChar === '*') {
-            // Skip multi-line comment
-            i++; // skip '*'
-            while (i < sql.length - 1 && !(sql[i] === '*' && sql[i + 1] === '/')) {
-                i++;
-            }
-            i++; // skip past closing '/'
-        } else if (char === ';') {
-            if (current.trim()) {
-                statements.push(current.trim());
-            }
-            current = '';
-        } else {
-            current += char;
+            continue;
         }
+
+        if (char === '/' && nextChar === '*') {
+            i += 2;
+            let sawStar = false;
+            while (i < sql.length) {
+                const current = sql[i];
+                i++;
+                if (sawStar && current === '/') {
+                    break;
+                }
+                sawStar = current === '*';
+            }
+            continue;
+        }
+
+        if (char === ';') {
+            return {
+                token: Token.TkSemi,
+                nextIndex: i + 1,
+                tokenEnd: i + 1,
+            };
+        }
+
+        if (isAsciiWhitespace(char)) {
+            return {
+                token: Token.TkWhitespace,
+                nextIndex: i + 1,
+                tokenEnd: i + 1,
+            };
+        }
+
+        if (isAsciiAlpha(char) || char === '_') {
+            let end = i + 1;
+            while (end < sql.length && (isAsciiAlnum(sql[end]) || sql[end] === '_')) {
+                end++;
+            }
+
+            return {
+                token: classifyKeyword(sql.slice(i, end).toUpperCase()),
+                nextIndex: end,
+                tokenEnd: end,
+            };
+        }
+
+        return {
+            token: Token.TkOther,
+            nextIndex: i + 1,
+            tokenEnd: i + 1,
+        };
     }
 
-    // Add any remaining statement
-    if (current.trim()) {
-        statements.push(current.trim());
+    return null;
+}
+
+function transition(state, token) {
+    switch (state) {
+        case ReadState.Invalid:
+            switch (token) {
+                case Token.TkSemi:
+                    return ReadState.Start;
+                case Token.TkWhitespace:
+                    return ReadState.Invalid;
+                case Token.TkExplain:
+                    return ReadState.Explain;
+                case Token.TkCreate:
+                    return ReadState.Create;
+                default:
+                    return ReadState.Normal;
+            }
+        case ReadState.Start:
+            switch (token) {
+                case Token.TkSemi:
+                    return ReadState.Start;
+                case Token.TkWhitespace:
+                    return ReadState.Start;
+                case Token.TkExplain:
+                    return ReadState.Explain;
+                case Token.TkCreate:
+                    return ReadState.Create;
+                default:
+                    return ReadState.Normal;
+            }
+        case ReadState.Normal:
+            switch (token) {
+                case Token.TkSemi:
+                    return ReadState.Start;
+                case Token.TkWhitespace:
+                    return ReadState.Normal;
+                default:
+                    return ReadState.Normal;
+            }
+        case ReadState.Explain:
+            switch (token) {
+                case Token.TkSemi:
+                    return ReadState.Start;
+                case Token.TkWhitespace:
+                    return ReadState.Explain;
+                case Token.TkCreate:
+                    return ReadState.Create;
+                case Token.TkExplain:
+                case Token.TkTemp:
+                case Token.TkTrigger:
+                case Token.TkEnd:
+                    return ReadState.Normal;
+                default:
+                    return ReadState.Explain;
+            }
+        case ReadState.Create:
+            switch (token) {
+                case Token.TkSemi:
+                    return ReadState.Start;
+                case Token.TkWhitespace:
+                    return ReadState.Create;
+                case Token.TkTemp:
+                    return ReadState.Create;
+                case Token.TkTrigger:
+                    return ReadState.Trigger;
+                default:
+                    return ReadState.Normal;
+            }
+        case ReadState.Trigger:
+            switch (token) {
+                case Token.TkSemi:
+                    return ReadState.Semi;
+                case Token.TkWhitespace:
+                    return ReadState.Trigger;
+                default:
+                    return ReadState.Trigger;
+            }
+        case ReadState.Semi:
+            switch (token) {
+                case Token.TkSemi:
+                    return ReadState.Semi;
+                case Token.TkWhitespace:
+                    return ReadState.Semi;
+                case Token.TkEnd:
+                    return ReadState.End;
+                default:
+                    return ReadState.Trigger;
+            }
+        case ReadState.End:
+            switch (token) {
+                case Token.TkSemi:
+                    return ReadState.Start;
+                case Token.TkWhitespace:
+                    return ReadState.End;
+                default:
+                    return ReadState.Trigger;
+            }
+        default:
+            return ReadState.Invalid;
+    }
+}
+
+function hasMeaningfulSql(sql) {
+    let index = 0;
+    while (true) {
+        const token = nextToken(sql, index);
+        if (!token) {
+            return false;
+        }
+
+        if (token.token !== Token.TkWhitespace && token.token !== Token.TkSemi) {
+            return true;
+        }
+
+        index = token.nextIndex;
+    }
+}
+
+/**
+ * Split SQL text into individual statements using sqlite3_complete-like semantics.
+ *
+ * This matches testing/runner/src/parser/sql_complete.rs so CREATE TRIGGER bodies
+ * containing semicolons are treated as a single statement until the ;END; sentinel.
+ */
+function splitStatements(sql) {
+    const statements = [];
+    let state = ReadState.Invalid;
+    let statementStart = 0;
+    let index = 0;
+
+    while (true) {
+        const tokenInfo = nextToken(sql, index);
+        if (!tokenInfo) {
+            break;
+        }
+
+        const newState = transition(state, tokenInfo.token);
+
+        if (newState === ReadState.Start && state !== ReadState.Start) {
+            const candidate = sql.slice(statementStart, tokenInfo.tokenEnd).trim();
+            if (candidate && hasMeaningfulSql(candidate)) {
+                statements.push(candidate);
+            }
+            statementStart = tokenInfo.tokenEnd;
+        }
+
+        state = newState;
+        index = tokenInfo.nextIndex;
+    }
+
+    const remainder = sql.slice(statementStart).trim();
+    if (remainder && hasMeaningfulSql(remainder)) {
+        statements.push(remainder);
     }
 
     return statements;
 }
 
-main().catch(err => {
-    console.error(`Error: ${err.message}`);
-    process.exit(1);
-});
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMain) {
+    main().catch(err => {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+    });
+}
+
+export { splitStatements };
