@@ -83,16 +83,22 @@ export interface ResultSet {
  * libSQL-compatible error class with error codes.
  */
 export class LibsqlError extends Error {
-  /** Machine-readable error code */
+  /** Machine-readable error code (e.g., "SQLITE_CONSTRAINT") */
   code: string;
+  /** Extended error code with more specific information (e.g., "SQLITE_CONSTRAINT_PRIMARYKEY") */
+  extendedCode?: string;
   /** Raw numeric error code (if available) */
   rawCode?: number;
+  /** Original error that caused this error */
+  declare cause?: Error;
 
-  constructor(message: string, code: string, rawCode?: number) {
+  constructor(message: string, code: string, extendedCode?: string, rawCode?: number, cause?: Error) {
     super(message);
     this.name = 'LibsqlError';
     this.code = code;
+    this.extendedCode = extendedCode;
     this.rawCode = rawCode;
+    this.cause = cause;
   }
 }
 
@@ -257,7 +263,10 @@ class LibSQLClient implements Client {
       const result = await this.session.execute(normalizedStmt.sql, normalizedStmt.args, this._defaultSafeIntegers);
       return this.convertResult(result);
     } catch (error: any) {
-      throw new LibsqlError(error.message, "EXECUTE_ERROR");
+      if (error instanceof LibsqlError) {
+        throw error;
+      }
+      throw mapDatabaseError(error, "EXECUTE_ERROR");
     }
   }
 
@@ -277,7 +286,10 @@ class LibSQLClient implements Client {
       // Return array of result sets (simplified - actual implementation would be more complex)
       return [this.convertResult(result)];
     } catch (error: any) {
-      throw new LibsqlError(error.message, "BATCH_ERROR");
+      if (error instanceof LibsqlError) {
+        throw error;
+      }
+      throw mapDatabaseError(error, "BATCH_ERROR");
     }
   }
 
@@ -298,7 +310,10 @@ class LibSQLClient implements Client {
       
       await this.session.sequence(sql);
     } catch (error: any) {
-      throw new LibsqlError(error.message, "EXECUTE_MULTIPLE_ERROR");
+      if (error instanceof LibsqlError) {
+        throw error;
+      }
+      throw mapDatabaseError(error, "EXECUTE_MULTIPLE_ERROR");
     }
   }
 
@@ -341,4 +356,67 @@ class LibSQLClient implements Client {
  */
 export function createClient(config: Config): Client {
   return new LibSQLClient(config);
+}
+
+// Known SQLite base error code names, used to split extended codes like
+// "SQLITE_CONSTRAINT_PRIMARYKEY" into base ("SQLITE_CONSTRAINT") and extended.
+const sqliteBaseErrorCodes = new Set([
+  "SQLITE_ERROR",
+  "SQLITE_INTERNAL",
+  "SQLITE_PERM",
+  "SQLITE_ABORT",
+  "SQLITE_BUSY",
+  "SQLITE_LOCKED",
+  "SQLITE_NOMEM",
+  "SQLITE_READONLY",
+  "SQLITE_INTERRUPT",
+  "SQLITE_IOERR",
+  "SQLITE_CORRUPT",
+  "SQLITE_NOTFOUND",
+  "SQLITE_FULL",
+  "SQLITE_CANTOPEN",
+  "SQLITE_PROTOCOL",
+  "SQLITE_EMPTY",
+  "SQLITE_SCHEMA",
+  "SQLITE_TOOBIG",
+  "SQLITE_CONSTRAINT",
+  "SQLITE_MISMATCH",
+  "SQLITE_MISUSE",
+  "SQLITE_NOLFS",
+  "SQLITE_AUTH",
+  "SQLITE_FORMAT",
+  "SQLITE_RANGE",
+  "SQLITE_NOTADB",
+  "SQLITE_NOTICE",
+  "SQLITE_WARNING",
+]);
+
+/**
+ * Parse a protocol error code into base and extended codes.
+ *
+ * The server may send either a base code ("SQLITE_CONSTRAINT") or an extended
+ * code ("SQLITE_CONSTRAINT_PRIMARYKEY"). This function splits them so that
+ * `code` is always the base code and `extendedCode` carries the full detail.
+ */
+function parseErrorCode(serverCode: string): { code: string; extendedCode?: string } {
+  if (sqliteBaseErrorCodes.has(serverCode)) {
+    return { code: serverCode };
+  }
+  // Try to find a base code prefix (e.g. "SQLITE_CONSTRAINT" in "SQLITE_CONSTRAINT_PRIMARYKEY")
+  for (const base of sqliteBaseErrorCodes) {
+    if (serverCode.startsWith(base + "_")) {
+      return { code: base, extendedCode: serverCode };
+    }
+  }
+  // Unknown code — return as-is
+  return { code: serverCode };
+}
+
+function mapDatabaseError(error: any, fallbackCode: string): LibsqlError {
+  if (error instanceof DatabaseError && error.code) {
+    const { code, extendedCode } = parseErrorCode(error.code);
+    return new LibsqlError(error.message, code, extendedCode, error.rawCode, error);
+  }
+  const cause = error instanceof Error ? error : undefined;
+  return new LibsqlError(error.message ?? String(error), fallbackCode, undefined, undefined, cause);
 }
