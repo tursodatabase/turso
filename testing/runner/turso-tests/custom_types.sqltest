@@ -387,11 +387,14 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test custom-type-requires-strict {
+test custom-type-non-strict-no-encode {
     CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint);
+    INSERT INTO t1 VALUES (1, 42);
+    SELECT val, typeof(val) FROM t1;
 }
-expect error {
+expect {
+    42|integer
 }
 
 @requires strict "uses STRICT tables"

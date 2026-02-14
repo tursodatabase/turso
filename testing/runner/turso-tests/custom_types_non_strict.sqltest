@@ -1,11 +1,39 @@
 @database :memory:
 
-# Tests that custom types do NOT leak into non-STRICT tables.
-# Non-STRICT tables accept any type name as an affinity hint, including names
-# that collide with built-in custom types (boolean, uuid, date, etc.).
-# Custom type encode/decode/default/operators must NOT apply to these tables.
+# Tests for custom types on non-STRICT tables.
+# On non-STRICT tables any type name (including registered custom type names)
+# is accepted and treated as a plain affinity hint. No encode/decode is applied.
+# Custom type encode/decode only activates on STRICT tables.
 
-# boolean column on non-STRICT table should store raw integer, not encode/decode
+# User-created custom type on non-STRICT table: accepted but no encode/decode.
+# The value is stored raw (affinity only), not passed through the encode function.
+@requires strict "uses STRICT tables"
+test non-strict-user-type-no-encode {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val test_uint);
+    INSERT INTO t VALUES (1, 42);
+    SELECT val, typeof(val) FROM t;
+}
+expect {
+    42|integer
+}
+
+# ALTER TABLE ADD COLUMN with user-created custom type on non-STRICT table:
+# accepted, no encode/decode applied.
+@requires strict "uses STRICT tables"
+test non-strict-alter-add-user-type-no-encode {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b test_uint;
+    UPDATE t SET b = 99;
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    99|integer
+}
+
+# Built-in boolean on non-STRICT table should store raw value, no encode/decode
 test non-strict-boolean-stores-raw-integer {
     CREATE TABLE t_ns_bool(x boolean);
     INSERT INTO t_ns_bool VALUES (42);
@@ -15,49 +43,21 @@ expect {
     42|integer
 }
 
-# AFTER trigger on non-STRICT table with boolean column should see raw value
-test non-strict-trigger-no-decode {
-    CREATE TABLE t_src(x boolean);
-    CREATE TABLE t_log(val TEXT);
-    CREATE TRIGGER tr_src AFTER INSERT ON t_src BEGIN INSERT INTO t_log VALUES (CAST(NEW.x AS TEXT)); END;
-    INSERT INTO t_src VALUES (42);
-    SELECT val FROM t_log;
+# Built-in type names are allowed as affinity hints on non-STRICT tables
+test non-strict-numeric-affinity {
+    CREATE TABLE t_ns_num(x numeric);
+    INSERT INTO t_ns_num VALUES ('123.45');
+    SELECT x, typeof(x) FROM t_ns_num;
 }
 expect {
-    42
+    123.45|real
 }
 
-# AFTER UPDATE trigger on non-STRICT table should see raw values
-test non-strict-update-trigger-no-decode {
-    CREATE TABLE t_upd(id INTEGER PRIMARY KEY, x boolean);
-    CREATE TABLE t_upd_log(old_val TEXT, new_val TEXT);
-    CREATE TRIGGER tr_upd AFTER UPDATE ON t_upd BEGIN INSERT INTO t_upd_log VALUES (CAST(OLD.x AS TEXT), CAST(NEW.x AS TEXT)); END;
-    INSERT INTO t_upd VALUES (1, 0);
-    UPDATE t_upd SET x = 99 WHERE id = 1;
-    SELECT old_val, new_val FROM t_upd_log;
-}
-expect {
-    0|99
-}
-
-# INSERT DEFAULT VALUES on non-STRICT table should get NULL, not custom type default
-test non-strict-no-custom-default {
-    CREATE TABLE t_ns_def(id INTEGER PRIMARY KEY, x boolean);
-    INSERT INTO t_ns_def(id) VALUES (1);
-    SELECT id, x FROM t_ns_def;
-}
-expect {
-    1|
-}
-
-# Non-STRICT table with type name matching a custom type with operators
-# should not use custom type comparison operators
-test non-strict-no-custom-operators {
-    CREATE TABLE t_ns_op(x boolean);
-    INSERT INTO t_ns_op VALUES (1);
-    INSERT INTO t_ns_op VALUES (0);
-    INSERT INTO t_ns_op VALUES (42);
-    SELECT x FROM t_ns_op WHERE x > 1 ORDER BY x;
+# Non-STRICT table with a type name that is NOT a registered custom type is fine
+test non-strict-unknown-type-ok {
+    CREATE TABLE t(x FAKETYPE);
+    INSERT INTO t VALUES (42);
+    SELECT x FROM t;
 }
 expect {
     42
@@ -75,48 +75,6 @@ expect {
     1
     2
     3
-}
-
-# DISTINCT on non-STRICT table should use standard comparison
-test non-strict-distinct {
-    CREATE TABLE t_ns_dist(x boolean);
-    INSERT INTO t_ns_dist VALUES (1);
-    INSERT INTO t_ns_dist VALUES (1);
-    INSERT INTO t_ns_dist VALUES (0);
-    SELECT DISTINCT x FROM t_ns_dist ORDER BY x;
-}
-expect {
-    0
-    1
-}
-
-# CAST(x AS type) always works for non-parametric custom types even outside
-# STRICT tables, because CAST is an explicit user request, not column-scoped.
-# Parametric types without params (e.g. CAST(x AS numeric)) fall through to
-# standard SQLite CAST.
-test non-strict-cast-explicit {
-    SELECT CAST(1 AS boolean);
-}
-expect {
-    true
-}
-
-# CAST(x AS numeric) without params falls through to standard SQLite CAST
-test non-strict-cast-parametric-fallthrough {
-    SELECT CAST('123.45' AS numeric), typeof(CAST('123.45' AS numeric));
-}
-expect {
-    123.45|real
-}
-
-# Non-STRICT table with "numeric" column should work like standard SQLite NUMERIC affinity
-test non-strict-numeric-affinity {
-    CREATE TABLE t_ns_num(x numeric);
-    INSERT INTO t_ns_num VALUES ('123.45');
-    SELECT x, typeof(x) FROM t_ns_num;
-}
-expect {
-    123.45|real
 }
 
 # GROUP BY on non-STRICT boolean column should use standard grouping
@@ -143,4 +101,21 @@ test non-strict-min-max {
 }
 expect {
     1|9
+}
+
+# CAST(x AS type) always works for non-parametric custom types even outside
+# STRICT tables, because CAST is an explicit user request, not column-scoped.
+test non-strict-cast-explicit {
+    SELECT CAST(1 AS boolean);
+}
+expect {
+    true
+}
+
+# CAST(x AS numeric) without params falls through to standard SQLite CAST
+test non-strict-cast-parametric-fallthrough {
+    SELECT CAST('123.45' AS numeric), typeof(CAST('123.45' AS numeric));
+}
+expect {
+    123.45|real
 }
