@@ -102,6 +102,7 @@ fastbloom = "0.14.1"
 
 [target.'cfg(antithesis)'.dependencies]
 antithesis_sdk = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
 
 [target.'cfg(loom)'.dependencies]
 loom = { workspace = true }
