@@ -3916,11 +3916,19 @@ impl Pager {
                         return_if_io!(self.with_header(|header| header.database_size)).get();
                     let page_size = self.get_page_size().unwrap_or_default();
                     let expected = (db_size * page_size.get()) as u64;
-                    #[cfg(not(target_family = "wasm"))]
-                    let should_skip_truncate_db_file = expected >= self.db_file.size()?;
-                    #[cfg(target_family = "wasm")]
-                    let should_skip_truncate_db_file = false;
-                    if should_skip_truncate_db_file {
+                    let should_skip_db_truncate = match self.db_file.size() {
+                        Ok(current_size) => expected >= current_size,
+                        Err(err) => {
+                            // e.g. file.size() is not supported in web worker environment, so we should
+                            // skip the truncate if we can't check the size.
+                            tracing::debug!(
+                                "checkpoint(TRUNCATE): db_file.size unavailable, skipping db truncate pre-check: {err}"
+                            );
+                            true
+                        }
+                    };
+                    if should_skip_db_truncate {
+                        // No DB truncation needed (or unsupported size pre-check), move to next phase.
                         let mut state = self.checkpoint_state.write();
                         if sync_mode == crate::SyncMode::Off {
                             // Skip DB sync, proceed to WAL truncation
