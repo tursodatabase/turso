@@ -254,7 +254,6 @@ impl Row {
 /// TODO: we can optimize this by using bitpacking for the begin and end fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowVersion {
-    
     /// Unique identifier for this version within the MvStore.
     /// Used for savepoint tracking to identify specific versions to rollback.
     pub id: u64,
@@ -342,6 +341,11 @@ impl PackedTxTimestampOrID {
     #[inline]
     pub fn is_none(self) -> bool {
         self.tag() == Self::TAG_NONE
+    }
+
+    #[inline]
+    pub fn is_some(self) -> bool {
+        !self.is_none()
     }
     #[inline]
     pub fn as_timestamp(self) -> Option<u64> {
@@ -913,49 +917,44 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                             continue;
                         }
 
-                        match version.begin {
-                            Some(TxTimestampOrID::TxID(other_tx_id)) => {
-                                // Skip our own version
-                                if other_tx_id == self.tx_id {
-                                    continue;
-                                }
-                                // Another transaction's uncommitted version - check their state
-                                let other_tx = mvcc_store.txs.get(&other_tx_id);
-                                if let Some(other_tx) = other_tx {
-                                    let other_tx = other_tx.value();
-                                    match other_tx.state.load() {
-                                        // Other tx already committed = conflict
-                                        TransactionState::Committed(_) => {
+                        if let Some(other_tx_id) = version.begin.as_txid() {
+                            // Skip our own version
+                            if other_tx_id == self.tx_id {
+                                continue;
+                            }
+                            // Another transaction's uncommitted version - check their state
+                            let other_tx = mvcc_store.txs.get(&other_tx_id);
+                            if let Some(other_tx) = other_tx {
+                                let other_tx = other_tx.value();
+                                match other_tx.state.load() {
+                                    // Other tx already committed = conflict
+                                    TransactionState::Committed(_) => {
+                                        return Err(LimboError::WriteWriteConflict);
+                                    }
+                                    // Both preparing - compare end_ts (lower wins)
+                                    TransactionState::Preparing(other_end_ts) => {
+                                        if other_end_ts < *end_ts {
+                                            // Other tx has lower end_ts, they win
                                             return Err(LimboError::WriteWriteConflict);
                                         }
-                                        // Both preparing - compare end_ts (lower wins)
-                                        TransactionState::Preparing(other_end_ts) => {
-                                            if other_end_ts < *end_ts {
-                                                // Other tx has lower end_ts, they win
-                                                return Err(LimboError::WriteWriteConflict);
-                                            }
-                                            // We have lower end_ts, we win - they'll abort when they validate
-                                        }
-                                        // Other tx still active - we're already Preparing so we're ahead
-                                        // They'll see us in Preparing/Committed when they try to commit
-                                        TransactionState::Active => {}
-                                        // Other tx aborted - no conflict
-                                        TransactionState::Aborted
-                                        | TransactionState::Terminated => {}
+                                        // We have lower end_ts, we win - they'll abort when they validate
                                     }
+                                    // Other tx still active - we're already Preparing so we're ahead
+                                    // They'll see us in Preparing/Committed when they try to commit
+                                    TransactionState::Active => {}
+                                    // Other tx aborted - no conflict
+                                    TransactionState::Aborted | TransactionState::Terminated => {}
                                 }
                             }
-                            Some(TxTimestampOrID::Timestamp(begin_ts)) => {
-                                // Committed version - check if it was inserted after we started
-                                if begin_ts >= tx.begin_ts {
-                                    // Duplicate! A version was committed after we started
-                                    return Err(LimboError::WriteWriteConflict);
-                                }
-                                turso_assert!(false, "there is another row insterted and not updated/deleted from before");
+                        } else if let Some(begin_ts) = version.begin.as_timestamp() {
+                            // Committed version - check if it was inserted after we started
+                            if begin_ts >= tx.begin_ts {
+                                // Duplicate! A version was committed after we started
+                                return Err(LimboError::WriteWriteConflict);
                             }
-                            None => {
-                                // Invalid version
-                            }
+                            turso_assert!(false, "there is another row insterted and not updated/deleted from before");
+                        } else {
+                            // Invalid version
                         }
                     }
                 }
@@ -1721,8 +1720,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
-                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
-                    end: None,
+                    begin: PackedTxTimestampOrID::txid(tx.tx_id),
+                    end: PackedTxTimestampOrID::none(),
                     row: row.clone(),
                     btree_resident: true,
                 };
@@ -1738,8 +1737,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
-                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
-                    end: None,
+                    begin: PackedTxTimestampOrID::txid(tx.tx_id),
+                    end: PackedTxTimestampOrID::none(),
                     row,
                     btree_resident: true,
                 };
@@ -1862,7 +1861,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             drop(row_versions_opt);
                             return Err(LimboError::WriteWriteConflict);
                         }
-                      
+
                         let version_id = rv.id;
                         rv.end = PackedTxTimestampOrID::txid(tx.tx_id);
                         let tx = self
@@ -1899,7 +1898,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             return Err(LimboError::WriteWriteConflict);
                         }
 
-                        
                         let version_id = rv.id;
                         rv.end = PackedTxTimestampOrID::txid(tx.tx_id);
                         drop(row_versions);
@@ -2738,7 +2736,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let mut versions = entry.value().write();
                     for rv in versions.iter_mut() {
                         if rv.id == version_id {
-                            rv.end = None;
+                            rv.end = PackedTxTimestampOrID::none();
                             tracing::debug!("rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
                                 rowid.table_id, rowid.row_id, version_id);
                             break;
@@ -2755,7 +2753,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let mut versions = entry.value().write();
                         for rv in versions.iter_mut() {
                             if rv.id == version_id {
-                                rv.end = None;
+                                rv.end = PackedTxTimestampOrID::none();
                                 tracing::debug!("rollback_savepoint: restored index version(table_id={}, version_id={})",
                                     table_id, version_id);
                                 break;
@@ -2773,8 +2771,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let has_tx_version = if let Some(entry) = self.rows.get(rowid) {
                     let versions = entry.value().read();
                     versions.iter().any(|rv| {
-                        matches!(rv.begin, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
-                            || matches!(rv.end, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
+                        (rv.begin.as_txid() == Some(tx_id)) || (rv.end.as_txid() == Some(tx_id))
                     })
                 } else {
                     false
@@ -2940,7 +2937,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let before = versions.len();
 
         // Rule 1: aborted garbage
-        versions.retain(|rv| !matches!((&rv.begin, &rv.end), (None, None)));
+        versions.retain(|rv| !rv.begin.is_none() || !rv.end.is_none());
 
         // Rule 2: superseded versions below LWM, with tombstone guard.
         // A superseded version with e <= lwm is invisible to all readers and
@@ -2954,22 +2951,24 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // which would resurrect the B-tree row if the tombstone was removed.
         let has_current = versions
             .iter()
-            .any(|rv| rv.end.is_none() && matches!(&rv.begin, Some(TxTimestampOrID::Timestamp(_))));
-        versions.retain(|rv| match &rv.end {
-            Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
-                // Retain only if this is a tombstone AND not yet checkpointed.
-                // For recovery tombstones (e=0): when ckpt_max == 0, no
-                // checkpoint has processed real transactions, so 0 > 0 = false
-                // makes the retain condition `!has_current && false` = false,
-                // i.e., REMOVED. But we need them retained before their first
-                // checkpoint. Since recovery timestamps are 0 and ckpt_max
-                // starts at 0, `e > ckpt_max` is `0 > 0` = false. Combined
-                // with `ckpt_max == 0` meaning "no real checkpoint yet", we
-                // add the second guard: retain if e == 0 AND ckpt_max == 0
-                // (recovery data not yet checkpointed).
-                !has_current && (*e > ckpt_max || (*e == 0 && ckpt_max == 0))
+            .any(|rv| rv.end.is_none() && rv.begin.as_timestamp().is_some());
+        versions.retain(|rv| {
+            if let Some(e) = rv.end.as_timestamp() {
+                if e <= lwm {
+                    // Retain only if this is a tombstone AND not yet checkpointed.
+                    // For recovery tombstones (e=0): when ckpt_max == 0, no
+                    // checkpoint has processed real transactions, so 0 > 0 = false
+                    // makes the retain condition `!has_current && false` = false,
+                    // i.e., REMOVED. But we need them retained before their first
+                    // checkpoint. Since recovery timestamps are 0 and ckpt_max
+                    // starts at 0, `e > ckpt_max` is `0 > 0` = false. Combined
+                    // with `ckpt_max == 0` meaning "no real checkpoint yet", we
+                    // add the second guard: retain if e == 0 AND ckpt_max == 0
+                    // (recovery data not yet checkpointed).
+                    return !has_current && (e > ckpt_max || (e == 0 && ckpt_max == 0));
+                }
             }
-            _ => true,
+            true
         });
 
         // Rule 3: checkpointed sole-survivor current version.
@@ -2980,10 +2979,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // but no real checkpoint has run. The `ckpt_max > 0` part of the guard
         // ensures we only collect b=0 versions after a real checkpoint.
         if versions.len() == 1 {
-            if let (Some(TxTimestampOrID::Timestamp(b)), None) =
-                (&versions[0].begin, &versions[0].end)
-            {
-                if (*b > 0 || ckpt_max > 0) && *b <= ckpt_max && *b < lwm {
+            if let Some(b) = versions[0].begin.as_timestamp() {
+                if versions[0].end.is_none() && (b > 0 || ckpt_max > 0) && b <= ckpt_max && b < lwm
+                {
                     versions.clear();
                 }
             }
@@ -3376,16 +3374,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 }
 
 fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
-    if rv.begin == Some(TxTimestampOrID::TxID(tx_id)) {
+    if rv.begin == PackedTxTimestampOrID::txid(tx_id) {
         // If the transaction has aborted,
         // it marks all its new versions as garbage and sets their Begin
         // and End timestamps to infinity to make them invisible
         // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-        rv.begin = None;
-        rv.end = None;
-    } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
+        rv.begin = PackedTxTimestampOrID::none();
+        rv.end = PackedTxTimestampOrID::none();
+    } else if rv.end == PackedTxTimestampOrID::txid(tx_id) {
         // undo deletions by this transaction
-        rv.end = None;
+        rv.end = PackedTxTimestampOrID::none();
     }
 }
 
@@ -3521,58 +3519,31 @@ impl RowVersion {
         }
 
         // Check if this version represents a deletion/update that affects us
-        match self.end {
-            Some(TxTimestampOrID::Timestamp(end_ts)) => {
-                // Row was deleted at end_ts. If we started at or after end_ts, we shouldn't see it
-                tx.begin_ts >= end_ts
-            }
-            Some(TxTimestampOrID::TxID(end_tx_id)) => {
-                // Row is being deleted/updated by another transaction
-                // If it's OUR transaction, the B-tree row is invalid (we deleted/updated it)
-                end_tx_id == tx.tx_id
-            }
-            None => false,
+        // Check if this version represents a deletion/update that affects us
+        if let Some(end_ts) = self.end.as_timestamp() {
+            // Row was deleted at end_ts. If we started at or after end_ts, we shouldn't see it
+            tx.begin_ts >= end_ts
+        } else if let Some(end_tx_id) = self.end.as_txid() {
+            // Row is being deleted/updated by another transaction
+            // If it's OUR transaction, the B-tree row is invalid (we deleted/updated it)
+            end_tx_id == tx.tx_id
+        } else {
+            false
         }
     }
 }
 
 fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &RowVersion) -> bool {
-    match rv.begin {
-        Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => tx.begin_ts >= rv_begin_ts,
-        Some(TxTimestampOrID::TxID(rv_begin)) => {
-            let tb = txs
-                .get(&rv_begin)
-                .unwrap_or_else(|| panic!("transaction {rv_begin:?} should exist in txs map"));
-            let tb = tb.value();
-            let visible = match tb.state.load() {
-                TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
-                TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
-                TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
-                TransactionState::Aborted => false,
-                TransactionState::Terminated => {
-                    tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
-                    false
-                }
-            };
-            tracing::trace!(
-                "is_begin_visible: tx={tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
-                rv.begin,
-                rv.end
-            );
-            visible
-        }
-        None => false,
-    }
-
-    if let Some(rv_begin) = rv.begin.as_txid() {
+    if let Some(rv_begin_ts) = rv.begin.as_timestamp() {
+        tx.begin_ts >= rv_begin_ts
+    } else if let Some(rv_begin) = rv.begin.as_txid() {
         let tb = txs
             .get(&rv_begin)
-            .expect("transaction should exist in txs map");
+            .unwrap_or_else(|| panic!("transaction {rv_begin:?} should exist in txs map"));
         let tb = tb.value();
-
         let visible = match tb.state.load() {
             TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
-            TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
+            TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
             TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
             TransactionState::Aborted => false,
             TransactionState::Terminated => {
@@ -3580,17 +3551,15 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
                 false
             }
         };
-
         tracing::trace!(
             "is_begin_visible: tx={tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
             rv.begin,
             rv.end
         );
-
-        return visible;
+        visible
+    } else {
+        false
     }
-
-    false
 }
 
 fn is_end_visible(
@@ -3598,34 +3567,34 @@ fn is_end_visible(
     current_tx: &Transaction,
     row_version: &RowVersion,
 ) -> bool {
-    match row_version.end {
-        Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
-        Some(TxTimestampOrID::TxID(rv_end)) => {
-            let other_tx = txs
-                .get(&rv_end)
-                .unwrap_or_else(|| panic!("Transaction {rv_end} not found"));
-            let other_tx = other_tx.value();
-            let visible = match other_tx.state.load() {
-                // V's sharp mind discovered an issue with the hekaton paper which basically states that a
-                // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
-                // Source: https://avi.im/blag/2023/hekaton-paper-typo/
-                TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                // Table 2 (Hekaton): If TS > RT, V is visible. If TS < RT, T speculatively ignores V.
-                TransactionState::Preparing(end_ts) => current_tx.begin_ts < end_ts,
-                TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
-                TransactionState::Aborted => true,
-                // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
-                // reachable from Aborted, and abort rollback resets end to None → visible.
-                TransactionState::Terminated => true,
-            };
-            tracing::trace!(
-                "is_end_visible: tx={current_tx}, te={other_tx} rv = {:?}-{:?}  visible = {visible}",
-                row_version.begin,
-                row_version.end
-            );
-            visible
-        }
-        None => true,
+    if let Some(rv_end_ts) = row_version.end.as_timestamp() {
+        current_tx.begin_ts < rv_end_ts
+    } else if let Some(rv_end) = row_version.end.as_txid() {
+        let other_tx = txs
+            .get(&rv_end)
+            .unwrap_or_else(|| panic!("Transaction {rv_end} not found"));
+        let other_tx = other_tx.value();
+        let visible = match other_tx.state.load() {
+            // V's sharp mind discovered an issue with the hekaton paper which basically states that a
+            // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
+            // Source: https://avi.im/blag/2023/hekaton-paper-typo/
+            TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
+            // Table 2 (Hekaton): If TS > RT, V is visible. If TS < RT, T speculatively ignores V.
+            TransactionState::Preparing(end_ts) => current_tx.begin_ts < end_ts,
+            TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
+            TransactionState::Aborted => true,
+            // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
+            // reachable from Aborted, and abort rollback resets end to None → visible.
+            TransactionState::Terminated => true,
+        };
+        tracing::trace!(
+            "is_end_visible: tx={current_tx}, te={other_tx} rv = {:?}-{:?}  visible = {visible}",
+            row_version.begin,
+            row_version.end
+        );
+        visible
+    } else {
+        true
     }
 }
 

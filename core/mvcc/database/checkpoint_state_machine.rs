@@ -915,7 +915,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         })?;
 
                 // Check if this is an insert or delete
-                if !row_version.end.is_none() {
+                if row_version.end.is_some() {
                     // This is a delete operation.
                     // Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
                     // since there is no existing row to delete.
