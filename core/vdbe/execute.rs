@@ -11906,8 +11906,14 @@ fn op_vacuum_into_inner(
                 // This batches all writes and ensures destination is either empty or complete.
                 dest_conn.execute("BEGIN")?;
 
-                let schema_sql = "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END";
-                let schema_stmt = program.connection.prepare(schema_sql)?;
+                // Exclude the MVCC metadata table from the vacuum destination — it is an
+                // internal artifact of experimental_mvcc mode and must not appear in a
+                // standalone SQLite file produced by VACUUM INTO.
+                let schema_sql = format!(
+                    "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
+                    crate::mvcc::database::MVCC_META_TABLE_NAME
+                );
+                let schema_stmt = program.connection.prepare(schema_sql.as_str())?;
 
                 vacuum_state.dest_db = Some(dest_db);
                 vacuum_state.source_user_version = user_version;
@@ -11954,6 +11960,7 @@ fn op_vacuum_into_inner(
                                         if type_val.as_str() == "table"
                                             && (!name.starts_with("sqlite_")
                                                 || name == "sqlite_sequence")
+                                            && name != crate::mvcc::database::MVCC_META_TABLE_NAME
                                         {
                                             return Some(name.to_string());
                                         }
