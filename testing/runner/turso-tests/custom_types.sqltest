@@ -119,15 +119,24 @@ test cast-to-custom-type {
     SELECT CAST('hello' AS test_reverse);
 }
 expect {
-    hello
+    olleh
 }
 
 @requires strict "uses STRICT tables"
 test cast-to-parametric-type {
-    SELECT CAST(42 AS numeric(10,2));
+    SELECT typeof(CAST(42 AS numeric(10,2)));
 }
 expect {
-    42.00
+    blob
+}
+
+@requires strict "uses STRICT tables"
+test cast-to-custom-type-encode-only {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    SELECT CAST(42 AS cents);
+}
+expect {
+    4200
 }
 
 @requires strict "uses STRICT tables"

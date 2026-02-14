@@ -1325,24 +1325,13 @@ pub fn translate_expr(
                         );
                         cast_col.ty_params = ty_params;
 
-                        // CAST to custom type: encode then decode to produce the
-                        // normalized user-facing form (matching PostgreSQL semantics).
-                        // e.g. CAST(42 AS numeric(10,2)) → '42.00'
+                        // CAST to custom type applies only the encode function,
+                        // producing the stored representation.
+                        // e.g. CAST(42 AS cents) → 4200
                         if let Some(ref encode_expr) = type_def.encode {
                             emit_type_expr(
                                 program,
                                 encode_expr,
-                                target_register,
-                                target_register,
-                                &cast_col,
-                                type_def,
-                                resolver,
-                            )?;
-                        }
-                        if let Some(ref decode_expr) = type_def.decode {
-                            emit_type_expr(
-                                program,
-                                decode_expr,
                                 target_register,
                                 target_register,
                                 &cast_col,
