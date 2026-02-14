@@ -212,39 +212,6 @@ Performance scales sub-linearly due to queue sync overhead and corpus sharing.
 
 ## Monitoring
 
-### Real-time status (recommended)
-
-```bash
-./whatsup.sh [OUTPUT_DIR] [--verbose]
-```
-
-Compact monitoring view suitable for `watch`. Default output dir: `/tmp/sqlright_test`
-
-Example output:
-```
-=== SQLRight Fuzzer Monitor ===
-Output: /tmp/sqlright_test
-
-SUMMARY: 63 instances | 12453 execs | 15 crashes | 320 eps | 3.41% cov
-
-⚠️  2 instances with execs_since_crash=0 (crashing on every exec)
-
-Stuck instances: 3 (showing first 5)
-  secondary_15: execs=2 eps=0.00 crashes=2
-  secondary_26: execs=1 eps=0.00 crashes=1
-  secondary_31: execs=3 eps=0.00 crashes=2
-
-Total crash files: 15
-
-Run with --verbose for detailed crash analysis
-```
-
-Use `watch -n5 ./whatsup.sh` for live monitoring. Add `--verbose` flag for detailed per-instance crash distribution and source analysis.
-
-During calibration (before fuzzer_stats exists), shows initialization progress: AFL processes running, last test execution time, seed processing status, and CPU usage.
-
-### Manual inspection
-
 ```bash
 cat /tmp/sqlright_test/primary/fuzzer_stats
 ```
@@ -291,7 +258,6 @@ testing/sqlright/
 ├── run.sh                # quick fuzzing script
 ├── run_production.sh     # production fuzzing script
 ├── collect_coverage.sh   # coverage report generation
-├── whatsup.sh            # real-time fuzzer monitoring
 ├── check_affinity.sh     # CPU affinity verification
 ├── patches/              # git patches applied to SQLRight
 │   └── 0001-turso-increase-map-size-and-fix-gcc13.patch
@@ -356,4 +322,4 @@ testing/sqlright/
 - **Queue growth:** Normal, especially early in fuzzing (new coverage paths discovered)
 - **Crashes found:** If target has bugs, expect crashes within first hour
 
-Use `./whatsup.sh` to monitor progress and diagnose issues.
+Check `fuzzer_stats` files to monitor progress and diagnose issues.

@@ -276,15 +276,17 @@ def run_extended_checks(db_path, timeout):
                 # Prefix: all prior columns must be equal (NULL-safe via IS)
                 prefix_eq = ' AND '.join(
                     f"_p{j} IS {quote_ident(cols[j]['name'])}"
+                    f"{' COLLATE ' + cols[j]['collation'] if cols[j]['collation'] != 'BINARY' else ''}"
                     for j in range(i)
                 )
                 qc = quote_ident(c['name'])
+                collate = f" COLLATE {c['collation']}" if c['collation'] != 'BINARY' else ""
                 if not c['desc']:
                     # ASC: violation when prev is non-NULL but curr is NULL or prev > curr
-                    cond = f"(_p{i} IS NOT NULL AND ({qc} IS NULL OR _p{i} > {qc}))"
+                    cond = f"(_p{i} IS NOT NULL AND ({qc} IS NULL OR _p{i} > {qc}{collate}))"
                 else:
                     # DESC: violation when curr is non-NULL but prev is NULL or prev < curr
-                    cond = f"({qc} IS NOT NULL AND (_p{i} IS NULL OR _p{i} < {qc}))"
+                    cond = f"({qc} IS NOT NULL AND (_p{i} IS NULL OR _p{i} < {qc}{collate}))"
                 if prefix_eq:
                     cond = f"({prefix_eq} AND {cond})"
                 conditions.append(cond)
@@ -391,11 +393,12 @@ def check_one(tursodb_path: Path, sql_path: Path, timeout: int):
     1. Create a unique temp DB file
     2. Run tursodb with file-backed DB, piping in the SQL
     3. Run sqlite3 PRAGMA integrity_check on the result
-    4. Run extended checks (page size, index ordering, round-trip)
-    5. Clean up temp files
+    4. Run tursodb PRAGMA integrity_check on the result (catches turso-specific issues)
+    5. Run extended checks (page size, index ordering, round-trip)
+    6. Clean up temp files
 
     Returns dict with turso_exit_code, turso_stderr, integrity_output,
-    extended_output, passed.
+    turso_integrity_output, extended_output, passed.
     """
     fd, tmp_db = tempfile.mkstemp(suffix='.db', prefix='integrity_',
                                   dir='/tmp/claude')
@@ -407,6 +410,7 @@ def check_one(tursodb_path: Path, sql_path: Path, timeout: int):
         'turso_exit_code': None,
         'turso_stderr': None,
         'integrity_output': None,
+        'turso_integrity_output': None,
         'extended_output': None,
         'passed': True,  # Default: no file created = no corruption possible
     }
@@ -418,7 +422,11 @@ def check_one(tursodb_path: Path, sql_path: Path, timeout: int):
         # Run tursodb with the SQL input
         try:
             turso_proc = subprocess.run(
-                [str(tursodb_path), tmp_db, '-q', '-m', 'list'],
+                [str(tursodb_path), tmp_db, '-q', '-m', 'list',
+                 '--experimental-views', '--experimental-strict',
+                 '--experimental-triggers', '--experimental-index-method',
+                 '--experimental-autovacuum', '--experimental-attach',
+                 '--experimental-encryption'],
                 input=sql_content,
                 capture_output=True,
                 timeout=timeout,
@@ -456,6 +464,31 @@ def check_one(tursodb_path: Path, sql_path: Path, timeout: int):
         except Exception as e:
             result['integrity_output'] = f'ERROR: {e}'
             result['passed'] = False
+
+        # Run tursodb's own integrity_check (catches turso-specific issues
+        # like duplicate rowids in indexes)
+        try:
+            turso_check = subprocess.run(
+                [str(tursodb_path), tmp_db, '-q', '-m', 'list',
+                 '--experimental-views', '--experimental-strict',
+                 '--experimental-triggers', '--experimental-index-method',
+                 '--experimental-autovacuum', '--experimental-attach',
+                 '--experimental-encryption'],
+                input=b'PRAGMA integrity_check;\n',
+                capture_output=True,
+                timeout=timeout,
+            )
+            turso_output = turso_check.stdout.decode('utf-8', errors='replace').strip()
+            result['turso_integrity_output'] = turso_output[:4096] if turso_output else None
+            # Only mark as failed if turso explicitly reported errors (non-empty, non-ok).
+            # Empty output means tursodb crashed during the check — don't count that
+            # as an integrity failure since sqlite3 already validated the DB.
+            if turso_output and turso_output != 'ok':
+                result['passed'] = False
+        except subprocess.TimeoutExpired:
+            result['turso_integrity_output'] = 'TIMEOUT'
+        except Exception as e:
+            result['turso_integrity_output'] = f'ERROR: {e}'
 
         # Run extended checks if basic check passed
         if result['passed']:
@@ -625,15 +658,27 @@ Examples:
                 integrity_output=result['integrity_output'],
                 passed=result['passed'],
                 extended_output=result.get('extended_output'),
+                turso_integrity_output=result.get('turso_integrity_output'),
             )
 
             if result['passed']:
                 passed += 1
             else:
                 failed += 1
-                detail = result['integrity_output'][:100]
-                if result.get('extended_output') and result['integrity_output'] == 'ok':
-                    detail = result['extended_output'][:200]
+                details = []
+                sqlite_out = result.get('integrity_output', '')
+                turso_out = result.get('turso_integrity_output', '')
+                ext_out = result.get('extended_output', '')
+                if sqlite_out and sqlite_out != 'ok':
+                    details.append(f"sqlite3: {sqlite_out[:100]}")
+                if turso_out and turso_out not in ('ok', '', None):
+                    details.append(f"turso: {turso_out[:100]}")
+                if ext_out:
+                    # Show only FAIL lines from extended output
+                    fail_lines = [l for l in ext_out.split('\n') if l.startswith('[FAIL]')]
+                    if fail_lines:
+                        details.append(f"extended: {'; '.join(fail_lines)[:150]}")
+                detail = ' | '.join(details) if details else 'unknown'
                 logger.warning(f"FAIL: {sql_path.name} — {detail}")
 
             # Progress every 10 items

@@ -47,7 +47,13 @@ class CrashExecutor:
                     str(self.tursodb_path),
                     '-q',  # Quiet mode
                     '-m', 'list',  # List mode
-                    '--experimental-attach',  # Enable experimental features
+                    '--experimental-views',
+                    '--experimental-strict',
+                    '--experimental-triggers',
+                    '--experimental-index-method',
+                    '--experimental-autovacuum',
+                    '--experimental-attach',
+                    '--experimental-encryption',
                 ],
                 input=sql_content,
                 capture_output=True,

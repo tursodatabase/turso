@@ -1,5 +1,5 @@
 #!/bin/bash
-# SQLRight fuzzer for Turso - Quick run script.
+# SQLRight fuzzer using SQLRight's default seeds (116 curated SQL inputs).
 # Usage: ./run.sh [--cores N] [--oracle NOREC|TLP|INDEX] [--resume]
 set -e
 
@@ -21,7 +21,7 @@ done
 BUILD_DIR="$SCRIPT_DIR/build"
 AFL="$BUILD_DIR/afl-fuzz"
 TURSODB="$LIMBO_ROOT/target/fuzzing/tursodb"
-SEEDS_DIR="$SCRIPT_DIR/seeds"
+SEEDS_DIR="$BUILD_DIR/sqlright/SQLite/docker/fuzz_root/inputs"
 OUTPUT="/tmp/sqlright_test"
 
 # Verify setup
@@ -37,16 +37,21 @@ if [ ! -x "$TURSODB" ]; then
     exit 1
 fi
 
+if [ ! -d "$SEEDS_DIR" ] || [ -z "$(ls -A "$SEEDS_DIR")" ]; then
+    echo "Error: SQLRight default seeds not found at $SEEDS_DIR"
+    echo "Run setup first: $SCRIPT_DIR/setup.sh"
+    exit 1
+fi
+
 export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
 export AFL_SKIP_CPUFREQ=1
 export AFL_MAP_SIZE=2097152
 export AFL_OLD_FORKSERVER=1
-export AFL_HANG_TMOUT=30000  # 30 seconds - only mark truly stuck queries as hangs
-export AFL_SKIP_CRASHES=1    # Skip inputs that crash, don't fuzz them indefinitely
-export AFL_NO_AFFINITY=1     # Disable automatic CPU binding to prevent race condition
+export AFL_HANG_TMOUT=30000
+export AFL_SKIP_CRASHES=1
+export AFL_NO_AFFINITY=1
 
-AFL_CMD="$AFL -t 1000"  # 1 second timeout (normal queries finish in ~20ms)
-# Enable all experimental features to maximize attack surface
+AFL_CMD="$AFL -t 1000"
 AFL_TARGET="-- $TURSODB -q -m list --experimental-views --experimental-strict --experimental-triggers --experimental-index-method --experimental-autovacuum --experimental-attach --experimental-encryption"
 
 if [ "$RESUME" = true ] && [ -d "$OUTPUT/primary/queue" ]; then
@@ -54,14 +59,7 @@ if [ "$RESUME" = true ] && [ -d "$OUTPUT/primary/queue" ]; then
     INPUT_FLAG="-"
 else
     RESUME=false
-
-    # Extract seeds from sqltest corpus
-    echo "Extracting seeds from sqltest corpus..."
-    cargo run --manifest-path "$LIMBO_ROOT/Cargo.toml" --profile fuzzing --bin test-runner -- \
-        extract-sql "$LIMBO_ROOT/testing/runner/tests/" \
-        --output-dir "$SEEDS_DIR"
-    echo "Seeds: $(ls "$SEEDS_DIR" | wc -l) files"
-
+    echo "Using SQLRight default seeds: $(ls "$SEEDS_DIR" | wc -l) files"
     rm -rf "$OUTPUT"
     INPUT_FLAG="$SEEDS_DIR"
 fi
@@ -82,25 +80,23 @@ cleanup() {
 }
 trap "cleanup; rm -rf $BASE_WORK_DIR" INT TERM
 
-echo "=== Fuzzing with $CORES core(s), oracle=$ORACLE ==="
-echo "Fix: Each instance has its own working directory to avoid file contention"
-echo ""
-
-# Limit cores to avoid using CPU 0 (reserved for system)
-RESERVED_CORES=1  # Reserve CPU 0 for system interrupts
+# Limit cores
+RESERVED_CORES=1
 MAX_CORES=63
 AVAILABLE_CORES=$(($(nproc) - RESERVED_CORES))
 if [ "$AVAILABLE_CORES" -gt "$MAX_CORES" ]; then
     AVAILABLE_CORES=$MAX_CORES
 fi
 if [ "$CORES" -gt "$AVAILABLE_CORES" ]; then
-    echo "WARNING: Requested $CORES cores, limiting to $AVAILABLE_CORES (CPU 0 reserved, max $MAX_CORES for safety)"
+    echo "WARNING: Requested $CORES cores, limiting to $AVAILABLE_CORES"
     CORES=$AVAILABLE_CORES
 fi
-echo "Using $CORES cores (CPUs 1-$CORES), CPU 0 reserved for system"
+
+echo "=== Fuzzing with $CORES core(s), oracle=$ORACLE ==="
+echo "Seeds:  $SEEDS_DIR"
+echo "Output: $OUTPUT"
 echo ""
 
-# Helper function to create per-instance working directory
 setup_work_dir() {
     local instance_name=$1
     local work_dir="$BASE_WORK_DIR/$instance_name"
@@ -111,13 +107,14 @@ setup_work_dir() {
     echo "$work_dir"
 }
 
-# Launch primary instance with its own working directory
+# Launch primary
 PRIMARY_WORK_DIR=$(setup_work_dir "primary")
 PRIMARY_CPU=1
 (cd "$PRIMARY_WORK_DIR" && taskset -c $PRIMARY_CPU $AFL_CMD -M primary -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET) &
 PIDS+=($!)
-echo "  primary (PID $!, CPU $PRIMARY_CPU) started in $PRIMARY_WORK_DIR"
+echo "  primary (PID $!, CPU $PRIMARY_CPU)"
 
+# Launch secondaries
 if [ "$CORES" -gt 1 ]; then
     sleep 2
     for i in $(seq 2 "$CORES"); do
@@ -125,31 +122,14 @@ if [ "$CORES" -gt 1 ]; then
         SEC_CPU=$i
         (cd "$SEC_WORK_DIR" && taskset -c $SEC_CPU $AFL_CMD -S "secondary_$i" -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET) &
         PIDS+=($!)
-        echo "  secondary_$i (PID $!, CPU $SEC_CPU) started in $SEC_WORK_DIR"
+        echo "  secondary_$i (PID $!, CPU $SEC_CPU)"
     done
 fi
 
 echo ""
-echo "Output: $OUTPUT"
-echo "Stats:  cat $OUTPUT/primary/fuzzer_stats"
-echo "Stop:   Ctrl+C"
+echo "Stats: cat $OUTPUT/primary/fuzzer_stats"
+echo "Stop:  Ctrl+C"
 echo ""
-
-# Verify CPU affinity
-verify_affinity() {
-    sleep 3
-    echo "=== Verifying CPU Affinity ==="
-    for pid in "${PIDS[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
-            affinity=$(taskset -cp "$pid" 2>/dev/null | awk '{print $NF}')
-            instance=$(ps -o args= -p "$pid" 2>/dev/null | grep -oP '(-M|-S) \K\S+' || echo "unknown")
-            echo "  $instance (PID $pid): CPU affinity = $affinity"
-        fi
-    done
-    echo ""
-}
-
-verify_affinity
 
 wait "${PIDS[0]}" 2>/dev/null || true
 cleanup
