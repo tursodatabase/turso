@@ -651,36 +651,32 @@ pub fn emit_fk_child_update_counters(
     new_rowid_reg: usize,
     updated_cols: &HashSet<usize>,
 ) -> Result<()> {
-    // Helper: materialize OLD tuple for this FK; returns (start_reg, ncols) or None if any component is NULL.
-    let load_old_tuple =
-        |program: &mut ProgramBuilder, fk_cols: &[String]| -> Option<(usize, usize)> {
-            let n = fk_cols.len();
-            let start = program.alloc_registers(n);
-            let null_jmp = program.allocate_label();
+    // Helper: materialize OLD tuple for this FK.
+    // Returns (start_reg, ncols, skip_label). If any component is NULL at runtime,
+    // execution jumps to skip_label.
+    let load_old_tuple = |program: &mut ProgramBuilder,
+                          fk_cols: &[String]|
+     -> Option<(usize, usize, BranchOffset)> {
+        let n = fk_cols.len();
+        let start = program.alloc_registers(n);
+        let skip = program.allocate_label();
 
-            for (k, cname) in fk_cols.iter().enumerate() {
-                let (pos, _col) = match child_tbl.get_column(cname) {
-                    Some(v) => v,
-                    None => {
-                        return None;
-                    }
-                };
-                program.emit_column_or_rowid(child_cursor_id, pos, start + k);
-                program.emit_insn(Insn::IsNull {
-                    reg: start + k,
-                    target_pc: null_jmp,
-                });
-            }
+        for (k, cname) in fk_cols.iter().enumerate() {
+            let (pos, _col) = match child_tbl.get_column(cname) {
+                Some(v) => v,
+                None => {
+                    return None;
+                }
+            };
+            program.emit_column_or_rowid(child_cursor_id, pos, start + k);
+            program.emit_insn(Insn::IsNull {
+                reg: start + k,
+                target_pc: skip,
+            });
+        }
 
-            // No NULLs, proceed
-            let cont = program.allocate_label();
-            program.emit_insn(Insn::Goto { target_pc: cont });
-            // NULL encountered: invalidate tuple by jumping here
-            program.preassign_label_to_next_insn(null_jmp);
-
-            program.preassign_label_to_next_insn(cont);
-            Some((start, n))
-        };
+        Some((start, n, skip))
+    };
 
     for fk_ref in resolver.schema.resolved_fks_for_child(child_table_name)? {
         // If the child-side FK columns did not change, there is nothing to do.
@@ -692,7 +688,9 @@ pub fn emit_fk_child_update_counters(
 
         // Pass 1: OLD tuple handling only for deferred FKs
         if fk_ref.fk.deferred {
-            if let Some((old_start, _)) = load_old_tuple(program, &fk_ref.child_cols) {
+            if let Some((old_start, _, old_tuple_skip)) =
+                load_old_tuple(program, &fk_ref.child_cols)
+            {
                 if fk_ref.parent_uses_rowid {
                     // Parent key is rowid: probe parent table by rowid
                     let parent_tbl = resolver
@@ -759,6 +757,7 @@ pub fn emit_fk_child_update_counters(
                         },
                     )?;
                 }
+                program.preassign_label_to_next_insn(old_tuple_skip);
             }
         }
 

@@ -189,6 +189,13 @@ pub enum RegisterOrLiteral<T: Copy + std::fmt::Display> {
     Literal(T),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum SavepointOp {
+    Begin,
+    Release,
+    RollbackTo,
+}
+
 impl From<PageIdx> for RegisterOrLiteral<PageIdx> {
     fn from(value: PageIdx) -> Self {
         RegisterOrLiteral::Literal(value)
@@ -602,6 +609,12 @@ pub enum Insn {
     AutoCommit {
         auto_commit: bool,
         rollback: bool,
+    },
+
+    /// Execute a named savepoint operation.
+    Savepoint {
+        op: SavepointOp,
+        name: String,
     },
 
     /// Branch to the given PC.
@@ -1534,6 +1547,7 @@ impl InsnVariants {
             InsnVariants::HaltIfNull => execute::op_halt_if_null,
             InsnVariants::Transaction => execute::op_transaction,
             InsnVariants::AutoCommit => execute::op_auto_commit,
+            InsnVariants::Savepoint => execute::op_savepoint,
             InsnVariants::Goto => execute::op_goto,
             InsnVariants::Gosub => execute::op_gosub,
             InsnVariants::Return => execute::op_return,

@@ -275,10 +275,11 @@ impl File for OpfsFile {
     }
 
     fn size(&self) -> turso_core::Result<u64> {
-        assert!(
-            is_web_worker_safe(),
-            "size can be called only from web worker context"
-        );
+        if !is_web_worker_safe() {
+            return Err(turso_core::LimboError::InternalError(
+                "size can be called only from web worker context".to_string(),
+            ));
+        }
         tracing::debug!("size({})", self.handle);
         let handle = self.handle;
         let result = unsafe { size(handle) };

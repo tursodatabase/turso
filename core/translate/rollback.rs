@@ -1,23 +1,48 @@
 use turso_parser::ast::Name;
 
 use crate::{
-    vdbe::{builder::ProgramBuilder, insn::Insn},
+    vdbe::{
+        builder::ProgramBuilder,
+        insn::{Insn, SavepointOp},
+    },
     Result,
 };
 
+/// Emits bytecode for `SAVEPOINT <name>`.
+pub fn translate_savepoint(mut program: ProgramBuilder, name: Name) -> Result<ProgramBuilder> {
+    program.emit_insn(Insn::Savepoint {
+        op: SavepointOp::Begin,
+        name: name.as_str().to_ascii_lowercase(),
+    });
+    Ok(program)
+}
+
+/// Emits bytecode for `RELEASE [SAVEPOINT] <name>`.
+pub fn translate_release(mut program: ProgramBuilder, name: Name) -> Result<ProgramBuilder> {
+    program.emit_insn(Insn::Savepoint {
+        op: SavepointOp::Release,
+        name: name.as_str().to_ascii_lowercase(),
+    });
+    Ok(program)
+}
+
+/// Emits bytecode for either full transaction rollback or `ROLLBACK TO` named savepoint.
 pub fn translate_rollback(
     mut program: ProgramBuilder,
-    txn_name: Option<Name>,
+    _txn_name: Option<Name>,
     savepoint_name: Option<Name>,
 ) -> Result<ProgramBuilder> {
-    assert!(
-        txn_name.is_none() && savepoint_name.is_none(),
-        "txn_name and savepoint not supported yet"
-    );
-    program.emit_insn(Insn::AutoCommit {
-        auto_commit: true,
-        rollback: true,
-    });
-    program.rollback();
+    if let Some(savepoint_name) = savepoint_name {
+        program.emit_insn(Insn::Savepoint {
+            op: SavepointOp::RollbackTo,
+            name: savepoint_name.as_str().to_ascii_lowercase(),
+        });
+    } else {
+        program.emit_insn(Insn::AutoCommit {
+            auto_commit: true,
+            rollback: true,
+        });
+        program.rollback();
+    }
     Ok(program)
 }

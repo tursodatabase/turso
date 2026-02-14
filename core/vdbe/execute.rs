@@ -12,7 +12,7 @@ use crate::storage::btree::{
 use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
-use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
+use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef, SavepointResult};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
@@ -78,7 +78,7 @@ use crate::{
     util::{cast_real_to_integer, checked_cast_text_to_numeric, parse_schema_rows},
     vdbe::{
         builder::CursorType,
-        insn::{IdxInsertFlags, Insn},
+        insn::{IdxInsertFlags, Insn, SavepointOp},
     },
 };
 
@@ -2006,7 +2006,14 @@ pub fn halt(
                 .swap(0, Ordering::AcqRel);
             if deferred_violations > 0 {
                 vtab_rollback_all(&program.connection)?;
-                pager.rollback_tx(&program.connection);
+                if let Some(mv_store) = mv_store.as_ref() {
+                    if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                        mv_store.rollback_tx(tx_id, pager.clone(), &program.connection);
+                    }
+                    pager.end_read_tx();
+                } else {
+                    pager.rollback_tx(&program.connection);
+                }
                 program.connection.set_tx_state(TransactionState::None);
                 program.connection.auto_commit.store(true, Ordering::SeqCst);
                 return Err(LimboError::ForeignKeyConstraint(
@@ -2520,6 +2527,16 @@ pub fn op_auto_commit(
         .commit_txn(pager.clone(), state, mv_store.as_ref(), requested_rollback)
         .map(Into::into);
 
+    if mv_store.is_none()
+        && matches!(
+            res,
+            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
+        )
+        && (is_rollback_req || is_commit_req)
+    {
+        pager.clear_savepoints()?;
+    }
+
     // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
     if fk_on
         && matches!(
@@ -2532,6 +2549,107 @@ pub fn op_auto_commit(
     }
 
     res
+}
+
+pub fn op_savepoint(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(Savepoint { op, name }, insn);
+    let conn = program.connection.clone();
+    let mv_store = conn.mv_store();
+
+    match *op {
+        SavepointOp::Begin => {
+            let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
+            let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
+
+            if let Some(mv_store) = mv_store.as_ref() {
+                let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
+                    tx_id
+                } else {
+                    let tx_id = mv_store.begin_tx(pager.clone())?;
+                    conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
+                    if matches!(conn.get_tx_state(), TransactionState::None) {
+                        conn.set_tx_state(TransactionState::Read);
+                    }
+                    tx_id
+                };
+                mv_store.begin_named_savepoint(
+                    tx_id,
+                    name.clone(),
+                    starts_transaction,
+                    deferred_fk_violations,
+                );
+            } else {
+                pager.open_subjournal()?;
+                let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
+                pager.open_named_savepoint(
+                    name.clone(),
+                    db_size,
+                    starts_transaction,
+                    deferred_fk_violations,
+                )?;
+            }
+
+            if starts_transaction {
+                conn.auto_commit.store(false, Ordering::SeqCst);
+            }
+
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        SavepointOp::Release => {
+            let release_result = if let Some(mv_store) = mv_store.as_ref() {
+                match conn.get_mv_tx_id() {
+                    Some(tx_id) => mv_store.release_named_savepoint(tx_id, name)?,
+                    None => SavepointResult::NotFound,
+                }
+            } else {
+                pager.release_named_savepoint(name)?
+            };
+            match release_result {
+                SavepointResult::NotFound => {
+                    return Err(LimboError::TxError(format!("no such savepoint: {name}")));
+                }
+                SavepointResult::Release => {
+                    // Savepoint released successfully, just continue
+                }
+                SavepointResult::Commit => {
+                    // This means that releasing the savepoint caused the transaction to commit, so we need to auto-commit here.
+                    let auto_commit = Insn::AutoCommit {
+                        auto_commit: true,
+                        rollback: false,
+                    };
+                    return op_auto_commit(program, state, &auto_commit, pager);
+                }
+            }
+
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        SavepointOp::RollbackTo => {
+            let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
+                match conn.get_mv_tx_id() {
+                    Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
+                    None => None,
+                }
+            } else {
+                pager.rollback_to_named_savepoint(name)?
+            };
+
+            let Some(deferred_fk_snapshot) = deferred_fk_snapshot else {
+                return Err(LimboError::TxError(format!("no such savepoint: {name}")));
+            };
+            conn.fk_deferred_violations
+                .store(deferred_fk_snapshot, Ordering::SeqCst);
+
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+    }
 }
 
 fn check_deferred_fk_on_commit(conn: &Connection) -> Result<()> {
@@ -3357,7 +3475,9 @@ pub fn seek_internal(
                                     .as_btree_mut();
                                 let record = match &registers[*record_reg] {
                                     Register::Record(ref record) => record,
-                                    _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                                    _ => unreachable!(
+                                        "op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"
+                                    ),
                                 };
                                 (cursor, record)
                             };
@@ -5407,7 +5527,7 @@ pub fn op_function(
                             None => {
                                 return Err(LimboError::InvalidArgument(format!(
                                     "table_columns_json_array: table {table} doesn't exists"
-                                )))
+                                )));
                             }
                         }
                     };
@@ -6567,7 +6687,10 @@ pub fn op_insert(
                     continue;
                 }
 
-                turso_assert!(!flag.has(InsertFlags::REQUIRE_SEEK), "to capture old record accurately, we must be located at the correct position in the table");
+                turso_assert!(
+                    !flag.has(InsertFlags::REQUIRE_SEEK),
+                    "to capture old record accurately, we must be located at the correct position in the table"
+                );
 
                 // Get the key we're going to insert
                 let insert_key = match &state.registers[*key_reg].get_value() {
@@ -7257,7 +7380,11 @@ fn new_rowid_inner(
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-                        match return_if_io!(mvcc_cursor.start_new_rowid()) {
+                        let use_cached_allocator = matches!(
+                            program.connection.get_mv_tx(),
+                            Some((_, TransactionMode::Concurrent))
+                        ) || program.connection.get_auto_commit();
+                        match return_if_io!(mvcc_cursor.start_new_rowid(use_cached_allocator)) {
                             NextRowidResult::Uninitialized => {
                                 // we need to find last to initialize it
                                 state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
@@ -8330,7 +8457,7 @@ pub fn op_populate_materialized_views(
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
-                    ))
+                    ));
                 }
             };
 
@@ -8364,7 +8491,7 @@ pub fn op_populate_materialized_views(
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view population".into(),
-                    ))
+                    ));
                 }
             };
 
@@ -8445,13 +8572,21 @@ pub fn op_set_cookie(
                 Cookie::SchemaVersion => {
                     // we update transaction state to indicate that the schema has changed
                     match program.connection.get_tx_state() {
-                    TransactionState::Write { .. } => {
-                        program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
-                    },
-                    TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                    TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                    TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
-                }
+                        TransactionState::Write { .. } => {
+                            program.connection.set_tx_state(TransactionState::Write {
+                                schema_did_change: true,
+                            });
+                        }
+                        TransactionState::Read => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::Read, should be write"
+                        ),
+                        TransactionState::None => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::None, should be write"
+                        ),
+                        TransactionState::PendingUpgrade { .. } => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"
+                        ),
+                    }
                     program
                         .connection
                         .with_schema_mut(|schema| schema.schema_version = *value as u32);
@@ -9385,7 +9520,10 @@ pub fn op_integrity_check(
                         auto_vacuum_mode,
                         crate::storage::pager::AutoVacuumMode::None
                     ) {
-                        tracing::debug!("Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.", auto_vacuum_mode);
+                        tracing::debug!(
+                            "Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.",
+                            auto_vacuum_mode
+                        );
                         let page_size = pager.get_page_size_unchecked().get() as usize;
 
                         for page_number in 2..=integrity_check_state.db_size {
@@ -9393,7 +9531,10 @@ pub fn op_integrity_check(
                                 page_number as u32,
                                 page_size,
                             ) {
-                                tracing::debug!("Integrity check: Found and marking pointer-map page as visited: page_id={}", page_number);
+                                tracing::debug!(
+                                    "Integrity check: Found and marking pointer-map page as visited: page_id={}",
+                                    page_number
+                                );
 
                                 integrity_check_state.start(
                                     page_number as i64,
@@ -12480,7 +12621,9 @@ mod tests {
                     );
                 }
                 other => {
-                    panic!("String '{input}' should be converted to integer {expected_int}, got {other:?}");
+                    panic!(
+                        "String '{input}' should be converted to integer {expected_int}, got {other:?}"
+                    );
                 }
             }
         }

@@ -1,6 +1,6 @@
-use crate::common::TempDatabase;
+use crate::common::{ExecRows, TempDatabase};
 use std::sync::Arc;
-use turso_core::StepResult;
+use turso_core::{LimboError, StepResult};
 
 #[turso_macros::test(mvcc)]
 fn test_newrowid_mvcc_concurrent(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -96,6 +96,26 @@ fn test_newrowid_mvcc_concurrent(tmp_db: TempDatabase) -> anyhow::Result<()> {
     // Assertion disabled - concurrent inserts without transactions cause duplicates
     assert_eq!(count, (num_threads * inserts_per_thread) as i64);
     eprintln!("Test disabled - would need BEGIN CONCURRENT for proper concurrent testing");
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_rowid_reused_after_failed_autocommit_insert(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")?;
+
+    conn.execute("INSERT INTO t(v) VALUES('a')")?;
+    let err = conn
+        .execute("INSERT INTO t(v) VALUES('a')")
+        .expect_err("expected unique constraint");
+    assert!(
+        matches!(err, LimboError::Constraint(_)),
+        "expected unique constraint, got: {err:?}"
+    );
+
+    conn.execute("INSERT INTO t(v) VALUES('b')")?;
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows, vec![(1, "a".to_string()), (2, "b".to_string())]);
     Ok(())
 }
 

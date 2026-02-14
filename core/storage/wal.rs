@@ -976,7 +976,14 @@ impl WalFile {
                     shared.transaction_count.load(Ordering::Acquire),
                 )
             });
-        tracing::debug!("try_begin_read_tx: shared_max={}, nbackfills={}, last_checksum={:?}, checkpoint_seq={:?}, transaction_count={}", shared_max, nbackfills, last_checksum, checkpoint_seq, transaction_count);
+        tracing::debug!(
+            "try_begin_read_tx: shared_max={}, nbackfills={}, last_checksum={:?}, checkpoint_seq={:?}, transaction_count={}",
+            shared_max,
+            nbackfills,
+            last_checksum,
+            checkpoint_seq,
+            transaction_count
+        );
 
         // Check if database changed since this connection's last read transaction.
         // If it has, the connection will invalidate its page cache.
@@ -2245,8 +2252,6 @@ impl WalFile {
     }
 
     fn reset_internal_states(&self) {
-        self.max_frame_read_lock_index
-            .store(NO_LOCK_HELD, Ordering::Release);
         self.ongoing_checkpoint.write().reset();
         self.syncing.store(false, Ordering::Release);
     }
@@ -2483,9 +2488,7 @@ impl WalFile {
                         let wal_checkpoint_backfilled =
                             wal_total_backfilled.saturating_sub(ongoing_chkpt.min_frame - 1);
 
-                        tracing::debug!(
-                            "checkpoint: wal_max_frame={wal_max_frame}, wal_total_backfilled={wal_total_backfilled}, wal_checkpoint_backfilled={wal_checkpoint_backfilled}"
-                        );
+                        tracing::debug!("checkpoint: wal_max_frame={wal_max_frame}, wal_total_backfilled={wal_total_backfilled}, wal_checkpoint_backfilled={wal_checkpoint_backfilled}");
 
                         CheckpointResult::new(wal_max_frame, wal_total_backfilled, wal_checkpoint_backfilled)
                     });
@@ -2656,7 +2659,9 @@ impl WalFile {
             "backfills can't be more than max_frame"
         );
         if max_frame != nbackfills {
-            tracing::debug!("try_restart_log_before_write: max_frame={max_frame}, nbackfills={nbackfills}, not everything is backfilled to the DB file - can't restart the log");
+            tracing::debug!(
+                "try_restart_log_before_write: max_frame={max_frame}, nbackfills={nbackfills}, not everything is backfilled to the DB file - can't restart the log"
+            );
             return Ok(());
         }
         let read_lock_0 = self.with_shared(|s| s.read_locks[0].upgrade());
