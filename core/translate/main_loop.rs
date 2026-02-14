@@ -2792,7 +2792,15 @@ fn encode_seek_keys_for_custom_types(
     idx_col_offset: usize,
     resolver: &super::emitter::Resolver,
 ) -> crate::Result<()> {
-    let table = tables.find_table_by_identifier(&seek_index.table_name);
+    // First try by identifier (alias), then fall back to the underlying table
+    // name.  Ephemeral auto-indexes store the base table name (e.g. "t1") in
+    // `table_name`, but the table reference may use an alias (e.g. "a" in
+    // `FROM t1 a`).  Without the fallback, self-joins and aliased tables would
+    // fail to find the table, skipping the encode step entirely and causing a
+    // seek-key / index-key mismatch.
+    let table = tables
+        .find_table_by_identifier(&seek_index.table_name)
+        .or_else(|| tables.find_table_by_table_name(&seek_index.table_name));
     let table = match table {
         Some(t) => t,
         None => return Ok(()),

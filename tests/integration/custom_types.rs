@@ -157,4 +157,63 @@ mod tests {
         let rows: Vec<(i64,)> = conn2.exec_rows("SELECT amount FROM t1 WHERE id = 2");
         assert_eq!(rows, vec![(77,)]);
     }
+
+    /// Self-joins on custom type columns must return matching rows.
+    ///
+    /// The optimizer builds an ephemeral auto-index for the inner table.
+    /// The auto-index stores raw encoded values, so the seek key built from
+    /// the outer table must also be encoded.  Previously, the seek-key
+    /// encoder could not find the table metadata because it searched by
+    /// alias (e.g. "b") while the index stored the base table name ("t1"),
+    /// causing a seek-key / index-key mismatch and returning no rows.
+    #[test]
+    fn test_self_join_on_custom_type_column() {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("custom_types_self_join.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_strict(true)
+            .with_encryption(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 10)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 20)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 10)").unwrap();
+
+        // Self-join: rows with equal decoded amounts must match
+        let mut rows: Vec<(i64, i64)> =
+            conn.exec_rows("SELECT a.id, b.id FROM t1 a, t1 b WHERE a.amount = b.amount");
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, 1), (1, 3), (2, 2), (3, 1), (3, 3)],
+            "Self-join on custom type column should return matching rows"
+        );
+
+        // LEFT JOIN variant: unmatched rows should produce NULLs
+        conn.execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, amount cents) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 10)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2, 20)").unwrap();
+
+        let rows: Vec<(i64, String)> = conn.exec_rows(
+            "SELECT t1.id, COALESCE(CAST(t2.id AS TEXT), 'NULL') \
+             FROM t1 LEFT JOIN t2 ON t1.amount = t2.amount ORDER BY t1.id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                (1, "1".to_string()),
+                (2, "2".to_string()),
+                (3, "1".to_string()),
+            ],
+            "LEFT JOIN on custom type column should find matches and produce NULLs for non-matches"
+        );
+    }
 }
