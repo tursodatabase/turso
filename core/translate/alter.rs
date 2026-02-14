@@ -749,9 +749,7 @@ pub fn translate_alter_table(
                     // On non-STRICT tables any type name is allowed and is
                     // treated as a plain affinity hint (no encode/decode).
                     // Custom type validation only applies to STRICT tables.
-                    let type_def = resolver
-                        .schema
-                        .get_type_def_unchecked(&normalize_ident(ty));
+                    let type_def = resolver.schema.get_type_def_unchecked(&normalize_ident(ty));
                     if type_def.is_none() {
                         return Err(LimboError::ParseError(format!(
                             "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
