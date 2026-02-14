@@ -6506,3 +6506,48 @@ pub(crate) fn emit_custom_type_encode_columns(
     }
     Ok(())
 }
+
+/// Emit decode expressions for columns with custom types in a contiguous register range.
+/// Used by the UPSERT path to decode values that were read from disk (encoded) so that
+/// WHERE/SET expressions in DO UPDATE see user-facing values.
+///
+/// If `only_columns` is `Some`, only decode columns whose index is in the set.
+pub(crate) fn emit_custom_type_decode_columns(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    columns: &[crate::schema::Column],
+    start_reg: usize,
+    only_columns: Option<&std::collections::HashSet<usize>>,
+) -> Result<()> {
+    for (i, col) in columns.iter().enumerate() {
+        if let Some(filter) = only_columns {
+            if !filter.contains(&i) {
+                continue;
+            }
+        }
+        let type_name = &col.ty_str;
+        if type_name.is_empty() {
+            continue;
+        }
+        let Some(type_def) = resolver.schema.get_type_def_unchecked(type_name) else {
+            continue;
+        };
+        let Some(ref decode_expr) = type_def.decode else {
+            continue;
+        };
+
+        let reg = start_reg + i;
+
+        // Skip NULL values: jump over decode if NULL
+        let skip_label = program.allocate_label();
+        program.emit_insn(crate::vdbe::insn::Insn::IsNull {
+            reg,
+            target_pc: skip_label,
+        });
+
+        emit_type_expr(program, decode_expr, reg, reg, col, type_def, resolver)?;
+
+        program.preassign_label_to_next_insn(skip_label);
+    }
+    Ok(())
+}

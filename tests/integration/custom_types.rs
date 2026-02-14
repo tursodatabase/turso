@@ -158,6 +158,95 @@ mod tests {
         assert_eq!(rows, vec![(77,)]);
     }
 
+    /// UPSERT (INSERT ... ON CONFLICT DO UPDATE) must not double-encode
+    /// custom type values. The `excluded.column` pseudo-table must return
+    /// user-facing (decoded) values so that the DO UPDATE SET path encodes
+    /// them exactly once.
+    ///
+    /// Also tests that the WHERE clause in DO UPDATE sees decoded values,
+    /// and that sequential UPSERTs do not progressively corrupt data.
+    #[test]
+    fn test_upsert_does_not_double_encode_custom_types() {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("custom_types_upsert.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_strict(true)
+            .with_encryption(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 42)").unwrap();
+
+        // Bug 7: excluded.amount should not be double-encoded
+        conn.execute(
+            "INSERT INTO t1 VALUES (1, 50) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount",
+        )
+        .unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t1 WHERE id = 1");
+        assert_eq!(
+            rows,
+            vec![(50,)],
+            "UPSERT with excluded.amount should produce 50, not double-encoded value"
+        );
+
+        // Bug 15: sequential UPSERTs must not progressively corrupt data
+        conn.execute(
+            "INSERT INTO t1 VALUES (1, 75) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount",
+        )
+        .unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t1 WHERE id = 1");
+        assert_eq!(
+            rows,
+            vec![(75,)],
+            "Sequential UPSERT should produce 75, not progressively corrupted value"
+        );
+
+        // Bug 13: WHERE clause in DO UPDATE must see decoded values
+        conn.execute("INSERT INTO t1 VALUES (2, 10)").unwrap();
+        conn.execute(
+            "INSERT INTO t1 VALUES (2, 99) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount WHERE t1.amount < 20",
+        )
+        .unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t1 WHERE id = 2");
+        assert_eq!(
+            rows,
+            vec![(99,)],
+            "WHERE clause should compare against decoded value (10 < 20 = true)"
+        );
+
+        // WHERE clause should block update when condition is false (99 < 20 is false)
+        conn.execute(
+            "INSERT INTO t1 VALUES (2, 5) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount WHERE t1.amount < 20",
+        )
+        .unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t1 WHERE id = 2");
+        assert_eq!(
+            rows,
+            vec![(99,)],
+            "WHERE clause should block update when decoded value 99 >= 20"
+        );
+
+        // Complex expression: excluded.amount + t1.amount
+        conn.execute("DELETE FROM t1").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 42)").unwrap();
+        conn.execute(
+            "INSERT INTO t1 VALUES (1, 8) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount + t1.amount",
+        )
+        .unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t1 WHERE id = 1");
+        assert_eq!(
+            rows,
+            vec![(50,)],
+            "excluded.amount (8) + t1.amount (42) should equal 50"
+        );
+    }
+
     /// Self-joins on custom type columns must return matching rows.
     ///
     /// The optimizer builds an ephemeral auto-index for the inner table.
