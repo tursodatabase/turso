@@ -794,7 +794,7 @@ pub fn translate_expr(
                                         type_def,
                                         resolver,
                                     )?;
-                                    program.resolve_label(skip_label, program.offset());
+                                    program.preassign_label_to_next_insn(skip_label);
                                 }
                             }
                         }
@@ -2853,7 +2853,7 @@ pub fn translate_expr(
                                                 resolver,
                                             )?;
                                         }
-                                        program.resolve_label(skip_default_label, program.offset());
+                                        program.preassign_label_to_next_insn(skip_default_label);
                                     }
                                 }
 
@@ -2872,7 +2872,7 @@ pub fn translate_expr(
                                         type_def,
                                         resolver,
                                     )?;
-                                    program.resolve_label(skip_label, program.offset());
+                                    program.preassign_label_to_next_insn(skip_label);
                                 }
                             }
                         }
@@ -5764,7 +5764,7 @@ pub(crate) fn emit_trigger_decode_registers(
                         type_def,
                         resolver,
                     )?;
-                    program.resolve_label(skip_label, program.offset());
+                    program.preassign_label_to_next_insn(skip_label);
                     return Ok(decoded_reg);
                 }
             }
@@ -5815,7 +5815,7 @@ pub(crate) fn emit_custom_type_encode_columns(
 
         emit_type_expr(program, encode_expr, reg, reg, col, type_def, resolver)?;
 
-        program.resolve_label(skip_label, program.offset());
+        program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
 }
