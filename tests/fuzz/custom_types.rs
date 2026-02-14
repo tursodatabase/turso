@@ -1,8 +1,9 @@
 //! Fuzzer for custom type cross-feature interactions.
 //!
 //! Tests that custom type columns (numeric(10,2)) work correctly with:
-//! ORDER BY, GROUP BY, DISTINCT, JOINs, indexes, subqueries, aggregates,
-//! CTEs, UNION, CASE WHEN, NULL handling, and multi-column ordering.
+//! ORDER BY, GROUP BY, DISTINCT, JOINs (including self-joins), indexes,
+//! subqueries, aggregates, CTEs, UNION, CASE WHEN, NULL handling, and
+//! multi-column ordering.
 //!
 //! Queries that fail (unsupported features) are silently skipped, so this
 //! test automatically gains coverage as Turso implements new SQL features.
@@ -371,7 +372,7 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
-        const NUM_PATTERNS: usize = 39;
+        const NUM_PATTERNS: usize = 40;
         let mut executed = 0u64;
         let mut skipped = 0u64;
         let mut violations: Vec<String> = Vec::new();
@@ -1245,6 +1246,30 @@ mod tests {
                             &format!("DELETE FROM t4 WHERE id = {next_id}"),
                         )
                         .map_err(|_| String::new())?;
+                        executed += 1;
+                    }
+                    // --- Self-join on custom type column ---
+                    // Joins t1 with itself using aliases. The optimizer builds
+                    // an ephemeral auto-index for the inner copy. Previously
+                    // this failed because the seek-key encoder searched by alias
+                    // while the index stored the base table name.
+                    39 => {
+                        let query = "SELECT a.val, b.val FROM t1 a JOIN t1 b ON a.val = b.val \
+                             WHERE a.val IS NOT NULL"
+                            .to_string();
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        // Every row must satisfy the join condition: a.val == b.val
+                        check_join_condition(&rows, 0, 1, &format!("[{iter}] {query}"))?;
+                        // The result must have at least t1_rows rows (each row
+                        // matches at least itself), and exactly
+                        // sum(count(v)^2) rows for each distinct value v.
+                        if rows.len() < t1_rows {
+                            return Err(format!(
+                                "[{iter}] Self-join: expected >= {t1_rows} rows, got {}. {query}",
+                                rows.len()
+                            ));
+                        }
                         executed += 1;
                     }
                     _ => unreachable!(),
