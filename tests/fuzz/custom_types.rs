@@ -371,7 +371,7 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
-        const NUM_PATTERNS: usize = 38;
+        const NUM_PATTERNS: usize = 39;
         let mut executed = 0u64;
         let mut skipped = 0u64;
         let mut violations: Vec<String> = Vec::new();
@@ -1203,6 +1203,48 @@ mod tests {
                                 }
                             }
                         }
+                        executed += 1;
+                    }
+                    // --- RETURNING must agree with SELECT ---
+                    // INSERT a row with RETURNING, then SELECT the same row and
+                    // verify both paths produce identical values.
+                    38 => {
+                        let val = random_numeric(&mut rng);
+                        let next_id = t4_size + iter;
+                        let ret_rows = limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!(
+                                "INSERT INTO t4 VALUES ({next_id}, '{val}', 'ret') RETURNING id, val, label"
+                            ),
+                        )
+                        .map_err(|_| String::new())?;
+                        let sel_rows = limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!("SELECT id, val, label FROM t4 WHERE id = {next_id}"),
+                        )
+                        .map_err(|_| String::new())?;
+                        if ret_rows.len() != 1 || sel_rows.len() != 1 {
+                            return Err(format!(
+                                "[{iter}] INSERT RETURNING vs SELECT: row count mismatch ({} vs {})",
+                                ret_rows.len(),
+                                sel_rows.len()
+                            ));
+                        }
+                        if ret_rows[0] != sel_rows[0] {
+                            return Err(format!(
+                                "[{iter}] INSERT RETURNING disagrees with SELECT: {:?} vs {:?}",
+                                ret_rows[0], sel_rows[0]
+                            ));
+                        }
+                        // Clean up
+                        limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!("DELETE FROM t4 WHERE id = {next_id}"),
+                        )
+                        .map_err(|_| String::new())?;
                         executed += 1;
                     }
                     _ => unreachable!(),

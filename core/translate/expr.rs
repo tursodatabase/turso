@@ -2934,14 +2934,14 @@ pub fn translate_expr(
                         // Decode custom type columns (skipped when building ORDER BY sort keys
                         // for types without a `<` operator, so the sorter sorts on encoded values)
                         if !program.suppress_custom_type_decode {
+                            // For custom type columns with a default, the Column
+                            // instruction returns NULL for pre-existing rows
+                            // (since we suppressed the default). Load the default
+                            // and encode it so decode produces the correct value.
                             if let Some(type_def) = resolver
                                 .schema
                                 .get_type_def(&column.ty_str, table.is_strict())
                             {
-                                // For custom type columns with a default, the Column
-                                // instruction returns NULL for pre-existing rows
-                                // (since we suppressed the default). Load the default
-                                // and encode it so decode produces the correct value.
                                 if let Some(ref default_expr) = column.default {
                                     if type_def.encode.is_some() {
                                         let skip_default_label = program.allocate_label();
@@ -2949,9 +2949,6 @@ pub fn translate_expr(
                                             reg: target_register,
                                             target_pc: skip_default_label,
                                         });
-                                        // Must use no-constant-opt to avoid loading
-                                        // the default in the init section (where it
-                                        // would be overwritten by Column at runtime).
                                         translate_expr_no_constant_opt(
                                             program,
                                             referenced_tables,
@@ -2974,25 +2971,15 @@ pub fn translate_expr(
                                         program.preassign_label_to_next_insn(skip_default_label);
                                     }
                                 }
-
-                                if let Some(ref decode_expr) = type_def.decode {
-                                    let skip_label = program.allocate_label();
-                                    program.emit_insn(Insn::IsNull {
-                                        reg: target_register,
-                                        target_pc: skip_label,
-                                    });
-                                    emit_type_expr(
-                                        program,
-                                        decode_expr,
-                                        target_register,
-                                        target_register,
-                                        column,
-                                        type_def,
-                                        resolver,
-                                    )?;
-                                    program.preassign_label_to_next_insn(skip_label);
-                                }
                             }
+                            emit_user_facing_column_value(
+                                program,
+                                target_register,
+                                target_register,
+                                column,
+                                table.is_strict(),
+                                resolver,
+                            )?;
                         }
                     }
                     Ok(target_register)
@@ -5912,11 +5899,23 @@ pub(crate) fn emit_returning_results<'a>(
         .expr_to_reg_cache
         .push((std::borrow::Cow::Owned(expr), rowid_reg, false));
     for (i, column) in table.columns().iter().enumerate() {
-        let reg = if column.is_rowid_alias() {
+        let raw_reg = if column.is_rowid_alias() {
             rowid_reg
         } else {
             reg_columns_start + i
         };
+        // The write registers hold stored (encoded) values. Produce the
+        // user-facing value in a fresh register so RETURNING shows decoded
+        // results — this is a no-op for regular columns.
+        let decoded_reg = program.alloc_register();
+        emit_user_facing_column_value(
+            program,
+            raw_reg,
+            decoded_reg,
+            column,
+            table.table.is_strict(),
+            resolver,
+        )?;
         let expr = Expr::Column {
             database: None,
             table: table.internal_id,
@@ -5925,7 +5924,7 @@ pub(crate) fn emit_returning_results<'a>(
         };
         resolver
             .expr_to_reg_cache
-            .push((std::borrow::Cow::Owned(expr), reg, false));
+            .push((std::borrow::Cow::Owned(expr), decoded_reg, false));
     }
 
     let result_start_reg = program.alloc_registers(result_columns.len());
@@ -6303,6 +6302,54 @@ fn find_custom_type_operator(
     }
 
     None
+}
+
+/// Emit bytecode that transforms a stored column value into its user-facing
+/// representation.
+///
+/// For regular columns this is a simple copy (or no-op when source == dest).
+/// For custom type columns with a DECODE function the decode expression is
+/// applied, converting the internal storage form back to the value the user
+/// expects to see.
+///
+/// Every code path that surfaces a stored column value to the user — SELECT,
+/// RETURNING, trigger OLD/NEW — should go through this function so decode
+/// logic lives in one place.
+pub(crate) fn emit_user_facing_column_value(
+    program: &mut ProgramBuilder,
+    source_reg: usize,
+    dest_reg: usize,
+    column: &crate::schema::Column,
+    is_strict: bool,
+    resolver: &Resolver,
+) -> Result<()> {
+    if source_reg != dest_reg {
+        program.emit_insn(Insn::Copy {
+            src_reg: source_reg,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
+    }
+    if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str, is_strict) {
+        if let Some(ref decode_expr) = type_def.decode {
+            let skip_label = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: dest_reg,
+                target_pc: skip_label,
+            });
+            emit_type_expr(
+                program,
+                decode_expr,
+                dest_reg,
+                dest_reg,
+                column,
+                type_def,
+                resolver,
+            )?;
+            program.preassign_label_to_next_insn(skip_label);
+        }
+    }
+    Ok(())
 }
 
 /// Emit bytecode for a custom type encode/decode expression.
