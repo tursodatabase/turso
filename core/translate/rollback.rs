@@ -8,6 +8,7 @@ use crate::{
     Result,
 };
 
+/// Emits bytecode for `SAVEPOINT <name>`.
 pub fn translate_savepoint(mut program: ProgramBuilder, name: Name) -> Result<ProgramBuilder> {
     program.emit_insn(Insn::Savepoint {
         op: SavepointOp::Begin,
@@ -16,6 +17,7 @@ pub fn translate_savepoint(mut program: ProgramBuilder, name: Name) -> Result<Pr
     Ok(program)
 }
 
+/// Emits bytecode for `RELEASE [SAVEPOINT] <name>`.
 pub fn translate_release(mut program: ProgramBuilder, name: Name) -> Result<ProgramBuilder> {
     program.emit_insn(Insn::Savepoint {
         op: SavepointOp::Release,
@@ -24,6 +26,7 @@ pub fn translate_release(mut program: ProgramBuilder, name: Name) -> Result<Prog
     Ok(program)
 }
 
+/// Emits bytecode for either full transaction rollback or `ROLLBACK TO` named savepoint.
 pub fn translate_rollback(
     mut program: ProgramBuilder,
     _txn_name: Option<Name>,

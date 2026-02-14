@@ -1137,8 +1137,11 @@ enum SavepointKind {
 
 #[derive(Clone, Copy, Debug)]
 pub enum SavepointResult {
+    /// Releasing the named savepoint should commit the surrounding transaction.
     Commit,
+    /// The named savepoint was released without committing the transaction.
     Release,
+    /// No matching named savepoint exists.
     NotFound,
 }
 
@@ -1692,6 +1695,10 @@ impl Pager {
         Ok(())
     }
 
+    /// Opens a named savepoint and captures rollback metadata for the current transaction state.
+    ///
+    /// If `starts_transaction` is true, releasing this savepoint at the root depth commits the
+    /// transaction.
     pub fn open_named_savepoint(
         &self,
         name: String,

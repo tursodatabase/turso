@@ -310,13 +310,16 @@ pub enum TxTimestampOrID {
 /// Used for statement-level savepoints in interactive transactions.
 #[derive(Debug)]
 enum SavepointKind {
+    /// Internal savepoint used for statement-level rollback.
     Statement,
+    /// User-visible named savepoint.
     Named {
         name: String,
         starts_transaction: bool,
     },
 }
 
+/// Tracks row/index version deltas created inside a single savepoint scope.
 #[derive(Debug)]
 pub struct Savepoint {
     kind: SavepointKind,
@@ -369,6 +372,13 @@ impl Savepoint {
     }
 }
 
+struct SavepointRollbackResult {
+    /// Savepoints that were rolled back, in the order they were created (oldest to newest).
+    rolledback_savepoints: Vec<Savepoint>,
+    /// Deferred FK counter snapshot captured at the target named savepoint.
+    deferred_fk_violations: isize,
+}
+
 /// Transaction
 #[derive(Debug)]
 pub struct Transaction {
@@ -417,6 +427,9 @@ impl Transaction {
         self.savepoint_stack.write().push(Savepoint::statement());
     }
 
+    /// Begin a new named savepoint. If `starts_transaction` is true, this savepoint represents the
+    /// beginning of an interactive transaction and will be used to track deferred FK violations
+    /// for that transaction.
     fn begin_named_savepoint(
         &self,
         name: String,
@@ -465,6 +478,8 @@ impl Transaction {
         savepoints.pop()
     }
 
+    /// Release a named savepoint. If this savepoint starts a transaction, returns
+    /// [SavepointResult::Commit] to indicate the transaction should be committed.
     fn release_named_savepoint(&self, name: &str) -> SavepointResult {
         let mut savepoints = self.savepoint_stack.write();
         let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
@@ -506,7 +521,10 @@ impl Transaction {
         commits_transaction
     }
 
-    fn rollback_to_named_savepoint(&self, name: &str) -> Option<(Vec<Savepoint>, isize)> {
+    /// Find the named savepoint to rollback to and pop all savepoints above it. Returns the rolled
+    /// back savepoints and net change in deferred FK violations for undoing changes to transaction
+    /// state.
+    fn rollback_to_named_savepoint(&self, name: &str) -> Option<SavepointRollbackResult> {
         let mut savepoints = self.savepoint_stack.write();
         let target_idx = savepoints.iter().rposition(|savepoint| {
             matches!(
@@ -537,7 +555,10 @@ impl Transaction {
             starts_transaction,
             deferred_fk_violations,
         ));
-        Some((drained, deferred_fk_violations))
+        Some(SavepointRollbackResult {
+            rolledback_savepoints: drained,
+            deferred_fk_violations,
+        })
     }
 
     /// Record a version that was created during the current savepoint.
@@ -2807,6 +2828,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tx.value().begin_savepoint();
     }
 
+    /// Begin a user-visible named savepoint inside an existing transaction.
+    ///
+    /// `starts_transaction` is true when the savepoint was opened in autocommit mode and therefore
+    /// releasing the root savepoint should commit the transaction.
     pub fn begin_named_savepoint(
         &self,
         tx_id: TxID,
@@ -2832,6 +2857,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Releases a named savepoint and nested savepoints above it.
+    ///
+    /// Returns [SavepointResult::Commit] when releasing the root savepoint should commit the
+    /// transaction.
     pub fn release_named_savepoint(&self, tx_id: TxID, name: &str) -> Result<SavepointResult> {
         let tx = self
             .txs
@@ -2862,17 +2890,23 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Rolls back to the newest matching named savepoint while keeping that savepoint active.
+    ///
+    /// Returns the deferred FK snapshot stored on the named savepoint, or `None` if no matching
+    /// savepoint exists.
     pub fn rollback_to_named_savepoint(&self, tx_id: TxID, name: &str) -> Result<Option<isize>> {
         let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
             panic!("Transaction {tx_id} not found while rolling back named savepoint")
         });
-        let Some((drained_savepoints, deferred_fk_violations)) =
-            tx.value().rollback_to_named_savepoint(name)
+        let Some(SavepointRollbackResult {
+            rolledback_savepoints,
+            deferred_fk_violations,
+        }) = tx.value().rollback_to_named_savepoint(name)
         else {
             return Ok(None);
         };
 
-        for savepoint in drained_savepoints.into_iter().rev() {
+        for savepoint in rolledback_savepoints.into_iter().rev() {
             self.rollback_savepoint_changes(tx_id, savepoint);
         }
 
