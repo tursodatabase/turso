@@ -2916,11 +2916,11 @@ expect {
     0
 }
 
-# Regression: x'7B2261223A317D0A' starts with '{' (0x7B), which can overlap with
-# JSONB inline header byte patterns. This is valid JSON text and must return 1.
-test json_valid_blob_header_overlap_with_valid_text_json {
-    SELECT json_valid(x'7B2261223A317D0A');
+# Regression: x'7C31323334353637' starts with '|' (0x7C), which can overlap
+# with JSONB inline header byte patterns, but this is scalar non-JSON bytes.
+test json_valid_blob_header_overlap_scalar_bytes {
+    SELECT json_valid(x'7C31323334353637');
 }
 expect {
-    1
+    0
 }
