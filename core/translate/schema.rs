@@ -181,34 +181,39 @@ fn validate(
                 });
 
                 if !is_builtin && is_strict {
+                    // On non-STRICT tables any type name is allowed and is
+                    // treated as a plain affinity hint (no encode/decode).
+                    // Custom type validation only applies to STRICT tables.
                     let type_def = resolver.schema.get_type_def_unchecked(type_name);
-                    match type_def {
-                        None => {
-                            bail_parse_error!(
-                                "unknown datatype for {}.{}: \"{}\"",
-                                table_name,
-                                c.col_name,
-                                type_name
-                            );
-                        }
-                        Some(td) if !td.params.is_empty() => {
-                            // Parametric type: verify the column provides the right
-                            // number of parameters (e.g. numeric(10,2)).
-                            let provided = match &col_type.size {
-                                Some(ast::TypeSize::TypeSize(_, _)) => 2,
-                                Some(ast::TypeSize::MaxSize(_)) => 1,
-                                None => 0,
-                            };
-                            if provided != td.params.len() {
+                    {
+                        match type_def {
+                            None => {
                                 bail_parse_error!(
-                                    "type \"{}\" requires {} parameter(s), got {}",
-                                    type_name,
-                                    td.params.len(),
-                                    provided
+                                    "unknown datatype for {}.{}: \"{}\"",
+                                    table_name,
+                                    c.col_name,
+                                    type_name
                                 );
                             }
+                            Some(td) if !td.params.is_empty() => {
+                                // Parametric type: verify the column provides the right
+                                // number of parameters (e.g. numeric(10,2)).
+                                let provided = match &col_type.size {
+                                    Some(ast::TypeSize::TypeSize(_, _)) => 2,
+                                    Some(ast::TypeSize::MaxSize(_)) => 1,
+                                    None => 0,
+                                };
+                                if provided != td.params.len() {
+                                    bail_parse_error!(
+                                        "type \"{}\" requires {} parameter(s), got {}",
+                                        type_name,
+                                        td.params.len(),
+                                        provided
+                                    );
+                                }
+                            }
+                            Some(_) => {}
                         }
-                        Some(_) => {}
                     }
                 }
             }

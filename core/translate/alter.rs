@@ -731,27 +731,32 @@ pub fn translate_alter_table(
             }
 
             let mut default_type_mismatch = false;
-            if btree.is_strict {
+            {
                 let ty = column.ty_str.as_str();
-                if ty.is_empty() {
+                if btree.is_strict && ty.is_empty() {
                     return Err(LimboError::ParseError(format!(
                         "missing datatype for {table_name}.{new_column_name}"
                     )));
                 }
-                if !ty.eq_ignore_ascii_case("INT")
-                    && !ty.eq_ignore_ascii_case("INTEGER")
-                    && !ty.eq_ignore_ascii_case("REAL")
-                    && !ty.eq_ignore_ascii_case("TEXT")
-                    && !ty.eq_ignore_ascii_case("BLOB")
-                    && !ty.eq_ignore_ascii_case("ANY")
-                    && resolver
+                let is_builtin = ty.is_empty()
+                    || ty.eq_ignore_ascii_case("INT")
+                    || ty.eq_ignore_ascii_case("INTEGER")
+                    || ty.eq_ignore_ascii_case("REAL")
+                    || ty.eq_ignore_ascii_case("TEXT")
+                    || ty.eq_ignore_ascii_case("BLOB")
+                    || ty.eq_ignore_ascii_case("ANY");
+                if !is_builtin && btree.is_strict {
+                    // On non-STRICT tables any type name is allowed and is
+                    // treated as a plain affinity hint (no encode/decode).
+                    // Custom type validation only applies to STRICT tables.
+                    let type_def = resolver
                         .schema
-                        .get_type_def_unchecked(&normalize_ident(ty))
-                        .is_none()
-                {
-                    return Err(LimboError::ParseError(format!(
-                        "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
-                    )));
+                        .get_type_def_unchecked(&normalize_ident(ty));
+                    if type_def.is_none() {
+                        return Err(LimboError::ParseError(format!(
+                            "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
+                        )));
+                    }
                 }
 
                 default_type_mismatch = strict_default_type_mismatch(&column)?;
