@@ -247,6 +247,73 @@ mod tests {
         );
     }
 
+    /// Multi-row UPDATE must not progressively double-encode custom type
+    /// values. Each row updated by a single UPDATE statement must receive
+    /// exactly one encode pass, regardless of how many rows are affected.
+    ///
+    /// Previously, the encode expression wrote its result back to the same
+    /// register that held the user's SET constant. Because the constant was
+    /// hoisted before the loop, subsequent iterations read the already-encoded
+    /// value and encoded it again, causing exponential corruption.
+    #[test]
+    fn test_multi_row_update_does_not_double_encode() {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("custom_types_multi_update.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_strict(true)
+            .with_encryption(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 10)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 20)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 30)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (4, 40)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (5, 50)").unwrap();
+
+        // UPDATE all rows with a constant value
+        conn.execute("UPDATE t1 SET amount = 99").unwrap();
+        let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM t1 ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![(1, 99), (2, 99), (3, 99), (4, 99), (5, 99)],
+            "All rows must have amount=99 after UPDATE, not progressively double-encoded values"
+        );
+
+        // UPDATE with WHERE matching multiple rows
+        conn.execute("UPDATE t1 SET amount = 42 WHERE id > 2")
+            .unwrap();
+        let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM t1 ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![(1, 99), (2, 99), (3, 42), (4, 42), (5, 42)],
+            "WHERE-filtered multi-row UPDATE must encode each row exactly once"
+        );
+
+        // Multi-column UPDATE with different custom types
+        conn.execute("CREATE TYPE score BASE integer ENCODE value * 10 DECODE value / 10")
+            .unwrap();
+        conn.execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, a cents, b score) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 10, 5)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2, 20, 6)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3, 30, 7)").unwrap();
+
+        conn.execute("UPDATE t2 SET a = 50, b = 8").unwrap();
+        let rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT id, a, b FROM t2 ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![(1, 50, 8), (2, 50, 8), (3, 50, 8)],
+            "Multi-column UPDATE must encode each column independently and correctly"
+        );
+    }
+
     /// Self-joins on custom type columns must return matching rows.
     ///
     /// The optimizer builds an ephemeral auto-index for the inner table.

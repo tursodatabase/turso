@@ -807,6 +807,25 @@ pub enum NoConstantOptReason {
     /// so hoisting those register assignments is not safe.
     /// e.g. SELECT COALESCE(1, t.x, NULL) would overwrite 1 with NULL, which is invalid.
     RegisterReuse,
+    /// The column has a custom type encode function that will be applied
+    /// in-place after this expression is evaluated. We must not hoist the
+    /// expression because:
+    ///
+    /// 1. The encode function may be non-deterministic (e.g. it could use
+    ///    datetime('now')), so hoisting would produce incorrect results.
+    ///
+    /// 2. Even if the encode function were deterministic, the encode is
+    ///    applied in-place to the target register inside the update loop.
+    ///    If the original value were hoisted (evaluated once before the
+    ///    loop), the second iteration would read the already-encoded value
+    ///    from the register and encode it again, causing progressive
+    ///    double-encoding (e.g. 99 → 9900 → 990000 → ...).
+    ///
+    /// The correct fix for deterministic encode functions would be to hoist
+    /// the *encoded* result (i.e. `encode_fn(99)` not `99`), but that
+    /// requires tracking the encode through the hoisting machinery. For now
+    /// we simply disable hoisting for these columns.
+    CustomTypeEncode,
 }
 
 /// Controls how binary expressions are emitted.

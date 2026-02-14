@@ -2789,13 +2789,36 @@ fn emit_update_column_values<'a>(
 
                     program.emit_null(target_reg, None);
                 } else {
-                    translate_expr(
-                        program,
-                        Some(table_references),
-                        expr,
-                        target_reg,
-                        &t_ctx.resolver,
-                    )?;
+                    // Columns with custom type encode must not have their
+                    // SET expressions hoisted as constants. See the doc
+                    // comment on NoConstantOptReason::CustomTypeEncode.
+                    let has_custom_encode = {
+                        let ty = &table_column.ty_str;
+                        !ty.is_empty()
+                            && t_ctx
+                                .resolver
+                                .schema
+                                .get_type_def_unchecked(ty)
+                                .is_some_and(|td| td.encode.is_some())
+                    };
+                    if has_custom_encode {
+                        translate_expr_no_constant_opt(
+                            program,
+                            Some(table_references),
+                            expr,
+                            target_reg,
+                            &t_ctx.resolver,
+                            NoConstantOptReason::CustomTypeEncode,
+                        )?;
+                    } else {
+                        translate_expr(
+                            program,
+                            Some(table_references),
+                            expr,
+                            target_reg,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                     if table_column.notnull() {
                         match or_conflict {
                             ResolveType::Ignore => {

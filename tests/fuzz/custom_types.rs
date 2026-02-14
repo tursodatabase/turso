@@ -372,7 +372,7 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
-        const NUM_PATTERNS: usize = 40;
+        const NUM_PATTERNS: usize = 41;
         let mut executed = 0u64;
         let mut skipped = 0u64;
         let mut violations: Vec<String> = Vec::new();
@@ -388,7 +388,8 @@ mod tests {
             let dir = if desc { "DESC" } else { "ASC" };
 
             // Repopulate t4 only when a mutation pattern is selected AND t4 was previously mutated
-            let is_mutation_pattern = (18..=22).contains(&pattern) || pattern == 36;
+            let is_mutation_pattern =
+                (18..=22).contains(&pattern) || pattern == 36 || pattern == 40;
             if is_mutation_pattern && t4_dirty {
                 repopulate_t4(&db, &conn, &mut rng, t4_size);
                 t4_dirty = false;
@@ -1269,6 +1270,34 @@ mod tests {
                                 "[{iter}] Self-join: expected >= {t1_rows} rows, got {}. {query}",
                                 rows.len()
                             ));
+                        }
+                        executed += 1;
+                    }
+                    // --- Multi-row UPDATE with constant SET value ---
+                    // Updates ALL rows in t4 with a single constant. Previously
+                    // the encode expression overwrote the constant register,
+                    // causing each successive row to be double-encoded.
+                    40 => {
+                        let new_val = random_numeric(&mut rng);
+                        limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!("UPDATE t4 SET val = '{new_val}'"),
+                        )
+                        .map_err(|_| String::new())?;
+                        let query = "SELECT val FROM t4".to_string();
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        let expected: f64 = new_val.parse().unwrap();
+                        for (i, row) in rows.iter().enumerate() {
+                            let got = parse_numeric_value(&row[0]);
+                            if let Some(g) = got {
+                                if (g - expected).abs() >= 0.015 {
+                                    return Err(format!(
+                                        "[{iter}] Multi-row UPDATE: row {i} expected {expected}, got {g} (double-encode bug)"
+                                    ));
+                                }
+                            }
                         }
                         executed += 1;
                     }
