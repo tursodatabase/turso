@@ -216,6 +216,18 @@ expect {
     0
 }
 
+test savepoint-release-root-with-deferred-fk-fails {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    SAVEPOINT s;
+    INSERT INTO c VALUES (1);
+    RELEASE s;
+}
+expect error {
+    constraint failed
+}
+
 test savepoint-not-reusable-after-transaction-boundary {
     CREATE TABLE t(x);
     SAVEPOINT s;

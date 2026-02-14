@@ -414,4 +414,59 @@ mod savepoint_tests {
             "autocommit deferred-fk outcome mismatch\nsqlite: {sqlite_res:?}\nlimbo: {limbo_res:?}"
         );
     }
+
+    #[turso_macros::test(mvcc)]
+    fn release_root_deferred_fk_failure_can_recover_with_rollback_to(db: TempDatabase) {
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        limbo_conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        sqlite_conn
+            .execute("PRAGMA foreign_keys = ON", params![])
+            .unwrap();
+
+        for schema in [
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+        ] {
+            limbo_conn.execute(schema).unwrap();
+            sqlite_conn.execute(schema, params![]).unwrap();
+        }
+
+        for stmt in ["SAVEPOINT s", "INSERT INTO c(id, pid) VALUES (1, 999)"] {
+            let sqlite_res = sqlite_conn.execute(stmt, params![]);
+            let limbo_res = limbo_exec_rows_fallible(&db, &limbo_conn, stmt);
+            assert!(
+                sqlite_res.is_ok() == limbo_res.is_ok(),
+                "statement outcome mismatch for `{stmt}`\nsqlite: {sqlite_res:?}\nlimbo: {limbo_res:?}"
+            );
+        }
+
+        let sqlite_release = sqlite_conn.execute("RELEASE s", params![]);
+        let limbo_release = limbo_exec_rows_fallible(&db, &limbo_conn, "RELEASE s");
+        assert!(
+            sqlite_release.is_ok() == limbo_release.is_ok(),
+            "release outcome mismatch\nsqlite: {sqlite_release:?}\nlimbo: {limbo_release:?}"
+        );
+        assert!(
+            sqlite_release.is_err(),
+            "expected deferred FK error while releasing root savepoint"
+        );
+
+        for stmt in ["ROLLBACK TO s", "RELEASE s"] {
+            let sqlite_res = sqlite_conn.execute(stmt, params![]);
+            let limbo_res = limbo_exec_rows_fallible(&db, &limbo_conn, stmt);
+            assert!(
+                sqlite_res.is_ok() == limbo_res.is_ok(),
+                "statement outcome mismatch for `{stmt}`\nsqlite: {sqlite_res:?}\nlimbo: {limbo_res:?}"
+            );
+        }
+
+        let sqlite_rows = sqlite_exec_rows(&sqlite_conn, "SELECT count(*) FROM c");
+        let limbo_rows = limbo_exec_rows(&limbo_conn, "SELECT count(*) FROM c");
+        assert_eq!(
+            limbo_rows, sqlite_rows,
+            "final table state mismatch after rollback-to recovery"
+        );
+    }
 }
