@@ -238,6 +238,7 @@ mod fuzz_tests {
     pub fn index_scan_compound_key_fuzz(db: TempDatabase) {
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
+        eprintln!("SEED={seed} index_scan_compound_key_fuzz");
 
         let is_mvcc = db.enable_mvcc;
         let opts = db.db_opts;
@@ -362,7 +363,7 @@ mod fuzz_tests {
 
         const ITERATIONS: usize = 10000;
         for i in 0..ITERATIONS {
-            if i % (ITERATIONS / 100) == 0 {
+            if i % (ITERATIONS / 1000) == 0 {
                 println!(
                     "index_scan_compound_key_fuzz: iteration {}/{}",
                     i + 1,
