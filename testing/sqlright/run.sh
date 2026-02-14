@@ -47,7 +47,7 @@ export AFL_NO_AFFINITY=1     # Disable automatic CPU binding to prevent race con
 
 AFL_CMD="$AFL -t 1000"  # 1 second timeout (normal queries finish in ~20ms)
 # Enable all experimental features to maximize attack surface
-AFL_TARGET="-- $TURSODB -q -m list --experimental-views --experimental-strict --experimental-triggers --experimental-index-method --experimental-autovacuum --experimental-attach"
+AFL_TARGET="-- $TURSODB -q -m list --experimental-views --experimental-strict --experimental-triggers --experimental-index-method --experimental-autovacuum --experimental-attach --experimental-encryption"
 
 if [ "$RESUME" = true ] && [ -d "$OUTPUT/primary/queue" ]; then
     echo "Resuming from $OUTPUT..."
