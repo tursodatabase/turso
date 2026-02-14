@@ -515,6 +515,40 @@ impl Schema {
         Ok(())
     }
 
+    /// Resolve custom type affinities for all STRICT tables in the schema.
+    /// Call this after loading user-defined types from __turso_internal_types
+    /// so that columns declared with custom types use the BASE type's affinity.
+    pub fn resolve_all_custom_type_affinities(&mut self) {
+        let table_names: Vec<String> = self
+            .tables
+            .iter()
+            .filter_map(|(name, t)| {
+                if let Table::BTree(bt) = t.as_ref() {
+                    if bt.is_strict {
+                        return Some(name.clone());
+                    }
+                }
+                None
+            })
+            .collect();
+        for name in table_names {
+            if let Some(table_arc) = self.tables.get(&name) {
+                if let Table::BTree(bt) = table_arc.as_ref() {
+                    let needs_fixup = bt
+                        .columns
+                        .iter()
+                        .any(|c| self.get_type_def_unchecked(&c.ty_str).is_some());
+                    if needs_fixup {
+                        let mut modified = (**bt).clone();
+                        modified.resolve_custom_type_affinities(self);
+                        self.tables
+                            .insert(name, Arc::new(Table::BTree(Arc::new(modified))));
+                    }
+                }
+            }
+        }
+    }
+
     pub fn is_unique_idx_name(&self, name: &str) -> bool {
         !self
             .indexes
@@ -1256,6 +1290,8 @@ impl Schema {
                         }
                     }
 
+                    let mut table = table;
+                    table.resolve_custom_type_affinities(self);
                     self.add_btree_table(Arc::new(table))?;
                 }
             }
@@ -1965,6 +2001,23 @@ impl BTreeTable {
             }
         }
         Arc::new(modified)
+    }
+
+    /// Override column type metadata for custom type columns so that
+    /// SQLite's name-based type/affinity rules use the BASE type
+    /// instead of the custom type name (e.g. "doubled" contains "DOUB"
+    /// which would incorrectly map to REAL instead of INTEGER).
+    pub fn resolve_custom_type_affinities(&mut self, schema: &Schema) {
+        if !self.is_strict {
+            return;
+        }
+        for col in &mut self.columns {
+            if let Some(type_def) = schema.get_type_def_unchecked(&col.ty_str) {
+                let (base_ty, _) = type_from_name(&type_def.base);
+                col.set_ty(base_ty);
+                col.set_base_affinity(Affinity::affinity(&type_def.base));
+            }
+        }
     }
 
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
@@ -2843,9 +2896,40 @@ const TYPE_MASK: u16 = 0b111 << TYPE_SHIFT;
 const COLL_SHIFT: u16 = TYPE_SHIFT + 3;
 const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
 
+// Bits 10-12: base type affinity override for custom type columns.
+// 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1
+const BASE_AFF_SHIFT: u16 = COLL_SHIFT + 2;
+const BASE_AFF_MASK: u16 = 0b111 << BASE_AFF_SHIFT;
+
 impl Column {
     pub fn affinity(&self) -> Affinity {
-        Affinity::affinity(&self.ty_str)
+        let v = ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) as u8;
+        if v > 0 {
+            // Custom type column: use the base type's affinity
+            match v {
+                1 => Affinity::Integer,
+                2 => Affinity::Text,
+                3 => Affinity::Blob,
+                4 => Affinity::Real,
+                _ => Affinity::Numeric,
+            }
+        } else {
+            Affinity::affinity(&self.ty_str)
+        }
+    }
+
+    /// Set the base type affinity override for a custom type column.
+    /// This ensures affinity rules use the custom type's BASE type
+    /// rather than applying SQLite name-based rules to the type name.
+    pub fn set_base_affinity(&mut self, affinity: Affinity) {
+        let v: u16 = match affinity {
+            Affinity::Integer => 1,
+            Affinity::Text => 2,
+            Affinity::Blob => 3,
+            Affinity::Real => 4,
+            Affinity::Numeric => 5,
+        };
+        self.raw = (self.raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
     }
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {

@@ -477,6 +477,8 @@ impl Connection {
                 for sql in &type_rows {
                     fresh.add_type_from_sql(sql)?;
                 }
+                // Resolve column affinities for tables that use these custom types
+                fresh.resolve_all_custom_type_affinities();
                 Ok(())
             })();
             if let Err(e) = load_result {

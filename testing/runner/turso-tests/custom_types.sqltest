@@ -70,6 +70,20 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test custom-type-name-does-not-affect-column-affinity {
+    -- A custom type name like "doubled" contains the substring "DOUB"
+    -- which SQLite's affinity rules would map to REAL. Verify that the
+    -- BASE type (integer) determines the column's affinity instead.
+    CREATE TYPE doubled BASE integer ENCODE (value * 2) DECODE (value / 2);
+    CREATE TABLE t1(a doubled) STRICT;
+    INSERT INTO t1 VALUES(5);
+    SELECT typeof(a), a FROM t1;
+}
+expect {
+    integer|5
+}
+
+@requires strict "uses STRICT tables"
 test uint-addition {
     CREATE TYPE test_uint BASE text
         ENCODE test_uint_encode(value) DECODE test_uint_decode(value)

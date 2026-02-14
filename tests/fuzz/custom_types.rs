@@ -270,6 +270,16 @@ mod tests {
              END",
         )
         .unwrap();
+        // t5: table with custom type names that contain SQLite affinity-triggering
+        // substrings. "doubled" contains "DOUB" which SQLite rules would map to REAL,
+        // but the BASE type is integer. "charmed" contains "CHAR" which would map to
+        // TEXT, but the BASE type is integer. Verify that the BASE type wins.
+        conn.execute("CREATE TYPE doubled BASE integer ENCODE (value * 2) DECODE (value / 2)")
+            .unwrap();
+        conn.execute("CREATE TYPE charmed BASE integer ENCODE (value * 3) DECODE (value / 3)")
+            .unwrap();
+        conn.execute("CREATE TABLE t5(id INTEGER PRIMARY KEY, d doubled, c charmed) STRICT")
+            .unwrap();
 
         // --- Populate data ---
         let t1_rows: usize = rng.random_range(50..=100);
@@ -322,6 +332,15 @@ mod tests {
                 .unwrap();
         }
 
+        // Populate t5 with integer values for affinity-sensitive custom types
+        let t5_rows: usize = rng.random_range(20..=40);
+        for i in 0..t5_rows {
+            let d_val: i32 = rng.random_range(1..=1000);
+            let c_val: i32 = rng.random_range(1..=1000);
+            conn.execute(format!("INSERT INTO t5 VALUES ({i}, {d_val}, {c_val})"))
+                .unwrap();
+        }
+
         // Helper to repopulate t4 (mutable table) before each mutation pattern
         let t4_size: usize = 20;
         fn repopulate_t4(
@@ -352,7 +371,7 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
-        const NUM_PATTERNS: usize = 37;
+        const NUM_PATTERNS: usize = 38;
         let mut executed = 0u64;
         let mut skipped = 0u64;
         let mut violations: Vec<String> = Vec::new();
@@ -1141,6 +1160,48 @@ mod tests {
                             return Err(format!(
                                 "[{iter}] t4 index seek: updated val '{new_val}' not found via WHERE"
                             ));
+                        }
+                        executed += 1;
+                    }
+                    // --- Custom type name does not affect column affinity ---
+                    // "doubled" contains "DOUB" and "charmed" contains "CHAR".
+                    // Verify that typeof() returns "integer" (the BASE type),
+                    // not "real" or "text" (from SQLite's name-based rules).
+                    37 => {
+                        let target_id = rng.random_range(0..t5_rows);
+                        let query = format!(
+                            "SELECT typeof(d), typeof(c), d, c FROM t5 WHERE id = {target_id}"
+                        );
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        if rows.len() != 1 {
+                            return Err(format!(
+                                "[{iter}] t5 typeof: expected 1 row, got {}",
+                                rows.len()
+                            ));
+                        }
+                        let row = &rows[0];
+                        // typeof(d) and typeof(c) must be "integer"
+                        for (col_idx, col_name) in [(0, "d"), (1, "c")] {
+                            match &row[col_idx] {
+                                Value::Text(s) if s == "integer" => {}
+                                other => {
+                                    return Err(format!(
+                                        "[{iter}] t5 typeof({col_name}): expected 'integer', got {other:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        // The decoded values must be integers (not floats)
+                        for (col_idx, col_name) in [(2, "d"), (3, "c")] {
+                            match &row[col_idx] {
+                                Value::Integer(_) => {}
+                                other => {
+                                    return Err(format!(
+                                        "[{iter}] t5 {col_name} value: expected integer, got {other:?}"
+                                    ));
+                                }
+                            }
                         }
                         executed += 1;
                     }
