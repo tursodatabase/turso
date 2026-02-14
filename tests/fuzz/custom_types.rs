@@ -251,11 +251,16 @@ mod tests {
         )
         .unwrap();
         conn.execute("CREATE INDEX idx_t3_val ON t3(val)").unwrap();
+        // Multi-column index on t1: exercises composite index with custom type
+        conn.execute("CREATE INDEX idx_t1_label_val ON t1(label, val)")
+            .unwrap();
         // t4: mutable table for UPDATE/UPSERT/DELETE/INSERT...SELECT patterns
         conn.execute(
             "CREATE TABLE t4(id INTEGER PRIMARY KEY, val numeric(10,2), label TEXT) STRICT",
         )
         .unwrap();
+        // Index on t4 so mutations exercise index maintenance paths
+        conn.execute("CREATE INDEX idx_t4_val ON t4(val)").unwrap();
         // t4_log: trigger audit log
         conn.execute("CREATE TABLE t4_log(old_val TEXT, new_val TEXT) STRICT")
             .unwrap();
@@ -347,7 +352,7 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
-        const NUM_PATTERNS: usize = 30;
+        const NUM_PATTERNS: usize = 37;
         let mut executed = 0u64;
         let mut skipped = 0u64;
         let mut violations: Vec<String> = Vec::new();
@@ -363,7 +368,7 @@ mod tests {
             let dir = if desc { "DESC" } else { "ASC" };
 
             // Repopulate t4 only when a mutation pattern is selected AND t4 was previously mutated
-            let is_mutation_pattern = (18..=22).contains(&pattern);
+            let is_mutation_pattern = (18..=22).contains(&pattern) || pattern == 36;
             if is_mutation_pattern && t4_dirty {
                 repopulate_t4(&db, &conn, &mut rng, t4_size);
                 t4_dirty = false;
@@ -965,6 +970,177 @@ mod tests {
                                     ));
                                 }
                             }
+                        }
+                        executed += 1;
+                    }
+                    // --- Multi-column index: ORDER BY (label, val) ---
+                    30 => {
+                        let query =
+                            format!("SELECT label, val FROM t1 ORDER BY label {dir}, val {dir}");
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        // Check sorted by (label, val) pair
+                        for i in 1..rows.len() {
+                            let prev_label = match &rows[i - 1][0] {
+                                Value::Text(s) => s.clone(),
+                                Value::Null => String::new(),
+                                _ => {
+                                    return Err(format!("[{iter}] multi-col sort: bad label type"))
+                                }
+                            };
+                            let cur_label = match &rows[i][0] {
+                                Value::Text(s) => s.clone(),
+                                Value::Null => String::new(),
+                                _ => {
+                                    return Err(format!("[{iter}] multi-col sort: bad label type"))
+                                }
+                            };
+                            let prev_val = parse_numeric_value(&rows[i - 1][1]);
+                            let cur_val = parse_numeric_value(&rows[i][1]);
+                            let label_cmp = if desc {
+                                prev_label.cmp(&cur_label).reverse()
+                            } else {
+                                prev_label.cmp(&cur_label)
+                            };
+                            if label_cmp == std::cmp::Ordering::Greater {
+                                return Err(format!(
+                                    "[{iter}] multi-col sort: labels out of order: '{prev_label}' vs '{cur_label}'"
+                                ));
+                            }
+                            if label_cmp == std::cmp::Ordering::Equal {
+                                if let (Some(pv), Some(cv)) = (prev_val, cur_val) {
+                                    let val_ok = if desc { pv >= cv } else { pv <= cv };
+                                    if !val_ok {
+                                        return Err(format!(
+                                            "[{iter}] multi-col sort: vals out of order within label '{cur_label}': {pv} vs {cv}"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        executed += 1;
+                    }
+                    // --- Multi-column index: WHERE label = ? ORDER BY val ---
+                    31 => {
+                        let label = LABELS[rng.random_range(0..LABELS.len())];
+                        let query = format!(
+                            "SELECT val FROM t1 WHERE label = '{label}' ORDER BY val {dir}"
+                        );
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        check_sorted(&rows, 0, desc, &format!("[{iter}] {query}"))?;
+                        executed += 1;
+                    }
+                    // --- Multi-column index: WHERE label = ? AND val > threshold ---
+                    32 => {
+                        let label = LABELS[rng.random_range(0..LABELS.len())];
+                        let threshold = random_numeric(&mut rng);
+                        let t: f64 = threshold.parse().unwrap();
+                        let query = format!(
+                            "SELECT val FROM t1 WHERE label = '{label}' AND val > '{threshold}' ORDER BY val"
+                        );
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        check_sorted(&rows, 0, false, &format!("[{iter}] {query}"))?;
+                        check_all_satisfy(
+                            &rows,
+                            0,
+                            |v| v > t,
+                            &format!("val > {threshold}"),
+                            &format!("[{iter}] {query}"),
+                        )?;
+                        executed += 1;
+                    }
+                    // --- Index on t4: ORDER BY val (exercises index after mutations) ---
+                    33 => {
+                        let query = format!("SELECT val FROM t4 ORDER BY val {dir}");
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        check_sorted(&rows, 0, desc, &format!("[{iter}] {query}"))?;
+                        executed += 1;
+                    }
+                    // --- Index on t4: WHERE val > threshold (index seek after mutations) ---
+                    34 => {
+                        let threshold = random_numeric(&mut rng);
+                        let t: f64 = threshold.parse().unwrap();
+                        let query =
+                            format!("SELECT val FROM t4 WHERE val > '{threshold}' ORDER BY val");
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        check_sorted(&rows, 0, false, &format!("[{iter}] {query}"))?;
+                        check_all_satisfy(
+                            &rows,
+                            0,
+                            |v| v > t,
+                            &format!("val > {threshold}"),
+                            &format!("[{iter}] {query}"),
+                        )?;
+                        executed += 1;
+                    }
+                    // --- Index on t4: range query (index range scan after mutations) ---
+                    35 => {
+                        let a = random_numeric(&mut rng);
+                        let b = random_numeric(&mut rng);
+                        let (lo, hi) = if a.parse::<f64>().unwrap() <= b.parse::<f64>().unwrap() {
+                            (a, b)
+                        } else {
+                            (b, a)
+                        };
+                        let query = format!(
+                            "SELECT val FROM t4 WHERE val >= '{lo}' AND val <= '{hi}' ORDER BY val"
+                        );
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        check_sorted(&rows, 0, false, &format!("[{iter}] {query}"))?;
+                        let lo_f: f64 = lo.parse().unwrap();
+                        let hi_f: f64 = hi.parse().unwrap();
+                        check_all_satisfy(
+                            &rows,
+                            0,
+                            |v| v >= lo_f && v <= hi_f,
+                            &format!("val in [{lo}, {hi}]"),
+                            &format!("[{iter}] {query}"),
+                        )?;
+                        executed += 1;
+                    }
+                    // --- Mutate t4 then verify index consistency ---
+                    36 => {
+                        // Update a row, then verify index-ordered scan still correct
+                        let new_val = random_numeric(&mut rng);
+                        let target_id = rng.random_range(0..t4_size);
+                        limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!("UPDATE t4 SET val = '{new_val}' WHERE id = {target_id}"),
+                        )
+                        .map_err(|_| String::new())?;
+                        // Index scan must still be sorted after the update
+                        let rows =
+                            limbo_exec_rows_fallible(&db, &conn, "SELECT val FROM t4 ORDER BY val")
+                                .map_err(|_| String::new())?;
+                        check_sorted(
+                            &rows,
+                            0,
+                            false,
+                            &format!("[{iter}] t4 index after UPDATE id={target_id}"),
+                        )?;
+                        // Verify the updated value is findable via index seek
+                        let seek = limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!("SELECT val FROM t4 WHERE val = '{new_val}'"),
+                        )
+                        .map_err(|_| String::new())?;
+                        let expected: f64 = new_val.parse().unwrap();
+                        let found = seek.iter().any(|row| {
+                            parse_numeric_value(&row[0])
+                                .map(|v| (v - expected).abs() < 0.005)
+                                .unwrap_or(false)
+                        });
+                        if !found {
+                            return Err(format!(
+                                "[{iter}] t4 index seek: updated val '{new_val}' not found via WHERE"
+                            ));
                         }
                         executed += 1;
                     }
