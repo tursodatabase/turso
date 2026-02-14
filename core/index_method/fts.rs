@@ -1632,6 +1632,9 @@ fn can_cache_chunks(path: &Path) -> bool {
     path.as_os_str().to_str() != Some(TANTIVY_META_LOCK_FILE)
 }
 
+/// Accumulated file metadata: path -> (chunk_no -> (blob_size, Option<blob_data>))
+type CatalogBuilder = HashMap<i64, (usize, Option<Vec<u8>>)>;
+
 /// State machine for FTS cursor async operations
 #[derive(Debug)]
 enum FtsState {
@@ -1642,10 +1645,9 @@ enum FtsState {
     /// Loading file catalog from BTree (metadata only, not content)
     /// This is the new catalog-first approach for HybridBTreeDirectory
     LoadingCatalog {
-        /// Accumulated file metadata: path -> (chunk_no -> blob_size)
-        /// Using nested HashMap to properly deduplicate by (path, chunk_no) pairs
-        catalog_builder: HashMap<PathBuf, HashMap<i64, usize>>,
-        current_path: Option<String>,
+        /// Hot files capture blob data during scan to avoid a second pass.
+        catalog_builder: HashMap<PathBuf, CatalogBuilder>,
+        current_path: Option<PathBuf>,
     },
     /// Preloading essential files (meta.json and other hot files)
     PreloadingEssentials {
@@ -2632,19 +2634,35 @@ impl IndexMethodCursor for FtsCursor {
                     })?;
 
                     if !cursor.has_record() {
-                        // Done scanning - build catalog and identify files to preload
+                        // Done scanning: build catalog and assemble hot files in single pass
                         let mut catalog = HashMap::default();
+                        let mut hot_files: HashMap<PathBuf, Vec<u8>> = HashMap::default();
                         let mut files_to_load = Vec::new();
 
                         for (path, chunks) in catalog_builder.drain() {
-                            // Calculate max_chunk and total_size from deduplicated chunks
                             let max_chunk = chunks.keys().max().copied().unwrap_or(0);
-                            let total_size: usize = chunks.values().sum();
+                            let total_size: usize = chunks.values().map(|(size, _)| size).sum();
                             let num_chunks = (max_chunk + 1) as usize;
                             let metadata = FileMetadata::new(&path, total_size, num_chunks);
 
-                            // Queue hot files for preloading
-                            if metadata.category.should_preload() || metadata.category.is_hot() {
+                            if metadata.category.is_hot() {
+                                // Try to assemble from captured blob data
+                                let mut all_captured = true;
+                                let mut assembled = Vec::with_capacity(total_size);
+                                for chunk_no in 0..=(max_chunk) {
+                                    if let Some((_, Some(data))) = chunks.get(&chunk_no) {
+                                        assembled.extend_from_slice(data);
+                                    } else {
+                                        all_captured = false;
+                                        break;
+                                    }
+                                }
+                                if all_captured {
+                                    hot_files.insert(path.clone(), assembled);
+                                } else {
+                                    files_to_load.push(path.clone());
+                                }
+                            } else if metadata.category.should_preload() {
                                 files_to_load.push(path.clone());
                             }
 
@@ -2652,12 +2670,13 @@ impl IndexMethodCursor for FtsCursor {
                         }
 
                         tracing::debug!(
-                            "FTS LoadingCatalog: found {} files, {} to preload",
+                            "FTS LoadingCatalog: found {} files, {} hot assembled, {} to preload",
                             catalog.len(),
+                            hot_files.len(),
                             files_to_load.len()
                         );
 
-                        // Create HybridBTreeDirectory with catalog
+                        // Create HybridBTreeDirectory with catalog and pre-assembled hot files
                         let pager = conn.pager.load().clone();
                         let root_page = self.btree_root_page.ok_or_else(|| {
                             LimboError::InternalError("btree_root_page not set".into())
@@ -2667,14 +2686,14 @@ impl IndexMethodCursor for FtsCursor {
                             pager,
                             root_page,
                             catalog,
-                            HashMap::default(), // Will be filled in PreloadingEssentials
+                            hot_files,
                             DEFAULT_HOT_CACHE_BYTES,
                             DEFAULT_CHUNK_CACHE_BYTES,
                         );
                         self.hybrid_directory = Some(hybrid_dir);
 
                         if files_to_load.is_empty() {
-                            // No files to preload, go directly to CreatingIndex
+                            // All hot files assembled in single pass, skip PreloadingEssentials
                             self.state = FtsState::CreatingIndex;
                         } else {
                             self.state = FtsState::PreloadingEssentials {
@@ -2687,10 +2706,10 @@ impl IndexMethodCursor for FtsCursor {
                         continue;
                     }
 
-                    // Read record metadata (path, chunk_no, blob size estimate)
+                    // Read record metadata and capture hot file blobs in single pass
                     let record = return_if_io!(cursor.record());
                     if let Some(record) = record {
-                        let path = record.get_value_opt(0).and_then(|v| match v {
+                        let path_str = record.get_value_opt(0).and_then(|v| match v {
                             crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
                             _ => None,
                         });
@@ -2700,27 +2719,38 @@ impl IndexMethodCursor for FtsCursor {
                             )) => Some(i),
                             _ => None,
                         });
-                        // Get blob size for estimation (we don't read the full blob)
-                        let blob_size = record
-                            .get_value_opt(2)
-                            .map(|v| match v {
-                                crate::types::ValueRef::Blob(b) => b.len(),
-                                _ => 0,
-                            })
-                            .unwrap_or(0);
 
-                        if let (Some(path_str), Some(chunk_no)) = (path, chunk_no) {
-                            // Track path transition
-                            if current_path.as_ref() != Some(&path_str) {
-                                *current_path = Some(path_str.clone());
-                            }
+                        if let (Some(path_str), Some(chunk_no)) = (path_str, chunk_no) {
+                            // Reuse PathBuf when path hasn't changed (records are BTree-ordered)
+                            let path_buf = if current_path.as_ref().map(|p| p.as_os_str().to_str())
+                                == Some(Some(&path_str))
+                            {
+                                current_path.clone().unwrap()
+                            } else {
+                                let p = PathBuf::from(&path_str);
+                                *current_path = Some(p.clone());
+                                p
+                            };
 
-                            // Update catalog builder - store blob_size per chunk_no
-                            // This properly deduplicates: if same chunk_no appears twice,
-                            // we keep the last one (which should be the newest)
-                            let path_buf = PathBuf::from(&path_str);
+                            // Classify file to decide whether to capture blob data
+                            let category = FileCategory::from_path(&path_buf);
+                            let (blob_size, blob_data) = record
+                                .get_value_opt(2)
+                                .map(|v| match v {
+                                    crate::types::ValueRef::Blob(b) => {
+                                        let size = b.len();
+                                        if category.is_hot() {
+                                            (size, Some(b.to_vec()))
+                                        } else {
+                                            (size, None)
+                                        }
+                                    }
+                                    _ => (0, None),
+                                })
+                                .unwrap_or((0, None));
+
                             let chunks = catalog_builder.entry(path_buf).or_default();
-                            chunks.insert(chunk_no, blob_size);
+                            chunks.insert(chunk_no, (blob_size, blob_data));
                         }
                     }
 
