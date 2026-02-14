@@ -691,6 +691,7 @@ impl HybridBTreeDirectory {
             has_rowid: false,
             num_cols: Self::CHUNK_LEN,
             key_info: vec![key_info(), key_info(), key_info()],
+            is_unique: false,
         }));
 
         let seek_key = ImmutableRecord::from_values(
@@ -1823,6 +1824,7 @@ impl FtsCursor {
             has_rowid: false,
             num_cols: 3,
             key_info: vec![key_info(), key_info(), key_info()],
+            is_unique: false,
         }));
         self.fts_dir_cursor = Some(cursor);
         Ok(())

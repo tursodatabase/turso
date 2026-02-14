@@ -1115,6 +1115,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                                     key_info: index_info.key_info.clone(),
                                     has_rowid: index_info.has_rowid,
                                     num_cols: index_key.column_count(),
+                                    is_unique: index_info.is_unique,
                                 })
                             };
                             let sortable_key =
