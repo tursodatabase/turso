@@ -1,7 +1,11 @@
 use either::Either;
 use turso_parser::ast::{Expr, Literal};
 
-use crate::{types::AsValueRef, Value, ValueRef};
+use crate::{
+    numeric::{format_float, DoubleDouble, Numeric},
+    types::AsValueRef,
+    Value, ValueRef,
+};
 
 /// # SQLite Column Type Affinities
 ///
@@ -182,13 +186,23 @@ impl Affinity {
                 .map(Either::Left),
 
             Affinity::Text => {
-                if is_text {
-                    is_numeric_value(val)
-                        .then(|| stringify_register(val))
-                        .flatten()
-                        .map(Either::Right)
-                } else {
-                    None
+                // TEXT affinity: Convert numeric values to their text representation
+                match val {
+                    ValueRef::Numeric(Numeric::Integer(i)) => {
+                        Some(Either::Right(Value::Text(i.to_string().into())))
+                    }
+                    ValueRef::Numeric(Numeric::Float(f)) => Some(Either::Right(Value::Text(
+                        format_float(f64::from(f)).into(),
+                    ))),
+                    ValueRef::Text(_) => {
+                        // If it's already text but looks numeric, ensure it's in canonical text form
+                        if is_numeric_value(val) {
+                            stringify_register(val).map(Either::Right)
+                        } else {
+                            None // Already text, no conversion needed
+                        }
+                    }
+                    _ => None, // Blob and Null are not converted
                 }
             }
 
@@ -197,8 +211,8 @@ impl Affinity {
                     .then(|| apply_numeric_affinity(val, false))
                     .flatten();
 
-                if let ValueRef::Integer(i) = left.unwrap_or(val) {
-                    left = Some(ValueRef::Float(i as f64));
+                if let ValueRef::Numeric(Numeric::Integer(i)) = left.unwrap_or(val) {
+                    left = Some(ValueRef::from_f64(i as f64));
                 }
 
                 left.map(Either::Left)
@@ -271,8 +285,7 @@ impl ParsedNumber {
     }
 }
 
-pub fn try_for_float(text: &str) -> (NumericParseResult, ParsedNumber) {
-    let bytes = text.as_bytes();
+pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
     if bytes.is_empty() {
         return (NumericParseResult::NotNumeric, ParsedNumber::None);
     }
@@ -447,47 +460,49 @@ fn create_result_from_significand(
         return (parse_result, ParsedNumber::Integer(signed_val));
     }
 
-    // Convert to float
-    let mut result = significand as f64;
+    // Convert to float using Dekker double-double arithmetic for precision
+    // This matches SQLite's sqlite3AtoF implementation
+    let mut result = DoubleDouble::from(significand);
 
     let mut exp = exponent;
     match exp.cmp(&0) {
         std::cmp::Ordering::Greater => {
             while exp >= 100 {
-                result *= 1e100;
+                result *= DoubleDouble::E100;
                 exp -= 100;
             }
             while exp >= 10 {
-                result *= 1e10;
+                result *= DoubleDouble::E10;
                 exp -= 10;
             }
             while exp >= 1 {
-                result *= 10.0;
+                result *= DoubleDouble::E1;
                 exp -= 1;
             }
         }
         std::cmp::Ordering::Less => {
             while exp <= -100 {
-                result *= 1e-100;
+                result *= DoubleDouble::NEG_E100;
                 exp += 100;
             }
             while exp <= -10 {
-                result *= 1e-10;
+                result *= DoubleDouble::NEG_E10;
                 exp += 10;
             }
             while exp <= -1 {
-                result *= 0.1;
+                result *= DoubleDouble::NEG_E1;
                 exp += 1;
             }
         }
         std::cmp::Ordering::Equal => {}
     }
 
+    let mut final_result: f64 = result.into();
     if sign < 0 {
-        result = -result;
+        final_result = -final_result;
     }
 
-    (parse_result, ParsedNumber::Float(result))
+    (parse_result, ParsedNumber::Float(final_result))
 }
 
 pub fn is_space(byte: u8) -> bool {
@@ -505,15 +520,16 @@ fn real_to_i64(r: f64) -> i64 {
 }
 
 fn apply_integer_affinity(val: ValueRef) -> Option<ValueRef> {
-    let ValueRef::Float(f) = val else {
+    let ValueRef::Numeric(Numeric::Float(nn)) = val else {
         return None;
     };
 
+    let f: f64 = nn.into();
     let ix = real_to_i64(f);
 
     // Only convert if round-trip is exact and not at extreme values
     if f == (ix as f64) && ix > i64::MIN && ix < i64::MAX {
-        Some(ValueRef::Integer(ix))
+        Some(ValueRef::Numeric(Numeric::Integer(ix)))
     } else {
         None
     }
@@ -529,7 +545,7 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
     };
 
     let text_str = text.as_str();
-    let (parse_result, parsed_value) = try_for_float(text_str);
+    let (parse_result, parsed_value) = try_for_float(text_str.as_bytes());
 
     // Only convert if we have a complete valid number (not just a prefix)
     match parse_result {
@@ -538,9 +554,9 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
         }
         NumericParseResult::PureInteger => {
             if let Some(int_val) = parsed_value.as_integer() {
-                Some(ValueRef::Integer(int_val))
+                Some(ValueRef::Numeric(Numeric::Integer(int_val)))
             } else if let Some(float_val) = parsed_value.as_float() {
-                let res = ValueRef::Float(float_val);
+                let res = ValueRef::from_f64(float_val);
                 if try_for_int {
                     apply_integer_affinity(res)
                 } else {
@@ -552,7 +568,14 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
         }
         NumericParseResult::HasDecimalOrExp => {
             if let Some(float_val) = parsed_value.as_float() {
-                let res = ValueRef::Float(float_val);
+                // Failed parses can occasionally surface as NaN. Treat those as
+                // non-convertible so we keep the original text value instead of
+                // coercing to NULL during comparison affinity conversion.
+                if float_val.is_nan() {
+                    return None;
+                }
+
+                let res = ValueRef::from_f64(float_val);
                 // If try_for_int is true, try to convert float to int if exact
                 if try_for_int {
                     apply_integer_affinity(res)
@@ -567,14 +590,14 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
 }
 
 fn is_numeric_value(val: ValueRef) -> bool {
-    matches!(val, ValueRef::Integer(_) | ValueRef::Float(_))
+    matches!(val, ValueRef::Numeric(_))
 }
 
 fn stringify_register(val: ValueRef) -> Option<Value> {
     match val {
-        ValueRef::Integer(i) => Some(Value::build_text(i.to_string())),
-        ValueRef::Float(f) => Some(Value::build_text(f.to_string())),
-        ValueRef::Text(_) | ValueRef::Null | ValueRef::Blob(_) => None,
+        ValueRef::Numeric(Numeric::Integer(i)) => Some(Value::build_text(i.to_string())),
+        ValueRef::Numeric(Numeric::Float(f)) => Some(Value::build_text(f64::from(f).to_string())),
+        _ => None,
     }
 }
 
@@ -601,18 +624,42 @@ mod tests {
     fn test_apply_numeric_affinity_complete_numbers() {
         let val = Value::Text("123".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
-        assert_eq!(res, Some(ValueRef::Integer(123)));
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(123))));
 
         let val = Value::Text("123.45".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
-        assert_eq!(res, Some(ValueRef::Float(123.45)));
+        assert_eq!(res, Some(ValueRef::from_f64(123.45)));
 
         let val = Value::Text("  -456  ".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
-        assert_eq!(res, Some(ValueRef::Integer(-456)));
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(-456))));
 
         let val = Value::Text("0".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
-        assert_eq!(res, Some(ValueRef::Integer(0)));
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(0))));
+    }
+
+    #[test]
+    fn test_apply_numeric_affinity_nan_like_parse_keeps_text() {
+        // Regression: this text can parse into a NaN float in the numeric-affinity
+        // path. We must not coerce it to NULL.
+        let val = Value::Text("3139353734372E383932303939343135".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_try_for_float_precision() {
+        // This test verifies that try_for_float uses high-precision arithmetic
+        // to avoid rounding errors when computing significand * 10^exponent.
+        // Naive f64 multiplication accumulates errors; Dekker double-double fixes this.
+        let (_, parsed) = try_for_float(b"12345678901234567e-5");
+        let expected: f64 = "12345678901234567e-5".parse().unwrap();
+        assert_eq!(
+            parsed.as_float().unwrap().to_bits(),
+            expected.to_bits(),
+            "try_for_float precision mismatch: got {}, expected {expected}",
+            parsed.as_float().unwrap(),
+        );
     }
 }

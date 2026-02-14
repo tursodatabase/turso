@@ -1,0 +1,46 @@
+---
+source: sorting.sqltest
+expression: "SELECT id, name, price, stock, price * stock AS total_value\n    FROM products\n    ORDER BY price * stock DESC;"
+info:
+  statement_type: SELECT
+  tables:
+    - products
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SCAN products
+`--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode          p1  p2  p3  p4                p5  comment
+   0  Init             0  27   0                     0  Start at 27
+   1  SorterOpen       0   1   0  k(1,-B)            0  cursor=0
+   2  OpenRead         1   2   0  k(6,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   3  Rewind           1  16   0                     0  Rewind table products
+   4    Column         1   2  12                     0  r[12]=products.price
+   5    RealAffinity  12   0   0                     0
+   6    Column         1   4  13                     0  r[13]=products.stock
+   7    Multiply      12  13   7                     0  r[7]=r[12]*r[13]
+   8    RowId          1   8   0                     0  r[8]=products.rowid
+   9    Column         1   1   9                     0  r[9]=products.name
+  10    Column         1   2  10                     0  r[10]=products.price
+  11    RealAffinity  10   0   0                     0
+  12    Column         1   4  11                     0  r[11]=products.stock
+  13    MakeRecord     7   5   6                     0  r[6]=mkrec(r[7..11])
+  14    SorterInsert   0   6   0  0                  0  key=r[6]
+  15  Next             1   4   0                     0
+  16  OpenPseudo       2   6   5                     0  5 columns in r[6]
+  17  SorterSort       0  26   0                     0
+  18    SorterData     0   6   2                     0  r[6]=data
+  19    Column         2   1   1                     0  r[1]=pseudo.column 1
+  20    Column         2   2   2                     0  r[2]=pseudo.column 2
+  21    Column         2   3   3                     0  r[3]=pseudo.column 3
+  22    Column         2   4   4                     0  r[4]=pseudo.column 4
+  23    Column         2   0   5                     0  r[5]=pseudo.column 0
+  24    ResultRow      1   5   0                     0  output=r[1..5]
+  25  SorterNext       0  18   0                     0
+  26  Halt             0   0   0                     0
+  27  Transaction      0   1   7                     0  iDb=0 tx_mode=Read
+  28  Goto             0   1   0                     0

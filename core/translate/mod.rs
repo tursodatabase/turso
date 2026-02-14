@@ -40,12 +40,14 @@ pub(crate) mod trigger;
 pub(crate) mod trigger_exec;
 pub(crate) mod update;
 pub(crate) mod upsert;
+pub(crate) mod vacuum;
 mod values;
 pub(crate) mod view;
 mod window;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
+use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
@@ -53,12 +55,11 @@ use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
-use index::{translate_create_index, translate_drop_index};
+use index::{translate_create_index, translate_drop_index, translate_optimize};
 use insert::translate_insert;
 use rollback::translate_rollback;
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
-use std::sync::Arc;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast::{self, Indexed};
@@ -136,6 +137,7 @@ pub fn translate_inner(
             | ast::Stmt::DropTable { .. }
             | ast::Stmt::DropView { .. }
             | ast::Stmt::Reindex { .. }
+            | ast::Stmt::Optimize { .. }
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
     );
@@ -152,7 +154,7 @@ pub fn translate_inner(
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program)?
+            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
         ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
@@ -205,6 +207,7 @@ pub fn translate_inner(
                 tbl_name,
                 program,
                 sql,
+                connection.clone(),
             )?
         }
         ast::Stmt::CreateView {
@@ -241,9 +244,6 @@ pub fn translate_inner(
             order_by,
             with,
         } => {
-            if with.is_some() {
-                bail_parse_error!("WITH clause is not supported in DELETE");
-            }
             if indexed.is_some_and(|i| matches!(i, Indexed::IndexedBy(_))) {
                 bail_parse_error!("INDEXED BY clause is not supported in DELETE");
             }
@@ -256,11 +256,14 @@ pub fn translate_inner(
                 where_clause,
                 limit,
                 returning,
+                with,
                 program,
                 connection,
             )?
         }
-        ast::Stmt::Detach { name } => attach::translate_detach(&name, resolver, program)?,
+        ast::Stmt::Detach { name } => {
+            attach::translate_detach(&name, resolver, program, connection.clone())?
+        }
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
@@ -277,6 +280,7 @@ pub fn translate_inner(
             trigger_name.name.as_str(),
             if_exists,
             program,
+            connection.clone(),
         )?,
         ast::Stmt::DropView {
             if_exists,
@@ -288,6 +292,9 @@ pub fn translate_inner(
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
         ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
+        ast::Stmt::Optimize { idx_name } => {
+            translate_optimize(idx_name, resolver, program, connection)?
+        }
         ast::Stmt::Release { .. } => bail_parse_error!("RELEASE not supported yet"),
         ast::Stmt::Rollback {
             tx_name,
@@ -305,7 +312,9 @@ pub fn translate_inner(
             .program
         }
         ast::Stmt::Update(update) => translate_update(update, resolver, program, connection)?,
-        ast::Stmt::Vacuum { .. } => bail_parse_error!("VACUUM not supported yet"),
+        ast::Stmt::Vacuum { name, into } => {
+            vacuum::translate_vacuum(program, name.as_ref(), into.as_deref())?
+        }
         ast::Stmt::Insert {
             with,
             or_conflict,
@@ -313,21 +322,17 @@ pub fn translate_inner(
             columns,
             body,
             returning,
-        } => {
-            if with.is_some() {
-                crate::bail_parse_error!("WITH clause is not supported");
-            }
-            translate_insert(
-                resolver,
-                or_conflict,
-                tbl_name,
-                columns,
-                body,
-                returning,
-                program,
-                connection,
-            )?
-        }
+        } => translate_insert(
+            resolver,
+            or_conflict,
+            tbl_name,
+            columns,
+            body,
+            returning,
+            with,
+            program,
+            connection,
+        )?,
     };
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction
@@ -341,4 +346,45 @@ pub fn translate_inner(
     }
 
     Ok(program)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::MemoryIO;
+    use crate::Database;
+
+    /// Verify that REGEXP produces the correct error when no regexp function is registered.
+    #[test]
+    fn test_regexp_no_function_registered() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        let schema = db.schema.lock().clone();
+        let pager = conn.pager.load().clone();
+
+        // Use an empty SymbolTable so regexp() is not available.
+        let empty_syms = SymbolTable::new();
+        let mut parser = turso_parser::parser::Parser::new(b"SELECT 'x' REGEXP 'y'");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let result = translate(
+            &schema,
+            stmt,
+            pager,
+            conn,
+            &empty_syms,
+            QueryMode::Normal,
+            "",
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no such function: regexp"),
+            "expected 'no such function: regexp', got: {err}"
+        );
+    }
 }

@@ -1,9 +1,7 @@
-use crate::common::{do_flush, maybe_setup_tracing, TempDatabase};
-use std::cell::RefCell;
+use crate::common::{compute_dbhash, do_flush, maybe_setup_tracing, TempDatabase};
 use std::ops::Deref;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use turso_core::{Connection, LimboError, Result, StepResult};
+use turso_core::{Connection, LimboError, Result};
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
@@ -20,6 +18,9 @@ fn test_wal_checkpoint_result(tmp_db: TempDatabase) -> Result<()> {
     conn.execute("select * from t1;")?;
     do_flush(&conn, &tmp_db).unwrap();
 
+    // hash BEFORE checkpoint
+    let hash_before = compute_dbhash(&tmp_db);
+
     // checkpoint result should return > 0 num pages now as database has data
     let res = execute_and_get_ints(&conn, "pragma wal_checkpoint;")?;
     println!("'pragma wal_checkpoint;' returns: {res:?}");
@@ -27,6 +28,15 @@ fn test_wal_checkpoint_result(tmp_db: TempDatabase) -> Result<()> {
     assert_eq!(res[0], 0); // checkpoint successfully
     assert!(res[1] > 0); // num pages in wal
     assert!(res[2] > 0); // num pages checkpointed successfully
+
+    do_flush(&conn, &tmp_db).unwrap();
+
+    // hash AFTER checkpoint - must be identical
+    let hash_after = compute_dbhash(&tmp_db);
+    assert_eq!(
+        hash_before.hash, hash_after.hash,
+        "checkpoint changed database content!!!!!!"
+    );
 
     Ok(())
 }
@@ -41,17 +51,9 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     {
         let conn = db.connect().unwrap();
         match conn.query("CREATE TABLE t (id)")? {
-            Some(ref mut rows) => loop {
-                match rows.step().unwrap() {
-                    StepResult::Row => {}
-                    StepResult::IO => {
-                        rows.run_once().unwrap();
-                    }
-                    StepResult::Interrupt => break,
-                    StepResult::Done => break,
-                    StepResult::Busy => unreachable!(),
-                }
-            },
+            Some(ref mut rows) => {
+                rows.run_with_row_callback(|_| Ok(())).unwrap();
+            }
             None => todo!(),
         }
         do_flush(&conn, tmp_db.lock().unwrap().deref()).unwrap();
@@ -76,22 +78,15 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
             let rows = *rows_.lock().unwrap();
             let mut i = 0;
             match conn.query("SELECT * FROM t") {
-                Ok(Some(ref mut rows)) => loop {
-                    match rows.step().unwrap() {
-                        StepResult::Row => {
-                            let row = rows.row().unwrap();
-                            let id = row.get::<i64>(0).unwrap();
-                            assert_eq!(id, i);
-                            i += 1;
-                        }
-                        StepResult::IO => {
-                            rows.run_once().unwrap();
-                        }
-                        StepResult::Interrupt => break,
-                        StepResult::Done => break,
-                        StepResult::Busy => unreachable!(),
-                    }
-                },
+                Ok(Some(ref mut rows)) => {
+                    rows.run_with_row_callback(|row| {
+                        let id = row.get::<i64>(0).unwrap();
+                        assert_eq!(id, i);
+                        i += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                }
                 Ok(None) => {}
                 Err(err) => {
                     eprintln!("{err}");
@@ -110,56 +105,101 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
 
 /// Execute a statement and get strings result
 pub(crate) fn execute_and_get_strings(conn: &Arc<Connection>, sql: &str) -> Result<Vec<String>> {
-    let statement = conn.prepare(sql)?;
-    let stmt = Rc::new(RefCell::new(statement));
+    let mut stmt = conn.prepare(sql)?;
     let mut result = Vec::new();
 
-    let mut stmt = stmt.borrow_mut();
-    while let Ok(step_result) = stmt.step() {
-        match step_result {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                for el in row.get_values() {
-                    result.push(format!("{el}"));
-                }
-            }
-            StepResult::Done => break,
-            StepResult::Interrupt => break,
-            StepResult::IO => stmt.run_once()?,
-            StepResult::Busy => stmt.run_once()?,
+    stmt.run_with_row_callback(|row| {
+        for el in row.get_values() {
+            result.push(format!("{el}"));
         }
-    }
+        Ok(())
+    })?;
     Ok(result)
 }
 
 /// Execute a statement and get integers
 pub(crate) fn execute_and_get_ints(conn: &Arc<Connection>, sql: &str) -> Result<Vec<i64>> {
-    let statement = conn.prepare(sql)?;
-    let stmt = Rc::new(RefCell::new(statement));
+    let mut stmt = conn.prepare(sql)?;
     let mut result = Vec::new();
 
-    let mut stmt = stmt.borrow_mut();
-    while let Ok(step_result) = stmt.step() {
-        match step_result {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                for value in row.get_values() {
-                    let out = match value {
-                        turso_core::Value::Integer(i) => i,
-                        _ => {
-                            return Err(LimboError::ConversionError(format!(
-                                "cannot convert {value} to int"
-                            )))
-                        }
-                    };
-                    result.push(*out);
+    stmt.run_with_row_callback(|row| {
+        for value in row.get_values() {
+            let out = match value {
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => i,
+                _ => {
+                    return Err(LimboError::ConversionError(format!(
+                        "cannot convert {value} to int"
+                    )))
                 }
-            }
-            StepResult::Done => break,
-            StepResult::Interrupt => break,
-            StepResult::IO => stmt.run_once()?,
-            StepResult::Busy => stmt.run_once()?,
+            };
+            result.push(*out);
         }
-    }
+        Ok(())
+    })?;
+
     Ok(result)
+}
+
+#[test]
+fn test_wal_read_lock_released_on_conn_drop() {
+    maybe_setup_tracing();
+    let tmp_db = TempDatabase::new("test_wal_read_lock_released.db");
+    let db = tmp_db.limbo_database();
+
+    // Setup: create table and insert data so WAL has content
+    let setup_conn = db.connect().unwrap();
+    setup_conn
+        .execute("CREATE TABLE t (id integer primary key)")
+        .unwrap();
+    setup_conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let conn1 = db.connect().unwrap();
+    let conn2 = db.connect().unwrap();
+
+    // conn1 starts a read transaction and panics while holding the read lock
+    let join_result = std::thread::spawn(move || {
+        conn1.execute("BEGIN").unwrap();
+        conn1.execute("SELECT * FROM t").unwrap();
+        panic!("intentional panic while holding read tx");
+    })
+    .join();
+    assert!(join_result.is_err(), "conn1 thread should panic");
+
+    // TRUNCATE checkpoint requires that there be no readers - this would hang/fail if read lock wasn't released
+    let res = conn2.pragma_update("wal_checkpoint", "TRUNCATE").unwrap();
+    let row = res.first().unwrap();
+    let truncate_succeeded = row.first().unwrap() == &turso_core::Value::from_i64(0)
+        && row.get(1).unwrap() == &turso_core::Value::from_i64(0)
+        && row.get(2).unwrap() == &turso_core::Value::from_i64(0);
+
+    // Expect full truncate, i.e. 0 0 0 result.
+    assert!(
+        truncate_succeeded,
+        "truncate should have succeeded, got checkpoint result: {res:?}"
+    );
+}
+
+#[test]
+fn test_wal_write_lock_released_on_conn_drop() {
+    maybe_setup_tracing();
+    let tmp_db = TempDatabase::new("test_wal_write_lock_released.db");
+    let db = tmp_db.limbo_database();
+
+    let conn1 = db.connect().unwrap();
+    let conn2 = db.connect().unwrap();
+
+    let join_result = std::thread::spawn(move || {
+        conn1.execute("BEGIN IMMEDIATE").unwrap();
+        panic!("intentional panic while holding write tx");
+    })
+    .join();
+    assert!(join_result.is_err(), "conn1 thread should panic");
+
+    conn2.set_busy_handler(Some(Box::new(move |_| {
+        panic!("Got busy, this should not happen");
+    })));
+
+    conn2
+        .execute("CREATE TABLE t (id integer primary key)")
+        .unwrap();
 }

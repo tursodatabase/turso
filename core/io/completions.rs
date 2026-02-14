@@ -7,11 +7,14 @@ use std::{
     task::Waker,
 };
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 
 use crate::{Buffer, CompletionError};
 
-pub type ReadComplete = dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + Sync;
+/// Callback for read completions. Returns `Some(error)` if the callback detects an error
+/// (e.g., short read), which will be stored in the completion and propagated to VDBE.
+pub type ReadComplete =
+    dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) -> Option<CompletionError> + Send + Sync;
 pub type WriteComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 pub type SyncComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
@@ -84,8 +87,7 @@ pub(super) struct CompletionInner {
     completion_type: CompletionType,
     /// None means we completed successfully
     // Thread safe with OnceLock
-    pub(super) result: std::sync::OnceLock<Option<CompletionError>>,
-    needs_link: bool,
+    pub(super) result: crate::sync::OnceLock<Option<CompletionError>>,
     context: Context,
     /// Optional parent group this completion belongs to
     parent: OnceLock<Arc<GroupCompletionInner>>,
@@ -95,7 +97,6 @@ impl fmt::Debug for CompletionInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompletionInner")
             .field("completion_type", &self.completion_type)
-            .field("needs_link", &self.needs_link)
             .field("parent", &self.parent.get().is_some())
             .finish()
     }
@@ -167,6 +168,8 @@ impl CompletionGroup {
             _ => unreachable!(),
         };
         if group_inner.outstanding.load(Ordering::SeqCst) == 0 {
+            // Set result to Some(None) on success so succeeded() returns true
+            let _ = group_inner.result.set(None);
             (group_inner.complete)(Ok(0));
         }
         group
@@ -247,11 +250,10 @@ pub enum CompletionType {
 }
 
 impl CompletionInner {
-    fn new(completion_type: CompletionType, needs_link: bool) -> Self {
+    fn new(completion_type: CompletionType) -> Self {
         Self {
             completion_type,
             result: OnceLock::new(),
-            needs_link,
             context: Context::new(),
             parent: OnceLock::new(),
         }
@@ -261,13 +263,7 @@ impl CompletionInner {
 impl Completion {
     pub fn new(completion_type: CompletionType) -> Self {
         Self {
-            inner: Some(Arc::new(CompletionInner::new(completion_type, false))),
-        }
-    }
-
-    pub fn new_linked(completion_type: CompletionType) -> Self {
-        Self {
-            inner: Some(Arc::new(CompletionInner::new(completion_type, true))),
+            inner: Some(Arc::new(CompletionInner::new(completion_type))),
         }
     }
 
@@ -275,19 +271,6 @@ impl Completion {
         self.inner
             .as_ref()
             .expect("completion inner should be initialized")
-    }
-
-    pub fn needs_link(&self) -> bool {
-        self.get_inner().needs_link
-    }
-
-    pub fn new_write_linked<F>(complete: F) -> Self
-    where
-        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
-    {
-        Self::new_linked(CompletionType::Write(WriteCompletion::new(Box::new(
-            complete,
-        ))))
     }
 
     pub fn new_write<F>(complete: F) -> Self
@@ -301,7 +284,10 @@ impl Completion {
 
     pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
     where
-        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + Sync + 'static,
+        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) -> Option<CompletionError>
+            + Send
+            + Sync
+            + 'static,
     {
         Self::new(CompletionType::Read(ReadCompletion::new(
             buf,
@@ -349,9 +335,9 @@ impl Completion {
             Some(inner) => match &inner.completion_type {
                 CompletionType::Group(g) => {
                     g.inner.outstanding.load(Ordering::SeqCst) == 0
-                        && g.inner.result.get().is_none_or(|e| e.is_none())
+                        && g.inner.result.get().is_some_and(|e| e.is_none())
                 }
-                _ => inner.result.get().is_some(),
+                _ => inner.result.get().is_some_and(|e| e.is_none()),
             },
             None => true,
         }
@@ -408,25 +394,50 @@ impl Completion {
     fn callback(&self, result: Result<i32, CompletionError>) {
         let inner = self.get_inner();
         inner.result.get_or_init(|| {
-            match &inner.completion_type {
+            // Run the type-specific callback. For ReadCompletion, this returns
+            // an optional error detected by the callback (e.g., short read).
+            let callback_error = match &inner.completion_type {
                 CompletionType::Read(r) => r.callback(result),
-                CompletionType::Write(w) => w.callback(result),
-                CompletionType::Sync(s) => s.callback(result), // fix
-                CompletionType::Truncate(t) => t.callback(result),
-                CompletionType::Group(g) => g.callback(result),
-                CompletionType::Yield => {}
+                CompletionType::Write(w) => {
+                    w.callback(result);
+                    None
+                }
+                CompletionType::Sync(s) => {
+                    s.callback(result);
+                    None
+                }
+                CompletionType::Truncate(t) => {
+                    t.callback(result);
+                    None
+                }
+                CompletionType::Group(g) => {
+                    g.callback(result);
+                    None
+                }
+                CompletionType::Yield => None,
             };
+
+            // Use callback error if present, otherwise use the original IO error
+            let final_error = callback_error.or_else(|| result.err());
 
             if let Some(group) = inner.parent.get() {
                 // Capture first error in group
-                if let Err(err) = result {
+                if let Some(err) = final_error {
                     let _ = group.result.set(Some(err));
                 }
                 let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
-
+                if prev > 1 {
+                    // progress wake so the waiter keeps driving io.step,
+                    // If prev > 1, there are still children outstanding after this one.
+                    if let Some(group_completion) = group.self_completion.get() {
+                        group_completion.wake();
+                    }
+                }
                 // If this was the last completion in the group, trigger the group's callback
                 // which will recursively call this same callback() method to notify parents
                 if prev == 1 {
+                    // Set result to Some(None) on success so succeeded() returns true
+                    let _ = group.result.set(None);
                     if let Some(group_completion) = group.self_completion.get() {
                         let group_result = group.result.get().and_then(|e| *e);
                         group_completion.callback(group_result.map_or(Ok(0), Err));
@@ -434,7 +445,7 @@ impl Completion {
                 }
             }
 
-            result.err()
+            final_error
         });
         // call the waker regardless
         inner.context.wake();
@@ -478,8 +489,8 @@ impl ReadCompletion {
         &self.buf
     }
 
-    pub fn callback(&self, bytes_read: Result<i32, CompletionError>) {
-        (self.complete)(bytes_read.map(|b| (self.buf.clone(), b)));
+    pub fn callback(&self, bytes_read: Result<i32, CompletionError>) -> Option<CompletionError> {
+        (self.complete)(bytes_read.map(|b| (self.buf.clone(), b)))
     }
 
     pub fn buf_arc(&self) -> Arc<Buffer> {
@@ -537,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_completion_group_empty() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
 
         let callback_called = Arc::new(AtomicBool::new(false));
         let callback_called_clone = callback_called.clone();
@@ -620,7 +631,7 @@ mod tests {
 
     #[test]
     fn test_completion_group_callback() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 
@@ -702,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_completion_group_mixed_finished_and_pending() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 
@@ -768,7 +779,7 @@ mod tests {
         // when code used drain() to move completions into a group, because
         // finished completions would be removed from the source but not tracked
         // by the group, effectively losing them.
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::sync::atomic::{AtomicUsize, Ordering};
 
         let callback_count = Arc::new(AtomicUsize::new(0));
         let callback_count_clone = callback_count.clone();
@@ -824,7 +835,7 @@ mod tests {
     fn test_completion_group_with_all_finished_successfully() {
         // Edge case: all completions are already successfully finished
         // when added to the group. The group should complete immediately.
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
 
         let callback_called = Arc::new(AtomicBool::new(false));
         let callback_called_clone = callback_called.clone();
@@ -858,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_completion_group_nested() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::sync::atomic::{AtomicUsize, Ordering};
 
         // Track callbacks at different levels
         let parent_called = Arc::new(AtomicUsize::new(0));
@@ -943,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_completion_group_nested_with_error() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
 
         let parent_called = Arc::new(AtomicBool::new(false));
         let child_called = Arc::new(AtomicBool::new(false));
@@ -988,5 +999,250 @@ mod tests {
         assert!(!parent_group.succeeded());
         assert_eq!(parent_group.get_error(), Some(CompletionError::Aborted));
         assert!(parent_called.load(Ordering::SeqCst));
+    }
+
+    // Tests for individual completion success/failure status
+
+    #[test]
+    fn test_write_completion_pending_status() {
+        let c = Completion::new_write(|_| {});
+
+        // Pending completion should not be finished, succeeded, or failed
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_write_completion_success() {
+        let c = Completion::new_write(|_| {});
+
+        c.complete(42);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_write_completion_failure() {
+        let c = Completion::new_write(|_| {});
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_read_completion_pending_status() {
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let c = Completion::new_read(buf, |_| None);
+
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_read_completion_success() {
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let c = Completion::new_read(buf, |_| None);
+
+        c.complete(1024);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_read_completion_failure() {
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let c = Completion::new_read(buf, |_| None);
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_sync_completion_pending_status() {
+        let c = Completion::new_sync(|_| {});
+
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_sync_completion_success() {
+        let c = Completion::new_sync(|_| {});
+
+        c.complete(0);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_sync_completion_failure() {
+        let c = Completion::new_sync(|_| {});
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_truncate_completion_pending_status() {
+        let c = Completion::new_trunc(|_| {});
+
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_truncate_completion_success() {
+        let c = Completion::new_trunc(|_| {});
+
+        c.complete(0);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_truncate_completion_failure() {
+        let c = Completion::new_trunc(|_| {});
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_yield_completion_status() {
+        let c = Completion::new_yield();
+
+        // Yield completions are always considered finished and succeeded
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_abort() {
+        let c = Completion::new_write(|_| {});
+
+        c.abort();
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_completion_callback_receives_success_result() {
+        use crate::sync::atomic::{AtomicI32, Ordering};
+
+        let result_value = Arc::new(AtomicI32::new(-1));
+        let result_value_clone = result_value.clone();
+
+        let c = Completion::new_write(move |res| {
+            if let Ok(val) = res {
+                result_value_clone.store(val, Ordering::SeqCst);
+            }
+        });
+
+        c.complete(42);
+
+        assert_eq!(result_value.load(Ordering::SeqCst), 42);
+        assert!(c.succeeded());
+    }
+
+    #[test]
+    fn test_completion_callback_receives_error_result() {
+        use crate::sync::atomic::{AtomicBool, Ordering};
+
+        let got_error = Arc::new(AtomicBool::new(false));
+        let got_error_clone = got_error.clone();
+
+        let c = Completion::new_write(move |res| {
+            if res.is_err() {
+                got_error_clone.store(true, Ordering::SeqCst);
+            }
+        });
+
+        c.error(CompletionError::Aborted);
+
+        assert!(got_error.load(Ordering::SeqCst));
+        assert!(c.failed());
+    }
+
+    #[test]
+    fn test_completion_idempotent_complete() {
+        // Completing a completion multiple times should only trigger the callback once
+        use crate::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let c = Completion::new_write(move |_| {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        c.complete(1);
+        c.complete(2);
+        c.complete(3);
+
+        // Callback should only be called once
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(c.succeeded());
+    }
+
+    #[test]
+    fn test_completion_idempotent_error() {
+        // Erroring a completion multiple times should only trigger the callback once
+        use crate::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let c = Completion::new_write(move |_| {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        c.error(CompletionError::Aborted);
+        c.error(CompletionError::Aborted);
+        c.complete(0); // Try completing after error
+
+        // Callback should only be called once
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(c.failed());
     }
 }

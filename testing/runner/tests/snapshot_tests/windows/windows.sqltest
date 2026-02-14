@@ -1,0 +1,340 @@
+# Window Functions Query Plan Snapshots
+# These snapshots capture EXPLAIN QUERY PLAN output for window function queries
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    CREATE TABLE employees (
+        emp_id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        department TEXT NOT NULL,
+        salary INTEGER NOT NULL,
+        hire_date TEXT NOT NULL
+    );
+
+    CREATE TABLE sales (
+        sale_id INTEGER PRIMARY KEY,
+        emp_id INTEGER NOT NULL,
+        sale_date TEXT NOT NULL,
+        amount INTEGER NOT NULL,
+        region TEXT NOT NULL,
+        FOREIGN KEY (emp_id) REFERENCES employees(emp_id)
+    );
+
+    CREATE INDEX idx_employees_department ON employees(department);
+    CREATE INDEX idx_employees_salary ON employees(salary);
+    CREATE INDEX idx_sales_emp_id ON sales(emp_id);
+    CREATE INDEX idx_sales_date ON sales(sale_date);
+    CREATE INDEX idx_sales_region ON sales(region);
+}
+
+# TODO: Uncomment when ROW_NUMBER() is implemented
+# # 1. ROW_NUMBER() - Basic window function for row numbering
+# @setup schema
+# snapshot row-number-basic {
+#     SELECT
+#         emp_id,
+#         name,
+#         department,
+#         salary,
+#         ROW_NUMBER() OVER (ORDER BY salary DESC) AS salary_rank
+#     FROM employees;
+# }
+
+# TODO: Uncomment when RANK() is implemented
+# # 2. RANK() - Ranking with gaps for tied values
+# @setup schema
+# snapshot rank-with-gaps {
+#     SELECT
+#         emp_id,
+#         name,
+#         department,
+#         salary,
+#         RANK() OVER (ORDER BY salary DESC) AS salary_rank
+#     FROM employees;
+# }
+
+# TODO: Uncomment when DENSE_RANK() is implemented
+# # 3. DENSE_RANK() - Ranking without gaps for tied values
+# @setup schema
+# snapshot dense-rank-no-gaps {
+#     SELECT
+#         emp_id,
+#         name,
+#         department,
+#         salary,
+#         DENSE_RANK() OVER (ORDER BY salary DESC) AS salary_rank
+#     FROM employees;
+# }
+
+# TODO: Uncomment when LEAD() is implemented
+# # 4. LEAD() - Access next row value
+# @setup schema
+# snapshot lead-next-row {
+#     SELECT
+#         emp_id,
+#         name,
+#         salary,
+#         hire_date,
+#         LEAD(salary, 1) OVER (ORDER BY hire_date) AS next_salary,
+#         LEAD(name, 1) OVER (ORDER BY hire_date) AS next_employee
+#     FROM employees;
+# }
+
+# TODO: Uncomment when LAG() is implemented
+# # 5. LAG() - Access previous row value
+# @setup schema
+# snapshot lag-previous-row {
+#     SELECT
+#         emp_id,
+#         name,
+#         salary,
+#         hire_date,
+#         LAG(salary, 1) OVER (ORDER BY hire_date) AS prev_salary,
+#         LAG(name, 1) OVER (ORDER BY hire_date) AS prev_employee
+#     FROM employees;
+# }
+
+# TODO: Uncomment when ROW_NUMBER() and RANK() are implemented
+# # 6. PARTITION BY - Window partitioned by department
+# @setup schema
+# snapshot partition-by-department {
+#     SELECT
+#         emp_id,
+#         name,
+#         department,
+#         salary,
+#         ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary DESC) AS dept_salary_rank,
+#         RANK() OVER (PARTITION BY department ORDER BY salary DESC) AS dept_rank
+#     FROM employees;
+# }
+
+# TODO: Uncomment when ROW_NUMBER() is implemented
+# # 7. Window with ORDER BY - Sorted windows
+# @setup schema
+# snapshot window-order-by {
+#     SELECT
+#         sale_id,
+#         emp_id,
+#         sale_date,
+#         amount,
+#         region,
+#         ROW_NUMBER() OVER (ORDER BY sale_date ASC, amount DESC) AS sale_order
+#     FROM sales;
+# }
+
+# TODO: Uncomment when custom frame specifications are supported
+# # 8a. Frame clause - ROWS BETWEEN
+# @setup schema
+# snapshot frame-rows-between {
+#     SELECT
+#         emp_id,
+#         name,
+#         department,
+#         salary,
+#         SUM(salary) OVER (
+#             ORDER BY salary
+#             ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+#         ) AS nearby_salary_sum,
+#         AVG(salary) OVER (
+#             ORDER BY salary
+#             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+#         ) AS running_avg
+#     FROM employees;
+# }
+
+# TODO: Uncomment when custom frame specifications are supported
+# # 8b. Frame clause - RANGE BETWEEN
+# @setup schema
+# snapshot frame-range-between {
+#     SELECT
+#         emp_id,
+#         name,
+#         salary,
+#         SUM(salary) OVER (
+#             ORDER BY salary
+#             RANGE BETWEEN 10000 PRECEDING AND 10000 FOLLOWING
+#         ) AS similar_salary_sum
+#     FROM employees;
+# }
+
+# 9. SUM() OVER - Running total
+@setup schema
+snapshot running-total {
+    SELECT
+        sale_id,
+        emp_id,
+        sale_date,
+        amount,
+        SUM(amount) OVER (ORDER BY sale_date) AS running_total,
+        SUM(amount) OVER (
+            PARTITION BY emp_id
+            ORDER BY sale_date
+        ) AS emp_running_total
+    FROM sales;
+}
+
+# TODO: Uncomment when ROW_NUMBER() is implemented
+# # 10. Multiple windows - Different partitions in one query
+# @setup schema
+# snapshot multiple-windows {
+#     SELECT
+#         e.emp_id,
+#         e.name,
+#         e.department,
+#         e.salary,
+#         s.amount,
+#         s.region,
+#         ROW_NUMBER() OVER (PARTITION BY e.department ORDER BY e.salary DESC) AS dept_rank,
+#         ROW_NUMBER() OVER (PARTITION BY s.region ORDER BY s.amount DESC) AS region_rank,
+#         SUM(s.amount) OVER (PARTITION BY e.department) AS dept_total_sales,
+#         AVG(e.salary) OVER (PARTITION BY s.region) AS region_avg_salary
+#     FROM employees e
+#     JOIN sales s ON e.emp_id = s.emp_id;
+# }
+
+# Additional useful window function patterns
+
+# TODO: Uncomment when FIRST_VALUE and LAST_VALUE are implemented
+# # FIRST_VALUE and LAST_VALUE
+# @setup schema
+# snapshot first-last-value {
+#     SELECT
+#         emp_id,
+#         name,
+#         department,
+#         salary,
+#         FIRST_VALUE(name) OVER (
+#             PARTITION BY department
+#             ORDER BY salary DESC
+#         ) AS highest_paid_in_dept,
+#         LAST_VALUE(name) OVER (
+#             PARTITION BY department
+#             ORDER BY salary DESC
+#             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+#         ) AS lowest_paid_in_dept
+#     FROM employees;
+# }
+
+# TODO: Uncomment when NTH_VALUE is implemented
+# # NTH_VALUE
+# @setup schema
+# snapshot nth-value {
+#     SELECT
+#         emp_id,
+#         name,
+#         department,
+#         salary,
+#         NTH_VALUE(name, 2) OVER (
+#             PARTITION BY department
+#             ORDER BY salary DESC
+#         ) AS second_highest_paid
+#     FROM employees;
+# }
+
+# TODO: Uncomment when NTILE is implemented
+# # NTILE - Divide into buckets
+# @setup schema
+# snapshot ntile-buckets {
+#     SELECT
+#         emp_id,
+#         name,
+#         salary,
+#         NTILE(4) OVER (ORDER BY salary DESC) AS salary_quartile
+#     FROM employees;
+# }
+
+# Percentage calculations with window functions
+@setup schema
+snapshot percent-of-total {
+    SELECT
+        emp_id,
+        name,
+        department,
+        salary,
+        CAST(salary AS REAL) * 100.0 / SUM(salary) OVER () AS pct_of_total,
+        CAST(salary AS REAL) * 100.0 / SUM(salary) OVER (PARTITION BY department) AS pct_of_dept
+    FROM employees;
+}
+
+# TODO: Uncomment when ROW_NUMBER() and RANK() are implemented
+# # Window with WHERE clause
+# @setup schema
+# snapshot window-with-filter {
+#     SELECT
+#         emp_id,
+#         name,
+#         department,
+#         salary,
+#         ROW_NUMBER() OVER (ORDER BY salary DESC) AS overall_rank,
+#         RANK() OVER (PARTITION BY department ORDER BY salary DESC) AS dept_rank
+#     FROM employees
+#     WHERE salary > 50000;
+# }
+
+# TODO: Uncomment when ROW_NUMBER() is implemented
+# # Window with GROUP BY (window over grouped results)
+# @setup schema
+# snapshot window-over-grouped {
+#     SELECT
+#         department,
+#         COUNT(*) AS emp_count,
+#         SUM(salary) AS total_salary,
+#         ROW_NUMBER() OVER (ORDER BY SUM(salary) DESC) AS dept_salary_rank
+#     FROM employees
+#     GROUP BY department;
+# }
+
+# TODO: Uncomment when ROW_NUMBER() is implemented
+# # Complex window with subquery
+# @setup schema
+# snapshot window-with-subquery {
+#     SELECT
+#         emp_id,
+#         name,
+#         department,
+#         salary,
+#         dept_avg,
+#         salary - dept_avg AS diff_from_avg,
+#         ROW_NUMBER() OVER (ORDER BY salary - dept_avg DESC) AS rank_by_diff
+#     FROM (
+#         SELECT
+#             emp_id,
+#             name,
+#             department,
+#             salary,
+#             AVG(salary) OVER (PARTITION BY department) AS dept_avg
+#         FROM employees
+#     );
+# }
+
+# TODO: Uncomment when LAG and LEAD are implemented
+# # LEAD/LAG with default values
+# @setup schema
+# snapshot lead-lag-with-defaults {
+#     SELECT
+#         sale_id,
+#         sale_date,
+#         amount,
+#         LAG(amount, 1, 0) OVER (ORDER BY sale_date) AS prev_amount,
+#         LEAD(amount, 1, 0) OVER (ORDER BY sale_date) AS next_amount,
+#         amount - LAG(amount, 1, 0) OVER (ORDER BY sale_date) AS change_from_prev
+#     FROM sales;
+# }
+
+# COUNT and other aggregates over windows
+@setup schema
+snapshot aggregate-windows {
+    SELECT
+        emp_id,
+        name,
+        department,
+        salary,
+        COUNT(*) OVER () AS total_employees,
+        COUNT(*) OVER (PARTITION BY department) AS dept_employees,
+        MIN(salary) OVER (PARTITION BY department) AS dept_min_salary,
+        MAX(salary) OVER (PARTITION BY department) AS dept_max_salary,
+        AVG(salary) OVER (PARTITION BY department) AS dept_avg_salary
+    FROM employees;
+}

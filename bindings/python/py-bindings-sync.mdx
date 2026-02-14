@@ -16,11 +16,13 @@ Your task is to write extra code which will use abstractions lib.py and build sy
 # Rules
 
 General rules for driver implementation you **MUST** follow and never go against these rules:
+
 - USE already implemented driver - DO NOT copy it
 - SET async_io=True for the driver database configuration - because partial sync support requires TURSO_IO to handled externally from the bindings
-- STRUCTURE of the implementation 
-    * Declaration order of elements and semantic blocks MUST be exsactly the same
-    * (details and full enumerations omited in the example for brevity but you must generate full code)
+- STRUCTURE of the implementation
+  - Declaration order of elements and semantic blocks MUST be exsactly the same
+  - (details and full enumerations omited in the example for brevity but you must generate full code)
+
 ```py
 # ALL imports MUST be at the beginning - no imports in the middle of function
 from typing import ...
@@ -55,7 +57,7 @@ class PartialSyncQueryBootstrap:
 class PartialSyncOpts:
     bootstrap_strategy: Union[PartialSyncPrefixBootstrap, PartialSyncQueryBootstrap]
     segment_size: Optional[int] = None
-    speculative_load: Optional[bool] = None
+    prefetch: Optional[bool] = None
 
 def connect_sync(
     path: str, # path to the main database file locally
@@ -70,13 +72,15 @@ def connect_sync(
     client_name: Optional[str], # optional unique client name (library MUST use `turso-sync-py` if omitted)
     long_poll_timeout_ms: Optional[number], # long polling timeout
     bootstrap_if_empty: bool = True, # if not set, initial bootstrap phase will be skipped and caller must call .pull(...) explicitly in order to get initial state from remote
-    partial_sync_opts: Optional[PartialSyncOpts] = None, # optional partial sync configuration
+    partial_sync_experimental: Optional[PartialSyncOpts] = None, # EXPERIMENTAL partial sync configuration
     experimental_features: Optional[str] = None, # pass it as-is to the underlying connection
     isolation_level: Optional[str] = "DEFERRED", # pass it as-is to the underlying connection
 ) -> ConnectionSync: ...
 
 ```
+
 - STREAM data from the http request to the completion in chunks and spin async operation in between in order to prevent loading whole response in memory
+
 ```py
 # event loop for async operation "op"
 while True:
@@ -86,6 +90,7 @@ while True:
     io_item.push_buffer(chunk)
     op.resume() # assert that None is returned
 ```
+
 - AVOID unnecessary FFI calls as their cost is non zero
 - AVOID unnecessary strings transformations - replace them with more efficient alternatives if possible
 - AVOID cryptic names - prefer short but concise names (wr is BAD, full_write is GOOD)
@@ -117,7 +122,6 @@ You must integrate with current driver implementation:
 
 <File path="./src/turso.rs" />
 <File path="./turso/lib.py" />
-
 
 </Code>
 

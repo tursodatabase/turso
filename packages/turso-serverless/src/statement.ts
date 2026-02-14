@@ -28,6 +28,25 @@ export class Statement {
     this.columnMetadata = columns || [];
   }
 
+  /**
+   * Whether the prepared statement returns data.
+   *
+   * This is `true` for SELECT queries and statements with RETURNING clause,
+   * and `false` for INSERT, UPDATE, DELETE statements without RETURNING.
+   *
+   * @example
+   * ```typescript
+   * const stmt = await conn.prepare(sql);
+   * if (stmt.reader) {
+   *   return stmt.all(args);  // SELECT-like query
+   * } else {
+   *   return stmt.run(args);  // INSERT/UPDATE/DELETE
+   * }
+   * ```
+   */
+  get reader(): boolean {
+    return this.columnMetadata.length > 0;
+  }
 
   /**
    * Enable raw mode to return arrays instead of objects.
@@ -233,8 +252,12 @@ export class Statement {
               // In raw mode, yield arrays of values
               yield decodedRow;
             } else {
-              const rowObject = this.session.createRowObject(decodedRow, columns);
-              yield rowObject;
+              // In expanded mode, yield plain objects with named properties (consistent with all())
+              const obj: any = {};
+              columns.forEach((col: string, i: number) => {
+                obj[col] = decodedRow[i];
+              });
+              yield obj;
             }
           }
           break;

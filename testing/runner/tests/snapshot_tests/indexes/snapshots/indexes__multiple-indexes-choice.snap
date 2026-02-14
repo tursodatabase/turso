@@ -1,0 +1,37 @@
+---
+source: indexes.sqltest
+expression: "SELECT id, sku, name, price\n    FROM products\n    WHERE category = 'Electronics' AND price < 100;"
+info:
+  statement_type: SELECT
+  tables:
+    - products
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--SEARCH products USING INDEX idx_products_category
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4                  p5  comment
+   0  Init              0  18   0                       0  Start at 18
+   1  OpenRead          0   2   0  k(7,B,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   2  OpenRead          1   4   0  k(2,B)               0  index=idx_products_category, root=4, iDb=0
+   3  String8           0   5   0  Electronics          0  r[5]='Electronics'
+   4  SeekGE            1  17   5                       0  key=[5..5]
+   5    IdxGT           1  17   5                       0  key=[5..5]
+   6    DeferredSeek    1   0   0                       0
+   7    Column          0   4   7                       0  r[7]=products.price
+   8    RealAffinity    7   0   0                       0
+   9    Ge              7   8  16  Binary               0  if r[7]>=r[8] goto 16
+  10    IdxRowId        1   1   0                       0  r[1]=cursor 1 for index idx_products_category.rowid
+  11    Column          0   1   2                       0  r[2]=products.sku
+  12    Column          0   2   3                       0  r[3]=products.name
+  13    Column          0   4   4                       0  r[4]=products.price
+  14    RealAffinity    4   0   0                       0
+  15    ResultRow       1   4   0                       0  output=r[1..4]
+  16  Next              1   5   0                       0
+  17  Halt              0   0   0                       0
+  18  Transaction       0   1  14                       0  iDb=0 tx_mode=Read
+  19  Integer         100   8   0                       0  r[8]=100
+  20  Goto              0   1   0                       0

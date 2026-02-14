@@ -1,24 +1,27 @@
 use crate::schema::{Index, IndexColumn, Schema};
+use crate::sync::Arc;
 use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
+use crate::translate::result_row::emit_columns_to_destination;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
-use crate::vdbe::BranchOffset;
 use crate::{emit_explain, LimboError, QueryMode, SymbolTable};
-use std::sync::Arc;
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
 
 use tracing::Level;
 
+/// Emits bytecode for a compound SELECT statement (UNION, INTERSECT, EXCEPT, UNION ALL).
+/// Returns the result column start register when in coroutine mode (for CTE subqueries),
+/// or None for top-level queries.
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: Plan,
-) -> crate::Result<()> {
+) -> crate::Result<Option<usize>> {
     let Plan::CompoundSelect {
         left,
         right_most,
@@ -104,20 +107,33 @@ pub fn emit_program_for_compound_select(
     // When a compound SELECT is part of a query that yields results to a coroutine (e.g. within an INSERT clause),
     // we must allocate registers for the result columns to be yielded. Each subselect will then yield to
     // the coroutine using the same set of registers.
-    let (yield_reg, reg_result_cols_start) = match right_most.query_destination {
-        QueryDestination::CoroutineYield { yield_reg, .. } => {
-            let start_reg = program.alloc_registers(right_most.result_columns.len());
-            (Some(yield_reg), Some(start_reg))
+    // When the destination is an EphemeralTable or EphemeralIndex (for CTE materialization), we need to
+    // insert into that table/index.
+    // For top-level queries (ResultRows), we emit ResultRow instructions directly.
+    // Allocate registers for result columns when we need to hold values before emitting.
+    // For ResultRows we allocate fresh registers per-row in read_deduplicated_*.
+    let reg_result_cols_start = match &right_most.query_destination {
+        QueryDestination::CoroutineYield { .. }
+        | QueryDestination::EphemeralTable { .. }
+        | QueryDestination::EphemeralIndex { .. } => {
+            Some(program.alloc_registers(right_most.result_columns.len()))
         }
-        _ => (None, None),
+        QueryDestination::ResultRows => None,
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "Unexpected query destination: {other:?} for compound select"
+            )));
+        }
     };
+    // Clone the destination for passing to emit_compound_select
+    let query_destination = right_most.query_destination.clone();
 
     emit_explain!(program, true, "COMPOUND QUERY".to_owned());
 
     // This is inefficient, but emit_compound_select() takes ownership of 'plan' and we
     // must set the result columns to the leftmost subselect's result columns to be compatible
     // with SQLite.
-    program.result_columns = left[0].0.result_columns.clone();
+    program.result_columns.clone_from(&left[0].0.result_columns);
 
     // These must also be set because we make the decision to start a transaction based on whether
     // any tables are actually touched by the query. Previously this only used the rightmost subselect's
@@ -128,9 +144,7 @@ pub fn emit_program_for_compound_select(
             .table_references
             .extend(plan.table_references.clone());
     }
-    program
-        .table_references
-        .extend(right_plan.table_references.clone());
+    program.table_references.extend(right_plan.table_references);
 
     emit_compound_select(
         program,
@@ -139,12 +153,12 @@ pub fn emit_program_for_compound_select(
         right_most_ctx.resolver.symbol_table,
         limit_ctx,
         offset_reg,
-        yield_reg,
         reg_result_cols_start,
+        &query_destination,
     )?;
     program.pop_current_parent_explain();
 
-    Ok(())
+    Ok(reg_result_cols_start)
 }
 
 // Emits bytecode for a compound SELECT statement. This function processes the rightmost part of
@@ -157,8 +171,8 @@ fn emit_compound_select(
     syms: &SymbolTable,
     limit_ctx: Option<LimitCtx>,
     offset_reg: Option<usize>,
-    yield_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
+    query_destination: &QueryDestination,
 ) -> crate::Result<()> {
     let Plan::CompoundSelect {
         mut left,
@@ -192,6 +206,8 @@ fn emit_compound_select(
                 if matches!(
                     right_most.query_destination,
                     QueryDestination::EphemeralIndex { .. }
+                        | QueryDestination::CoroutineYield { .. }
+                        | QueryDestination::EphemeralTable { .. }
                 ) {
                     plan.query_destination = right_most.query_destination.clone();
                 }
@@ -209,8 +225,8 @@ fn emit_compound_select(
                     syms,
                     limit_ctx,
                     offset_reg,
-                    yield_reg,
                     reg_result_cols_start,
+                    query_destination,
                 )?;
 
                 let label_next_select = program.allocate_label();
@@ -238,7 +254,7 @@ fn emit_compound_select(
                 let dedupe_index = match right_most.query_destination {
                     QueryDestination::EphemeralIndex {
                         cursor_id, index, ..
-                    } => (cursor_id, index.clone()),
+                    } => (cursor_id, index),
                     _ => {
                         new_dedupe_index = true;
                         create_dedupe_index(program, &plan, &right_most, schema)?
@@ -263,8 +279,8 @@ fn emit_compound_select(
                     syms,
                     None,
                     None,
-                    yield_reg,
                     reg_result_cols_start,
+                    query_destination,
                 )?;
 
                 right_most.query_destination = QueryDestination::EphemeralIndex {
@@ -284,17 +300,16 @@ fn emit_compound_select(
                         dedupe_index.1.as_ref(),
                         limit_ctx,
                         offset_reg,
-                        yield_reg,
-                    );
+                        reg_result_cols_start,
+                        query_destination,
+                    )?;
                 }
             }
             CompoundOperator::Intersect => {
-                let mut target_cursor_id = None;
-                if let QueryDestination::EphemeralIndex { cursor_id, .. } =
-                    right_most.query_destination
-                {
-                    target_cursor_id = Some(cursor_id);
-                }
+                // For nested compound selects (e.g., A INTERSECT B UNION C), the outer UNION
+                // sets right_most.query_destination to its dedupe_index. We need to capture
+                // this BEFORE we overwrite it with our own indexes for the intersection.
+                let intersect_destination = right_most.query_destination.clone();
 
                 let (left_cursor_id, left_index) =
                     create_dedupe_index(program, &plan, &right_most, schema)?;
@@ -325,8 +340,8 @@ fn emit_compound_select(
                     syms,
                     None,
                     None,
-                    yield_reg,
                     reg_result_cols_start,
+                    query_destination,
                 )?;
 
                 emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
@@ -337,11 +352,11 @@ fn emit_compound_select(
                     left_cursor_id,
                     &left_index,
                     right_cursor_id,
-                    target_cursor_id,
                     limit_ctx,
                     offset_reg,
-                    yield_reg,
-                );
+                    reg_result_cols_start,
+                    &intersect_destination,
+                )?;
             }
             CompoundOperator::Except => {
                 let mut new_index = false;
@@ -373,8 +388,8 @@ fn emit_compound_select(
                     syms,
                     None,
                     None,
-                    yield_reg,
                     reg_result_cols_start,
+                    query_destination,
                 )?;
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id,
@@ -386,8 +401,14 @@ fn emit_compound_select(
                 program.pop_current_parent_explain();
                 if new_index {
                     read_deduplicated_union_or_except_rows(
-                        program, cursor_id, &index, limit_ctx, offset_reg, yield_reg,
-                    );
+                        program,
+                        cursor_id,
+                        &index,
+                        limit_ctx,
+                        offset_reg,
+                        reg_result_cols_start,
+                        query_destination,
+                    )?;
                 }
             }
         },
@@ -468,23 +489,28 @@ fn create_dedupe_index(
         cursor_id,
         is_table: false,
     });
-    Ok((cursor_id, dedupe_index.clone()))
+    Ok((cursor_id, dedupe_index))
 }
 
 /// Emits the bytecode for reading deduplicated rows from the ephemeral index created for
 /// UNION or EXCEPT operators.
+#[allow(clippy::too_many_arguments)]
 fn read_deduplicated_union_or_except_rows(
     program: &mut ProgramBuilder,
     dedupe_cursor_id: usize,
     dedupe_index: &Index,
     limit_ctx: Option<LimitCtx>,
     offset_reg: Option<usize>,
-    yield_reg: Option<usize>,
-) {
+    reg_result_cols_start: Option<usize>,
+    query_destination: &QueryDestination,
+) -> crate::Result<()> {
     let label_close = program.allocate_label();
     let label_dedupe_next = program.allocate_label();
     let label_dedupe_loop_start = program.allocate_label();
-    let dedupe_cols_start_reg = program.alloc_registers(dedupe_index.columns.len());
+    // When in coroutine mode or emitting to index/table, use the pre-allocated result column registers.
+    // Otherwise, allocate new registers for reading from the dedupe index.
+    let dedupe_cols_start_reg = reg_result_cols_start
+        .unwrap_or_else(|| program.alloc_registers(dedupe_index.columns.len()));
     program.emit_insn(Insn::Rewind {
         cursor_id: dedupe_cursor_id,
         pc_if_empty: label_dedupe_next,
@@ -498,30 +524,19 @@ fn read_deduplicated_union_or_except_rows(
         });
     }
     for col_idx in 0..dedupe_index.columns.len() {
-        let start_reg = if let Some(yield_reg) = yield_reg {
-            // Need to reuse the yield_reg for the column being emitted
-            yield_reg + 1
-        } else {
-            dedupe_cols_start_reg
-        };
         program.emit_insn(Insn::Column {
             cursor_id: dedupe_cursor_id,
             column: col_idx,
-            dest: start_reg + col_idx,
+            dest: dedupe_cols_start_reg + col_idx,
             default: None,
         });
     }
-    if let Some(yield_reg) = yield_reg {
-        program.emit_insn(Insn::Yield {
-            yield_reg,
-            end_offset: BranchOffset::Offset(0),
-        });
-    } else {
-        program.emit_insn(Insn::ResultRow {
-            start_reg: dedupe_cols_start_reg,
-            count: dedupe_index.columns.len(),
-        });
-    }
+    emit_columns_to_destination(
+        program,
+        query_destination,
+        dedupe_cols_start_reg,
+        dedupe_index.columns.len(),
+    )?;
 
     if let Some(limit_ctx) = limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
@@ -538,20 +553,21 @@ fn read_deduplicated_union_or_except_rows(
     program.emit_insn(Insn::Close {
         cursor_id: dedupe_cursor_id,
     });
+    Ok(())
 }
 
-// Emits the bytecode for Reading rows from the intersection of two cursors.
+/// Emits the bytecode for reading rows from the intersection of two cursors.
 #[allow(clippy::too_many_arguments)]
 fn read_intersect_rows(
     program: &mut ProgramBuilder,
     left_cursor_id: usize,
     index: &Index,
     right_cursor_id: usize,
-    target_cursor: Option<usize>,
     limit_ctx: Option<LimitCtx>,
     offset_reg: Option<usize>,
-    yield_reg: Option<usize>,
-) {
+    reg_result_cols_start: Option<usize>,
+    query_destination: &QueryDestination,
+) -> crate::Result<()> {
     let label_close = program.allocate_label();
     let label_loop_start = program.allocate_label();
     program.emit_insn(Insn::Rewind {
@@ -580,11 +596,10 @@ fn read_intersect_rows(
         });
     }
     let column_count = index.columns.len();
-    let cols_start_reg = if let Some(yield_reg) = yield_reg {
-        yield_reg + 1
-    } else {
-        program.alloc_registers(column_count)
-    };
+    // When in coroutine mode, use the pre-allocated result column registers.
+    // Otherwise, allocate new registers for reading from the index.
+    let cols_start_reg =
+        reg_result_cols_start.unwrap_or_else(|| program.alloc_registers(column_count));
     for i in 0..column_count {
         program.emit_insn(Insn::Column {
             cursor_id: left_cursor_id,
@@ -593,32 +608,9 @@ fn read_intersect_rows(
             default: None,
         });
     }
-    if let Some(target_cursor_id) = target_cursor {
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: cols_start_reg,
-            count: column_count,
-            dest_reg: row_content_reg,
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: target_cursor_id,
-            record_reg: row_content_reg,
-            unpacked_start: Some(cols_start_reg),
-            unpacked_count: Some(column_count as u16),
-            flags: Default::default(),
-        });
-    } else if let Some(yield_reg) = yield_reg {
-        program.emit_insn(Insn::Yield {
-            yield_reg,
-            end_offset: BranchOffset::Offset(0),
-        })
-    } else {
-        program.emit_insn(Insn::ResultRow {
-            start_reg: cols_start_reg,
-            count: column_count,
-        });
-    }
+
+    emit_columns_to_destination(program, query_destination, cols_start_reg, column_count)?;
+
     if let Some(limit_ctx) = limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,
@@ -638,4 +630,5 @@ fn read_intersect_rows(
     program.emit_insn(Insn::Close {
         cursor_id: left_cursor_id,
     });
+    Ok(())
 }

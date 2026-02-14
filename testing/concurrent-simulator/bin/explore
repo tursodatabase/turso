@@ -1,0 +1,36 @@
+#!/bin/bash
+
+# Usage: ./explore.sh [--enable-checksums|--enable-encryption] [other-args...]
+
+set -e
+
+# Check for special build time flags (e.g. `--enable-checksums`, `--enable-encryption`)
+FEATURES=""
+ARGS=()
+CHECKSUM_ENABLED=false
+ENCRYPTION_ENABLED=false
+
+for arg in "$@"; do
+    if [[ "$arg" == "--enable-checksums" ]]; then
+        FEATURES="--features checksum"
+        CHECKSUM_ENABLED=true
+    elif [[ "$arg" == "--enable-encryption" ]]; then
+        ENCRYPTION_ENABLED=true
+        ARGS+=("$arg")
+    else
+        ARGS+=("$arg")
+    fi
+done
+
+# check for incompatible options
+if [[ "$CHECKSUM_ENABLED" == true && "$ENCRYPTION_ENABLED" == true ]]; then
+    echo "Error: --enable-checksums and --enable-encryption are not compatible with each other"
+    exit 1
+fi
+
+cargo build $FEATURES -p turso_whopper
+
+echo "Running Whopper in an infinite loop in 'fast' mode..."
+while true; do
+    time RUST_BACKTRACE=full ./target/debug/turso_whopper --mode fast "${ARGS[@]}"
+done

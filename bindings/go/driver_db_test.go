@@ -1,10 +1,13 @@
 package turso
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
 	"log"
 	"math"
+	"os"
+	"path"
 	"slices"
 	"testing"
 	"time"
@@ -14,8 +17,7 @@ import (
 )
 
 var (
-	conn    *sql.DB
-	connErr error
+	conn *sql.DB
 )
 
 func openMem(t *testing.T) *sql.DB {
@@ -30,11 +32,12 @@ func openMem(t *testing.T) *sql.DB {
 
 func TestMain(m *testing.M) {
 	InitLibrary(turso_libs.LoadTursoLibraryConfig{LoadStrategy: "mixed"})
-	conn, connErr = sql.Open("turso", ":memory:")
-	if connErr != nil {
-		panic(connErr)
+	var err error
+	conn, err = sql.Open("turso", ":memory:")
+	if err != nil {
+		log.Fatalf("Failed to create database: %v", err)
 	}
-	err := conn.Ping()
+	err = conn.Ping()
 	if err != nil {
 		log.Fatalf("Error pinging database: %v", err)
 	}
@@ -44,6 +47,93 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Error creating table: %v", err)
 	}
 	m.Run()
+}
+
+func TestEncryption(t *testing.T) {
+	hexkey := "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+	wrongKey := "aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+
+	t.Run("encryption=disabled", func(t *testing.T) {
+		tmp := t.TempDir()
+		dbPath := path.Join(tmp, "local.db")
+		conn, err := sql.Open("turso", dbPath)
+		require.Nil(t, err)
+		require.Nil(t, conn.Ping())
+		_, err = conn.Exec("CREATE TABLE t(x)")
+		require.Nil(t, err)
+		_, err = conn.Exec("INSERT INTO t SELECT 'secret' FROM generate_series(1, 1024)")
+		require.Nil(t, err)
+		_, err = conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		require.Nil(t, err)
+		content, err := os.ReadFile(dbPath)
+		require.Nil(t, err)
+		require.True(t, bytes.Contains(content, []byte("secret")))
+	})
+
+	t.Run("encryption=enabled", func(t *testing.T) {
+		tmp := t.TempDir()
+		dbPath := path.Join(tmp, "local.db")
+		dsn := fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=%s", dbPath, hexkey)
+		conn, err := sql.Open("turso", dsn)
+		require.Nil(t, err)
+		require.Nil(t, conn.Ping())
+		_, err = conn.Exec("CREATE TABLE t(x)")
+		require.Nil(t, err)
+		_, err = conn.Exec("INSERT INTO t SELECT 'secret' FROM generate_series(1, 1024)")
+		require.Nil(t, err)
+		_, err = conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		require.Nil(t, err)
+		content, err := os.ReadFile(dbPath)
+		require.Nil(t, err)
+		require.False(t, bytes.Contains(content, []byte("secret")))
+		conn.Close()
+	})
+
+	t.Run("encryption=full_test", func(t *testing.T) {
+		tmp := t.TempDir()
+		dbPath := path.Join(tmp, "encrypted.db")
+
+		dsn := fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=%s", dbPath, hexkey)
+		conn, err := sql.Open("turso", dsn)
+		require.Nil(t, err)
+		require.Nil(t, conn.Ping())
+		_, err = conn.Exec("CREATE TABLE t(x)")
+		require.Nil(t, err)
+		_, err = conn.Exec("INSERT INTO t SELECT 'secret' FROM generate_series(1, 1024)")
+		require.Nil(t, err)
+		_, err = conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		require.Nil(t, err)
+		conn.Close()
+
+		content, err := os.ReadFile(dbPath)
+		require.Nil(t, err)
+		require.Greater(t, len(content), 16*1024)
+		require.False(t, bytes.Contains(content, []byte("secret")))
+
+		// verify we can re-open with the same key
+		conn2, err := sql.Open("turso", dsn)
+		require.Nil(t, err)
+		var count int
+		err = conn2.QueryRow("SELECT count(*) FROM t").Scan(&count)
+		require.Nil(t, err)
+		require.Equal(t, 1024, count)
+		conn2.Close()
+
+		// verify opening with wrong key fails
+		wrongDsn := fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=%s", dbPath, wrongKey)
+		conn3, err := sql.Open("turso", wrongDsn)
+		require.Nil(t, err) // open succeeds but query should fail
+		_, err = conn3.Exec("SELECT * FROM t")
+		require.NotNil(t, err)
+		conn3.Close()
+
+		// verify opening without encryption fails
+		conn4, err := sql.Open("turso", dbPath)
+		require.Nil(t, err) // Open succeeds but query should fail
+		_, err = conn4.Exec("SELECT * FROM t")
+		require.NotNil(t, err)
+		conn4.Close()
+	})
 }
 
 func TestInsertData(t *testing.T) {
@@ -1240,4 +1330,315 @@ func TestMultiStatementExecution(t *testing.T) {
 			t.Errorf("Expected 1 row, got %d", count)
 		}
 	})
+}
+
+func TestTimeValueRoundtrip(t *testing.T) {
+	db := openMem(t)
+
+	_, err := db.Exec(`CREATE TABLE time_test (
+		id INTEGER PRIMARY KEY,
+		created_at DATETIME,
+		updated_at DATETIME,
+		deleted_at TIMESTAMP
+	)`)
+	require.NoError(t, err)
+
+	// Use a fixed time for deterministic testing
+	// time.Time values are stored as RFC3339Nano strings
+	originalTime := time.Date(2024, 6, 15, 14, 30, 45, 123456789, time.UTC)
+	laterTime := originalTime.Add(24 * time.Hour)
+
+	// Insert using time.Time values
+	_, err = db.Exec(
+		`INSERT INTO time_test (id, created_at, updated_at, deleted_at) VALUES (?, ?, ?, ?)`,
+		1, originalTime, laterTime, nil,
+	)
+	require.NoError(t, err)
+
+	t.Run("scan into time.Time", func(t *testing.T) {
+		var id int
+		var createdAt, updatedAt time.Time
+		var deletedAt sql.NullTime
+
+		err := db.QueryRow(`SELECT id, created_at, updated_at, deleted_at FROM time_test WHERE id = 1`).
+			Scan(&id, &createdAt, &updatedAt, &deletedAt)
+		require.NoError(t, err)
+
+		require.Equal(t, 1, id)
+		require.True(t, originalTime.Equal(createdAt), "createdAt mismatch: expected %v, got %v", originalTime, createdAt)
+		require.True(t, laterTime.Equal(updatedAt), "updatedAt mismatch: expected %v, got %v", laterTime, updatedAt)
+		require.False(t, deletedAt.Valid, "deletedAt should be NULL")
+	})
+
+	t.Run("scan into string then parse", func(t *testing.T) {
+		var createdAtStr string
+		err := db.QueryRow(`SELECT created_at FROM time_test WHERE id = 1`).Scan(&createdAtStr)
+		require.NoError(t, err)
+
+		// Verify the stored format is RFC3339Nano
+		parsed, err := time.Parse(time.RFC3339Nano, createdAtStr)
+		require.NoError(t, err)
+		require.True(t, originalTime.Equal(parsed), "parsed time mismatch")
+	})
+
+	t.Run("update with time.Time", func(t *testing.T) {
+		newTime := originalTime.Add(48 * time.Hour)
+		_, err := db.Exec(`UPDATE time_test SET updated_at = ? WHERE id = ?`, newTime, 1)
+		require.NoError(t, err)
+
+		var updatedAt time.Time
+		err = db.QueryRow(`SELECT updated_at FROM time_test WHERE id = 1`).Scan(&updatedAt)
+		require.NoError(t, err)
+		require.True(t, newTime.Equal(updatedAt), "updated time mismatch")
+	})
+
+	t.Run("query with time.Time parameter", func(t *testing.T) {
+		// Insert another row
+		anotherTime := originalTime.Add(72 * time.Hour)
+		_, err := db.Exec(`INSERT INTO time_test (id, created_at) VALUES (?, ?)`, 2, anotherTime)
+		require.NoError(t, err)
+
+		// Query using time as parameter
+		var id int
+		err = db.QueryRow(`SELECT id FROM time_test WHERE created_at = ?`, originalTime).Scan(&id)
+		require.NoError(t, err)
+		require.Equal(t, 1, id)
+	})
+
+	t.Run("prepared statement with time.Time", func(t *testing.T) {
+		stmt, err := db.Prepare(`SELECT id, created_at FROM time_test WHERE created_at < ?`)
+		require.NoError(t, err)
+		defer stmt.Close()
+
+		cutoff := originalTime.Add(1 * time.Hour)
+		var id int
+		var createdAt time.Time
+		err = stmt.QueryRow(cutoff).Scan(&id, &createdAt)
+		require.NoError(t, err)
+		require.Equal(t, 1, id)
+		require.True(t, originalTime.Equal(createdAt))
+	})
+
+	// expected behaviour - similar to the sqlite3 go driver as it uses decltype
+	t.Run("transform datetime column", func(t *testing.T) {
+		stmt, err := db.Prepare(`SELECT concat(created_at || '') FROM time_test`)
+		require.NoError(t, err)
+		defer stmt.Close()
+
+		var createdAt string
+		err = stmt.QueryRow().Scan(&createdAt)
+		require.NoError(t, err)
+		require.Equal(t, createdAt, originalTime.Format(time.RFC3339Nano))
+	})
+}
+
+// --- Busy Timeout Tests ---
+
+func TestBusyTimeoutDefault(t *testing.T) {
+	// Open a database without specifying busy timeout - should use default (5000ms)
+	db, err := sql.Open("turso", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Get the underlying connection and verify the timeout
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = conn.Raw(func(driverConn any) error {
+		tc, ok := driverConn.(*tursoDbConnection)
+		require.True(t, ok, "expected *tursoDbConnection")
+		require.Equal(t, DefaultBusyTimeout, tc.GetBusyTimeout(),
+			"expected default busy timeout of %d, got %d", DefaultBusyTimeout, tc.GetBusyTimeout())
+		return nil
+	})
+	require.NoError(t, err)
+	fmt.Println("Default busy timeout test passed")
+}
+
+func TestBusyTimeoutDSN(t *testing.T) {
+	// Test that _busy_timeout in DSN overrides the default
+	db, err := sql.Open("turso", ":memory:?_busy_timeout=10000")
+	require.NoError(t, err)
+	defer db.Close()
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = conn.Raw(func(driverConn any) error {
+		tc, ok := driverConn.(*tursoDbConnection)
+		require.True(t, ok)
+		require.Equal(t, 10000, tc.GetBusyTimeout(),
+			"expected busy timeout of 10000, got %d", tc.GetBusyTimeout())
+		return nil
+	})
+	require.NoError(t, err)
+	fmt.Println("Busy timeout DSN test passed")
+}
+
+func TestBusyTimeoutDisabled(t *testing.T) {
+	// Test that _busy_timeout=-1 disables the timeout
+	db, err := sql.Open("turso", ":memory:?_busy_timeout=-1")
+	require.NoError(t, err)
+	defer db.Close()
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = conn.Raw(func(driverConn any) error {
+		tc, ok := driverConn.(*tursoDbConnection)
+		require.True(t, ok)
+		require.Equal(t, 0, tc.GetBusyTimeout(),
+			"expected busy timeout of 0 (disabled), got %d", tc.GetBusyTimeout())
+		return nil
+	})
+	fmt.Println("Busy timeout disabled test passed")
+	require.NoError(t, err)
+}
+
+func TestBusyTimeoutRuntimeChange(t *testing.T) {
+	db, err := sql.Open("turso", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = conn.Raw(func(driverConn any) error {
+		tc, ok := driverConn.(*tursoDbConnection)
+		require.True(t, ok)
+
+		// Check initial default
+		require.Equal(t, DefaultBusyTimeout, tc.GetBusyTimeout())
+
+		// Change to custom value
+		err := tc.SetBusyTimeout(15000)
+		require.NoError(t, err)
+		require.Equal(t, 15000, tc.GetBusyTimeout())
+
+		// Disable timeout
+		err = tc.SetBusyTimeout(0)
+		require.NoError(t, err)
+		require.Equal(t, 0, tc.GetBusyTimeout())
+
+		return nil
+	})
+	fmt.Println("Busy timeout runtime change test passed")
+	require.NoError(t, err)
+}
+
+func TestBusyTimeoutConnector(t *testing.T) {
+	t.Run("default timeout via connector", func(t *testing.T) {
+		connector, err := NewConnector(":memory:")
+		require.NoError(t, err)
+
+		db := sql.OpenDB(connector)
+		defer db.Close()
+
+		conn, err := db.Conn(t.Context())
+		require.NoError(t, err)
+		defer conn.Close()
+
+		err = conn.Raw(func(driverConn any) error {
+			tc, ok := driverConn.(*tursoDbConnection)
+			require.True(t, ok)
+			require.Equal(t, DefaultBusyTimeout, tc.GetBusyTimeout())
+			return nil
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("custom timeout via connector", func(t *testing.T) {
+		connector, err := NewConnector(":memory:", WithBusyTimeout(20000))
+		require.NoError(t, err)
+
+		db := sql.OpenDB(connector)
+		defer db.Close()
+
+		conn, err := db.Conn(t.Context())
+		require.NoError(t, err)
+		defer conn.Close()
+
+		err = conn.Raw(func(driverConn any) error {
+			tc, ok := driverConn.(*tursoDbConnection)
+			require.True(t, ok)
+			require.Equal(t, 20000, tc.GetBusyTimeout())
+			return nil
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("disabled timeout via connector", func(t *testing.T) {
+		connector, err := NewConnector(":memory:", WithBusyTimeout(0))
+		require.NoError(t, err)
+
+		db := sql.OpenDB(connector)
+		defer db.Close()
+
+		conn, err := db.Conn(t.Context())
+		require.NoError(t, err)
+		defer conn.Close()
+
+		err = conn.Raw(func(driverConn any) error {
+			tc, ok := driverConn.(*tursoDbConnection)
+			require.True(t, ok)
+			require.Equal(t, 0, tc.GetBusyTimeout())
+			return nil
+		})
+		require.NoError(t, err)
+	})
+	fmt.Println("Busy timeout connector test passed")
+}
+
+func TestBusyTimeoutConcurrentWrites(t *testing.T) {
+	// This test verifies that with a busy timeout, concurrent writers succeed
+	// instead of immediately failing with SQLITE_BUSY
+	tmp := t.TempDir()
+	dbPath := path.Join(tmp, "concurrent.db")
+
+	// Open with default timeout
+	db, err := sql.Open("turso", dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Create table
+	_, err = db.Exec("CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER)")
+	require.NoError(t, err)
+	_, err = db.Exec("INSERT INTO counter (id, value) VALUES (1, 0)")
+	require.NoError(t, err)
+
+	// Run concurrent updates
+	const numGoroutines = 5
+	const numUpdates = 10
+	done := make(chan error, numGoroutines)
+
+	for i := range numGoroutines {
+		go func(workerID int) {
+			for j := range numUpdates {
+				_, err := db.Exec("UPDATE counter SET value = value + 1 WHERE id = 1")
+				if err != nil {
+					done <- fmt.Errorf("worker %d, update %d: %w", workerID, j, err)
+					return
+				}
+			}
+			done <- nil
+		}(i)
+	}
+
+	// Collect results
+	for range numGoroutines {
+		err := <-done
+		require.NoError(t, err, "concurrent update should succeed with busy timeout")
+	}
+
+	// Verify final count
+	var finalValue int
+	err = db.QueryRow("SELECT value FROM counter WHERE id = 1").Scan(&finalValue)
+	require.NoError(t, err)
+	require.Equal(t, numGoroutines*numUpdates, finalValue,
+		"expected %d updates, got %d", numGoroutines*numUpdates, finalValue)
+	fmt.Println("Busy timeout concurrent writes test passed")
 }

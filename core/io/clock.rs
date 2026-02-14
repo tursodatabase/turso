@@ -1,52 +1,93 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// A monotonic instant in time, backed by `std::time::Instant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Instant {
+pub struct MonotonicInstant(std::time::Instant);
+
+impl MonotonicInstant {
+    pub fn now() -> Self {
+        MonotonicInstant(std::time::Instant::now())
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
+
+    pub fn duration_since(&self, earlier: MonotonicInstant) -> Duration {
+        self.0.duration_since(earlier.0)
+    }
+
+    pub fn checked_add(&self, duration: Duration) -> Option<MonotonicInstant> {
+        self.0.checked_add(duration).map(MonotonicInstant)
+    }
+
+    pub fn checked_sub(&self, duration: Duration) -> Option<MonotonicInstant> {
+        self.0.checked_sub(duration).map(MonotonicInstant)
+    }
+}
+
+impl std::ops::Add<Duration> for MonotonicInstant {
+    type Output = MonotonicInstant;
+
+    fn add(self, rhs: Duration) -> Self::Output {
+        MonotonicInstant(self.0 + rhs)
+    }
+}
+
+impl std::ops::Sub<Duration> for MonotonicInstant {
+    type Output = MonotonicInstant;
+
+    fn sub(self, rhs: Duration) -> Self::Output {
+        MonotonicInstant(self.0 - rhs)
+    }
+}
+
+/// Wall-clock time as seconds and microseconds since Unix epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WallClockInstant {
     pub secs: i64,
     pub micros: u32,
 }
 
-const NSEC_PER_SEC: u64 = 1_000_000_000;
-const NANOS_PER_MICRO: u32 = 1_000;
-const MICROS_PER_SEC: u32 = NSEC_PER_SEC as u32 / NANOS_PER_MICRO;
+const MICROS_PER_SEC: u32 = 1_000_000;
 
-impl Instant {
+impl WallClockInstant {
+    pub fn now() -> Self {
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before Unix epoch");
+        WallClockInstant {
+            secs: duration.as_secs() as i64,
+            micros: duration.subsec_micros(),
+        }
+    }
+
     pub fn to_system_time(self) -> SystemTime {
         if self.secs >= 0 {
             UNIX_EPOCH + Duration::new(self.secs as u64, self.micros * 1000)
         } else {
             let positive_secs = (-self.secs) as u64;
-
             if self.micros > 0 {
-                // We have partial seconds that reduce the negative offset
-                // Need to borrow 1 second and subtract the remainder
                 let nanos_to_subtract = (1_000_000 - self.micros) * 1000;
                 UNIX_EPOCH - Duration::new(positive_secs - 1, nanos_to_subtract)
             } else {
-                // Exactly N seconds before epoch
                 UNIX_EPOCH - Duration::new(positive_secs, 0)
             }
         }
     }
 
-    pub fn checked_add_duration(&self, other: &Duration) -> Option<Instant> {
+    pub fn checked_add_duration(&self, other: &Duration) -> Option<WallClockInstant> {
         let mut secs = self.secs.checked_add_unsigned(other.as_secs())?;
-
-        // Micros calculations can't overflow because micros are <1B which fit
-        // in a u32.
         let mut micros = other.subsec_micros() + self.micros;
         if micros >= MICROS_PER_SEC {
             micros -= MICROS_PER_SEC;
             secs = secs.checked_add(1)?;
         }
-
         Some(Self { secs, micros })
     }
 
-    pub fn checked_sub_duration(&self, other: &Duration) -> Option<Instant> {
+    pub fn checked_sub_duration(&self, other: &Duration) -> Option<WallClockInstant> {
         let mut secs = self.secs.checked_sub_unsigned(other.as_secs())?;
-
-        // Similar to above, micros can't overflow.
         let mut micros = self.micros as i32 - other.subsec_micros() as i32;
         if micros < 0 {
             micros += MICROS_PER_SEC as i32;
@@ -59,17 +100,8 @@ impl Instant {
     }
 }
 
-impl<T: chrono::TimeZone> From<chrono::DateTime<T>> for Instant {
-    fn from(value: chrono::DateTime<T>) -> Self {
-        Instant {
-            secs: value.timestamp(),
-            micros: value.timestamp_subsec_micros(),
-        }
-    }
-}
-
-impl std::ops::Add<Duration> for Instant {
-    type Output = Instant;
+impl std::ops::Add<Duration> for WallClockInstant {
+    type Output = WallClockInstant;
 
     fn add(self, rhs: Duration) -> Self::Output {
         self.checked_add_duration(&rhs)
@@ -77,8 +109,8 @@ impl std::ops::Add<Duration> for Instant {
     }
 }
 
-impl std::ops::Sub<Duration> for Instant {
-    type Output = Instant;
+impl std::ops::Sub<Duration> for WallClockInstant {
+    type Output = WallClockInstant;
 
     fn sub(self, rhs: Duration) -> Self::Output {
         self.checked_sub_duration(&rhs)
@@ -86,18 +118,33 @@ impl std::ops::Sub<Duration> for Instant {
     }
 }
 
+impl<T: chrono::TimeZone> From<chrono::DateTime<T>> for WallClockInstant {
+    fn from(value: chrono::DateTime<T>) -> Self {
+        WallClockInstant {
+            secs: value.timestamp(),
+            micros: value.timestamp_subsec_micros(),
+        }
+    }
+}
+
 pub trait Clock {
-    fn now(&self) -> Instant;
+    /// Monotonic time for timeout checking and elapsed time measurement.
+    /// Cheap on real systems (reads TSC), controllable in simulation.
+    fn current_time_monotonic(&self) -> MonotonicInstant;
+
+    /// Wall-clock time for timestamps (WAL, datetime functions).
+    /// Controllable in simulation for deterministic behavior.
+    fn current_time_wall_clock(&self) -> WallClockInstant;
 }
 
 pub struct DefaultClock;
 
 impl Clock for DefaultClock {
-    fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        MonotonicInstant::now()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        WallClockInstant::now()
     }
 }

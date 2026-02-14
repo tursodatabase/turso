@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, StepResult, Value as DbValue};
+use turso_core::{Connection, Database, DatabaseOpts, Numeric, OpenFlags, Value as DbValue};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
@@ -450,28 +450,14 @@ impl TursoMcpServer {
             Ok(Some(mut rows)) => {
                 let mut tables = Vec::new();
 
-                loop {
-                    match rows.step() {
-                        Ok(StepResult::Row) => {
-                            let row = rows.row().unwrap();
-                            if let Ok(DbValue::Text(table)) = row.get::<&DbValue>(0) {
-                                tables.push(table.to_string());
-                            }
-                        }
-                        Ok(StepResult::IO) => {
-                            if rows.run_once().is_err() {
-                                break;
-                            }
-                        }
-                        Ok(StepResult::Done) => break,
-                        Ok(StepResult::Interrupt) => break,
-                        Ok(StepResult::Busy) => {
-                            return "Database is busy".to_string();
-                        }
-                        Err(e) => {
-                            return format!("Error listing tables: {e}");
-                        }
+                let res = rows.run_with_row_callback(|row| {
+                    if let Ok(DbValue::Text(table)) = row.get::<&DbValue>(0) {
+                        tables.push(table.to_string());
                     }
+                    Ok(())
+                });
+                if let Err(err) = res {
+                    return err.to_string();
                 }
 
                 if tables.is_empty() {
@@ -500,68 +486,47 @@ impl TursoMcpServer {
         match conn.query(&query) {
             Ok(Some(mut rows)) => {
                 let mut columns = Vec::new();
+                let res = rows.run_with_row_callback(|row| {
+                    if let (Ok(col_name), Ok(col_type), Ok(not_null), Ok(default_value), Ok(pk)) = (
+                        row.get::<&DbValue>(1),
+                        row.get::<&DbValue>(2),
+                        row.get::<&DbValue>(3),
+                        row.get::<&DbValue>(4),
+                        row.get::<&DbValue>(5),
+                    ) {
+                        let default_str = if matches!(default_value, DbValue::Null) {
+                            "".to_string()
+                        } else {
+                            format!("DEFAULT {default_value}")
+                        };
 
-                loop {
-                    match rows.step() {
-                        Ok(StepResult::Row) => {
-                            let row = rows.row().unwrap();
-                            if let (
-                                Ok(col_name),
-                                Ok(col_type),
-                                Ok(not_null),
-                                Ok(default_value),
-                                Ok(pk),
-                            ) = (
-                                row.get::<&DbValue>(1),
-                                row.get::<&DbValue>(2),
-                                row.get::<&DbValue>(3),
-                                row.get::<&DbValue>(4),
-                                row.get::<&DbValue>(5),
-                            ) {
-                                let default_str = if matches!(default_value, DbValue::Null) {
-                                    "".to_string()
+                        columns.push(
+                            format!(
+                                "{} {} {} {} {}",
+                                col_name,
+                                col_type,
+                                if matches!(not_null, DbValue::Numeric(Numeric::Integer(1))) {
+                                    "NOT NULL"
                                 } else {
-                                    format!("DEFAULT {default_value}")
-                                };
-
-                                columns.push(
-                                    format!(
-                                        "{} {} {} {} {}",
-                                        col_name,
-                                        col_type,
-                                        if matches!(not_null, DbValue::Integer(1)) {
-                                            "NOT NULL"
-                                        } else {
-                                            "NULL"
-                                        },
-                                        default_str,
-                                        if matches!(pk, DbValue::Integer(1)) {
-                                            "PRIMARY KEY"
-                                        } else {
-                                            ""
-                                        }
-                                    )
-                                    .trim()
-                                    .to_string(),
-                                );
-                            }
-                        }
-                        Ok(StepResult::IO) => {
-                            if rows.run_once().is_err() {
-                                break;
-                            }
-                        }
-                        Ok(StepResult::Done) => break,
-                        Ok(StepResult::Interrupt) => break,
-                        Ok(StepResult::Busy) => {
-                            return "Database is busy".to_string();
-                        }
-                        Err(e) => {
-                            return format!("Error describing table: {e}");
-                        }
+                                    "NULL"
+                                },
+                                default_str,
+                                if matches!(pk, DbValue::Numeric(Numeric::Integer(1))) {
+                                    "PRIMARY KEY"
+                                } else {
+                                    ""
+                                }
+                            )
+                            .trim()
+                            .to_string(),
+                        );
                     }
-                }
+                    Ok(())
+                });
 
+                if let Err(err) = res {
+                    return err.to_string();
+                }
                 if columns.is_empty() {
                     format!("Table '{table_name}' not found")
                 } else {
@@ -599,32 +564,19 @@ impl TursoMcpServer {
                     .collect();
 
                 // Get the data
-                loop {
-                    match rows.step() {
-                        Ok(StepResult::Row) => {
-                            let row = rows.row().unwrap();
-                            let mut row_data = Vec::new();
+                let res = rows.run_with_row_callback(|row| {
+                    let mut row_data = Vec::new();
 
-                            for value in row.get_values() {
-                                row_data.push(value.to_string());
-                            }
-
-                            results.push(row_data);
-                        }
-                        Ok(StepResult::IO) => {
-                            if rows.run_once().is_err() {
-                                break;
-                            }
-                        }
-                        Ok(StepResult::Done) => break,
-                        Ok(StepResult::Interrupt) => break,
-                        Ok(StepResult::Busy) => {
-                            return "Database is busy".to_string();
-                        }
-                        Err(e) => {
-                            return format!("Error executing query: {e}");
-                        }
+                    for value in row.get_values() {
+                        row_data.push(value.to_string());
                     }
+
+                    results.push(row_data);
+                    Ok(())
+                });
+
+                if let Err(err) = res {
+                    return err.to_string();
                 }
 
                 // Format results as text table

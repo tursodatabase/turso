@@ -21,7 +21,7 @@ impl Parameter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Parameters {
     next_index: NonZero<usize>,
     pub list: Vec<Parameter>,

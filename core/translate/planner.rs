@@ -1,5 +1,5 @@
+use crate::sync::Arc;
 use std::cmp::PartialEq;
-use std::sync::Arc;
 
 use super::{
     expr::walk_expr,
@@ -30,10 +30,150 @@ use crate::{
     translate::plan::{Window, WindowFunction},
     vdbe::builder::ProgramBuilder,
 };
+use smallvec::SmallVec;
 use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, TableInternalId, With,
+    self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, Select,
+    TableInternalId, With,
 };
+
+/// A CTE definition stored for deferred planning.
+/// Instead of planning CTEs once and cloning the result, we store the AST and
+/// re-plan each time the CTE is referenced. This ensures each reference gets
+/// truly unique internal_ids and cursor IDs.
+struct CteDefinition {
+    /// Globally unique CTE identity for sharing materialized data.
+    /// Multiple references to this CTE will use this ID to look up shared cursors.
+    cte_id: usize,
+    /// Normalized CTE name
+    name: String,
+    /// The original AST SELECT statement (cloned for each reference)
+    select: Select,
+    /// Explicit column names from WITH t(a, b) AS (...) syntax
+    explicit_columns: Vec<String>,
+    /// Indexes of CTEs that this CTE directly references.
+    /// Only includes CTEs that appear in this CTE's FROM clause,
+    /// avoiding exponential re-planning when CTEs have transitive dependencies.
+    referenced_cte_indices: SmallVec<[usize; 2]>,
+    /// True if WITH ... AS MATERIALIZED was specified, forcing materialization
+    materialize_hint: bool,
+}
+
+/// Collect all table names referenced in a SELECT's FROM clause.
+/// Used to determine which earlier CTEs a CTE directly depends on.
+fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
+    collect_from_select_body(&select.body, out);
+    collect_subquery_table_refs_in_select_exprs(select, out);
+}
+
+fn collect_from_select_body(body: &ast::SelectBody, out: &mut Vec<String>) {
+    collect_from_one_select(&body.select, out);
+    for compound in &body.compounds {
+        collect_from_one_select(&compound.select, out);
+    }
+}
+
+fn collect_from_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
+    match one {
+        ast::OneSelect::Select { from, .. } => {
+            if let Some(from_clause) = from {
+                collect_from_select_table(&from_clause.select, out);
+                for join in &from_clause.joins {
+                    collect_from_select_table(&join.table, out);
+                }
+            }
+        }
+        ast::OneSelect::Values(_) => {}
+    }
+}
+
+fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
+    match table {
+        ast::SelectTable::Table(qualified_name, _, _)
+        | ast::SelectTable::TableCall(qualified_name, _, _) => {
+            out.push(normalize_ident(qualified_name.name.as_str()));
+        }
+        ast::SelectTable::Select(subselect, _) => {
+            collect_from_clause_table_refs(subselect, out);
+        }
+        ast::SelectTable::Sub(from_clause, _) => {
+            collect_from_select_table(&from_clause.select, out);
+            for join in &from_clause.joins {
+                collect_from_select_table(&join.table, out);
+            }
+        }
+    }
+}
+
+/// Collect table references from subqueries embedded in expressions.
+fn collect_subquery_table_refs_in_select_exprs(select: &Select, out: &mut Vec<String>) {
+    collect_subquery_table_refs_in_one_select(&select.body.select, out);
+    for compound in &select.body.compounds {
+        collect_subquery_table_refs_in_one_select(&compound.select, out);
+    }
+
+    for sorted in &select.order_by {
+        collect_subquery_table_refs_in_expr(&sorted.expr, out);
+    }
+
+    if let Some(limit) = &select.limit {
+        collect_subquery_table_refs_in_expr(&limit.expr, out);
+        if let Some(offset) = &limit.offset {
+            collect_subquery_table_refs_in_expr(offset, out);
+        }
+    }
+}
+
+fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
+    match one {
+        ast::OneSelect::Select {
+            columns,
+            where_clause,
+            group_by,
+            ..
+        } => {
+            for column in columns {
+                if let ast::ResultColumn::Expr(expr, _) = column {
+                    collect_subquery_table_refs_in_expr(expr, out);
+                }
+            }
+            if let Some(expr) = where_clause {
+                collect_subquery_table_refs_in_expr(expr, out);
+            }
+            if let Some(group_by) = group_by {
+                for expr in &group_by.exprs {
+                    collect_subquery_table_refs_in_expr(expr, out);
+                }
+                if let Some(having) = &group_by.having {
+                    collect_subquery_table_refs_in_expr(having, out);
+                }
+            }
+        }
+        ast::OneSelect::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    collect_subquery_table_refs_in_expr(expr, out);
+                }
+            }
+        }
+    }
+}
+
+fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
+    let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
+        match node {
+            Expr::Exists(select) | Expr::Subquery(select) => {
+                collect_from_clause_table_refs(select, out);
+                Ok(WalkControl::SkipChildren)
+            }
+            Expr::InSelect { rhs, .. } => {
+                collect_from_clause_table_refs(rhs, out);
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    });
+}
 
 /// Valid ways to refer to the rowid of a btree table.
 pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
@@ -284,13 +424,219 @@ fn add_aggregate_if_not_exists(
     Ok(())
 }
 
+/// Plan a CTE when it's referenced in a query.
+/// Each call produces a fresh plan with unique internal_ids, ensuring that
+/// multiple references to the same CTE get independent cursor IDs,
+/// yield registers and so on.
+///
+/// `count_reference`: Controls whether this call increments the CTE reference count.
+///
+/// **Reference counting determines materialization strategy:**
+/// - ref_count = 1: CTE can use efficient coroutine (no materialization needed)
+/// - ref_count > 1: CTE must be materialized into ephemeral table for sharing
+///
+/// **When to count (true):**
+/// - CTE appears in a FROM/JOIN clause (actual usage site)
+/// - CTE is referenced via outer_query_refs (e.g., in scalar subqueries)
+///
+/// **When NOT to count (false):**
+/// - Pre-planning CTEs for outer_query_refs visibility (making CTEs available
+///   for potential use by nested subqueries - not actual usage)
+/// - Recursively planning CTE dependencies (CTE A references CTE B internally -
+///   B needs to be visible to A's planning, but this isn't a usage from the
+///   main query's perspective)
+#[allow(clippy::too_many_arguments)]
+fn plan_cte(
+    cte_idx: usize,
+    cte_definitions: &[CteDefinition],
+    base_outer_query_refs: &[OuterQueryReference],
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    count_reference: bool,
+) -> Result<JoinedTable> {
+    let cte_def = &cte_definitions[cte_idx];
+
+    // Build outer_query_refs including only the CTEs this one directly references.
+    // By tracking direct dependencies instead of all preceding CTEs, we avoid
+    // exponential re-planning when CTEs have transitive dependencies.
+    let mut outer_query_refs = base_outer_query_refs.to_vec();
+    for &ref_idx in &cte_def.referenced_cte_indices {
+        let ref_cte_name = &cte_definitions[ref_idx].name;
+        // Check if this CTE has already been planned and is in outer_query_refs.
+        // This avoids exponential re-planning when CTEs have transitive dependencies.
+        if outer_query_refs
+            .iter()
+            .any(|r| &r.identifier == ref_cte_name)
+        {
+            continue;
+        }
+        // Recursively plan the referenced CTE so it's visible within this CTE's body.
+        // Example: WITH a AS (...), b AS (SELECT * FROM a) - when planning b, we need
+        // a to be in scope. But this internal dependency doesn't count as a "reference"
+        // for materialization purposes - only actual usage in the main query counts.
+        let referenced_table = plan_cte(
+            ref_idx,
+            cte_definitions,
+            base_outer_query_refs,
+            resolver,
+            program,
+            connection,
+            false,
+        )?;
+        outer_query_refs.push(OuterQueryReference {
+            identifier: referenced_table.identifier.clone(),
+            internal_id: referenced_table.internal_id,
+            table: referenced_table.table.clone(),
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: None,
+            cte_explicit_columns: vec![],
+            cte_id: Some(cte_definitions[ref_idx].cte_id),
+        });
+    }
+
+    // Plan this CTE with fresh IDs
+    let cte_plan = prepare_select_plan(
+        cte_def.select.clone(),
+        resolver,
+        program,
+        &outer_query_refs,
+        QueryDestination::placeholder_for_subquery(),
+        connection,
+    )?;
+
+    // CTEs can be either simple SELECT or compound SELECT (UNION/INTERSECT/EXCEPT)
+    let explicit_cols = if cte_def.explicit_columns.is_empty() {
+        None
+    } else {
+        Some(cte_def.explicit_columns.as_slice())
+    };
+
+    // Track CTE reference count globally for materialization decisions during emission.
+    // Multi-ref CTEs should be materialized; single-ref CTEs can use coroutine.
+    // Only count actual references (FROM/JOIN usage), not pre-planning or recursive deps.
+    if count_reference {
+        program.increment_cte_reference(cte_def.cte_id);
+    }
+
+    match cte_plan {
+        Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
+            cte_def.name.clone(),
+            cte_plan,
+            None,
+            program.table_reference_counter.next(),
+            explicit_cols,
+            Some(cte_def.cte_id), // Pass the CTE identity for sharing materialized data
+            cte_def.materialize_hint,
+        ),
+        Plan::Delete(_) | Plan::Update(_) => {
+            crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
+        }
+    }
+}
+
+/// Plan CTEs from a WITH clause and add them as outer query references.
+/// This is used by DML statements (DELETE, UPDATE) to make CTEs available
+/// for subqueries in WHERE and SET clauses.
+pub fn plan_ctes_as_outer_refs(
+    with: Option<With>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let Some(with) = with else {
+        return Ok(());
+    };
+
+    if with.recursive {
+        crate::bail_parse_error!("Recursive CTEs are not yet supported");
+    }
+
+    for cte in with.ctes {
+        // Normalize explicit column names
+        let explicit_columns: Vec<String> = cte
+            .columns
+            .iter()
+            .map(|c| normalize_ident(c.col_name.as_str()))
+            .collect();
+
+        let cte_name = normalize_ident(cte.tbl_name.as_str());
+
+        // Check for duplicate CTE names
+        if table_references
+            .outer_query_refs()
+            .iter()
+            .any(|r| r.identifier == cte_name)
+        {
+            crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
+        }
+
+        // Check if CTE name conflicts with catalog table
+        if resolver.schema.get_table(&cte_name).is_some() {
+            crate::bail_parse_error!(
+                "CTE name {} conflicts with catalog table name",
+                cte.tbl_name.as_str()
+            );
+        }
+
+        // Clone the CTE select AST before planning, so we can store it for re-planning
+        let cte_select_ast = cte.select.clone();
+        // AS MATERIALIZED forces materialization
+        let materialize_hint = cte.materialized == Materialized::Yes;
+        // Plan the CTE SELECT
+        let cte_plan = prepare_select_plan(
+            cte.select,
+            resolver,
+            program,
+            table_references.outer_query_refs(),
+            QueryDestination::placeholder_for_subquery(),
+            connection,
+        )?;
+
+        // Convert plan to JoinedTable to extract column info
+        let explicit_cols = if explicit_columns.is_empty() {
+            None
+        } else {
+            Some(explicit_columns.as_slice())
+        };
+        let joined_table = match cte_plan {
+            Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
+                cte_name.clone(),
+                cte_plan,
+                None,
+                program.table_reference_counter.next(),
+                explicit_cols,
+                None, // CTEs in DML don't share materialized data (TODO: implement if needed)
+                materialize_hint,
+            )?,
+            Plan::Delete(_) | Plan::Update(_) => {
+                crate::bail_parse_error!("Only SELECT queries are supported in CTEs")
+            }
+        };
+
+        // Add CTE as outer query reference so it's available to subqueries
+        table_references.add_outer_query_reference(OuterQueryReference {
+            identifier: cte_name,
+            internal_id: joined_table.internal_id,
+            table: joined_table.table,
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: Some(cte_select_ast),
+            cte_explicit_columns: explicit_columns,
+            cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
+        });
+    }
+
+    Ok(())
+}
+
 fn parse_from_clause_table(
     table: ast::SelectTable,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
     vtab_predicates: &mut Vec<Expr>,
-    ctes: &mut Vec<JoinedTable>,
+    cte_definitions: &[CteDefinition],
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     match table {
@@ -304,7 +650,7 @@ fn parse_from_clause_table(
                 table_references,
                 resolver,
                 program,
-                ctes,
+                cte_definitions,
                 vtab_predicates,
                 &qualified_name,
                 maybe_alias.as_ref(),
@@ -313,32 +659,63 @@ fn parse_from_clause_table(
             )
         }
         ast::SelectTable::Select(subselect, maybe_alias) => {
-            let outer_query_refs_for_subquery = table_references
-                .outer_query_refs()
-                .iter()
-                .cloned()
-                .chain(
-                    ctes.iter()
-                        .cloned()
-                        .map(|t: JoinedTable| OuterQueryReference {
-                            identifier: t.identifier,
-                            internal_id: t.internal_id,
-                            table: t.table,
-                            col_used_mask: ColumnUsedMask::default(),
-                        }),
-                )
-                .collect::<Vec<_>>();
-            let Plan::Select(subplan) = prepare_select_plan(
+            // For inline subqueries, we plan all CTEs once and pass them as outer_query_refs.
+            // This allows the subquery to reference CTEs defined in the parent's WITH clause.
+            let mut outer_query_refs_for_subquery = table_references.outer_query_refs().to_vec();
+            let base_outer_query_refs_for_subquery = base_outer_refs_for_cte_planning(
+                table_references.outer_query_refs(),
+                cte_definitions,
+            );
+            for (idx, cte_def) in cte_definitions.iter().enumerate() {
+                // Check if this CTE has already been planned and is in outer_query_refs.
+                // This avoids exponential re-planning when CTEs have transitive dependencies.
+                if outer_query_refs_for_subquery
+                    .iter()
+                    .any(|r| r.identifier == cte_def.name)
+                {
+                    continue;
+                }
+                // Plan each CTE so it's visible to this inline subquery's FROM clause.
+                // Example: WITH cte AS (...) SELECT * FROM (SELECT * FROM cte) sub
+                // The inline subquery "(SELECT * FROM cte)" needs cte in scope, but
+                // planning this visibility isn't a reference - the actual reference
+                // happens when the inline subquery's FROM clause resolves "cte".
+                let cte_table = plan_cte(
+                    idx,
+                    cte_definitions,
+                    &base_outer_query_refs_for_subquery,
+                    resolver,
+                    program,
+                    connection,
+                    false,
+                )?;
+                outer_query_refs_for_subquery.push(OuterQueryReference {
+                    identifier: cte_def.name.clone(),
+                    internal_id: cte_table.internal_id,
+                    table: cte_table.table,
+                    col_used_mask: ColumnUsedMask::default(),
+                    cte_select: Some(cte_def.select.clone()),
+                    cte_explicit_columns: cte_def.explicit_columns.clone(),
+                    cte_id: Some(cte_def.cte_id),
+                });
+            }
+
+            let subplan = prepare_select_plan(
                 subselect,
                 resolver,
                 program,
                 &outer_query_refs_for_subquery,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
-            )?
-            else {
-                crate::bail_parse_error!("Only non-compound SELECT queries are currently supported in FROM clause subqueries");
-            };
+            )?;
+            match &subplan {
+                Plan::Select(_) | Plan::CompoundSelect { .. } => {}
+                Plan::Delete(_) | Plan::Update(_) => {
+                    crate::bail_parse_error!(
+                        "DELETE/UPDATE queries are not supported in FROM clause subqueries"
+                    );
+                }
+            }
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
                 .map(|a| match a {
@@ -346,12 +723,15 @@ fn parse_from_clause_table(
                     ast::As::Elided(id) => id,
                 })
                 .map(|id| normalize_ident(id.as_str()))
-                .unwrap_or(format!("subquery_{cur_table_index}"));
-            table_references.add_joined_table(JoinedTable::new_subquery(
+                .unwrap_or_else(|| format!("subquery_{cur_table_index}"));
+            table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
                 subplan,
                 None,
                 program.table_reference_counter.next(),
+                None,  // No explicit columns for regular subqueries
+                None,  // Regular inline subqueries don't have a CTE identity
+                false, // No materialize hint for inline subqueries
             )?);
             Ok(())
         }
@@ -359,14 +739,16 @@ fn parse_from_clause_table(
             table_references,
             resolver,
             program,
-            ctes,
+            cte_definitions,
             vtab_predicates,
             &qualified_name,
             maybe_alias.as_ref(),
             &args,
             connection,
         ),
-        _ => todo!(),
+        ast::SelectTable::Sub(..) => {
+            crate::bail_parse_error!("Parenthesized FROM clause subqueries are not supported")
+        }
     }
 }
 
@@ -375,7 +757,7 @@ fn parse_table(
     table_references: &mut TableReferences,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    ctes: &mut Vec<JoinedTable>,
+    cte_definitions: &[CteDefinition],
     vtab_predicates: &mut Vec<Expr>,
     qualified_name: &QualifiedName,
     maybe_alias: Option<&As>,
@@ -387,12 +769,23 @@ fn parse_table(
     let table_name = &qualified_name.name;
 
     // Check if the FROM clause table is referring to a CTE in the current scope.
-    if let Some(cte_idx) = ctes
+    // Each reference gets a freshly planned CTE to ensure unique internal_ids and cursor IDs.
+    if let Some(cte_idx) = cte_definitions
         .iter()
-        .position(|cte| cte.identifier == normalized_qualified_name)
+        .position(|cte| cte.name == normalized_qualified_name)
     {
-        // TODO: what if the CTE is referenced multiple times?
-        let mut cte_table = ctes.remove(cte_idx);
+        let planning_outer_query_refs =
+            base_outer_refs_for_cte_planning(table_references.outer_query_refs(), cte_definitions);
+        // This is an actual CTE reference in the FROM/JOIN clause - count it
+        let mut cte_table = plan_cte(
+            cte_idx,
+            cte_definitions,
+            &planning_outer_query_refs,
+            resolver,
+            program,
+            connection,
+            true, // Actual FROM/JOIN reference - count it
+        )?;
 
         // If there's an alias provided, update the identifier to use that alias
         if let Some(a) = maybe_alias {
@@ -405,7 +798,84 @@ fn parse_table(
 
         table_references.add_joined_table(cte_table);
         return Ok(());
-    };
+    }
+
+    // Check if the table is a CTE from an outer scope (e.g., a CTE referencing another CTE).
+    // This handles cases like: WITH a AS (...), b AS (SELECT ... FROM a) SELECT * FROM b;
+    // When planning b's body, 'a' is in outer_query_refs.
+    if let Some(outer_ref) =
+        table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+    {
+        // If this is a CTE reference (via outer_query_refs), count it for materialization decisions.
+        // This handles scalar subqueries that reference CTEs.
+        if let Some(cte_id) = outer_ref.cte_id {
+            program.increment_cte_reference(cte_id);
+        }
+        let alias = maybe_alias
+            .map(|a| match a {
+                ast::As::As(id) => id,
+                ast::As::Elided(id) => id,
+            })
+            .map(|a| normalize_ident(a.as_str()));
+        // Clone fields we need before dropping the borrow on table_references.
+        let cte_select = outer_ref.cte_select.clone();
+        let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
+        let cte_id = outer_ref.cte_id;
+        let outer_table = outer_ref.table.clone();
+        let materialize_hint = match &outer_table {
+            Table::FromClauseSubquery(subquery) => subquery.materialize_hint,
+            _ => false,
+        };
+
+        if let Some(cte_ast) = cte_select {
+            // Re-plan the CTE from its original AST to get fresh internal_ids.
+            // This prevents cursor key collisions when the same CTE is
+            // referenced multiple times in the same scope.
+            let cte_plan = prepare_select_plan(
+                cte_ast,
+                resolver,
+                program,
+                table_references.outer_query_refs(),
+                QueryDestination::placeholder_for_subquery(),
+                connection,
+            )?;
+            let explicit_cols = if cte_explicit_columns.is_empty() {
+                None
+            } else {
+                Some(cte_explicit_columns.as_slice())
+            };
+            // Use the CTE name for the subquery name so query plans show
+            // "SCAN cte_name AS alias" instead of just "SCAN alias".
+            let mut jt = JoinedTable::new_subquery_from_plan(
+                normalized_qualified_name.clone(),
+                cte_plan,
+                None,
+                program.table_reference_counter.next(),
+                explicit_cols,
+                cte_id,
+                materialize_hint,
+            )?;
+            if let Some(alias) = alias {
+                jt.identifier = alias;
+            }
+            jt.database_id = database_id;
+            table_references.add_joined_table(jt);
+        } else {
+            let internal_id = program.table_reference_counter.next();
+            table_references.add_joined_table(JoinedTable {
+                op: Operation::default_scan_for(&outer_table),
+                table: outer_table,
+                identifier: alias.unwrap_or(normalized_qualified_name),
+                internal_id,
+                join_info: None,
+                col_used_mask: ColumnUsedMask::default(),
+                column_use_counts: Vec::new(),
+                expression_index_usages: Vec::new(),
+                database_id,
+            });
+        }
+        return Ok(());
+    }
 
     // Resolve table using connection's with_schema method
     let table = connection.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
@@ -457,12 +927,12 @@ fn parse_table(
 
         // Recursively call parse_from_clause_table with the view as a SELECT
         let result = parse_from_clause_table(
-            ast::SelectTable::Select(*subselect.clone(), view_alias),
+            ast::SelectTable::Select(*subselect, view_alias),
             resolver,
             program,
             table_references,
             vtab_predicates,
-            ctes,
+            cte_definitions,
             connection,
         );
         view.done();
@@ -511,6 +981,7 @@ fn parse_table(
 
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         });
         drop(view_guard);
 
@@ -630,43 +1101,60 @@ fn transform_args_into_where_terms(
     Ok(())
 }
 
+/// Build a stable outer-scope reference set for CTE planning.
+/// Current WITH-scope CTE entries are excluded to avoid cloning/replanning cascades.
+fn base_outer_refs_for_cte_planning(
+    refs: &[OuterQueryReference],
+    cte_definitions: &[CteDefinition],
+) -> Vec<OuterQueryReference> {
+    refs.iter()
+        .filter(|r| !cte_definitions.iter().any(|cte| cte.name == r.identifier))
+        .cloned()
+        .map(|mut r| {
+            if matches!(r.table, Table::FromClauseSubquery(_)) {
+                r.cte_select = None;
+            }
+            r
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn parse_from(
-    mut from: Option<FromClause>,
+    from: Option<FromClause>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     with: Option<With>,
+    preplan_ctes_for_non_from_subqueries: bool,
     out_where_clause: &mut Vec<WhereTerm>,
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    if from.is_none() {
-        return Ok(());
-    }
-
-    let mut ctes_as_subqueries: Vec<JoinedTable> = vec![];
+    // Collect CTE definitions instead of planning them immediately.
+    // Each CTE reference will be planned fresh when encountered, ensuring unique internal_ids.
+    let mut cte_definitions: Vec<CteDefinition> = vec![];
 
     if let Some(with) = with {
         if with.recursive {
             crate::bail_parse_error!("Recursive CTEs are not yet supported");
         }
 
-        for cte in with.ctes {
-            if cte.materialized == Materialized::Yes {
-                crate::bail_parse_error!("Materialized CTEs are not yet supported");
-            }
-            if !cte.columns.is_empty() {
-                crate::bail_parse_error!("CTE columns are not yet supported");
-            }
+        for (idx, cte) in with.ctes.into_iter().enumerate() {
+            // Normalize explicit column names
+            let explicit_columns: Vec<String> = cte
+                .columns
+                .iter()
+                .map(|c| normalize_ident(c.col_name.as_str()))
+                .collect();
 
             // Check if normalized name conflicts with catalog tables or other CTEs
             // TODO: sqlite actually allows overriding a catalog table with a CTE.
             // We should carry over the 'Scope' struct to all of our identifier resolution.
             let cte_name_normalized = normalize_ident(cte.tbl_name.as_str());
-            if ctes_as_subqueries
+            if cte_definitions
                 .iter()
-                .any(|t| t.table.get_name() == cte_name_normalized)
+                .any(|d| d.name == cte_name_normalized)
             {
                 crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
             }
@@ -677,74 +1165,86 @@ pub fn parse_from(
                     cte.tbl_name.as_str()
                 );
             }
-            if table_references
-                .outer_query_refs()
-                .iter()
-                .any(|t| t.identifier == cte_name_normalized)
-            {
-                crate::bail_parse_error!(
-                    "CTE name {} conflicts with WITH table name {}",
-                    cte.tbl_name.as_str(),
-                    cte_name_normalized
-                );
-            }
+            // Collect table names referenced in this CTE's FROM clause.
+            let mut referenced_tables = Vec::new();
+            collect_from_clause_table_refs(&cte.select, &mut referenced_tables);
 
-            let mut outer_query_refs_for_cte = table_references.outer_query_refs().to_vec();
-            outer_query_refs_for_cte.extend(ctes_as_subqueries.iter().map(|t: &JoinedTable| {
-                OuterQueryReference {
-                    identifier: t.identifier.clone(),
-                    internal_id: t.internal_id,
-                    table: t.table.clone(),
+            // Find which preceding CTEs are directly referenced by this CTE.
+            // This avoids exponential re-planning when CTEs have transitive dependencies.
+            let referenced_cte_indices: SmallVec<[usize; 2]> = (0..idx)
+                .filter(|&i| referenced_tables.contains(&cte_definitions[i].name))
+                .collect();
+
+            // AS MATERIALIZED forces materialization; AS NOT MATERIALIZED prevents it
+            let materialize_hint = cte.materialized == Materialized::Yes;
+
+            cte_definitions.push(CteDefinition {
+                cte_id: program.alloc_cte_id(),
+                name: cte_name_normalized,
+                select: cte.select,
+                explicit_columns,
+                referenced_cte_indices,
+                materialize_hint,
+            });
+        }
+
+        if preplan_ctes_for_non_from_subqueries {
+            // Pre-plan all CTEs and add them to outer_query_refs for visibility.
+            // This is needed when non-FROM expressions contain subqueries that may reference
+            // CTEs from this WITH scope.
+            let base_outer_query_refs = base_outer_refs_for_cte_planning(
+                table_references.outer_query_refs(),
+                &cte_definitions,
+            );
+            for (idx, cte_def) in cte_definitions.iter().enumerate() {
+                let cte_table = plan_cte(
+                    idx,
+                    &cte_definitions,
+                    &base_outer_query_refs,
+                    resolver,
+                    program,
+                    connection,
+                    false,
+                )?;
+                table_references.add_outer_query_reference(OuterQueryReference {
+                    identifier: cte_def.name.clone(),
+                    internal_id: cte_table.internal_id,
+                    table: cte_table.table,
                     col_used_mask: ColumnUsedMask::default(),
-                }
-            }));
-
-            // CTE can refer to other CTEs that came before it, plus any schema tables or tables in the outer scope.
-            let cte_plan = prepare_select_plan(
-                cte.select,
-                resolver,
-                program,
-                &outer_query_refs_for_cte,
-                QueryDestination::placeholder_for_subquery(),
-                connection,
-            )?;
-            let Plan::Select(cte_plan) = cte_plan else {
-                crate::bail_parse_error!("Only SELECT queries are currently supported in CTEs");
-            };
-
-            ctes_as_subqueries.push(JoinedTable::new_subquery(
-                cte_name_normalized,
-                cte_plan,
-                None,
-                program.table_reference_counter.next(),
-            )?);
+                    cte_select: Some(cte_def.select.clone()),
+                    cte_explicit_columns: cte_def.explicit_columns.clone(),
+                    cte_id: Some(cte_def.cte_id),
+                });
+            }
         }
     }
 
-    let from_owned = std::mem::take(&mut from).unwrap();
-    let select_owned = from_owned.select;
-    let joins_owned = from_owned.joins;
-    parse_from_clause_table(
-        *select_owned,
-        resolver,
-        program,
-        table_references,
-        vtab_predicates,
-        &mut ctes_as_subqueries,
-        connection,
-    )?;
-
-    for join in joins_owned.into_iter() {
-        parse_join(
-            join,
+    // Process FROM clause if present
+    if let Some(from_owned) = from {
+        let select_owned = from_owned.select;
+        let joins_owned = from_owned.joins;
+        parse_from_clause_table(
+            *select_owned,
             resolver,
             program,
-            &mut ctes_as_subqueries,
-            out_where_clause,
-            vtab_predicates,
             table_references,
+            vtab_predicates,
+            &cte_definitions,
             connection,
         )?;
+
+        for join in joins_owned.into_iter() {
+            parse_join(
+                join,
+                resolver,
+                program,
+                &cte_definitions,
+                out_where_clause,
+                vtab_predicates,
+                table_references,
+                connection,
+            )?;
+        }
     }
 
     Ok(())
@@ -768,6 +1268,31 @@ pub fn parse_where(
                 connection,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
+        }
+        // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
+        // Re-break any ANDs that were created so they become separate WhereTerms for
+        // constraint extraction.
+        let mut i = start_idx;
+        while i < out_where_clause.len() {
+            if matches!(
+                &out_where_clause[i].expr,
+                Expr::Binary(_, ast::Operator::And, _)
+            ) {
+                let term = out_where_clause.remove(i);
+                let mut new_terms: Vec<WhereTerm> = Vec::new();
+                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+                // Preserve from_outer_join from the original term
+                for new_term in new_terms.iter_mut() {
+                    new_term.from_outer_join = term.from_outer_join;
+                }
+                let count = new_terms.len();
+                for (j, new_term) in new_terms.into_iter().enumerate() {
+                    out_where_clause.insert(i + j, new_term);
+                }
+                i += count;
+            } else {
+                i += 1;
+            }
         }
         Ok(())
     } else {
@@ -893,9 +1418,17 @@ impl TableMask {
     pub fn intersects(&self, other: &TableMask) -> bool {
         self.0 & other.0 != 0
     }
+
+    /// Iterate the table indices present in this mask.
+    pub fn tables_iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..127).filter(move |table_no| self.contains_table(*table_no))
+    }
 }
 
 /// Returns a [TableMask] representing the tables referenced in the given expression.
+///
+/// This includes outer references from subqueries, even if the subquery plan has
+/// already been consumed, by relying on the cached outer reference ids.
 /// Used in the optimizer for constraint analysis.
 pub fn table_mask_from_expr(
     top_level_expr: &Expr,
@@ -930,23 +1463,42 @@ pub fn table_mask_from_expr(
                 else {
                     crate::bail_parse_error!("subquery not found");
                 };
-                let SubqueryState::Unevaluated { plan } = &subquery.state else {
-                    crate::bail_parse_error!("subquery has already been evaluated");
-                };
-                let used_outer_query_refs = plan
-                    .as_ref()
-                    .unwrap()
-                    .table_references
-                    .outer_query_refs()
-                    .iter()
-                    .filter(|t| t.is_used());
-                for outer_query_ref in used_outer_query_refs {
-                    if let Some(table_idx) = table_references
-                        .joined_tables()
-                        .iter()
-                        .position(|t| t.internal_id == outer_query_ref.internal_id)
-                    {
-                        mask.add_table(table_idx);
+                match &subquery.state {
+                    SubqueryState::Unevaluated { plan } => {
+                        let used_outer_query_refs = plan
+                            .as_ref()
+                            .unwrap()
+                            .table_references
+                            .outer_query_refs()
+                            .iter()
+                            .filter(|t| t.is_used());
+                        for outer_query_ref in used_outer_query_refs {
+                            if let Some(table_idx) = table_references
+                                .joined_tables()
+                                .iter()
+                                .position(|t| t.internal_id == outer_query_ref.internal_id)
+                            {
+                                mask.add_table(table_idx);
+                            }
+                        }
+                    }
+                    SubqueryState::Evaluated { outer_ref_ids, .. } => {
+                        // Now hash-join plans can now translate some correlated subqueries early, we
+                        // still revisit those predicates even though the plan has already been consumed.
+                        // Without this cache we'd panic or lose the knowledge that an outer table was required.
+                        //
+                        // Example: `SELECT t.a FROM t WHERE t.a = (SELECT MAX(x.a) FROM x WHERE x.b = t.b)`.
+                        // The outer expression `x.b = t.b` is visited after the subquery is translated,
+                        // so we need cached `outer_ref_ids` to realize that `t` must already be in scope.
+                        for outer_ref_id in outer_ref_ids {
+                            if let Some(table_idx) = table_references
+                                .joined_tables()
+                                .iter()
+                                .position(|t| t.internal_id == *outer_ref_id)
+                            {
+                                mask.add_table(table_idx);
+                            }
+                        }
                     }
                 }
             }
@@ -958,8 +1510,11 @@ pub fn table_mask_from_expr(
     Ok(mask)
 }
 
-/// When a table referenced in the expression is not found in join_order, we check if it's
-/// a hash join build table. If so, we map the condition to the probe table's loop position.
+/// Determines the earliest loop where an expression can be safely evaluated.
+///
+/// When a referenced table is not found in `join_order`, we check if it's a hash-join
+/// build table and map the condition to the probe loop where its rows are produced.
+/// Subquery references are also respected, even after their plans are consumed.
 pub fn determine_where_to_eval_expr(
     top_level_expr: &Expr,
     join_order: &[JoinOrderMember],
@@ -1001,7 +1556,7 @@ pub fn determine_where_to_eval_expr(
                     crate::bail_parse_error!("subquery not found");
                 };
                 match &subquery.state {
-                    SubqueryState::Evaluated { evaluated_at } => {
+                    SubqueryState::Evaluated { evaluated_at, .. } => {
                         eval_at = eval_at.max(*evaluated_at);
                     }
                     SubqueryState::Unevaluated { plan } => {
@@ -1013,13 +1568,27 @@ pub fn determine_where_to_eval_expr(
                             .iter()
                             .filter(|t| t.is_used());
                         for outer_ref in used_outer_refs {
-                            let Some(join_idx) = join_order
+                            let join_idx = join_order
                                 .iter()
                                 .position(|t| t.table_id == outer_ref.internal_id)
-                            else {
-                                continue;
-                            };
-                            eval_at = eval_at.max(EvalAt::Loop(join_idx));
+                                .or_else(|| {
+                                    let tables = table_references?;
+                                    for (probe_idx, member) in join_order.iter().enumerate() {
+                                        let probe_table =
+                                            &tables.joined_tables()[member.original_idx];
+                                        if let Operation::HashJoin(ref hj) = probe_table.op {
+                                            let build_table =
+                                                &tables.joined_tables()[hj.build_table_idx];
+                                            if build_table.internal_id == outer_ref.internal_id {
+                                                return Some(probe_idx);
+                                            }
+                                        }
+                                    }
+                                    None
+                                });
+                            if let Some(join_idx) = join_idx {
+                                eval_at = eval_at.max(EvalAt::Loop(join_idx));
+                            }
                         }
                         return Ok(WalkControl::Continue);
                     }
@@ -1038,7 +1607,7 @@ fn parse_join(
     join: ast::JoinedSelectTable,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    ctes: &mut Vec<JoinedTable>,
+    cte_definitions: &[CteDefinition],
     out_where_clause: &mut Vec<WhereTerm>,
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
@@ -1056,7 +1625,7 @@ fn parse_join(
         program,
         table_references,
         vtab_predicates,
-        ctes,
+        cte_definitions,
         connection,
     )?;
 
@@ -1296,7 +1865,7 @@ where
 #[allow(clippy::type_complexity)]
 pub fn parse_limit(
     mut limit: Limit,
-    connection: &std::sync::Arc<crate::Connection>,
+    connection: &crate::sync::Arc<crate::Connection>,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
     bind_and_rewrite_expr(
         &mut limit.expr,

@@ -1,0 +1,80 @@
+@database :memory:
+
+# Regression test: NOT BETWEEN with self-referencing expressions must not
+# be optimized into multi-index union seeks, because the seek key depends
+# on the current row and cannot be evaluated before scanning.
+
+test not-between-self-ref-group-by {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
+    INSERT INTO t1 VALUES (1, 10, 100), (2, 20, 200), (3, NULL, 300), (4, 40, 400);
+    SELECT c, AVG(b) FROM t1 WHERE TYPEOF(b) NOT BETWEEN a AND a GROUP BY a, b, c;
+}
+expect {
+    100|10.0
+    200|20.0
+    300|
+    400|40.0
+}
+expect @js {
+    100|10
+    200|20
+    300|
+    400|40
+}
+
+test not-between-self-ref-no-group-by {
+    CREATE TABLE t2 (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
+    INSERT INTO t2 VALUES (1, 10, 100), (2, 20, 200), (3, NULL, 300), (4, 40, 400);
+    SELECT * FROM t2 WHERE TYPEOF(b) NOT BETWEEN a AND a;
+}
+expect {
+    1|10|100
+    2|20|200
+    3||300
+    4|40|400
+}
+
+test between-self-ref-group-by {
+    CREATE TABLE t3 (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (1, 10, 100), (2, 20, 200), (3, NULL, 300), (4, 40, 400);
+    SELECT c, AVG(b) FROM t3 WHERE TYPEOF(b) BETWEEN a AND a GROUP BY a, b, c;
+}
+expect {
+}
+
+# Regression test: multi-index OR must not be used when NOT BETWEEN bounds depend
+# on scalar subquery results. The predicate below should evaluate to NULL for every
+# row (thus filter all rows), even with ORDER BY + LIMIT/OFFSET.
+test not-between-subquery-bound-orderby-offset {
+    CREATE TABLE t4 (
+        a INTEGER PRIMARY KEY,
+        b TEXT NOT NULL UNIQUE,
+        c REAL UNIQUE
+    );
+    INSERT INTO t4 (a, b, c) VALUES
+        (1, 'aa', 1.1), (2, 'bb', 2.2), (3, 'cc', 3.3), (4, 'dd', 4.4),
+        (5, 'ee', 5.5), (6, 'ff', 6.6), (7, 'gg', 7.7), (8, 'hh', 8.8),
+        (9, 'ii', 9.9), (10, 'jj', 10.1), (11, 'kk', 11.1), (12, 'll', 12.1),
+        (13, 'mm', 13.1), (14, 'nn', 14.1), (15, 'oo', 15.1), (16, 'pp', 16.1),
+        (17, 'qq', 17.1), (18, 'rr', 18.1);
+    CREATE TABLE t4_bounds (x INTEGER PRIMARY KEY, y REAL, z REAL);
+    INSERT INTO t4_bounds VALUES (1, 10.0, 20.0), (2, 30.0, 40.0);
+    SELECT COUNT(*) FROM (
+        SELECT a
+        FROM t4
+        WHERE b NOT BETWEEN
+            UPPER('K8ugv7CjevPxLX') NOT IN (
+                SELECT y
+                FROM t4_bounds
+                WHERE QUOTE(NULL)
+                ORDER BY x DESC
+                LIMIT 1
+            )
+            AND DATE('wBGsYcgTSjG7lCOBtvjz8MmzH3VKk597QX7')
+        ORDER BY a DESC, b DESC
+        LIMIT 936 OFFSET 15
+    );
+}
+expect {
+    0
+}

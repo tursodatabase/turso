@@ -55,6 +55,12 @@ pub struct RowSet {
     mode: RowSetMode,
 }
 
+impl Default for RowSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RowSet {
     /// Creates a new empty RowSet.
     pub fn new() -> Self {
@@ -447,7 +453,7 @@ mod tests {
 
             // Verify they're in sorted order
             let mut sorted_inserted: Vec<i64> = inserted.iter().copied().collect();
-            sorted_inserted.sort();
+            sorted_inserted.sort_unstable();
             assert_eq!(extracted, sorted_inserted);
         }
     }

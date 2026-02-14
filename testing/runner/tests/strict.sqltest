@@ -1,0 +1,59 @@
+@database :memory:
+
+@requires strict "uses STRICT tables"
+test strict-null-integer-column {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER) STRICT;
+    INSERT INTO t1 (a) VALUES (5);
+    SELECT id, a, b FROM t1;
+}
+expect {
+    1|5|
+}
+
+@requires strict "uses STRICT tables"
+test strict-null-text-column {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, first TEXT, last TEXT) STRICT;
+    INSERT INTO t2 (first) VALUES ('John');
+    SELECT id, first, last FROM t2;
+}
+expect {
+    1|John|
+}
+
+@requires strict "uses STRICT tables"
+test strict-null-real-column {
+    CREATE TABLE t3 (id INTEGER PRIMARY KEY, a REAL, b REAL) STRICT;
+    INSERT INTO t3 (a) VALUES (3.14);
+    SELECT id, a, b FROM t3;
+}
+expect {
+    1|3.14|
+}
+
+@requires strict "uses STRICT tables"
+test strict-null-blob-column {
+    CREATE TABLE t4 (id INTEGER PRIMARY KEY, a BLOB, b BLOB) STRICT;
+    INSERT INTO t4 (a) VALUES (X'CAFE');
+    SELECT id, hex(a), b FROM t4;
+}
+expect {
+    1|CAFE|
+}
+
+@requires strict "uses STRICT tables"
+test strict-explicit-null-insert {
+    CREATE TABLE t5 (id INTEGER PRIMARY KEY, a INTEGER, b TEXT) STRICT;
+    INSERT INTO t5 VALUES (1, NULL, NULL);
+    SELECT * FROM t5;
+}
+expect {
+    1||
+}
+
+@requires strict "uses STRICT tables"
+test strict-not-null-still-enforced {
+    CREATE TABLE t6 (id INTEGER PRIMARY KEY, a INTEGER NOT NULL) STRICT;
+    INSERT INTO t6 (id) VALUES (1);
+}
+expect error {
+}

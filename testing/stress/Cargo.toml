@@ -1,0 +1,43 @@
+# Copyright 2025 the Limbo authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_stress"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Limbo stress tester"
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "turso_stress"
+path = "main.rs"
+
+[features]
+default = []
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+hex = { workspace = true }
+indicatif = { workspace = true }
+rand = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+turso = { workspace = true }
+rusqlite = { workspace = true }
+
+[target.'cfg(antithesis)'.dependencies]
+antithesis_sdk = { workspace = true, features = ["full"] }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
+

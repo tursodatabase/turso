@@ -22,7 +22,7 @@ path = "fuzz/mod.rs"
 anyhow.workspace = true
 env_logger = { workspace = true }
 turso_core = { workspace = true, features = ["conn_raw_api"] }
-turso = { workspace = true, features = ["conn_raw_api"] }
+turso = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 rusqlite.workspace = true
 tempfile = { workspace = true }
@@ -37,12 +37,16 @@ sql_generation = { path = "../sql_generation" }
 turso_parser = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing = { workspace = true }
+turso-dbhash.workspace = true
 
 [dev-dependencies]
+similar-asserts.workspace = true
 test-log = { version = "0.2.17", features = ["trace"] }
 turso_macros.workspace = true
 
 [features]
-default = ["test_helper"]
+default = ["test_helper", "fts", "io_uring"]
 checksum = ["turso_core/checksum"]
 test_helper = ["turso_core/test_helper"]
+fts = ["turso_core/fts"]
+io_uring = ["turso_core/io_uring"]

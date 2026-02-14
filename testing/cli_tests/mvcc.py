@@ -13,8 +13,8 @@ class MVCCTest(BaseModel):
 
 
 def test_create_table_with_mvcc():
-    """Test CREATE TABLE t(x) with --experimental-mvcc flag"""
-    shell = TestTursoShell(flags="--experimental-mvcc", init_commands="")
+    """Test CREATE TABLE t(x) with MVCC journal mode"""
+    shell = TestTursoShell(init_commands="PRAGMA journal_mode = 'experimental_mvcc';")
     shell.run_test("create-table-mvcc", "CREATE TABLE t(x);", "")
     shell.run_test("insert-mvcc", "INSERT INTO t(x) VALUES (1);", "")
     shell.quit()

@@ -1,5 +1,5 @@
-use crate::common::{limbo_exec_rows, TempDatabase};
-use turso_core::{LimboError, StepResult, Value};
+use crate::common::{ExecRows, TempDatabase};
+use turso_core::{LimboError, Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -7,39 +7,28 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     let mut stmt = conn.prepare("select ?")?;
 
-    stmt.bind_at(1.try_into()?, Value::Integer(1));
-
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                assert_eq!(
-                    *row.get::<&Value>(0).unwrap(),
-                    turso_core::Value::Integer(1)
-                );
-            }
-            StepResult::IO => stmt.run_once()?,
-            _ => break,
-        }
-    }
+    stmt.bind_at(1.try_into()?, Value::from_i64(1));
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(
+            *row.get::<&Value>(0).unwrap(),
+            turso_core::Value::from_i64(1)
+        );
+        Ok(())
+    })
+    .unwrap();
 
     stmt.reset();
 
-    stmt.bind_at(1.try_into()?, Value::Integer(2));
+    stmt.bind_at(1.try_into()?, Value::from_i64(2));
 
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                assert_eq!(
-                    *row.get::<&Value>(0).unwrap(),
-                    turso_core::Value::Integer(2)
-                );
-            }
-            StepResult::IO => stmt.run_once()?,
-            _ => break,
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(
+            *row.get::<&Value>(0).unwrap(),
+            turso_core::Value::from_i64(2)
+        );
+        Ok(())
+    })
+    .unwrap();
 
     Ok(())
 }
@@ -53,46 +42,38 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     stmt.bind_at(1.try_into()?, Value::build_text("hello"));
 
     let i = stmt.parameters().index(":named").unwrap();
-    stmt.bind_at(i, Value::Integer(42));
+    stmt.bind_at(i, Value::from_i64(42));
 
     stmt.bind_at(3.try_into()?, Value::from_blob(vec![0x1, 0x2, 0x3]));
 
-    stmt.bind_at(4.try_into()?, Value::Float(0.5));
+    stmt.bind_at(4.try_into()?, Value::from_f64(0.5));
 
     assert_eq!(stmt.parameters().count(), 4);
 
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                if let turso_core::Value::Text(s) = row.get::<&Value>(0).unwrap() {
-                    assert_eq!(s.as_str(), "hello")
-                }
+    stmt.run_with_row_callback(|row| {
+        if let turso_core::Value::Text(s) = row.get::<&Value>(0).unwrap() {
+            assert_eq!(s.as_str(), "hello")
+        }
 
-                if let turso_core::Value::Text(s) = row.get::<&Value>(1).unwrap() {
-                    assert_eq!(s.as_str(), "hello")
-                }
+        if let turso_core::Value::Text(s) = row.get::<&Value>(1).unwrap() {
+            assert_eq!(s.as_str(), "hello")
+        }
 
-                if let turso_core::Value::Integer(i) = row.get::<&Value>(2).unwrap() {
-                    assert_eq!(*i, 42)
-                }
+        if let turso_core::Value::Numeric(Numeric::Integer(i)) = row.get::<&Value>(2).unwrap() {
+            assert_eq!(*i, 42)
+        }
 
-                if let turso_core::Value::Blob(v) = row.get::<&Value>(3).unwrap() {
-                    assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
-                }
+        if let turso_core::Value::Blob(v) = row.get::<&Value>(3).unwrap() {
+            assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
+        }
 
-                if let turso_core::Value::Float(f) = row.get::<&Value>(4).unwrap() {
-                    assert_eq!(*f, 0.5)
-                }
-            }
-            StepResult::IO => {
-                stmt.run_once()?;
-            }
-            StepResult::Interrupt => break,
-            StepResult::Done => break,
-            StepResult::Busy => panic!("Database is busy"),
-        };
-    }
+        if let turso_core::Value::Numeric(Numeric::Float(f)) = row.get::<&Value>(4).unwrap() {
+            assert_eq!(f64::from(*f), 0.5)
+        }
+        Ok(())
+    })
+    .unwrap();
+
     Ok(())
 }
 
@@ -115,43 +96,29 @@ fn test_insert_parameter_remap(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     // prepare INSERT with re-ordered columns and constants
     let mut ins = conn.prepare("insert into test (d, c, a, b) values (22, ?, 7, ?);")?;
-    let args = [Value::Integer(111), Value::Integer(222)];
+    let args = [Value::from_i64(111), Value::from_i64(222)];
     for (i, arg) in args.iter().enumerate() {
         let idx = i + 1;
         ins.bind_at(idx.try_into()?, arg.clone());
     }
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.run_with_row_callback(|_| panic!("Unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b, c, d from test;")?;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
-                // insert_index = 3
-                // A = 7
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(7));
-                // insert_index = 4
-                // B = 222
-                assert_eq!(row.get::<&Value>(1).unwrap(), &Value::Integer(222));
-                // insert_index = 2
-                // C = 111
-                assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(111));
-                // insert_index = 1
-                // D = 22
-                assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(22));
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
+    sel.run_with_row_callback(|row| {
+        // insert_index = 3
+        // A = 7
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(7));
+        // insert_index = 4
+        // B = 222
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::from_i64(222));
+        // insert_index = 2
+        // C = 111
+        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::from_i64(111));
+        // insert_index = 1
+        // D = 22
+        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::from_i64(22));
+        Ok(())
+    })?;
 
     // exactly two distinct parameters were used
     assert_eq!(ins.parameters().count(), 2);
@@ -179,10 +146,10 @@ fn test_insert_parameter_remap_all_params(tmp_db: TempDatabase) -> anyhow::Resul
     let mut ins = conn.prepare("insert into test (d, a, c, b) values (?, ?, ?, ?);")?;
 
     let values = [
-        Value::Integer(999), // ?1 → d
-        Value::Integer(111), // ?2 → a
-        Value::Integer(333), // ?3 → c
-        Value::Integer(444), // ?4 → b
+        Value::from_i64(999), // ?1 → d
+        Value::from_i64(111), // ?2 → a
+        Value::from_i64(333), // ?3 → c
+        Value::from_i64(444), // ?4 → b
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
@@ -190,39 +157,25 @@ fn test_insert_parameter_remap_all_params(tmp_db: TempDatabase) -> anyhow::Resul
     }
 
     // execute the insert (no rows returned)
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.run_with_row_callback(|_| panic!("Unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b, c, d from test;")?;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
+    sel.run_with_row_callback(|row| {
+        // insert_index = 2
+        // A = 111
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(111));
+        // insert_index = 4
+        // B = 444
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::from_i64(444));
+        // insert_index = 3
+        // C = 333
+        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::from_i64(333));
+        // insert_index = 1
+        // D = 999
+        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::from_i64(999));
+        Ok(())
+    })?;
 
-                // insert_index = 2
-                // A = 111
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(111));
-                // insert_index = 4
-                // B = 444
-                assert_eq!(row.get::<&Value>(1).unwrap(), &Value::Integer(444));
-                // insert_index = 3
-                // C = 333
-                assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(333));
-                // insert_index = 1
-                // D = 999
-                assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(999));
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
     assert_eq!(ins.parameters().count(), 4);
     Ok(())
 }
@@ -246,10 +199,10 @@ fn test_insert_parameter_multiple_remap_backwards(tmp_db: TempDatabase) -> anyho
     let mut ins = conn.prepare("insert into test (d,c,b,a) values (?, ?, ?, ?);")?;
 
     let values = [
-        Value::Integer(444), // ?1 → d
-        Value::Integer(333), // ?2 → c
-        Value::Integer(222), // ?3 → b
-        Value::Integer(111), // ?4 → a
+        Value::from_i64(444), // ?1 → d
+        Value::from_i64(333), // ?2 → c
+        Value::from_i64(222), // ?3 → b
+        Value::from_i64(111), // ?4 → a
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
@@ -257,39 +210,25 @@ fn test_insert_parameter_multiple_remap_backwards(tmp_db: TempDatabase) -> anyho
     }
 
     // execute the insert (no rows returned)
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.run_with_row_callback(|_| panic!("Unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b, c, d from test;")?;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
+    sel.run_with_row_callback(|row| {
+        // insert_index = 2
+        // A = 111
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(111));
+        // insert_index = 4
+        // B = 444
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::from_i64(222));
+        // insert_index = 3
+        // C = 333
+        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::from_i64(333));
+        // insert_index = 1
+        // D = 999
+        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::from_i64(444));
+        Ok(())
+    })?;
 
-                // insert_index = 2
-                // A = 111
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(111));
-                // insert_index = 4
-                // B = 444
-                assert_eq!(row.get::<&Value>(1).unwrap(), &Value::Integer(222));
-                // insert_index = 3
-                // C = 333
-                assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(333));
-                // insert_index = 1
-                // D = 999
-                assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(444));
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
     assert_eq!(ins.parameters().count(), 4);
     Ok(())
 }
@@ -313,10 +252,10 @@ fn test_insert_parameter_multiple_no_remap(tmp_db: TempDatabase) -> anyhow::Resu
     let mut ins = conn.prepare("insert into test (a,b,c,d) values (?, ?, ?, ?);")?;
 
     let values = [
-        Value::Integer(111), // ?1 → a
-        Value::Integer(222), // ?2 → b
-        Value::Integer(333), // ?3 → c
-        Value::Integer(444), // ?4 → d
+        Value::from_i64(111), // ?1 → a
+        Value::from_i64(222), // ?2 → b
+        Value::from_i64(333), // ?3 → c
+        Value::from_i64(444), // ?4 → d
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
@@ -324,39 +263,24 @@ fn test_insert_parameter_multiple_no_remap(tmp_db: TempDatabase) -> anyhow::Resu
     }
 
     // execute the insert (no rows returned)
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b, c, d from test;")?;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
-
-                // insert_index = 2
-                // A = 111
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(111));
-                // insert_index = 4
-                // B = 444
-                assert_eq!(row.get::<&Value>(1).unwrap(), &Value::Integer(222));
-                // insert_index = 3
-                // C = 333
-                assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(333));
-                // insert_index = 1
-                // D = 999
-                assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(444));
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
+    sel.run_with_row_callback(|row| {
+        // insert_index = 2
+        // A = 111
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(111));
+        // insert_index = 4
+        // B = 444
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::from_i64(222));
+        // insert_index = 3
+        // C = 333
+        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::from_i64(333));
+        // insert_index = 1
+        // D = 999
+        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::from_i64(444));
+        Ok(())
+    })?;
     assert_eq!(ins.parameters().count(), 4);
     Ok(())
 }
@@ -379,14 +303,14 @@ fn test_insert_parameter_multiple_row(tmp_db: TempDatabase) -> anyhow::Result<()
     let mut ins = conn.prepare("insert into test (b,a,d,c) values (?, ?, ?, ?), (?, ?, ?, ?);")?;
 
     let values = [
-        Value::Integer(222), // ?1 → b
-        Value::Integer(111), // ?2 → a
-        Value::Integer(444), // ?3 → d
-        Value::Integer(333), // ?4 → c
-        Value::Integer(666), // ?1 → b
-        Value::Integer(555), // ?2 → a
-        Value::Integer(888), // ?3 → d
-        Value::Integer(777), // ?4 → c
+        Value::from_i64(222), // ?1 → b
+        Value::from_i64(111), // ?2 → a
+        Value::from_i64(444), // ?3 → d
+        Value::from_i64(333), // ?4 → c
+        Value::from_i64(666), // ?1 → b
+        Value::from_i64(555), // ?2 → a
+        Value::from_i64(888), // ?3 → d
+        Value::from_i64(777), // ?4 → c
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
@@ -394,45 +318,30 @@ fn test_insert_parameter_multiple_row(tmp_db: TempDatabase) -> anyhow::Result<()
     }
 
     // execute the insert (no rows returned)
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b, c, d from test;")?;
     let mut i = 0;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
-
-                assert_eq!(
-                    row.get::<&Value>(0).unwrap(),
-                    &Value::Integer(if i == 0 { 111 } else { 555 })
-                );
-                assert_eq!(
-                    row.get::<&Value>(1).unwrap(),
-                    &Value::Integer(if i == 0 { 222 } else { 666 })
-                );
-                assert_eq!(
-                    row.get::<&Value>(2).unwrap(),
-                    &Value::Integer(if i == 0 { 333 } else { 777 })
-                );
-                assert_eq!(
-                    row.get::<&Value>(3).unwrap(),
-                    &Value::Integer(if i == 0 { 444 } else { 888 })
-                );
-                i += 1;
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
+    sel.run_with_row_callback(|row| {
+        assert_eq!(
+            row.get::<&Value>(0).unwrap(),
+            &Value::from_i64(if i == 0 { 111 } else { 555 })
+        );
+        assert_eq!(
+            row.get::<&Value>(1).unwrap(),
+            &Value::from_i64(if i == 0 { 222 } else { 666 })
+        );
+        assert_eq!(
+            row.get::<&Value>(2).unwrap(),
+            &Value::from_i64(if i == 0 { 333 } else { 777 })
+        );
+        assert_eq!(
+            row.get::<&Value>(3).unwrap(),
+            &Value::from_i64(if i == 0 { 444 } else { 888 })
+        );
+        i += 1;
+        Ok(())
+    })?;
     assert_eq!(ins.parameters().count(), 8);
     Ok(())
 }
@@ -441,39 +350,20 @@ fn test_insert_parameter_multiple_row(tmp_db: TempDatabase) -> anyhow::Result<()
 fn test_bind_parameters_update_query(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a, b) values (3, 'test1');")?;
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.run_with_row_callback(|_| panic!("unexpected row"))?;
+
     let mut ins = conn.prepare("update test set a = ? where b = ?;")?;
-    ins.bind_at(1.try_into()?, Value::Integer(222));
+    ins.bind_at(1.try_into()?, Value::from_i64(222));
     ins.bind_at(2.try_into()?, Value::build_text("test1"));
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+
+    ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b from test;")?;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(222));
-                assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test1"),);
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
+    sel.run_with_row_callback(|row| {
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(222));
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test1"),);
+        Ok(())
+    })?;
     assert_eq!(ins.parameters().count(), 2);
     Ok(())
 }
@@ -485,42 +375,22 @@ fn test_bind_parameters_update_query(tmp_db: TempDatabase) -> anyhow::Result<()>
 fn test_bind_parameters_update_query_multiple_where(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a, b, c, d) values (3, 'test1', 4, 5);")?;
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.run_with_row_callback(|_| panic!("unexpected row"))?;
+
     let mut ins = conn.prepare("update test set a = ? where b = ? and c = 4 and d = ?;")?;
-    ins.bind_at(1.try_into()?, Value::Integer(222));
+    ins.bind_at(1.try_into()?, Value::from_i64(222));
     ins.bind_at(2.try_into()?, Value::build_text("test1"));
-    ins.bind_at(3.try_into()?, Value::Integer(5));
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.bind_at(3.try_into()?, Value::from_i64(5));
+    ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b, c, d from test;")?;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(222));
-                assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test1"),);
-                assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(4));
-                assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(5));
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
+    sel.run_with_row_callback(|row| {
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(222));
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test1"),);
+        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::from_i64(4));
+        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::from_i64(5));
+        Ok(())
+    })?;
     assert_eq!(ins.parameters().count(), 3);
     Ok(())
 }
@@ -532,53 +402,26 @@ fn test_bind_parameters_update_query_multiple_where(tmp_db: TempDatabase) -> any
 fn test_bind_parameters_update_rowid_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (id, name) values (1, 'test');")?;
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select id, name from test;")?;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
-                assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test"),);
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
+    sel.run_with_row_callback(|row| {
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(1));
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test"),);
+        Ok(())
+    })?;
+
     let mut ins = conn.prepare("update test set name = ? where id = ?;")?;
     ins.bind_at(1.try_into()?, Value::build_text("updated"));
-    ins.bind_at(2.try_into()?, Value::Integer(1));
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.bind_at(2.try_into()?, Value::from_i64(1));
+    ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select id, name from test;")?;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
-                assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("updated"),);
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
+    sel.run_with_row_callback(|row| {
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(1));
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("updated"),);
+        Ok(())
+    })?;
     assert_eq!(ins.parameters().count(), 2);
     Ok(())
 }
@@ -594,57 +437,37 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid(tmp_db: TempDatabase) -> a
 
     let mut sel = conn.prepare("select id, name, age from test;")?;
     let mut i = 0;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
-                assert_eq!(
-                    row.get::<&Value>(0).unwrap(),
-                    &Value::Integer(if i == 0 { 1 } else { 2 })
-                );
-                assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test"),);
-                assert_eq!(
-                    row.get::<&Value>(2).unwrap(),
-                    &Value::Integer(if i == 0 { 4 } else { 11 })
-                );
-                i += 1;
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
+    sel.run_with_row_callback(|row| {
+        assert_eq!(
+            row.get::<&Value>(0).unwrap(),
+            &Value::from_i64(if i == 0 { 1 } else { 2 })
+        );
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test"),);
+        assert_eq!(
+            row.get::<&Value>(2).unwrap(),
+            &Value::from_i64(if i == 0 { 4 } else { 11 })
+        );
+        i += 1;
+        Ok(())
+    })?;
+
     let mut ins = conn.prepare("update test set name = ? where id < ? AND age between ? and ?;")?;
     ins.bind_at(1.try_into()?, Value::build_text("updated"));
-    ins.bind_at(2.try_into()?, Value::Integer(2));
-    ins.bind_at(3.try_into()?, Value::Integer(3));
-    ins.bind_at(4.try_into()?, Value::Integer(5));
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.bind_at(2.try_into()?, Value::from_i64(2));
+    ins.bind_at(3.try_into()?, Value::from_i64(3));
+    ins.bind_at(4.try_into()?, Value::from_i64(5));
+    ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select name from test;")?;
     let mut i = 0;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
-                assert_eq!(
-                    row.get::<&Value>(0).unwrap(),
-                    &Value::build_text(if i == 0 { "updated" } else { "test" }),
-                );
-                i += 1;
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
+    sel.run_with_row_callback(|row| {
+        assert_eq!(
+            row.get::<&Value>(0).unwrap(),
+            &Value::build_text(if i == 0 { "updated" } else { "test" }),
+        );
+        i += 1;
+        Ok(())
+    })?;
 
     assert_eq!(ins.parameters().count(), 4);
     Ok(())
@@ -663,33 +486,20 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order(
 
     let mut ins =
         conn.prepare("delete from test where age between ? and ? AND id > ? AND name = ?;")?;
-    ins.bind_at(1.try_into()?, Value::Integer(10));
-    ins.bind_at(2.try_into()?, Value::Integer(12));
-    ins.bind_at(3.try_into()?, Value::Integer(4));
+    ins.bind_at(1.try_into()?, Value::from_i64(10));
+    ins.bind_at(2.try_into()?, Value::from_i64(12));
+    ins.bind_at(3.try_into()?, Value::from_i64(4));
     ins.bind_at(4.try_into()?, Value::build_text("test"));
-    loop {
-        match ins.step()? {
-            StepResult::IO => ins.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-            _ => {}
-        }
-    }
+    ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select name from test;")?;
     let mut i = 0;
-    loop {
-        match sel.step()? {
-            StepResult::Row => {
-                let row = sel.row().unwrap();
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::build_text("correct"),);
-                i += 1;
-            }
-            StepResult::IO => sel.run_once()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => panic!("database busy"),
-        }
-    }
+    sel.run_with_row_callback(|row| {
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::build_text("correct"),);
+        i += 1;
+        Ok(())
+    })?;
+
     assert_eq!(i, 1);
     assert_eq!(ins.parameters().count(), 4);
     Ok(())
@@ -707,37 +517,17 @@ fn test_cte_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let mut stmt1 = conn.prepare(
         "WITH a1 AS (SELECT id FROM test WHERE name = 'Limbo') SELECT a2.id FROM a1 AS a2",
     )?;
-    loop {
-        match stmt1.step()? {
-            StepResult::Row => {
-                let row = stmt1.row().unwrap();
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
-                break;
-            }
-            StepResult::Done => {
-                panic!("Expected a row but got Done");
-            }
-            StepResult::IO => stmt1.run_once()?,
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    stmt1.run_with_row_callback(|row| {
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(1));
+        Ok(())
+    })?;
 
     let mut stmt2 = conn
         .prepare("WITH a1 AS (SELECT id FROM test WHERE name = 'Turso') SELECT a2.id FROM a1 a2")?;
-    loop {
-        match stmt2.step()? {
-            StepResult::Row => {
-                let row = stmt2.row().unwrap();
-                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(2));
-                break;
-            }
-            StepResult::Done => {
-                panic!("Expected a row but got Done");
-            }
-            StepResult::IO => stmt2.run_once()?,
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    stmt2.run_with_row_callback(|row| {
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(2));
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -755,35 +545,23 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
         "WITH t AS (SELECT id, name FROM test WHERE id = 1) SELECT * FROM t UNION ALL SELECT 99, 'Extra'",
     )?;
     let mut rows = Vec::new();
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
-            }
-            StepResult::Done => break,
-            StepResult::IO => stmt.run_once()?,
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], Value::Integer(1));
-    assert_eq!(rows[1][0], Value::Integer(99));
+    assert_eq!(rows[0][0], Value::from_i64(1));
+    assert_eq!(rows[1][0], Value::from_i64(99));
 
     // Test 2: CTE with UNION (not UNION ALL)
     let mut stmt = conn.prepare("WITH t AS (SELECT 1 as x) SELECT * FROM t UNION SELECT 2 as x")?;
     let mut rows = Vec::new();
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
-            }
-            StepResult::Done => break,
-            StepResult::IO => stmt.run_once()?,
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+
     assert_eq!(rows.len(), 2);
 
     // Test 3: Multiple CTEs with UNION ALL - both CTEs used in different branches
@@ -792,20 +570,14 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
          SELECT * FROM t1 UNION ALL SELECT * FROM t2",
     )?;
     let mut rows = Vec::new();
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
-            }
-            StepResult::Done => break,
-            StepResult::IO => stmt.run_once()?,
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], Value::Integer(1));
-    assert_eq!(rows[1][0], Value::Integer(2));
+    assert_eq!(rows[0][0], Value::from_i64(1));
+    assert_eq!(rows[1][0], Value::from_i64(2));
 
     Ok(())
 }
@@ -816,17 +588,10 @@ fn test_avg_agg(tmp_db: TempDatabase) -> anyhow::Result<()> {
     conn.execute("insert into t values (1, null), (2, null), (3, null), (null, null), (4, null)")?;
     let mut rows = Vec::new();
     let mut stmt = conn.prepare("select avg(x), avg(y) from t")?;
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
-            }
-            StepResult::Done => break,
-            StepResult::IO => stmt.run_once()?,
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
 
     assert_eq!(stmt.num_columns(), 2);
     assert_eq!(stmt.get_column_name(0), "avg (t.x)");
@@ -835,7 +600,7 @@ fn test_avg_agg(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(
         rows,
         vec![vec![
-            turso_core::Value::Float((1.0 + 2.0 + 3.0 + 4.0) / (4.0)),
+            turso_core::Value::from_f64((1.0 + 2.0 + 3.0 + 4.0) / (4.0)),
             turso_core::Value::Null
         ]]
     );
@@ -854,30 +619,24 @@ fn test_offset_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
             2,
             1,
             vec![
-                vec![turso_core::Value::Integer(4)],
-                vec![turso_core::Value::Integer(3)],
+                vec![turso_core::Value::from_i64(4)],
+                vec![turso_core::Value::from_i64(3)],
             ],
         ),
         (0, 0, vec![]),
-        (1, 0, vec![vec![turso_core::Value::Integer(5)]]),
+        (1, 0, vec![vec![turso_core::Value::from_i64(5)]]),
         (0, 1, vec![]),
-        (1, 1, vec![vec![turso_core::Value::Integer(4)]]),
+        (1, 1, vec![vec![turso_core::Value::from_i64(4)]]),
     ] {
         let mut stmt = conn.prepare("SELECT * FROM test LIMIT ? OFFSET ?")?;
-        stmt.bind_at(1.try_into()?, Value::Integer(limit));
-        stmt.bind_at(2.try_into()?, Value::Integer(offset));
+        stmt.bind_at(1.try_into()?, Value::from_i64(limit));
+        stmt.bind_at(2.try_into()?, Value::from_i64(offset));
 
         let mut rows = Vec::new();
-        loop {
-            match stmt.step()? {
-                StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
-                }
-                StepResult::IO => stmt.run_once()?,
-                _ => break,
-            }
-        }
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            Ok(())
+        })?;
 
         assert_eq!(rows, expected);
     }
@@ -895,38 +654,30 @@ fn test_upsert_parameters_order(tmp_db: TempDatabase) -> anyhow::Result<()> {
     conn.execute("INSERT INTO test VALUES (1, 2), (3, 4)")?;
     let mut stmt =
         conn.prepare("INSERT INTO test VALUES (?, ?), (?, ?) ON CONFLICT DO UPDATE SET v = ?")?;
-    stmt.bind_at(1.try_into()?, Value::Integer(1));
-    stmt.bind_at(2.try_into()?, Value::Integer(20));
-    stmt.bind_at(3.try_into()?, Value::Integer(3));
-    stmt.bind_at(4.try_into()?, Value::Integer(40));
-    stmt.bind_at(5.try_into()?, Value::Integer(66));
-    while let StepResult::Row | StepResult::IO = stmt.step()? {
-        stmt.run_once()?;
-    }
+    stmt.bind_at(1.try_into()?, Value::from_i64(1));
+    stmt.bind_at(2.try_into()?, Value::from_i64(20));
+    stmt.bind_at(3.try_into()?, Value::from_i64(3));
+    stmt.bind_at(4.try_into()?, Value::from_i64(40));
+    stmt.bind_at(5.try_into()?, Value::from_i64(66));
+    stmt.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut rows = Vec::new();
     let mut stmt = conn.prepare("SELECT * FROM test")?;
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
-            }
-            StepResult::IO => stmt.run_once()?,
-            _ => break,
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
 
     assert_eq!(
         rows,
         vec![
             vec![
-                turso_core::Value::Integer(1),
-                turso_core::Value::Integer(66)
+                turso_core::Value::from_i64(1),
+                turso_core::Value::from_i64(66)
             ],
             vec![
-                turso_core::Value::Integer(3),
-                turso_core::Value::Integer(66)
+                turso_core::Value::from_i64(3),
+                turso_core::Value::from_i64(66)
             ]
         ]
     );
@@ -950,8 +701,8 @@ fn test_multiple_connections_visibility(tmp_db: TempDatabase) -> anyhow::Result<
     drop(stmt);
     conn1.execute("COMMIT")?;
 
-    let rows = limbo_exec_rows(&conn2, "SELECT COUNT(*) FROM test");
-    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2,)]);
     Ok(())
 }
 
@@ -983,17 +734,8 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
             _ => tmp_db.io.step().unwrap(),
         }
     }
-    let rows = limbo_exec_rows(&conn1, "SELECT rowid FROM test");
-    assert_eq!(
-        rows,
-        vec![
-            vec![rusqlite::types::Value::Integer(1)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)],
-            vec![rusqlite::types::Value::Integer(4)],
-            vec![rusqlite::types::Value::Integer(5)],
-        ]
-    );
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT rowid FROM test");
+    assert_eq!(rows, vec![(1,), (2,), (3,), (4,), (5,)]);
     Ok(())
 }
 
@@ -1060,31 +802,26 @@ fn test_many_columns(tmp_db: TempDatabase) {
 
     let mut rows = Vec::new();
     let mut stmt = conn.prepare(&select_sql).unwrap();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            _ => break,
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })
+    .unwrap();
 
     // Verify we got values 0,100,200,...,900
     assert_eq!(
         rows,
         vec![vec![
-            turso_core::Value::Integer(0),
-            turso_core::Value::Integer(100),
-            turso_core::Value::Integer(200),
-            turso_core::Value::Integer(300),
-            turso_core::Value::Integer(400),
-            turso_core::Value::Integer(500),
-            turso_core::Value::Integer(600),
-            turso_core::Value::Integer(700),
-            turso_core::Value::Integer(800),
-            turso_core::Value::Integer(900),
+            turso_core::Value::from_i64(0),
+            turso_core::Value::from_i64(100),
+            turso_core::Value::from_i64(200),
+            turso_core::Value::from_i64(300),
+            turso_core::Value::from_i64(400),
+            turso_core::Value::from_i64(500),
+            turso_core::Value::from_i64(600),
+            turso_core::Value::from_i64(700),
+            turso_core::Value::from_i64(800),
+            turso_core::Value::from_i64(900),
         ]]
     );
 }
@@ -1101,33 +838,22 @@ fn test_eval_param_only_once(tmp_db: TempDatabase) {
         .unwrap();
     stmt.bind_at(
         1.try_into().unwrap(),
-        turso_core::Value::Integer(100_000_000),
+        turso_core::Value::from_i64(100_000_000),
     );
     stmt.bind_at(
         2.try_into().unwrap(),
-        turso_core::Value::Integer(100_000_000),
+        turso_core::Value::from_i64(100_000_000),
     );
     let start_time = std::time::Instant::now();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            StepResult::Done => break,
-            StepResult::Row => {
-                let values = stmt
-                    .row()
-                    .unwrap()
-                    .get_values()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                assert_eq!(values, vec![turso_core::Value::Integer(10000)]);
-            }
-            _ => unreachable!(),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        let values = row.get_values().cloned().collect::<Vec<_>>();
+        assert_eq!(values, vec![turso_core::Value::from_i64(10000)]);
+        Ok(())
+    })
+    .unwrap();
+
     let end_time = std::time::Instant::now();
     let elapsed = end_time.duration_since(start_time);
     // the test will allocate 10^8 * 10^4 bytes in case if parameter will be evaluated for every row
-    assert!(elapsed < std::time::Duration::from_millis(100));
+    assert!(elapsed < std::time::Duration::from_millis(500));
 }

@@ -282,6 +282,7 @@ def main():
     try:
         with TestTursoShell("") as turso:
             for test in tests:
+                turso.execute_dot("PRAGMA cache_size = 200")
                 stub_memory_test(turso, **test)
             test_hash_joins(turso)
             test_multi_way_hash_joins(turso)

@@ -1,14 +1,14 @@
 use crate::schema::{BTreeTable, Trigger};
+use crate::sync::Arc;
+use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::translate_expr;
 use crate::translate::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
 use crate::{bail_parse_error, QueryMode, Result, Statement};
-use parking_lot::RwLock;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 use std::num::NonZero;
-use std::sync::Arc;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
@@ -20,6 +20,12 @@ pub struct TriggerContext {
     pub new_registers: Option<Vec<usize>>,
     /// OLD row registers (for UPDATE/DELETE). The last element is always the rowid.
     pub old_registers: Option<Vec<usize>>,
+    /// Override conflict resolution for statements within this trigger.
+    /// When set, all INSERT/UPDATE statements in the trigger will use this
+    /// conflict resolution instead of their specified OR clause.
+    /// This is needed for UPSERT DO UPDATE triggers where SQLite requires
+    /// that nested OR IGNORE/REPLACE clauses do not suppress errors.
+    pub override_conflict: Option<ast::ResolveType>,
 }
 
 impl TriggerContext {
@@ -32,6 +38,24 @@ impl TriggerContext {
             table,
             new_registers,
             old_registers,
+            override_conflict: None,
+        }
+    }
+
+    /// Create a trigger context with a conflict resolution override.
+    /// Used for UPSERT DO UPDATE triggers where nested OR IGNORE/REPLACE
+    /// clauses should not suppress errors.
+    pub fn new_with_override_conflict(
+        table: Arc<BTreeTable>,
+        new_registers: Option<Vec<usize>>,
+        old_registers: Option<Vec<usize>>,
+        override_conflict: ast::ResolveType,
+    ) -> Self {
+        Self {
+            table,
+            new_registers,
+            old_registers,
+            override_conflict: Some(override_conflict),
         }
     }
 }
@@ -53,6 +77,8 @@ struct TriggerSubprogramContext {
     /// Map from column index to parameter index for OLD values (1-indexed)
     old_param_map: Option<ParamMap>,
     table: Arc<BTreeTable>,
+    /// Override conflict resolution for statements within this trigger.
+    override_conflict: Option<ast::ResolveType>,
 }
 
 impl TriggerSubprogramContext {
@@ -178,32 +204,6 @@ fn rewrite_trigger_expr_for_subprogram(
                     }
                 }
 
-                // Handle unqualified column references - they refer to NEW if available, else OLD
-                if let Some((idx, _)) = table.get_column(&col) {
-                    if let Some(new_params) = &ctx.new_param_map {
-                        if idx < new_params.len() {
-                            *e = Expr::Variable(format!(
-                                "{}",
-                                ctx.get_new_param(idx)
-                                    .expect("NEW parameters must be provided")
-                                    .get()
-                            ));
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-                    if let Some(old_params) = &ctx.old_param_map {
-                        if idx < old_params.len() {
-                            *e = Expr::Variable(format!(
-                                "{}",
-                                ctx.get_old_param(idx)
-                                    .expect("OLD parameters must be provided")
-                                    .get()
-                            ));
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-                }
-
                 Ok(WalkControl::Continue)
             }
             _ => Ok(WalkControl::Continue),
@@ -217,7 +217,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
     cmd: &ast::TriggerCmd,
     subprogram_ctx: &TriggerSubprogramContext,
 ) -> Result<ast::Stmt> {
-    use turso_parser::ast::{InsertBody, QualifiedName};
+    use ast::{InsertBody, QualifiedName};
 
     match cmd {
         ast::TriggerCmd::Insert {
@@ -233,9 +233,12 @@ fn trigger_cmd_to_stmt_for_subprogram(
             rewrite_expressions_in_select_for_subprogram(&mut select_clone, subprogram_ctx)?;
 
             let body = InsertBody::Select(select_clone, upsert.clone());
+            // If override_conflict is set (e.g., in UPSERT DO UPDATE context),
+            // use it instead of the command's or_conflict to ensure errors propagate.
+            let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);
             Ok(ast::Stmt::Insert {
                 with: None,
-                or_conflict: *or_conflict,
+                or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
                     db_name: None,
                     name: tbl_name.clone(),
@@ -272,9 +275,12 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 )?;
             }
 
+            // If override_conflict is set (e.g., in UPSERT DO UPDATE context),
+            // use it instead of the command's or_conflict to ensure errors propagate.
+            let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);
             Ok(ast::Stmt::Update(ast::Update {
                 with: None,
-                or_conflict: *or_conflict,
+                or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
                     db_name: None,
                     name: tbl_name.clone(),
@@ -544,6 +550,7 @@ fn execute_trigger_commands(
         new_param_map,
         old_param_map,
         table: ctx.table.clone(),
+        override_conflict: ctx.override_conflict,
     };
     let mut subprogram_builder = ProgramBuilder::new_for_trigger(
         QueryMode::Normal,
@@ -555,6 +562,11 @@ fn execute_trigger_commands(
         },
         trigger.clone(),
     );
+    // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),
+    // propagate it to the subprogram so that nested trigger firing will also use it.
+    if let Some(override_conflict) = ctx.override_conflict {
+        subprogram_builder.set_trigger_conflict_override(override_conflict);
+    }
     for command in trigger.commands.iter() {
         let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
         subprogram_builder.prologue();
@@ -579,7 +591,7 @@ fn execute_trigger_commands(
             new_regs
                 .iter()
                 .copied()
-                .map(|reg_idx| crate::types::Value::Integer(reg_idx as i64)),
+                .map(|reg_idx| crate::types::Value::from_i64(reg_idx as i64)),
         );
     }
     if let Some(old_regs) = &ctx.old_registers {
@@ -587,7 +599,7 @@ fn execute_trigger_commands(
             old_regs
                 .iter()
                 .copied()
-                .map(|reg_idx| crate::types::Value::Integer(reg_idx as i64)),
+                .map(|reg_idx| crate::types::Value::from_i64(reg_idx as i64)),
         );
     }
 

@@ -14,7 +14,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::{Scope, SyntaxSet};
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
-use turso_core::{Connection, StepResult};
+use turso_core::Connection;
 
 use crate::commands::CommandParser;
 use crate::config::{HighlightConfig, CONFIG_DIR};
@@ -209,28 +209,18 @@ impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
         );
 
         if let Some(mut rows) = query {
-            loop {
-                match try_result!(rows.step(), (prefix_pos, candidates)) {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        let completion: &str =
-                            try_result!(row.get::<&str>(0), (prefix_pos, candidates));
-                        let pair = Pair {
-                            display: completion.to_string(),
-                            replacement: completion.to_string(),
-                        };
-                        candidates.push(pair);
-                    }
-                    StepResult::IO => {
-                        try_result!(rows.run_once(), (prefix_pos, candidates));
-                    }
-                    StepResult::Interrupt => break,
-                    StepResult::Done => break,
-                    StepResult::Busy => {
-                        break;
-                    }
-                }
-            }
+            try_result!(
+                rows.run_with_row_callback(|row| {
+                    let completion: &str = row.get::<&str>(0)?;
+                    let pair = Pair {
+                        display: completion.to_string(),
+                        replacement: completion.to_string(),
+                    };
+                    candidates.push(pair);
+                    Ok(())
+                }),
+                (prefix_pos, candidates)
+            );
         }
 
         Ok((prefix_pos, candidates))

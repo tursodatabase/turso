@@ -179,6 +179,9 @@ pub enum TokenType {
     TK_FILTER = 167,
     TK_ILLEGAL = 185,
     TK_CONCURRENT = 186,
+    TK_OPTIMIZE = 187,
+    // None token
+    TK_NONE = 255,
 }
 
 impl TokenType {
@@ -274,6 +277,7 @@ impl TokenType {
             TokenType::TK_ON => Some("ON"),
             TokenType::TK_OR => Some("OR"),
             TokenType::TK_ORDER => Some("ORDER"),
+            TokenType::TK_OPTIMIZE => Some("OPTIMIZE"),
             TokenType::TK_OTHERS => Some("OTHERS"),
             TokenType::TK_OVER => Some("OVER"),
             TokenType::TK_PARTITION => Some("PARTITION"),
@@ -343,6 +347,21 @@ impl TokenType {
             TokenType::TK_STAR => Some("*"),
             _ => None,
         }
+    }
+    #[inline]
+    pub fn unwrap_or(self, default: TokenType) -> TokenType {
+        if self.is_none() {
+            #[cold]
+            pub const fn cold() {}
+            cold();
+            default
+        } else {
+            self
+        }
+    }
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        *self == TokenType::TK_NONE
     }
 }
 
@@ -446,6 +465,7 @@ impl Display for TokenType {
             TK_UNBOUNDED => "TK_UNBOUNDED",
             TK_EXCLUDE => "TK_EXCLUDE",
             TK_GROUPS => "TK_GROUPS",
+            TK_OPTIMIZE => "TK_OPTIMIZE",
             TK_OTHERS => "TK_OTHERS",
             TK_TIES => "TK_TIES",
             TK_GENERATED => "TK_GENERATED",
@@ -521,6 +541,8 @@ impl Display for TokenType {
             TK_OVER => "TK_OVER",
             TK_FILTER => "TK_FILTER",
             TK_ILLEGAL => "TK_ILLEGAL",
+            // None
+            TK_NONE => "TK_NONE",
         };
         write!(f, "{s}")
     }
@@ -542,7 +564,7 @@ impl TokenType {
             | TK_TRIGGER | TK_VACUUM | TK_VIEW | TK_VIRTUAL | TK_WITH | TK_NULLS | TK_FIRST
             | TK_LAST | TK_CURRENT | TK_FOLLOWING | TK_PARTITION | TK_PRECEDING | TK_RANGE
             | TK_UNBOUNDED | TK_EXCLUDE | TK_GROUPS | TK_OTHERS | TK_TIES | TK_ALWAYS
-            | TK_MATERIALIZED | TK_REINDEX | TK_RENAME | TK_CTIME_KW | TK_IF => TK_ID,
+            | TK_MATERIALIZED | TK_REINDEX | TK_RENAME | TK_CTIME_KW | TK_IF | TK_OPTIMIZE => TK_ID,
             // | TK_COLUMNKW | TK_UNION | TK_EXCEPT | TK_INTERSECT | TK_GENERATED | TK_WITHOUT
             // see comments in `next_token` of parser
             _ => self,

@@ -42,3 +42,6 @@ bin/
 ### turso builds ###
 libs
 temp
+
+### Rust build artifacts ###
+.rustc_info.json

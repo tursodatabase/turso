@@ -7,13 +7,15 @@ use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
 use crate::incremental::persistence::{ReadRecord, WriteRow};
+use crate::numeric::Numeric;
 use crate::storage::btree::CursorTrait;
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef};
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
-use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::BTreeMap;
 use std::fmt::{self, Display};
-use std::sync::Arc;
 
 // Architecture of the Aggregate Operator
 // ========================================
@@ -129,36 +131,48 @@ impl AggregateFunction {
     /// Returns a vector of values: [type_code, optional_column_index]
     pub fn to_values(&self) -> Vec<Value> {
         match self {
-            AggregateFunction::Count => vec![Value::Integer(AGG_FUNC_COUNT)],
+            AggregateFunction::Count => vec![Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT))],
             AggregateFunction::CountDistinct(idx) => {
                 vec![
-                    Value::Integer(AGG_FUNC_COUNT_DISTINCT),
-                    Value::Integer(*idx as i64),
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_DISTINCT)),
+                    Value::from_i64(*idx as i64),
                 ]
             }
             AggregateFunction::Sum(idx) => {
-                vec![Value::Integer(AGG_FUNC_SUM), Value::Integer(*idx as i64)]
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_SUM)),
+                    Value::from_i64(*idx as i64),
+                ]
             }
             AggregateFunction::SumDistinct(idx) => {
                 vec![
-                    Value::Integer(AGG_FUNC_SUM_DISTINCT),
-                    Value::Integer(*idx as i64),
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_SUM_DISTINCT)),
+                    Value::from_i64(*idx as i64),
                 ]
             }
             AggregateFunction::Avg(idx) => {
-                vec![Value::Integer(AGG_FUNC_AVG), Value::Integer(*idx as i64)]
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_AVG)),
+                    Value::from_i64(*idx as i64),
+                ]
             }
             AggregateFunction::AvgDistinct(idx) => {
                 vec![
-                    Value::Integer(AGG_FUNC_AVG_DISTINCT),
-                    Value::Integer(*idx as i64),
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_AVG_DISTINCT)),
+                    Value::from_i64(*idx as i64),
                 ]
             }
             AggregateFunction::Min(idx) => {
-                vec![Value::Integer(AGG_FUNC_MIN), Value::Integer(*idx as i64)]
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_MIN)),
+                    Value::from_i64(*idx as i64),
+                ]
             }
             AggregateFunction::Max(idx) => {
-                vec![Value::Integer(AGG_FUNC_MAX), Value::Integer(*idx as i64)]
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_MAX)),
+                    Value::from_i64(*idx as i64),
+                ]
             }
         }
     }
@@ -171,16 +185,16 @@ impl AggregateFunction {
             .ok_or_else(|| LimboError::InternalError("Missing aggregate type code".into()))?;
 
         let agg_fn = match type_code {
-            Value::Integer(AGG_FUNC_COUNT) => {
+            Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT)) => {
                 *cursor += 1;
                 AggregateFunction::Count
             }
-            Value::Integer(AGG_FUNC_COUNT_DISTINCT) => {
+            Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_DISTINCT)) => {
                 *cursor += 1;
                 let idx = values.get(*cursor).ok_or_else(|| {
                     LimboError::InternalError("Missing COUNT(DISTINCT) column index".into())
                 })?;
-                if let Value::Integer(idx) = idx {
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
                     *cursor += 1;
                     AggregateFunction::CountDistinct(*idx as usize)
                 } else {
@@ -189,12 +203,12 @@ impl AggregateFunction {
                     )));
                 }
             }
-            Value::Integer(AGG_FUNC_SUM) => {
+            Value::Numeric(Numeric::Integer(AGG_FUNC_SUM)) => {
                 *cursor += 1;
                 let idx = values
                     .get(*cursor)
                     .ok_or_else(|| LimboError::InternalError("Missing SUM column index".into()))?;
-                if let Value::Integer(idx) = idx {
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
                     *cursor += 1;
                     AggregateFunction::Sum(*idx as usize)
                 } else {
@@ -203,12 +217,12 @@ impl AggregateFunction {
                     )));
                 }
             }
-            Value::Integer(AGG_FUNC_SUM_DISTINCT) => {
+            Value::Numeric(Numeric::Integer(AGG_FUNC_SUM_DISTINCT)) => {
                 *cursor += 1;
                 let idx = values.get(*cursor).ok_or_else(|| {
                     LimboError::InternalError("Missing SUM(DISTINCT) column index".into())
                 })?;
-                if let Value::Integer(idx) = idx {
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
                     *cursor += 1;
                     AggregateFunction::SumDistinct(*idx as usize)
                 } else {
@@ -217,12 +231,12 @@ impl AggregateFunction {
                     )));
                 }
             }
-            Value::Integer(AGG_FUNC_AVG) => {
+            Value::Numeric(Numeric::Integer(AGG_FUNC_AVG)) => {
                 *cursor += 1;
                 let idx = values
                     .get(*cursor)
                     .ok_or_else(|| LimboError::InternalError("Missing AVG column index".into()))?;
-                if let Value::Integer(idx) = idx {
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
                     *cursor += 1;
                     AggregateFunction::Avg(*idx as usize)
                 } else {
@@ -231,12 +245,12 @@ impl AggregateFunction {
                     )));
                 }
             }
-            Value::Integer(AGG_FUNC_AVG_DISTINCT) => {
+            Value::Numeric(Numeric::Integer(AGG_FUNC_AVG_DISTINCT)) => {
                 *cursor += 1;
                 let idx = values.get(*cursor).ok_or_else(|| {
                     LimboError::InternalError("Missing AVG(DISTINCT) column index".into())
                 })?;
-                if let Value::Integer(idx) = idx {
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
                     *cursor += 1;
                     AggregateFunction::AvgDistinct(*idx as usize)
                 } else {
@@ -245,12 +259,12 @@ impl AggregateFunction {
                     )));
                 }
             }
-            Value::Integer(AGG_FUNC_MIN) => {
+            Value::Numeric(Numeric::Integer(AGG_FUNC_MIN)) => {
                 *cursor += 1;
                 let idx = values
                     .get(*cursor)
                     .ok_or_else(|| LimboError::InternalError("Missing MIN column index".into()))?;
-                if let Value::Integer(idx) = idx {
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
                     *cursor += 1;
                     AggregateFunction::Min(*idx as usize)
                 } else {
@@ -259,12 +273,12 @@ impl AggregateFunction {
                     )));
                 }
             }
-            Value::Integer(AGG_FUNC_MAX) => {
+            Value::Numeric(Numeric::Integer(AGG_FUNC_MAX)) => {
                 *cursor += 1;
                 let idx = values
                     .get(*cursor)
                     .ok_or_else(|| LimboError::InternalError("Missing MAX column index".into()))?;
-                if let Value::Integer(idx) = idx {
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
                     *cursor += 1;
                     AggregateFunction::Max(*idx as usize)
                 } else {
@@ -533,7 +547,7 @@ impl AggregateEvalState {
 
                         // Create index key values
                         let index_key_values = vec![
-                            Value::Integer(operator_storage_id),
+                            Value::from_i64(operator_storage_id),
                             zset_hash.to_value(),
                             element_id.to_value(),
                         ];
@@ -720,10 +734,10 @@ impl AggregateState {
         let mut values = Vec::new();
 
         // Include count first
-        values.push(Value::Integer(self.count));
+        values.push(Value::from_i64(self.count));
 
         // Store number of aggregates
-        values.push(Value::Integer(aggregates.len() as i64));
+        values.push(Value::from_i64(aggregates.len() as i64));
 
         // Add each aggregate's metadata and state
         for agg in aggregates {
@@ -738,45 +752,45 @@ impl AggregateState {
                 AggregateFunction::CountDistinct(col_idx) => {
                     // Store the distinct count for this column
                     let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
-                    values.push(Value::Integer(count));
+                    values.push(Value::from_i64(count));
                 }
                 AggregateFunction::Sum(col_idx) => {
                     let sum = self.sums.get(col_idx).copied().unwrap_or(0.0);
-                    values.push(Value::Float(sum));
+                    values.push(Value::from_f64(sum));
                 }
                 AggregateFunction::SumDistinct(col_idx) => {
                     // Store both the distinct count and sum for this column
                     let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
                     let sum = self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
-                    values.push(Value::Integer(count));
-                    values.push(Value::Float(sum));
+                    values.push(Value::from_i64(count));
+                    values.push(Value::from_f64(sum));
                 }
                 AggregateFunction::Avg(col_idx) => {
                     let (sum, count) = self.avgs.get(col_idx).copied().unwrap_or((0.0, 0));
-                    values.push(Value::Float(sum));
-                    values.push(Value::Integer(count));
+                    values.push(Value::from_f64(sum));
+                    values.push(Value::from_i64(count));
                 }
                 AggregateFunction::AvgDistinct(col_idx) => {
                     // Store both the distinct count and sum for this column
                     let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
                     let sum = self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
-                    values.push(Value::Integer(count));
-                    values.push(Value::Float(sum));
+                    values.push(Value::from_i64(count));
+                    values.push(Value::from_f64(sum));
                 }
                 AggregateFunction::Min(col_idx) => {
                     if let Some(min_val) = self.mins.get(col_idx) {
-                        values.push(Value::Integer(1)); // Has value
+                        values.push(Value::from_i64(1)); // Has value
                         values.push(min_val.clone());
                     } else {
-                        values.push(Value::Integer(0)); // No value
+                        values.push(Value::from_i64(0)); // No value
                     }
                 }
                 AggregateFunction::Max(col_idx) => {
                     if let Some(max_val) = self.maxs.get(col_idx) {
-                        values.push(Value::Integer(1)); // Has value
+                        values.push(Value::from_i64(1)); // Has value
                         values.push(max_val.clone());
                     } else {
-                        values.push(Value::Integer(0)); // No value
+                        values.push(Value::from_i64(0)); // No value
                     }
                 }
             }
@@ -794,7 +808,7 @@ impl AggregateState {
         let count = values
             .get(cursor)
             .ok_or_else(|| LimboError::InternalError("Aggregate state missing count".into()))?;
-        if let Value::Integer(count) = count {
+        if let Value::Numeric(Numeric::Integer(count)) = count {
             state.count = *count;
             cursor += 1;
         } else {
@@ -808,7 +822,7 @@ impl AggregateState {
             .get(cursor)
             .ok_or_else(|| LimboError::InternalError("Missing number of aggregates".into()))?;
         let num_aggregates = match num_aggregates {
-            Value::Integer(n) => *n as usize,
+            Value::Numeric(Numeric::Integer(n)) => *n as usize,
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "Expected Integer for aggregate count, got {num_aggregates:?}"
@@ -831,7 +845,7 @@ impl AggregateState {
                     let count = values.get(cursor).ok_or_else(|| {
                         LimboError::InternalError("Missing COUNT(DISTINCT) value".into())
                     })?;
-                    if let Value::Integer(count) = count {
+                    if let Value::Numeric(Numeric::Integer(count)) = count {
                         state.distinct_counts.insert(col_idx, *count);
                         cursor += 1;
                     } else {
@@ -844,7 +858,7 @@ impl AggregateState {
                     let count = values.get(cursor).ok_or_else(|| {
                         LimboError::InternalError("Missing SUM(DISTINCT) count".into())
                     })?;
-                    if let Value::Integer(count) = count {
+                    if let Value::Numeric(Numeric::Integer(count)) = count {
                         state.distinct_counts.insert(col_idx, *count);
                         cursor += 1;
                     } else {
@@ -856,8 +870,8 @@ impl AggregateState {
                     let sum = values.get(cursor).ok_or_else(|| {
                         LimboError::InternalError("Missing SUM(DISTINCT) sum".into())
                     })?;
-                    if let Value::Float(sum) = sum {
-                        state.distinct_sums.insert(col_idx, *sum);
+                    if let Value::Numeric(Numeric::Float(sum)) = sum {
+                        state.distinct_sums.insert(col_idx, f64::from(*sum));
                         cursor += 1;
                     } else {
                         return Err(LimboError::InternalError(format!(
@@ -869,7 +883,7 @@ impl AggregateState {
                     let count = values.get(cursor).ok_or_else(|| {
                         LimboError::InternalError("Missing AVG(DISTINCT) count".into())
                     })?;
-                    if let Value::Integer(count) = count {
+                    if let Value::Numeric(Numeric::Integer(count)) = count {
                         state.distinct_counts.insert(col_idx, *count);
                         cursor += 1;
                     } else {
@@ -881,8 +895,8 @@ impl AggregateState {
                     let sum = values.get(cursor).ok_or_else(|| {
                         LimboError::InternalError("Missing AVG(DISTINCT) sum".into())
                     })?;
-                    if let Value::Float(sum) = sum {
-                        state.distinct_sums.insert(col_idx, *sum);
+                    if let Value::Numeric(Numeric::Float(sum)) = sum {
+                        state.distinct_sums.insert(col_idx, f64::from(*sum));
                         cursor += 1;
                     } else {
                         return Err(LimboError::InternalError(format!(
@@ -894,8 +908,8 @@ impl AggregateState {
                     let sum = values
                         .get(cursor)
                         .ok_or_else(|| LimboError::InternalError("Missing SUM value".into()))?;
-                    if let Value::Float(sum) = sum {
-                        state.sums.insert(col_idx, *sum);
+                    if let Value::Numeric(Numeric::Float(sum)) = sum {
+                        state.sums.insert(col_idx, f64::from(*sum));
                         cursor += 1;
                     } else {
                         return Err(LimboError::InternalError(format!(
@@ -908,7 +922,7 @@ impl AggregateState {
                         .get(cursor)
                         .ok_or_else(|| LimboError::InternalError("Missing AVG sum value".into()))?;
                     let sum = match sum {
-                        Value::Float(f) => *f,
+                        Value::Numeric(Numeric::Float(f)) => f64::from(*f),
                         _ => {
                             return Err(LimboError::InternalError(format!(
                                 "Expected Float for AVG sum, got {sum:?}"
@@ -921,7 +935,7 @@ impl AggregateState {
                         LimboError::InternalError("Missing AVG count value".into())
                     })?;
                     let count = match count {
-                        Value::Integer(i) => *i,
+                        Value::Numeric(Numeric::Integer(i)) => *i,
                         _ => {
                             return Err(LimboError::InternalError(format!(
                                 "Expected Integer for AVG count, got {count:?}"
@@ -936,7 +950,7 @@ impl AggregateState {
                     let has_value = values.get(cursor).ok_or_else(|| {
                         LimboError::InternalError("Missing MIN has_value flag".into())
                     })?;
-                    if let Value::Integer(has_value) = has_value {
+                    if let Value::Numeric(Numeric::Integer(has_value)) = has_value {
                         cursor += 1;
                         if *has_value == 1 {
                             let min_val = values
@@ -958,7 +972,7 @@ impl AggregateState {
                     let has_value = values.get(cursor).ok_or_else(|| {
                         LimboError::InternalError("Missing MAX has_value flag".into())
                     })?;
-                    if let Value::Integer(has_value) = has_value {
+                    if let Value::Numeric(Numeric::Integer(has_value)) = has_value {
                         cursor += 1;
                         if *has_value == 1 {
                             let max_val = values
@@ -985,7 +999,7 @@ impl AggregateState {
     fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Vec<u8> {
         let mut all_values = Vec::new();
         // Store the group key size first
-        all_values.push(Value::Integer(group_key.len() as i64));
+        all_values.push(Value::from_i64(group_key.len() as i64));
         all_values.extend_from_slice(group_key);
         all_values.extend(self.to_value_vector(aggregates));
 
@@ -995,8 +1009,7 @@ impl AggregateState {
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
         let record = ImmutableRecord::from_bin_record(blob.to_vec());
-        let ref_values = record.get_values();
-        let mut all_values: Vec<Value> = ref_values.into_iter().map(|rv| rv.to_owned()).collect();
+        let mut all_values: Vec<Value> = record.get_values_owned()?;
 
         if all_values.is_empty() {
             return Err(LimboError::InternalError(
@@ -1006,8 +1019,8 @@ impl AggregateState {
 
         // Read the group key size
         let group_key_count = match &all_values[0] {
-            Value::Integer(n) if *n >= 0 => *n as usize,
-            Value::Integer(n) => {
+            Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
+            Value::Numeric(Numeric::Integer(n)) => {
                 return Err(LimboError::InternalError(format!(
                     "Negative group key count: {n}"
                 )))
@@ -1055,8 +1068,8 @@ impl AggregateState {
         // Track which columns have had their distinct counts/sums updated
         // This prevents double-counting when multiple distinct aggregates
         // operate on the same column (e.g., COUNT(DISTINCT col), SUM(DISTINCT col), AVG(DISTINCT col))
-        let mut processed_counts: HashSet<usize> = HashSet::new();
-        let mut processed_sums: HashSet<usize> = HashSet::new();
+        let mut processed_counts: HashSet<usize> = HashSet::default();
+        let mut processed_sums: HashSet<usize> = HashSet::default();
 
         // Update distinct aggregate state
         for agg in aggregates {
@@ -1099,8 +1112,8 @@ impl AggregateState {
                             let current_sum =
                                 self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
                             let value_as_float = match &transition.transitioned_value {
-                                Value::Integer(i) => *i as f64,
-                                Value::Float(f) => *f,
+                                Value::Numeric(Numeric::Integer(i)) => *i as f64,
+                                Value::Numeric(Numeric::Float(f)) => f64::from(*f),
                                 _ => 0.0,
                             };
 
@@ -1116,8 +1129,8 @@ impl AggregateState {
                 AggregateFunction::Sum(col_idx) => {
                     if let Some(val) = values.get(*col_idx) {
                         let num_val = match val {
-                            Value::Integer(i) => *i as f64,
-                            Value::Float(f) => *f,
+                            Value::Numeric(Numeric::Integer(i)) => *i as f64,
+                            Value::Numeric(Numeric::Float(f)) => f64::from(*f),
                             _ => 0.0,
                         };
                         *self.sums.entry(*col_idx).or_insert(0.0) += num_val * weight as f64;
@@ -1126,8 +1139,8 @@ impl AggregateState {
                 AggregateFunction::Avg(col_idx) => {
                     if let Some(val) = values.get(*col_idx) {
                         let num_val = match val {
-                            Value::Integer(i) => *i as f64,
-                            Value::Float(f) => *f,
+                            Value::Numeric(Numeric::Integer(i)) => *i as f64,
+                            Value::Numeric(Numeric::Float(f)) => f64::from(*f),
                             _ => 0.0,
                         };
                         let (sum, count) = self.avgs.entry(*col_idx).or_insert((0.0, 0));
@@ -1180,26 +1193,26 @@ impl AggregateState {
         for agg in aggregates {
             match agg {
                 AggregateFunction::Count => {
-                    result.push(Value::Integer(self.count));
+                    result.push(Value::from_i64(self.count));
                 }
                 AggregateFunction::CountDistinct(col_idx) => {
                     // Return the computed DISTINCT count
                     let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
-                    result.push(Value::Integer(count));
+                    result.push(Value::from_i64(count));
                 }
                 AggregateFunction::Sum(col_idx) => {
                     let sum = self.sums.get(col_idx).copied().unwrap_or(0.0);
-                    result.push(Value::Float(sum));
+                    result.push(Value::from_f64(sum));
                 }
                 AggregateFunction::SumDistinct(col_idx) => {
                     // Return the computed SUM(DISTINCT)
                     let sum = self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
-                    result.push(Value::Float(sum));
+                    result.push(Value::from_f64(sum));
                 }
                 AggregateFunction::Avg(col_idx) => {
                     if let Some((sum, count)) = self.avgs.get(col_idx) {
                         if *count > 0 {
-                            result.push(Value::Float(sum / *count as f64));
+                            result.push(Value::from_f64(sum / *count as f64));
                         } else {
                             result.push(Value::Null);
                         }
@@ -1214,7 +1227,7 @@ impl AggregateState {
                         let sum = self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
                         let avg = sum / count as f64;
                         // AVG always returns a float value for consistency with SQLite
-                        result.push(Value::Float(avg));
+                        result.push(Value::from_f64(avg));
                     } else {
                         result.push(Value::Null);
                     }
@@ -1254,10 +1267,7 @@ impl AggregateOperator {
 
         // Get the accumulated weight from the current batch (before this row)
         let batch_accumulated = if let Some(deltas) = group_distinct_deltas {
-            deltas
-                .get(&(col_idx, hashable_row.clone()))
-                .copied()
-                .unwrap_or(0)
+            deltas.get(&(col_idx, hashable_row)).copied().unwrap_or(0)
         } else {
             0
         };
@@ -1294,7 +1304,7 @@ impl AggregateOperator {
         existing_state: &AggregateState,
         group_distinct_deltas: Option<&HashMap<(usize, HashableRow), isize>>,
     ) -> HashMap<usize, DistinctTransition> {
-        let mut transitions = HashMap::new();
+        let mut transitions = HashMap::default();
 
         // Plain Distinct doesn't track individual values, so no transitions needed
         if self.is_distinct_only {
@@ -1339,8 +1349,8 @@ impl AggregateOperator {
         let is_distinct_only = aggregates.is_empty();
 
         // Build map of column indices to their MIN/MAX info
-        let mut column_min_max = HashMap::new();
-        let mut storage_indices = HashMap::new();
+        let mut column_min_max = HashMap::default();
+        let mut storage_indices = HashMap::default();
         let mut current_index = 0;
 
         // First pass: assign storage indices to unique MIN/MAX columns
@@ -1391,7 +1401,7 @@ impl AggregateOperator {
         }
 
         // Build the distinct columns set
-        let mut distinct_columns = HashSet::new();
+        let mut distinct_columns = HashSet::default();
         for agg in &aggregates {
             match agg {
                 AggregateFunction::CountDistinct(col_idx)
@@ -1443,7 +1453,7 @@ impl AggregateOperator {
 
                 if deltas.left.changes.is_empty() {
                     *state = EvalState::Done;
-                    return Ok(IOResult::Done((Delta::new(), HashMap::new())));
+                    return Ok(IOResult::Done((Delta::new(), HashMap::default())));
                 }
 
                 let mut groups_to_read = BTreeMap::new();
@@ -1458,9 +1468,9 @@ impl AggregateOperator {
                     delta,
                     current_idx: 0,
                     groups_to_read: groups_to_read.into_iter().collect(),
-                    existing_groups: HashMap::new(),
-                    old_values: HashMap::new(),
-                    pre_existing_groups: HashSet::new(), // Initialize empty
+                    existing_groups: HashMap::default(),
+                    old_values: HashMap::default(),
+                    pre_existing_groups: HashSet::default(), // Initialize empty
                 }));
             }
             EvalState::Aggregate(_agg_state) => {
@@ -1492,11 +1502,11 @@ impl AggregateOperator {
         pre_existing_groups: &HashSet<String>,
     ) -> MergeResult {
         let mut output_delta = Delta::new();
-        let mut temp_keys: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut temp_keys: HashMap<String, Vec<Value>> = HashMap::default();
 
         // Track distinct value weights as we process the batch
         let mut batch_distinct_weights: HashMap<String, HashMap<(usize, HashableRow), isize>> =
-            HashMap::new();
+            HashMap::default();
 
         // Process each change in the delta
         for (row, weight) in delta.changes.iter() {
@@ -1518,7 +1528,7 @@ impl AggregateOperator {
             let distinct_transitions = if self.has_distinct() {
                 self.detect_distinct_transitions(&row.values, *weight, state, group_batch_weights)
             } else {
-                HashMap::new()
+                HashMap::default()
             };
 
             // Update batch weights after detecting transitions
@@ -1551,7 +1561,7 @@ impl AggregateOperator {
         }
 
         // Generate output delta from temporary states and collect final states
-        let mut final_states = HashMap::new();
+        let mut final_states = HashMap::default();
 
         for (group_key_str, state) in existing_groups.iter() {
             let group_key = if let Some(key) = temp_keys.get(group_key_str) {
@@ -1621,7 +1631,7 @@ impl AggregateOperator {
 
     /// Extract distinct values from delta changes for batch tracking
     fn extract_distinct_deltas(&self, delta: &Delta) -> DistinctDeltas {
-        let mut distinct_deltas: DistinctDeltas = HashMap::new();
+        let mut distinct_deltas: DistinctDeltas = HashMap::default();
 
         for (row, weight) in &delta.changes {
             let group_key = self.extract_group_key(&row.values);
@@ -1663,7 +1673,7 @@ impl AggregateOperator {
 
     /// Extract MIN/MAX values from delta changes for persistence to index
     fn extract_min_max_deltas(&self, delta: &Delta) -> MinMaxDeltas {
-        let mut min_max_deltas: MinMaxDeltas = HashMap::new();
+        let mut min_max_deltas: MinMaxDeltas = HashMap::default();
 
         for (row, weight) in &delta.changes {
             let group_key = self.extract_group_key(&row.values);
@@ -1796,12 +1806,12 @@ impl IncrementalOperator for AggregateOperator {
                     let distinct_deltas = if self.has_distinct() || self.is_distinct_only {
                         self.extract_distinct_deltas(&input_delta)
                     } else {
-                        HashMap::new()
+                        HashMap::default()
                     };
 
                     // Get old counts before eval modifies the states
                     // We need to extract this from the eval_state before it's consumed
-                    let old_states = HashMap::new(); // TODO: Extract from eval_state
+                    let old_states = HashMap::default(); // TODO: Extract from eval_state
 
                     let (output_delta, computed_states) = return_and_restore_if_io!(
                         &mut self.commit_state,
@@ -1887,7 +1897,7 @@ impl IncrementalOperator for AggregateOperator {
                         let blob_value = Value::Blob(state_blob);
 
                         // Build the aggregate storage format: [operator_id, zset_hash, element_id, value, weight]
-                        let operator_id_val = Value::Integer(operator_storage_id);
+                        let operator_id_val = Value::from_i64(operator_storage_id);
                         let zset_hash_val = zset_hash.to_value();
                         let element_id_val = element_id.to_value();
                         let blob_val = blob_value.clone();
@@ -2025,7 +2035,7 @@ impl RecomputeMinMax {
         existing_groups: &HashMap<String, AggregateState>,
         operator: &AggregateOperator,
     ) -> Self {
-        let mut groups_to_check: HashSet<(String, usize, bool)> = HashSet::new();
+        let mut groups_to_check: HashSet<(String, usize, bool)> = HashSet::default();
 
         // Remember the min_max_deltas are essentially just the only column that is affected by
         // this min/max, in delta (actually ZSet - consolidated delta) format. This makes it easier
@@ -2291,21 +2301,19 @@ impl ScanState {
             )
         })?;
 
-        let values = record.get_values();
-        if values.len() < 3 {
-            return Ok(IOResult::Done(None));
-        }
+        let mut values = record.iter()?;
 
-        let Some(rec_storage_id) = values.first() else {
+        let Some(rec_storage_id) = values.next() else {
             return Ok(IOResult::Done(None));
         };
-        let Some(rec_zset_hash) = values.get(1) else {
+
+        let Some(rec_zset_hash) = values.next() else {
             return Ok(IOResult::Done(None));
         };
 
         // Check if we're still in the same group
-        if let ValueRef::Integer(rec_sid) = rec_storage_id {
-            if *rec_sid != storage_id {
+        if let ValueRef::Numeric(Numeric::Integer(rec_sid)) = rec_storage_id? {
+            if rec_sid != storage_id {
                 return Ok(IOResult::Done(None));
             }
         } else {
@@ -2313,7 +2321,7 @@ impl ScanState {
         }
 
         // Compare zset_hash as blob
-        if let ValueRef::Blob(rec_zset_blob) = rec_zset_hash {
+        if let ValueRef::Blob(rec_zset_blob) = rec_zset_hash? {
             if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob) {
                 if rec_hash != zset_hash {
                     return Ok(IOResult::Done(None));
@@ -2325,8 +2333,13 @@ impl ScanState {
             return Ok(IOResult::Done(None));
         }
 
+        let third = values.next();
+        let Some(third) = third else {
+            return Ok(IOResult::Done(None));
+        };
+
         // Get the value (3rd element)
-        Ok(IOResult::Done(values.get(2).map(|v| v.to_owned())))
+        Ok(IOResult::Done(Some(third?.to_owned())))
     }
 
     pub fn new_for_max(
@@ -2447,7 +2460,7 @@ impl ScanState {
                 } => {
                     // Seek to the next value in the index
                     let index_key = vec![
-                        Value::Integer(*storage_id),
+                        Value::from_i64(*storage_id),
                         zset_hash.to_value(),
                         current_candidate.clone(),
                     ];
@@ -2576,7 +2589,7 @@ impl FetchDistinctState {
         is_plain_distinct: bool,
     ) -> Self {
         let mut groups_to_fetch: HashMap<String, HashMap<usize, HashSet<HashableRow>>> =
-            HashMap::new();
+            HashMap::default();
 
         for (row, _weight) in &delta.changes {
             let group_key = extract_group_key(&row.values);
@@ -2701,7 +2714,7 @@ impl FetchDistinctState {
 
                     // First, seek in the index cursor
                     let index_key = vec![
-                        Value::Integer(storage_id),
+                        Value::from_i64(storage_id),
                         zset_hash.to_value(),
                         element_id.to_value(),
                     ];
@@ -2766,14 +2779,12 @@ impl FetchDistinctState {
                     let record = return_if_io!(cursors.table_cursor.record());
 
                     if let Some(r) = record {
-                        let values = r.get_values();
-
                         // The table has 5 columns: storage_id, zset_hash, element_id, blob, weight
                         // The weight is at index 4
-                        if values.len() >= 5 {
-                            // Get the weight directly from column 4
-                            let weight = match values[4].to_owned() {
-                                Value::Integer(w) => w,
+                        if let Some(weight) = r.get_value_opt(4) {
+                            // Get the weight directly from column 5(index 4)
+                            let weight = match weight.to_owned() {
+                                Value::Numeric(Numeric::Integer(w)) => w,
                                 _ => 0,
                             };
 
@@ -2959,7 +2970,7 @@ impl DistinctPersistState {
 
                     // Create index key
                     let index_key = vec![
-                        Value::Integer(storage_id),
+                        Value::from_i64(storage_id),
                         zset_hash.to_value(),
                         element_id.to_value(),
                     ];
@@ -2973,7 +2984,7 @@ impl DistinctPersistState {
                     let weight_blob = weight_state.to_blob(&[], &[]);
 
                     let record_values = vec![
-                        Value::Integer(storage_id),
+                        Value::from_i64(storage_id),
                         zset_hash.to_value(),
                         element_id.to_value(),
                         Value::Blob(weight_blob),
@@ -3109,7 +3120,7 @@ impl MinMaxPersistState {
 
                     // Create index key
                     let index_key = vec![
-                        Value::Integer(storage_id),
+                        Value::from_i64(storage_id),
                         zset_hash.to_value(),
                         element_id_val.clone(),
                     ];
@@ -3117,7 +3128,7 @@ impl MinMaxPersistState {
                     // Record values (operator_id, zset_hash, element_id, unused_placeholder)
                     // For MIN/MAX, the element_id IS the value, so we use NULL for the 4th column
                     let record_values = vec![
-                        Value::Integer(storage_id),
+                        Value::from_i64(storage_id),
                         zset_hash.to_value(),
                         element_id_val.clone(),
                         Value::Null, // Placeholder - not used for MIN/MAX

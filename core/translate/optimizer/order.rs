@@ -1,12 +1,12 @@
 use crate::{
     translate::{
+        collate::{get_collseq_from_expr, CollationSeq},
         optimizer::access_method::AccessMethodParams,
         plan::{GroupBy, IterationDirection, JoinedTable, TableReferences},
         planner::table_mask_from_expr,
     },
     util::exprs_are_equivalent,
 };
-use std::cell::RefCell;
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::{access_method::AccessMethod, join::JoinN};
@@ -15,6 +15,7 @@ use super::{access_method::AccessMethod, join::JoinN};
 #[derive(Debug, PartialEq, Clone)]
 pub enum ColumnTarget {
     Column(usize),
+    RowId,
     /// We know that the ast lives at least as long as the Statement/Program,
     /// so we store a raw pointer here to avoid cloning yet another ast::Expr
     Expr(*const ast::Expr),
@@ -26,6 +27,7 @@ pub struct ColumnOrder {
     pub table_id: TableInternalId,
     pub target: ColumnTarget,
     pub order: SortOrder,
+    pub collation: CollationSeq,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -128,12 +130,18 @@ pub fn compute_order_target(
             // it contains all the necessary columns required for the ORDER BY, and the GROUP BY columns are now in the correct order.
             // First, however, we need to make sure the GROUP BY sorter's column sort directions match the ORDER BY requirements.
             assert!(group_by.exprs.len() >= order_by.len());
+            let sort_order = group_by
+                .sort_order
+                .as_mut()
+                .expect("GROUP BY should have a sort order before optimization is run");
             for (i, (_, order_by_dir)) in order_by.iter().enumerate() {
-                group_by
-                    .sort_order
-                    .as_mut()
-                    .expect("GROUP BY should have a sort order before optimization is run")[i] =
-                    *order_by_dir;
+                sort_order[i] = *order_by_dir;
+            }
+            // The sort_by_key above reordered group_by.exprs but not sort_order,
+            // so remaining positions may have stale values. GROUP BY columns not
+            // in ORDER BY should default to ASC (matching SQLite's tie-breaking).
+            for s in &mut sort_order[order_by.len()..] {
+                *s = SortOrder::Asc;
             }
             // Now we can remove the ORDER BY from the query.
             order_by.clear();
@@ -161,21 +169,23 @@ pub fn compute_order_target(
 /// If yes, and this plan is selected, then a sort operation can be eliminated.
 pub fn plan_satisfies_order_target(
     plan: &JoinN,
-    access_methods_arena: &RefCell<Vec<AccessMethod>>,
+    access_methods_arena: &[AccessMethod],
     joined_tables: &[JoinedTable],
     order_target: &OrderTarget,
 ) -> bool {
     let mut target_col_idx = 0;
     let num_cols_in_order_target = order_target.0.len();
     for (table_index, access_method_index) in plan.data.iter() {
-        let access_method = &access_methods_arena.borrow()[*access_method_index];
+        let access_method = &access_methods_arena[*access_method_index];
         let table_ref = &joined_tables[*table_index];
 
         // Check if this table has an access method that provides the right ordering.
         let consumed = match &access_method.params {
             AccessMethodParams::BTreeTable {
-                iter_dir, index, ..
-            } => match index {
+                iter_dir,
+                index: index_opt,
+                ..
+            } => match index_opt {
                 None => {
                     // Only rowid order is available without an index.
                     if target_col_idx >= num_cols_in_order_target {
@@ -190,14 +200,19 @@ pub fn plan_satisfies_order_target(
                         .columns()
                         .iter()
                         .position(|c| c.is_rowid_alias());
-                    let Some(rowid_alias_col) = rowid_alias_col else {
-                        return false;
-                    };
-                    if !matches!(
-                        target_col.target,
-                        ColumnTarget::Column(col_no) if col_no == rowid_alias_col
-                    ) {
-                        return false;
+                    match target_col.target {
+                        ColumnTarget::RowId => {}
+                        ColumnTarget::Column(col_no) => {
+                            let Some(rowid_alias_col) = rowid_alias_col else {
+                                return false;
+                            };
+                            if col_no != rowid_alias_col {
+                                return false;
+                            }
+                        }
+                        ColumnTarget::Expr(_) => {
+                            return false;
+                        }
                     }
                     let correct_order = if *iter_dir == IterationDirection::Forwards {
                         target_col.order == SortOrder::Asc
@@ -224,11 +239,21 @@ pub fn plan_satisfies_order_target(
                             (ColumnTarget::Expr(expr), Some(idx_expr)) => {
                                 exprs_are_equivalent(unsafe { &**expr }, idx_expr)
                             }
+                            (ColumnTarget::RowId, _) => false,
                             _ => false,
                         };
                         if !column_matches {
                             break;
                         }
+
+                        // If ORDER BY collation doesn't match index collation, this index can't satisfy the ordering
+                        if idx_col
+                            .collation
+                            .is_some_and(|idx_collation| target_col.collation != idx_collation)
+                        {
+                            break;
+                        }
+
                         let correct_order = if *iter_dir == IterationDirection::Forwards {
                             target_col.order == idx_col.order
                         } else {
@@ -261,17 +286,54 @@ fn expr_to_column_order(
     order: SortOrder,
     tables: &TableReferences,
 ) -> Option<ColumnOrder> {
-    if let ast::Expr::Column { table, column, .. } = expr {
-        return Some(ColumnOrder {
-            table_id: *table,
-            target: ColumnTarget::Column(*column),
-            order,
-        });
+    match expr {
+        ast::Expr::Column {
+            table: table_id,
+            column,
+            ..
+        } => {
+            let table = tables.find_joined_table_by_internal_id(*table_id)?;
+            let col = table.columns().get(*column)?;
+            return Some(ColumnOrder {
+                table_id: *table_id,
+                target: ColumnTarget::Column(*column),
+                order,
+                collation: col.collation(),
+            });
+        }
+        ast::Expr::Collate(expr, collation) => {
+            if let ast::Expr::Column {
+                table: table_id,
+                column,
+                ..
+            } = expr.as_ref()
+            {
+                let collation = CollationSeq::new(collation.as_str()).unwrap_or_default();
+                return Some(ColumnOrder {
+                    table_id: *table_id,
+                    target: ColumnTarget::Column(*column),
+                    order,
+                    collation,
+                });
+            };
+        }
+        ast::Expr::RowId { table, .. } => {
+            return Some(ColumnOrder {
+                table_id: *table,
+                target: ColumnTarget::RowId,
+                order,
+                collation: CollationSeq::default(),
+            });
+        }
+        _ => {}
     }
     let mask = table_mask_from_expr(expr, tables, &[]).ok()?;
     if mask.table_count() != 1 {
         return None;
     }
+    let collation = get_collseq_from_expr(expr, tables)
+        .ok()?
+        .unwrap_or_default();
     let table_no = tables
         .joined_tables()
         .iter()
@@ -282,5 +344,6 @@ fn expr_to_column_order(
         table_id,
         target: ColumnTarget::Expr(expr as *const ast::Expr),
         order,
+        collation,
     })
 }

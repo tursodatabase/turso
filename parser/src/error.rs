@@ -105,4 +105,6 @@ pub enum Error {
     // Custom error message
     #[error("{0}")]
     Custom(String),
+    #[error("Parse error: {0}")]
+    ParseError(String),
 }

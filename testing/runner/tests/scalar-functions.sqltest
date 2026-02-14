@@ -1,0 +1,2059 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test concat-chars {
+    select concat('l', 'i');
+}
+expect {
+    li
+}
+
+test concat-char-and-number {
+    select concat('l', 1);
+}
+expect {
+    l1
+}
+
+test concat-char-and-decimal {
+    select concat('l', 1.5);
+}
+expect {
+    l1.5
+}
+
+test concat-char-null-char {
+    select concat('l', null, 'i');
+}
+expect {
+    li
+}
+
+test concat_ws-numbers {
+    select concat_ws(',', 1, 2);
+}
+expect {
+    1,2
+}
+
+test concat_ws-single-number {
+    select concat_ws(',', 1);
+}
+expect {
+    1
+}
+
+test concat_ws-null {
+    select concat_ws(null, 1, 2);
+}
+expect {
+}
+
+test concat_ws-multiple {
+    select concat_ws(',', 1, 2), concat_ws(',', 3, 4)
+}
+expect {
+    1,2|3,4
+}
+
+test concat_ws-complex-args {
+    select concat_ws(',', 'a' || 'b', 'b' || 'c', 'c' || 'd');
+}
+expect {
+    ab,bc,cd
+}
+
+# Regression test: CONCAT with complex first argument that allocates internal registers
+test concat-complex-first-arg {
+    select concat((1 IN (2,3)), 'hello', 'world')
+}
+expect {
+    0helloworld
+}
+
+test abs {
+    select abs(1);
+}
+expect {
+    1
+}
+
+test abs-negative {
+    select abs(-1);
+}
+expect {
+    1
+}
+
+test abs-char {
+    select abs('a');
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test abs-null {
+    select abs(null);
+}
+expect {
+}
+
+test ifnull-1 {
+    select ifnull(1, 2);
+}
+expect {
+    1
+}
+
+test ifnull-2 {
+    select ifnull(null, 2);
+}
+expect {
+    2
+}
+
+test iif-true {
+    select iif(1, 'pass', 'fail');
+}
+expect {
+    pass
+}
+
+test iif-false {
+    select iif(0, 'fail', 'pass');
+}
+expect {
+    pass
+}
+
+test instr-str {
+    select instr('limbo', 'im');
+}
+expect {
+    2
+}
+
+test instr-str-not-found {
+    select instr('limbo', 'xyz');
+}
+expect {
+    0
+}
+
+test instr-blob {
+    select instr(x'000102', x'01');
+}
+expect {
+    2
+}
+
+test instr-blob-not-found {
+    select instr(x'000102', x'10');
+}
+expect {
+    0
+}
+
+test instr-null {
+    select instr(null, 'limbo');
+}
+expect {
+}
+
+test instr-integer {
+    select instr(123, 2);
+}
+expect {
+    2
+}
+
+test instr-integer-not-found {
+    select instr(123, 5);
+}
+expect {
+    0
+}
+
+test instr-integer-leading-zeros {
+    select instr(0001, 0);
+}
+expect {
+    0
+}
+
+test instr-real {
+    select instr(12.34, 2.3);
+}
+expect {
+    2
+}
+
+test instr-real-not-found {
+    select instr(12.34, 5);
+}
+expect {
+    0
+}
+
+test instr-real-trailing-zeros {
+    select instr(1.10000, 0);
+}
+expect {
+    0
+}
+
+test instr-blob-2 {
+    select instr(x'01020304', x'02');
+}
+expect {
+    2
+}
+
+test instr-blob-not-found-2 {
+    select instr(x'01020304', x'05');
+}
+expect {
+    0
+}
+
+test upper {
+    select upper('Limbo')
+}
+expect {
+    LIMBO
+}
+
+test upper-number {
+    select upper(1)
+}
+expect {
+    1
+}
+
+test upper-char {
+    select upper('a')
+}
+expect {
+    A
+}
+
+test upper-null {
+    select upper(null)
+}
+expect {
+}
+
+test lower {
+    select lower('Limbo')
+}
+expect {
+    limbo
+}
+
+test lower-number {
+    select lower(1)
+}
+expect {
+    1
+}
+
+test lower-char {
+    select lower('A')
+}
+expect {
+    a
+}
+
+test lower-null {
+    select lower(null)
+}
+expect {
+}
+
+test replace {
+    select replace('test', 'test', 'example')
+}
+expect {
+    example
+}
+
+test replace-number {
+    select replace('tes3', 3, 0.3)
+}
+expect {
+    tes0.3
+}
+
+test replace-null {
+    select replace('test', null, 'example')
+}
+expect {
+}
+
+test replace-wrong-arg-count-0 {
+    select replace()
+}
+expect error {
+    wrong number of arguments to function replace()
+}
+
+test replace-wrong-arg-count-2 {
+    select replace('a', 'b')
+}
+expect error {
+    wrong number of arguments to function replace()
+}
+
+test replace-wrong-arg-count-4 {
+    select replace('a', 'b', 'c', 'd')
+}
+expect error {
+    wrong number of arguments to function replace()
+}
+
+test replace-null-byte-pattern {
+    select replace('hello', char(0), 'world');
+}
+expect {
+    hello
+}
+
+test replace-null-byte-prefix {
+    select replace('hello', char(0) || 'e', 'world');
+}
+expect {
+    hello
+}
+
+test hex {
+    select hex('limbo')
+}
+expect {
+    6C696D626F
+}
+
+test hex-number {
+    select hex(100)
+}
+expect {
+    313030
+}
+
+test hex-null {
+    select hex(null)
+}
+expect {
+}
+
+test likely {
+    select likely('limbo')
+}
+expect {
+    limbo
+}
+
+test likely-int {
+    select likely(100)
+}
+expect {
+    100
+}
+
+test likely-decimal {
+    select likely(12.34)
+}
+expect {
+    12.34
+}
+
+test likely-null {
+    select likely(NULL)
+}
+expect {
+}
+
+test likelihood-string {
+    SELECT likelihood('limbo', 0.5);
+}
+expect {
+    limbo
+}
+
+test likelihood-string-high-probability {
+    SELECT likelihood('database', 0.9375);
+}
+expect {
+    database
+}
+
+test likelihood-integer {
+    SELECT likelihood(100, 0.0625);
+}
+expect {
+    100
+}
+
+test likelihood-integer-probability-1 {
+    SELECT likelihood(42, 1.0);
+}
+expect {
+    42
+}
+
+test likelihood-decimal {
+    SELECT likelihood(12.34, 0.5);
+}
+expect {
+    12.34
+}
+
+test likelihood-null {
+    SELECT likelihood(NULL, 0.5);
+}
+expect {
+}
+
+test likelihood-blob {
+    SELECT hex(likelihood(x'01020304', 0.5));
+}
+expect {
+    01020304
+}
+
+test likelihood-zero-probability {
+    SELECT likelihood(999, 0.0);
+}
+expect {
+    999
+}
+
+test unhex-str-ab {
+    SELECT unhex('6162');
+}
+expect {
+    ab
+}
+
+test unhex-int-ab {
+    SELECT unhex(6162);
+}
+expect {
+    ab
+}
+
+test unhex-dot-uppercase {
+    SELECT unhex('2E');
+}
+expect {
+    .
+}
+
+test unhex-dot-lowercase {
+    SELECT unhex('2e');
+}
+expect {
+    .
+}
+
+test unhex-no-hex {
+    SELECT unhex('x');
+}
+expect {
+}
+
+test unhex-null {
+    SELECT unhex(NULL);
+}
+expect {
+}
+
+test unhex-x-y-prefix {
+    SELECT unhex('x2E', 'x');
+}
+expect {
+    .
+}
+
+test unhex-x-y-suffix {
+    SELECT unhex('2Ex', 'x');
+}
+expect {
+    .
+}
+
+test unhex-x-y-prefix-suffix {
+    SELECT unhex('x2Ex', 'x');
+}
+expect {
+    .
+}
+
+test unhex-x-y-incorrect-suffix {
+    SELECT unhex('x2Ey', 'x');
+}
+expect {
+}
+
+test unhex-x-y-long-prefix {
+    SELECT unhex('xyz2E', 'xyz');
+}
+expect {
+    .
+}
+
+test unhex-x-y-shorter-suffix {
+    SELECT unhex('xyz2Exy', 'xyz');
+}
+expect {
+    .
+}
+
+test unhex-x-y-shorter-prefix {
+    SELECT unhex('xy2Exyz', 'xyz');
+}
+expect {
+    .
+}
+
+test unhex-x-y-random-order {
+    SELECT unhex('yx2Ezyx', 'xyz');
+}
+expect {
+    .
+}
+
+test unhex-x-y-char-in-the-middle {
+    SELECT unhex('yx2xEzyx', 'xyz');
+}
+expect {
+}
+
+test unhex-x-y-character-outside-set {
+    SELECT unhex('yxn2Ezyx', 'xyz');
+}
+expect {
+}
+
+test trim {
+    SELECT trim('   Limbo    ');
+}
+expect {
+    Limbo
+}
+
+test trim-number {
+    SELECT trim(1);
+}
+expect {
+    1
+}
+
+test trim-null {
+    SELECT trim(null);
+}
+expect {
+}
+
+test trim-leading-whitespace {
+    SELECT trim('   Leading');
+}
+expect {
+    Leading
+}
+
+test trim-trailing-whitespace {
+    SELECT trim('Trailing   ');
+}
+expect {
+    Trailing
+}
+
+test trim-pattern {
+    SELECT trim('Limbo', 'Limbo');
+}
+expect {
+}
+
+test trim-pattern-number {
+    SELECT trim(1, '1');
+}
+expect {
+}
+
+test trim-pattern-null {
+    SELECT trim(null, 'null');
+}
+expect {
+}
+
+test trim-pattern-null-2 {
+    SELECT trim('abc', NULL);
+}
+expect {
+}
+
+test trim-no-match-pattern {
+    SELECT trim('Limbo', 'xyz');
+}
+expect {
+    Limbo
+}
+
+test ltrim {
+    SELECT ltrim('   Limbo    ');
+}
+expect raw {
+Limbo    
+}
+
+test ltrim-number {
+    SELECT ltrim(1);
+}
+expect {
+    1
+}
+
+test ltrim-null {
+    SELECT ltrim(null);
+}
+expect {
+}
+
+test ltrim-leading-whitespace {
+    SELECT ltrim('   Leading');
+}
+expect {
+    Leading
+}
+
+test ltrim-no-leading-whitespace {
+    SELECT ltrim('Limbo');
+}
+expect {
+    Limbo
+}
+
+test ltrim-pattern {
+    SELECT ltrim('Limbo', 'Limbo');
+}
+expect {
+}
+
+test ltrim-pattern-number {
+    SELECT ltrim(1, '1');
+}
+expect {
+}
+
+test ltrim-pattern-null {
+    SELECT ltrim(null, 'null');
+}
+expect {
+}
+
+test ltrim-no-match-pattern {
+    SELECT ltrim('Limbo', 'xyz');
+}
+expect {
+    Limbo
+}
+
+test rtrim {
+    SELECT rtrim('   Limbo    ');
+}
+expect raw {
+   Limbo
+}
+
+test rtrim-number {
+    SELECT rtrim(1);
+}
+expect {
+    1
+}
+
+test rtrim-null {
+    SELECT rtrim(null);
+}
+expect {
+}
+
+test rtrim-trailing-whitespace {
+    SELECT rtrim('Trailing   ');
+}
+expect {
+    Trailing
+}
+
+test rtrim-no-trailing-whitespace {
+    SELECT rtrim('Limbo');
+}
+expect {
+    Limbo
+}
+
+test rtrim-pattern {
+    SELECT rtrim('Limbo', 'Limbo');
+}
+expect {
+}
+
+test rtrim-pattern-number {
+    SELECT rtrim(1, '1');
+}
+expect {
+}
+
+test rtrim-pattern-null {
+    SELECT rtrim(null, 'null');
+}
+expect {
+}
+
+test rtrim-no-match-pattern {
+    SELECT rtrim('Limbo', 'xyz');
+}
+expect {
+    Limbo
+}
+
+# TRIM always returns TEXT, even for numeric inputs.
+# This is important for expression indexes that use TRIM on numeric columns.
+test trim-integer-returns-text {
+    SELECT typeof(trim(42));
+}
+expect {
+    text
+}
+
+test trim-float-returns-text {
+    SELECT typeof(trim(3.14));
+}
+expect {
+    text
+}
+
+test ltrim-integer-returns-text {
+    SELECT typeof(ltrim(42));
+}
+expect {
+    text
+}
+
+test rtrim-integer-returns-text {
+    SELECT typeof(rtrim(42));
+}
+expect {
+    text
+}
+
+test trim-integer-with-pattern-returns-text {
+    SELECT typeof(trim(123, '1'));
+}
+expect {
+    text
+}
+
+test round-float-no-precision {
+    SELECT round(123.456);
+}
+expect {
+    123.0
+}
+expect @js {
+    123
+}
+
+test round-float-with-precision {
+    SELECT round(123.456, 2);
+}
+expect {
+    123.46
+}
+
+test round-float-with-text-precision {
+    SELECT round(123.5, '1');
+}
+expect {
+    123.5
+}
+
+test round-text-parsable {
+    SELECT round('123.456', 2);
+}
+expect {
+    123.46
+}
+
+test round-text-non-parsable {
+    SELECT round('abc', 1);
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test round-integer-with-precision {
+    SELECT round(123, 1);
+}
+expect {
+    123.0
+}
+expect @js {
+    123
+}
+
+test round-float-negative-precision {
+    SELECT round(123.456, -1);
+}
+expect {
+    123.0
+}
+expect @js {
+    123
+}
+
+test round-float-zero-precision {
+    SELECT round(123.456, 0);
+}
+expect {
+    123.0
+}
+expect @js {
+    123
+}
+
+test round-null-precision {
+    SELECT round(123.456, null);
+}
+expect {
+}
+
+test length-text {
+    SELECT length('limbo');
+}
+expect {
+    5
+}
+
+test length-text-utf8-chars {
+    SELECT length('ąłóżźć');
+}
+expect {
+    6
+}
+
+test length-integer {
+    SELECT length(12345);
+}
+expect {
+    5
+}
+
+test length-float {
+    SELECT length(123.456);
+}
+expect {
+    7
+}
+
+test length-null {
+    SELECT length(NULL);
+}
+expect {
+}
+
+test length-empty-text {
+    SELECT length('');
+}
+expect {
+    0
+}
+
+test octet-length-text {
+    SELECT length('limbo');
+}
+expect {
+    5
+}
+
+test octet-length-text-utf8-chars {
+    SELECT octet_length('ąłóżźć');
+}
+expect {
+    12
+}
+
+test octet-length-integer {
+    SELECT octet_length(12345);
+}
+expect {
+    5
+}
+
+test octet-length-float {
+    SELECT octet_length(123.456);
+}
+expect {
+    7
+}
+
+test octet-length-null {
+    SELECT octet_length(NULL);
+}
+expect {
+}
+
+test octet-length-empty-text {
+    SELECT octet_length('');
+}
+expect {
+    0
+}
+
+test octet-length-date-binary-expr {
+    select octet_length(date('now')) = 10;
+}
+expect {
+    1
+}
+
+test min-number {
+    select min(-10,2,3,+4)
+}
+expect {
+    -10
+}
+
+test min-str {
+    select min('b','a','z')
+}
+expect {
+    a
+}
+
+test min-str-number {
+    select min('42',100)
+}
+expect {
+    100
+}
+
+test min-blob-number {
+    select min(3.14,x'616263')
+}
+expect {
+    3.14
+}
+
+test max-str-number {
+    select max('42',100)
+}
+expect {
+    42
+}
+
+test max-blob-number {
+    select max(3.14,x'616263')
+}
+expect {
+    abc
+}
+
+test min-null {
+    select min(null,null)
+}
+expect {
+}
+
+# SQLite: multi-arg min/max returns NULL if ANY argument is NULL
+test min-with-null {
+    select min(1, null)
+}
+expect {
+}
+
+test max-number {
+    select max(-10,2,3)
+}
+expect {
+    3
+}
+
+test max-str {
+    select max('b','a','z')
+}
+expect {
+    z
+}
+
+test min-int-float {
+    select min(1,5.0)
+}
+expect {
+    1
+}
+
+test max-int-float {
+    select max(1,5.0)
+}
+expect {
+    5.0
+}
+expect @js {
+    5
+}
+
+test min-float-int {
+    select min(5.0,1)
+}
+expect {
+    1
+}
+
+test max-null {
+    select max(null,null)
+}
+expect {
+}
+
+test max-with-null {
+    select max(1, null)
+}
+expect {
+}
+
+test nullif {
+    select nullif(1, 2)
+}
+expect {
+    1
+}
+
+test nullif-2 {
+    select nullif(1, 1)
+}
+expect {
+}
+
+test nullif-3 {
+    select nullif('limbo', 'limbo')
+}
+expect {
+}
+
+# Regression test: NULLIF with complex first argument that allocates internal registers
+test nullif-complex-first-arg {
+    select nullif((1 IN (2,3)), 5)
+}
+expect {
+    0
+}
+
+test substr-3-args {
+    SELECT substr('limbo', 1, 3);
+}
+expect {
+    lim
+}
+
+test substr-3-args-exceed-length {
+    SELECT substr('limbo', 1, 10);
+}
+expect {
+    limbo
+}
+
+test substr-3-args-start-exceed-length {
+    SELECT substr('limbo', 10, 3);
+}
+expect {
+}
+
+test substr-2-args {
+    SELECT substr('limbo', 3);
+}
+expect {
+    mbo
+}
+
+test substr-cases {
+    SELECT substr('limbo', 0);
+    SELECT substr('limbo', 0, 3);
+    SELECT substr('limbo', -2);
+    SELECT substr('limbo', -2, 1);
+    SELECT substr('limbo', -10, 7);
+    SELECT substr('limbo', 10, -7);
+}
+expect {
+    limbo
+    li
+    bo
+    b
+    li
+    mbo
+}
+
+test substring-3-args {
+    SELECT substring('limbo', 1, 3);
+}
+expect {
+    lim
+}
+
+test substring-3-args-exceed-length {
+    SELECT substring('limbo', 1, 10);
+}
+expect {
+    limbo
+}
+
+test substring-3-args-start-exceed-length {
+    SELECT substring('limbo', 10, 3);
+}
+expect {
+}
+
+test substring-2-args {
+    SELECT substring('limbo', 3);
+}
+expect {
+    mbo
+}
+
+test substring-2-args-exceed-length {
+    SELECT substring('limbo', 10);
+}
+expect {
+}
+
+test substring-with-blob {
+    select substr(x'446F6E7450616E696321', 0);
+}
+expect {
+    DontPanic!
+}
+
+test substring-with-blob-size {
+    select substr(x'446F6E7450616E696321', 5, 6);
+}
+expect {
+    Panic!
+}
+
+# https://github.com/tursodatabase/turso/issues/3306
+test substring-with-blob-sanity {
+    with t as (select hex(substr(x'414243',2,1)) as slice) select slice, typeof(slice), length(slice) from t;
+}
+expect {
+    42|text|2
+}
+
+test substring-with-numbers {
+    select substr(12345678987654, 5, 6);
+}
+expect {
+    567898
+}
+
+test substring-with-numbers-2 {
+    select substr(12345678987654, 0);
+}
+expect {
+    12345678987654
+}
+
+test substring-emoji-1 {
+    SELECT substr('😁😅', 1, 1);
+}
+expect {
+    😁
+}
+
+test substring-emoji-2 {
+    SELECT substr('😁😅', 1, 2);
+}
+expect {
+    😁😅
+}
+
+test substring-emoji-3 {
+    SELECT substr('😁😅', 1);
+}
+expect {
+    😁😅
+}
+
+test substring-utf8-emoji-1 {
+    SELECT substr('a😁ã😅', 2, 1);
+}
+expect {
+    😁
+}
+
+test substring-utf8-emoji-2 {
+    SELECT substr('a😁ã😅', 2, 2);
+}
+expect {
+    😁ã
+}
+
+test substring-utf8-emoji-3 {
+    SELECT substr('a😁ã😅', 2, 3);
+}
+expect {
+    😁ã😅
+}
+
+test substr-null-length-returns-null {
+    SELECT substr('hello', 2, NULL), typeof(substr('hello', 2, NULL));
+}
+expect {
+    |null
+}
+
+test typeof-null {
+    SELECT typeof(null);
+}
+expect {
+    null
+}
+
+test typeof-null-case {
+    SELECT typeof(nuLL);
+}
+expect {
+    null
+}
+
+test typeof-text {
+    SELECT typeof('hello');
+}
+expect {
+    text
+}
+
+test typeof-text-empty {
+    SELECT typeof('');
+}
+expect {
+    text
+}
+
+test typeof-integer {
+    SELECT typeof(123);
+}
+expect {
+    integer
+}
+
+test typeof-real {
+    SELECT typeof(1.0);
+}
+expect {
+    real
+}
+
+test typeof-blob {
+    SELECT typeof(x'61');
+}
+expect {
+    blob
+}
+
+test typeof-blob-empty {
+    SELECT typeof(x'');
+}
+expect {
+    blob
+}
+
+test typeof-sum-integer {
+    SELECT typeof(sum(age)) from users;
+}
+expect {
+    integer
+}
+
+test typeof-sum-real {
+    SELECT typeof(sum(price)) from products;
+}
+expect {
+    real
+}
+
+test typeof-group_concat {
+    SELECT typeof(group_concat(name)) from products;
+}
+expect {
+    text
+}
+
+test unicode-a {
+    SELECT unicode('a');
+}
+expect {
+    97
+}
+
+test unicode-emoji {
+    SELECT unicode('😊');
+}
+expect {
+    128522
+}
+
+test unicode-empty {
+    SELECT unicode('');
+}
+expect {
+}
+
+test unicode-number {
+    SELECT unicode(23);
+}
+expect {
+    50
+}
+
+test unicode-float {
+    SELECT unicode(23.45);
+}
+expect {
+    50
+}
+
+test unicode-null {
+    SELECT unicode(NULL);
+}
+expect {
+}
+
+test quote-string-embedded-nul {
+    SELECT quote(concat('abc', char(0), 'def'))
+}
+expect {
+    'abc'
+}
+
+test quote-string {
+    SELECT quote('limbo')
+}
+expect {
+    'limbo'
+}
+
+test quote-escape {
+    SELECT quote('''quote''')
+}
+expect {
+    '''quote'''
+}
+
+test quote-null {
+    SELECT quote(null)
+}
+expect {
+    NULL
+}
+
+test quote-integer {
+    SELECT quote(123)
+}
+expect {
+    123
+}
+
+# Regression: QUOTE() should return TEXT type for integers, not INTEGER
+test quote-integer-typeof {
+    SELECT typeof(quote(123))
+}
+expect {
+    text
+}
+
+test quote-negative-integer {
+    SELECT quote(-4755622169394918639)
+}
+expect {
+    -4755622169394918639
+}
+
+test quote-float {
+    SELECT quote(12.34)
+}
+expect {
+    12.34
+}
+
+# Regression from differential fuzzer seed 17161292163153366865:
+# QUOTE(REAL) must use SQLite's canonical float text format.
+test quote-float-scientific-format {
+    SELECT quote(CAST('2.042747795102219097e+05' AS REAL))
+}
+expect {
+    2.042747795102219097e+05
+}
+
+# Regression: QUOTE() should return TEXT type for floats, not REAL
+test quote-float-typeof {
+    SELECT typeof(quote(12.34))
+}
+expect {
+    text
+}
+
+test sign-positive-integer {
+    SELECT sign(42);
+}
+expect {
+    1
+}
+
+test sign-negative-integer {
+    SELECT sign(-42);
+}
+expect {
+    -1
+}
+
+test sign-zero {
+    SELECT sign(0);
+}
+expect {
+    0
+}
+
+test sign-positive-float {
+    SELECT sign(42.0);
+}
+expect {
+    1
+}
+
+test sign-negative-float {
+    SELECT sign(-42.0);
+}
+expect {
+    -1
+}
+
+test sign-zero-float {
+    SELECT sign(0.0);
+}
+expect {
+    0
+}
+
+test sign-text-positive-integer {
+    SELECT sign('42');
+}
+expect {
+    1
+}
+
+test sign-text-negative-integer {
+    SELECT sign('-42');
+}
+expect {
+    -1
+}
+
+test sign-text-zero {
+    SELECT sign('0');
+}
+expect {
+    0
+}
+
+test sign-text-non-numeric {
+    SELECT sign('abc');
+}
+expect {
+}
+
+test sign-null {
+    SELECT sign(NULL);
+}
+expect {
+}
+
+test randomblob-int-2 {
+    SELECT length(randomblob(2));
+}
+expect {
+    2
+}
+
+test randomblob-int-0 {
+    SELECT length(randomblob(0));
+}
+expect {
+    1
+}
+
+test randomblob-int-negative {
+    SELECT length(randomblob(-2));
+}
+expect {
+    1
+}
+
+test randomblob-str-2 {
+    SELECT length(randomblob('2'));
+}
+expect {
+    2
+}
+
+test zeroblob-int-0 {
+    SELECT zeroblob(0) = x'';
+}
+expect {
+    1
+}
+
+test zeroblob-int-1 {
+    SELECT zeroblob(1) = x'00';
+}
+expect {
+    1
+}
+
+test zeroblob-str-3 {
+    SELECT zeroblob('3') = x'000000';
+}
+expect {
+    1
+}
+
+test zeroblob-str-a {
+    SELECT zeroblob('a') = x'';
+}
+expect {
+    1
+}
+
+test zeroblob-blob {
+    SELECT zeroblob(x'01') = x'';
+}
+expect {
+    1
+}
+
+# CAST tests - INTEGER affinity
+test cast-text-to-integer {
+    SELECT CAST('123' AS INTEGER);
+}
+expect {
+    123
+}
+
+test cast-text-with-spaces-to-integer {
+    SELECT CAST('  123  ' AS INTEGER);
+}
+expect {
+    123
+}
+
+test cast-text-with-trailing-junk-to-integer {
+    SELECT CAST('1abc' AS INTEGER);
+}
+expect {
+    1
+}
+
+test cast-invalid-text-to-integer {
+    SELECT CAST('abc' AS INTEGER);
+}
+expect {
+    0
+}
+
+test cast-text-prefix-to-integer {
+    SELECT CAST('123abc' AS INTEGER);
+}
+expect {
+    123
+}
+
+test cast-float-to-integer {
+    SELECT CAST(123.45 AS INTEGER);
+}
+expect {
+    123
+}
+
+test cast-float-to-integer-rounding {
+    SELECT CAST(0.6 AS INTEGER);
+    SELECT CAST(1.0 AS INTEGER);
+    SELECT CAST(1.6 AS INTEGER);
+    SELECT CAST(-0.6 AS INTEGER);
+    SELECT CAST(-1.0 AS INTEGER);
+    SELECT CAST(-1.6 AS INTEGER);
+}
+expect {
+    0
+    1
+    1
+    0
+    -1
+    -1
+}
+
+test cast-large-float-to-integer {
+    SELECT CAST(9223372036854775808.0 AS INTEGER);
+}
+expect {
+    9223372036854775807
+}
+
+test cast-small-float-to-integer {
+    SELECT CAST(-9223372036854775809.0 AS INTEGER);
+}
+expect {
+    -9223372036854775808
+}
+
+test cast-large-text-to-integer {
+    SELECT CAST('9223372036854775808' AS INTEGER);
+}
+expect {
+    9223372036854775807
+}
+
+test cast-text-exp-to-integer {
+    SELECT CAST('123e+5' AS INTEGER);
+}
+expect {
+    123
+}
+
+# CAST tests - REAL affinity
+test cast-text-to-real {
+    SELECT CAST('123.45' AS REAL);
+}
+expect {
+    123.45
+}
+
+test cast-text-with-spaces-to-real {
+    SELECT CAST('  123.45  ' AS REAL);
+}
+expect {
+    123.45
+}
+
+test cast-invalid-text-to-real {
+    SELECT CAST('abc' AS REAL);
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test cast-text-prefix-to-real {
+    SELECT CAST('123.45abc' AS REAL);
+}
+expect {
+    123.45
+}
+
+test cast-integer-to-real {
+    SELECT CAST(123 AS REAL);
+}
+expect {
+    123.0
+}
+expect @js {
+    123
+}
+
+# CAST tests - TEXT affinity
+test cast-integer-to-text {
+    SELECT CAST(123 AS TEXT);
+}
+expect {
+    123
+}
+
+test cast-real-to-text {
+    SELECT CAST(123.45 AS TEXT);
+}
+expect {
+    123.45
+}
+
+test cast-blob-to-text {
+    SELECT CAST(x'68656C6C6F' AS TEXT);
+}
+expect {
+    hello
+}
+
+# CAST tests - BLOB affinity
+# not really a great test since it gets converted back to string for the output anyway...
+test cast-text-to-blob {
+    SELECT hex(CAST('hello' AS BLOB));
+}
+expect {
+    68656C6C6F
+}
+
+test cast-integer-to-blob {
+    SELECT hex(CAST(123 AS BLOB));
+}
+expect {
+    313233
+}
+
+# CAST tests - NUMERIC affinity
+test cast-integer-text-to-numeric {
+    SELECT typeof(CAST('123' AS NUMERIC)), CAST('123' AS NUMERIC);
+}
+expect {
+    integer|123
+}
+
+test cast-float-text-to-numeric {
+    SELECT typeof(CAST('123.45' AS NUMERIC)), CAST('123.45' AS NUMERIC);
+}
+expect {
+    real|123.45
+}
+
+test cast-small-float-to-numeric {
+    SELECT typeof(CAST('1.23' AS NUMERIC)), CAST('1.23' AS NUMERIC);
+}
+expect {
+    real|1.23
+}
+
+test cast-signed-edgecase-int-to-numeric {
+    SELECT typeof(CAST('-1230-23.40e24' AS NUMERIC)), CAST('-1230-23.40e24' AS NUMERIC);
+}
+expect {
+    integer|-1230
+}
+
+test cast-edgecase-int-to-numeric {
+    SELECT typeof(CAST('1230-23.40e24' AS NUMERIC)), CAST('1230-23.40e24' AS NUMERIC);
+}
+expect {
+    integer|1230
+}
+
+test cast-edgecase-int-to-numeric-2 {
+    SELECT typeof(CAST('123023.4024' AS NUMERIC)), CAST('123023.4024' AS NUMERIC);
+}
+expect {
+    real|123023.4024
+}
+
+test sqlite-version-should-return-valid-output {
+    SELECT sqlite_version();
+}
+expect pattern {
+    \d+\.\d+\.\d+
+}
+
+test cast-large-text-to-numeric {
+    SELECT typeof(CAST('9223372036854775808' AS NUMERIC)), CAST('9223372036854775808' AS NUMERIC);
+}
+expect {
+    real|9.22337203685478e+18
+}
+expect @js {
+    real|9223372036854780000
+}
+
+test cast-max-i64-text-to-numeric {
+    SELECT CAST('9223372036854775807' AS NUMERIC);
+}
+expect {
+    9223372036854775807
+}
+
+test cast-negative-large-text-to-numeric {
+    SELECT CAST('-9223372036854775809' AS NUMERIC);
+}
+expect {
+    -9.22337203685478e+18
+}
+expect @js {
+    -9223372036854780000
+}
+
+test cast-null-to-any {
+    SELECT CAST(NULL AS INTEGER), CAST(NULL AS TEXT), CAST(NULL AS BLOB), CAST(NULL AS REAL), CAST(NULL AS NUMERIC);
+}
+expect {
+    ||||
+}
+
+# CAST without type name - SQLite treats this as NUMERIC affinity
+# https://github.com/tursodatabase/turso/issues/4550
+test cast-without-type-integer {
+    SELECT CAST(1 AS);
+}
+expect {
+    1
+}
+
+test cast-without-type-text-numeric {
+    SELECT CAST('hello' AS);
+}
+expect {
+    0
+}
+
+test cast-without-type-text-integer-string {
+    SELECT CAST('123' AS);
+}
+expect {
+    123
+}
+
+test cast-without-type-text-real-string {
+    SELECT typeof(CAST('123.45' AS)), CAST('123.45' AS);
+}
+expect {
+    real|123.45
+}
+
+test cast-without-type-null {
+    SELECT CAST(NULL AS);
+}
+expect {
+}
+
+test cast-without-type-in-expression {
+    SELECT 1 WHERE CAST(1 AS) = 1;
+}
+expect {
+    1
+}
+
+# CAST smoke test in where clause
+test cast-in-where {
+    select age from users where age = cast('45' as integer) limit 1;
+}
+expect {
+    45
+}
+
+#Parsing test for large numeric strings in logical operations with numeric operands
+test parse-large-integral-numeric-string-as-number {
+    SELECT (104614899632619 || 45597) > CAST(0 AS NUMERIC);
+}
+expect {
+    1
+}
+
+test parse-large-integral-numeric-string-as-number-2 {
+    SELECT (-104614899632619 || 45597) > CAST(0 AS NUMERIC);
+}
+expect {
+    0
+}
+
+# https://github.com/tursodatabase/turso/issues/3317
+test length-999123 {
+    select length('a' || char(0) || 'b');
+}
+expect {
+    1
+}
+
+# refer https://github.com/tursodatabase/turso/issues/3285
+test sum-1 {
+    select sum('1'+'2');
+}
+expect {
+    3
+}
+
+test sum-2 {
+    select sum('a1'+'a2');
+}
+expect {
+    0
+}
+
+test sum-3 {
+    select sum('11a'+'21a2');
+}
+expect {
+    32
+}
+
+test sum-4 {
+    select sum('?.a'+'a2');
+}
+expect {
+    0
+}
+
+test sum-5 {
+    select sum('1*2a'+'a2');
+}
+expect {
+    1
+}
+
+test sum-6 {
+    select sum('1+2a'+'a2');
+}
+expect {
+    1
+}
+
+test sum-7 {
+    select sum('1-2a'+'a2');
+}
+expect {
+    1
+}
+
+test sum-8 {
+    select sum('1.2a'+'a2');
+}
+expect {
+    1.2
+}
+
+# https://github.com/tursodatabase/turso/issues/3689
+test iif-3-args-true {
+    select iif(1 < 2, 'yes', 'no');
+}
+expect {
+    yes
+}
+
+test iif-3-args-false {
+    select iif(1 > 2, 'yes', 'no');
+}
+expect {
+    no
+}
+
+test iif-2-args-true {
+    select iif(1 < 2, 'yes');
+}
+expect {
+    yes
+}
+
+test iif-2-args-false-is-null {
+    select iif(1 > 2, 'yes');
+}
+expect {
+}
+
+test iif-multi-args-finds-first-true {
+    select iif(0, 'a', 1, 'b', 2, 'c', 'default');
+}
+expect {
+    b
+}
+
+test iif-multi-args-falls-to-else {
+    select iif(0, 'a', 0, 'b', 0, 'c', 'default');
+}
+expect {
+    default
+}
+
+test if-alias-3-args-true {
+    select if(1 < 2, 'yes', 'no');
+}
+expect {
+    yes
+}
+
+test if-alias-3-args-false {
+    select if(1 > 2, 'yes', 'no');
+}
+expect {
+    no
+}
+
+test if-alias-2-args-true {
+    select if(1 < 2, 'ok');
+}
+expect {
+    ok
+}
+
+test if-alias-multi-args-finds-first-true {
+    select if(0, 'a', 1, 'b', 'c');
+}
+expect {
+    b
+}
+
+test if-alias-multi-args-falls-to-else {
+    select if(0, 'a', 0, 'b', 'c');
+}
+expect {
+    c
+}
+
+test if-alias-multi-args-no-else-is-null {
+    select if(0, 'a', 0, 'b');
+}
+expect {
+}
+
+test replace-test-zeroblob-quote {
+    select replace(substr(quote(zeroblob((6 + 1) / 2)), 3, 6), '0', 'a');
+}
+expect {
+    aaaaaa
+}
+
+test replace-test-zeroblob-quote-2 {
+    select quote(0xf7b);
+}
+expect {
+    3963
+}
+
+# regression test for https://github.com/tursodatabase/turso/issues/5122
+@skip-if sqlite "different error message"
+test uuid-str-empty {
+		select uuid_str();
+}
+expect error {
+	wrong number of arguments to function uuid_str()
+}
+
+# regression test for https://github.com/tursodatabase/turso/issues/5122
+@skip-if sqlite "different error message"
+test uuid-blob-empty {
+	select uuid_blob();
+}
+expect error {
+	wrong number of arguments to function uuid_blob()
+}
+
+# regression test for https://github.com/tursodatabase/turso/issues/5122
+@skip-if sqlite "different error message"
+test uuid7-timestamp-ms-empty {
+	select uuid7_timestamp_ms();
+}
+expect error {
+	wrong number of arguments to function uuid7_timestamp_ms()
+}
+
+# TODO: sqlite seems not enable soundex() by default unless build it with SQLITE_SOUNDEX enabled.
+# do_execsql_test soundex-text {
+#  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
+# } {P236|H210|T522|A261|R163|R163|R150|K530|K530|X000|0000}

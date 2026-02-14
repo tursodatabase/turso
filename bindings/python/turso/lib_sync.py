@@ -22,7 +22,11 @@ from ._turso import (
     PyTursoSyncIoItemRequestKind,
     py_turso_sync_new,
 )
+from ._turso import (
+    PyRemoteEncryptionCipher as RemoteEncryptionCipher,
+)
 from .lib import Connection as _Connection
+from .lib import _map_turso_exception
 
 # Constants
 _HTTP_CHUNK_SIZE = 64 * 1024  # 64 KiB
@@ -39,11 +43,13 @@ class PartialSyncQueryBootstrap:
     # Bootstraps DB by fetching pages touched by given SQL query on server
     query: str
 
+
 @dataclass
 class PartialSyncOpts:
     bootstrap_strategy: Union[PartialSyncPrefixBootstrap, PartialSyncQueryBootstrap]
     segment_size: Optional[int] = None
-    speculative_load: Optional[bool] = None
+    prefetch: Optional[bool] = None
+
 
 class _HttpContext:
     """
@@ -53,7 +59,7 @@ class _HttpContext:
 
     def __init__(
         self,
-        remote_url: Union[str, Callable[[], Optional[str]]],
+        remote_url: Optional[Union[str, Callable[[], Optional[str]]]],
         auth_token: Optional[Union[str, Callable[[], Optional[str]]]],
         client_name: str,
     ) -> None:
@@ -61,16 +67,13 @@ class _HttpContext:
         self.auth_token = auth_token
         self.client_name = client_name
 
-    def _eval(self, v: Union[str, Callable[[], Optional[str]]]) -> Optional[str]:
+    def _eval(self, v: Optional[Union[str, Callable[[], Optional[str]]]]) -> Optional[str]:
         if callable(v):
             return v()
         return v
 
-    def base_url(self) -> str:
-        url = self._eval(self.remote_url)
-        if not url:
-            raise RuntimeError("remote_url is not available")
-        return url
+    def base_url(self) -> Optional[str]:
+        return self._eval(self.remote_url)
 
     def token(self) -> Optional[str]:
         if self.auth_token is None:
@@ -130,7 +133,11 @@ def _process_http_item(
         return
 
     # Build full URL
-    url = _join_url(base_url, path)
+    url = base_url if base_url else req_kind.url
+    if not url:
+        io_item.poison("remote url unavailable")
+        raise RuntimeError("remote_url is not available")
+    url = _join_url(url, path)
 
     # Build request
     request = urllib.request.Request(url=url, data=body, method=method)
@@ -317,12 +324,16 @@ def _run_op(
       - Stats: returns PyTursoSyncDatabaseStats
     """
     while True:
-        res = op.resume()
-        if res is None:
+        try:
+            finished = op.resume()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+        if not finished:
             # Needs IO
             _drain_sync_io(sync, ctx, current_op=op)
             continue
         # Finished
+        res = op.take_result()
         if res.kind == PyTursoAsyncOperationResultKind.No:
             return None
         if res.kind == PyTursoAsyncOperationResultKind.Connection and res.connection is not None:
@@ -398,15 +409,17 @@ class ConnectionSync(_Connection):
 
 def connect_sync(
     path: str,
-    remote_url: Union[str, Callable[[], Optional[str]]],
+    remote_url: Optional[Union[str, Callable[[], Optional[str]]]] = None,
     *,
     auth_token: Optional[Union[str, Callable[[], Optional[str]]]] = None,
     client_name: Optional[str] = None,
     long_poll_timeout_ms: Optional[int] = None,
     bootstrap_if_empty: bool = True,
-    partial_sync_opts: Optional[PartialSyncOpts] = None,
+    partial_sync_experimental: Optional[PartialSyncOpts] = None,
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
+    remote_encryption_key: Optional[str] = None,
+    remote_encryption_cipher: Optional[RemoteEncryptionCipher] = None,
 ) -> ConnectionSync:
     """
     Create and open a synchronized database connection.
@@ -417,12 +430,14 @@ def connect_sync(
     - client_name: optional unique client name (defaults to 'turso-sync-py')
     - long_poll_timeout_ms: timeout for long polling during pull
     - bootstrap_if_empty: if True and db empty, bootstrap from remote during create()
-    - partial_sync_opts: optional partial sync configuration
+    - partial_sync_experimental: EXPERIMENTAL partial sync configuration
     - experimental_features, isolation_level: passed to underlying connection
+    - remote_encryption_key: base64-encoded encryption key for encrypted Turso Cloud databases
+    - remote_encryption_cipher: encryption cipher for the remote database (used to calculate reserved_bytes)
     """
     # Resolve client name
     cname = client_name or "turso-sync-py"
-    if remote_url.startswith("libsql://"):
+    if remote_url and isinstance(remote_url, str) and remote_url.startswith("libsql://"):
         remote_url = remote_url.replace("libsql://", "https://", 1)
     http_ctx = _HttpContext(remote_url=remote_url, auth_token=auth_token, client_name=cname)
 
@@ -430,29 +445,37 @@ def connect_sync(
     db_cfg = PyTursoDatabaseConfig(
         path=path,
         experimental_features=experimental_features,
-        async_io=True,
     )
 
     # Sync config with optional partial bootstrap strategy
     prefix_len: Optional[int] = None
     query_str: Optional[str] = None
-    if partial_sync_opts is not None and isinstance(partial_sync_opts.bootstrap_strategy, PartialSyncPrefixBootstrap):
-        prefix_len = int(partial_sync_opts.bootstrap_strategy.length)
-    elif partial_sync_opts is not None and isinstance(partial_sync_opts.bootstrap_strategy, PartialSyncQueryBootstrap):
-        query_str = str(partial_sync_opts.bootstrap_strategy.query)
+    if partial_sync_experimental is not None and isinstance(
+        partial_sync_experimental.bootstrap_strategy, PartialSyncPrefixBootstrap
+    ):
+        prefix_len = int(partial_sync_experimental.bootstrap_strategy.length)
+    elif partial_sync_experimental is not None and isinstance(
+        partial_sync_experimental.bootstrap_strategy, PartialSyncQueryBootstrap
+    ):
+        query_str = str(partial_sync_experimental.bootstrap_strategy.query)
 
     sync_cfg = PyTursoSyncDatabaseConfig(
         path=path,
+        remote_url=remote_url,
         client_name=cname,
         long_poll_timeout_ms=long_poll_timeout_ms,
         bootstrap_if_empty=bootstrap_if_empty,
         reserved_bytes=None,
-        partial_sync_opts=PyTursoPartialSyncOpts(
+        partial_sync=PyTursoPartialSyncOpts(
             bootstrap_strategy_prefix=prefix_len,
             bootstrap_strategy_query=query_str,
-            segment_size=partial_sync_opts.segment_size,
-            speculative_load=partial_sync_opts.speculative_load
-        ) if partial_sync_opts is not None else None,
+            segment_size=partial_sync_experimental.segment_size,
+            prefetch=partial_sync_experimental.prefetch,
+        )
+        if partial_sync_experimental is not None
+        else None,
+        remote_encryption_key=remote_encryption_key,
+        remote_encryption_cipher=remote_encryption_cipher,
     )
 
     # Create sync database holder

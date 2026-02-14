@@ -1,0 +1,60 @@
+@database :memory:
+
+test coalesce {
+    select coalesce(NULL, 1);
+}
+expect {
+    1
+}
+
+test coalesce-2 {
+    select coalesce(NULL, NULL, 1);
+}
+expect {
+    1
+}
+
+test coalesce-nested {
+    select coalesce(NULL, coalesce(NULL, NULL));
+}
+expect {
+}
+
+test coalesce-nested-2 {
+    select coalesce(NULL, coalesce(NULL, 2));
+    select coalesce(NULL, coalesce(1, 2));
+    select coalesce(0, coalesce(1, 2));
+}
+expect {
+    2
+    1
+    0
+}
+
+test coalesce-null {
+    select coalesce(NULL, NULL, NULL);
+}
+expect {
+}
+
+test coalesce-first {
+    select coalesce(1, 2, 3);
+}
+expect {
+    1
+}
+
+# Regression: constant COALESCE with IN(...) must not generate jumps into unopened cursor loops.
+test coalesce-constant-in-orderby-regression {
+    DROP TABLE IF EXISTS coalesce_regression;
+    CREATE TABLE coalesce_regression (a INTEGER, b INTEGER);
+    INSERT INTO coalesce_regression VALUES (1, NULL), (2, 7);
+    SELECT COALESCE(LENGTH('a'), HEX(X'01') IN (X'02')), QUOTE(b)
+    FROM coalesce_regression
+    WHERE a
+    ORDER BY a DESC;
+}
+expect {
+    1|7
+    1|NULL
+}

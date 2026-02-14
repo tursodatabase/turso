@@ -1,8 +1,17 @@
 use std::sync::Arc;
 
-use criterion::async_executor::FuturesExecutor;
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+#[cfg(not(feature = "codspeed"))]
+use criterion::{
+    async_executor::FuturesExecutor, criterion_group, criterion_main, Criterion, Throughput,
+};
+#[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+
+#[cfg(feature = "codspeed")]
+use codspeed_criterion_compat::{
+    async_executor::FuturesExecutor, criterion_group, criterion_main, Criterion, Throughput,
+};
+
 use turso_core::mvcc::clock::LocalClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
@@ -16,8 +25,11 @@ struct BenchDb {
 
 fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io.clone(), ":memory:", true).unwrap();
+    let db = Database::open_file(io, ":memory:").unwrap();
     let conn = db.connect().unwrap();
+    // Enable MVCC via PRAGMA
+    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+        .unwrap();
     let mvcc_store = db.get_mv_store().clone().unwrap();
     BenchDb {
         _db: db,
@@ -34,9 +46,8 @@ fn bench(c: &mut Criterion) {
         let db = bench_db();
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = db.conn.clone();
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
-            db.mvcc_store
-                .rollback_tx(tx_id, conn.get_pager().clone(), &conn);
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
+            db.mvcc_store.rollback_tx(tx_id, conn.get_pager(), &conn);
         })
     });
 
@@ -44,7 +55,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx + commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
             let mv_store = &db.mvcc_store;
             let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
             // TODO: sync IO hack
@@ -62,7 +73,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx-read-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
             db.mvcc_store
                 .read(
                     tx_id,
@@ -91,7 +102,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx-update-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
             db.mvcc_store
                 .update(
                     tx_id,
@@ -116,7 +127,7 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone()).unwrap();
+    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager()).unwrap();
     db.mvcc_store
         .insert(
             tx_id,
@@ -142,7 +153,7 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone()).unwrap();
+    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager()).unwrap();
     db.mvcc_store
         .insert(
             tx_id,
@@ -169,9 +180,18 @@ fn bench(c: &mut Criterion) {
     });
 }
 
+#[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench
 }
+
+#[cfg(feature = "codspeed")]
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
+    targets = bench
+}
+
 criterion_main!(benches);

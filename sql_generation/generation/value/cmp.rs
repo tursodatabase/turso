@@ -1,4 +1,4 @@
-use turso_core::Value;
+use turso_core::{Numeric, Value};
 
 use crate::{
     generation::{ArbitraryFrom, GenerationContext},
@@ -14,8 +14,12 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
         (value, _col_type): (&SimValue, ColumnType),
     ) -> Self {
         let new_value = match &value.0 {
-            Value::Integer(i) => Value::Integer(rng.random_range(i64::MIN..*i - 1)),
-            Value::Float(f) => Value::Float(f - rng.random_range(0.0..1e10)),
+            Value::Numeric(Numeric::Integer(i)) => {
+                Value::from_i64(rng.random_range(i64::MIN..*i - 1))
+            }
+            Value::Numeric(Numeric::Float(f)) => {
+                Value::from_f64(f64::from(*f) - rng.random_range(0.0..1e10))
+            }
             value @ Value::Text(..) => {
                 // Either shorten the string, or make at least one character smaller and mutate the rest
                 let mut t = value.to_string();
@@ -58,8 +62,10 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
         (value, col_type): (&SimValue, ColumnType),
     ) -> Self {
         let new_value = match &value.0 {
-            Value::Integer(i) => Value::Integer(rng.random_range(*i..i64::MAX)),
-            Value::Float(f) => Value::Float(rng.random_range(*f..1e10)),
+            Value::Numeric(Numeric::Integer(i)) => Value::from_i64(rng.random_range(*i..i64::MAX)),
+            Value::Numeric(Numeric::Float(f)) => {
+                Value::from_f64(rng.random_range(f64::from(*f)..1e10))
+            }
             value @ Value::Text(..) => {
                 // Either lengthen the string, or make at least one character smaller and mutate the rest
                 let mut t = value.to_string();
@@ -115,22 +121,52 @@ fn mutate_string<R: rand::Rng + ?Sized>(
     rng: &mut R,
     mutation_type: MutationType,
 ) -> String {
+    if t.is_empty() {
+        // Handle empty string: for increment, return a single char; for decrement, stay empty
+        return if mutation_type == MutationType::Increment {
+            "A".to_string()
+        } else {
+            String::new()
+        };
+    }
+
     let mut chars = t.chars().map(|c| c as u32).collect::<Vec<_>>();
-    let mut index;
-    let mut max_loops = 100;
-    loop {
-        index = rng.random_range(0..chars.len());
-        if chars[index] > UPPERCASE_A && chars[index] < UPPERCASE_Z
-            || chars[index] > LOWERCASE_A && chars[index] < LOWERCASE_Z
-        {
+
+    // Try to find a character that can be safely incremented/decremented
+    let mut index = None;
+    for _ in 0..100 {
+        let candidate = rng.random_range(0..chars.len());
+        let c = chars[candidate];
+        // Check if character is in the "safe" range (not at boundary)
+        let can_decrement = ((UPPERCASE_A + 1)..=UPPERCASE_Z).contains(&c)
+            || ((LOWERCASE_A + 1)..=LOWERCASE_Z).contains(&c);
+        let can_increment =
+            (UPPERCASE_A..UPPERCASE_Z).contains(&c) || (LOWERCASE_A..LOWERCASE_Z).contains(&c);
+
+        let can_mutate = match mutation_type {
+            MutationType::Decrement => can_decrement,
+            MutationType::Increment => can_increment,
+        };
+        if can_mutate {
+            index = Some(candidate);
             break;
-        }
-        max_loops -= 1;
-        if max_loops == 0 {
-            panic!("Failed to find a printable character to decrement");
         }
     }
 
+    // Fallback: if no suitable character found, use length-based mutation
+    if index.is_none() {
+        return if mutation_type == MutationType::Decrement {
+            // For decrement: remove last char (shorter string < original)
+            let mut s = t.to_string();
+            s.pop();
+            s
+        } else {
+            // For increment: append a char (longer string > original)
+            format!("{t}A")
+        };
+    }
+
+    let index = index.unwrap();
     if mutation_type == MutationType::Decrement {
         chars[index] -= 1;
     } else {

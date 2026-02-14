@@ -1,7 +1,7 @@
 use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
 use rand::{rng, RngCore};
-use std::panic;
-use turso_core::{DatabaseOpts, Row};
+use std::sync::Arc;
+use turso_core::{Database, DatabaseOpts, EncryptionOpts, OpenFlags, PlatformIO, Row, IO};
 
 const ENABLE_ENCRYPTION: bool = true;
 
@@ -92,29 +92,25 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
         do_flush(&conn, &tmp_db)?;
     }
     {
-        // test connecting to encrypted db using wrong key(key is ending with 77.The correct key is ending with 27).This should panic.
+        // test connecting to encrypted db using wrong key (key ends with 77, correct key ends with 27).
         let uri = format!(
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
         let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
-        }));
+        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB with wrong key"
+            result.is_err(),
+            "should return error when accessing encrypted DB with wrong key"
         );
     }
     {
-        //test connecting to encrypted db using insufficient encryption parameters in URI.This should panic.
+        // test connecting to encrypted db using insufficient encryption parameters in URI.
         let uri = format!("file:{}?cipher=aegis256", db_path.to_str().unwrap());
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            turso_core::Connection::from_uri(&uri, opts).unwrap();
-        }));
+        let result = turso_core::Connection::from_uri(&uri, opts);
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB without passing hexkey in URI"
+            result.is_err(),
+            "should return error when accessing encrypted DB without passing hexkey in URI"
         );
     }
     {
@@ -122,23 +118,19 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            turso_core::Connection::from_uri(&uri, opts).unwrap();
-        }));
+        let result = turso_core::Connection::from_uri(&uri, opts);
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB without passing cipher in URI"
+            result.is_err(),
+            "should return error when accessing encrypted DB without passing cipher in URI"
         );
     }
     {
-        // Testing connecting to db without using URI.This should panic.
+        // test connecting to encrypted db without using URI.
         let conn = tmp_db.connect_limbo();
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
-        }));
+        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB without using URI"
+            result.is_err(),
+            "should return error when accessing encrypted DB without using URI"
         );
     }
 
@@ -241,21 +233,24 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
         file.write_all(b"V")?;
     }
 
-    // try to connect to the corrupted database - this should fail
+    // try to connect to the corrupted database - this should return a decryption error
     {
         let uri = format!(
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
 
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let (_io, conn) = turso_core::Connection::from_uri(&uri, opts).unwrap();
-            run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
-        }));
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
 
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB with corrupted Turso magic bytes"
+            result.is_err(),
+            "should return error when accessing encrypted DB with corrupted Turso magic bytes"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Decryption failed"),
+            "error should indicate decryption failure, got: {err_msg}"
         );
     }
 
@@ -330,19 +325,18 @@ fn test_corruption_associated_data_bytes(tmp_db: TempDatabase) -> anyhow::Result
                 test_db_path.to_str().unwrap()
             );
 
-            let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let result = (|| -> anyhow::Result<()> {
                 let (_io, conn) = turso_core::Connection::from_uri(
                     &uri,
                     DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
-                )
-                .unwrap();
-                run_query_on_row(&test_tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {})
-                    .unwrap();
-            }));
+                )?;
+                run_query_on_row(&test_tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {})?;
+                Ok(())
+            })();
 
             assert!(
-                should_panic.is_err(),
-                "should panic when accessing encrypted DB with corrupted associated data at position {corrupt_pos}",
+                result.is_err(),
+                "should return error when accessing encrypted DB with corrupted associated data at position {corrupt_pos}",
             );
         }
     }
@@ -457,6 +451,200 @@ fn test_turso_header_structure(db: TempDatabase) -> anyhow::Result<()> {
         }
 
         verify_header(db_path.to_str().unwrap(), expected_id, description)?;
+    }
+    Ok(())
+}
+
+/// this is a smoll test for database registry caching encryption keys
+///
+/// Previously, the DATABASE_MANAGER cached Database instances with keys. Which led to:
+/// 1. Open database with correct key -> Database cached with correct encryption_key
+/// 2. Open database with WRONG key or no key -> Cached Database returned
+/// 3. Decryption succeeds because cached Database has correct key
+///
+/// This test ensures that opening with wrong encryption key (or no key) fails even after
+/// the database has been opened with the correct key (which populates the cache).
+#[turso_macros::test(mvcc)]
+fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir
+        .path()
+        .join(format!("test-enc-cache-{}.db", rng().next_u32()));
+    let db_path_str = db_path.to_str().unwrap();
+
+    let correct_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let wrong_key = "aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+
+    let io = Arc::new(PlatformIO::new()?);
+    let opts = DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION);
+
+    let correct_encryption_opts = Some(EncryptionOpts {
+        cipher: "aegis256".to_string(),
+        hexkey: correct_key.to_string(),
+    });
+
+    let main_db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_str,
+        OpenFlags::Create,
+        opts,
+        correct_encryption_opts.clone(),
+    )?;
+
+    // step 1: Create encrypted database with correct key
+    {
+        let correct_encryption_key =
+            turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
+
+        let conn = main_db.connect()?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(correct_encryption_key)?;
+
+        conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, value TEXT)")?;
+        conn.execute("INSERT INTO secret_data (value) VALUES ('top secret')")?;
+        conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        for completion in conn.cacheflush()? {
+            io.wait_for_completion(completion)?;
+        }
+    }
+
+    // Step 2: re-open with correct key (this uses the DATABASE_MANAGER cache)
+    {
+        let correct_encryption_key =
+            turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            correct_encryption_opts.clone(),
+        )?;
+
+        let conn = db.connect()?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(correct_encryption_key)?;
+
+        let rows = conn.query("SELECT * FROM secret_data")?;
+        let mut row_count = 0;
+        if let Some(mut rows) = rows {
+            loop {
+                match rows.step()? {
+                    turso_core::StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        assert_eq!(row.get::<String>(1).unwrap(), "top secret");
+                        row_count += 1;
+                    }
+                    turso_core::StepResult::Done => break,
+                    turso_core::StepResult::Interrupt => break,
+                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                }
+            }
+        }
+        assert_eq!(row_count, 1, "Should read data with correct key");
+    }
+
+    // Step 3: Opening with wrong key succeeds, but reading data fails with decryption error
+    {
+        let wrong_encryption_key = turso_core::EncryptionKey::from_hex_string(wrong_key).unwrap();
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            Some(EncryptionOpts {
+                cipher: "aegis256".to_string(),
+                hexkey: wrong_key.to_string(),
+            }),
+        )?;
+
+        // opening succeeds - the key is not validated at open time
+        let conn = db.connect()?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(wrong_encryption_key)?;
+
+        // Reading data should fail with a decryption error
+        let read_failed = match conn.query("SELECT * FROM secret_data") {
+            Err(_) => true,
+            Ok(Some(mut rows)) => loop {
+                match rows.step() {
+                    Err(_) => break true,                            // Error - read failed
+                    Ok(turso_core::StepResult::Done) => break false, // Completed without error
+                    Ok(turso_core::StepResult::Interrupt) => break false,
+                    Ok(turso_core::StepResult::Row) => break false, // Got data - unexpected!!
+                    Ok(turso_core::StepResult::Busy) | Ok(turso_core::StepResult::IO) => continue,
+                }
+            },
+            Ok(None) => false,
+        };
+        assert!(
+            read_failed,
+            "Reading data with wrong key should fail with decryption error"
+        );
+    }
+
+    // Step 4: Opening without encryption options should fail immediately
+    {
+        let result = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "Opening encrypted database without encryption options should fail"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Database is encrypted but no encryption options provided"),
+            "Error message should indicate missing encryption options"
+        );
+    }
+
+    // Step 5: verify correct key still works after wrong key attempt
+    {
+        let correct_encryption_key =
+            turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            correct_encryption_opts.clone(),
+        )?;
+
+        let conn = db.connect()?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(correct_encryption_key)?;
+
+        let rows = conn.query("SELECT * FROM secret_data")?;
+        let mut row_count = 0;
+        if let Some(mut rows) = rows {
+            loop {
+                match rows.step()? {
+                    turso_core::StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        assert_eq!(row.get::<String>(1).unwrap(), "top secret");
+                        row_count += 1;
+                    }
+                    turso_core::StepResult::Done => break,
+                    turso_core::StepResult::Interrupt => break,
+                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                }
+            }
+        }
+        assert_eq!(
+            row_count, 1,
+            "Should still read data with correct key after wrong key attempt"
+        );
     }
     Ok(())
 }

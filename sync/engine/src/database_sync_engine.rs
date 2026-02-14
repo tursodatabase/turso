@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use turso_core::{Buffer, Completion, DatabaseStorage, OpenFlags};
+use turso_core::{Buffer, Completion, DatabaseStorage, OpenDbAsyncState, OpenFlags};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
@@ -16,7 +16,8 @@ use crate::{
         acquire_slot, apply_transformation, bootstrap_db_file, connect_untracked,
         count_local_changes, has_table, push_logical_changes, read_last_change_id, read_wal_salt,
         reset_wal_file, update_last_change_id, wait_all_results, wal_apply_from_file,
-        wal_pull_to_file, SyncEngineIoStats, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        wal_pull_to_file, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER,
+        WAL_FRAME_SIZE,
     },
     database_tape::{
         DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
@@ -27,8 +28,9 @@ use crate::{
     io_operations::IoOperations,
     types::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
-        DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DbChangesStatus, PartialSyncOpts,
-        SyncEngineStats, DATABASE_METADATA_VERSION,
+        DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
+        DbChangesStatus, PartialSyncOpts, SyncEngineIoResult, SyncEngineStats,
+        DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
@@ -36,6 +38,7 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub struct DatabaseSyncEngineOpts {
+    pub remote_url: Option<String>,
     pub client_name: String,
     pub tables_ignore: Vec<String>,
     pub use_transform: bool,
@@ -45,6 +48,8 @@ pub struct DatabaseSyncEngineOpts {
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: usize,
     pub partial_sync_opts: Option<PartialSyncOpts>,
+    /// Base64-encoded encryption key for the Turso Cloud database
+    pub remote_encryption_key: Option<String>,
 }
 
 pub struct DataStats {
@@ -112,7 +117,7 @@ fn create_changes_path(main_db_path: &str) -> String {
 /// so, I decided to keep a little bit of mess in sync-engine for a little bit longer
 async fn full_read<Ctx, IO: SyncEngineIo>(
     coro: &Coro<Ctx>,
-    io: Arc<dyn turso_core::IO>,
+    io: Option<Arc<dyn turso_core::IO>>,
     sync_engine_io: Arc<IO>,
     path: &str,
     is_memory: bool,
@@ -126,6 +131,11 @@ async fn full_read<Ctx, IO: SyncEngineIo>(
             return Ok(Some(data));
         }
     }
+    let Some(io) = io else {
+        return Err(Error::DatabaseSyncEngineError(
+            "MemoryIO must be set".to_string(),
+        ));
+    };
     let Ok(file) = io.open_file(path, OpenFlags::None, false) else {
         return Ok(None);
     };
@@ -136,7 +146,10 @@ async fn full_read<Ctx, IO: SyncEngineIo>(
     loop {
         let c = Completion::new_read(buffer.clone(), {
             let read_len = read_len.clone();
-            move |r| *read_len.lock().unwrap() = r.expect("memory io must not fail").1
+            move |r| {
+                *read_len.lock().unwrap() = r.expect("memory io must not fail").1;
+                None
+            }
         });
         let read = file.pread(offset, c).expect("memory io must not fail");
         assert!(read.finished(), "memory io must complete immediately");
@@ -185,19 +198,13 @@ async fn full_write<Ctx, IO: SyncEngineIo>(
 impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn read_db_meta<Ctx>(
         coro: &Coro<Ctx>,
-        io: Arc<dyn turso_core::IO>,
+        io: Option<Arc<dyn turso_core::IO>>,
         sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
     ) -> Result<Option<DatabaseMetadata>> {
         let path = create_meta_path(main_db_path);
-        let meta = full_read(
-            coro,
-            io,
-            sync_engine_io.io.clone(),
-            &path,
-            is_memory(main_db_path),
-        )
-        .await?;
+        let is_memory = is_memory(main_db_path);
+        let meta = full_read(coro, io, sync_engine_io.io.clone(), &path, is_memory).await?;
         match meta {
             Some(meta) => Ok(Some(DatabaseMetadata::load(&meta)?)),
             None => Ok(None),
@@ -210,32 +217,42 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
         opts: &DatabaseSyncEngineOpts,
+        meta: Option<DatabaseMetadata>,
     ) -> Result<DatabaseMetadata> {
         tracing::info!("bootstrap_db(path={}): opts={:?}", main_db_path, opts);
-
         let meta_path = create_meta_path(main_db_path);
-        let meta = full_read(
-            coro,
-            io.clone(),
-            sync_engine_io.io.clone(),
-            &meta_path,
-            is_memory(main_db_path),
-        )
-        .await?;
-        let meta = match meta {
-            Some(meta) => Some(DatabaseMetadata::load(&meta)?),
-            None => None,
-        };
         let partial_sync_opts = opts.partial_sync_opts.clone();
         let partial = partial_sync_opts.is_some();
 
+        let configuration = DatabaseSavedConfiguration {
+            remote_url: opts.remote_url.clone(),
+            partial_sync_prefetch: opts.partial_sync_opts.as_ref().map(|p| p.prefetch),
+            partial_sync_segment_size: opts.partial_sync_opts.as_ref().map(|p| p.segment_size),
+        };
         let meta = match meta {
-            Some(meta) => meta,
+            Some(mut meta) => {
+                if meta.update_configuration(configuration) {
+                    full_write(
+                        coro,
+                        io.clone(),
+                        sync_engine_io.io.clone(),
+                        &meta_path,
+                        is_memory(main_db_path),
+                        meta.dump()?,
+                    )
+                    .await?;
+                }
+                meta
+            }
             None if opts.bootstrap_if_empty => {
                 let client_unique_id = format!("{}-{}", opts.client_name, uuid::Uuid::new_v4());
                 let revision = bootstrap_db_file(
-                    coro,
-                    &sync_engine_io,
+                    &SyncOperationCtx::new(
+                        coro,
+                        &sync_engine_io,
+                        opts.remote_url.clone(),
+                        opts.remote_encryption_key.as_deref(),
+                    ),
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
@@ -250,13 +267,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     revert_since_wal_watermark: 0,
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
-                    last_pull_unix_time: Some(io.now().secs),
+                    last_pull_unix_time: Some(io.current_time_wall_clock().secs),
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: if partial {
                         Some(revision.clone())
                     } else {
                         None
                     },
+                    saved_configuration: Some(configuration),
                 };
                 tracing::info!("write meta after successful bootstrap: meta={meta:?}");
 
@@ -295,6 +313,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_pull_unix_time: None,
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: None,
+                    saved_configuration: Some(configuration),
                 };
                 tracing::info!("write meta after successful bootstrap: meta={meta:?}");
                 full_write(
@@ -334,12 +353,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         meta: &DatabaseMetadata,
         main_db_path: &str,
-        opts: &DatabaseSyncEngineOpts,
+        remote_encryption_key: Option<&str>,
     ) -> Result<Arc<dyn DatabaseStorage>> {
-        let partial_bootstrap_opts = &opts.partial_sync_opts;
-        let partial = !partial_bootstrap_opts.is_none();
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
-        let db_file: Arc<dyn DatabaseStorage> = if partial {
+        let db_file: Arc<dyn DatabaseStorage> = if let Some(partial_sync_opts) =
+            meta.partial_sync_opts()
+        {
             let Some(partial_bootstrap_server_revision) = &meta.partial_bootstrap_server_revision
             else {
                 return Err(Error::DatabaseSyncEngineError(
@@ -352,15 +371,19 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 ));
             };
             tracing::info!("create LazyDatabaseStorage database storage");
+            let encoded_key = remote_encryption_key.map(|k| k.to_string());
             Arc::new(LazyDatabaseStorage::new(
                 db_file,
                 None, // todo(sivukhin): allocate dirty file for FS IO
                 sync_engine_io.clone(),
                 revision.to_string(),
-                partial_bootstrap_opts
-                    .clone()
-                    .expect("partial sync opts are set here"),
-            ))
+                partial_sync_opts,
+                meta.saved_configuration
+                    .as_ref()
+                    .and_then(|x| x.remote_url.as_ref())
+                    .cloned(),
+                encoded_key,
+            )?)
         } else {
             Arc::new(turso_core::storage::database::DatabaseFile::new(db_file))
         };
@@ -382,7 +405,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let meta = full_read(
             coro,
-            io.clone(),
+            Some(io.clone()),
             sync_engine_io.io.clone(),
             &meta_path,
             is_memory(&main_db_path),
@@ -454,12 +477,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         main_db_path: &str,
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
+        let meta = Self::read_db_meta(coro, Some(io.clone()), sync_engine_io.clone(), main_db_path)
+            .await?;
         let meta = Self::bootstrap_db(
             coro,
             io.clone(),
             sync_engine_io.clone(),
             main_db_path,
             &opts,
+            meta,
         )
         .await?;
         let main_db_storage = Self::init_db_storage(
@@ -467,29 +493,60 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             sync_engine_io.clone(),
             &meta,
             main_db_path,
-            &opts,
+            opts.remote_encryption_key.as_deref(),
         )?;
-        let main_db = turso_core::Database::open_with_flags(
-            io.clone(),
-            main_db_path,
-            main_db_storage,
-            OpenFlags::Create,
-            turso_core::DatabaseOpts::new(),
-            None,
-        )?;
+
+        // Use async database opening that yields on IO for large schemas
+        let mut open_state = turso_core::OpenDbAsyncState::new();
+        let main_db = loop {
+            match turso_core::Database::open_with_flags_async(
+                &mut open_state,
+                io.clone(),
+                main_db_path,
+                main_db_storage.clone(),
+                OpenFlags::Create,
+                turso_core::DatabaseOpts::new(),
+                None,
+            )? {
+                turso_core::IOResult::Done(db) => break db,
+                turso_core::IOResult::IO(io_completion) => {
+                    while !io_completion.finished() {
+                        coro.yield_(SyncEngineIoResult::IO).await?;
+                    }
+                }
+            }
+        };
+
         Self::open_db(coro, io, sync_engine_io, main_db, opts).await
     }
 
-    fn open_revert_db_conn(&self) -> Result<Arc<turso_core::Connection>> {
-        let db = turso_core::Database::open_with_flags_bypass_registry(
-            self.io.clone(),
-            &self.main_db_path,
-            &self.revert_db_wal_path,
-            self.db_file.clone(),
-            OpenFlags::Create,
-            turso_core::DatabaseOpts::new(),
-            None,
-        )?;
+    async fn open_revert_db_conn<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+    ) -> Result<Arc<turso_core::Connection>> {
+        let db = {
+            let mut state = OpenDbAsyncState::new();
+            loop {
+                match turso_core::Database::open_with_flags_bypass_registry_async(
+                    &mut state,
+                    self.io.clone(),
+                    &self.main_db_path,
+                    Some(&self.revert_db_wal_path),
+                    self.db_file.clone(),
+                    OpenFlags::Create,
+                    turso_core::DatabaseOpts::new(),
+                    None,
+                )? {
+                    turso_core::IOResult::Done(db) => break db,
+                    turso_core::IOResult::IO(io_completion) => {
+                        while !io_completion.finished() {
+                            coro.yield_(SyncEngineIoResult::IO).await?;
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
         let conn = db.connect()?;
         conn.wal_auto_checkpoint_disable();
         Ok(conn)
@@ -535,7 +592,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.main_db_path,
             result
         );
-        if result.max_frame < watermark {
+        if result.wal_max_frame < watermark {
             return Err(Error::DatabaseSyncEngineError(
                 format!("unable to checkpoint synced portion of WAL: result={result:?}, watermark={watermark}"),
             ));
@@ -592,7 +649,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.main_db_path
         );
         let main_conn = connect_untracked(&self.main_tape)?;
-        let revert_conn = self.open_revert_db_conn()?;
+        let revert_conn = self.open_revert_db_conn(coro).await?;
 
         let mut page = [0u8; PAGE_SIZE];
         let db_size = if revert_conn.try_wal_watermark_read_page(1, &mut page, None)? {
@@ -651,9 +708,21 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     );
                     continue;
                 }
-                if !main_conn.try_wal_watermark_read_page(page_no, &mut page, Some(watermark))? {
+
+                let begin_read_result =
+                    main_conn.try_wal_watermark_read_page_begin(page_no, Some(watermark))?;
+                let end_read_result = match begin_read_result {
+                    Some((page_ref, c)) => {
+                        while !c.succeeded() {
+                            let _ = coro.yield_(crate::types::SyncEngineIoResult::IO).await;
+                        }
+                        main_conn.try_wal_watermark_read_page_end(&mut page, page_ref)?
+                    }
+                    None => false,
+                };
+                if !end_read_result {
                     tracing::info!(
-                        "checkpoint(path={:?}): skip page {} as it was allocated in the wAL portion for revert",
+                        "checkpoint(path={:?}): skip page {} as it was allocated in the WAL portion for revert",
                         self.main_db_path,
                         page_no
                     );
@@ -693,11 +762,16 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let file = acquire_slot(&self.changes_file)?;
 
-        let now = self.io.now();
+        let now = self.io.current_time_wall_clock();
         let revision = self.meta().synced_revision.clone();
-        let next_revision = wal_pull_to_file(
+        let ctx = &SyncOperationCtx::new(
             coro,
             &self.sync_engine_io,
+            self.meta().remote_url(),
+            self.opts.remote_encryption_key.as_deref(),
+        );
+        let next_revision = wal_pull_to_file(
+            ctx,
             &file.value,
             &revision,
             self.opts.wal_pull_batch_size,
@@ -778,7 +852,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let (_, watermark) = self.checkpoint_passive(coro).await?;
 
-        let revert_conn = self.open_revert_db_conn()?;
+        let revert_conn = self.open_revert_db_conn(coro).await?;
         let main_conn = connect_untracked(&self.main_tape)?;
 
         let mut revert_session = WalSession::new(revert_conn.clone());
@@ -820,7 +894,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             watermark,
             main_conn.wal_state()?.max_frame
         );
-        let local_rollback = main_session.rollback_changes_after(watermark)?;
+        let local_rollback = main_session.rollback_changes_after(coro, watermark).await?;
         let mut frame = [0u8; WAL_FRAME_SIZE];
 
         let remote_rollback = revert_conn.wal_state()?.max_frame;
@@ -945,15 +1019,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             };
 
             let mut transformed = if self.opts.use_transform {
-                Some(
-                    apply_transformation(
-                        coro,
-                        &self.sync_engine_io,
-                        &local_changes,
-                        &replay.generator,
-                    )
-                    .await?,
-                )
+                let ctx = &SyncOperationCtx::new(
+                    coro,
+                    &self.sync_engine_io,
+                    self.meta().remote_url(),
+                    self.opts.remote_encryption_key.as_deref(),
+                );
+                Some(apply_transformation(ctx, &local_changes, &replay.generator).await?)
             } else {
                 None
             };
@@ -992,18 +1064,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn push_changes_to_remote<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
         tracing::info!("push_changes(path={})", self.main_db_path);
 
-        let (_, change_id) = push_logical_changes(
+        let ctx = &SyncOperationCtx::new(
             coro,
             &self.sync_engine_io,
-            &self.main_tape,
-            &self.client_unique_id,
-            &self.opts,
-        )
-        .await?;
+            self.meta().remote_url(),
+            self.opts.remote_encryption_key.as_deref(),
+        );
+        let (_, change_id) =
+            push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
 
         self.update_meta(coro, |m| {
             m.last_pushed_change_id_hint = change_id;
-            m.last_push_unix_time = Some(self.io.now().secs);
+            m.last_push_unix_time = Some(self.io.current_time_wall_clock().secs);
         })
         .await?;
 

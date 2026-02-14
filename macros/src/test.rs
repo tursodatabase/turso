@@ -14,12 +14,6 @@ use syn::{
 #[derive(Debug, Clone, Copy)]
 struct SpannedType<T>(T, Span);
 
-impl<T> SpannedType<T> {
-    fn map<U>(self, func: impl FnOnce(T) -> U) -> SpannedType<U> {
-        SpannedType(func(self.0), self.1)
-    }
-}
-
 impl<T> Deref for SpannedType<T> {
     type Target = T;
 
@@ -39,7 +33,6 @@ impl<T: ToTokens> ToTokens for SpannedType<T> {
     }
 }
 
-#[derive(Debug)]
 struct Args {
     path: Option<SpannedType<String>>,
     mvcc: Option<SpannedType<()>>,
@@ -63,22 +56,13 @@ impl Args {
             |path| path.to_token_stream(),
         );
 
-        let mut db_opts = quote! {
+        let db_opts = quote! {
             turso_core::DatabaseOpts::new()
                 .with_index_method(true)
                 .with_encryption(true)
+                .with_triggers(true)
+                .with_attach(true)
         };
-
-        if let Some(spanned) = self
-            .mvcc
-            .filter(|_| mvcc)
-            .map(|val| val.map(|_| quote! {.with_mvcc(true)}))
-        {
-            db_opts = quote! {
-                #db_opts
-                #spanned
-            }
-        }
 
         builder = quote! {
             #builder
@@ -86,10 +70,19 @@ impl Args {
             .with_opts(#db_opts)
         };
 
-        if let Some(expr) = &self.init_sql {
+        // Enable MVCC if requested
+        if mvcc && self.mvcc.is_some() {
             builder = quote! {
                 #builder
-                .with_init_sql(#expr)
+                .with_mvcc(true)
+            };
+        }
+
+        // Add init_sql if provided
+        if let Some(user_sql) = &self.init_sql {
+            builder = quote! {
+                #builder
+                .with_init_sql(#user_sql)
             };
         }
 

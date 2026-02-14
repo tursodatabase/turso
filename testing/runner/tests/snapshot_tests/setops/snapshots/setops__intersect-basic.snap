@@ -1,0 +1,47 @@
+---
+source: setops.sqltest
+expression: "SELECT department FROM current_employees\n    INTERSECT\n    SELECT department FROM former_employees;"
+info:
+  statement_type: SELECT
+  tables:
+    - current_employees
+    - former_employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--COMPOUND QUERY
+   |--LEFT-MOST SUBQUERY
+   |  `--SCAN current_employees USING COVERING INDEX idx_current_dept
+   `--INTERSECT USING TEMP B-TREE
+      `--SCAN former_employees USING COVERING INDEX idx_former_dept
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4      p5  comment
+   0  Init            0  24   0           0  Start at 24
+   1  OpenEphemeral   0   0   0           0  cursor=0 is_table=false
+   2  OpenEphemeral   1   0   0           0  cursor=1 is_table=false
+   3  OpenRead        2   5   0  k(2,B)   0  index=idx_current_dept, root=5, iDb=0
+   4  Rewind          2   9   0           0  Rewind index idx_current_dept
+   5    Column        2   0   1           0  r[1]=idx_current_dept.department
+   6    MakeRecord    1   1   2           0  r[2]=mkrec(r[1..1]); for compound_dedupe
+   7    IdxInsert     0   2   0           8  key=r[2]
+   8  Next            2   5   0           0
+   9  OpenRead        3   6   0  k(2,B)   0  index=idx_former_dept, root=6, iDb=0
+  10  Rewind          3  15   0           0  Rewind index idx_former_dept
+  11    Column        3   0   3           0  r[3]=idx_former_dept.department
+  12    MakeRecord    3   1   4           0  r[4]=mkrec(r[3..3]); for compound_dedupe
+  13    IdxInsert     1   4   0           8  key=r[4]
+  14  Next            3  11   0           0
+  15  Rewind          0  21   0           0  Rewind  compound_dedupe
+  16    RowData       0   5   0           0  r[5] = data
+  17    NotFound      1  20   5           0  if not found goto 20
+  18    Column        0   0   6           0  r[6]=compound_dedupe.department
+  19    ResultRow     6   1   0           0  output=r[6]
+  20  Next            0  16   0           0
+  21  Close           1   0   0           0
+  22  Close           0   0   0           0
+  23  Halt            0   0   0           0
+  24  Transaction     0   1   6           0  iDb=0 tx_mode=Read
+  25  Goto            0   1   0           0

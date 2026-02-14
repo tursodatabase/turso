@@ -1,12 +1,14 @@
 /target
+/target.noindex
 /.idea
 /.vscode
+/.sqlite3
 **/target
 
 *.so
 *.ipynb
 *.o
-
+*.sqlite
 # Python
 .mypy_cache/
 .pytest_cache/
@@ -44,11 +46,23 @@ simulator.log
 profile.json.gz
 simulator-output/
 tests/*.sql
-
+stress-go/stress-go
 &1
 bisected.sql
 *.log
 
 *.db-log
 settings.local.json
+.claude/agents/
 .build-hash
+
+# Track empty wals for read only databases
+!testing/runner/database/*
+
+
+# For simulator redo
+test.sql
+
+# for elle edn transaction history
+*.edn
+elle-history-results/

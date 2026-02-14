@@ -2,11 +2,15 @@
 mod dynamic;
 mod vtab_xconnect;
 use crate::index_method::backing_btree::BackingBtreeIndexMethod;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+use crate::index_method::fts::{FtsIndexMethod, FTS_INDEX_METHOD_NAME};
 use crate::index_method::toy_vector_sparse_ivf::VectorSparseInvertedIndexMethod;
 use crate::index_method::{
     BACKING_BTREE_INDEX_METHOD_NAME, TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
 };
 use crate::schema::{Schema, Table};
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::Mutex;
 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
 use crate::{function::ExternalFunc, Connection, Database};
@@ -15,7 +19,6 @@ use crate::{vtab::VirtualTable, SymbolTable};
 use crate::{LimboError, IO};
 #[cfg(feature = "fs")]
 pub use dynamic::{add_builtin_vfs_extensions, add_vfs_module, list_vfs_modules, VfsMod};
-use parking_lot::Mutex;
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     sync::Arc,
@@ -32,6 +35,8 @@ pub use vtab_xconnect::{execute, prepare_stmt};
 pub struct ExtensionCtx {
     syms: *mut SymbolTable,
     schema: *mut c_void,
+    /// We must update this generation counter when we modify the symbol table
+    syms_generation: *const AtomicU64,
 }
 
 pub(crate) unsafe extern "C" fn register_vtab_module(
@@ -60,6 +65,10 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     unsafe {
         let syms = &mut *ext_ctx.syms;
         syms.vtab_modules.insert(name_str.clone(), vmodule.into());
+        if !ext_ctx.syms_generation.is_null() {
+            let syms_generation = &*ext_ctx.syms_generation;
+            syms_generation.fetch_add(1, Ordering::SeqCst);
+        }
 
         if kind == VTabKind::TableValuedFunction {
             if let Ok(vtab) = VirtualTable::function(&name_str, syms) {
@@ -102,6 +111,10 @@ pub(crate) unsafe extern "C" fn register_scalar_function(
             name_str.clone(),
             Arc::new(ExternalFunc::new_scalar(name_str, func)),
         );
+        if !ext_ctx.syms_generation.is_null() {
+            let syms_generation = &*ext_ctx.syms_generation;
+            syms_generation.fetch_add(1, Ordering::SeqCst);
+        }
     }
     ResultCode::OK
 }
@@ -132,6 +145,10 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
                 (init_func, step_func, finalize_func),
             )),
         );
+        if !ext_ctx.syms_generation.is_null() {
+            let syms_generation = &*ext_ctx.syms_generation;
+            syms_generation.fetch_add(1, Ordering::SeqCst);
+        }
     }
     ResultCode::OK
 }
@@ -159,7 +176,7 @@ impl Database {
                 }
             },
         };
-        let db = Self::open_file(io.clone(), path, false)?;
+        let db = Self::open_file(io.clone(), path)?;
         Ok((io, db))
     }
 
@@ -176,13 +193,18 @@ impl Database {
                 BACKING_BTREE_INDEX_METHOD_NAME.to_string(),
                 Arc::new(BackingBtreeIndexMethod),
             );
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            syms.index_methods
+                .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));
         }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler
-        let schema_mutex_ptr = &self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
+        let schema_mutex_ptr =
+            &*self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
         let ctx = Box::into_raw(Box::new(ExtensionCtx {
             syms,
             schema: schema_mutex_ptr as *mut c_void,
+            syms_generation: std::ptr::null(),
         }));
         #[allow(unused)]
         let mut ext_api = ExtensionApi {
@@ -202,6 +224,9 @@ impl Database {
         crate::uuid::register_extension(&mut ext_api);
         #[cfg(feature = "series")]
         crate::series::register_extension(&mut ext_api);
+        #[cfg(feature = "time")]
+        crate::time::register_extension(&mut ext_api);
+        crate::regexp::register_extension(&mut ext_api);
         #[cfg(feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;
@@ -234,10 +259,11 @@ impl Connection {
     ///```
     pub unsafe fn _build_turso_ext(&self) -> ExtensionApi {
         let schema_mutex_ptr =
-            &self.db.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
+            &*self.db.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
         let ctx = ExtensionCtx {
             syms: self.syms.data_ptr(),
             schema: schema_mutex_ptr as *mut c_void,
+            syms_generation: &self.syms_generation as *const _,
         };
         let ctx = Box::into_raw(Box::new(ctx)) as *mut c_void;
         ExtensionApi {

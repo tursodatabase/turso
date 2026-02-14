@@ -1,29 +1,34 @@
-use turso_parser::ast::{fmt::ToTokens, Expr, SortOrder};
+use turso_parser::ast::{Expr, SortOrder};
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, sync::Arc};
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
-    display::PlanContext,
-    emitter::{OperationMode, TranslateCtx, UpdateRowSource},
+    emitter::{
+        MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, TranslateCtx,
+        UpdateRowSource,
+    },
     expr::{
-        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        translate_condition_expr, translate_expr, translate_expr_no_constant_opt, walk_expr,
+        ConditionMetadata, NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::Optimizable,
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
-        Aggregate, DistinctCtx, Distinctness, EvalAt, GroupBy, HashJoinOp, IterationDirection,
-        JoinOrderMember, NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekDef,
-        SeekKeyComponent, SelectPlan, TableReferences, WhereTerm,
+        Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, IterationDirection,
+        JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery, Operation,
+        QueryDestination, Scan, Search, SeekDef, SeekKeyComponent, SelectPlan, SetOperation,
+        TableReferences, WhereTerm,
     },
 };
 use crate::{
-    schema::{Index, IndexColumn, Table},
+    schema::{Index, Table},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
+        expr::comparison_affinity,
+        planner::{table_mask_from_expr, TableMask},
         result_row::emit_select_result,
         subquery::emit_non_from_clause_subquery,
         window::emit_window_loop_source,
@@ -32,8 +37,11 @@ use crate::{
     types::SeekOp,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{CmpInsFlags, IdxInsertFlags, Insn},
+        builder::{
+            CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
+            ProgramBuilder,
+        },
+        insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
@@ -72,49 +80,20 @@ impl LoopLabels {
 }
 
 pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<DistinctCtx> {
-    let index_name = format!("distinct_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
-    let mut columns = plan
+    let collations = plan
         .result_columns
         .iter()
-        .enumerate()
-        .map(|(i, col)| IndexColumn {
-            name: col
-                .expr
-                .displayer(&PlanContext(&[&plan.table_references]))
-                .to_string(),
-            order: SortOrder::Asc,
-            pos_in_table: i,
-            collation: None,
-            default: None,
-            expr: None,
+        .map(|col| {
+            get_collseq_from_expr(&col.expr, &plan.table_references)
+                .map(|c| c.unwrap_or(CollationSeq::Binary))
         })
-        .collect::<Vec<_>>();
-    for (i, column) in columns.iter_mut().enumerate() {
-        column.collation =
-            get_collseq_from_expr(&plan.result_columns[i].expr, &plan.table_references)?;
-    }
-    let index = Arc::new(Index {
-        name: index_name.clone(),
-        table_name: String::new(),
-        ephemeral: true,
-        root_page: 0,
-        columns,
-        unique: false,
-        has_rowid: false,
-        where_clause: None,
-        index_method: None,
-    });
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+        .collect::<Result<Vec<_>>>()?;
+    let hash_table_id = program.alloc_hash_table_id();
     let ctx = DistinctCtx {
-        cursor_id,
-        ephemeral_index_name: index_name,
+        hash_table_id,
+        collations,
         label_on_conflict: program.allocate_label(),
     };
-
-    program.emit_insn(Insn::OpenEphemeral {
-        cursor_id,
-        is_table: false,
-    });
 
     Ok(ctx)
 }
@@ -126,7 +105,6 @@ pub fn init_loop(
     t_ctx: &mut TranslateCtx,
     tables: &TableReferences,
     aggregates: &mut [Aggregate],
-    group_by: Option<&GroupBy>,
     mode: OperationMode,
     where_clause: &[WhereTerm],
     join_order: &[JoinOrderMember],
@@ -150,57 +128,39 @@ pub fn init_loop(
         }
     }
 
-    // Initialize ephemeral indexes for distinct aggregates
-    for (i, agg) in aggregates
-        .iter_mut()
-        .enumerate()
-        .filter(|(_, agg)| agg.is_distinct())
-    {
+    // Initialize distinct aggregates using hash tables
+    for agg in aggregates.iter_mut().filter(|agg| agg.is_distinct()) {
         assert!(
             agg.args.len() == 1,
             "DISTINCT aggregate functions must have exactly one argument"
         );
-        let index_name = format!(
-            "distinct_agg_{}_{}",
-            i,
-            agg.args[0].displayer(&PlanContext(&[tables]))
-        );
-        let index = Arc::new(Index {
-            name: index_name.clone(),
-            table_name: String::new(),
-            ephemeral: true,
-            root_page: 0,
-            columns: vec![IndexColumn {
-                name: agg.args[0].displayer(&PlanContext(&[tables])).to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: get_collseq_from_expr(&agg.original_expr, tables)?,
-                default: None, // FIXME: this should be inferred from the expression
-                expr: None,
-            }],
-            has_rowid: false,
-            unique: false,
-            where_clause: None,
-            index_method: None,
-        });
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
-        if group_by.is_none() {
-            // In GROUP BY, the ephemeral index is reinitialized for every group
-            // in the clear accumulator subroutine, so we only do it here if there is no GROUP BY.
-            program.emit_insn(Insn::OpenEphemeral {
-                cursor_id,
-                is_table: false,
-            });
-        }
+        let collations = vec![
+            get_collseq_from_expr(&agg.original_expr, tables)?.unwrap_or(CollationSeq::Binary)
+        ];
+        let hash_table_id = program.alloc_hash_table_id();
         agg.distinctness = Distinctness::Distinct {
             ctx: Some(DistinctCtx {
-                cursor_id,
-                ephemeral_index_name: index_name,
+                hash_table_id,
+                collations,
                 label_on_conflict: program.allocate_label(),
             }),
         };
     }
+    // Include hash-join build tables so their cursors are opened for hash build.
+    let mut required_tables: HashSet<usize> = join_order
+        .iter()
+        .map(|member| member.original_idx)
+        .collect();
+    for table in tables.joined_tables().iter() {
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            required_tables.insert(hash_join_op.build_table_idx);
+        }
+    }
+
     for (table_index, table) in tables.joined_tables().iter().enumerate() {
+        if !required_tables.contains(&table_index) {
+            continue;
+        }
         // Initialize bookkeeping for OUTER JOIN
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {
@@ -326,7 +286,7 @@ pub fn init_loop(
                         if let Some(table_cursor_id) = table_cursor_id {
                             program.emit_insn(Insn::OpenRead {
                                 cursor_id: table_cursor_id,
-                                root_page: table.table.get_root_page(),
+                                root_page: table.table.get_root_page()?,
                                 db: table.database_id,
                             });
                         }
@@ -338,7 +298,7 @@ pub fn init_loop(
 
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: table_cursor_id,
-                            root_page: table.table.get_root_page().into(),
+                            root_page: table.table.get_root_page()?.into(),
                             db: table.database_id,
                         });
 
@@ -366,7 +326,9 @@ pub fn init_loop(
                         }
                     }
                     _ => {
-                        unimplemented!()
+                        return Err(crate::LimboError::InternalError(
+                            "INSERT mode is not supported for Search operations".to_string(),
+                        ));
                     }
                 }
 
@@ -394,7 +356,10 @@ pub fn init_loop(
                                 });
                             }
                             _ => {
-                                unimplemented!()
+                                return Err(crate::LimboError::InternalError(
+                                    "INSERT mode is not supported for indexed Search operations"
+                                        .to_string(),
+                                ));
                             }
                         }
                     }
@@ -405,7 +370,7 @@ pub fn init_loop(
                     if let Some(table_cursor_id) = table_cursor_id {
                         program.emit_insn(Insn::OpenRead {
                             cursor_id: table_cursor_id,
-                            root_page: table.table.get_root_page(),
+                            root_page: table.table.get_root_page()?,
                             db: table.database_id,
                         });
                     }
@@ -436,6 +401,38 @@ pub fn init_loop(
                     _ => unreachable!("Hash joins should only occur in SELECT operations"),
                 }
             }
+            Operation::MultiIndexScan(multi_idx_op) => {
+                match mode {
+                    OperationMode::SELECT => {
+                        let Table::BTree(btree) = &table.table else {
+                            panic!("Expected multi-index scan table to be a BTree table");
+                        };
+                        // Open the table cursor
+                        if let Some(table_cursor_id) = table_cursor_id {
+                            program.emit_insn(Insn::OpenRead {
+                                cursor_id: table_cursor_id,
+                                root_page: btree.root_page,
+                                db: table.database_id,
+                            });
+                        }
+                        // Open cursors for each index branch
+                        for branch in &multi_idx_op.branches {
+                            if let Some(index) = &branch.index {
+                                let branch_cursor_id = program.alloc_cursor_index(
+                                    Some(CursorKey::index(table.internal_id, index.clone())),
+                                    index,
+                                )?;
+                                program.emit_insn(Insn::OpenRead {
+                                    cursor_id: branch_cursor_id,
+                                    root_page: index.root_page,
+                                    db: table.database_id,
+                                });
+                            }
+                        }
+                    }
+                    _ => unreachable!("Multi-index scans should only occur in SELECT operations"),
+                }
+            }
         }
     }
 
@@ -457,22 +454,40 @@ pub fn init_loop(
     Ok(())
 }
 
-/// Emit the hash table build phase for a hash join operation.
-/// This scans the build table and populates the hash table with matching rows.
-/// Information about payload columns stored in the hash table during build phase.
-/// Returned by emit_hash_build_phase to be used during probe phase emission.
+/// Information captured during hash table build for use in probe emission.
+///
+/// This describes the payload layout, key affinities, bloom filter settings,
+/// and whether the probe phase may seek into the build table for missing data.
 #[derive(Debug, Clone)]
 pub struct HashBuildPayloadInfo {
-    /// Column indices from the build table stored as payload, in order.
-    pub payload_columns: Vec<usize>,
+    /// Column references stored as payload, in order.
+    /// These may reference multiple tables when using a materialized join prefix.
+    pub payload_columns: Vec<MaterializedColumnRef>,
+    /// Affinity string for the join keys.
+    pub key_affinities: String,
+    /// Whether to use a bloom filter for probe-side pruning.
+    pub use_bloom_filter: bool,
+    /// Cursor id used to store the bloom filter.
+    pub bloom_filter_cursor_id: CursorID,
+    /// Whether it's safe to SeekRowid into the build table when payload is missing.
+    /// This is false when keys/payload are sourced from a materialized input.
+    pub allow_seek: bool,
 }
 
-/// Uses a separate hash build cursor to allow chained hash joins where a table
-/// can be both a probe table for one join and a build table for another.
+/// Emit the hash table build phase for a hash join operation.
+///
+/// This scans the build input (either the base table or a materialized input)
+/// and populates the hash table with matching rows and payload. The returned
+/// metadata drives probe-side emission, including bloom filter use and whether
+/// build-table seeks are permitted.
+/// Uses a separate hash build cursor so the build scan does not interfere with
+/// the probe cursor for the same table.
+#[allow(clippy::too_many_arguments)]
 fn emit_hash_build_phase(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &TableReferences,
+    non_from_clause_subqueries: &[NonFromClauseSubquery],
     predicates: &[WhereTerm],
     hash_join_op: &HashJoinOp,
     hash_build_cursor_id: CursorID,
@@ -482,74 +497,22 @@ fn emit_hash_build_phase(
     let btree = build_table
         .btree()
         .expect("Hash join build table must be a BTree table");
+    // If build input was materialized, we may use either rowids (SeekRowid) or
+    // precomputed keys/payload depending on the materialization mode.
+    let materialized_input = t_ctx
+        .materialized_build_inputs
+        .get(&hash_join_op.build_table_idx);
+    let materialized_cursor_id = materialized_input.map(|input| input.cursor_id);
 
     let num_keys = hash_join_op.join_keys.len();
-    let build_key_start_reg = program.alloc_registers(num_keys);
-
-    // Create new loop for hash table build phase
-    let build_loop_start = program.allocate_label();
-    let build_loop_end = program.allocate_label();
-    let skip_to_next = program.allocate_label();
-    let label_hash_build_end = program.allocate_label();
-    program.emit_insn(Insn::Once {
-        target_pc_when_reentered: label_hash_build_end,
-    });
-
-    // This is a separate cursor from the regular table cursor, allowing
-    // the table to be iterated here even if it's the probe table for another hash join.
-    program.emit_insn(Insn::OpenRead {
-        cursor_id: hash_build_cursor_id,
-        root_page: btree.root_page,
-        db: build_table.database_id,
-    });
-
-    program.emit_insn(Insn::Rewind {
-        cursor_id: hash_build_cursor_id,
-        pc_if_empty: build_loop_end,
-    });
-
-    // Set cursor override so translate_expr uses the hash build cursor for this table
-    program.set_cursor_override(build_table.internal_id, hash_build_cursor_id);
-
-    program.preassign_label_to_next_insn(build_loop_start);
-    for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
+    // Determine comparison affinity for each join key
+    let mut key_affinities = String::new();
+    for join_key in hash_join_op.join_keys.iter() {
         let build_expr = join_key.get_build_expr(predicates);
-        let target_reg = build_key_start_reg + idx;
-        translate_expr(
-            program,
-            Some(table_references),
-            build_expr,
-            target_reg,
-            &t_ctx.resolver,
-        )?;
+        let probe_expr = join_key.get_probe_expr(predicates);
+        let affinity = comparison_affinity(build_expr, probe_expr, Some(table_references));
+        key_affinities.push(affinity.aff_mask());
     }
-
-    // Collect payload columns, all columns referenced from the build table.
-    // These will be stored in the hash entry to avoid SeekRowid during probe.
-    let payload_columns: Vec<usize> = build_table.col_used_mask.iter().collect();
-    let num_payload = payload_columns.len();
-
-    let (payload_start_reg, payload_info) = if num_payload > 0 {
-        let payload_reg = program.alloc_registers(num_payload);
-        for (i, &col_idx) in payload_columns.iter().enumerate() {
-            program.emit_column_or_rowid(hash_build_cursor_id, col_idx, payload_reg + i);
-        }
-        (
-            Some(payload_reg),
-            HashBuildPayloadInfo {
-                payload_columns: payload_columns.clone(),
-            },
-        )
-    } else {
-        (
-            None,
-            HashBuildPayloadInfo {
-                payload_columns: vec![],
-            },
-        )
-    };
-
-    program.clear_cursor_override(build_table.internal_id);
 
     // Extract collations for each join key expression
     let collations: Vec<CollationSeq> = hash_join_op
@@ -564,29 +527,526 @@ fn emit_hash_build_phase(
         })
         .collect();
 
+    // Bloom filter uses binary hashing; skip if any join key uses non-binary collation.
+    let use_bloom_filter = hash_join_op.use_bloom_filter
+        && collations
+            .iter()
+            .all(|c| matches!(c, CollationSeq::Binary | CollationSeq::Unset));
+
+    let (payload_columns, payload_signature_columns, use_materialized_keys, allow_seek) =
+        match materialized_input.map(|input| &input.mode) {
+            Some(MaterializedBuildInputMode::KeyPayload {
+                num_keys: payload_num_keys,
+                payload_columns,
+            }) => {
+                turso_assert!(
+                    *payload_num_keys == num_keys,
+                    "materialized hash build input key count mismatch"
+                );
+                let payload_signature_columns = (0..payload_columns.len())
+                    .map(|i| *payload_num_keys + i)
+                    .collect();
+                (
+                    payload_columns.clone(),
+                    payload_signature_columns,
+                    true,
+                    false,
+                )
+            }
+            _ => {
+                // Collect payload columns from the build table for normal hash builds.
+                let payload_signature_columns: Vec<usize> =
+                    build_table.col_used_mask.iter().collect();
+                let payload_columns: Vec<MaterializedColumnRef> = payload_signature_columns
+                    .iter()
+                    .map(|col_idx| {
+                        let column = build_table
+                            .columns()
+                            .get(*col_idx)
+                            .expect("build table column missing");
+                        MaterializedColumnRef::Column {
+                            table_id: build_table.internal_id,
+                            column_idx: *col_idx,
+                            is_rowid_alias: column.is_rowid_alias(),
+                        }
+                    })
+                    .collect();
+                (payload_columns, payload_signature_columns, false, true)
+            }
+        };
+    let bloom_filter_cursor_id = if use_materialized_keys {
+        materialized_cursor_id.expect("materialized input cursor is required")
+    } else {
+        hash_build_cursor_id
+    };
+
+    let join_key_indices = hash_join_op
+        .join_keys
+        .iter()
+        .map(|key| key.where_clause_idx)
+        .collect::<Vec<_>>();
+    let signature = HashBuildSignature {
+        join_key_indices,
+        payload_refs: payload_columns.clone(),
+        key_affinities: key_affinities.clone(),
+        use_bloom_filter,
+        materialized_input_cursor: materialized_cursor_id,
+        materialized_mode: materialized_input.as_ref().map(|input| match input.mode {
+            MaterializedBuildInputMode::RowidOnly => MaterializedBuildInputModeTag::RowidOnly,
+            MaterializedBuildInputMode::KeyPayload { .. } => MaterializedBuildInputModeTag::Payload,
+        }),
+    };
+    if program.hash_build_signature_matches(hash_table_id, &signature) {
+        return Ok(HashBuildPayloadInfo {
+            payload_columns,
+            key_affinities,
+            use_bloom_filter,
+            bloom_filter_cursor_id,
+            allow_seek,
+        });
+    }
+    if program.has_hash_build_signature(hash_table_id) {
+        program.emit_insn(Insn::HashClose { hash_table_id });
+        program.clear_hash_build_signature(hash_table_id);
+    }
+
+    let build_key_start_reg = program.alloc_registers(num_keys);
+    let mut build_rowid_reg = None;
+    let mut build_iter_cursor_id = hash_build_cursor_id;
+    if let Some(input) = materialized_input {
+        match &input.mode {
+            MaterializedBuildInputMode::RowidOnly => {
+                build_rowid_reg = Some(program.alloc_register());
+                build_iter_cursor_id = input.cursor_id;
+            }
+            MaterializedBuildInputMode::KeyPayload { .. } => {
+                build_iter_cursor_id = input.cursor_id;
+            }
+        }
+    }
+
+    let (key_source_cursor_id, payload_source_cursor_id, hash_build_rowid_cursor_id) =
+        if use_materialized_keys {
+            (
+                build_iter_cursor_id,
+                build_iter_cursor_id,
+                build_iter_cursor_id,
+            )
+        } else {
+            (
+                hash_build_cursor_id,
+                hash_build_cursor_id,
+                hash_build_cursor_id,
+            )
+        };
+
+    // Create new loop for hash table build phase
+    let build_loop_start = program.allocate_label();
+    let build_loop_end = program.allocate_label();
+    let skip_to_next = program.allocate_label();
+    let label_hash_build_end = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: label_hash_build_end,
+    });
+
+    // This is a separate cursor from the regular table cursor so we can iterate
+    // the build side without disturbing the probe cursor.
+    if !use_materialized_keys {
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: hash_build_cursor_id,
+            root_page: btree.root_page,
+            db: build_table.database_id,
+        });
+    }
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: build_iter_cursor_id,
+        pc_if_empty: build_loop_end,
+    });
+
+    // Set cursor override so translate_expr uses the hash build cursor for this table
+    if !use_materialized_keys {
+        program.set_cursor_override(build_table.internal_id, hash_build_cursor_id);
+    }
+
+    program.preassign_label_to_next_insn(build_loop_start);
+
+    if let (Some(rowid_reg), Some(input_cursor_id)) = (build_rowid_reg, materialized_cursor_id) {
+        program.emit_column_or_rowid(input_cursor_id, 0, rowid_reg);
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: hash_build_cursor_id,
+            src_reg: rowid_reg,
+            target_pc: skip_to_next,
+        });
+    }
+
+    if !use_materialized_keys {
+        let build_only_mask =
+            TableMask::from_table_number_iter([hash_join_op.build_table_idx].into_iter());
+        for cond in predicates.iter() {
+            let mask =
+                table_mask_from_expr(&cond.expr, table_references, non_from_clause_subqueries)?;
+            if !mask.contains_table(hash_join_op.build_table_idx)
+                || !build_only_mask.contains_all(&mask)
+            {
+                continue;
+            }
+            let jump_target_when_true = program.allocate_label();
+            let condition_metadata = ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true,
+                jump_target_when_false: skip_to_next,
+                jump_target_when_null: skip_to_next,
+            };
+            translate_condition_expr(
+                program,
+                table_references,
+                &cond.expr,
+                condition_metadata,
+                &t_ctx.resolver,
+            )?;
+            program.preassign_label_to_next_insn(jump_target_when_true);
+        }
+    }
+
+    if use_materialized_keys {
+        for idx in 0..num_keys {
+            program.emit_column_or_rowid(key_source_cursor_id, idx, build_key_start_reg + idx);
+        }
+    } else {
+        for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
+            let build_expr = join_key.get_build_expr(predicates);
+            let target_reg = build_key_start_reg + idx;
+            translate_expr(
+                program,
+                Some(table_references),
+                build_expr,
+                target_reg,
+                &t_ctx.resolver,
+            )?;
+        }
+    }
+
+    // Apply affinity conversion to build keys before hashing
+    if let Some(count) = std::num::NonZeroUsize::new(num_keys) {
+        program.emit_insn(Insn::Affinity {
+            start_reg: build_key_start_reg,
+            count,
+            affinities: key_affinities.clone(),
+        });
+    }
+
+    let num_payload = payload_columns.len();
+
+    let (payload_start_reg, mut payload_info) = if num_payload > 0 {
+        let payload_reg = program.alloc_registers(num_payload);
+        for (i, &col_idx) in payload_signature_columns.iter().enumerate() {
+            program.emit_column_or_rowid(payload_source_cursor_id, col_idx, payload_reg + i);
+        }
+        (
+            Some(payload_reg),
+            HashBuildPayloadInfo {
+                payload_columns,
+                key_affinities: key_affinities.clone(),
+                use_bloom_filter: false,
+                bloom_filter_cursor_id,
+                allow_seek,
+            },
+        )
+    } else {
+        (
+            None,
+            HashBuildPayloadInfo {
+                payload_columns: vec![],
+                key_affinities: key_affinities.clone(),
+                use_bloom_filter: false,
+                bloom_filter_cursor_id,
+                allow_seek,
+            },
+        )
+    };
+
+    if !use_materialized_keys {
+        program.clear_cursor_override(build_table.internal_id);
+    }
+
     // Insert current row into hash table with payload columns.
     program.emit_insn(Insn::HashBuild {
-        cursor_id: hash_build_cursor_id,
-        key_start_reg: build_key_start_reg,
-        num_keys,
-        hash_table_id,
-        mem_budget: hash_join_op.mem_budget,
-        collations,
-        payload_start_reg,
-        num_payload,
+        data: Box::new(HashBuildData {
+            cursor_id: hash_build_rowid_cursor_id,
+            key_start_reg: build_key_start_reg,
+            num_keys,
+            hash_table_id,
+            mem_budget: hash_join_op.mem_budget,
+            collations,
+            payload_start_reg,
+            num_payload,
+        }),
     });
+    if use_bloom_filter {
+        program.emit_insn(Insn::FilterAdd {
+            cursor_id: bloom_filter_cursor_id,
+            key_reg: build_key_start_reg,
+            num_keys,
+        });
+        payload_info.use_bloom_filter = true;
+    }
 
     program.preassign_label_to_next_insn(skip_to_next);
     program.emit_insn(Insn::Next {
-        cursor_id: hash_build_cursor_id,
+        cursor_id: build_iter_cursor_id,
         pc_if_next: build_loop_start,
     });
 
     program.preassign_label_to_next_insn(build_loop_end);
     program.emit_insn(Insn::HashBuildFinalize { hash_table_id });
+    program.record_hash_build_signature(hash_table_id, signature);
 
     program.preassign_label_to_next_insn(label_hash_build_end);
     Ok(payload_info)
+}
+
+/// Emit bytecode for a multi-index scan (OR-by-union or AND-by-intersection).
+///
+/// For *Union (OR)*: scans each index branch separately, collecting rowids into a RowSet
+/// for deduplication, then reads from the RowSet to fetch actual rows.
+///
+/// For *Intersection (AND)*: uses two RowSets. First branch populates rowset1,
+/// subsequent branches test against rowset1 and add found rows to rowset2.
+/// Only rowids appearing in ALL branches end up in the final result.
+#[allow(clippy::too_many_arguments)]
+fn emit_multi_index_scan_loop(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    table: &JoinedTable,
+    table_references: &TableReferences,
+    multi_idx_op: &MultiIndexScanOp,
+    loop_start: BranchOffset,
+    loop_end: BranchOffset,
+    _next: BranchOffset,
+) -> Result<()> {
+    let table_cursor_id = program.resolve_cursor_id(&CursorKey::table(table.internal_id));
+
+    // Allocate register for rowid during collection and final fetch
+    let rowid_reg = program.alloc_register();
+
+    // For intersection, we need two rowsets (swap between them for multi-way intersection)
+    // For union, we only need one rowset
+    let is_intersection = multi_idx_op.set_op == SetOperation::Intersection;
+
+    // Allocate registers for RowSets
+    let rowset1_reg = program.alloc_register();
+    let rowset2_reg = if is_intersection {
+        program.alloc_register()
+    } else {
+        rowset1_reg // Union only uses one rowset
+    };
+
+    // Initialize RowSet(s) to NULL (empty)
+    program.emit_insn(Insn::Null {
+        dest: rowset1_reg,
+        dest_end: None,
+    });
+    if is_intersection {
+        program.emit_insn(Insn::Null {
+            dest: rowset2_reg,
+            dest_end: None,
+        });
+    }
+
+    // For intersection, we track which rowset to read from and write to
+    // First branch writes to rowset1, subsequent branches read from current and write to next
+    let mut current_read_rowset = rowset1_reg;
+    let mut current_write_rowset = if is_intersection {
+        rowset2_reg
+    } else {
+        rowset1_reg
+    };
+
+    // Emit each index branch - collect rowids into RowSet
+    for (branch_idx, branch) in multi_idx_op.branches.iter().enumerate() {
+        let branch_loop_start = program.allocate_label();
+        let branch_loop_end = program.allocate_label();
+        let branch_next = program.allocate_label();
+
+        // For intersection after first branch, we need a label for "found in previous rowset"
+        let found_in_prev_label = if is_intersection && branch_idx > 0 {
+            Some(program.allocate_label())
+        } else {
+            None
+        };
+
+        let seek_def = &branch.seek_def;
+        let is_index = branch.index.is_some();
+        let branch_cursor_id = if let Some(index) = &branch.index {
+            program.resolve_cursor_id(&CursorKey::index(table.internal_id, index.clone()))
+        } else {
+            // Rowid-based access
+            table_cursor_id
+        };
+
+        // Reuse regular seek emission so multi-index branches honor start/end bounds
+        // and NULL-key behavior exactly the same as non-multi-index scans.
+        let max_key_regs = seek_def
+            .size(&seek_def.start)
+            .max(seek_def.size(&seek_def.end))
+            .max(1);
+        let key_start_reg = program.alloc_registers(max_key_regs);
+        emit_seek(
+            program,
+            table_references,
+            seek_def,
+            t_ctx,
+            branch_cursor_id,
+            key_start_reg,
+            branch_loop_end,
+            branch.index.as_ref(),
+            false, // multi-index branches never use ephemeral autoindex bloom filters
+        )?;
+        emit_seek_termination(
+            program,
+            table_references,
+            seek_def,
+            t_ctx,
+            branch_cursor_id,
+            key_start_reg,
+            branch_loop_start,
+            branch_loop_end,
+            branch.index.as_ref(),
+        )?;
+
+        // Get rowid from the branch cursor.
+        if is_index {
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: branch_cursor_id,
+                dest: rowid_reg,
+            });
+        } else {
+            program.emit_insn(Insn::RowId {
+                cursor_id: branch_cursor_id,
+                dest: rowid_reg,
+            });
+        }
+
+        // Note: For Union, we use RowSetAdd (not RowSetTest) for all branches.
+        // Deduplication happens in RowSetRead via sort + dedup.
+        // For Intersection, batch semantics are handled in the intersection-specific code.
+        if is_intersection {
+            if branch_idx == 0 {
+                // First branch: just add to rowset1
+                program.emit_insn(Insn::RowSetAdd {
+                    rowset_reg: rowset1_reg,
+                    value_reg: rowid_reg,
+                });
+            } else {
+                // Subsequent branches: test against previous rowset
+                program.emit_insn(Insn::RowSetTest {
+                    rowset_reg: current_read_rowset,
+                    pc_if_found: found_in_prev_label.unwrap(),
+                    value_reg: rowid_reg,
+                    batch: -1, // Test only, no insert
+                });
+                // Not found - skip to next
+                program.emit_insn(Insn::Goto {
+                    target_pc: branch_next,
+                });
+                // Found - add to result rowset
+                program.preassign_label_to_next_insn(found_in_prev_label.unwrap());
+                program.emit_insn(Insn::RowSetAdd {
+                    rowset_reg: current_write_rowset,
+                    value_reg: rowid_reg,
+                });
+            }
+        } else {
+            // Union: Just add all rowids, RowSetRead will deduplicate
+            program.emit_insn(Insn::RowSetAdd {
+                rowset_reg: rowset1_reg,
+                value_reg: rowid_reg,
+            });
+        }
+
+        program.preassign_label_to_next_insn(branch_next);
+        match seek_def.iter_dir {
+            IterationDirection::Forwards => program.emit_insn(Insn::Next {
+                cursor_id: branch_cursor_id,
+                pc_if_next: branch_loop_start,
+            }),
+            IterationDirection::Backwards => program.emit_insn(Insn::Prev {
+                cursor_id: branch_cursor_id,
+                pc_if_prev: branch_loop_start,
+            }),
+        }
+        program.preassign_label_to_next_insn(branch_loop_end);
+
+        // For intersection with more than 2 branches, swap the rowsets
+        // so the next iteration reads from what we just wrote and writes to the other
+        if is_intersection && branch_idx > 0 && branch_idx < multi_idx_op.branches.len() - 1 {
+            std::mem::swap(&mut current_read_rowset, &mut current_write_rowset);
+            // Re-initialize the write rowset for the next iteration
+            program.emit_insn(Insn::Null {
+                dest: current_write_rowset,
+                dest_end: None,
+            });
+        }
+    }
+
+    // Determine which rowset to read from for final results
+    let final_rowset = if is_intersection && multi_idx_op.branches.len() > 1 {
+        // For intersection:
+        // - Branch 0: writes to rowset1 (rowset1 is write-only, never tested)
+        // - Branch 1: tests against rowset1, writes matches to rowset2
+        // - Branch 2: tests against rowset2, writes matches to rowset1 (after swap)
+        // - etc.
+        //
+        // After N branches, the results are in the rowset that branch N-1 wrote to.
+        // Branch 0 writes to rowset1, branch 1 writes to rowset2, branch 2 writes to rowset1...
+        // Number of swaps = N - 2 (swaps happen after branches 1, 2, ... N-2)
+        //
+        // For 2 branches: 0 swaps, final is rowset2 (branch 1 wrote there)
+        // For 3 branches: 1 swap, final is rowset1 (branch 2 wrote there after swap)
+        // For 4 branches: 2 swaps, final is rowset2
+        //
+        // Pattern: N branches -> (N-2) swaps
+        // If (N-2) is even -> rowset2, if odd -> rowset1
+        let num_swaps = multi_idx_op.branches.len().saturating_sub(2);
+        if num_swaps % 2 == 0 {
+            rowset2_reg
+        } else {
+            rowset1_reg
+        }
+    } else {
+        rowset1_reg
+    };
+
+    // Now read from RowSet and fetch actual rows
+    program.preassign_label_to_next_insn(loop_start);
+    program.emit_insn(Insn::RowSetRead {
+        rowset_reg: final_rowset,
+        pc_if_empty: loop_end,
+        dest_reg: rowid_reg,
+    });
+
+    // Seek to the row in the table
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: table_cursor_id,
+        src_reg: rowid_reg,
+        target_pc: skip_label,
+    });
+
+    // Cache the rowid expression for later use
+    let rowid_expr = Expr::RowId {
+        database: None,
+        table: table.internal_id,
+    };
+    t_ctx
+        .resolver
+        .expr_to_reg_cache
+        .push((Cow::Owned(rowid_expr), rowid_reg));
+
+    program.preassign_label_to_next_insn(skip_label);
+
+    Ok(())
 }
 
 /// Set up the main query execution loop
@@ -603,6 +1063,7 @@ pub fn open_loop(
     mode: OperationMode,
     subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
+    let live_table_ids: HashSet<_> = join_order.iter().map(|member| member.table_id).collect();
     for (join_index, join) in join_order.iter().enumerate() {
         let joined_table_index = join.original_idx;
         let table = &table_references.joined_tables()[joined_table_index];
@@ -704,29 +1165,52 @@ pub fn open_loop(
                         program.preassign_label_to_next_insn(loop_start);
                     }
                     (Scan::Subquery, Table::FromClauseSubquery(from_clause_subquery)) => {
-                        let (yield_reg, coroutine_implementation_start) =
-                            match &from_clause_subquery.plan.query_destination {
-                                QueryDestination::CoroutineYield {
-                                    yield_reg,
-                                    coroutine_implementation_start,
-                                } => (*yield_reg, *coroutine_implementation_start),
-                                _ => unreachable!("Subquery table with non-subquery query type"),
-                            };
-                        // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
-                        program.emit_insn(Insn::InitCoroutine {
-                            yield_reg,
-                            jump_on_definition: BranchOffset::Offset(0),
-                            start_offset: coroutine_implementation_start,
-                        });
-                        program.preassign_label_to_next_insn(loop_start);
-                        // A subquery within the main loop of a parent query has no cursor, so instead of advancing the cursor,
-                        // it emits a Yield which jumps back to the main loop of the subquery itself to retrieve the next row.
-                        // When the subquery coroutine completes, this instruction jumps to the label at the top of the termination_label_stack,
-                        // which in this case is the end of the Yield-Goto loop in the parent query.
-                        program.emit_insn(Insn::Yield {
-                            yield_reg,
-                            end_offset: loop_end,
-                        });
+                        match from_clause_subquery.plan.select_query_destination() {
+                            Some(QueryDestination::CoroutineYield {
+                                yield_reg,
+                                coroutine_implementation_start,
+                            }) => {
+                                // Coroutine-based subquery execution
+                                // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
+                                program.emit_insn(Insn::InitCoroutine {
+                                    yield_reg: *yield_reg,
+                                    jump_on_definition: BranchOffset::Offset(0),
+                                    start_offset: *coroutine_implementation_start,
+                                });
+                                program.preassign_label_to_next_insn(loop_start);
+                                // A subquery within the main loop of a parent query has no cursor, so instead of advancing the cursor,
+                                // it emits a Yield which jumps back to the main loop of the subquery itself to retrieve the next row.
+                                // When the subquery coroutine completes, this instruction jumps to the label at the top of the termination_label_stack,
+                                // which in this case is the end of the Yield-Goto loop in the parent query.
+                                program.emit_insn(Insn::Yield {
+                                    yield_reg: *yield_reg,
+                                    end_offset: loop_end,
+                                });
+                            }
+                            Some(QueryDestination::EphemeralTable { cursor_id, .. }) => {
+                                // Materialized CTE - scan the ephemeral table with Rewind/Next
+                                program.emit_insn(Insn::Rewind {
+                                    cursor_id: *cursor_id,
+                                    pc_if_empty: loop_end,
+                                });
+                                program.preassign_label_to_next_insn(loop_start);
+                                // Emit Column instructions to read from the ephemeral table
+                                // into the result registers at the start of each iteration
+                                if let Some(start_reg) =
+                                    from_clause_subquery.result_columns_start_reg
+                                {
+                                    for col_idx in 0..from_clause_subquery.columns.len() {
+                                        program.emit_insn(Insn::Column {
+                                            cursor_id: *cursor_id,
+                                            column: col_idx,
+                                            dest: start_reg + col_idx,
+                                            default: None,
+                                        });
+                                    }
+                                }
+                            }
+                            _ => unreachable!("Subquery table with unexpected query destination"),
+                        }
                     }
                     _ => unreachable!(
                         "{:?} scan cannot be used with {:?} table",
@@ -743,14 +1227,18 @@ pub fn open_loop(
                 }
             }
             Operation::Search(search) => {
-                assert!(
-                    !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "Subqueries do not support index seeks"
-                );
+                // Check if this is a FROM clause subquery with a materialized ephemeral index
+                let is_materialized_subquery = matches!(&table.table, Table::FromClauseSubquery(_))
+                    && matches!(search, Search::Seek { index: Some(idx), .. } if idx.ephemeral);
+
                 // Open the loop for the index search.
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
                 match search {
                     Search::RowidEq { cmp_expr } => {
+                        assert!(
+                            !matches!(table.table, Table::FromClauseSubquery(_)),
+                            "Subqueries do not support rowid seeks"
+                        );
                         let src_reg = program.alloc_register();
                         translate_expr(
                             program,
@@ -772,7 +1260,9 @@ pub fn open_loop(
                         // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
                         let mut bloom_filter = false;
                         if let Some(index) = index {
-                            if index.ephemeral {
+                            if index.ephemeral && !is_materialized_subquery {
+                                // For regular tables with ephemeral indexes, build the auto-index now.
+                                // For materialized subqueries, the index was already built during emission.
                                 let table_has_rowid = if let Table::BTree(btree) = &table.table {
                                     btree.has_rowid
                                 } else {
@@ -797,13 +1287,18 @@ pub fn open_loop(
                             }
                         }
 
-                        let seek_cursor_id = temp_cursor_id.unwrap_or_else(|| {
-                            index_cursor_id.unwrap_or_else(|| {
-                                table_cursor_id.expect(
-                                    "Either ephemeral or index or table cursor must be opened",
-                                )
+                        // For materialized subqueries, use the index cursor directly
+                        let seek_cursor_id = if is_materialized_subquery {
+                            index_cursor_id.expect("materialized subquery must have index cursor")
+                        } else {
+                            temp_cursor_id.unwrap_or_else(|| {
+                                index_cursor_id.unwrap_or_else(|| {
+                                    table_cursor_id.expect(
+                                        "Either ephemeral or index or table cursor must be opened",
+                                    )
+                                })
                             })
-                        });
+                        };
 
                         let max_registers = seek_def
                             .size(&seek_def.start)
@@ -832,13 +1327,36 @@ pub fn open_loop(
                             index.as_ref(),
                         )?;
 
-                        if let Some(index_cursor_id) = index_cursor_id {
-                            if let Some(table_cursor_id) = table_cursor_id {
-                                // Don't do a btree table seek until it's actually necessary to read from the table.
-                                program.emit_insn(Insn::DeferredSeek {
-                                    index_cursor_id,
-                                    table_cursor_id,
-                                });
+                        if is_materialized_subquery {
+                            // For materialized subqueries with seek indexes, emit Column
+                            // instructions to populate result registers from the covering index.
+                            // The index contains all columns so we can read directly from it.
+                            if let Table::FromClauseSubquery(from_clause_subquery) = &table.table {
+                                if let Some(start_reg) =
+                                    from_clause_subquery.result_columns_start_reg
+                                {
+                                    let index_cursor = index_cursor_id
+                                        .expect("materialized subquery must have index cursor");
+                                    for col_idx in 0..from_clause_subquery.columns.len() {
+                                        program.emit_insn(Insn::Column {
+                                            cursor_id: index_cursor,
+                                            column: col_idx,
+                                            dest: start_reg + col_idx,
+                                            default: None,
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            // Only emit DeferredSeek for non-subquery tables
+                            if let Some(index_cursor_id) = index_cursor_id {
+                                if let Some(table_cursor_id) = table_cursor_id {
+                                    // Don't do a btree table seek until it's actually necessary to read from the table.
+                                    program.emit_insn(Insn::DeferredSeek {
+                                        index_cursor_id,
+                                        table_cursor_id,
+                                    });
+                                }
                             }
                         }
                     }
@@ -877,18 +1395,45 @@ pub fn open_loop(
                 // Get build table info for cursor resolution and hash table reference
                 let build_table = &table_references.joined_tables()[hash_join_op.build_table_idx];
                 let (build_cursor_id, _) = build_table.resolve_cursors(program, mode.clone())?;
-                let build_cursor_id = build_cursor_id.expect("Build table must have a cursor");
+                let build_cursor_id = if let Some(cursor_id) = build_cursor_id {
+                    cursor_id
+                } else {
+                    let btree = build_table
+                        .btree()
+                        .expect("Hash join build table must be a BTree table");
+                    let cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
+                        CursorKey::table(build_table.internal_id),
+                        CursorType::BTreeTable(btree.clone()),
+                    );
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id,
+                        root_page: btree.root_page,
+                        db: build_table.database_id,
+                    });
+                    cursor_id
+                };
 
                 // Allocate a separate cursor for the hash build phase.
-                // This allows the build table to be iterated during hash build
-                // even if it's also being used as a probe table for another hash join.
+                // This keeps the build scan independent from the probe cursor.
+                let hash_table_id: usize = build_table.internal_id.into();
                 let btree = build_table
                     .btree()
                     .expect("Hash join build table must be a BTree table");
-                let hash_build_cursor_id =
-                    program.alloc_cursor_id(CursorType::BTreeTable(btree.clone()));
+                let hash_build_cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
+                    CursorKey::hash_build(build_table.internal_id),
+                    CursorType::BTreeTable(btree.clone()),
+                );
+                let payload_info = emit_hash_build_phase(
+                    program,
+                    t_ctx,
+                    table_references,
+                    subqueries,
+                    predicates,
+                    hash_join_op,
+                    hash_build_cursor_id,
+                    hash_table_id,
+                )?;
 
-                let hash_table_id: usize = build_table.internal_id.into();
                 let num_keys = hash_join_op.join_keys.len();
 
                 // Hash Table Probe Phase
@@ -898,17 +1443,6 @@ pub fn open_loop(
                     cursor_id: probe_cursor_id,
                     pc_if_empty: loop_end,
                 });
-                // TODO: enable bloom filter for hash joins, probably should wait until we have
-                // more metadata about build table size, etc.
-                let payload_info = emit_hash_build_phase(
-                    program,
-                    t_ctx,
-                    table_references,
-                    predicates,
-                    hash_join_op,
-                    hash_build_cursor_id,
-                    hash_table_id,
-                )?;
 
                 program.preassign_label_to_next_insn(loop_start);
 
@@ -925,6 +1459,24 @@ pub fn open_loop(
                     )?;
                 }
 
+                // Apply affinity conversion to probe keys before hashing to match build keys
+                if let Some(count) = std::num::NonZeroUsize::new(num_keys) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: probe_key_start_reg,
+                        count,
+                        affinities: payload_info.key_affinities.clone(),
+                    });
+                }
+
+                if payload_info.use_bloom_filter {
+                    program.emit_insn(Insn::Filter {
+                        cursor_id: payload_info.bloom_filter_cursor_id,
+                        target_pc: next,
+                        key_reg: probe_key_start_reg,
+                        num_keys,
+                    });
+                }
+
                 // Allocate payload destination registers if we have payload columns
                 let num_payload = payload_info.payload_columns.len();
                 let payload_dest_reg = if num_payload > 0 {
@@ -936,13 +1488,13 @@ pub fn open_loop(
                 // Probe hash table with keys, store matched rowid and payload in registers
                 let match_reg = program.alloc_register();
                 program.emit_insn(Insn::HashProbe {
-                    hash_table_id,
-                    key_start_reg: probe_key_start_reg,
-                    num_keys,
-                    dest_reg: match_reg,
+                    hash_table_id: to_u16(hash_table_id),
+                    key_start_reg: to_u16(probe_key_start_reg),
+                    num_keys: to_u16(num_keys),
+                    dest_reg: to_u16(match_reg),
                     target_pc: next,
-                    payload_dest_reg,
-                    num_payload,
+                    payload_dest_reg: payload_dest_reg.map(to_u16),
+                    num_payload: to_u16(num_payload),
                 });
 
                 // Label for match processing, HashNext jumps here to avoid re-probing
@@ -966,30 +1518,76 @@ pub fn open_loop(
 
                 // Add payload columns to resolver's cache so translate_expr will
                 // use Copy from payload registers instead of reading from cursor.
+                t_ctx.resolver.enable_expr_to_reg_cache();
+                let rowid_expr = Expr::RowId {
+                    database: None,
+                    table: build_table.internal_id,
+                };
+                let payload_has_build_rowid = payload_columns.iter().any(|payload| {
+                    matches!(
+                        payload,
+                        MaterializedColumnRef::RowId { table_id } if *table_id == build_table.internal_id
+                    )
+                });
+                let build_table_is_live = live_table_ids.contains(&build_table.internal_id);
+                if payload_info.allow_seek && !payload_has_build_rowid && !build_table_is_live {
+                    t_ctx
+                        .resolver
+                        .expr_to_reg_cache
+                        .push((Cow::Owned(rowid_expr), match_reg));
+                }
                 if let Some(payload_reg) = payload_dest_reg {
-                    t_ctx.resolver.enable_expr_to_reg_cache();
-                    for (i, &col_idx) in payload_columns.iter().enumerate() {
-                        let column = build_table.columns().get(col_idx);
-                        let is_rowid_alias = column.is_some_and(|c| c.is_rowid_alias());
-                        let expr = Expr::Column {
-                            database: None,
-                            table: build_table.internal_id,
-                            column: col_idx,
-                            is_rowid_alias,
+                    for (i, payload) in payload_columns.iter().enumerate() {
+                        let (payload_table_id, expr) = match payload {
+                            MaterializedColumnRef::Column {
+                                table_id,
+                                column_idx,
+                                is_rowid_alias,
+                            } => (
+                                *table_id,
+                                Expr::Column {
+                                    database: None,
+                                    table: *table_id,
+                                    column: *column_idx,
+                                    is_rowid_alias: *is_rowid_alias,
+                                },
+                            ),
+                            MaterializedColumnRef::RowId { table_id } => (
+                                *table_id,
+                                Expr::RowId {
+                                    database: None,
+                                    table: *table_id,
+                                },
+                            ),
                         };
+                        if live_table_ids.contains(&payload_table_id) {
+                            continue;
+                        }
                         t_ctx
                             .resolver
                             .expr_to_reg_cache
                             .push((Cow::Owned(expr), payload_reg + i));
                     }
-                } else {
-                    // When payload doesnt contain all needed columns, we still need to SeekRowid
+                } else if payload_info.allow_seek && !build_table_is_live {
+                    // When payload doesn't contain all needed columns, SeekRowid to the build table.
                     program.emit_insn(Insn::SeekRowid {
                         cursor_id: build_cursor_id,
                         src_reg: match_reg,
                         target_pc: hash_next_label,
                     });
                 }
+            }
+            Operation::MultiIndexScan(multi_idx_op) => {
+                emit_multi_index_scan_loop(
+                    program,
+                    t_ctx,
+                    table,
+                    table_references,
+                    multi_idx_op,
+                    loop_start,
+                    loop_end,
+                    next,
+                )?;
             }
         }
 
@@ -1014,6 +1612,7 @@ pub fn open_loop(
             condition_fail_target,
             true,
             subqueries,
+            SubqueryRefFilter::All,
         )?;
 
         // Set the match flag to true if this is a LEFT JOIN.
@@ -1031,29 +1630,7 @@ pub fn open_loop(
             }
         }
 
-        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
-            assert!(subquery.correlated, "subquery must be correlated");
-            let eval_at = subquery.get_eval_at(join_order)?;
-
-            if eval_at != EvalAt::Loop(join_index) {
-                continue;
-            }
-
-            let plan = subquery.consume_plan(eval_at);
-
-            emit_non_from_clause_subquery(
-                program,
-                t_ctx,
-                *plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
-        }
-
-        // Now we can emit conditions from the WHERE clause.
-        // If the right table produces a NULL row, control jumps to the point where the match flag is set.
-        // The WHERE clause conditions may reference columns from that row, so they cannot be emitted
-        // before the flag is set — the row may be filtered out by the WHERE clause.
+        // emit conditions that do not reference subquery results
         emit_conditions(
             program,
             &t_ctx,
@@ -1064,6 +1641,41 @@ pub fn open_loop(
             condition_fail_target,
             false,
             subqueries,
+            SubqueryRefFilter::WithoutSubqueryRefs,
+        )?;
+
+        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+            assert!(subquery.correlated, "subquery must be correlated");
+            let eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
+
+            if eval_at != EvalAt::Loop(join_index) {
+                continue;
+            }
+
+            let plan = subquery.consume_plan(eval_at);
+
+            emit_non_from_clause_subquery(
+                program,
+                &t_ctx.resolver,
+                *plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
+        }
+
+        // FINALLY emit conditions that DO reference subquery results.
+        // These depend on the subquery evaluation that just happened above.
+        emit_conditions(
+            program,
+            &t_ctx,
+            table_references,
+            join_order,
+            predicates,
+            join_index,
+            condition_fail_target,
+            false,
+            subqueries,
+            SubqueryRefFilter::WithSubqueryRefs,
         )?;
     }
 
@@ -1080,7 +1692,33 @@ pub fn open_loop(
     Ok(())
 }
 
+// this is used to determine the order in which WHERE conditions should be emitted
+fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        if let Expr::SubqueryResult { subquery_id, .. } = e {
+            if subqueries.iter().any(|s| s.internal_id == *subquery_id) {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubqueryRefFilter {
+    /// Emit all conditions regardless of subquery references
+    All,
+    /// Only emit conditions that do NOT reference subqueries (for early evaluation)
+    WithoutSubqueryRefs,
+    /// Only emit conditions that DO reference subqueries (for late evaluation)
+    WithSubqueryRefs,
+}
+
 #[allow(clippy::too_many_arguments)]
+/// Emits WHERE/ON predicates that must be evaluated at the current join loop.
 fn emit_conditions(
     program: &mut ProgramBuilder,
     t_ctx: &&mut TranslateCtx,
@@ -1091,12 +1729,22 @@ fn emit_conditions(
     next: BranchOffset,
     from_outer_join: bool,
     subqueries: &[NonFromClauseSubquery],
+    subquery_ref_filter: SubqueryRefFilter,
 ) -> Result<()> {
     for cond in predicates
         .iter()
         .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
         .filter(|cond| {
             cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
+        })
+        .filter(|cond| match subquery_ref_filter {
+            SubqueryRefFilter::All => true,
+            SubqueryRefFilter::WithoutSubqueryRefs => {
+                !condition_references_subquery(&cond.expr, subqueries)
+            }
+            SubqueryRefFilter::WithSubqueryRefs => {
+                condition_references_subquery(&cond.expr, subqueries)
+            }
         })
     {
         let jump_target_when_true = program.allocate_label();
@@ -1144,7 +1792,11 @@ pub fn emit_loop(
 ) -> Result<()> {
     // if we have a group by, we emit a record into the group by sorter,
     // or if the rows are already sorted, we do the group by aggregation phase directly.
-    if plan.group_by.is_some() {
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+    if has_group_by_exprs {
         return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::GroupBy);
     }
     // if we DONT have a group by, but we have aggregates, we emit without ResultRow.
@@ -1436,20 +2088,42 @@ pub fn close_loop(
                         });
                     }
                     Scan::Subquery => {
-                        // A subquery has no cursor to call Next on, so it just emits a Goto
-                        // to the Yield instruction, which in turn jumps back to the main loop of the subquery,
-                        // so that the next row from the subquery can be read.
-                        program.emit_insn(Insn::Goto {
-                            target_pc: loop_labels.loop_start,
-                        });
+                        // Check if this is a materialized CTE (EphemeralTable) or coroutine
+                        if let Table::FromClauseSubquery(subquery) = &table.table {
+                            if let Some(QueryDestination::EphemeralTable { cursor_id, .. }) =
+                                subquery.plan.select_query_destination()
+                            {
+                                // Materialized CTE - use Next to iterate
+                                program.emit_insn(Insn::Next {
+                                    cursor_id: *cursor_id,
+                                    pc_if_next: loop_labels.loop_start,
+                                });
+                            } else {
+                                // Coroutine-based subquery - use Goto to Yield
+                                program.emit_insn(Insn::Goto {
+                                    target_pc: loop_labels.loop_start,
+                                });
+                            }
+                        } else {
+                            // A subquery has no cursor to call Next on, so it just emits a Goto
+                            // to the Yield instruction, which in turn jumps back to the main loop of the subquery,
+                            // so that the next row from the subquery can be read.
+                            program.emit_insn(Insn::Goto {
+                                target_pc: loop_labels.loop_start,
+                            });
+                        }
                     }
                 }
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
             Operation::Search(search) => {
+                // Materialized subqueries with ephemeral indexes are allowed
+                let is_materialized_subquery = matches!(&table.table, Table::FromClauseSubquery(_))
+                    && matches!(search, Search::Seek { index: Some(idx), .. } if idx.ephemeral);
                 assert!(
-                    !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "Subqueries do not support index seeks"
+                    !matches!(table.table, Table::FromClauseSubquery(_))
+                        || is_materialized_subquery,
+                    "Subqueries do not support index seeks unless materialized"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
                 let iteration_cursor_id =
@@ -1459,6 +2133,9 @@ pub fn close_loop(
                     }) = &mode
                     {
                         *ephemeral_table_cursor_id
+                    } else if is_materialized_subquery {
+                        // For materialized subqueries, use the index cursor
+                        index_cursor_id.expect("materialized subquery must have index cursor")
                     } else {
                         index_cursor_id.unwrap_or_else(|| {
                             table_cursor_id
@@ -1539,6 +2216,15 @@ pub fn close_loop(
                 });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
+            Operation::MultiIndexScan(_) => {
+                // MultiIndexScan uses RowSetRead for iteration - the next is handled
+                // at the end of the RowSet read loop in emit_multi_index_scan_loop
+                program.resolve_label(loop_labels.next, program.offset());
+                program.emit_insn(Insn::Goto {
+                    target_pc: loop_labels.loop_start,
+                });
+                program.preassign_label_to_next_insn(loop_labels.loop_end);
+            }
         }
 
         // Handle OUTER JOIN logic. The reason this comes after the "loop end" mark is that we may need to still jump back
@@ -1601,16 +2287,26 @@ pub fn close_loop(
 
     // After ALL loops are closed, emit HashClose for any hash tables that were built.
     // This must happen at the very end because hash join probe loops may be nested
-    // inside outer loops that re-enter them.
-    for join in join_order.iter() {
-        let table_index = join.original_idx;
-        let table = &tables.joined_tables()[table_index];
-        if let Operation::HashJoin(hash_join_op) = &table.op {
-            let build_table = &tables.joined_tables()[hash_join_op.build_table_idx];
-            let hash_table_reg: usize = build_table.internal_id.into();
-            program.emit_insn(Insn::HashClose {
-                hash_table_id: hash_table_reg,
-            });
+    // inside outer loops that re-enter them. Hash tables used by materialization
+    // subplans can be kept open and are skipped here.
+    //
+    // When inside a nested subquery (correlated or non-correlated), skip HashClose
+    // because the hash build is protected by Once and must persist across subquery
+    // re-invocations. The hash table will be cleaned up by ProgramState::reset().
+    if !program.is_nested() {
+        for join in join_order.iter() {
+            let table_index = join.original_idx;
+            let table = &tables.joined_tables()[table_index];
+            if let Operation::HashJoin(hash_join_op) = &table.op {
+                let build_table = &tables.joined_tables()[hash_join_op.build_table_idx];
+                let hash_table_reg: usize = build_table.internal_id.into();
+                if !program.should_keep_hash_table_open(hash_table_reg) {
+                    program.emit_insn(Insn::HashClose {
+                        hash_table_id: hash_table_reg,
+                    });
+                    program.clear_hash_build_signature(hash_table_reg);
+                }
+            }
         }
     }
 
@@ -1851,6 +2547,22 @@ fn emit_seek_termination(
                 &t_ctx.resolver,
                 NoConstantOptReason::RegisterReuse,
             )?;
+            // Apply affinity to the end key (same as we do for start key).
+            // Without this, e.g. BETWEEN '15' AND '35' on a numeric column would
+            // compare '35' as a string against numeric values, causing incorrect results.
+            if is_index {
+                let affinities: String = seek_def
+                    .iter_affinity(&seek_def.end)
+                    .map(|affinity| affinity.aff_mask())
+                    .collect();
+                if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg,
+                        count: std::num::NonZeroUsize::new(num_regs).unwrap(),
+                        affinities,
+                    });
+                }
+            }
             // If the seek termination key expression is not verifiably non-NULL, we need to check whether it is NULL,
             // and if so, jump to the loop end.
             // This is to avoid returning rows for e.g. SELECT * FROM t WHERE t.x > NULL,
@@ -2003,9 +2715,9 @@ fn emit_autoindex(
     }
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: ephemeral_cols_start_reg,
-        count: num_regs_to_reserve,
-        dest_reg: record_reg,
+        start_reg: to_u16(ephemeral_cols_start_reg),
+        count: to_u16(num_regs_to_reserve),
+        dest_reg: to_u16(record_reg),
         index_name: Some(index.name.clone()),
         affinity_str: None,
     });

@@ -39,8 +39,10 @@ Welcome to Turso database manual!
       - [`sqlite3_column`](#sqlite3_column)
     - [WAL manipulation](#wal-manipulation)
       - [`libsql_wal_frame_count`](#libsql_wal_frame_count)
+  - [Journal Mode](#journal-mode)
   - [Encryption](#encryption)
   - [Vector search](#vector-search)
+  - [Full-Text Search](#full-text-search-experimental)
   - [CDC](#cdc-early-preview)
   - [Index Method](#index-method-experimental)
   - [Appendix A: Turso Internals](#appendix-a-turso-internals)
@@ -152,7 +154,6 @@ The SQL shell supports the following command line options:
 | `-V`, `--version` | Print version |
 | `--mcp` | Start a MCP server instead of the interactive shell |
 | `--experimental-encryption` | Enable experimental encryption at rest feature. **Note:** the feature is not production ready so do not use it for critical data right now. |
-| `--experimental-mvcc` | Enable experimental MVCC feature. **Note:** the feature is not production ready so do not use it for critical data right now. |
 | `--experimental-strict` | Enable experimental strict schema feature. **Note**: the feature is not production ready so do not use it for critical data right now. |
 | `--experimental-views` | Enable experimental views feature. **Note**: the feature is not production ready so do not use it for critical data right now. |
 
@@ -579,6 +580,62 @@ in the `p_frame_count` parameter.
 * The `p_frame_count` must be a valid pointer to a `u32` that will store the
 * number of frames in the WAL file.
 
+## Journal Mode
+
+Turso supports switching between different journal modes at runtime using the `PRAGMA journal_mode` statement. Journal modes control how the database handles transaction logging and durability.
+
+### Supported Modes
+
+| Mode | Description |
+|------|-------------|
+| `wal` | Write-Ahead Logging mode. The default mode for new databases. Provides good concurrency for readers and writers. |
+| `experimental_mvcc` | Multi-Version Concurrency Control mode. Enables concurrent transactions with snapshot isolation. **Note:** the feature is not production ready so do not use it for critical data right now. |
+
+> **Note:** Legacy SQLite journal modes (`delete`, `truncate`, `persist`, `memory`, `off`) are recognized but not currently supported. Attempting to switch to these modes will return an error.
+
+### Usage
+
+**Query the current journal mode:**
+
+```sql
+PRAGMA journal_mode;
+```
+
+**Switch to WAL mode:**
+
+```sql
+PRAGMA journal_mode = wal;
+```
+
+**Switch to MVCC mode:**
+
+```sql
+PRAGMA journal_mode = experimental_mvcc;
+```
+
+### Example
+
+```console
+turso> PRAGMA journal_mode;
+┌──────────────┐
+│ journal_mode │
+├──────────────┤
+│ wal          │
+└──────────────┘
+turso> PRAGMA journal_mode = experimental_mvcc;
+┌───────────────────┐
+│ journal_mode      │
+├───────────────────┤
+│ experimental_mvcc │
+└───────────────────┘
+```
+
+### Important Notes
+
+- Switching journal modes triggers a checkpoint to ensure all pending changes are persisted before the mode change.
+- When switching from MVCC to WAL mode, the MVCC log file is cleared after checkpointing.
+- Legacy SQLite databases are automatically converted to WAL mode when opened.
+
 ## Encryption
 
 The work-in-progress RFC is [here](https://github.com/tursodatabase/turso/issues/2447).
@@ -773,6 +830,176 @@ FROM documents
 ORDER BY similarity
 LIMIT 5;
 ```
+
+## Full-Text Search (Experimental)
+
+Turso provides full-text search (FTS) capabilities powered by the [Tantivy](https://github.com/quickwit-oss/tantivy) search engine library. FTS enables efficient text search with relevance ranking, boolean queries, phrase matching, and more.
+
+> **Note:** Full-text search is an experimental feature and requires the `fts` feature to be enabled at compile time.
+
+### Creating an FTS Index
+
+Create an FTS index on text columns using the `USING fts` syntax:
+
+```sql
+CREATE INDEX idx_articles ON articles USING fts (title, body);
+```
+
+You can index multiple columns in a single FTS index. The index automatically tracks inserts, updates, and deletes to the underlying table.
+
+### Tokenizer Configuration
+
+Configure how text is tokenized using the `WITH` clause:
+
+```sql
+-- Use ngram tokenizer for autocomplete/substring matching
+CREATE INDEX idx_products ON products USING fts (name) WITH (tokenizer = 'ngram');
+
+-- Use raw tokenizer for exact-match fields
+CREATE INDEX idx_tags ON articles USING fts (tag) WITH (tokenizer = 'raw');
+```
+
+**Available tokenizers:**
+
+| Tokenizer | Description | Use Case |
+|-----------|-------------|----------|
+| `default` | Lowercase, punctuation split, 40 char limit | General English text |
+| `raw` | No tokenization - exact match only | IDs, UUIDs, tags |
+| `simple` | Basic whitespace/punctuation split | Simple text without lowercase |
+| `whitespace` | Split on whitespace only | Space-separated tokens |
+| `ngram` | 2-3 character n-grams | Autocomplete, substring matching |
+
+### Field Weights
+
+Configure relative importance of indexed columns for relevance scoring:
+
+```sql
+-- Title matches are 2x more important than body matches
+CREATE INDEX idx_articles ON articles USING fts (title, body)
+WITH (weights = 'title=2.0,body=1.0');
+
+-- Combined with tokenizer
+CREATE INDEX idx_docs ON docs USING fts (name, description)
+WITH (tokenizer = 'simple', weights = 'name=3.0,description=1.0');
+```
+
+### Query Functions
+
+Turso provides three FTS functions:
+
+#### `fts_match(col1, col2, ..., 'query')`
+#### or `WHERE col1, col2 MATCH 'query'`
+
+Returns a boolean indicating if the row matches the query. Used in `WHERE` clauses:
+
+```sql
+SELECT id, title FROM articles WHERE fts_match(title, body, 'database');
+```
+
+#### `fts_score(col1, col2, ..., 'query')`
+
+Returns the BM25 relevance score for ranking results:
+
+```sql
+SELECT fts_score(title, body, 'database') as score, id, title
+FROM articles
+WHERE fts_match(title, body, 'database')
+ORDER BY score DESC
+LIMIT 10;
+```
+
+#### `fts_highlight(col1, col2, ..., before_tag, after_tag, 'query')`
+
+Returns text with matching terms wrapped in tags for display:
+
+```sql
+SELECT fts_highlight(body, '<mark>', '</mark>', 'database') as highlighted
+FROM articles
+WHERE fts_match(title, body, 'database');
+-- Returns: "Learn about <mark>database</mark> optimization"
+```
+
+### Query Syntax
+
+The query string supports Tantivy's query syntax:
+[docs](https://docs.rs/tantivy/latest/tantivy/query/struct.QueryParser.html)
+
+| Syntax | Example | Description |
+|--------|---------|-------------|
+| Single term | `database` | Match documents containing "database" |
+| Multiple terms (OR) | `database sql` | Match documents with "database" OR "sql" |
+| AND operator | `database AND sql` | Match documents with both terms |
+| NOT operator | `database NOT nosql` | Match "database" but exclude "nosql" |
+| Phrase search | `"full text search"` | Match exact phrase |
+| Prefix search | `data*` | Match terms starting with "data" |
+| Column filter | `title:database` | Match "database" only in title field |
+| Boosting | `title:database^2` | Boost matches in title field |
+
+### Complex Queries
+
+FTS functions work with additional WHERE conditions:
+
+```sql
+SELECT id, title, fts_score(title, body, 'Rust') as score
+FROM articles
+WHERE fts_match(title, body, 'Rust')
+  AND category = 'tech'
+  AND published = 1
+ORDER BY score DESC;
+```
+
+### Index Maintenance
+
+Use `OPTIMIZE INDEX` to merge Tantivy segments for better query performance:
+
+```sql
+-- Optimize a specific FTS index
+OPTIMIZE INDEX idx_articles;
+
+-- Optimize all FTS indexes
+OPTIMIZE INDEX;
+```
+
+Run optimization after bulk inserts or when query performance degrades.
+
+### Example: Building a Search Feature
+
+```sql
+-- Create a documents table
+CREATE TABLE documents (
+    id INTEGER PRIMARY KEY,
+    title TEXT,
+    content TEXT,
+    category TEXT
+);
+
+-- Create FTS index with weighted fields
+CREATE INDEX fts_docs ON documents USING fts (title, content)
+WITH (weights = 'title=2.0,content=1.0');
+
+-- Insert documents
+INSERT INTO documents VALUES
+    (1, 'Introduction to SQL', 'Learn SQL basics and queries', 'tutorial'),
+    (2, 'Advanced SQL Techniques', 'Complex joins and optimization', 'tutorial'),
+    (3, 'Database Design', 'Schema design best practices', 'architecture');
+
+-- Search with relevance ranking
+SELECT
+    id,
+    title,
+    fts_score(title, content, 'SQL') as score,
+    fts_highlight(content, '<b>', '</b>', 'SQL') as snippet
+FROM documents
+WHERE fts_match(title, content, 'SQL')
+ORDER BY score DESC;
+```
+
+### Limitations
+
+| Limitation | Description |
+|------------|-------------|
+| No MATCH operator | Use `fts_match()` function instead of `WHERE table MATCH 'query'` |
+| No read-your-writes in transaction | FTS changes visible only after COMMIT |
 
 ## CDC (Early Preview)
 
@@ -1108,8 +1335,7 @@ To know if a function does any sort of I/O we just have to look at the function 
 The `IOResult` struct looks as follows:
   ```rust
   pub enum IOCompletions {
-    Single(Arc<Completion>),
-    Many(Vec<Arc<Completion>>),
+    Single(Completion),
   }
 
   #[must_use]
@@ -1117,6 +1343,14 @@ The `IOResult` struct looks as follows:
     Done(T),
     IO(IOCompletions),
   }
+  ```
+
+To combine multiple completions, use `CompletionGroup`:
+  ```rust
+  let mut group = CompletionGroup::new(|_| {});
+  group.add(&completion1);
+  group.add(&completion2);
+  let combined = group.build();  // Single completion that waits for all
   ```
 
 This implies that when a function returns an `IOResult`, it must be called again until it returns an `IOResult::Done` variant. This works similarly to how `Future`s are polled in rust. When you receive a `Poll::Ready(None)`, it means that the future stopped it's execution. In a similar vein, if we receive `IOResult::Done`, the function/state machine has reached the end of it's execution. `IOCompletions` is here to signal that, if we are executing any I/O operation, that we need to propagate the completions that are generated from it. This design forces us to handle the fact that a function is asynchronous in nature. This is essentially [function coloring](https://www.tedinski.com/2018/11/13/function-coloring.html), but done at the application level instead of the compiler level.

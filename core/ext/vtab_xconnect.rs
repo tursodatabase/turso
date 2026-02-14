@@ -1,4 +1,4 @@
-use crate::{types::Value, Connection, Statement, StepResult};
+use crate::{types::Value, Connection, LimboError, Statement};
 use std::{
     boxed::Box,
     ffi::{c_char, c_void, CStr, CString},
@@ -47,31 +47,26 @@ pub unsafe extern "C" fn execute(
                         );
                     }
                 }
-                loop {
-                    match stmt.step() {
-                        Ok(StepResult::Row) => {
-                            tracing::error!("execute used for query returning a row");
-                            return ResultCode::Error;
-                        }
-                        Ok(StepResult::Done) => {
-                            *last_insert_rowid = conn.last_insert_rowid();
-                            return ResultCode::OK;
-                        }
-                        Ok(StepResult::IO) => {
-                            let res = stmt.run_once();
-                            if res.is_err() {
-                                return ResultCode::Error;
-                            }
-                            continue;
-                        }
-                        Ok(StepResult::Interrupt) => return ResultCode::Interrupt,
-                        Ok(StepResult::Busy) => return ResultCode::Busy,
-                        Err(e) => {
-                            tracing::error!("execute: failed to execute query: {:?}", e);
-                            return ResultCode::Error;
-                        }
+                let result = stmt.run_with_row_callback(|_| {
+                    Err(crate::LimboError::InternalError(String::from(
+                        "execute used for query returning a row",
+                    )))
+                });
+                let rc = match result {
+                    Ok(_) => {
+                        *last_insert_rowid = conn.last_insert_rowid();
+                        ResultCode::OK
                     }
-                }
+                    Err(err) => match err {
+                        crate::LimboError::Busy => ResultCode::Busy,
+                        crate::LimboError::Interrupt => ResultCode::Interrupt,
+                        _ => {
+                            tracing::error!("execute: failed to execute query: {:?}", err);
+                            ResultCode::Error
+                        }
+                    },
+                };
+                return rc;
             }
             Ok(None) => tracing::error!("query: no statement returned"),
             Err(e) => tracing::error!("query: failed to execute query: {:?}", e),
@@ -151,6 +146,7 @@ pub unsafe extern "C" fn stmt_bind_args_fn(ctx: *mut Stmt, idx: i32, arg: ExtVal
 /// Wraps the functionality of the core Statement::step function,
 /// preferring to handle the IO step result internally to prevent having to expose
 /// run_once. Returns the equivalent ResultCode which then maps to an external StepResult.
+/// This function is blocking
 pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
     let Ok(stmt) = Stmt::from_ptr(stmt) else {
         tracing::error!("stmt_step: failed to convert stmt to Stmt");
@@ -161,23 +157,17 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
         return ResultCode::Error;
     }
     let stmt_ctx: &mut Statement = unsafe { &mut *(stmt._ctx as *mut Statement) };
-    while let Ok(res) = stmt_ctx.step() {
-        match res {
-            StepResult::Row => return ResultCode::Row,
-            StepResult::Done => return ResultCode::EOF,
-            StepResult::IO => {
-                // always handle IO step result internally.
-                let res = stmt_ctx.run_once();
-                if res.is_err() {
-                    return ResultCode::Error;
-                }
-                continue;
-            }
-            StepResult::Interrupt => return ResultCode::Interrupt,
-            StepResult::Busy => return ResultCode::Busy,
+    let res = stmt_ctx.run_one_step_blocking(|| Ok(()), || Ok(()));
+    match res {
+        Ok(Some(_)) => ResultCode::Row,
+        Ok(None) => {
+            // Done
+            ResultCode::EOF
         }
+        Err(LimboError::Interrupt) => ResultCode::Interrupt,
+        Err(LimboError::Busy) => ResultCode::Busy,
+        Err(_) => ResultCode::Error,
     }
-    ResultCode::Error
 }
 
 /// Instead of returning a pointer to the row, sets the Stmt's 'cursor'/current_row

@@ -67,7 +67,7 @@ impl CollationSeq {
 
     #[inline(always)]
     fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
-        lhs.trim_end().cmp(rhs.trim_end())
+        lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
     }
 }
 
@@ -147,7 +147,7 @@ pub fn get_collseq_from_expr(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 
@@ -362,12 +362,14 @@ mod tests {
                 Some("foo".to_string()),
                 "text".to_string(),
                 None,
+                None,
                 Type::Text,
                 collation,
                 ColDef::default(),
             )],
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         }));
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -416,12 +418,14 @@ mod tests {
                     Some("a".to_string()),
                     "text".to_string(),
                     None,
+                    None,
                     Type::Text,
                     left,
                     ColDef::default(),
                 )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                check_constraints: vec![],
             })),
         });
         // Right table t2(id=2)
@@ -448,12 +452,14 @@ mod tests {
                     Some("b".to_string()),
                     "text".to_string(),
                     None,
+                    None,
                     Type::Text,
                     right,
                     ColDef::default(),
                 )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                check_constraints: vec![],
             })),
         });
         table_references
@@ -487,6 +493,7 @@ mod tests {
                     Some("id".to_string()),
                     "INTEGER".to_string(),
                     None,
+                    None,
                     Type::Integer,
                     collation,
                     ColDef {
@@ -499,6 +506,7 @@ mod tests {
                 )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                check_constraints: vec![],
             })),
         });
         table_references

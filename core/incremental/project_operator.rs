@@ -6,10 +6,10 @@ use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
     ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
+use crate::sync::Mutex;
+use crate::sync::{atomic::Ordering, Arc};
 use crate::types::IOResult;
 use crate::{Connection, Database, Result, Value};
-use parking_lot::Mutex;
-use std::sync::{atomic::Ordering, Arc};
 
 #[derive(Debug, Clone)]
 pub struct ProjectColumn {
@@ -57,7 +57,7 @@ impl ProjectOperator {
     ) -> crate::Result<Self> {
         // Set up internal connection for expression evaluation
         let io = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", false)?;
+        let db = Database::open_file(io, ":memory:")?;
         let internal_conn = db.connect()?;
         // Set to read-only mode and disable auto-commit since we're only evaluating expressions
         internal_conn.set_query_only(true);

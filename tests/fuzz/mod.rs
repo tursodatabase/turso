@@ -1,5 +1,9 @@
+pub mod cte;
 pub mod grammar_generator;
+pub mod journal_mode;
+pub mod orderby_collation;
 pub mod rowid_alias;
+pub mod subquery;
 pub mod test_join_optimizer;
 
 #[cfg(test)]
@@ -9,7 +13,7 @@ mod fuzz_tests {
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     use core_tester::common::{
         do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
@@ -234,10 +238,11 @@ mod fuzz_tests {
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
 
+        let is_mvcc = db.enable_mvcc;
         let opts = db.db_opts;
         let flags = db.db_flags;
         let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
-        let table_defs: [&str; 8] = [
+        let table_defs = [
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x, y, z))",
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x desc, y, z))",
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x, y desc, z))",
@@ -253,7 +258,8 @@ mod fuzz_tests {
             .map(|init_sql| builder.clone().with_init_sql(init_sql).build())
             .collect::<Vec<_>>();
         let mut pk_tuples = HashSet::new();
-        while pk_tuples.len() < 100000 {
+        let num_tuples = if is_mvcc { 10000 } else { 100000 };
+        while pk_tuples.len() < num_tuples {
             pk_tuples.insert((
                 rng.random_range(0..3000),
                 rng.random_range(0..3000),
@@ -272,20 +278,43 @@ mod fuzz_tests {
         }
         let insert = format!("INSERT INTO t VALUES {}", tuples.join(", "));
 
-        // Insert all tuples into all databases
-        let sqlite_conns = dbs
+        let tmp_dir = TempDir::new().unwrap();
+        let sqlite_paths: Vec<_> = dbs
             .iter()
-            .map(|db| rusqlite::Connection::open(db.path.clone()).unwrap())
+            .enumerate()
+            .map(|(i, db)| {
+                if is_mvcc {
+                    tmp_dir
+                        .path()
+                        .join(std::path::PathBuf::from(format!("sqlite_{i}.db")))
+                } else {
+                    db.path.clone()
+                }
+            })
+            .collect();
+        // Insert all tuples into all databases
+        // In mvcc we need to create separate databases as SQLite will not read an MVCC database
+        let sqlite_conns = sqlite_paths
+            .iter()
+            .map(|db| rusqlite::Connection::open(db).unwrap())
             .collect::<Vec<_>>();
-        for sqlite_conn in sqlite_conns.into_iter() {
+        for (i, sqlite_conn) in sqlite_conns.into_iter().enumerate() {
+            if is_mvcc {
+                sqlite_conn.execute(table_defs[i], []).unwrap();
+            }
             sqlite_conn.execute(&insert, params![]).unwrap();
             sqlite_conn.close().unwrap();
         }
-        let sqlite_conns = dbs
+        let sqlite_conns = sqlite_paths
             .iter()
-            .map(|db| rusqlite::Connection::open(db.path.clone()).unwrap())
+            .map(|db| rusqlite::Connection::open(db).unwrap())
             .collect::<Vec<_>>();
         let limbo_conns = dbs.iter().map(|db| db.connect_limbo()).collect::<Vec<_>>();
+        if is_mvcc {
+            for limbo_conn in limbo_conns.iter() {
+                limbo_conn.execute(&insert).unwrap();
+            }
+        }
 
         const COMPARISONS: [&str; 5] = ["=", "<", "<=", ">", ">="];
 
@@ -576,6 +605,7 @@ mod fuzz_tests {
         }
 
         let tables = ["t1", "t2", "t3", "t4"];
+        let mut all_inserts: Vec<String> = Vec::new();
         for (t_idx, tname) in tables.iter().enumerate() {
             for i in 0..rows {
                 let id = i + 1 + (t_idx as i64) * 10_000;
@@ -608,10 +638,50 @@ mod fuzz_tests {
 
                 sqlite_conn.execute(&stmt, params![]).unwrap();
                 limbo_conn.execute(&stmt).unwrap();
+                all_inserts.push(stmt);
             }
         }
 
-        let non_pk_cols = ["a", "b", "c", "d"];
+        let _non_pk_cols = ["a", "b", "c", "d"];
+
+        // Helper to generate a derived table (FROM clause subquery) for a given table
+        let gen_derived_table = |rng: &mut ChaCha8Rng,
+                                 table: &str,
+                                 alias: &str|
+         -> (String, Vec<&str>) {
+            let kind = rng.random_range(0..4);
+            match kind {
+                0 => {
+                    // Simple passthrough: (SELECT * FROM t) AS alias
+                    (
+                        format!("(SELECT * FROM {table}) AS {alias}"),
+                        vec!["a", "b", "c", "d"],
+                    )
+                }
+                1 => {
+                    // Select specific columns with expression: (SELECT a, b, c + d AS cd FROM t) AS alias
+                    (
+                        format!("(SELECT a, b, c, d, c + d AS cd FROM {table}) AS {alias}"),
+                        vec!["a", "b", "c", "d"],
+                    )
+                }
+                2 => {
+                    // With aggregate: (SELECT a, sum(b) AS sum_b, count(*) AS cnt FROM t GROUP BY a) AS alias
+                    (
+                        format!("(SELECT a, sum(b) AS sum_b, max(c) AS max_c, count(*) AS cnt FROM {table} GROUP BY a) AS {alias}"),
+                        vec!["a"], // Only 'a' can be used for joins
+                    )
+                }
+                3 => {
+                    // With filter: (SELECT * FROM t WHERE a IS NOT NULL) AS alias
+                    (
+                        format!("(SELECT * FROM {table} WHERE a IS NOT NULL) AS {alias}"),
+                        vec!["a", "b", "c", "d"],
+                    )
+                }
+                _ => unreachable!(),
+            }
+        };
 
         for iter in 0..iterations {
             if iter % (iterations / 100).max(1) == 0 {
@@ -626,15 +696,49 @@ mod fuzz_tests {
             let num_tables = rng.random_range(2..=4);
             let used_tables = &tables[..num_tables];
 
+            // Decide which tables to wrap in derived tables (30% chance each)
+            let use_derived: Vec<bool> = (0..num_tables).map(|_| rng.random_bool(0.3)).collect();
+
+            // Generate table references (either direct or derived) and track available join columns
+            let mut table_refs: Vec<(String, String, Vec<&str>)> = Vec::new(); // (from_expr, alias, joinable_cols)
+            for (i, &tname) in used_tables.iter().enumerate() {
+                if use_derived[i] {
+                    let alias = format!("sub_{tname}");
+                    let (derived, cols) = gen_derived_table(&mut rng, tname, &alias);
+                    table_refs.push((derived, alias, cols));
+                } else {
+                    table_refs.push((
+                        tname.to_string(),
+                        tname.to_string(),
+                        vec!["a", "b", "c", "d"],
+                    ));
+                }
+            }
+
             let mut select_cols: Vec<String> = Vec::new();
-            for t in used_tables.iter() {
-                select_cols.push(format!("{t}.id"));
+            for (_, alias, _) in table_refs.iter() {
+                // For derived tables without id column (like aggregates), we can't select id
+                // So we select the first available column for ordering
+                if alias.starts_with("sub_")
+                    && use_derived[table_refs.iter().position(|(_, a, _)| a == alias).unwrap()]
+                {
+                    // Check if this is an aggregate derived table (kind==2) by checking if only 'a' is joinable
+                    let idx = table_refs.iter().position(|(_, a, _)| a == alias).unwrap();
+                    if table_refs[idx].2.len() == 1 {
+                        select_cols.push(format!("{alias}.a"));
+                    } else {
+                        select_cols.push(format!("{alias}.a")); // Use 'a' for consistency
+                    }
+                } else {
+                    select_cols.push(format!("{alias}.id"));
+                }
             }
             let select_clause = select_cols.join(", ");
-            let mut from_clause = format!("FROM {}", used_tables[0]);
+
+            let mut from_clause = format!("FROM {}", table_refs[0].0);
             for i in 1..num_tables {
-                let left = used_tables[i - 1];
-                let right = used_tables[i];
+                let (_, left_alias, left_cols) = &table_refs[i - 1];
+                let (right_expr, right_alias, right_cols) = &table_refs[i];
 
                 let join_type = if rng.random_bool(0.5) {
                     "JOIN"
@@ -642,37 +746,55 @@ mod fuzz_tests {
                     "LEFT JOIN"
                 };
 
-                let num_preds = rng.random_range(1..=3);
+                // Find common joinable columns between left and right
+                let common_cols: Vec<&str> = left_cols
+                    .iter()
+                    .filter(|c| right_cols.contains(c))
+                    .copied()
+                    .collect();
+
+                // If no common columns (e.g., both are aggregates with only 'a'), use 'a'
+                let join_cols = if common_cols.is_empty() {
+                    vec!["a"]
+                } else {
+                    common_cols
+                };
+
+                let num_preds = rng.random_range(1..=join_cols.len().min(3));
                 let mut preds = Vec::new();
                 for _ in 0..num_preds {
-                    let col = non_pk_cols[rng.random_range(0..non_pk_cols.len())];
-                    preds.push(format!("{left}.{col} = {right}.{col}"));
+                    let col = join_cols[rng.random_range(0..join_cols.len())];
+                    preds.push(format!("{left_alias}.{col} = {right_alias}.{col}"));
                 }
                 preds.sort();
                 preds.dedup();
 
                 let on_clause = preds.join(" AND ");
-                from_clause = format!("{from_clause} {join_type} {right} ON {on_clause}");
+                from_clause = format!("{from_clause} {join_type} {right_expr} ON {on_clause}");
             }
 
-            // WHERE clause: 0..2 predicates on non-pk cols
+            // WHERE clause: 0..2 predicates on columns available in each table ref
             let mut where_parts = Vec::new();
             let num_where = rng.random_range(0..=2);
             for _ in 0..num_where {
-                let t = used_tables[rng.random_range(0..num_tables)];
-                let col = non_pk_cols[rng.random_range(0..non_pk_cols.len())];
+                let idx = rng.random_range(0..num_tables);
+                let (_, alias, cols) = &table_refs[idx];
+                if cols.is_empty() {
+                    continue;
+                }
+                let col = cols[rng.random_range(0..cols.len())];
                 let kind = rng.random_range(0..4);
                 let cond = match kind {
                     0 => {
                         let val = rng.random_range(-10..=20);
-                        format!("{t}.{col} = {val}")
+                        format!("{alias}.{col} = {val}")
                     }
                     1 => {
                         let val = rng.random_range(-10..=20);
-                        format!("{t}.{col} <> {val}")
+                        format!("{alias}.{col} <> {val}")
                     }
-                    2 => format!("{t}.{col} IS NULL"),
-                    3 => format!("{t}.{col} IS NOT NULL"),
+                    2 => format!("{alias}.{col} IS NULL"),
+                    3 => format!("{alias}.{col} IS NOT NULL"),
                     _ => unreachable!(),
                 };
                 where_parts.push(cond);
@@ -687,9 +809,23 @@ mod fuzz_tests {
             let query = format!(
                 "SELECT {select_clause} {from_clause} {where_clause} {order_clause} LIMIT {limit}",
             );
+            // Print some sample queries to verify derived table generation
+            if iter < 10 {
+                println!("query[{iter}]: {query}");
+            }
             let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
             let limbo_rows = limbo_exec_rows(&limbo_conn, &query);
             if sqlite_rows != limbo_rows {
+                // Print DDL and DML for reproduction
+                eprintln!("\n=== REPRODUCTION DDL/DML ===");
+                eprintln!("{schema}");
+                for ins in &all_inserts {
+                    eprintln!("{ins};");
+                }
+                eprintln!("\n=== FAILING QUERY ===");
+                eprintln!("{query}");
+                eprintln!("=== END ===\n");
+
                 panic!(
                 "JOIN FUZZ MISMATCH (add_indexes={})\nseed: {}\niteration: {}\nquery: {}\n\
                  sqlite ({} rows): {:?}\nlimbo ({} rows): {:?}\nsqlite path: {:?}\nlimbo path: {:?}",
@@ -1061,6 +1197,29 @@ mod fuzz_tests {
                  -- Also create a deferred child referencing the same parent
                  INSERT INTO child_deferred VALUES (NEW.id + 30000, NEW.pid, NEW.y);
                 END",
+                // BEFORE UPDATE on child_deferred using UPDATE OR IGNORE - tests OR IGNORE propagation from UPDATE
+                "CREATE TRIGGER trig_child_deferred_before_update_or_ignore BEFORE UPDATE ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_UPDATE', 'child_deferred', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_update', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Try to insert a parent that might already exist (OR IGNORE should propagate)
+                 INSERT INTO parent VALUES (NEW.pid, NEW.x, NEW.x * 2);
+                 -- Update another child_deferred row (might conflict on unique constraint)
+                 UPDATE OR IGNORE child_deferred SET x = NEW.x WHERE id = NEW.id + 1;
+                END",
+                // AFTER INSERT on parent using UPDATE OR REPLACE in trigger - tests OR REPLACE propagation
+                "CREATE TRIGGER trig_parent_after_insert_or_replace AFTER INSERT ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_INSERT', 'parent', NEW.id, NEW.a);
+                 INSERT INTO trigger_stats VALUES ('parent_after_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Use UPDATE OR REPLACE which might delete conflicting rows
+                 UPDATE OR REPLACE parent SET a = NEW.a + 1 WHERE id = NEW.id + 1;
+                END",
+                // BEFORE DELETE on child_immediate using UPDATE OR IGNORE - tests cascading with OR IGNORE
+                "CREATE TRIGGER trig_child_immediate_before_delete BEFORE DELETE ON child_immediate BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_DELETE', 'child_immediate', OLD.id, OLD.pid);
+                 INSERT INTO trigger_stats VALUES ('child_immediate_delete', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Try to update parent, ignoring if it would cause constraint violation
+                 UPDATE OR IGNORE parent SET id = OLD.pid + 50000 WHERE id = OLD.pid;
+                END",
             ];
 
             // Randomly select up to 2 triggers from the list
@@ -1427,10 +1586,10 @@ mod fuzz_tests {
                         let b = rng.random_range(-5..=25);
                         format!(
                             "INSERT {} INTO p VALUES({id}, {a}, {b})",
-                            if rng.random_bool(0.4) {
+                            if rng.random_bool(0.5) {
                                 "OR REPLACE "
                             } else {
-                                ""
+                                "OR ROLLBACK"
                             }
                         )
                     }
@@ -1470,7 +1629,7 @@ mod fuzz_tests {
                             if rng.random_bool(0.4) {
                                 "OR REPLACE "
                             } else {
-                                ""
+                                "OR FAIL"
                             }
                         )
                     }
@@ -1972,6 +2131,664 @@ mod fuzz_tests {
         println!("fk_edgecases_minifuzz complete (seed {seed})");
     }
 
+    // Fuzz test for ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT actions
+    #[turso_macros::test()]
+    pub fn fk_cascade_actions_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("fk_cascade_actions_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+        const OUTER_ITERS: usize = 50;
+        const INNER_ITERS: usize = 200;
+
+        for outer in 0..OUTER_ITERS {
+            println!("fk_cascade_actions_fuzz {}/{}", outer + 1, OUTER_ITERS);
+
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            let mut stmts: Vec<String> = Vec::new();
+            let mut log_and_exec = |sql: &str| {
+                stmts.push(sql.to_string());
+                sql.to_string()
+            };
+
+            // Enable FKs
+            let s = log_and_exec("PRAGMA foreign_keys=ON");
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Randomly pick action types for this iteration
+            let on_delete_actions = ["CASCADE", "SET NULL", "NO ACTION", "RESTRICT"];
+            let on_update_actions = ["CASCADE", "SET NULL", "NO ACTION", "RESTRICT"];
+
+            let del_action = on_delete_actions[rng.random_range(0..on_delete_actions.len())];
+            let upd_action = on_update_actions[rng.random_range(0..on_update_actions.len())];
+
+            // Parent table with INTEGER PRIMARY KEY
+            let s = log_and_exec("CREATE TABLE parent(id INTEGER PRIMARY KEY, a INT, b INT)");
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Child with CASCADE/SET NULL FK
+            let s = log_and_exec(&format!(
+                "CREATE TABLE child_cascade(id INTEGER PRIMARY KEY, pid INT, x INT, \
+                 FOREIGN KEY(pid) REFERENCES parent(id) ON DELETE {del_action} ON UPDATE {upd_action})"
+            ));
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Second child with different action combo
+            let del_action2 = on_delete_actions[rng.random_range(0..on_delete_actions.len())];
+            let upd_action2 = on_update_actions[rng.random_range(0..on_update_actions.len())];
+            let s = log_and_exec(&format!(
+                "CREATE TABLE child_mixed(id INTEGER PRIMARY KEY, pid INT, y INT, \
+                 FOREIGN KEY(pid) REFERENCES parent(id) ON DELETE {del_action2} ON UPDATE {upd_action2})"
+            ));
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Composite key parent for testing composite CASCADE
+            let s = log_and_exec(
+                "CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b))",
+            );
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Child with composite FK and CASCADE
+            let s = log_and_exec(
+                "CREATE TABLE child_comp(id INTEGER PRIMARY KEY, ca INT, cb INT, z INT, \
+                 FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) ON DELETE CASCADE ON UPDATE CASCADE)"
+            );
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Seed initial parent data
+            let mut parent_ids = std::collections::HashSet::new();
+            for _ in 0..rng.random_range(10..=30) {
+                let id = rng.random_range(1..=100) as i64;
+                if parent_ids.insert(id) {
+                    let a = rng.random_range(-5..=25);
+                    let b = rng.random_range(-5..=25);
+                    let stmt = log_and_exec(&format!("INSERT INTO parent VALUES ({id}, {a}, {b})"));
+                    limbo_exec_rows(&limbo, &stmt);
+                    sqlite.execute(&stmt, params![]).unwrap();
+                }
+            }
+
+            // Seed composite parent data
+            let mut comp_pairs = std::collections::HashSet::new();
+            for _ in 0..rng.random_range(5..=15) {
+                let a = rng.random_range(-3..=10) as i64;
+                let b = rng.random_range(-3..=10) as i64;
+                if comp_pairs.insert((a, b)) {
+                    let c = rng.random_range(0..=20);
+                    let stmt =
+                        log_and_exec(&format!("INSERT INTO parent_comp VALUES ({a}, {b}, {c})"));
+                    limbo_exec_rows(&limbo, &stmt);
+                    sqlite.execute(&stmt, params![]).unwrap();
+                }
+            }
+
+            // Seed child data
+            for _ in 0..rng.random_range(15..=40) {
+                let id = rng.random_range(1000..=2000);
+                let pid = if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                    *p
+                } else {
+                    continue;
+                };
+                let x = rng.random_range(-10..=10);
+                let stmt = log_and_exec(&format!(
+                    "INSERT OR IGNORE INTO child_cascade VALUES ({id}, {pid}, {x})"
+                ));
+                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                let _ = sqlite.execute(&stmt, params![]);
+            }
+
+            for _ in 0..rng.random_range(10..=30) {
+                let id = rng.random_range(3000..=4000);
+                let pid = if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                    *p
+                } else {
+                    continue;
+                };
+                let y = rng.random_range(-10..=10);
+                let stmt = log_and_exec(&format!(
+                    "INSERT OR IGNORE INTO child_mixed VALUES ({id}, {pid}, {y})"
+                ));
+                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                let _ = sqlite.execute(&stmt, params![]);
+            }
+
+            // Seed composite child data
+            for _ in 0..rng.random_range(8..=20) {
+                let id = rng.random_range(5000..=6000);
+                if let Some((a, b)) = comp_pairs.iter().choose(&mut rng) {
+                    let z = rng.random_range(0..=10);
+                    let stmt = log_and_exec(&format!(
+                        "INSERT OR IGNORE INTO child_comp VALUES ({id}, {a}, {b}, {z})"
+                    ));
+                    let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                    let _ = sqlite.execute(&stmt, params![]);
+                }
+            }
+
+            // Now fuzz mutations that trigger CASCADE/SET NULL behavior
+            for _ in 0..INNER_ITERS {
+                let op = rng.random_range(0..14);
+                let stmt = match op {
+                    // DELETE parent (triggers ON DELETE action)
+                    0 | 1 => {
+                        let id = if rng.random_bool(0.7) {
+                            if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                                *p
+                            } else {
+                                rng.random_range(1..=100) as i64
+                            }
+                        } else {
+                            rng.random_range(1..=150) as i64
+                        };
+                        format!("DELETE FROM parent WHERE id={id}")
+                    }
+                    // UPDATE parent PK (triggers ON UPDATE action)
+                    2 | 3 => {
+                        let old_id = if rng.random_bool(0.7) {
+                            if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                                *p
+                            } else {
+                                rng.random_range(1..=100) as i64
+                            }
+                        } else {
+                            rng.random_range(1..=150) as i64
+                        };
+                        let new_id = rng.random_range(1..=200);
+                        parent_ids.remove(&old_id);
+                        parent_ids.insert(new_id as i64);
+                        format!("UPDATE parent SET id={new_id} WHERE id={old_id}")
+                    }
+                    // DELETE composite parent (triggers composite CASCADE)
+                    4 => {
+                        if let Some((a, b)) = comp_pairs.iter().choose(&mut rng).cloned() {
+                            format!("DELETE FROM parent_comp WHERE a={a} AND b={b}")
+                        } else {
+                            let a = rng.random_range(-3..=10);
+                            let b = rng.random_range(-3..=10);
+                            format!("DELETE FROM parent_comp WHERE a={a} AND b={b}")
+                        }
+                    }
+                    // UPDATE composite parent key (triggers composite CASCADE UPDATE)
+                    5 => {
+                        if let Some((old_a, old_b)) = comp_pairs.iter().choose(&mut rng).cloned() {
+                            let new_a = rng.random_range(-5..=15);
+                            let new_b = rng.random_range(-5..=15);
+                            comp_pairs.remove(&(old_a, old_b));
+                            comp_pairs.insert((new_a as i64, new_b as i64));
+                            format!(
+                                "UPDATE parent_comp SET a={new_a}, b={new_b} WHERE a={old_a} AND b={old_b}"
+                            )
+                        } else {
+                            continue;
+                        }
+                    }
+                    // INSERT new parent
+                    6 => {
+                        let id = rng.random_range(1..=150);
+                        let a = rng.random_range(-5..=25);
+                        let b = rng.random_range(-5..=25);
+                        parent_ids.insert(id as i64);
+                        format!("INSERT OR IGNORE INTO parent VALUES({id}, {a}, {b})")
+                    }
+                    // INSERT child_cascade
+                    7 => {
+                        let id = rng.random_range(1000..=2500);
+                        let pid = if rng.random_bool(0.8) {
+                            if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                                *p
+                            } else {
+                                rng.random_range(1..=150) as i64
+                            }
+                        } else {
+                            rng.random_range(1..=150) as i64
+                        };
+                        let x = rng.random_range(-10..=10);
+                        format!("INSERT OR IGNORE INTO child_cascade VALUES({id}, {pid}, {x})")
+                    }
+                    // INSERT composite child
+                    8 => {
+                        let id = rng.random_range(5000..=6500);
+                        if let Some((a, b)) = comp_pairs.iter().choose(&mut rng) {
+                            let z = rng.random_range(0..=10);
+                            format!("INSERT OR IGNORE INTO child_comp VALUES({id}, {a}, {b}, {z})")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // DELETE child directly
+                    9 => {
+                        let id = rng.random_range(1000..=2500);
+                        format!("DELETE FROM child_cascade WHERE id={id}")
+                    }
+                    // INSERT OR REPLACE on parent (triggers ON DELETE action)
+                    10 => {
+                        let id = if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                            *p
+                        } else {
+                            rng.random_range(1..=100) as i64
+                        };
+                        let a = rng.random_range(-5..=25);
+                        let b = rng.random_range(-5..=25);
+                        parent_ids.insert(id);
+                        format!("INSERT OR REPLACE INTO parent VALUES({id}, {a}, {b})")
+                    }
+                    // INSERT OR REPLACE on composite parent (triggers ON DELETE action)
+                    11 => {
+                        if let Some((a, b)) = comp_pairs.iter().choose(&mut rng).cloned() {
+                            let c = rng.random_range(0..=20);
+                            format!("INSERT OR REPLACE INTO parent_comp VALUES({a}, {b}, {c})")
+                        } else {
+                            let a = rng.random_range(-3..=10);
+                            let b = rng.random_range(-3..=10);
+                            let c = rng.random_range(0..=20);
+                            comp_pairs.insert((a as i64, b as i64));
+                            format!("INSERT OR REPLACE INTO parent_comp VALUES({a}, {b}, {c})")
+                        }
+                    }
+                    // UPSERT on parent that updates columns (triggers ON UPDATE action)
+                    12 => {
+                        let id = if rng.random_bool(0.8) {
+                            if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                                *p
+                            } else {
+                                rng.random_range(1..=100) as i64
+                            }
+                        } else {
+                            rng.random_range(1..=150) as i64
+                        };
+                        let new_a = rng.random_range(-5..=25);
+                        let new_b = rng.random_range(-5..=25);
+                        parent_ids.insert(id);
+                        format!("INSERT INTO parent VALUES({id}, {new_a}, {new_b}) ON CONFLICT(id) DO UPDATE SET a={new_a}, b={new_b}")
+                    }
+                    // UPSERT on composite parent that updates columns (triggers ON UPDATE action)
+                    _ => {
+                        if let Some((a, b)) = comp_pairs.iter().choose(&mut rng).cloned() {
+                            let new_c = rng.random_range(0..=20);
+                            format!("INSERT INTO parent_comp VALUES({a}, {b}, {new_c}) ON CONFLICT(a,b) DO UPDATE SET c={new_c}")
+                        } else {
+                            let a = rng.random_range(-3..=10);
+                            let b = rng.random_range(-3..=10);
+                            let c = rng.random_range(0..=20);
+                            comp_pairs.insert((a as i64, b as i64));
+                            format!("INSERT INTO parent_comp VALUES({a}, {b}, {c}) ON CONFLICT(a,b) DO UPDATE SET c={c}")
+                        }
+                    }
+                };
+
+                let stmt = log_and_exec(&stmt);
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+
+                match (sres, lres) {
+                    (Ok(_), Ok(_)) => {
+                        // Verify state parity after successful operations
+                        let sp = sqlite_exec_rows(&sqlite, "SELECT id,a,b FROM parent ORDER BY id");
+                        let lp = limbo_exec_rows(&limbo, "SELECT id,a,b FROM parent ORDER BY id");
+                        let sc_cascade = sqlite_exec_rows(
+                            &sqlite,
+                            "SELECT id,pid,x FROM child_cascade ORDER BY id",
+                        );
+                        let lc_cascade = limbo_exec_rows(
+                            &limbo,
+                            "SELECT id,pid,x FROM child_cascade ORDER BY id",
+                        );
+                        let sc_mixed = sqlite_exec_rows(
+                            &sqlite,
+                            "SELECT id,pid,y FROM child_mixed ORDER BY id",
+                        );
+                        let lc_mixed =
+                            limbo_exec_rows(&limbo, "SELECT id,pid,y FROM child_mixed ORDER BY id");
+                        let sp_comp =
+                            sqlite_exec_rows(&sqlite, "SELECT a,b,c FROM parent_comp ORDER BY a,b");
+                        let lp_comp =
+                            limbo_exec_rows(&limbo, "SELECT a,b,c FROM parent_comp ORDER BY a,b");
+                        let sc_comp = sqlite_exec_rows(
+                            &sqlite,
+                            "SELECT id,ca,cb,z FROM child_comp ORDER BY id",
+                        );
+                        let lc_comp = limbo_exec_rows(
+                            &limbo,
+                            "SELECT id,ca,cb,z FROM child_comp ORDER BY id",
+                        );
+
+                        if sp != lp
+                            || sc_cascade != lc_cascade
+                            || sc_mixed != lc_mixed
+                            || sp_comp != lp_comp
+                            || sc_comp != lc_comp
+                        {
+                            eprintln!("\n=== CASCADE fuzz failure (state mismatch) ===");
+                            eprintln!("seed: {seed}, outer: {}", outer + 1);
+                            eprintln!("del_action: {del_action}, upd_action: {upd_action}");
+                            eprintln!("del_action2: {del_action2}, upd_action2: {upd_action2}");
+                            eprintln!("last stmt: {stmt}");
+                            eprintln!("sqlite parent: {sp:?}");
+                            eprintln!("limbo  parent: {lp:?}");
+                            eprintln!("sqlite child_cascade: {sc_cascade:?}");
+                            eprintln!("limbo  child_cascade: {lc_cascade:?}");
+                            eprintln!("sqlite child_mixed: {sc_mixed:?}");
+                            eprintln!("limbo  child_mixed: {lc_mixed:?}");
+                            eprintln!("sqlite parent_comp: {sp_comp:?}");
+                            eprintln!("limbo  parent_comp: {lp_comp:?}");
+                            eprintln!("sqlite child_comp: {sc_comp:?}");
+                            eprintln!("limbo  child_comp: {lc_comp:?}");
+                            eprintln!("--- replay statements ({}) ---", stmts.len());
+                            let mut file = std::fs::File::create("fk_cascade_fuzz.sql").unwrap();
+                            for s in stmts.iter() {
+                                let _ = file.write_fmt(format_args!("{s};\n"));
+                            }
+                            file.flush().unwrap();
+                            panic!(
+                                "CASCADE state mismatch, statements written to fk_cascade_fuzz.sql"
+                            );
+                        }
+                    }
+                    (Err(_), Err(_)) => { /* both failed - parity OK */ }
+                    (ok_sqlite, ok_limbo) => {
+                        eprintln!("\n=== CASCADE fuzz failure (outcome mismatch) ===");
+                        eprintln!("seed: {seed}, outer: {}", outer + 1);
+                        eprintln!("del_action: {del_action}, upd_action: {upd_action}");
+                        eprintln!("sqlite: {ok_sqlite:?}, limbo: {ok_limbo:?}");
+                        eprintln!("last stmt: {stmt}");
+                        let mut file = std::fs::File::create("fk_cascade_fuzz.sql").unwrap();
+                        for s in stmts.iter() {
+                            let _ = file.write_fmt(format_args!("{s};\n"));
+                        }
+                        file.flush().unwrap();
+                        panic!(
+                            "CASCADE outcome mismatch, statements written to fk_cascade_fuzz.sql"
+                        );
+                    }
+                }
+            }
+        }
+        println!("fk_cascade_actions_fuzz complete (seed {seed})");
+    }
+
+    // Fuzz test for recursive CASCADE (A->B->C chains)
+    #[turso_macros::test()]
+    pub fn fk_recursive_cascade_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("fk_recursive_cascade_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+        const OUTER_ITERS: usize = 25;
+        const INNER_ITERS: usize = 200;
+
+        for outer in 0..OUTER_ITERS {
+            println!("fk_recursive_cascade_fuzz {}/{}", outer + 1, OUTER_ITERS);
+
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            let mut stmts: Vec<String> = Vec::new();
+            let mut log_and_exec = |sql: &str| {
+                stmts.push(sql.to_string());
+                sql.to_string()
+            };
+
+            // Enable FKs
+            let s = log_and_exec("PRAGMA foreign_keys=ON");
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Create a 3-level hierarchy: grandparent -> parent -> child
+            // All with CASCADE to test recursive deletion/update
+            let s = log_and_exec("CREATE TABLE gp(id INTEGER PRIMARY KEY, v INT)");
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            let s = log_and_exec(
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, gp_id INT, v INT, \
+                 FOREIGN KEY(gp_id) REFERENCES gp(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+            );
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            let s = log_and_exec(
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, p_id INT, v INT, \
+                 FOREIGN KEY(p_id) REFERENCES p(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+            );
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Seed grandparents
+            let mut gp_ids = std::collections::HashSet::new();
+            for _ in 0..rng.random_range(5..=15) {
+                let id = rng.random_range(1..=50) as i64;
+                if gp_ids.insert(id) {
+                    let v = rng.random_range(0..=100);
+                    let stmt = log_and_exec(&format!("INSERT INTO gp VALUES ({id}, {v})"));
+                    limbo_exec_rows(&limbo, &stmt);
+                    sqlite.execute(&stmt, params![]).unwrap();
+                }
+            }
+
+            // Seed parents
+            let mut p_ids = std::collections::HashSet::new();
+            for _ in 0..rng.random_range(10..=30) {
+                let id = rng.random_range(100..=200) as i64;
+                if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
+                    if p_ids.insert(id) {
+                        let v = rng.random_range(0..=100);
+                        let stmt =
+                            log_and_exec(&format!("INSERT INTO p VALUES ({id}, {gp_id}, {v})"));
+                        limbo_exec_rows(&limbo, &stmt);
+                        sqlite.execute(&stmt, params![]).unwrap();
+                    }
+                }
+            }
+
+            // Seed children
+            for _ in 0..rng.random_range(20..=50) {
+                let id = rng.random_range(1000..=2000) as i64;
+                if let Some(p_id) = p_ids.iter().choose(&mut rng) {
+                    let v = rng.random_range(0..=100);
+                    let stmt = log_and_exec(&format!(
+                        "INSERT OR IGNORE INTO c VALUES ({id}, {p_id}, {v})"
+                    ));
+                    let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                    let _ = sqlite.execute(&stmt, params![]);
+                }
+            }
+
+            // Fuzz mutations on the hierarchy
+            for _ in 0..INNER_ITERS {
+                let op = rng.random_range(0..12);
+                let stmt = match op {
+                    // DELETE grandparent (should cascade to parent and child)
+                    0 | 1 => {
+                        if let Some(id) = gp_ids.iter().choose(&mut rng).cloned() {
+                            format!("DELETE FROM gp WHERE id={id}")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // UPDATE grandparent PK (should cascade update to parent's gp_id)
+                    2 => {
+                        if let Some(old_id) = gp_ids.iter().choose(&mut rng).cloned() {
+                            let new_id = rng.random_range(1..=100);
+                            gp_ids.remove(&old_id);
+                            gp_ids.insert(new_id as i64);
+                            format!("UPDATE gp SET id={new_id} WHERE id={old_id}")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // DELETE parent (should cascade to child only)
+                    3 => {
+                        if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
+                            format!("DELETE FROM p WHERE id={id}")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // UPDATE parent PK (should cascade to child's p_id)
+                    4 => {
+                        if let Some(old_id) = p_ids.iter().choose(&mut rng).cloned() {
+                            let new_id = rng.random_range(100..=300);
+                            p_ids.remove(&old_id);
+                            p_ids.insert(new_id as i64);
+                            format!("UPDATE p SET id={new_id} WHERE id={old_id}")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // INSERT new grandparent
+                    5 => {
+                        let id = rng.random_range(1..=100);
+                        let v = rng.random_range(0..=100);
+                        gp_ids.insert(id as i64);
+                        format!("INSERT OR IGNORE INTO gp VALUES({id}, {v})")
+                    }
+                    // INSERT new parent
+                    6 => {
+                        let id = rng.random_range(100..=300);
+                        if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
+                            let v = rng.random_range(0..=100);
+                            p_ids.insert(id as i64);
+                            format!("INSERT OR IGNORE INTO p VALUES({id}, {gp_id}, {v})")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // INSERT new child
+                    7 => {
+                        let id = rng.random_range(1000..=3000);
+                        if let Some(p_id) = p_ids.iter().choose(&mut rng) {
+                            let v = rng.random_range(0..=100);
+                            format!("INSERT OR IGNORE INTO c VALUES({id}, {p_id}, {v})")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // INSERT OR REPLACE on grandparent (triggers recursive cascade)
+                    8 => {
+                        if let Some(id) = gp_ids.iter().choose(&mut rng).cloned() {
+                            let v = rng.random_range(0..=100);
+                            format!("INSERT OR REPLACE INTO gp VALUES({id}, {v})")
+                        } else {
+                            let id = rng.random_range(1..=50);
+                            let v = rng.random_range(0..=100);
+                            gp_ids.insert(id as i64);
+                            format!("INSERT OR REPLACE INTO gp VALUES({id}, {v})")
+                        }
+                    }
+                    // INSERT OR REPLACE on parent (triggers cascade to children)
+                    9 => {
+                        if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
+                            if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
+                                let v = rng.random_range(0..=100);
+                                format!("INSERT OR REPLACE INTO p VALUES({id}, {gp_id}, {v})")
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    // UPSERT on grandparent that updates value (doesn't change FK key, so no cascade)
+                    10 => {
+                        if let Some(id) = gp_ids.iter().choose(&mut rng).cloned() {
+                            let new_v = rng.random_range(0..=100);
+                            format!("INSERT INTO gp VALUES({id}, {new_v}) ON CONFLICT(id) DO UPDATE SET v={new_v}")
+                        } else {
+                            let id = rng.random_range(1..=50);
+                            let v = rng.random_range(0..=100);
+                            gp_ids.insert(id as i64);
+                            format!("INSERT INTO gp VALUES({id}, {v}) ON CONFLICT(id) DO UPDATE SET v={v}")
+                        }
+                    }
+                    // UPSERT on parent that updates value (doesn't change FK key)
+                    _ => {
+                        if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
+                            if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
+                                let new_v = rng.random_range(0..=100);
+                                format!("INSERT INTO p VALUES({id}, {gp_id}, {new_v}) ON CONFLICT(id) DO UPDATE SET v={new_v}")
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+
+                let stmt = log_and_exec(&stmt);
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+
+                match (sres, lres) {
+                    (Ok(_), Ok(_)) => {
+                        // Verify state parity
+                        let s_gp = sqlite_exec_rows(&sqlite, "SELECT id,v FROM gp ORDER BY id");
+                        let l_gp = limbo_exec_rows(&limbo, "SELECT id,v FROM gp ORDER BY id");
+                        let s_p = sqlite_exec_rows(&sqlite, "SELECT id,gp_id,v FROM p ORDER BY id");
+                        let l_p = limbo_exec_rows(&limbo, "SELECT id,gp_id,v FROM p ORDER BY id");
+                        let s_c = sqlite_exec_rows(&sqlite, "SELECT id,p_id,v FROM c ORDER BY id");
+                        let l_c = limbo_exec_rows(&limbo, "SELECT id,p_id,v FROM c ORDER BY id");
+
+                        if s_gp != l_gp || s_p != l_p || s_c != l_c {
+                            eprintln!("\n=== Recursive CASCADE fuzz failure ===");
+                            eprintln!("seed: {seed}, outer: {}", outer + 1);
+                            eprintln!("last stmt: {stmt}");
+                            eprintln!("sqlite gp: {s_gp:?}");
+                            eprintln!("limbo  gp: {l_gp:?}");
+                            eprintln!("sqlite p: {s_p:?}");
+                            eprintln!("limbo  p: {l_p:?}");
+                            eprintln!("sqlite c: {s_c:?}");
+                            eprintln!("limbo  c: {l_c:?}");
+                            let mut file =
+                                std::fs::File::create("fk_recursive_cascade_fuzz.sql").unwrap();
+                            for s in stmts.iter() {
+                                let _ = file.write_fmt(format_args!("{s};\n"));
+                            }
+                            file.flush().unwrap();
+                            panic!("Recursive CASCADE mismatch");
+                        }
+                    }
+                    (Err(_), Err(_)) => {}
+                    (ok_sqlite, ok_limbo) => {
+                        eprintln!("\n=== Recursive CASCADE outcome mismatch ===");
+                        eprintln!("seed: {seed}");
+                        eprintln!("sqlite: {ok_sqlite:?}, limbo: {ok_limbo:?}");
+                        eprintln!("stmt: {stmt}");
+                        let mut file =
+                            std::fs::File::create("fk_recursive_cascade_fuzz.sql").unwrap();
+                        for s in stmts.iter() {
+                            let _ = file.write_fmt(format_args!("{s};\n"));
+                        }
+                        file.flush().unwrap();
+                        panic!("Recursive CASCADE outcome mismatch");
+                    }
+                }
+            }
+        }
+        println!("fk_recursive_cascade_fuzz complete (seed {seed})");
+    }
+
     // TODO: mvcc indexes
     #[turso_macros::test()]
     pub fn fk_composite_pk_mutation_fuzz(db: TempDatabase) {
@@ -2175,7 +2992,7 @@ mod fuzz_tests {
     /// Create a table with a random number of columns and indexes, and then randomly update or delete rows from the table.
     /// Verify that the results are the same for SQLite and Turso.
     pub fn table_index_mutation_fuzz(db: TempDatabase) {
-        let is_mvcc = db.db_opts.enable_mvcc;
+        let is_mvcc = db.enable_mvcc;
         /// Format a nice diff between two result sets for better error messages
         #[allow(clippy::too_many_arguments)]
         fn format_rows_diff(
@@ -2305,7 +3122,11 @@ mod fuzz_tests {
                 OUTER_ITERATIONS
             );
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            // For the sqlite comparison database, use a separate builder without MVCC init_sql
+            let sqlite_db = TempDatabase::builder()
+                .with_flags(flags)
+                .with_opts(opts)
+                .build();
             let num_cols = rng.random_range(1..=10);
             let mut table_cols = vec!["id INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
             table_cols.extend(
@@ -2654,19 +3475,22 @@ mod fuzz_tests {
                 }
 
                 // Run integrity check on limbo db using rusqlite
-                if let Err(e) = rusqlite_integrity_check(&limbo_db.path) {
-                    println!("{table_def};");
-                    for t in indexes.iter() {
-                        println!("{t};");
+                // Skip for MVCC databases since rusqlite can't read MVCC version (255)
+                if !is_mvcc {
+                    if let Err(e) = rusqlite_integrity_check(&limbo_db.path) {
+                        println!("{table_def};");
+                        for t in indexes.iter() {
+                            println!("{t};");
+                        }
+                        if let Some(trigger) = trigger {
+                            println!("{trigger};");
+                        }
+                        for t in dml_statements.iter() {
+                            println!("{t};");
+                        }
+                        println!("{query};");
+                        panic!("seed: {seed}, error: {e}");
                     }
-                    if let Some(trigger) = trigger {
-                        println!("{trigger};");
-                    }
-                    for t in dml_statements.iter() {
-                        println!("{t};");
-                    }
-                    println!("{query};");
-                    panic!("seed: {seed}, error: {e}");
                 }
 
                 if sqlite_rows.is_empty() {
@@ -2785,19 +3609,29 @@ mod fuzz_tests {
                     // Maybe include int column comparison
                     if !int_cols.is_empty() && rng.random_bool(0.8) {
                         let c = &int_cols[rng.random_range(0..int_cols.len())];
-                        match rng.random_range(0..3) {
+                        match rng.random_range(0..4) {
                             0 => parts.push(format!("{c} IS NOT NULL")),
                             1 => {
                                 let n = rng.random_range(-10..=20);
                                 let op = *["<", "<=", "=", ">=", ">"].choose(&mut rng).unwrap();
                                 parts.push(format!("{c} {op} {n}"));
                             }
-                            _ => {
+                            2 => {
                                 let n = rng.random_range(0..=1);
                                 parts.push(format!(
                                     "{c} IS {}",
                                     if n == 0 { "NULL" } else { "NOT NULL" }
                                 ));
+                            }
+                            _ => {
+                                // BETWEEN expression
+                                let lo = rng.random_range(-10..=10);
+                                let hi = rng.random_range(lo..=20);
+                                if rng.random_bool(0.2) {
+                                    parts.push(format!("{c} NOT BETWEEN {lo} AND {hi}"));
+                                } else {
+                                    parts.push(format!("{c} BETWEEN {lo} AND {hi}"));
+                                }
                             }
                         }
                     }
@@ -3200,6 +4034,105 @@ mod fuzz_tests {
                 sqlite_results,
                 seed
             );
+        }
+    }
+
+    #[turso_macros::test(mvcc)]
+    pub fn distinct_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        log::info!("distinct_fuzz seed: {seed}");
+
+        const NUM_ROWS: usize = 200;
+        const NUM_ITERS: usize = 1000;
+        const COLS: [&str; 3] = ["a", "b", "c"];
+
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let create_sql = "CREATE TABLE t (a INTEGER, b REAL, c TEXT)";
+        limbo_exec_rows(&limbo_conn, create_sql);
+        sqlite_exec_rows(&sqlite_conn, create_sql);
+
+        for _ in 0..NUM_ROWS {
+            let vals: Vec<String> = COLS
+                .iter()
+                .map(|col| match *col {
+                    "a" => {
+                        if rng.random_bool(0.2) {
+                            "NULL".to_string()
+                        } else {
+                            rng.random_range(-10..=10).to_string()
+                        }
+                    }
+                    "b" => {
+                        if rng.random_bool(0.2) {
+                            "NULL".to_string()
+                        } else {
+                            let v: f64 = rng.random_range(-10.0..=10.0);
+                            format!("{v}")
+                        }
+                    }
+                    "c" => {
+                        if rng.random_bool(0.2) {
+                            "NULL".to_string()
+                        } else {
+                            let len = rng.random_range(0..=4);
+                            let s = (0..len)
+                                .map(|_| rng.random_range(b'a'..=b'z') as char)
+                                .collect::<String>();
+                            format!("'{s}'")
+                        }
+                    }
+                    _ => "NULL".to_string(),
+                })
+                .collect();
+            let insert_sql = format!("INSERT INTO t VALUES ({})", vals.join(", "));
+            limbo_exec_rows(&limbo_conn, &insert_sql);
+            sqlite_exec_rows(&sqlite_conn, &insert_sql);
+        }
+
+        for iter in 0..NUM_ITERS {
+            let num_cols = rng.random_range(1..=COLS.len());
+            let cols = COLS
+                .choose_multiple(&mut rng, num_cols)
+                .cloned()
+                .collect::<Vec<_>>();
+            let select_list = cols.join(", ");
+            let order_by = cols
+                .iter()
+                .map(|c| format!("{c} IS NULL, {c}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!("SELECT DISTINCT {select_list} FROM t ORDER BY {order_by}");
+
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+            let limbo_rows = limbo_exec_rows(&limbo_conn, &query);
+
+            assert_eq!(
+                limbo_rows, sqlite_rows,
+                "distinct_fuzz mismatch (iter {iter}, seed {seed}) query: {query}"
+            );
+
+            if iter % 5 == 0 {
+                let agg_query =
+                    "SELECT count(DISTINCT a), count(DISTINCT b), count(DISTINCT c) FROM t";
+                let sqlite_agg = sqlite_exec_rows(&sqlite_conn, agg_query);
+                let limbo_agg = limbo_exec_rows(&limbo_conn, agg_query);
+                assert_eq!(
+                    limbo_agg, sqlite_agg,
+                    "distinct_fuzz agg mismatch (iter {iter}, seed {seed}) query: {agg_query}"
+                );
+
+                let group_query =
+                    "SELECT a, count(DISTINCT b) FROM t GROUP BY a ORDER BY a IS NULL, a";
+                let sqlite_group = sqlite_exec_rows(&sqlite_conn, group_query);
+                let limbo_group = limbo_exec_rows(&limbo_conn, group_query);
+                assert_eq!(
+                    limbo_group, sqlite_group,
+                    "distinct_fuzz group mismatch (iter {iter}, seed {seed}) query: {group_query}"
+                );
+            }
         }
     }
 
@@ -4617,15 +5550,12 @@ mod fuzz_tests {
         let limbo_conn = db.connect_limbo();
 
         let (mut rng, seed) = rng_from_time_or_env();
-        let mvcc = db.db_opts.enable_mvcc;
-        tracing::info!(
-            "create_table_drop_table_fuzz seed: {seed}, mvcc: {}",
-            db.db_opts.enable_mvcc
-        );
+        let mvcc = db.enable_mvcc;
+        tracing::info!("create_table_drop_table_fuzz seed: {seed}, mvcc: {mvcc}");
 
         // Keep track of current tables and their columns in memory
         let mut current_tables: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
         let mut table_counter = 0;
 
         // Column types for random generation
@@ -4894,7 +5824,7 @@ mod fuzz_tests {
 
     // TODO: mvcc indexes
     #[turso_macros::test()]
-    /// Tests for correlated and uncorrelated subqueries occurring in the WHERE clause of a SELECT statement.
+    /// Tests for correlated and uncorrelated subqueries in SELECT statements (WHERE, SELECT-list, GROUP BY/HAVING).
     pub fn table_subquery_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -5179,11 +6109,33 @@ mod fuzz_tests {
             // Sometimes add nesting - but use scalar subquery for nesting to avoid column count issues
             if depth < 1 && rng.random_bool(0.2) {
                 // Reduced probability and depth
-                let nested = gen_scalar_subquery(rng, 0, outer_table, allowed_outer_cols);
-                if final_query.contains("WHERE") {
-                    format!("{final_query} AND id IN ({nested})")
+                let nested = gen_scalar_subquery(rng, 0, outer_table, allowed_outer_cols, false);
+                // Brittle string heuristic: infer scope from SQL text to avoid ambiguous id refs.
+                let derived_select_col =
+                    if let Some(start) = final_query.find("FROM (SELECT DISTINCT ") {
+                        let tail = &final_query[start + "FROM (SELECT DISTINCT ".len()..];
+                        tail.split(" FROM ")
+                            .next()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty() && !s.contains(' '))
+                    } else {
+                        None
+                    };
+                let id_expr = if final_query.contains("FROM (SELECT DISTINCT") {
+                    derived_select_col.unwrap_or("id")
+                } else if final_query.contains("FROM t1") {
+                    "t1.id"
+                } else if final_query.contains("FROM t2") {
+                    "t2.id"
+                } else if final_query.contains("FROM t3") {
+                    "t3.id"
                 } else {
-                    format!("{final_query} WHERE id IN ({nested})")
+                    "id"
+                };
+                if final_query.contains("WHERE") {
+                    format!("{final_query} AND {id_expr} IN ({nested})")
+                } else {
+                    format!("{final_query} WHERE {id_expr} IN ({nested})")
                 }
             } else {
                 final_query
@@ -5196,6 +6148,7 @@ mod fuzz_tests {
             depth: usize,
             outer_table: Option<&str>,
             allowed_outer_cols: Option<&[&str]>,
+            force_single_row: bool,
         ) -> String {
             if depth > MAX_SUBQUERY_DEPTH {
                 // Reduced nesting depth
@@ -5346,10 +6299,39 @@ mod fuzz_tests {
                     "SELECT ref_id FROM t2 WHERE {}",
                     gen_simple_where_inner(rng, "t2")
                 ),
+                {
+                    let inner_table = ["t1", "t2", "t3"][rng.random_range(0..3)];
+                    let select_column = match inner_table {
+                        "t1" => ["id", "value1", "value2"][rng.random_range(0..3)],
+                        "t2" => ["id", "ref_id", "data"][rng.random_range(0..3)],
+                        _ => ["id", "category", "amount"][rng.random_range(0..3)],
+                    };
+                    let can_correlate = match allowed_outer_cols {
+                        Some(cols) => !cols.is_empty(),
+                        None => true,
+                    };
+                    let where_clause = if let Some(outer_table) = outer_table {
+                        if can_correlate && rng.random_bool(0.4) {
+                            format!(
+                                " WHERE {}",
+                                gen_correlated_where(rng, inner_table, outer_table)
+                            )
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "SELECT {select_column} FROM (SELECT DISTINCT {select_column} FROM {inner_table}{where_clause})"
+                    )
+                },
             ];
 
             let base_query =
                 &scalar_subquery_types[rng.random_range(0..scalar_subquery_types.len())];
+            // Brittle string heuristic: detects the derived-table shape emitted above.
+            let base_is_derived = base_query.contains("FROM (SELECT DISTINCT");
 
             // Add correlated conditions if outer_table is provided and sometimes
             let final_query = if let Some(outer_table) = outer_table {
@@ -5357,7 +6339,7 @@ mod fuzz_tests {
                     Some(cols) => !cols.is_empty(),
                     None => true,
                 };
-                if can_correlate && rng.random_bool(0.4) {
+                if can_correlate && !base_is_derived && rng.random_bool(0.4) {
                     // 40% chance for correlation
                     // Extract the inner table from the base query
                     let inner_table = if base_query.contains("FROM t1") {
@@ -5385,23 +6367,69 @@ mod fuzz_tests {
             };
 
             // Sometimes add nesting
-            if depth < 1 && rng.random_bool(0.2) {
+            let mut query = if depth < 1 && rng.random_bool(0.2) {
                 // Reduced probability and depth
-                let nested = gen_scalar_subquery(rng, depth + 1, outer_table, allowed_outer_cols);
-                if final_query.contains("WHERE") {
-                    format!("{final_query} AND id IN ({nested})")
+                let nested =
+                    gen_scalar_subquery(rng, depth + 1, outer_table, allowed_outer_cols, false);
+                // Brittle string heuristic: infer scope from SQL text to avoid ambiguous id refs.
+                let derived_select_col =
+                    if let Some(start) = final_query.find("FROM (SELECT DISTINCT ") {
+                        let tail = &final_query[start + "FROM (SELECT DISTINCT ".len()..];
+                        tail.split(" FROM ")
+                            .next()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty() && !s.contains(' '))
+                    } else {
+                        None
+                    };
+                let id_expr = if final_query.contains("FROM (SELECT DISTINCT") {
+                    derived_select_col.unwrap_or("id")
+                } else if final_query.contains("FROM t1") {
+                    "t1.id"
+                } else if final_query.contains("FROM t2") {
+                    "t2.id"
+                } else if final_query.contains("FROM t3") {
+                    "t3.id"
                 } else {
-                    format!("{final_query} WHERE id IN ({nested})")
+                    "id"
+                };
+                // Brittle string heuristic: avoid attaching WHERE/AND to inner SELECT in derived-table shape.
+                let has_outer_where = if final_query.contains(" FROM (") {
+                    final_query.contains(") WHERE ")
+                } else {
+                    final_query.contains("WHERE")
+                };
+                if has_outer_where {
+                    format!("{final_query} AND {id_expr} IN ({nested})")
+                } else {
+                    format!("{final_query} WHERE {id_expr} IN ({nested})")
                 }
             } else {
                 final_query
+            };
+
+            // Brittle string heuristic: infer outer FROM table to choose a deterministic ORDER BY.
+            if force_single_row && !query.contains("LIMIT") {
+                let outer_from = query.find(" FROM ").and_then(|idx| {
+                    let rest = &query[idx + " FROM ".len()..];
+                    rest.split_whitespace().next()
+                });
+                let order_by = match outer_from {
+                    Some("t1") => "ORDER BY t1.id",
+                    Some("t2") => "ORDER BY t2.id",
+                    Some("t3") => "ORDER BY t3.id",
+                    _ => "ORDER BY 1",
+                };
+                query = format!("{query} {order_by} LIMIT 1");
             }
+
+            query
         }
 
         // Helper to generate a SELECT-list expression as a scalar subquery, optionally correlated
         fn gen_selectlist_scalar_expr(rng: &mut ChaCha8Rng, outer_table: &str) -> String {
             // Reuse scalar subquery generator; return the inner SELECT (without wrapping)
-            gen_scalar_subquery(rng, 0, Some(outer_table), None)
+            gen_scalar_subquery(rng, 0, Some(outer_table), None, true)
         }
 
         // Helper to generate a GROUP BY expression which may include a correlated scalar subquery
@@ -5421,7 +6449,7 @@ mod fuzz_tests {
                 // grouping expression itself, disallow correlation entirely here.
                 format!(
                     "({})",
-                    gen_scalar_subquery(rng, 0, Some(main_table), Some(&[]))
+                    gen_scalar_subquery(rng, 0, Some(main_table), Some(&[]), true)
                 )
             }
         }
@@ -5453,7 +6481,8 @@ mod fuzz_tests {
                 _ => ("COUNT", "*"),
             };
             let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
-            let rhs = gen_scalar_subquery(rng, 0, Some(main_table), Some(&[]));
+            // HAVING does not support correlated subqueries; force uncorrelated here.
+            let rhs = gen_scalar_subquery(rng, 0, None, Some(&[]), true);
             if agg_col == "*" {
                 format!("COUNT(*) {op} ({rhs})")
             } else {
@@ -5507,7 +6536,7 @@ mod fuzz_tests {
                         _ => "id",
                     };
                     let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
-                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None);
+                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None, true);
                     format!("SELECT * FROM {main_table} WHERE {column} {op} ({subquery})",)
                 }
                 1 => {
@@ -5525,7 +6554,7 @@ mod fuzz_tests {
                         "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
                         _ => "id",
                     };
-                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None);
+                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None, false);
                     format!("SELECT * FROM {main_table} WHERE {column} {not_in}IN ({subquery})",)
                 }
                 3 => {
@@ -5831,6 +6860,467 @@ mod fuzz_tests {
             if !all_limbo_in_sqlite || !all_sqlite_in_limbo {
                 panic!(
                     "Results mismatch for query: {query}\nLimbo: {limbo_results:?}\nSQLite: {sqlite_results:?}\nSeed: {seed}",
+                );
+            }
+        }
+    }
+
+    /// Fuzz test for DELETE/UPDATE statements with IN/NOT IN subqueries.
+    /// This test generates random DELETE and UPDATE statements using IN/NOT IN subqueries
+    /// and compares results between Limbo and SQLite to ensure correctness.
+    #[turso_macros::test(mvcc)]
+    pub fn dml_subquery_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        log::info!("dml_subquery_fuzz seed: {seed}");
+
+        const NUM_FUZZ_ITERATIONS: usize = 500;
+        const MAX_ROWS_PER_TABLE: usize = 500;
+        const MIN_ROWS_PER_TABLE: usize = 50;
+
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let mut debug_ddl_dml_string = String::new();
+
+        // Create two related tables for subquery testing
+        let table_schemas = [
+            "CREATE TABLE main_data (id INTEGER PRIMARY KEY, value INTEGER, category INTEGER);",
+            "CREATE TABLE ref_data (ref_id INTEGER);",
+        ];
+
+        for schema in &table_schemas {
+            debug_ddl_dml_string.push_str(schema);
+            debug_ddl_dml_string.push('\n');
+            limbo_exec_rows(&limbo_conn, schema);
+            sqlite_exec_rows(&sqlite_conn, schema);
+        }
+
+        fn populate_tables(
+            limbo_conn: &std::sync::Arc<turso_core::Connection>,
+            sqlite_conn: &rusqlite::Connection,
+            rng: &mut ChaCha8Rng,
+            debug_string: &mut String,
+            min_rows: usize,
+            max_rows: usize,
+        ) {
+            // Populate main_data
+            let num_main_rows = rng.random_range(min_rows..=max_rows);
+            for i in 1..=num_main_rows {
+                let insert_sql = format!(
+                    "INSERT INTO main_data VALUES ({}, {}, {});",
+                    i,
+                    rng.random_range(-100..100),
+                    rng.random_range(1..10)
+                );
+                debug_string.push_str(&insert_sql);
+                debug_string.push('\n');
+                limbo_exec_rows(limbo_conn, &insert_sql);
+                sqlite_exec_rows(sqlite_conn, &insert_sql);
+            }
+
+            // Populate ref_data with subset of main_data ids and some NULLs
+            let num_ref_rows = rng.random_range(min_rows / 2..=max_rows / 2);
+            for _ in 0..num_ref_rows {
+                let ref_val = if rng.random_bool(0.1) {
+                    "NULL".to_string()
+                } else {
+                    rng.random_range(1..=num_main_rows as i64).to_string()
+                };
+                let insert_sql = format!("INSERT INTO ref_data VALUES ({ref_val});");
+                debug_string.push_str(&insert_sql);
+                debug_string.push('\n');
+                limbo_exec_rows(limbo_conn, &insert_sql);
+                sqlite_exec_rows(sqlite_conn, &insert_sql);
+            }
+        }
+
+        fn verify_tables_match(
+            limbo_conn: &std::sync::Arc<turso_core::Connection>,
+            sqlite_conn: &rusqlite::Connection,
+            query: &str,
+            seed: u64,
+            debug_string: &str,
+        ) {
+            let verify_query = "SELECT * FROM main_data ORDER BY id";
+            let limbo_rows = limbo_exec_rows(limbo_conn, verify_query);
+            let sqlite_rows = sqlite_exec_rows(sqlite_conn, verify_query);
+
+            if limbo_rows != sqlite_rows {
+                panic!(
+                    "Results mismatch after query: {query}\n\
+                     Limbo main_data: {limbo_rows:?}\n\
+                     SQLite main_data: {sqlite_rows:?}\n\
+                     Seed: {seed}\n\n\
+                     DDL/DML to reproduce:\n{debug_string}"
+                );
+            }
+        }
+
+        populate_tables(
+            &limbo_conn,
+            &sqlite_conn,
+            &mut rng,
+            &mut debug_ddl_dml_string,
+            MIN_ROWS_PER_TABLE,
+            MAX_ROWS_PER_TABLE,
+        );
+
+        log::info!("DDL/DML to reproduce manually:\n{debug_ddl_dml_string}");
+
+        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+            let query_type = rng.random_range(0..14);
+            let query = match query_type {
+                0 => {
+                    // DELETE with IN subquery
+                    let subquery_filter = if rng.random_bool(0.5) {
+                        " WHERE ref_id IS NOT NULL"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "DELETE FROM main_data WHERE id IN (SELECT ref_id FROM ref_data{subquery_filter});",
+                    )
+                }
+                1 => {
+                    // DELETE with NOT IN subquery
+                    let subquery_filter = if rng.random_bool(0.5) {
+                        " WHERE ref_id IS NOT NULL"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "DELETE FROM main_data WHERE id NOT IN (SELECT ref_id FROM ref_data{subquery_filter});",
+                    )
+                }
+                2 => {
+                    // UPDATE with IN subquery
+                    let new_value = rng.random_range(-1000..1000);
+                    let subquery_filter = if rng.random_bool(0.5) {
+                        " WHERE ref_id IS NOT NULL"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE id IN (SELECT ref_id FROM ref_data{subquery_filter});",
+                    )
+                }
+                3 => {
+                    // UPDATE with NOT IN subquery
+                    let new_value = rng.random_range(-1000..1000);
+                    let subquery_filter = if rng.random_bool(0.5) {
+                        " WHERE ref_id IS NOT NULL"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE id NOT IN (SELECT ref_id FROM ref_data{subquery_filter});",
+                    )
+                }
+                4 => {
+                    // DELETE with IN subquery + additional condition
+                    let category = rng.random_range(1..10);
+                    format!(
+                        "DELETE FROM main_data WHERE category = {category} AND id IN (SELECT ref_id FROM ref_data WHERE ref_id IS NOT NULL);",
+                    )
+                }
+                5 => {
+                    // UPDATE with NOT IN subquery + additional condition
+                    let new_value = rng.random_range(-1000..1000);
+                    let category = rng.random_range(1..10);
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE category = {category} AND id NOT IN (SELECT ref_id FROM ref_data WHERE ref_id IS NOT NULL);",
+                    )
+                }
+                6 => {
+                    // DELETE with EXISTS subquery (correlated)
+                    "DELETE FROM main_data WHERE EXISTS (SELECT 1 FROM ref_data WHERE ref_data.ref_id = main_data.id);".into()
+                }
+                7 => {
+                    // DELETE with NOT EXISTS subquery (correlated)
+                    "DELETE FROM main_data WHERE NOT EXISTS (SELECT 1 FROM ref_data WHERE ref_data.ref_id = main_data.id);".into()
+                }
+                8 => {
+                    // UPDATE with EXISTS subquery (correlated)
+                    let new_value = rng.random_range(-1000..1000);
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE EXISTS (SELECT 1 FROM ref_data WHERE ref_data.ref_id = main_data.id);",
+                    )
+                }
+                9 => {
+                    // UPDATE with NOT EXISTS subquery (correlated)
+                    let new_value = rng.random_range(-1000..1000);
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE NOT EXISTS (SELECT 1 FROM ref_data WHERE ref_data.ref_id = main_data.id);",
+                    )
+                }
+                10 => {
+                    // DELETE with scalar comparison subquery (=)
+                    let category = rng.random_range(1..10);
+                    format!(
+                        "DELETE FROM main_data WHERE category = (SELECT {category} FROM (SELECT {category} AS c));",
+                    )
+                }
+                11 => {
+                    // DELETE with scalar comparison subquery (>) using aggregate
+                    "DELETE FROM main_data WHERE value > (SELECT AVG(value) FROM main_data);".into()
+                }
+                12 => {
+                    // UPDATE with scalar comparison subquery (=)
+                    let new_value = rng.random_range(-1000..1000);
+                    let category = rng.random_range(1..10);
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE category = (SELECT {category} FROM (SELECT {category} AS c));",
+                    )
+                }
+                13 => {
+                    // UPDATE with scalar comparison subquery (<) using aggregate
+                    let new_value = rng.random_range(-1000..1000);
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE value < (SELECT AVG(value) FROM main_data);",
+                    )
+                }
+                _ => unreachable!(),
+            };
+
+            log::info!(
+                "Iteration {}/{NUM_FUZZ_ITERATIONS}: Query: {query}",
+                iter_num + 1,
+            );
+
+            debug_ddl_dml_string.push_str(&query);
+            debug_ddl_dml_string.push('\n');
+
+            // Execute on both databases
+            limbo_exec_rows(&limbo_conn, &query);
+            sqlite_conn.execute(&query, params![]).unwrap();
+
+            // Verify tables match
+            verify_tables_match(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                seed,
+                &debug_ddl_dml_string,
+            );
+
+            // Periodically repopulate tables to ensure we have data to work with
+            if iter_num % 50 == 49 {
+                // Clear and repopulate
+                limbo_exec_rows(&limbo_conn, "DELETE FROM main_data;");
+                sqlite_conn
+                    .execute("DELETE FROM main_data;", params![])
+                    .unwrap();
+                limbo_exec_rows(&limbo_conn, "DELETE FROM ref_data;");
+                sqlite_conn
+                    .execute("DELETE FROM ref_data;", params![])
+                    .unwrap();
+
+                debug_ddl_dml_string.push_str("DELETE FROM main_data;\n");
+                debug_ddl_dml_string.push_str("DELETE FROM ref_data;\n");
+
+                populate_tables(
+                    &limbo_conn,
+                    &sqlite_conn,
+                    &mut rng,
+                    &mut debug_ddl_dml_string,
+                    MIN_ROWS_PER_TABLE,
+                    MAX_ROWS_PER_TABLE,
+                );
+            }
+        }
+    }
+
+    /// Fuzz test for UPDATE OR REPLACE/IGNORE statements.
+    /// This test generates random UPDATE statements with conflict resolution
+    /// clauses and compares results between Limbo and SQLite to ensure correctness.
+    #[turso_macros::test(mvcc)]
+    pub fn update_or_conflict_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        log::info!("update_or_conflict_fuzz seed: {seed}");
+
+        const NUM_FUZZ_ITERATIONS: usize = 200;
+        const ROWS_PER_TABLE: usize = 500;
+
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let mut debug_ddl_dml_string = String::new();
+
+        // Create table with UNIQUE constraints to trigger conflict resolution
+        let schema = "CREATE TABLE t1 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE, z INTEGER NOT NULL DEFAULT 99);";
+        debug_ddl_dml_string.push_str(schema);
+        debug_ddl_dml_string.push('\n');
+        limbo_exec_rows(&limbo_conn, schema);
+        sqlite_exec_rows(&sqlite_conn, schema);
+
+        fn populate_table(
+            limbo_conn: &std::sync::Arc<turso_core::Connection>,
+            sqlite_conn: &rusqlite::Connection,
+            rng: &mut ChaCha8Rng,
+            debug_string: &mut String,
+        ) {
+            // Insert rows with unique y values
+            for i in 1..=ROWS_PER_TABLE {
+                let insert_sql = format!(
+                    "INSERT INTO t1 VALUES ({}, {}, {});",
+                    i,
+                    i * 10, // y values: 10, 20, 30, ...
+                    rng.random_range(1..ROWS_PER_TABLE as i64)
+                );
+                debug_string.push_str(&insert_sql);
+                debug_string.push('\n');
+                limbo_exec_rows(limbo_conn, &insert_sql);
+                sqlite_exec_rows(sqlite_conn, &insert_sql);
+            }
+        }
+
+        fn verify_tables_match(
+            limbo_conn: &std::sync::Arc<turso_core::Connection>,
+            sqlite_conn: &rusqlite::Connection,
+            query: &str,
+            seed: u64,
+            debug_string: &str,
+        ) {
+            let verify_query = "SELECT * FROM t1 ORDER BY x";
+            let limbo_rows = limbo_exec_rows(limbo_conn, verify_query);
+            let sqlite_rows = sqlite_exec_rows(sqlite_conn, verify_query);
+
+            if limbo_rows != sqlite_rows {
+                panic!(
+                    "Results mismatch after query: {query}\n\
+                     Limbo t1: {limbo_rows:?}\n\
+                     SQLite t1: {sqlite_rows:?}\n\
+                     Seed: {seed}\n\n\
+                     DDL/DML to reproduce:\n{debug_string}"
+                );
+            }
+        }
+
+        populate_table(
+            &limbo_conn,
+            &sqlite_conn,
+            &mut rng,
+            &mut debug_ddl_dml_string,
+        );
+
+        log::info!("DDL/DML to reproduce manually:\n{debug_ddl_dml_string}");
+
+        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+            let query_type = rng.random_range(0..10);
+            let query = match query_type {
+                0 => {
+                    // UPDATE OR IGNORE - set y to existing value (should skip)
+                    let existing_y = rng.random_range(1..=20) * 10;
+                    let target_x = rng.random_range(1..=20);
+                    format!("UPDATE OR IGNORE t1 SET y = {existing_y} WHERE x = {target_x};")
+                }
+                1 => {
+                    // UPDATE OR REPLACE - set y to existing value (should delete conflicting row)
+                    let existing_y = rng.random_range(1..=20) * 10;
+                    let target_x = rng.random_range(1..=20);
+                    format!("UPDATE OR REPLACE t1 SET y = {existing_y} WHERE x = {target_x};")
+                }
+                2 => {
+                    // UPDATE OR IGNORE with expression (y - 10 may cause conflict)
+                    let target_x = rng.random_range(2..=20); // avoid x=1 since y-10=0
+                    format!("UPDATE OR IGNORE t1 SET y = y - 10 WHERE x = {target_x};")
+                }
+                3 => {
+                    // UPDATE OR REPLACE with expression (y - 10 may cause conflict)
+                    let target_x = rng.random_range(2..=20);
+                    format!("UPDATE OR REPLACE t1 SET y = y - 10 WHERE x = {target_x};")
+                }
+                4 => {
+                    // UPDATE OR IGNORE - multiple rows (WHERE x > ...)
+                    let min_x = rng.random_range(1..=15);
+                    let new_y = rng.random_range(-100..100);
+                    format!("UPDATE OR IGNORE t1 SET y = {new_y} WHERE x > {min_x};")
+                }
+                5 => {
+                    // UPDATE OR REPLACE with no conflict (new unique value)
+                    let target_x = rng.random_range(1..=20);
+                    let new_y = rng.random_range(1000..2000); // unlikely to conflict
+                    format!("UPDATE OR REPLACE t1 SET y = {new_y} WHERE x = {target_x};")
+                }
+                6 => {
+                    // UPDATE OR IGNORE with NOT NULL violation
+                    let target_x = rng.random_range(1..=20);
+                    format!("UPDATE OR IGNORE t1 SET z = NULL WHERE x = {target_x};")
+                }
+                7 => {
+                    // UPDATE OR REPLACE with NOT NULL violation (should use default)
+                    let target_x = rng.random_range(1..=20);
+                    format!("UPDATE OR REPLACE t1 SET z = NULL WHERE x = {target_x};")
+                }
+                8 => {
+                    // Regular UPDATE (no conflict clause) with safe value
+                    let target_x = rng.random_range(1..=20);
+                    let new_z = rng.random_range(1..500);
+                    format!("UPDATE t1 SET z = {new_z} WHERE x = {target_x};")
+                }
+                9 => {
+                    // UPDATE OR REPLACE with multiple rows, expression may cause cascading conflicts
+                    let min_x = rng.random_range(5..=15);
+                    format!("UPDATE OR REPLACE t1 SET y = y - 10 WHERE x > {min_x};")
+                }
+                10 => {
+                    // UPDATE OR FAIL with existing value
+                    let min_x = rng.random_range(1..=15);
+                    format!("UPDATE OR FAIL t1 SET y = 10 WHERE x > {min_x};")
+                }
+                11 => {
+                    // UPDATE OR ROLLBACK with existing value (should error)
+                    let min_x = rng.random_range(1..=15);
+                    format!("UPDATE OR ROLLBACK t1 SET y = 10 WHERE x > {min_x};")
+                }
+                12 => {
+                    // UPDATE OR FAIL with safe value
+                    let value = rng.random_range(1000..2000);
+                    format!("UPDATE OR FAIL t1 SET y = y + 1 WHERE x <= {value};")
+                }
+                13 => {
+                    // UPDATE OR ROLLBACK with safe value
+                    let value = rng.random_range(1000..2000);
+                    format!("UPDATE OR ROLLBACK t1 SET y = y + 1 WHERE x <= {value};")
+                }
+                _ => unreachable!(),
+            };
+
+            log::info!(
+                "Iteration {}/{NUM_FUZZ_ITERATIONS}: Query: {query}",
+                iter_num + 1,
+            );
+
+            debug_ddl_dml_string.push_str(&query);
+            debug_ddl_dml_string.push('\n');
+
+            // Execute on both databases (ignore errors from constraint violations for ABORT mode)
+            let _ = limbo_exec_rows_fallible(&db, &limbo_conn, &query);
+            let _ = sqlite_conn.execute(&query, params![]);
+
+            // Verify tables match
+            verify_tables_match(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                seed,
+                &debug_ddl_dml_string,
+            );
+
+            // Periodically repopulate table to ensure we have data to work with
+            if iter_num % 30 == 29 {
+                // Clear and repopulate
+                limbo_exec_rows(&limbo_conn, "DELETE FROM t1;");
+                sqlite_conn.execute("DELETE FROM t1;", params![]).unwrap();
+                debug_ddl_dml_string.push_str("DELETE FROM t1;\n");
+
+                populate_table(
+                    &limbo_conn,
+                    &sqlite_conn,
+                    &mut rng,
+                    &mut debug_ddl_dml_string,
                 );
             }
         }

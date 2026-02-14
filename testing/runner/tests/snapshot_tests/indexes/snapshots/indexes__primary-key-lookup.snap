@@ -1,0 +1,27 @@
+---
+source: indexes.sqltest
+expression: "SELECT id, sku, name FROM products WHERE id = 42;"
+info:
+  statement_type: SELECT
+  tables:
+    - products
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--SEARCH products USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4                  p5  comment
+   0  Init          0   8   0                       0  Start at 8
+   1  OpenRead      0   2   0  k(7,B,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   2  SeekRowid     0   4   7                       0  if (r[4]!=cursor 0 for table products.rowid) goto 7
+   3  RowId         0   1   0                       0  r[1]=products.rowid
+   4  Column        0   1   2                       0  r[2]=products.sku
+   5  Column        0   2   3                       0  r[3]=products.name
+   6  ResultRow     1   3   0                       0  output=r[1..3]
+   7  Halt          0   0   0                       0
+   8  Transaction   0   1  14                       0  iDb=0 tx_mode=Read
+   9  Integer      42   4   0                       0  r[4]=42
+  10  Goto          0   1   0                       0

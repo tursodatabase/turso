@@ -1,0 +1,19 @@
+[package]
+name = "turso-dotnet"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "turso_dotnet"
+crate-type = ["cdylib"]
+path = "rs_src/lib.rs"
+
+[dependencies]
+turso_core = { workspace = true }

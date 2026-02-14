@@ -1,3 +1,4 @@
+use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -5,7 +6,7 @@ use crate::translate::ProgramBuilderOpts;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, Result};
+use crate::{bail_parse_error, Connection, Result};
 use turso_parser::ast::{self, QualifiedName};
 
 /// Reconstruct SQL string from CREATE TRIGGER AST
@@ -90,7 +91,16 @@ pub fn translate_create_trigger(
     tbl_name: QualifiedName,
     mut program: ProgramBuilder,
     sql: String,
+    connection: Arc<Connection>,
 ) -> Result<ProgramBuilder> {
+    // Check if experimental triggers are enabled
+    if !connection.experimental_triggers_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "CREATE TRIGGER is an experimental feature. Enable with --experimental-triggers flag"
+                .to_string(),
+        ));
+    }
+
     program.begin_write_operation();
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
@@ -136,7 +146,7 @@ pub fn translate_create_trigger(
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -153,7 +163,7 @@ pub fn translate_create_trigger(
         &normalized_trigger_name,
         &normalized_table_name,
         0, // triggers don't have a root page
-        Some(sql.clone()),
+        Some(sql),
     )?;
 
     // Update schema version
@@ -179,7 +189,16 @@ pub fn translate_drop_trigger(
     trigger_name: &str,
     if_exists: bool,
     mut program: ProgramBuilder,
+    connection: Arc<Connection>,
 ) -> Result<ProgramBuilder> {
+    // Check if experimental triggers are enabled
+    if !connection.experimental_triggers_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "DROP TRIGGER is an experimental feature. Enable with --experimental-triggers flag"
+                .to_string(),
+        ));
+    }
+
     program.begin_write_operation();
     let normalized_trigger_name = normalize_ident(trigger_name);
 
@@ -200,7 +219,7 @@ pub fn translate_drop_trigger(
 
     // Open cursor to sqlite_schema table
     let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -290,7 +309,7 @@ pub fn translate_drop_trigger(
 
     program.emit_insn(Insn::DropTrigger {
         db: 0,
-        trigger_name: normalized_trigger_name.clone(),
+        trigger_name: normalized_trigger_name,
     });
 
     Ok(program)

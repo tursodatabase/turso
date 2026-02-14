@@ -1,0 +1,56 @@
+@database :memory:
+
+@skip-if mvcc "panic: transaction should exist in txs map"
+test left-join-virtual-table-matching {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t1 VALUES (0, 'alice');
+    INSERT INTO t1 VALUES (1, 'bob');
+    SELECT t1.name, p.name as col_name
+    FROM t1
+    LEFT JOIN pragma_table_info('t1') p ON p.cid = t1.id;
+}
+expect {
+    alice|id
+    bob|name
+}
+
+@skip-if mvcc "panic: transaction should exist in txs map"
+test left-join-virtual-table-null {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t2 VALUES (0, 'alice');
+    INSERT INTO t2 VALUES (99, 'nobody');
+    SELECT t2.name, p.name as col_name
+    FROM t2
+    LEFT JOIN pragma_table_info('t2') p ON p.cid = t2.id;
+}
+expect {
+    alice|id
+    nobody|
+}
+
+@skip-if mvcc "panic: transaction should exist in txs map"
+test left-join-virtual-table-on-left-matching {
+    CREATE TABLE t3 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t3 VALUES (0, 'alice');
+    INSERT INTO t3 VALUES (1, 'bob');
+    SELECT p.name as col_name, t3.name
+    FROM pragma_table_info('t3') p
+    LEFT JOIN t3 ON t3.id = p.cid;
+}
+expect {
+    id|alice
+    name|bob
+}
+
+@skip-if mvcc "panic: transaction should exist in txs map"
+test left-join-virtual-table-on-left-null {
+    CREATE TABLE t4 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t4 VALUES (0, 'alice');
+    SELECT p.name as col_name, t4.name
+    FROM pragma_table_info('t4') p
+    LEFT JOIN t4 ON t4.id = p.cid;
+}
+expect {
+    id|alice
+    name|
+}

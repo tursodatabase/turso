@@ -1,0 +1,62 @@
+@database :memory:
+
+test pragma-index-info-single-column {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(b);
+    PRAGMA index_info('idx1');
+}
+expect {
+    0|1|b
+}
+
+test pragma-index-info-equals-syntax {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(b);
+    PRAGMA index_info=idx1;
+}
+expect {
+    0|1|b
+}
+
+test pragma-index-info-multi-column {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(b, c);
+    PRAGMA index_info('idx1');
+}
+expect {
+    0|1|b
+    1|2|c
+}
+
+test pragma-index-info-unique-index {
+    CREATE TABLE t1(a, b, c);
+    CREATE UNIQUE INDEX idx1 ON t1(a, c);
+    PRAGMA index_info('idx1');
+}
+expect {
+    0|0|a
+    1|2|c
+}
+
+test pragma-index-info-autoindex {
+    CREATE TABLE t1(a PRIMARY KEY, b, c);
+    PRAGMA index_info('sqlite_autoindex_t1_1');
+}
+expect {
+    0|0|a
+}
+
+test pragma-index-info-nonexistent {
+    PRAGMA index_info('nonexistent');
+}
+expect {
+}
+
+test pragma-index-info-function-syntax {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(a);
+    SELECT * FROM pragma_index_info('idx1');
+}
+expect {
+    0|0|a
+}

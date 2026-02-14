@@ -11,13 +11,15 @@ pub use crate::incremental::join_operator::{JoinEvalState, JoinOperator, JoinTyp
 pub use crate::incremental::project_operator::{ProjectColumn, ProjectOperator};
 
 use crate::incremental::dbsp::{Delta, DeltaPair};
+#[cfg(test)]
+use crate::numeric::Numeric;
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::types::IOResult;
 use crate::Result;
-use parking_lot::Mutex;
 use std::fmt::Debug;
-use std::sync::Arc;
 
 /// Struct to hold both table and index cursors for DBSP state operations
 pub struct DbspStateCursors {
@@ -258,22 +260,24 @@ pub trait IncrementalOperator: Debug + Send {
 
 #[cfg(test)]
 mod tests {
+    use rustc_hash::FxHashSet as HashSet;
+
     use super::*;
     use crate::incremental::aggregate_operator::{AggregateOperator, AGG_TYPE_REGULAR};
     use crate::incremental::dbsp::HashableRow;
     use crate::storage::btree::CursorTrait;
     use crate::storage::pager::CreateBTreeFlags;
+    use crate::sync::Arc;
+    use crate::sync::Mutex;
     use crate::types::Text;
     use crate::util::IOExt;
     use crate::Value;
     use crate::{Database, MemoryIO, IO};
-    use parking_lot::Mutex;
-    use std::sync::Arc;
 
     /// Create a test pager for operator tests with both table and index
-    fn create_test_pager() -> (std::sync::Arc<crate::Pager>, i64, i64) {
+    fn create_test_pager() -> (crate::sync::Arc<crate::Pager>, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:").unwrap();
         let conn = db.connect().unwrap();
 
         let pager = conn.pager.load().clone();
@@ -302,7 +306,7 @@ mod tests {
     /// Returns a Delta with all the current aggregate values
     fn get_current_state_from_btree(
         agg: &AggregateOperator,
-        pager: &std::sync::Arc<crate::Pager>,
+        pager: &crate::sync::Arc<crate::Pager>,
         cursors: &mut DbspStateCursors,
     ) -> Delta {
         let mut result = Delta::new();
@@ -317,18 +321,19 @@ mod tests {
             }
 
             // Get the record at this position
-            let record = pager
-                .io
-                .block(|| cursors.table_cursor.record())
-                .unwrap()
-                .unwrap()
-                .to_owned();
+            let record = loop {
+                match cursors.table_cursor.record().unwrap() {
+                    IOResult::Done(r) => break r,
+                    IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
+                }
+            }
+            .unwrap()
+            .to_owned();
 
-            let values_ref = record.get_values();
-            let values: Vec<Value> = values_ref.into_iter().map(|x| x.to_owned()).collect();
+            let values: Vec<Value> = record.get_values_owned().unwrap();
 
             // Parse the 5-column structure: operator_id, zset_id, element_id, value, weight
-            if let Some(Value::Integer(op_id)) = values.first() {
+            if let Some(Value::Numeric(Numeric::Integer(op_id))) = values.first() {
                 // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
                 let expected_op_id = generate_storage_id(agg.operator_id, 0, AGG_TYPE_REGULAR);
 
@@ -420,25 +425,25 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".to_string().into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".to_string().into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".to_string().into()),
-                Value::Integer(35),
+                Value::from_i64(35),
             ],
         );
 
@@ -453,16 +458,16 @@ mod tests {
         assert_eq!(state.changes.len(), 1, "Should have one aggregate row");
         let (row, weight) = &state.changes[0];
         assert_eq!(*weight, 1, "Aggregate row should have weight 1");
-        assert_eq!(row.values[0], Value::Float(90.0), "SUM should be 90");
+        assert_eq!(row.values[0], Value::from_f64(90.0), "SUM should be 90");
 
         // Now add a new user (incremental update)
         let mut update_delta = Delta::new();
         update_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("David".to_string().into()),
-                Value::Integer(40),
+                Value::from_i64(40),
             ],
         );
 
@@ -491,7 +496,7 @@ mod tests {
         );
         assert_eq!(
             retraction_row.values[0],
-            Value::Float(90.0),
+            Value::from_f64(90.0),
             "Retracted value should be the old sum (90)"
         );
 
@@ -500,7 +505,7 @@ mod tests {
         assert_eq!(*insertion_weight, 1, "Second change should be an insertion");
         assert_eq!(
             insertion_row.values[0],
-            Value::Float(130.0),
+            Value::from_f64(130.0),
             "Inserted value should be the new sum (130)"
         );
 
@@ -544,28 +549,28 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("red".to_string().into()),
                 Value::Text("Alice".to_string().into()),
-                Value::Integer(10),
+                Value::from_i64(10),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("blue".to_string().into()),
                 Value::Text("Bob".to_string().into()),
-                Value::Integer(15),
+                Value::from_i64(15),
             ],
         );
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("red".to_string().into()),
                 Value::Text("Charlie".to_string().into()),
-                Value::Integer(20),
+                Value::from_i64(20),
             ],
         );
 
@@ -594,12 +599,12 @@ mod tests {
         }
         assert_eq!(
             red_sum,
-            Some(&Value::Float(30.0)),
+            Some(&Value::from_f64(30.0)),
             "Red team sum should be 30"
         );
         assert_eq!(
             blue_sum,
-            Some(&Value::Float(15.0)),
+            Some(&Value::from_f64(15.0)),
             "Blue team sum should be 15"
         );
 
@@ -608,10 +613,10 @@ mod tests {
         update_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("red".to_string().into()),
                 Value::Text("David".to_string().into()),
-                Value::Integer(25),
+                Value::from_i64(25),
             ],
         );
 
@@ -643,7 +648,7 @@ mod tests {
                     // Retraction of old value
                     assert_eq!(
                         row.values[1],
-                        Value::Float(30.0),
+                        Value::from_f64(30.0),
                         "Should retract old sum of 30"
                     );
                     found_retraction = true;
@@ -651,7 +656,7 @@ mod tests {
                     // Insertion of new value
                     assert_eq!(
                         row.values[1],
-                        Value::Float(55.0),
+                        Value::from_f64(55.0),
                         "Should insert new sum of 55"
                     );
                     found_insertion = true;
@@ -698,9 +703,9 @@ mod tests {
             initial.insert(
                 i,
                 vec![
-                    Value::Integer(i),
+                    Value::from_i64(i),
                     Value::Text(Text::new(category)),
-                    Value::Integer(i * 10),
+                    Value::from_i64(i * 10),
                 ],
             );
         }
@@ -717,9 +722,9 @@ mod tests {
         delta.insert(
             100,
             vec![
-                Value::Integer(100),
+                Value::from_i64(100),
                 Value::Text(Text::new("cat_0")),
-                Value::Integer(1000),
+                Value::from_i64(1000),
             ],
         );
 
@@ -737,7 +742,7 @@ mod tests {
             .iter()
             .find(|(row, _)| row.values[0] == Value::Text(Text::new("cat_0")))
             .unwrap();
-        assert_eq!(cat_0.0.values[1], Value::Integer(11));
+        assert_eq!(cat_0.0.values[1], Value::from_i64(11));
 
         // Verify incremental behavior - we process the delta twice (eval + commit)
         let t = tracker.lock();
@@ -776,25 +781,25 @@ mod tests {
         initial.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text(Text::new("Widget")),
-                Value::Integer(100),
+                Value::from_i64(100),
             ],
         );
         initial.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text(Text::new("Gadget")),
-                Value::Integer(200),
+                Value::from_i64(200),
             ],
         );
         initial.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text(Text::new("Widget")),
-                Value::Integer(150),
+                Value::from_i64(150),
             ],
         );
         pager
@@ -810,7 +815,7 @@ mod tests {
             .find(|(c, _)| c.values[0] == Value::Text(Text::new("Widget")))
             .map(|(c, _)| c)
             .unwrap();
-        assert_eq!(widget_sum.values[1], Value::Integer(250));
+        assert_eq!(widget_sum.values[1], Value::from_i64(250));
 
         // Reset tracker
         tracker.lock().aggregation_updates = 0;
@@ -820,9 +825,9 @@ mod tests {
         delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text(Text::new("Widget")),
-                Value::Integer(50),
+                Value::from_i64(50),
             ],
         );
 
@@ -840,7 +845,7 @@ mod tests {
             .iter()
             .find(|(row, _)| row.values[0] == Value::Text(Text::new("Widget")))
             .unwrap();
-        assert_eq!(widget.0.values[1], Value::Integer(300));
+        assert_eq!(widget.0.values[1], Value::from_i64(300));
     }
 
     #[test]
@@ -874,15 +879,15 @@ mod tests {
         let mut initial = Delta::new();
         initial.insert(
             1,
-            vec![Value::Integer(1), Value::Integer(1), Value::Integer(100)],
+            vec![Value::from_i64(1), Value::from_i64(1), Value::from_i64(100)],
         );
         initial.insert(
             2,
-            vec![Value::Integer(2), Value::Integer(1), Value::Integer(200)],
+            vec![Value::from_i64(2), Value::from_i64(1), Value::from_i64(200)],
         );
         initial.insert(
             3,
-            vec![Value::Integer(3), Value::Integer(2), Value::Integer(150)],
+            vec![Value::from_i64(3), Value::from_i64(2), Value::from_i64(150)],
         );
         pager
             .io
@@ -898,26 +903,26 @@ mod tests {
         let user1 = state
             .changes
             .iter()
-            .find(|(c, _)| c.values[0] == Value::Integer(1))
+            .find(|(c, _)| c.values[0] == Value::from_i64(1))
             .map(|(c, _)| c)
             .unwrap();
-        assert_eq!(user1.values[1], Value::Integer(2)); // count
-        assert_eq!(user1.values[2], Value::Integer(300)); // sum
+        assert_eq!(user1.values[1], Value::from_i64(2)); // count
+        assert_eq!(user1.values[2], Value::from_i64(300)); // sum
 
         let user2 = state
             .changes
             .iter()
-            .find(|(c, _)| c.values[0] == Value::Integer(2))
+            .find(|(c, _)| c.values[0] == Value::from_i64(2))
             .map(|(c, _)| c)
             .unwrap();
-        assert_eq!(user2.values[1], Value::Integer(1)); // count
-        assert_eq!(user2.values[2], Value::Integer(150)); // sum
+        assert_eq!(user2.values[1], Value::from_i64(1)); // count
+        assert_eq!(user2.values[2], Value::from_i64(150)); // sum
 
         // Add order for user 1
         let mut delta = Delta::new();
         delta.insert(
             4,
-            vec![Value::Integer(4), Value::Integer(1), Value::Integer(50)],
+            vec![Value::from_i64(4), Value::from_i64(1), Value::from_i64(50)],
         );
         pager
             .io
@@ -929,10 +934,10 @@ mod tests {
         let user1 = final_state
             .changes
             .iter()
-            .find(|(row, _)| row.values[0] == Value::Integer(1))
+            .find(|(row, _)| row.values[0] == Value::from_i64(1))
             .unwrap();
-        assert_eq!(user1.0.values[1], Value::Integer(3)); // count: 2 + 1
-        assert_eq!(user1.0.values[2], Value::Integer(350)); // sum: 300 + 50
+        assert_eq!(user1.0.values[1], Value::from_i64(3)); // count: 2 + 1
+        assert_eq!(user1.0.values[2], Value::from_i64(350)); // sum: 300 + 50
     }
 
     #[test]
@@ -964,25 +969,25 @@ mod tests {
         initial.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text(Text::new("A")),
-                Value::Integer(10),
+                Value::from_i64(10),
             ],
         );
         initial.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text(Text::new("A")),
-                Value::Integer(20),
+                Value::from_i64(20),
             ],
         );
         initial.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text(Text::new("B")),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         pager
@@ -1000,7 +1005,7 @@ mod tests {
             .find(|(c, _)| c.values[0] == Value::Text(Text::new("A")))
             .map(|(c, _)| c)
             .unwrap();
-        assert_eq!(cat_a.values[1], Value::Float(15.0));
+        assert_eq!(cat_a.values[1], Value::from_f64(15.0));
 
         let cat_b = state
             .changes
@@ -1008,16 +1013,16 @@ mod tests {
             .find(|(c, _)| c.values[0] == Value::Text(Text::new("B")))
             .map(|(c, _)| c)
             .unwrap();
-        assert_eq!(cat_b.values[1], Value::Float(30.0));
+        assert_eq!(cat_b.values[1], Value::from_f64(30.0));
 
         // Add value to category A
         let mut delta = Delta::new();
         delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text(Text::new("A")),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         pager
@@ -1032,7 +1037,7 @@ mod tests {
             .iter()
             .find(|(row, _)| row.values[0] == Value::Text(Text::new("A")))
             .unwrap();
-        assert_eq!(cat_a.0.values[1], Value::Float(20.0));
+        assert_eq!(cat_a.0.values[1], Value::from_f64(20.0));
     }
 
     #[test]
@@ -1067,17 +1072,17 @@ mod tests {
         initial.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text(Text::new("A")),
-                Value::Integer(100),
+                Value::from_i64(100),
             ],
         );
         initial.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text(Text::new("A")),
-                Value::Integer(200),
+                Value::from_i64(200),
             ],
         );
         pager
@@ -1089,17 +1094,17 @@ mod tests {
         let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert!(!state.changes.is_empty());
         let (row, _weight) = &state.changes[0];
-        assert_eq!(row.values[1], Value::Integer(2)); // count
-        assert_eq!(row.values[2], Value::Integer(300)); // sum
+        assert_eq!(row.values[1], Value::from_i64(2)); // count
+        assert_eq!(row.values[2], Value::from_i64(300)); // sum
 
         // Delete one row
         let mut delta = Delta::new();
         delta.delete(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text(Text::new("A")),
-                Value::Integer(100),
+                Value::from_i64(100),
             ],
         );
 
@@ -1115,8 +1120,8 @@ mod tests {
             .iter()
             .find(|(row, _)| row.values[0] == Value::Text(Text::new("A")))
             .unwrap();
-        assert_eq!(cat_a.0.values[1], Value::Integer(1)); // count: 2 - 1
-        assert_eq!(cat_a.0.values[2], Value::Integer(200)); // sum: 300 - 100
+        assert_eq!(cat_a.0.values[1], Value::from_i64(1)); // count: 2 - 1
+        assert_eq!(cat_a.0.values[2], Value::from_i64(200)); // sum: 300 - 100
     }
 
     #[test]
@@ -1137,16 +1142,16 @@ mod tests {
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
             group_by,
-            aggregates.clone(),
+            aggregates,
             input_columns,
         )
         .unwrap();
 
         // Initialize with data
         let mut init_data = Delta::new();
-        init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(10)]);
-        init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(20)]);
-        init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(30)]);
+        init_data.insert(1, vec![Value::Text("A".into()), Value::from_i64(10)]);
+        init_data.insert(2, vec![Value::Text("A".into()), Value::from_i64(20)]);
+        init_data.insert(3, vec![Value::Text("B".into()), Value::from_i64(30)]);
         pager
             .io
             .block(|| agg.commit((&init_data).into(), &mut cursors))
@@ -1168,12 +1173,12 @@ mod tests {
             .find(|(row, _)| row.values[0] == Value::Text("B".into()))
             .unwrap();
 
-        assert_eq!(group_a.0.values[1], Value::Integer(2)); // COUNT = 2 for A
-        assert_eq!(group_b.0.values[1], Value::Integer(1)); // COUNT = 1 for B
+        assert_eq!(group_a.0.values[1], Value::from_i64(2)); // COUNT = 2 for A
+        assert_eq!(group_b.0.values[1], Value::from_i64(1)); // COUNT = 1 for B
 
         // Delete one row from group A
         let mut delete_delta = Delta::new();
-        delete_delta.delete(1, vec![Value::Text("A".into()), Value::Integer(10)]);
+        delete_delta.delete(1, vec![Value::Text("A".into()), Value::from_i64(10)]);
 
         let output = pager
             .io
@@ -1190,11 +1195,11 @@ mod tests {
             .iter()
             .find(|(row, _)| row.values[0] == Value::Text("A".into()))
             .unwrap();
-        assert_eq!(group_a_final.0.values[1], Value::Integer(1)); // COUNT = 1 for A after deletion
+        assert_eq!(group_a_final.0.values[1], Value::from_i64(1)); // COUNT = 1 for A after deletion
 
         // Delete all rows from group B
         let mut delete_all_b = Delta::new();
-        delete_all_b.delete(3, vec![Value::Text("B".into()), Value::Integer(30)]);
+        delete_all_b.delete(3, vec![Value::Text("B".into()), Value::from_i64(30)]);
 
         let output_b = pager
             .io
@@ -1227,17 +1232,17 @@ mod tests {
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
             group_by,
-            aggregates.clone(),
+            aggregates,
             input_columns,
         )
         .unwrap();
 
         // Initialize with data
         let mut init_data = Delta::new();
-        init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(10)]);
-        init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(20)]);
-        init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(30)]);
-        init_data.insert(4, vec![Value::Text("B".into()), Value::Integer(15)]);
+        init_data.insert(1, vec![Value::Text("A".into()), Value::from_i64(10)]);
+        init_data.insert(2, vec![Value::Text("A".into()), Value::from_i64(20)]);
+        init_data.insert(3, vec![Value::Text("B".into()), Value::from_i64(30)]);
+        init_data.insert(4, vec![Value::Text("B".into()), Value::from_i64(15)]);
         pager
             .io
             .block(|| agg.commit((&init_data).into(), &mut cursors))
@@ -1256,12 +1261,12 @@ mod tests {
             .find(|(row, _)| row.values[0] == Value::Text("B".into()))
             .unwrap();
 
-        assert_eq!(group_a.0.values[1], Value::Integer(30)); // SUM = 30 for A (10+20)
-        assert_eq!(group_b.0.values[1], Value::Integer(45)); // SUM = 45 for B (30+15)
+        assert_eq!(group_a.0.values[1], Value::from_i64(30)); // SUM = 30 for A (10+20)
+        assert_eq!(group_b.0.values[1], Value::from_i64(45)); // SUM = 45 for B (30+15)
 
         // Delete one row from group A
         let mut delete_delta = Delta::new();
-        delete_delta.delete(2, vec![Value::Text("A".into()), Value::Integer(20)]);
+        delete_delta.delete(2, vec![Value::Text("A".into()), Value::from_i64(20)]);
 
         pager
             .io
@@ -1275,12 +1280,12 @@ mod tests {
             .iter()
             .find(|(row, _)| row.values[0] == Value::Text("A".into()))
             .unwrap();
-        assert_eq!(group_a.0.values[1], Value::Integer(10)); // SUM = 10 for A after deletion
+        assert_eq!(group_a.0.values[1], Value::from_i64(10)); // SUM = 10 for A after deletion
 
         // Delete all from group B
         let mut delete_all_b = Delta::new();
-        delete_all_b.delete(3, vec![Value::Text("B".into()), Value::Integer(30)]);
-        delete_all_b.delete(4, vec![Value::Text("B".into()), Value::Integer(15)]);
+        delete_all_b.delete(3, vec![Value::Text("B".into()), Value::from_i64(30)]);
+        delete_all_b.delete(4, vec![Value::Text("B".into()), Value::from_i64(15)]);
 
         pager
             .io
@@ -1311,16 +1316,16 @@ mod tests {
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
             group_by,
-            aggregates.clone(),
+            aggregates,
             input_columns,
         )
         .unwrap();
 
         // Initialize with data
         let mut init_data = Delta::new();
-        init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(10)]);
-        init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(20)]);
-        init_data.insert(3, vec![Value::Text("A".into()), Value::Integer(30)]);
+        init_data.insert(1, vec![Value::Text("A".into()), Value::from_i64(10)]);
+        init_data.insert(2, vec![Value::Text("A".into()), Value::from_i64(20)]);
+        init_data.insert(3, vec![Value::Text("A".into()), Value::from_i64(30)]);
         pager
             .io
             .block(|| agg.commit((&init_data).into(), &mut cursors))
@@ -1329,11 +1334,11 @@ mod tests {
         // Check initial average
         let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state.changes.len(), 1);
-        assert_eq!(state.changes[0].0.values[1], Value::Float(20.0)); // AVG = (10+20+30)/3 = 20
+        assert_eq!(state.changes[0].0.values[1], Value::from_f64(20.0)); // AVG = (10+20+30)/3 = 20
 
         // Delete the middle value
         let mut delete_delta = Delta::new();
-        delete_delta.delete(2, vec![Value::Text("A".into()), Value::Integer(20)]);
+        delete_delta.delete(2, vec![Value::Text("A".into()), Value::from_i64(20)]);
 
         pager
             .io
@@ -1342,11 +1347,11 @@ mod tests {
 
         // Check updated average
         let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
-        assert_eq!(state.changes[0].0.values[1], Value::Float(20.0)); // AVG = (10+30)/2 = 20 (same!)
+        assert_eq!(state.changes[0].0.values[1], Value::from_f64(20.0)); // AVG = (10+30)/2 = 20 (same!)
 
         // Delete another to change the average
         let mut delete_another = Delta::new();
-        delete_another.delete(3, vec![Value::Text("A".into()), Value::Integer(30)]);
+        delete_another.delete(3, vec![Value::Text("A".into()), Value::from_i64(30)]);
 
         pager
             .io
@@ -1354,7 +1359,7 @@ mod tests {
             .unwrap();
 
         let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
-        assert_eq!(state.changes[0].0.values[1], Value::Float(10.0)); // AVG = 10/1 = 10
+        assert_eq!(state.changes[0].0.values[1], Value::from_f64(10.0)); // AVG = 10/1 = 10
     }
 
     #[test]
@@ -1380,16 +1385,16 @@ mod tests {
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
             group_by,
-            aggregates.clone(),
+            aggregates,
             input_columns,
         )
         .unwrap();
 
         // Initialize with data
         let mut init_data = Delta::new();
-        init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(100)]);
-        init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(200)]);
-        init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(50)]);
+        init_data.insert(1, vec![Value::Text("A".into()), Value::from_i64(100)]);
+        init_data.insert(2, vec![Value::Text("A".into()), Value::from_i64(200)]);
+        init_data.insert(3, vec![Value::Text("B".into()), Value::from_i64(50)]);
         pager
             .io
             .block(|| agg.commit((&init_data).into(), &mut cursors))
@@ -1403,13 +1408,13 @@ mod tests {
             .find(|(row, _)| row.values[0] == Value::Text("A".into()))
             .unwrap();
 
-        assert_eq!(group_a.0.values[1], Value::Integer(2)); // COUNT = 2
-        assert_eq!(group_a.0.values[2], Value::Integer(300)); // SUM = 300
-        assert_eq!(group_a.0.values[3], Value::Float(150.0)); // AVG = 150
+        assert_eq!(group_a.0.values[1], Value::from_i64(2)); // COUNT = 2
+        assert_eq!(group_a.0.values[2], Value::from_i64(300)); // SUM = 300
+        assert_eq!(group_a.0.values[3], Value::from_f64(150.0)); // AVG = 150
 
         // Delete one row from group A
         let mut delete_delta = Delta::new();
-        delete_delta.delete(1, vec![Value::Text("A".into()), Value::Integer(100)]);
+        delete_delta.delete(1, vec![Value::Text("A".into()), Value::from_i64(100)]);
 
         pager
             .io
@@ -1424,13 +1429,13 @@ mod tests {
             .find(|(row, _)| row.values[0] == Value::Text("A".into()))
             .unwrap();
 
-        assert_eq!(group_a.0.values[1], Value::Integer(1)); // COUNT = 1
-        assert_eq!(group_a.0.values[2], Value::Integer(200)); // SUM = 200
-        assert_eq!(group_a.0.values[3], Value::Float(200.0)); // AVG = 200
+        assert_eq!(group_a.0.values[1], Value::from_i64(1)); // COUNT = 1
+        assert_eq!(group_a.0.values[2], Value::from_i64(200)); // SUM = 200
+        assert_eq!(group_a.0.values[3], Value::from_f64(200.0)); // AVG = 200
 
         // Insert a new row with floating point value
         let mut insert_delta = Delta::new();
-        insert_delta.insert(4, vec![Value::Text("A".into()), Value::Float(50.5)]);
+        insert_delta.insert(4, vec![Value::Text("A".into()), Value::from_f64(50.5)]);
 
         pager
             .io
@@ -1444,9 +1449,9 @@ mod tests {
             .find(|(row, _)| row.values[0] == Value::Text("A".into()))
             .unwrap();
 
-        assert_eq!(group_a.0.values[1], Value::Integer(2)); // COUNT = 2
-        assert_eq!(group_a.0.values[2], Value::Float(250.5)); // SUM = 250.5
-        assert_eq!(group_a.0.values[3], Value::Float(125.25)); // AVG = 125.25
+        assert_eq!(group_a.0.values[1], Value::from_i64(2)); // COUNT = 2
+        assert_eq!(group_a.0.values[2], Value::from_f64(250.5)); // SUM = 250.5
+        assert_eq!(group_a.0.values[3], Value::from_f64(125.25)); // AVG = 125.25
     }
 
     #[test]
@@ -1465,12 +1470,12 @@ mod tests {
 
         let mut filter = FilterOperator::new(FilterPredicate::GreaterThan {
             column_idx: 1, // "b" is at index 1
-            value: Value::Integer(2),
+            value: Value::from_i64(2),
         });
 
         // Initialize with a row (rowid=3, values=[3, 3])
         let mut init_data = Delta::new();
-        init_data.insert(3, vec![Value::Integer(3), Value::Integer(3)]);
+        init_data.insert(3, vec![Value::from_i64(3), Value::from_i64(3)]);
         let state = pager
             .io
             .block(|| filter.commit((&init_data).into(), &mut cursors))
@@ -1481,14 +1486,14 @@ mod tests {
         assert_eq!(state.changes[0].0.rowid, 3);
         assert_eq!(
             state.changes[0].0.values,
-            vec![Value::Integer(3), Value::Integer(3)]
+            vec![Value::from_i64(3), Value::from_i64(3)]
         );
 
         // Simulate an UPDATE that changes rowid from 3 to 1
         // This is sent as: delete(3) + insert(1)
         let mut update_delta = Delta::new();
-        update_delta.delete(3, vec![Value::Integer(3), Value::Integer(3)]);
-        update_delta.insert(1, vec![Value::Integer(1), Value::Integer(3)]);
+        update_delta.delete(3, vec![Value::from_i64(3), Value::from_i64(3)]);
+        update_delta.insert(1, vec![Value::from_i64(1), Value::from_i64(3)]);
 
         let output = pager
             .io
@@ -1523,7 +1528,7 @@ mod tests {
 
         let mut filter = FilterOperator::new(FilterPredicate::GreaterThan {
             column_idx: 2, // "age" is at index 2
-            value: Value::Integer(25),
+            value: Value::from_i64(25),
         });
 
         // Initialize with some data
@@ -1531,17 +1536,17 @@ mod tests {
         init_data.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(30),
+                Value::from_i64(30),
             ],
         );
         init_data.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(20),
+                Value::from_i64(20),
             ],
         );
         let state = pager
@@ -1558,17 +1563,17 @@ mod tests {
         uncommitted.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Charlie".into()),
-                Value::Integer(35),
+                Value::from_i64(35),
             ],
         );
         uncommitted.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("David".into()),
-                Value::Integer(15),
+                Value::from_i64(15),
             ],
         );
 
@@ -1631,25 +1636,25 @@ mod tests {
         init_data.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("A".into()),
-                Value::Integer(100),
+                Value::from_i64(100),
             ],
         );
         init_data.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("A".into()),
-                Value::Integer(200),
+                Value::from_i64(200),
             ],
         );
         init_data.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("B".into()),
-                Value::Integer(150),
+                Value::from_i64(150),
             ],
         );
         pager
@@ -1667,25 +1672,25 @@ mod tests {
             .iter()
             .find(|(row, _)| row.values[0] == Value::Text("A".into()))
             .unwrap();
-        assert_eq!(initial_a.0.values[1], Value::Integer(2)); // count
-        assert_eq!(initial_a.0.values[2], Value::Float(300.0)); // sum
+        assert_eq!(initial_a.0.values[1], Value::from_i64(2)); // count
+        assert_eq!(initial_a.0.values[2], Value::from_f64(300.0)); // sum
 
         // Create uncommitted changes
         let mut uncommitted = Delta::new();
         uncommitted.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("A".into()),
-                Value::Integer(50),
+                Value::from_i64(50),
             ],
         );
         uncommitted.insert(
             5,
             vec![
-                Value::Integer(5),
+                Value::from_i64(5),
                 Value::Text("C".into()),
-                Value::Integer(75),
+                Value::from_i64(75),
             ],
         );
 
@@ -1716,12 +1721,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             a_after_eval.0.values[1],
-            Value::Integer(2),
+            Value::from_i64(2),
             "A count should still be 2"
         );
         assert_eq!(
             a_after_eval.0.values[2],
-            Value::Float(300.0),
+            Value::from_f64(300.0),
             "A sum should still be 300"
         );
 
@@ -1742,12 +1747,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             a_final.0.values[1],
-            Value::Integer(3),
+            Value::from_i64(3),
             "A count should now be 3"
         );
         assert_eq!(
             a_final.0.values[2],
-            Value::Float(350.0),
+            Value::from_f64(350.0),
             "A sum should now be 350"
         );
 
@@ -1758,12 +1763,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             c_final.0.values[1],
-            Value::Integer(1),
+            Value::from_i64(1),
             "C count should be 1"
         );
         assert_eq!(
             c_final.0.values[2],
-            Value::Float(75.0),
+            Value::from_f64(75.0),
             "C sum should be 75"
         );
     }
@@ -1794,8 +1799,8 @@ mod tests {
 
         // Initialize
         let mut init_data = Delta::new();
-        init_data.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
-        init_data.insert(2, vec![Value::Integer(2), Value::Integer(200)]);
+        init_data.insert(1, vec![Value::from_i64(1), Value::from_i64(100)]);
+        init_data.insert(2, vec![Value::from_i64(2), Value::from_i64(200)]);
         pager
             .io
             .block(|| agg.commit((&init_data).into(), &mut cursors))
@@ -1804,12 +1809,12 @@ mod tests {
         // Initial state: count=2, sum=300
         let initial_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(initial_state.changes.len(), 1);
-        assert_eq!(initial_state.changes[0].0.values[0], Value::Integer(2));
-        assert_eq!(initial_state.changes[0].0.values[1], Value::Float(300.0));
+        assert_eq!(initial_state.changes[0].0.values[0], Value::from_i64(2));
+        assert_eq!(initial_state.changes[0].0.values[1], Value::from_f64(300.0));
 
         // First eval with uncommitted
         let mut uncommitted1 = Delta::new();
-        uncommitted1.insert(3, vec![Value::Integer(3), Value::Integer(50)]);
+        uncommitted1.insert(3, vec![Value::from_i64(3), Value::from_i64(50)]);
         let mut eval_state1 = uncommitted1.clone().into();
         let _ = pager
             .io
@@ -1818,13 +1823,13 @@ mod tests {
 
         // State should be unchanged
         let state1 = get_current_state_from_btree(&agg, &pager, &mut cursors);
-        assert_eq!(state1.changes[0].0.values[0], Value::Integer(2));
-        assert_eq!(state1.changes[0].0.values[1], Value::Float(300.0));
+        assert_eq!(state1.changes[0].0.values[0], Value::from_i64(2));
+        assert_eq!(state1.changes[0].0.values[1], Value::from_f64(300.0));
 
         // Second eval with different uncommitted
         let mut uncommitted2 = Delta::new();
-        uncommitted2.insert(4, vec![Value::Integer(4), Value::Integer(75)]);
-        uncommitted2.insert(5, vec![Value::Integer(5), Value::Integer(25)]);
+        uncommitted2.insert(4, vec![Value::from_i64(4), Value::from_i64(75)]);
+        uncommitted2.insert(5, vec![Value::from_i64(5), Value::from_i64(25)]);
         let mut eval_state2 = uncommitted2.clone().into();
         let _ = pager
             .io
@@ -1833,12 +1838,12 @@ mod tests {
 
         // State should STILL be unchanged
         let state2 = get_current_state_from_btree(&agg, &pager, &mut cursors);
-        assert_eq!(state2.changes[0].0.values[0], Value::Integer(2));
-        assert_eq!(state2.changes[0].0.values[1], Value::Float(300.0));
+        assert_eq!(state2.changes[0].0.values[0], Value::from_i64(2));
+        assert_eq!(state2.changes[0].0.values[1], Value::from_f64(300.0));
 
         // Third eval with deletion as uncommitted
         let mut uncommitted3 = Delta::new();
-        uncommitted3.delete(1, vec![Value::Integer(1), Value::Integer(100)]);
+        uncommitted3.delete(1, vec![Value::from_i64(1), Value::from_i64(100)]);
         let mut eval_state3 = uncommitted3.clone().into();
         let _ = pager
             .io
@@ -1847,8 +1852,8 @@ mod tests {
 
         // State should STILL be unchanged
         let state3 = get_current_state_from_btree(&agg, &pager, &mut cursors);
-        assert_eq!(state3.changes[0].0.values[0], Value::Integer(2));
-        assert_eq!(state3.changes[0].0.values[1], Value::Float(300.0));
+        assert_eq!(state3.changes[0].0.values[0], Value::from_i64(2));
+        assert_eq!(state3.changes[0].0.values[1], Value::from_f64(300.0));
     }
 
     #[test]
@@ -1873,8 +1878,8 @@ mod tests {
 
         // Initialize
         let mut init_data = Delta::new();
-        init_data.insert(1, vec![Value::Integer(1), Value::Text("X".into())]);
-        init_data.insert(2, vec![Value::Integer(2), Value::Text("Y".into())]);
+        init_data.insert(1, vec![Value::from_i64(1), Value::Text("X".into())]);
+        init_data.insert(2, vec![Value::from_i64(2), Value::Text("Y".into())]);
         pager
             .io
             .block(|| agg.commit((&init_data).into(), &mut cursors))
@@ -1882,12 +1887,12 @@ mod tests {
 
         // Create a committed delta (to be processed)
         let mut committed_delta = Delta::new();
-        committed_delta.insert(3, vec![Value::Integer(3), Value::Text("X".into())]);
+        committed_delta.insert(3, vec![Value::from_i64(3), Value::Text("X".into())]);
 
         // Create uncommitted changes
         let mut uncommitted = Delta::new();
-        uncommitted.insert(4, vec![Value::Integer(4), Value::Text("Y".into())]);
-        uncommitted.insert(5, vec![Value::Integer(5), Value::Text("Z".into())]);
+        uncommitted.insert(4, vec![Value::from_i64(4), Value::Text("Y".into())]);
+        uncommitted.insert(5, vec![Value::from_i64(5), Value::Text("Z".into())]);
 
         // Eval with both - should process both but not commit
         let mut combined = committed_delta.clone();
@@ -1927,25 +1932,25 @@ mod tests {
 
         // Check X group: should have retraction (-1) for count=1, then insertion (1) for count=2
         assert_eq!(sorted_changes[0].0.values[0], Value::Text("X".into()));
-        assert_eq!(sorted_changes[0].0.values[1], Value::Integer(1)); // old count
+        assert_eq!(sorted_changes[0].0.values[1], Value::from_i64(1)); // old count
         assert_eq!(sorted_changes[0].1, -1); // retraction
 
         assert_eq!(sorted_changes[1].0.values[0], Value::Text("X".into()));
-        assert_eq!(sorted_changes[1].0.values[1], Value::Integer(2)); // new count
+        assert_eq!(sorted_changes[1].0.values[1], Value::from_i64(2)); // new count
         assert_eq!(sorted_changes[1].1, 1); // insertion
 
         // Check Y group: should have retraction (-1) for count=1, then insertion (1) for count=2
         assert_eq!(sorted_changes[2].0.values[0], Value::Text("Y".into()));
-        assert_eq!(sorted_changes[2].0.values[1], Value::Integer(1)); // old count
+        assert_eq!(sorted_changes[2].0.values[1], Value::from_i64(1)); // old count
         assert_eq!(sorted_changes[2].1, -1); // retraction
 
         assert_eq!(sorted_changes[3].0.values[0], Value::Text("Y".into()));
-        assert_eq!(sorted_changes[3].0.values[1], Value::Integer(2)); // new count
+        assert_eq!(sorted_changes[3].0.values[1], Value::from_i64(2)); // new count
         assert_eq!(sorted_changes[3].1, 1); // insertion
 
         // Check Z group: should only have insertion (1) for count=1 (new group)
         assert_eq!(sorted_changes[4].0.values[0], Value::Text("Z".into()));
-        assert_eq!(sorted_changes[4].0.values[1], Value::Integer(1)); // new count
+        assert_eq!(sorted_changes[4].0.values[1], Value::from_i64(1)); // new count
         assert_eq!(sorted_changes[4].1, 1); // insertion only (no retraction as it's new);
 
         // But internal state should be unchanged
@@ -1965,7 +1970,7 @@ mod tests {
             .iter()
             .find(|(row, _)| row.values[0] == Value::Text("X".into()))
             .unwrap();
-        assert_eq!(x.0.values[1], Value::Integer(2));
+        assert_eq!(x.0.values[1], Value::from_i64(2));
     }
 
     #[test]
@@ -1993,33 +1998,33 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Apple".into()),
-                Value::Float(1.50),
+                Value::from_f64(1.50),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Banana".into()),
-                Value::Float(0.75),
+                Value::from_f64(0.75),
             ],
         );
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Orange".into()),
-                Value::Float(2.00),
+                Value::from_f64(2.00),
             ],
         );
         initial_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("Grape".into()),
-                Value::Float(3.50),
+                Value::from_f64(3.50),
             ],
         );
 
@@ -2032,8 +2037,8 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         let (row, weight) = &result.changes[0];
         assert_eq!(*weight, 1);
-        assert_eq!(row.values[0], Value::Float(0.75)); // MIN
-        assert_eq!(row.values[1], Value::Float(3.50)); // MAX
+        assert_eq!(row.values[0], Value::from_f64(0.75)); // MIN
+        assert_eq!(row.values[1], Value::from_f64(3.50)); // MAX
     }
 
     #[test]
@@ -2061,33 +2066,33 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Apple".into()),
-                Value::Float(1.50),
+                Value::from_f64(1.50),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Banana".into()),
-                Value::Float(0.75),
+                Value::from_f64(0.75),
             ],
         );
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Orange".into()),
-                Value::Float(2.00),
+                Value::from_f64(2.00),
             ],
         );
         initial_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("Grape".into()),
-                Value::Float(3.50),
+                Value::from_f64(3.50),
             ],
         );
 
@@ -2101,9 +2106,9 @@ mod tests {
         delete_delta.delete(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Banana".into()),
-                Value::Float(0.75),
+                Value::from_f64(0.75),
             ],
         );
 
@@ -2117,13 +2122,13 @@ mod tests {
 
         // Find the retraction (weight = -1)
         let retraction = result.changes.iter().find(|(_, w)| *w == -1).unwrap();
-        assert_eq!(retraction.0.values[0], Value::Float(0.75)); // Old MIN
-        assert_eq!(retraction.0.values[1], Value::Float(3.50)); // Old MAX
+        assert_eq!(retraction.0.values[0], Value::from_f64(0.75)); // Old MIN
+        assert_eq!(retraction.0.values[1], Value::from_f64(3.50)); // Old MAX
 
         // Find the new values (weight = 1)
         let new_values = result.changes.iter().find(|(_, w)| *w == 1).unwrap();
-        assert_eq!(new_values.0.values[0], Value::Float(1.50)); // New MIN (Apple)
-        assert_eq!(new_values.0.values[1], Value::Float(3.50)); // MAX unchanged
+        assert_eq!(new_values.0.values[0], Value::from_f64(1.50)); // New MIN (Apple)
+        assert_eq!(new_values.0.values[1], Value::from_f64(3.50)); // MAX unchanged
     }
 
     #[test]
@@ -2151,33 +2156,33 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Apple".into()),
-                Value::Float(1.50),
+                Value::from_f64(1.50),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Banana".into()),
-                Value::Float(0.75),
+                Value::from_f64(0.75),
             ],
         );
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Orange".into()),
-                Value::Float(2.00),
+                Value::from_f64(2.00),
             ],
         );
         initial_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("Grape".into()),
-                Value::Float(3.50),
+                Value::from_f64(3.50),
             ],
         );
 
@@ -2191,9 +2196,9 @@ mod tests {
         delete_delta.delete(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("Grape".into()),
-                Value::Float(3.50),
+                Value::from_f64(3.50),
             ],
         );
 
@@ -2207,13 +2212,13 @@ mod tests {
 
         // Find the retraction (weight = -1)
         let retraction = result.changes.iter().find(|(_, w)| *w == -1).unwrap();
-        assert_eq!(retraction.0.values[0], Value::Float(0.75)); // Old MIN
-        assert_eq!(retraction.0.values[1], Value::Float(3.50)); // Old MAX
+        assert_eq!(retraction.0.values[0], Value::from_f64(0.75)); // Old MIN
+        assert_eq!(retraction.0.values[1], Value::from_f64(3.50)); // Old MAX
 
         // Find the new values (weight = 1)
         let new_values = result.changes.iter().find(|(_, w)| *w == 1).unwrap();
-        assert_eq!(new_values.0.values[0], Value::Float(0.75)); // MIN unchanged
-        assert_eq!(new_values.0.values[1], Value::Float(2.00)); // New MAX (Orange)
+        assert_eq!(new_values.0.values[0], Value::from_f64(0.75)); // MIN unchanged
+        assert_eq!(new_values.0.values[1], Value::from_f64(2.00)); // New MAX (Orange)
     }
 
     #[test]
@@ -2241,25 +2246,25 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Apple".into()),
-                Value::Float(1.50),
+                Value::from_f64(1.50),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Orange".into()),
-                Value::Float(2.00),
+                Value::from_f64(2.00),
             ],
         );
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Grape".into()),
-                Value::Float(3.50),
+                Value::from_f64(3.50),
             ],
         );
 
@@ -2273,9 +2278,9 @@ mod tests {
         insert_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("Lemon".into()),
-                Value::Float(0.50),
+                Value::from_f64(0.50),
             ],
         );
 
@@ -2289,13 +2294,13 @@ mod tests {
 
         // Find the retraction (weight = -1)
         let retraction = result.changes.iter().find(|(_, w)| *w == -1).unwrap();
-        assert_eq!(retraction.0.values[0], Value::Float(1.50)); // Old MIN
-        assert_eq!(retraction.0.values[1], Value::Float(3.50)); // Old MAX
+        assert_eq!(retraction.0.values[0], Value::from_f64(1.50)); // Old MIN
+        assert_eq!(retraction.0.values[1], Value::from_f64(3.50)); // Old MAX
 
         // Find the new values (weight = 1)
         let new_values = result.changes.iter().find(|(_, w)| *w == 1).unwrap();
-        assert_eq!(new_values.0.values[0], Value::Float(0.50)); // New MIN (Lemon)
-        assert_eq!(new_values.0.values[1], Value::Float(3.50)); // MAX unchanged
+        assert_eq!(new_values.0.values[0], Value::from_f64(0.50)); // New MIN (Lemon)
+        assert_eq!(new_values.0.values[1], Value::from_f64(3.50)); // MAX unchanged
     }
 
     #[test]
@@ -2323,25 +2328,25 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Apple".into()),
-                Value::Float(1.50),
+                Value::from_f64(1.50),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Orange".into()),
-                Value::Float(2.00),
+                Value::from_f64(2.00),
             ],
         );
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Grape".into()),
-                Value::Float(3.50),
+                Value::from_f64(3.50),
             ],
         );
 
@@ -2355,9 +2360,9 @@ mod tests {
         insert_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("Melon".into()),
-                Value::Float(5.00),
+                Value::from_f64(5.00),
             ],
         );
 
@@ -2371,13 +2376,13 @@ mod tests {
 
         // Find the retraction (weight = -1)
         let retraction = result.changes.iter().find(|(_, w)| *w == -1).unwrap();
-        assert_eq!(retraction.0.values[0], Value::Float(1.50)); // Old MIN
-        assert_eq!(retraction.0.values[1], Value::Float(3.50)); // Old MAX
+        assert_eq!(retraction.0.values[0], Value::from_f64(1.50)); // Old MIN
+        assert_eq!(retraction.0.values[1], Value::from_f64(3.50)); // Old MAX
 
         // Find the new values (weight = 1)
         let new_values = result.changes.iter().find(|(_, w)| *w == 1).unwrap();
-        assert_eq!(new_values.0.values[0], Value::Float(1.50)); // MIN unchanged
-        assert_eq!(new_values.0.values[1], Value::Float(5.00)); // New MAX (Melon)
+        assert_eq!(new_values.0.values[0], Value::from_f64(1.50)); // MIN unchanged
+        assert_eq!(new_values.0.values[1], Value::from_f64(5.00)); // New MAX (Melon)
     }
 
     #[test]
@@ -2405,25 +2410,25 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Apple".into()),
-                Value::Float(1.50),
+                Value::from_f64(1.50),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Orange".into()),
-                Value::Float(2.00),
+                Value::from_f64(2.00),
             ],
         );
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Grape".into()),
-                Value::Float(3.50),
+                Value::from_f64(3.50),
             ],
         );
 
@@ -2437,17 +2442,17 @@ mod tests {
         update_delta.delete(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Orange".into()),
-                Value::Float(2.00),
+                Value::from_f64(2.00),
             ],
         );
         update_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Orange".into()),
-                Value::Float(0.25),
+                Value::from_f64(0.25),
             ],
         );
 
@@ -2461,13 +2466,13 @@ mod tests {
 
         // Find the retraction (weight = -1)
         let retraction = result.changes.iter().find(|(_, w)| *w == -1).unwrap();
-        assert_eq!(retraction.0.values[0], Value::Float(1.50)); // Old MIN
-        assert_eq!(retraction.0.values[1], Value::Float(3.50)); // Old MAX
+        assert_eq!(retraction.0.values[0], Value::from_f64(1.50)); // Old MIN
+        assert_eq!(retraction.0.values[1], Value::from_f64(3.50)); // Old MAX
 
         // Find the new values (weight = 1)
         let new_values = result.changes.iter().find(|(_, w)| *w == 1).unwrap();
-        assert_eq!(new_values.0.values[0], Value::Float(0.25)); // New MIN (updated Orange)
-        assert_eq!(new_values.0.values[1], Value::Float(3.50)); // MAX unchanged
+        assert_eq!(new_values.0.values[0], Value::from_f64(0.25)); // New MIN (updated Orange)
+        assert_eq!(new_values.0.values[1], Value::from_f64(3.50)); // MAX unchanged
     }
 
     #[test]
@@ -2500,46 +2505,46 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("fruit".into()),
                 Value::Text("Apple".into()),
-                Value::Float(1.50),
+                Value::from_f64(1.50),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("fruit".into()),
                 Value::Text("Banana".into()),
-                Value::Float(0.75),
+                Value::from_f64(0.75),
             ],
         );
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("fruit".into()),
                 Value::Text("Orange".into()),
-                Value::Float(2.00),
+                Value::from_f64(2.00),
             ],
         );
         initial_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("veggie".into()),
                 Value::Text("Carrot".into()),
-                Value::Float(0.50),
+                Value::from_f64(0.50),
             ],
         );
         initial_delta.insert(
             5,
             vec![
-                Value::Integer(5),
+                Value::from_i64(5),
                 Value::Text("veggie".into()),
                 Value::Text("Lettuce".into()),
-                Value::Float(1.25),
+                Value::from_f64(1.25),
             ],
         );
 
@@ -2558,8 +2563,8 @@ mod tests {
             .find(|(row, _)| row.values[0] == Value::Text("fruit".into()))
             .unwrap();
         assert_eq!(fruit.1, 1); // weight
-        assert_eq!(fruit.0.values[1], Value::Float(0.75)); // MIN (Banana)
-        assert_eq!(fruit.0.values[2], Value::Float(2.00)); // MAX (Orange)
+        assert_eq!(fruit.0.values[1], Value::from_f64(0.75)); // MIN (Banana)
+        assert_eq!(fruit.0.values[2], Value::from_f64(2.00)); // MAX (Orange)
 
         // Find veggie group
         let veggie = result
@@ -2568,8 +2573,8 @@ mod tests {
             .find(|(row, _)| row.values[0] == Value::Text("veggie".into()))
             .unwrap();
         assert_eq!(veggie.1, 1); // weight
-        assert_eq!(veggie.0.values[1], Value::Float(0.50)); // MIN (Carrot)
-        assert_eq!(veggie.0.values[2], Value::Float(1.25)); // MAX (Lettuce)
+        assert_eq!(veggie.0.values[1], Value::from_f64(0.50)); // MIN (Carrot)
+        assert_eq!(veggie.0.values[2], Value::from_f64(1.25)); // MAX (Lettuce)
     }
 
     #[test]
@@ -2597,15 +2602,15 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Apple".into()),
-                Value::Float(1.50),
+                Value::from_f64(1.50),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Unknown1".into()),
                 Value::Null,
             ],
@@ -2613,15 +2618,15 @@ mod tests {
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Orange".into()),
-                Value::Float(2.00),
+                Value::from_f64(2.00),
             ],
         );
         initial_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("Unknown2".into()),
                 Value::Null,
             ],
@@ -2629,9 +2634,9 @@ mod tests {
         initial_delta.insert(
             5,
             vec![
-                Value::Integer(5),
+                Value::from_i64(5),
                 Value::Text("Grape".into()),
-                Value::Float(3.50),
+                Value::from_f64(3.50),
             ],
         );
 
@@ -2644,8 +2649,8 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         let (row, weight) = &result.changes[0];
         assert_eq!(*weight, 1);
-        assert_eq!(row.values[0], Value::Float(1.50)); // MIN (Apple, ignoring NULLs)
-        assert_eq!(row.values[1], Value::Float(3.50)); // MAX (Grape, ignoring NULLs)
+        assert_eq!(row.values[0], Value::from_f64(1.50)); // MIN (Apple, ignoring NULLs)
+        assert_eq!(row.values[1], Value::from_f64(3.50)); // MAX (Grape, ignoring NULLs)
     }
 
     #[test]
@@ -2673,33 +2678,33 @@ mod tests {
         initial_delta.insert(
             1,
             vec![
-                Value::Integer(1),
+                Value::from_i64(1),
                 Value::Text("Alice".into()),
-                Value::Integer(85),
+                Value::from_i64(85),
             ],
         );
         initial_delta.insert(
             2,
             vec![
-                Value::Integer(2),
+                Value::from_i64(2),
                 Value::Text("Bob".into()),
-                Value::Integer(92),
+                Value::from_i64(92),
             ],
         );
         initial_delta.insert(
             3,
             vec![
-                Value::Integer(3),
+                Value::from_i64(3),
                 Value::Text("Carol".into()),
-                Value::Integer(78),
+                Value::from_i64(78),
             ],
         );
         initial_delta.insert(
             4,
             vec![
-                Value::Integer(4),
+                Value::from_i64(4),
                 Value::Text("Dave".into()),
-                Value::Integer(95),
+                Value::from_i64(95),
             ],
         );
 
@@ -2712,8 +2717,8 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         let (row, weight) = &result.changes[0];
         assert_eq!(*weight, 1);
-        assert_eq!(row.values[0], Value::Integer(78)); // MIN (Carol)
-        assert_eq!(row.values[1], Value::Integer(95)); // MAX (Dave)
+        assert_eq!(row.values[0], Value::from_i64(78)); // MIN (Carol)
+        assert_eq!(row.values[1], Value::from_i64(95)); // MAX (Dave)
     }
 
     #[test]
@@ -2738,10 +2743,10 @@ mod tests {
 
         // Initial data with text values
         let mut initial_delta = Delta::new();
-        initial_delta.insert(1, vec![Value::Integer(1), Value::Text("Charlie".into())]);
-        initial_delta.insert(2, vec![Value::Integer(2), Value::Text("Alice".into())]);
-        initial_delta.insert(3, vec![Value::Integer(3), Value::Text("Bob".into())]);
-        initial_delta.insert(4, vec![Value::Integer(4), Value::Text("David".into())]);
+        initial_delta.insert(1, vec![Value::from_i64(1), Value::Text("Charlie".into())]);
+        initial_delta.insert(2, vec![Value::from_i64(2), Value::Text("Alice".into())]);
+        initial_delta.insert(3, vec![Value::from_i64(3), Value::Text("Bob".into())]);
+        initial_delta.insert(4, vec![Value::from_i64(4), Value::Text("David".into())]);
 
         let result = pager
             .io
@@ -2780,10 +2785,10 @@ mod tests {
 
         // Initial data
         let mut delta = Delta::new();
-        delta.insert(1, vec![Value::Integer(1), Value::Integer(10)]);
-        delta.insert(2, vec![Value::Integer(2), Value::Integer(5)]);
-        delta.insert(3, vec![Value::Integer(3), Value::Integer(15)]);
-        delta.insert(4, vec![Value::Integer(4), Value::Integer(20)]);
+        delta.insert(1, vec![Value::from_i64(1), Value::from_i64(10)]);
+        delta.insert(2, vec![Value::from_i64(2), Value::from_i64(5)]);
+        delta.insert(3, vec![Value::from_i64(3), Value::from_i64(15)]);
+        delta.insert(4, vec![Value::from_i64(4), Value::from_i64(20)]);
 
         let result = pager
             .io
@@ -2793,15 +2798,15 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         let (row, weight) = &result.changes[0];
         assert_eq!(*weight, 1);
-        assert_eq!(row.values[0], Value::Integer(4)); // COUNT
-        assert_eq!(row.values[1], Value::Integer(50)); // SUM
-        assert_eq!(row.values[2], Value::Integer(5)); // MIN
-        assert_eq!(row.values[3], Value::Integer(20)); // MAX
-        assert_eq!(row.values[4], Value::Float(12.5)); // AVG (50/4)
+        assert_eq!(row.values[0], Value::from_i64(4)); // COUNT
+        assert_eq!(row.values[1], Value::from_i64(50)); // SUM
+        assert_eq!(row.values[2], Value::from_i64(5)); // MIN
+        assert_eq!(row.values[3], Value::from_i64(20)); // MAX
+        assert_eq!(row.values[4], Value::from_f64(12.5)); // AVG (50/4)
 
         // Delete the MIN value
         let mut delta2 = Delta::new();
-        delta2.delete(2, vec![Value::Integer(2), Value::Integer(5)]);
+        delta2.delete(2, vec![Value::from_i64(2), Value::from_i64(5)]);
 
         let result2 = pager
             .io
@@ -2811,23 +2816,23 @@ mod tests {
         assert_eq!(result2.changes.len(), 2);
         let (row_del, weight_del) = &result2.changes[0];
         assert_eq!(*weight_del, -1);
-        assert_eq!(row_del.values[0], Value::Integer(4)); // Old COUNT
-        assert_eq!(row_del.values[1], Value::Integer(50)); // Old SUM
-        assert_eq!(row_del.values[2], Value::Integer(5)); // Old MIN
-        assert_eq!(row_del.values[3], Value::Integer(20)); // Old MAX
-        assert_eq!(row_del.values[4], Value::Float(12.5)); // Old AVG
+        assert_eq!(row_del.values[0], Value::from_i64(4)); // Old COUNT
+        assert_eq!(row_del.values[1], Value::from_i64(50)); // Old SUM
+        assert_eq!(row_del.values[2], Value::from_i64(5)); // Old MIN
+        assert_eq!(row_del.values[3], Value::from_i64(20)); // Old MAX
+        assert_eq!(row_del.values[4], Value::from_f64(12.5)); // Old AVG
 
         let (row_ins, weight_ins) = &result2.changes[1];
         assert_eq!(*weight_ins, 1);
-        assert_eq!(row_ins.values[0], Value::Integer(3)); // New COUNT
-        assert_eq!(row_ins.values[1], Value::Integer(45)); // New SUM
-        assert_eq!(row_ins.values[2], Value::Integer(10)); // New MIN
-        assert_eq!(row_ins.values[3], Value::Integer(20)); // MAX unchanged
-        assert_eq!(row_ins.values[4], Value::Float(15.0)); // New AVG (45/3)
+        assert_eq!(row_ins.values[0], Value::from_i64(3)); // New COUNT
+        assert_eq!(row_ins.values[1], Value::from_i64(45)); // New SUM
+        assert_eq!(row_ins.values[2], Value::from_i64(10)); // New MIN
+        assert_eq!(row_ins.values[3], Value::from_i64(20)); // MAX unchanged
+        assert_eq!(row_ins.values[4], Value::from_f64(15.0)); // New AVG (45/3)
 
         // Now delete the MAX value
         let mut delta3 = Delta::new();
-        delta3.delete(4, vec![Value::Integer(4), Value::Integer(20)]);
+        delta3.delete(4, vec![Value::from_i64(4), Value::from_i64(20)]);
 
         let result3 = pager
             .io
@@ -2837,15 +2842,15 @@ mod tests {
         assert_eq!(result3.changes.len(), 2);
         let (row_del2, weight_del2) = &result3.changes[0];
         assert_eq!(*weight_del2, -1);
-        assert_eq!(row_del2.values[3], Value::Integer(20)); // Old MAX
+        assert_eq!(row_del2.values[3], Value::from_i64(20)); // Old MAX
 
         let (row_ins2, weight_ins2) = &result3.changes[1];
         assert_eq!(*weight_ins2, 1);
-        assert_eq!(row_ins2.values[0], Value::Integer(2)); // COUNT
-        assert_eq!(row_ins2.values[1], Value::Integer(25)); // SUM
-        assert_eq!(row_ins2.values[2], Value::Integer(10)); // MIN unchanged
-        assert_eq!(row_ins2.values[3], Value::Integer(15)); // New MAX
-        assert_eq!(row_ins2.values[4], Value::Float(12.5)); // AVG (25/2)
+        assert_eq!(row_ins2.values[0], Value::from_i64(2)); // COUNT
+        assert_eq!(row_ins2.values[1], Value::from_i64(25)); // SUM
+        assert_eq!(row_ins2.values[2], Value::from_i64(10)); // MIN unchanged
+        assert_eq!(row_ins2.values[3], Value::from_i64(15)); // New MAX
+        assert_eq!(row_ins2.values[4], Value::from_f64(12.5)); // AVG (25/2)
     }
 
     #[test]
@@ -2873,18 +2878,26 @@ mod tests {
         delta.insert(
             1,
             vec![
-                Value::Integer(10),
-                Value::Integer(100),
-                Value::Integer(1000),
+                Value::from_i64(10),
+                Value::from_i64(100),
+                Value::from_i64(1000),
             ],
         );
         delta.insert(
             2,
-            vec![Value::Integer(5), Value::Integer(200), Value::Integer(2000)],
+            vec![
+                Value::from_i64(5),
+                Value::from_i64(200),
+                Value::from_i64(2000),
+            ],
         );
         delta.insert(
             3,
-            vec![Value::Integer(15), Value::Integer(150), Value::Integer(500)],
+            vec![
+                Value::from_i64(15),
+                Value::from_i64(150),
+                Value::from_i64(500),
+            ],
         );
 
         let result = pager
@@ -2895,15 +2908,19 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         let (row, weight) = &result.changes[0];
         assert_eq!(*weight, 1);
-        assert_eq!(row.values[0], Value::Integer(5)); // MIN(col1)
-        assert_eq!(row.values[1], Value::Integer(200)); // MAX(col2)
-        assert_eq!(row.values[2], Value::Integer(500)); // MIN(col3)
+        assert_eq!(row.values[0], Value::from_i64(5)); // MIN(col1)
+        assert_eq!(row.values[1], Value::from_i64(200)); // MAX(col2)
+        assert_eq!(row.values[2], Value::from_i64(500)); // MIN(col3)
 
         // Delete the row with MIN(col1) and MAX(col2)
         let mut delta2 = Delta::new();
         delta2.delete(
             2,
-            vec![Value::Integer(5), Value::Integer(200), Value::Integer(2000)],
+            vec![
+                Value::from_i64(5),
+                Value::from_i64(200),
+                Value::from_i64(2000),
+            ],
         );
 
         let result2 = pager
@@ -2915,15 +2932,15 @@ mod tests {
         // Should emit delete of old state and insert of new state
         let (row_del, weight_del) = &result2.changes[0];
         assert_eq!(*weight_del, -1);
-        assert_eq!(row_del.values[0], Value::Integer(5)); // Old MIN(col1)
-        assert_eq!(row_del.values[1], Value::Integer(200)); // Old MAX(col2)
-        assert_eq!(row_del.values[2], Value::Integer(500)); // Old MIN(col3)
+        assert_eq!(row_del.values[0], Value::from_i64(5)); // Old MIN(col1)
+        assert_eq!(row_del.values[1], Value::from_i64(200)); // Old MAX(col2)
+        assert_eq!(row_del.values[2], Value::from_i64(500)); // Old MIN(col3)
 
         let (row_ins, weight_ins) = &result2.changes[1];
         assert_eq!(*weight_ins, 1);
-        assert_eq!(row_ins.values[0], Value::Integer(10)); // New MIN(col1)
-        assert_eq!(row_ins.values[1], Value::Integer(150)); // New MAX(col2)
-        assert_eq!(row_ins.values[2], Value::Integer(500)); // MIN(col3) unchanged
+        assert_eq!(row_ins.values[0], Value::from_i64(10)); // New MIN(col1)
+        assert_eq!(row_ins.values[1], Value::from_i64(150)); // New MAX(col2)
+        assert_eq!(row_ins.values[2], Value::from_i64(500)); // MIN(col3) unchanged
     }
 
     #[test]
@@ -2946,13 +2963,13 @@ mod tests {
 
         // FIRST COMMIT: Initialize with data
         let mut left_delta = Delta::new();
-        left_delta.insert(1, vec![Value::Integer(1), Value::Float(100.0)]);
-        left_delta.insert(2, vec![Value::Integer(2), Value::Float(200.0)]);
-        left_delta.insert(3, vec![Value::Integer(3), Value::Float(300.0)]); // No match initially
+        left_delta.insert(1, vec![Value::from_i64(1), Value::from_f64(100.0)]);
+        left_delta.insert(2, vec![Value::from_i64(2), Value::from_f64(200.0)]);
+        left_delta.insert(3, vec![Value::from_i64(3), Value::from_f64(300.0)]); // No match initially
         let mut right_delta = Delta::new();
-        right_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
-        right_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
-        right_delta.insert(4, vec![Value::Integer(4), Value::Text("David".into())]); // No match initially
+        right_delta.insert(1, vec![Value::from_i64(1), Value::Text("Alice".into())]);
+        right_delta.insert(2, vec![Value::from_i64(2), Value::Text("Bob".into())]);
+        right_delta.insert(4, vec![Value::from_i64(4), Value::Text("David".into())]); // No match initially
 
         let delta_pair = DeltaPair::new(left_delta, right_delta);
         let result = pager
@@ -2967,22 +2984,22 @@ mod tests {
             "First commit should produce 2 matches"
         );
 
-        let mut results: Vec<_> = result.changes.clone();
+        let mut results: Vec<_> = result.changes;
         results.sort_by_key(|r| r.0.values[0].clone());
 
-        assert_eq!(results[0].0.values[0], Value::Integer(1));
+        assert_eq!(results[0].0.values[0], Value::from_i64(1));
         assert_eq!(results[0].0.values[3], Value::Text("Alice".into()));
-        assert_eq!(results[1].0.values[0], Value::Integer(2));
+        assert_eq!(results[1].0.values[0], Value::from_i64(2));
         assert_eq!(results[1].0.values[3], Value::Text("Bob".into()));
 
         // SECOND COMMIT: Add incremental data that should join with persisted state
         // Add a new left row that should match existing right row (customer 4)
         let mut left_delta2 = Delta::new();
-        left_delta2.insert(5, vec![Value::Integer(4), Value::Float(400.0)]); // Should match David from persisted state
+        left_delta2.insert(5, vec![Value::from_i64(4), Value::from_f64(400.0)]); // Should match David from persisted state
 
         // Add a new right row that should match existing left row (customer 3)
         let mut right_delta2 = Delta::new();
-        right_delta2.insert(6, vec![Value::Integer(3), Value::Text("Charlie".into())]); // Should match customer 3 from persisted state
+        right_delta2.insert(6, vec![Value::from_i64(3), Value::Text("Charlie".into())]); // Should match customer 3 from persisted state
 
         let delta_pair2 = DeltaPair::new(left_delta2, right_delta2);
         let result2 = pager
@@ -3002,23 +3019,23 @@ mod tests {
         );
 
         // Verify the incremental results
-        let mut results2: Vec<_> = result2.changes.clone();
+        let mut results2: Vec<_> = result2.changes;
         results2.sort_by_key(|r| r.0.values[0].clone());
 
         // Check for customer 3 joined with Charlie (existing left + new right)
         let charlie_match = results2
             .iter()
-            .find(|(row, _)| row.values[0] == Value::Integer(3))
+            .find(|(row, _)| row.values[0] == Value::from_i64(3))
             .expect("Should find customer 3 joined with new Charlie");
-        assert_eq!(charlie_match.0.values[2], Value::Integer(3));
+        assert_eq!(charlie_match.0.values[2], Value::from_i64(3));
         assert_eq!(charlie_match.0.values[3], Value::Text("Charlie".into()));
 
         // Check for customer 4 joined with David (new left + existing right)
         let david_match = results2
             .iter()
-            .find(|(row, _)| row.values[0] == Value::Integer(4))
+            .find(|(row, _)| row.values[0] == Value::from_i64(4))
             .expect("Should find new customer 4 joined with existing David");
-        assert_eq!(david_match.0.values[0], Value::Integer(4));
+        assert_eq!(david_match.0.values[0], Value::from_i64(4));
         assert_eq!(david_match.0.values[3], Value::Text("David".into()));
     }
 
@@ -3043,14 +3060,14 @@ mod tests {
 
         // FIRST COMMIT: Add initial data
         let mut left_delta = Delta::new();
-        left_delta.insert(1, vec![Value::Integer(1), Value::Float(100.0)]);
-        left_delta.insert(2, vec![Value::Integer(2), Value::Float(200.0)]);
-        left_delta.insert(3, vec![Value::Integer(3), Value::Float(300.0)]);
+        left_delta.insert(1, vec![Value::from_i64(1), Value::from_f64(100.0)]);
+        left_delta.insert(2, vec![Value::from_i64(2), Value::from_f64(200.0)]);
+        left_delta.insert(3, vec![Value::from_i64(3), Value::from_f64(300.0)]);
 
         let mut right_delta = Delta::new();
-        right_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
-        right_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
-        right_delta.insert(3, vec![Value::Integer(3), Value::Text("Charlie".into())]);
+        right_delta.insert(1, vec![Value::from_i64(1), Value::Text("Alice".into())]);
+        right_delta.insert(2, vec![Value::from_i64(2), Value::Text("Bob".into())]);
+        right_delta.insert(3, vec![Value::from_i64(3), Value::Text("Charlie".into())]);
 
         let delta_pair = DeltaPair::new(left_delta, right_delta);
 
@@ -3063,7 +3080,7 @@ mod tests {
 
         // SECOND COMMIT: Delete customer 2 from left side
         let mut left_delta2 = Delta::new();
-        left_delta2.delete(2, vec![Value::Integer(2), Value::Float(200.0)]);
+        left_delta2.delete(2, vec![Value::from_i64(2), Value::from_f64(200.0)]);
 
         let empty_right = Delta::new();
         let delta_pair2 = DeltaPair::new(left_delta2, empty_right);
@@ -3083,13 +3100,13 @@ mod tests {
             result2.changes[0].1, -1,
             "Should have weight -1 for deletion"
         );
-        assert_eq!(result2.changes[0].0.values[0], Value::Integer(2));
+        assert_eq!(result2.changes[0].0.values[0], Value::from_i64(2));
         assert_eq!(result2.changes[0].0.values[3], Value::Text("Bob".into()));
 
         // THIRD COMMIT: Delete customer 3 from right side
         let empty_left = Delta::new();
         let mut right_delta3 = Delta::new();
-        right_delta3.delete(3, vec![Value::Integer(3), Value::Text("Charlie".into())]);
+        right_delta3.delete(3, vec![Value::from_i64(3), Value::Text("Charlie".into())]);
 
         let delta_pair3 = DeltaPair::new(empty_left, right_delta3);
 
@@ -3108,8 +3125,8 @@ mod tests {
             result3.changes[0].1, -1,
             "Should have weight -1 for deletion"
         );
-        assert_eq!(result3.changes[0].0.values[0], Value::Integer(3));
-        assert_eq!(result3.changes[0].0.values[2], Value::Integer(3));
+        assert_eq!(result3.changes[0].0.values[0], Value::from_i64(3));
+        assert_eq!(result3.changes[0].0.values[2], Value::from_i64(3));
     }
 
     #[test]
@@ -3138,7 +3155,7 @@ mod tests {
         // FIRST COMMIT: Add one customer
         let left_delta = Delta::new(); // Empty orders initially
         let mut right_delta = Delta::new();
-        right_delta.insert(1, vec![Value::Integer(100), Value::Text("Alice".into())]);
+        right_delta.insert(1, vec![Value::from_i64(100), Value::Text("Alice".into())]);
 
         let delta_pair = DeltaPair::new(left_delta, right_delta);
         let result = pager
@@ -3158,25 +3175,25 @@ mod tests {
         left_delta2.insert(
             1,
             vec![
-                Value::Integer(100),
-                Value::Integer(1001),
-                Value::Float(50.0),
+                Value::from_i64(100),
+                Value::from_i64(1001),
+                Value::from_f64(50.0),
             ],
         ); // order 1001
         left_delta2.insert(
             2,
             vec![
-                Value::Integer(100),
-                Value::Integer(1002),
-                Value::Float(75.0),
+                Value::from_i64(100),
+                Value::from_i64(1002),
+                Value::from_f64(75.0),
             ],
         ); // order 1002
         left_delta2.insert(
             3,
             vec![
-                Value::Integer(100),
-                Value::Integer(1003),
-                Value::Float(100.0),
+                Value::from_i64(100),
+                Value::from_i64(1003),
+                Value::from_f64(100.0),
             ],
         ); // order 1003
 
@@ -3201,7 +3218,7 @@ mod tests {
             assert_eq!(*weight, 1, "Weight should be 1 for insertion");
             assert_eq!(
                 row.values[0],
-                Value::Integer(100),
+                Value::from_i64(100),
                 "Customer ID should be 100"
             );
             assert_eq!(
@@ -3212,7 +3229,7 @@ mod tests {
 
             // Check order IDs are different
             let order_id = match &row.values[1] {
-                Value::Integer(id) => *id,
+                Value::Numeric(Numeric::Integer(id)) => *id,
                 _ => panic!("Expected integer order ID"),
             };
             assert!(
@@ -3226,9 +3243,9 @@ mod tests {
         left_delta3.delete(
             2,
             vec![
-                Value::Integer(100),
-                Value::Integer(1002),
-                Value::Float(75.0),
+                Value::from_i64(100),
+                Value::from_i64(1002),
+                Value::from_f64(75.0),
             ],
         );
 
@@ -3243,7 +3260,7 @@ mod tests {
         assert_eq!(result3.changes[0].1, -1, "Should be a deletion");
         assert_eq!(
             result3.changes[0].0.values[1],
-            Value::Integer(1002),
+            Value::from_i64(1002),
             "Should delete order 1002"
         );
     }
@@ -3276,25 +3293,25 @@ mod tests {
         left_delta.insert(
             1,
             vec![
-                Value::Integer(10),
+                Value::from_i64(10),
                 Value::Text("Laptop".into()),
-                Value::Float(1000.0),
+                Value::from_f64(1000.0),
             ],
         );
         left_delta.insert(
             2,
             vec![
-                Value::Integer(10),
+                Value::from_i64(10),
                 Value::Text("Mouse".into()),
-                Value::Float(50.0),
+                Value::from_f64(50.0),
             ],
         );
         left_delta.insert(
             3,
             vec![
-                Value::Integer(10),
+                Value::from_i64(10),
                 Value::Text("Keyboard".into()),
-                Value::Float(100.0),
+                Value::from_f64(100.0),
             ],
         );
 
@@ -3302,9 +3319,12 @@ mod tests {
         let mut right_delta = Delta::new();
         right_delta.insert(
             1,
-            vec![Value::Integer(10), Value::Text("Electronics".into())],
+            vec![Value::from_i64(10), Value::Text("Electronics".into())],
         );
-        right_delta.insert(2, vec![Value::Integer(10), Value::Text("Computers".into())]); // Same category ID, different name
+        right_delta.insert(
+            2,
+            vec![Value::from_i64(10), Value::Text("Computers".into())],
+        ); // Same category ID, different name
 
         let delta_pair = DeltaPair::new(left_delta, right_delta);
         let result = pager
@@ -3321,7 +3341,7 @@ mod tests {
         );
 
         // Verify we have all combinations
-        let mut found_combinations = std::collections::HashSet::new();
+        let mut found_combinations = HashSet::default();
         for (row, weight) in &result.changes {
             assert_eq!(*weight, 1);
             let product = row.values[1].to_string();
@@ -3340,9 +3360,9 @@ mod tests {
         left_delta2.insert(
             4,
             vec![
-                Value::Integer(10),
+                Value::from_i64(10),
                 Value::Text("Monitor".into()),
-                Value::Float(500.0),
+                Value::from_f64(500.0),
             ],
         );
 
@@ -3392,30 +3412,30 @@ mod tests {
         left_delta.insert(
             1,
             vec![
-                Value::Integer(100),
-                Value::Integer(1001),
-                Value::Float(50.0),
+                Value::from_i64(100),
+                Value::from_i64(1001),
+                Value::from_f64(50.0),
             ],
         );
         left_delta.insert(
             2,
             vec![
-                Value::Integer(100),
-                Value::Integer(1002),
-                Value::Float(75.0),
+                Value::from_i64(100),
+                Value::from_i64(1002),
+                Value::from_f64(75.0),
             ],
         );
         left_delta.insert(
             3,
             vec![
-                Value::Integer(100),
-                Value::Integer(1003),
-                Value::Float(100.0),
+                Value::from_i64(100),
+                Value::from_i64(1003),
+                Value::from_f64(100.0),
             ],
         );
 
         let mut right_delta = Delta::new();
-        right_delta.insert(1, vec![Value::Integer(100), Value::Text("Alice".into())]);
+        right_delta.insert(1, vec![Value::from_i64(100), Value::Text("Alice".into())]);
 
         let delta_pair = DeltaPair::new(left_delta, right_delta);
         let result = pager
@@ -3428,11 +3448,11 @@ mod tests {
         // SECOND COMMIT: Update the customer name (affects all 3 joins)
         let mut right_delta2 = Delta::new();
         // Delete old customer record
-        right_delta2.delete(1, vec![Value::Integer(100), Value::Text("Alice".into())]);
+        right_delta2.delete(1, vec![Value::from_i64(100), Value::Text("Alice".into())]);
         // Insert updated customer record
         right_delta2.insert(
             1,
-            vec![Value::Integer(100), Value::Text("Alice Smith".into())],
+            vec![Value::from_i64(100), Value::Text("Alice Smith".into())],
         );
 
         let delta_pair2 = DeltaPair::new(Delta::new(), right_delta2);
@@ -3470,9 +3490,9 @@ mod tests {
         }
 
         // Verify we still have all three order IDs in the insertions
-        let mut order_ids = std::collections::HashSet::new();
+        let mut order_ids = HashSet::default();
         for (row, _) in &insertions {
-            if let Value::Integer(order_id) = &row.values[1] {
+            if let Value::Numeric(Numeric::Integer(order_id)) = &row.values[1] {
                 order_ids.insert(*order_id);
             }
         }
@@ -3508,14 +3528,14 @@ mod tests {
         // FIRST COMMIT: Add identical rows multiple times (simulating duplicates)
         let mut left_delta = Delta::new();
         // Same key-value pair inserted 3 times with different rowids
-        left_delta.insert(1, vec![Value::Integer(10), Value::Text("A".into())]);
-        left_delta.insert(2, vec![Value::Integer(10), Value::Text("A".into())]);
-        left_delta.insert(3, vec![Value::Integer(10), Value::Text("A".into())]);
+        left_delta.insert(1, vec![Value::from_i64(10), Value::Text("A".into())]);
+        left_delta.insert(2, vec![Value::from_i64(10), Value::Text("A".into())]);
+        left_delta.insert(3, vec![Value::from_i64(10), Value::Text("A".into())]);
 
         let mut right_delta = Delta::new();
         // Same key-value pair inserted 2 times
-        right_delta.insert(4, vec![Value::Integer(10), Value::Text("B".into())]);
-        right_delta.insert(5, vec![Value::Integer(10), Value::Text("B".into())]);
+        right_delta.insert(4, vec![Value::from_i64(10), Value::Text("B".into())]);
+        right_delta.insert(5, vec![Value::from_i64(10), Value::Text("B".into())]);
 
         let delta_pair = DeltaPair::new(left_delta, right_delta);
         let result = pager
@@ -3537,7 +3557,7 @@ mod tests {
 
         // SECOND COMMIT: Delete one instance from left
         let mut left_delta2 = Delta::new();
-        left_delta2.delete(2, vec![Value::Integer(10), Value::Text("A".into())]);
+        left_delta2.delete(2, vec![Value::from_i64(10), Value::Text("A".into())]);
 
         let delta_pair2 = DeltaPair::new(left_delta2, Delta::new());
         let result2 = pager
@@ -3583,11 +3603,14 @@ mod tests {
         let left_delta = Delta {
             changes: vec![
                 (
-                    HashableRow::new(1, vec![Value::Integer(1), Value::Text(Text::from("Alice"))]),
+                    HashableRow::new(
+                        1,
+                        vec![Value::from_i64(1), Value::Text(Text::from("Alice"))],
+                    ),
                     1,
                 ),
                 (
-                    HashableRow::new(2, vec![Value::Integer(2), Value::Text(Text::from("Bob"))]),
+                    HashableRow::new(2, vec![Value::from_i64(2), Value::Text(Text::from("Bob"))]),
                     1,
                 ),
             ],
@@ -3599,21 +3622,21 @@ mod tests {
                 (
                     HashableRow::new(
                         1,
-                        vec![Value::Integer(1), Value::Integer(100), Value::Integer(5)],
+                        vec![Value::from_i64(1), Value::from_i64(100), Value::from_i64(5)],
                     ),
                     1,
                 ),
                 (
                     HashableRow::new(
                         2,
-                        vec![Value::Integer(1), Value::Integer(101), Value::Integer(3)],
+                        vec![Value::from_i64(1), Value::from_i64(101), Value::from_i64(3)],
                     ),
                     1,
                 ),
                 (
                     HashableRow::new(
                         3,
-                        vec![Value::Integer(2), Value::Integer(100), Value::Integer(7)],
+                        vec![Value::from_i64(2), Value::from_i64(100), Value::from_i64(7)],
                     ),
                     1,
                 ),
@@ -3643,13 +3666,13 @@ mod tests {
         );
 
         // Verify the actual content of the results
-        let mut expected_results = std::collections::HashSet::new();
+        let mut expected_results = HashSet::default();
         // Expected: (Alice, 5), (Alice, 3), (Bob, 7)
         expected_results.insert(("Alice".to_string(), 5));
         expected_results.insert(("Alice".to_string(), 3));
         expected_results.insert(("Bob".to_string(), 7));
 
-        let mut actual_results = std::collections::HashSet::new();
+        let mut actual_results = HashSet::default();
         for (row, weight) in &result.changes {
             assert_eq!(*weight, 1, "All results should have weight 1");
 
@@ -3659,7 +3682,7 @@ mod tests {
                 _ => panic!("Expected text value for name"),
             };
             let quantity = match &row.values[4] {
-                Value::Integer(q) => *q,
+                Value::Numeric(Numeric::Integer(q)) => *q,
                 _ => panic!("Expected integer value for quantity"),
             };
 
@@ -3672,7 +3695,7 @@ mod tests {
         );
 
         // Also verify that rowids are unique (this is important for btree storage)
-        let mut seen_rowids = std::collections::HashSet::new();
+        let mut seen_rowids = HashSet::default();
         for (row, _) in &result.changes {
             let was_new = seen_rowids.insert(row.rowid);
             assert!(was_new, "Duplicate rowid found: {}. This would cause rows to overwrite each other in btree storage!", row.rowid);
@@ -3687,8 +3710,7 @@ mod tests {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
         let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(_pager, index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut merge_op = MergeOperator::new(
@@ -3701,12 +3723,12 @@ mod tests {
 
         // Create two deltas
         let mut left_delta = Delta::new();
-        left_delta.insert(1, vec![Value::Integer(1)]);
-        left_delta.insert(2, vec![Value::Integer(2)]);
+        left_delta.insert(1, vec![Value::from_i64(1)]);
+        left_delta.insert(2, vec![Value::from_i64(2)]);
 
         let mut right_delta = Delta::new();
-        right_delta.insert(3, vec![Value::Integer(3)]);
-        right_delta.insert(4, vec![Value::Integer(4)]);
+        right_delta.insert(3, vec![Value::from_i64(3)]);
+        right_delta.insert(4, vec![Value::from_i64(4)]);
 
         let delta_pair = DeltaPair::new(left_delta, right_delta);
 
@@ -3723,7 +3745,7 @@ mod tests {
                 .iter()
                 .filter_map(|(row, weight)| {
                     if *weight > 0 && !row.values.is_empty() {
-                        if let Value::Integer(n) = &row.values[0] {
+                        if let Value::Numeric(Numeric::Integer(n)) = &row.values[0] {
                             Some(*n)
                         } else {
                             None
@@ -3748,8 +3770,7 @@ mod tests {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
         let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(_pager, index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Test that UNION (distinct) properly deduplicates across multiple operations
@@ -3757,14 +3778,14 @@ mod tests {
 
         // First operation: insert values 1, 2, 3 from left and 2, 3, 4 from right
         let mut left_delta1 = Delta::new();
-        left_delta1.insert(1, vec![Value::Integer(1)]);
-        left_delta1.insert(2, vec![Value::Integer(2)]);
-        left_delta1.insert(3, vec![Value::Integer(3)]);
+        left_delta1.insert(1, vec![Value::from_i64(1)]);
+        left_delta1.insert(2, vec![Value::from_i64(2)]);
+        left_delta1.insert(3, vec![Value::from_i64(3)]);
 
         let mut right_delta1 = Delta::new();
-        right_delta1.insert(4, vec![Value::Integer(2)]); // Duplicate value 2
-        right_delta1.insert(5, vec![Value::Integer(3)]); // Duplicate value 3
-        right_delta1.insert(6, vec![Value::Integer(4)]);
+        right_delta1.insert(4, vec![Value::from_i64(2)]); // Duplicate value 2
+        right_delta1.insert(5, vec![Value::from_i64(3)]); // Duplicate value 3
+        right_delta1.insert(6, vec![Value::from_i64(4)]);
 
         let result1 = merge_op
             .commit(DeltaPair::new(left_delta1, right_delta1), &mut cursors)
@@ -3775,7 +3796,7 @@ mod tests {
             assert_eq!(merged1.len(), 6);
 
             // Collect unique rowids - should be 4
-            let unique_rowids: std::collections::HashSet<i64> =
+            let unique_rowids: HashSet<i64> =
                 merged1.changes.iter().map(|(row, _)| row.rowid).collect();
             assert_eq!(
                 unique_rowids.len(),
@@ -3788,10 +3809,10 @@ mod tests {
 
         // Second operation: insert value 2 again from left, and value 5 from right
         let mut left_delta2 = Delta::new();
-        left_delta2.insert(7, vec![Value::Integer(2)]); // Duplicate of existing value
+        left_delta2.insert(7, vec![Value::from_i64(2)]); // Duplicate of existing value
 
         let mut right_delta2 = Delta::new();
-        right_delta2.insert(8, vec![Value::Integer(5)]); // New value
+        right_delta2.insert(8, vec![Value::from_i64(5)]); // New value
 
         let result2 = merge_op
             .commit(DeltaPair::new(left_delta2, right_delta2), &mut cursors)
@@ -3803,14 +3824,14 @@ mod tests {
             let has_existing_rowid = merged2
                 .changes
                 .iter()
-                .any(|(row, _)| row.values == vec![Value::Integer(2)] && row.rowid <= 4);
+                .any(|(row, _)| row.values == vec![Value::from_i64(2)] && row.rowid <= 4);
             assert!(has_existing_rowid, "Value 2 should reuse existing rowid");
 
             // Check that value 5 got a new rowid
             let has_new_rowid = merged2
                 .changes
                 .iter()
-                .any(|(row, _)| row.values == vec![Value::Integer(5)] && row.rowid > 4);
+                .any(|(row, _)| row.values == vec![Value::from_i64(5)] && row.rowid > 4);
             assert!(has_new_rowid, "Value 5 should get a new rowid");
         } else {
             panic!("Expected Done result");
@@ -3822,8 +3843,7 @@ mod tests {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
         let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(_pager, index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Test UNION ALL with inputs coming from only one side at a time
@@ -3837,8 +3857,8 @@ mod tests {
 
         // First: only left side (orders) has data
         let mut left_delta1 = Delta::new();
-        left_delta1.insert(100, vec![Value::Integer(1001)]);
-        left_delta1.insert(101, vec![Value::Integer(1002)]);
+        left_delta1.insert(100, vec![Value::from_i64(1001)]);
+        left_delta1.insert(101, vec![Value::from_i64(1002)]);
 
         let right_delta1 = Delta::new(); // Empty right side
 
@@ -3861,8 +3881,8 @@ mod tests {
         let left_delta2 = Delta::new(); // Empty left side
 
         let mut right_delta2 = Delta::new();
-        right_delta2.insert(100, vec![Value::Integer(2001)]); // Same rowid as left, different table
-        right_delta2.insert(102, vec![Value::Integer(2002)]);
+        right_delta2.insert(100, vec![Value::from_i64(2001)]); // Same rowid as left, different table
+        right_delta2.insert(102, vec![Value::from_i64(2002)]);
 
         let result2 = merge_op
             .commit(DeltaPair::new(left_delta2, right_delta2), &mut cursors)
@@ -3884,7 +3904,7 @@ mod tests {
             merged2
                 .changes
                 .iter()
-                .find(|(row, _)| row.values == vec![Value::Integer(2001)])
+                .find(|(row, _)| row.values == vec![Value::from_i64(2001)])
                 .map(|(row, _)| row.rowid)
                 .unwrap()
         } else {
@@ -3893,8 +3913,8 @@ mod tests {
 
         // Third: left side again with same rowids as before
         let mut left_delta3 = Delta::new();
-        left_delta3.insert(100, vec![Value::Integer(1003)]); // Same rowid 100 from orders
-        left_delta3.insert(101, vec![Value::Integer(1004)]); // Same rowid 101 from orders
+        left_delta3.insert(100, vec![Value::from_i64(1003)]); // Same rowid 100 from orders
+        left_delta3.insert(101, vec![Value::from_i64(1004)]); // Same rowid 101 from orders
 
         let right_delta3 = Delta::new(); // Empty right side
 
@@ -3918,7 +3938,7 @@ mod tests {
         let left_delta4 = Delta::new(); // Empty left side
 
         let mut right_delta4 = Delta::new();
-        right_delta4.insert(100, vec![Value::Integer(2003)]); // Same rowid 100 from archived_orders
+        right_delta4.insert(100, vec![Value::from_i64(2003)]); // Same rowid 100 from archived_orders
 
         let result4 = merge_op
             .commit(DeltaPair::new(left_delta4, right_delta4), &mut cursors)
@@ -3942,8 +3962,7 @@ mod tests {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
         let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(_pager, index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Test that both sides being empty works correctly
@@ -3957,9 +3976,9 @@ mod tests {
 
         // First: insert some data to establish state
         let mut left_delta1 = Delta::new();
-        left_delta1.insert(1, vec![Value::Integer(100)]);
+        left_delta1.insert(1, vec![Value::from_i64(100)]);
         let mut right_delta1 = Delta::new();
-        right_delta1.insert(1, vec![Value::Integer(200)]);
+        right_delta1.insert(1, vec![Value::from_i64(200)]);
 
         let result1 = merge_op
             .commit(DeltaPair::new(left_delta1, right_delta1), &mut cursors)
@@ -3970,7 +3989,7 @@ mod tests {
             merged1
                 .changes
                 .iter()
-                .find(|(row, _)| row.values == vec![Value::Integer(100)])
+                .find(|(row, _)| row.values == vec![Value::from_i64(100)])
                 .map(|(row, _)| row.rowid)
                 .unwrap()
         } else {
@@ -3996,7 +4015,7 @@ mod tests {
 
         // Third: add more data to verify state is still intact
         let mut left_delta3 = Delta::new();
-        left_delta3.insert(1, vec![Value::Integer(101)]); // Same rowid as before
+        left_delta3.insert(1, vec![Value::from_i64(101)]); // Same rowid as before
         let right_delta3 = Delta::new();
 
         let result3 = merge_op
@@ -4045,18 +4064,18 @@ mod tests {
             1,
             vec![
                 Value::Text("A".into()),
-                Value::Integer(10),
-                Value::Integer(100),
-                Value::Integer(5),
+                Value::from_i64(10),
+                Value::from_i64(100),
+                Value::from_i64(5),
             ],
         );
         delta.insert(
             2,
             vec![
                 Value::Text("A".into()),
-                Value::Integer(15),
-                Value::Integer(200),
-                Value::Integer(3),
+                Value::from_i64(15),
+                Value::from_i64(200),
+                Value::from_i64(3),
             ],
         );
 
@@ -4068,8 +4087,8 @@ mod tests {
         assert_eq!(result1.changes.len(), 1);
         let (row1, _) = &result1.changes[0];
         assert_eq!(row1.values[0], Value::Text("A".into()));
-        assert_eq!(row1.values[1], Value::Integer(25)); // SUM(val1) = 10 + 15
-        assert_eq!(row1.values[2], Value::Integer(3)); // MIN(val3) = min(5, 3)
+        assert_eq!(row1.values[1], Value::from_i64(25)); // SUM(val1) = 10 + 15
+        assert_eq!(row1.values[2], Value::from_i64(3)); // MIN(val3) = min(5, 3)
 
         // Create operator with same ID but different column mappings: SUM(col3), MIN(col1)
         let mut agg2 = AggregateOperator::new(
@@ -4091,9 +4110,9 @@ mod tests {
             3,
             vec![
                 Value::Text("A".into()),
-                Value::Integer(20),
-                Value::Integer(300),
-                Value::Integer(4),
+                Value::from_i64(20),
+                Value::from_i64(300),
+                Value::from_i64(4),
             ],
         );
 
@@ -4117,12 +4136,12 @@ mod tests {
         // - For MIN(col1), there's no existing state, so it starts fresh: 20
         assert_eq!(
             row2.values[1],
-            Value::Integer(4),
+            Value::from_i64(4),
             "SUM(col3) should be 4 (new data only)"
         );
         assert_eq!(
             row2.values[2],
-            Value::Integer(20),
+            Value::from_i64(20),
             "MIN(col1) should be 20 (new data only)"
         );
     }
@@ -4146,12 +4165,12 @@ mod tests {
 
         // Create input with duplicates
         let mut input = Delta::new();
-        input.insert(1, vec![Value::Integer(100)]); // First 100
-        input.insert(2, vec![Value::Integer(200)]); // First 200
-        input.insert(3, vec![Value::Integer(100)]); // Duplicate 100
-        input.insert(4, vec![Value::Integer(300)]); // First 300
-        input.insert(5, vec![Value::Integer(200)]); // Duplicate 200
-        input.insert(6, vec![Value::Integer(100)]); // Another duplicate 100
+        input.insert(1, vec![Value::from_i64(100)]); // First 100
+        input.insert(2, vec![Value::from_i64(200)]); // First 200
+        input.insert(3, vec![Value::from_i64(100)]); // Duplicate 100
+        input.insert(4, vec![Value::from_i64(300)]); // First 300
+        input.insert(5, vec![Value::from_i64(200)]); // Duplicate 200
+        input.insert(6, vec![Value::from_i64(100)]); // Another duplicate 100
 
         // Execute commit (for materialized views) instead of eval
         let result = pager
@@ -4160,11 +4179,11 @@ mod tests {
             .unwrap();
 
         // Should have exactly 3 distinct values (100, 200, 300)
-        let distinct_values: std::collections::HashSet<i64> = result
+        let distinct_values: HashSet<i64> = result
             .changes
             .iter()
             .map(|(row, _weight)| match &row.values[0] {
-                Value::Integer(i) => *i,
+                Value::Numeric(Numeric::Integer(i)) => *i,
                 _ => panic!("Expected integer value"),
             })
             .collect();
@@ -4202,9 +4221,9 @@ mod tests {
 
         // First batch: insert some values
         let mut delta1 = Delta::new();
-        delta1.insert(1, vec![Value::Text("A".into()), Value::Integer(100)]);
-        delta1.insert(2, vec![Value::Text("B".into()), Value::Integer(200)]);
-        delta1.insert(3, vec![Value::Text("A".into()), Value::Integer(100)]); // Duplicate
+        delta1.insert(1, vec![Value::Text("A".into()), Value::from_i64(100)]);
+        delta1.insert(2, vec![Value::Text("B".into()), Value::from_i64(200)]);
+        delta1.insert(3, vec![Value::Text("A".into()), Value::from_i64(100)]); // Duplicate
 
         // Commit first batch
         let result1 = pager
@@ -4226,8 +4245,8 @@ mod tests {
 
         // Second batch: delete one instance of (A,100) and add new group
         let mut delta2 = Delta::new();
-        delta2.delete(1, vec![Value::Text("A".into()), Value::Integer(100)]);
-        delta2.insert(4, vec![Value::Text("C".into()), Value::Integer(300)]);
+        delta2.delete(1, vec![Value::Text("A".into()), Value::from_i64(100)]);
+        delta2.insert(4, vec![Value::Text("C".into()), Value::from_i64(300)]);
 
         let result2 = pager
             .io
@@ -4245,11 +4264,11 @@ mod tests {
         let (row, weight) = &result2.changes[0];
         assert_eq!(*weight, 1);
         assert_eq!(row.values[0], Value::Text("C".into()));
-        assert_eq!(row.values[1], Value::Integer(300));
+        assert_eq!(row.values[1], Value::from_i64(300));
 
         // Third batch: delete last instance of (A,100)
         let mut delta3 = Delta::new();
-        delta3.delete(3, vec![Value::Text("A".into()), Value::Integer(100)]);
+        delta3.delete(3, vec![Value::Text("A".into()), Value::from_i64(100)]);
 
         let result3 = pager
             .io
@@ -4266,7 +4285,7 @@ mod tests {
         let (row, weight) = &result3.changes[0];
         assert_eq!(*weight, -1, "Disappeared group should have weight -1");
         assert_eq!(row.values[0], Value::Text("A".into()));
-        assert_eq!(row.values[1], Value::Integer(100))
+        assert_eq!(row.values[1], Value::from_i64(100))
     }
 
     #[test]
@@ -4289,7 +4308,7 @@ mod tests {
         // Insert value with weight 3
         let mut delta1 = Delta::new();
         for i in 1..=3 {
-            delta1.insert(i, vec![Value::Integer(100)]);
+            delta1.insert(i, vec![Value::from_i64(100)]);
         }
 
         let result1 = pager
@@ -4303,7 +4322,7 @@ mod tests {
         // Remove 2 instances (weight goes from 3 to 1, still positive)
         let mut delta2 = Delta::new();
         for i in 1..=2 {
-            delta2.delete(i, vec![Value::Integer(100)]);
+            delta2.delete(i, vec![Value::from_i64(100)]);
         }
 
         let result2 = pager
@@ -4315,7 +4334,7 @@ mod tests {
 
         // Remove last instance (weight goes from 1 to 0)
         let mut delta3 = Delta::new();
-        delta3.delete(3, vec![Value::Integer(100)]);
+        delta3.delete(3, vec![Value::from_i64(100)]);
 
         let result3 = pager
             .io
@@ -4327,7 +4346,7 @@ mod tests {
 
         // Re-add the value (weight goes from 0 to 1)
         let mut delta4 = Delta::new();
-        delta4.insert(4, vec![Value::Integer(100)]);
+        delta4.insert(4, vec![Value::from_i64(100)]);
 
         let result4 = pager
             .io
@@ -4357,9 +4376,9 @@ mod tests {
 
         // Insert some values
         let mut delta1 = Delta::new();
-        delta1.insert(1, vec![Value::Integer(100)]);
-        delta1.insert(2, vec![Value::Integer(100)]); // Duplicate
-        delta1.insert(3, vec![Value::Integer(200)]);
+        delta1.insert(1, vec![Value::from_i64(100)]);
+        delta1.insert(2, vec![Value::from_i64(100)]); // Duplicate
+        delta1.insert(3, vec![Value::from_i64(200)]);
 
         let result1 = pager
             .io
@@ -4386,8 +4405,8 @@ mod tests {
 
         // Add new value and delete existing (100 has weight 2, so it stays)
         let mut delta2 = Delta::new();
-        delta2.insert(4, vec![Value::Integer(300)]);
-        delta2.delete(1, vec![Value::Integer(100)]); // Remove one of the 100s
+        delta2.insert(4, vec![Value::from_i64(300)]);
+        delta2.delete(1, vec![Value::from_i64(100)]); // Remove one of the 100s
 
         let result2 = pager
             .io
@@ -4398,11 +4417,11 @@ mod tests {
         // 100 still exists (went from weight 2 to 1)
         assert_eq!(result2.changes.len(), 1, "Should only output new value");
         assert_eq!(result2.changes[0].1, 1, "Should be insertion");
-        assert_eq!(result2.changes[0].0.values[0], Value::Integer(300));
+        assert_eq!(result2.changes[0].0.values[0], Value::from_i64(300));
 
         // Now delete the last instance of 100
         let mut delta3 = Delta::new();
-        delta3.delete(2, vec![Value::Integer(100)]);
+        delta3.delete(2, vec![Value::from_i64(100)]);
 
         let result3 = pager
             .io
@@ -4412,7 +4431,7 @@ mod tests {
         // Should output deletion of 100
         assert_eq!(result3.changes.len(), 1, "Should output deletion");
         assert_eq!(result3.changes[0].1, -1, "Should be deletion");
-        assert_eq!(result3.changes[0].0.values[0], Value::Integer(100));
+        assert_eq!(result3.changes[0].0.values[0], Value::from_i64(100));
     }
 
     #[test]
@@ -4435,27 +4454,27 @@ mod tests {
         let mut delta = Delta::new();
 
         // Group (A, 100): 3 instances
-        delta.insert(1, vec![Value::Text("A".into()), Value::Integer(100)]);
-        delta.insert(2, vec![Value::Text("A".into()), Value::Integer(100)]);
-        delta.insert(3, vec![Value::Text("A".into()), Value::Integer(100)]);
+        delta.insert(1, vec![Value::Text("A".into()), Value::from_i64(100)]);
+        delta.insert(2, vec![Value::Text("A".into()), Value::from_i64(100)]);
+        delta.insert(3, vec![Value::Text("A".into()), Value::from_i64(100)]);
 
         // Group (B, 200): 2 instances
-        delta.insert(4, vec![Value::Text("B".into()), Value::Integer(200)]);
-        delta.insert(5, vec![Value::Text("B".into()), Value::Integer(200)]);
+        delta.insert(4, vec![Value::Text("B".into()), Value::from_i64(200)]);
+        delta.insert(5, vec![Value::Text("B".into()), Value::from_i64(200)]);
 
         // Group (A, 200): 1 instance
-        delta.insert(6, vec![Value::Text("A".into()), Value::Integer(200)]);
+        delta.insert(6, vec![Value::Text("A".into()), Value::from_i64(200)]);
 
         // Group (C, 100): 2 instances
-        delta.insert(7, vec![Value::Text("C".into()), Value::Integer(100)]);
-        delta.insert(8, vec![Value::Text("C".into()), Value::Integer(100)]);
+        delta.insert(7, vec![Value::Text("C".into()), Value::from_i64(100)]);
+        delta.insert(8, vec![Value::Text("C".into()), Value::from_i64(100)]);
 
         // More instances of Group (A, 100)
-        delta.insert(9, vec![Value::Text("A".into()), Value::Integer(100)]);
-        delta.insert(10, vec![Value::Text("A".into()), Value::Integer(100)]);
+        delta.insert(9, vec![Value::Text("A".into()), Value::from_i64(100)]);
+        delta.insert(10, vec![Value::Text("A".into()), Value::from_i64(100)]);
 
         // Group (B, 100): 1 instance
-        delta.insert(11, vec![Value::Text("B".into()), Value::Integer(100)]);
+        delta.insert(11, vec![Value::Text("B".into()), Value::from_i64(100)]);
 
         let result = pager
             .io
@@ -4476,7 +4495,7 @@ mod tests {
         }
 
         // Verify the distinct groups
-        let groups: std::collections::HashSet<(String, i64)> = result
+        let groups: HashSet<(String, i64)> = result
             .changes
             .iter()
             .map(|(row, _)| {
@@ -4485,7 +4504,7 @@ mod tests {
                     _ => panic!("Expected text for category"),
                 };
                 let value = match &row.values[1] {
-                    Value::Integer(i) => *i,
+                    Value::Numeric(Numeric::Integer(i)) => *i,
                     _ => panic!("Expected integer for value"),
                 };
                 (category, value)
@@ -4526,12 +4545,12 @@ mod tests {
 
         // Insert distinct values: 10, 20, 30 (each appearing multiple times)
         let mut input = Delta::new();
-        input.insert(1, vec![Value::Integer(10)]);
-        input.insert(2, vec![Value::Integer(10)]); // duplicate
-        input.insert(3, vec![Value::Integer(20)]);
-        input.insert(4, vec![Value::Integer(20)]); // duplicate
-        input.insert(5, vec![Value::Integer(30)]);
-        input.insert(6, vec![Value::Integer(10)]); // duplicate
+        input.insert(1, vec![Value::from_i64(10)]);
+        input.insert(2, vec![Value::from_i64(10)]); // duplicate
+        input.insert(3, vec![Value::from_i64(20)]);
+        input.insert(4, vec![Value::from_i64(20)]); // duplicate
+        input.insert(5, vec![Value::from_i64(30)]);
+        input.insert(6, vec![Value::from_i64(10)]); // duplicate
 
         let output = pager
             .io
@@ -4548,13 +4567,13 @@ mod tests {
         assert_eq!(values.len(), 3); // 3 aggregate values
 
         // COUNT(DISTINCT value) should be 3 (distinct values: 10, 20, 30)
-        assert_eq!(values[0], Value::Integer(3));
+        assert_eq!(values[0], Value::from_i64(3));
 
         // SUM(DISTINCT value) should be 60 (10 + 20 + 30)
-        assert_eq!(values[1], Value::Integer(60));
+        assert_eq!(values[1], Value::from_i64(60));
 
         // AVG(DISTINCT value) should be 20.0 (60 / 3)
-        assert_eq!(values[2], Value::Float(20.0));
+        assert_eq!(values[2], Value::from_f64(20.0));
     }
 
     #[test]
@@ -4576,9 +4595,9 @@ mod tests {
 
         // Insert 3 distinct values
         let mut delta1 = Delta::new();
-        delta1.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
-        delta1.insert(2, vec![Value::Integer(2), Value::Integer(200)]);
-        delta1.insert(3, vec![Value::Integer(3), Value::Integer(300)]);
+        delta1.insert(1, vec![Value::from_i64(1), Value::from_i64(100)]);
+        delta1.insert(2, vec![Value::from_i64(2), Value::from_i64(200)]);
+        delta1.insert(3, vec![Value::from_i64(3), Value::from_i64(300)]);
 
         let result1 = pager
             .io
@@ -4587,11 +4606,11 @@ mod tests {
 
         assert_eq!(result1.changes.len(), 1);
         assert_eq!(result1.changes[0].1, 1);
-        assert_eq!(result1.changes[0].0.values[0], Value::Integer(3));
+        assert_eq!(result1.changes[0].0.values[0], Value::from_i64(3));
 
         // Delete one value
         let mut delta2 = Delta::new();
-        delta2.delete(2, vec![Value::Integer(2), Value::Integer(200)]);
+        delta2.delete(2, vec![Value::from_i64(2), Value::from_i64(200)]);
 
         let result2 = pager
             .io
@@ -4600,7 +4619,7 @@ mod tests {
 
         assert_eq!(result2.changes.len(), 2);
         let new_row = result2.changes.iter().find(|(_, w)| *w == 1).unwrap();
-        assert_eq!(new_row.0.values[0], Value::Integer(2));
+        assert_eq!(new_row.0.values[0], Value::from_i64(2));
     }
 
     #[test]
@@ -4622,10 +4641,10 @@ mod tests {
 
         // Insert values including a duplicate
         let mut delta1 = Delta::new();
-        delta1.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
-        delta1.insert(2, vec![Value::Integer(2), Value::Integer(200)]);
-        delta1.insert(3, vec![Value::Integer(3), Value::Integer(100)]); // Duplicate
-        delta1.insert(4, vec![Value::Integer(4), Value::Integer(300)]);
+        delta1.insert(1, vec![Value::from_i64(1), Value::from_i64(100)]);
+        delta1.insert(2, vec![Value::from_i64(2), Value::from_i64(200)]);
+        delta1.insert(3, vec![Value::from_i64(3), Value::from_i64(100)]); // Duplicate
+        delta1.insert(4, vec![Value::from_i64(4), Value::from_i64(300)]);
 
         let result1 = pager
             .io
@@ -4634,11 +4653,11 @@ mod tests {
 
         assert_eq!(result1.changes.len(), 1);
         assert_eq!(result1.changes[0].1, 1);
-        assert_eq!(result1.changes[0].0.values[0], Value::Float(600.0)); // 100 + 200 + 300
+        assert_eq!(result1.changes[0].0.values[0], Value::from_f64(600.0)); // 100 + 200 + 300
 
         // Delete value 200
         let mut delta2 = Delta::new();
-        delta2.delete(2, vec![Value::Integer(2), Value::Integer(200)]);
+        delta2.delete(2, vec![Value::from_i64(2), Value::from_i64(200)]);
 
         let result2 = pager
             .io
@@ -4647,6 +4666,6 @@ mod tests {
 
         assert_eq!(result2.changes.len(), 2);
         let new_row = result2.changes.iter().find(|(_, w)| *w == 1).unwrap();
-        assert_eq!(new_row.0.values[0], Value::Float(400.0)); // 100 + 300
+        assert_eq!(new_row.0.values[0], Value::from_f64(400.0)); // 100 + 300
     }
 }

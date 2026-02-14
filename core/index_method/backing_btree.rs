@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use crate::sync::Arc;
 
 use crate::{
     index_method::{
         IndexMethod, IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCursor,
         IndexMethodDefinition, BACKING_BTREE_INDEX_METHOD_NAME,
     },
-    Result,
+    LimboError, Result,
 };
 
 /// Special 'backing_btree' index method which can be used by other custom index methods
@@ -40,6 +40,8 @@ impl IndexMethodAttachment for BackingBTreeIndexMethodAttachment {
     }
 
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
-        panic!("init is not supported for backing_btree index method")
+        Err(LimboError::InternalError(
+            "init is not supported for backing_btree index method".to_string(),
+        ))
     }
 }

@@ -40,7 +40,7 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 * **SQLite compatibility** for SQL dialect, file formats, and the C API [see [document](COMPAT.md) for details]
 * **Change data capture (CDC)** for real-time tracking of database changes.
 * **Multi-language support** for
-  * [Go](https://github.com/tursodatabase/turso-go)
+  * [Go](bindings/go)
   * [JavaScript](bindings/javascript)
   * [Java](bindings/java)
   * [Python](bindings/python)
@@ -55,7 +55,8 @@ The database has the following experimental features:
 
 * **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
 * **Encryption at rest** for protecting the data locally.
-* **Incremental computation** using DBSP for incremental view mainatenance and query subscriptions.
+* **Incremental computation** using DBSP for incremental view maintenance and query subscriptions.
+* **Full-Text-Search** powered by the awesome [tantivy](https://github.com/quickwit-oss/tantivy) library
 
 The following features are on our current roadmap:
 
@@ -174,15 +175,15 @@ print(res.fetchone())
 <br>
 
 ```console
-go get github.com/tursodatabase/turso-go
-go install github.com/tursodatabase/turso-go
+go get turso.tech/database/tursogo
+go install turso.tech/database/tursogo
 ```
 
 Example usage:
 ```go
 import (
     "database/sql"
-    _ "github.com/tursodatabase/turso-go"
+    _ "turso.tech/database/tursogo"
 )
 
 conn, _ = sql.Open("turso", "sqlite.db")
@@ -392,7 +393,7 @@ We'd love to have you contribute to Turso Database! Please check out the [contri
 ### Found a data corruption bug? Get up to $1,000.00
 
 SQLite is loved because it is the most reliable database in the world. The next evolution of SQLite has
-to match or surpass this level of reliability. Turso is built with [Deterministic Simulation Testing](simulator/)
+to match or surpass this level of reliability. Turso is built with [Deterministic Simulation Testing](testing/simulator/README.md/)
 from the ground up, and is also tested by [Antithesis](https://antithesis.com).
 
 Even during Alpha, if you find a bug that leads to a data corruption and demonstrate

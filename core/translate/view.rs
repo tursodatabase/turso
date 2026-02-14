@@ -1,12 +1,12 @@
-use crate::schema::{Schema, DBSP_TABLE_PREFIX};
+use crate::schema::{Schema, SchemaObjectType, DBSP_TABLE_PREFIX};
 use crate::storage::pager::CreateBTreeFlags;
+use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{Connection, Result};
-use std::sync::Arc;
 use turso_parser::ast;
 
 pub fn translate_create_materialized_view(
@@ -73,7 +73,7 @@ pub fn translate_create_materialized_view(
     let view_table = Arc::new(BTreeTable {
         root_page: 0, // Will be set to actual root page after creation
         name: normalized_view_name.clone(),
-        columns: view_columns.clone(),
+        columns: view_columns,
         primary_key_columns: vec![], // Materialized views use implicit rowid
         has_rowid: true,
         is_strict: false,
@@ -81,12 +81,12 @@ pub fn translate_create_materialized_view(
 
         unique_sets: vec![],
         foreign_keys: vec![],
+        check_constraints: vec![],
     });
 
     // Allocate a cursor for writing to the view's btree during population
-    let view_cursor_id = program.alloc_cursor_id(crate::vdbe::builder::CursorType::BTreeTable(
-        view_table.clone(),
-    ));
+    let view_cursor_id =
+        program.alloc_cursor_id(crate::vdbe::builder::CursorType::BTreeTable(view_table));
 
     // Open the cursor to the view's btree
     program.emit_insn(Insn::OpenWrite {
@@ -124,7 +124,7 @@ pub fn translate_create_materialized_view(
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -244,15 +244,26 @@ pub fn translate_create_view(
 ) -> Result<ProgramBuilder> {
     let normalized_view_name = normalize_ident(view_name.as_str());
 
-    // Check if view already exists
-    if resolver.schema.get_view(&normalized_view_name).is_some()
-        || resolver
-            .schema
-            .get_materialized_view(&normalized_view_name)
-            .is_some()
+    // Check for name conflicts with existing schema objects
+    if let Some(object_type) = resolver.schema.get_object_type(&normalized_view_name) {
+        let type_str = match object_type {
+            SchemaObjectType::Table => "table",
+            SchemaObjectType::View => "view",
+            SchemaObjectType::Index => "index",
+        };
+        return Err(crate::LimboError::ParseError(format!(
+            "{type_str} {normalized_view_name} already exists"
+        )));
+    }
+
+    // Also check materialized views (not in get_object_type since they're stored differently)
+    if resolver
+        .schema
+        .get_materialized_view(&normalized_view_name)
+        .is_some()
     {
         return Err(crate::LimboError::ParseError(format!(
-            "View {normalized_view_name} already exists"
+            "view {normalized_view_name} already exists"
         )));
     }
 
@@ -261,7 +272,7 @@ pub fn translate_create_view(
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -374,8 +385,7 @@ pub fn translate_drop_view(
 
     // Open cursor to sqlite_schema table
     let schema_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -479,7 +489,7 @@ pub fn translate_drop_view(
             format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{dbsp_table_name}_1");
         program.emit_insn(Insn::String8 {
             dest: dbsp_index_name_reg_2,
-            value: dbsp_index_name_2.clone(),
+            value: dbsp_index_name_2,
         });
 
         // Allocate column registers once (outside the loop)
@@ -573,7 +583,7 @@ pub fn translate_drop_view(
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {
         db: 0,
-        view_name: normalized_view_name.clone(),
+        view_name: normalized_view_name,
     });
 
     // Update schema version (increment schema cookie)

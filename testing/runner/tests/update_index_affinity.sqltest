@@ -1,0 +1,89 @@
+@database :memory:
+
+# Test that UPDATE correctly applies affinity before creating index records
+# This prevents index corruption when SET clause expressions reference columns
+# that need type conversion (e.g., TEXT to REAL)
+# Regression test for differential fuzzer seed 4000
+
+test update-index-affinity-text-to-real {
+    CREATE TABLE t1 (pk TEXT PRIMARY KEY, a REAL, b TEXT NOT NULL);
+    INSERT INTO t1 VALUES ('pk1', -1e-124, '5364810111559134897');
+    CREATE UNIQUE INDEX idx1 ON t1 (a, b);
+    UPDATE t1 SET a = b, b = '1';
+    SELECT pk, a, b FROM t1;
+    PRAGMA integrity_check;
+    UPDATE t1 SET a = 100.0, b = '2';
+    SELECT pk, a, b FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    pk1|5.36481011155914e+18|1
+    ok
+    pk1|100.0|2
+    ok
+}
+# JS Number formats large floats as integers and omits .0 suffix
+expect @js {
+    pk1|5364810111559135000|1
+    ok
+    pk1|100|2
+    ok
+}
+
+test update-index-affinity-nullif-expression {
+    CREATE TABLE t2 (pk TEXT PRIMARY KEY, a REAL, b TEXT NOT NULL);
+    INSERT INTO t2 VALUES ('pk1', -1e-124, '5364810111559134897');
+    CREATE UNIQUE INDEX idx2 ON t2 (a, b);
+    UPDATE t2 SET a = NULLIF(b, 7313626774591022633), b = '1';
+    SELECT pk, a, b FROM t2;
+    PRAGMA integrity_check;
+}
+expect {
+    pk1|5.36481011155914e+18|1
+    ok
+}
+expect @js {
+    pk1|5364810111559135000|1
+    ok
+}
+
+test update-index-affinity-multi-column {
+    CREATE TABLE t3 (pk TEXT PRIMARY KEY, w REAL NOT NULL, mov REAL NOT NULL, inq REAL, ngb TEXT NOT NULL);
+    INSERT INTO t3 VALUES ('pk1', 1.0, -1e-124, -1e-66, '5364810111559134897');
+    CREATE UNIQUE INDEX idx3 ON t3 (mov DESC, inq, ngb ASC);
+    UPDATE t3 SET w = 0, inq = NULLIF(ngb, 7313626774591022633), ngb = mov IS NOT NULL;
+    SELECT pk, w, mov, inq, ngb FROM t3;
+    PRAGMA integrity_check;
+    UPDATE t3 SET inq = -1.73e18, ngb = '2';
+    SELECT pk, w, mov, inq, ngb FROM t3;
+    PRAGMA integrity_check;
+}
+expect {
+    pk1|0.0|-1.0e-124|5.36481011155914e+18|1
+    ok
+    pk1|0.0|-1.0e-124|-1.73e+18|2
+    ok
+}
+expect @js {
+    pk1|0|-1e-124|5364810111559135000|1
+    ok
+    pk1|0|-1e-124|-1730000000000000000|2
+    ok
+}
+
+test update-index-affinity-non-unique {
+    CREATE TABLE t4 (pk INTEGER PRIMARY KEY, a REAL, b TEXT);
+    INSERT INTO t4 VALUES (1, 1.0, '12345');
+    CREATE INDEX idx4 ON t4 (a, b);
+    UPDATE t4 SET a = b, b = 'new';
+    SELECT pk, a, b FROM t4;
+    PRAGMA integrity_check;
+}
+expect {
+    1|12345.0|new
+    ok
+}
+expect @js {
+    1|12345|new
+    ok
+}

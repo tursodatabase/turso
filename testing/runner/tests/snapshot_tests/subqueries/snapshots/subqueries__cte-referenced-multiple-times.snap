@@ -1,0 +1,139 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH order_totals AS (
+          SELECT customer_id, sum(total_amount) AS total
+          FROM orders
+          GROUP BY customer_id
+      )
+      SELECT
+          c.name,
+          ot.total,
+          (SELECT avg(total) FROM order_totals) AS avg_total
+      FROM customers c
+      JOIN order_totals ot ON ot.customer_id = c.id
+      WHERE ot.total > (SELECT avg(total) FROM order_totals);
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - customers
+  - order_totals
+  - orders
+  - ot.customer_id
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN orders USING INDEX idx_orders_customer
+|--SCAN order_totals
+|--SCAN order_totals
+|--SCAN customers AS c
+`--SEARCH ot USING INDEX ephemeral_subquery_t5
+
+BYTECODE
+addr  opcode                      p1   p2  p3  p4            p5  comment
+   0              Init             0  102   0                 0  Start at 102
+   1              Once            57    0   0                 0  goto 57
+   2              BeginSubrtn      3    0   0                 0  r[3]=NULL
+   3              Null             0    1   0                 0  r[1]=NULL
+   4              OpenEphemeral    0    1   0                 0  cursor=0 is_table=true
+   5              Null             0   13   0                 0  r[13]=NULL
+   6              Integer          0   10   0                 0  r[10]=0; clear group by abort flag
+   7              Null             0   11   0                 0  r[11]=NULL; initialize group by comparison registers to NULL
+   8              Gosub           17   40   0                 0  ; go to clear accumulator subroutine
+   9              OpenRead         1    4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+  10              OpenRead         2    9   0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
+  11              Rewind           2   27   0                 0  Rewind index idx_orders_customer
+  12                DeferredSeek   2    1   0                 0
+  13                Column         1    1  15                 0  r[15]=orders.customer_id
+  14                Column         1    3  16                 0  r[16]=orders.total_amount
+  15                RealAffinity  16    0   0                 0
+  16                Compare       11   15   1  k(1, Binary)   0  r[11..11]==r[15..15]
+  17                Jump          18   22  18                 0  ; start new group if comparison is not equal
+  18                Gosub          8   31   0                 0  ; check if ended group had data, and output if so
+  19                Move          15   11   1                 0  r[11..11]=r[15..15]
+  20                IfPos         10   43   0                 0  r[10]>0 -> r[10]-=0, goto 43; check abort flag
+  21                Gosub         17   40   0                 0  ; goto clear accumulator subroutine
+  22                AggStep        0   16  13  sum            0  accum=r[13] step(r[16])
+  23                If             9   25   0                 0  if r[9] goto 25; don't emit group columns if continuing existing group
+  24                Column         1    1  12                 0  r[12]=orders.customer_id
+  25                Integer        1    9   0                 0  r[9]=1; indicate data in accumulator
+  26              Next             2   12   0                 0
+  27              Gosub            8   31   0                 0  ; emit row for final group
+  28              Goto             0   43   0                 0  ; group by finished
+  29              Integer          1   10   0                 0  r[10]=1
+  30            Return             8    0   0                 0
+  31            IfPos              9   33   0                 0  r[9]>0 -> r[9]-=0, goto 33; output group by row subroutine start
+  32          Return               8    0   0                 0
+  33          AggFinal             0   13   0  sum            0  accum=r[13]
+  34          Copy                12    6   0                 0  r[6]=r[12]
+  35          Copy                13    7   0                 0  r[7]=r[13]
+  36          MakeRecord           6    2  18                 0  r[18]=mkrec(r[6..7]); for
+  37          NewRowid             0   19   0                 0  r[19]=rowid
+  38          Insert               0   18  19                 4  intkey=r[19] data=r[18]
+  39        Return                 8    0   0                 0
+  40        Null                   0   12  13                 0  r[12..13]=NULL; clear accumulator subroutine start
+  41        Integer                0    9   0                 0  r[9]=0
+  42      Return                  17    0   0                 0
+  43      OpenDup                  3    0   0                 0  new_cursor=3, original_cursor=0
+  44      Null                     0   23   0                 0  r[23]=NULL
+  45      Integer                  1   24   0                 0  r[24]=1; LIMIT counter
+  46      IfNot                   24   53   0                 0  if !r[24] goto 53
+  47      Rewind                   3   53   0                 0  Rewind
+  48        Column                 3    0  20                 0  r[20]=.column 0
+  49        Column                 3    1  21                 0  r[21]=.column 1
+  50        Copy                  21   25   0                 0  r[25]=r[21]
+  51        AggStep                0   25  23  avg            0  accum=r[23] step(r[25])
+  52      Next                     3   48   0                 0
+  53      AggFinal                 0   23   0  avg            0  accum=r[23]
+  54      Copy                    23   22   0                 0  r[22]=r[23]
+  55      Copy                    22    1   0                 0  r[1]=r[22]
+  56    Return                     3    0   1                 0
+  57    Once                      74    0   0                 0  goto 74
+  58    BeginSubrtn               26    0   0                 0  r[26]=NULL
+  59    Null                       0    2   0                 0  r[2]=NULL
+  60    OpenDup                    4    0   0                 0  new_cursor=4, original_cursor=0
+  61    Null                       0   30   0                 0  r[30]=NULL
+  62    Integer                    1   31   0                 0  r[31]=1; LIMIT counter
+  63    IfNot                     31   70   0                 0  if !r[31] goto 70
+  64    Rewind                     4   70   0                 0  Rewind
+  65      Column                   4    0  27                 0  r[27]=.column 0
+  66      Column                   4    1  28                 0  r[28]=.column 1
+  67      Copy                    28   32   0                 0  r[32]=r[28]
+  68      AggStep                  0   32  30  avg            0  accum=r[30] step(r[32])
+  69    Next                       4   65   0                 0
+  70    AggFinal                   0   30   0  avg            0  accum=r[30]
+  71    Copy                      30   29   0                 0  r[29]=r[30]
+  72    Copy                      29    2   0                 0  r[2]=r[29]
+  73  Return                      26    0   1                 0
+  74  OpenDup                      5    0   0                 0  new_cursor=5, original_cursor=0
+  75  OpenEphemeral                6    0   0                 0  cursor=6 is_table=false
+  76  Rewind                       5   85   0                 0  Rewind
+  77    Column                     5    0  34                 0  r[34]=.column 0
+  78    Column                     5    1  35                 0  r[35]=.column 1
+  79    Copy                      34   36   0                 0  r[36]=r[34]
+  80    Copy                      35   37   0                 0  r[37]=r[35]
+  81    RowId                      5   38   0                 0  r[38]=.rowid
+  82    MakeRecord                36    3  33                 0  r[33]=mkrec(r[36..38]); for ephemeral_subquery_t5
+  83    IdxInsert                  6   33  36                 0  key=r[33]
+  84  Next                         5   77   0                 0
+  85  OpenRead                     7    6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
+  86  Rewind                       7  101   0                 0  Rewind table customers
+  87    RowId                      7   44   0                 0  r[44]=customers.rowid
+  88    SeekGE                     6  100  44                 0  key=[44..44]
+  89      IdxGT                    6  100  44                 0  key=[44..44]
+  90      Column                   6    0  39                 0  r[39]=ephemeral_subquery_t5.customer_id
+  91      Column                   6    1  40                 0  r[40]=ephemeral_subquery_t5.total
+  92      Column                   6    1  46                 0  r[46]=ephemeral_subquery_t5.total
+  93      Copy                     1   47   0                 0  r[47]=r[1]
+  94      Le                      46   47  99  Binary         0  if r[46]<=r[47] goto 99
+  95      Column                   7    1  41                 0  r[41]=customers.name
+  96      Column                   6    1  42                 0  r[42]=ephemeral_subquery_t5.total
+  97      Copy                     2   43   0                 0  r[43]=r[2]
+  98      ResultRow               41    3   0                 0  output=r[41..43]
+  99    Next                       6   89   0                 0
+ 100  Next                         7   87   0                 0
+ 101  Halt                         0    0   0                 0
+ 102  Transaction                  0    1  11                 0  iDb=0 tx_mode=Read
+ 103  Goto                         0    1   0                 0

@@ -11,9 +11,15 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 env:
   working-directory: bindings/python
   PIP_DISABLE_PIP_VERSION_CHECK: "true"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
 
 jobs:
   configure-strategy:
@@ -38,16 +44,27 @@ jobs:
         python-version: ${{ fromJson(needs.configure-strategy.outputs.python-versions) }}
     runs-on: ${{ matrix.os }}
 
-    defaults:
-      run:
-        working-directory: ${{ env.working-directory }}
-
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
+      - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup mold linker
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+
+      - uses: "./.github/shared/setup-sccache"
+
+      - name: Build Rust (debug)
+        run: cargo build --verbose --locked
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: useblacksmith/setup-python@v6
@@ -60,13 +77,44 @@ jobs:
           enable-cache: true
 
       - name: Install the project
+        working-directory: ${{ env.working-directory }}
         run: uv sync --all-extras --dev --all-packages
 
       - name: Run Pytest
+        working-directory: ${{ env.working-directory }}
         run: uv run pytest tests/test_database.py
 
       - name: Run Pytest (async driver)
+        working-directory: ${{ env.working-directory }}
         run: uv run pytest tests/test_database_aio.py
+
+      - name: Run Pytest (sync)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os != 'Windows'
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        run: uv run pytest tests/test_database_sync.py
+
+      - name: Run Pytest (sync, async driver)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os != 'Windows'
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        run: uv run pytest tests/test_database_sync_aio.py
+
+      - name: Run Pytest (windows, sync)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os == 'Windows'
+        env:
+          LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
+        run: uv run pytest tests/test_database_sync.py
+
+      - name: Run Pytest (windows, sync, async driver)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os == 'Windows'
+        env:
+          LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
+        run: uv run pytest tests/test_database_sync_aio.py
 
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -109,7 +157,7 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --profile release-official --out dist --find-interpreter
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels
@@ -140,7 +188,7 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --profile release-official --out dist --find-interpreter
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4

@@ -1,0 +1,115 @@
+name: SQL Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sqltest-check:
+    name: Check .sqltest syntax
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - name: Build test runner
+        run: make -C testing/runner build-runner
+      - name: Check test syntax
+        run: make -C testing/runner check
+
+  sqltest-run-cli:
+    name: Run SQL tests (CLI backend)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - uses: "./.github/shared/setup-sccache"
+      - name: Build tursodb
+        run: make -C testing/runner build-tursodb
+      - name: Build test runner
+        run: make -C testing/runner build-runner
+      - name: Run tests
+        run: make -C testing/runner run-cli
+      - name: Run tests (MVCC)
+        run: make -C testing/runner run-cli MVCC=1
+
+  sqltest-run-rust:
+    name: Run SQL tests (Rust backend)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - name: Build test runner
+        run: make -C testing/runner build-runner
+      - name: Run tests
+        run: make -C testing/runner run-rust
+      - name: Run tests (MVCC)
+        run: make -C testing/runner run-rust MVCC=1
+
+  sqltest-run-js:
+    name: Run SQL tests (JS backend)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: bindings/javascript
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - name: Setup node
+        uses: useblacksmith/setup-node@v5
+        with:
+          node-version: 20
+      - uses: "./.github/shared/setup-sccache"
+      - name: Install JS dependencies
+        run: yarn install
+      - name: Build common package
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Build native bindings
+        run: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-gnu
+      - name: Build TypeScript
+        run: yarn workspace @tursodatabase/database tsc-build
+      - name: Build test runner
+        working-directory: testing/runner
+        run: cargo build --release
+      - name: Run tests
+        working-directory: testing/runner
+        run: make run-js
+      - name: Run tests (MVCC)
+        working-directory: testing/runner
+        run: make run-js MVCC=1
+
+  sqltest-sqlite:
+    name: Run SQL tests (SQLite)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - uses: "./.github/shared/install_sqlite"
+      - name: Build test runner
+        run: make -C testing/runner build-runner
+      - name: Run tests against SQLite
+        run: make -C testing/runner test-sqlite

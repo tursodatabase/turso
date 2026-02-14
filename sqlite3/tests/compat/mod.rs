@@ -1,5 +1,6 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
+#![allow(unused_imports)]
 use std::ptr;
 
 #[repr(C)]
@@ -12,6 +13,12 @@ struct sqlite3_stmt {
     _private: [u8; 0],
 }
 
+// Windows: This entire compat test is excluded because Windows has no system SQLite library
+// (unlike Linux which has libsqlite3-dev pre-installed). The sqlite3 feature links against
+// native libsqlite3 for comparison testing, which isn't available on Windows without complex
+// setup (generating .lib from .def using VS tooling). Since SQLite behavior is platform-
+// independent, running these tests on Linux/macOS provides sufficient coverage.
+#[cfg(not(target_os = "windows"))]
 #[cfg_attr(not(feature = "sqlite3"), link(name = "turso_sqlite3"))]
 #[cfg_attr(feature = "sqlite3", link(name = "sqlite3"))]
 extern "C" {
@@ -106,6 +113,12 @@ extern "C" {
         p_primary_key: *mut libc::c_int,
         p_autoinc: *mut libc::c_int,
     ) -> i32;
+    fn sqlite3_busy_handler(
+        db: *mut sqlite3,
+        callback: Option<unsafe extern "C" fn(*mut libc::c_void, i32) -> i32>,
+        arg: *mut libc::c_void,
+    ) -> i32;
+    fn sqlite3_busy_timeout(db: *mut sqlite3, ms: i32) -> i32;
 }
 
 const SQLITE_OK: i32 = 0;
@@ -163,7 +176,7 @@ mod tests {
         unsafe {
             let mut db = ptr::null_mut();
             assert_eq!(
-                sqlite3_open(c"../testing/testing_clone.db".as_ptr(), &mut db),
+                sqlite3_open(c"../testing/system/testing_clone.db".as_ptr(), &mut db),
                 SQLITE_OK
             );
             assert_eq!(sqlite3_close(db), SQLITE_OK);
@@ -434,7 +447,7 @@ mod tests {
         unsafe {
             let mut db = std::ptr::null_mut();
             assert_eq!(
-                sqlite3_open(c"../testing/testing.db".as_ptr(), &mut db),
+                sqlite3_open(c"../testing/system/testing.db".as_ptr(), &mut db),
                 SQLITE_OK
             );
             let mut stmt = std::ptr::null_mut();
@@ -1902,11 +1915,11 @@ mod tests {
                 );
                 assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
                 let count = sqlite3_column_int64(stmt, 0);
-                // with a sane `should_checkpoint` method we have no garuantee that all 2000 rows are present, as the checkpoint was
+                // with a sane `should_checkpoint` method we have no guarantee that all 2000 rows are present, as the checkpoint was
                 // triggered by cacheflush on insertions. the pattern will trigger a checkpoint when the wal has > 1000 frames,
                 // so it will be triggered but will no longer be triggered on each consecutive
                 // write. here we can assert that we have > 1500 rows.
-                assert!(count > 1500);
+                assert!(count > 1500, "count: {count}");
                 assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
                 assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             }
@@ -2356,6 +2369,109 @@ mod tests {
             assert_eq!(primary_key5, 1); // rowid is primary key
             assert_eq!(not_null5, 0);
             assert_eq!(autoinc5, 0);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_busy_timeout() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // Test setting a positive timeout
+            assert_eq!(sqlite3_busy_timeout(db, 1000), SQLITE_OK);
+
+            // Test setting a zero timeout (disables busy handler)
+            assert_eq!(sqlite3_busy_timeout(db, 0), SQLITE_OK);
+
+            // Test setting a negative timeout (also disables busy handler)
+            assert_eq!(sqlite3_busy_timeout(db, -1), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    /// Busy handler callback that retries up to N times
+    unsafe extern "C" fn busy_handler_retry_n(data: *mut libc::c_void, count: i32) -> i32 {
+        if data.is_null() {
+            return 0;
+        }
+        let max_retries = *(data as *const i32);
+        if count < max_retries {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Busy handler callback that never retries
+    unsafe extern "C" fn busy_handler_never_retry(_data: *mut libc::c_void, _count: i32) -> i32 {
+        0
+    }
+
+    /// Busy handler callback that always retries (with safety limit)
+    unsafe extern "C" fn busy_handler_always_retry(_data: *mut libc::c_void, count: i32) -> i32 {
+        if count < 1000 {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_busy_handler() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // Test setting a custom busy handler with context
+            let mut max_retries: i32 = 3;
+            assert_eq!(
+                sqlite3_busy_handler(
+                    db,
+                    Some(busy_handler_retry_n),
+                    &mut max_retries as *mut i32 as *mut libc::c_void
+                ),
+                SQLITE_OK
+            );
+
+            // Test clearing the busy handler by passing NULL callback
+            assert_eq!(sqlite3_busy_handler(db, None, ptr::null_mut()), SQLITE_OK);
+
+            // Test setting busy handler that never retries
+            assert_eq!(
+                sqlite3_busy_handler(db, Some(busy_handler_never_retry), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            // Test setting busy handler that always retries
+            assert_eq!(
+                sqlite3_busy_handler(db, Some(busy_handler_always_retry), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            // Test that busy_timeout clears a previously set busy_handler
+            assert_eq!(
+                sqlite3_busy_handler(
+                    db,
+                    Some(busy_handler_retry_n),
+                    &mut max_retries as *mut i32 as *mut libc::c_void
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_busy_timeout(db, 500), SQLITE_OK);
+
+            // Test that busy_handler clears a previously set busy_timeout
+            assert_eq!(sqlite3_busy_timeout(db, 1000), SQLITE_OK);
+            assert_eq!(
+                sqlite3_busy_handler(
+                    db,
+                    Some(busy_handler_retry_n),
+                    &mut max_retries as *mut i32 as *mut libc::c_void
+                ),
+                SQLITE_OK
+            );
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }

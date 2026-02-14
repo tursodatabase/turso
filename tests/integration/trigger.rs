@@ -1,4 +1,4 @@
-use crate::common::TempDatabase;
+use crate::common::{ExecRows, TempDatabase};
 
 #[turso_macros::test(mvcc)]
 fn test_create_trigger(db: TempDatabase) {
@@ -20,24 +20,7 @@ fn test_create_trigger(db: TempDatabase) {
     conn.execute("INSERT INTO test VALUES (1, 'hello')")
         .unwrap();
 
-    let mut stmt = conn.prepare("SELECT * FROM test ORDER BY rowid").unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push((
-                    row.get_value(0).as_int().unwrap(),
-                    row.get_value(1).cast_text().unwrap().to_string(),
-                ));
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM test ORDER BY rowid");
 
     // Row inserted by trigger goes first
     assert_eq!(results[0], (100, "triggered".to_string()));
@@ -55,45 +38,15 @@ fn test_drop_trigger(db: TempDatabase) {
         .unwrap();
 
     // Verify trigger exists
-    let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'")
-        .unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push(row.get_value(0).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'");
     assert_eq!(results.len(), 1);
 
     conn.execute("DROP TRIGGER t1").unwrap();
 
     // Verify trigger is gone
-    let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'")
-        .unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push(row.get_value(0).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'");
     assert_eq!(results.len(), 0);
 }
 
@@ -116,24 +69,7 @@ fn test_trigger_after_insert(db: TempDatabase) {
     conn.execute("INSERT INTO test VALUES (1, 'hello')")
         .unwrap();
 
-    let mut stmt = conn.prepare("SELECT * FROM log").unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push((
-                    row.get_value(0).as_int().unwrap(),
-                    row.get_value(1).cast_text().unwrap().to_string(),
-                ));
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM log");
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0], (1, "hello".to_string()));
@@ -157,24 +93,10 @@ fn test_trigger_when_clause(db: TempDatabase) {
     conn.execute("INSERT INTO test VALUES (1, 5)").unwrap();
     conn.execute("INSERT INTO test VALUES (2, 15)").unwrap();
 
-    let mut stmt = conn.prepare("SELECT * FROM log").unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push(row.get_value(0).as_int().unwrap());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(i64,)> = conn.exec_rows("SELECT * FROM log");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0], 2);
+    assert_eq!(results[0], (2,));
 }
 
 #[turso_macros::test(mvcc)]
@@ -187,45 +109,15 @@ fn test_trigger_drop_table_drops_triggers(db: TempDatabase) {
         .unwrap();
 
     // Verify trigger exists
-    let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'")
-        .unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push(row.get_value(0).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'");
     assert_eq!(results.len(), 1);
 
     conn.execute("DROP TABLE test").unwrap();
 
     // Verify trigger is gone
-    let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'")
-        .unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push(row.get_value(0).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'");
     assert_eq!(results.len(), 0);
 }
 
@@ -250,24 +142,10 @@ fn test_trigger_new_old_references(db: TempDatabase) {
     conn.execute("UPDATE test SET y = 'world' WHERE x = 1")
         .unwrap();
 
-    let mut stmt = conn.prepare("SELECT * FROM log").unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push(row.get_value(0).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> = conn.exec_rows("SELECT * FROM log");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0], "old=hello new=world");
+    assert_eq!(results[0], ("old=hello new=world".to_string(),));
 }
 
 #[turso_macros::test(mvcc)]
@@ -294,25 +172,11 @@ fn test_multiple_triggers_same_event(db: TempDatabase) {
 
     conn.execute("INSERT INTO test VALUES (1)").unwrap();
 
-    let mut stmt = conn.prepare("SELECT * FROM log ORDER BY msg").unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push(row.get_value(0).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> = conn.exec_rows("SELECT * FROM log ORDER BY msg");
 
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0], "trigger1");
-    assert_eq!(results[1], "trigger2");
+    assert_eq!(results[0], ("trigger1".to_string(),));
+    assert_eq!(results[1], ("trigger2".to_string(),));
 }
 
 #[turso_macros::test(mvcc)]
@@ -345,21 +209,7 @@ fn test_two_triggers_on_same_table(db: TempDatabase) {
         .unwrap();
 
     // Check log entries to verify recursion was prevented
-    let mut stmt = conn.prepare("SELECT * FROM log ORDER BY rowid").unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push(row.get_value(0).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> = conn.exec_rows("SELECT * FROM log ORDER BY rowid");
 
     // At minimum, we should see both triggers fire and not infinite loop
     assert!(
@@ -368,11 +218,11 @@ fn test_two_triggers_on_same_table(db: TempDatabase) {
         results.len()
     );
     assert!(
-        results.iter().any(|s| s.contains("trigger_a")),
+        results.iter().any(|s| s.0.contains("trigger_a")),
         "trigger_a should have fired"
     );
     assert!(
-        results.iter().any(|s| s.contains("trigger_b")),
+        results.iter().any(|s| s.0.contains("trigger_b")),
         "trigger_b should have fired"
     );
 }
@@ -406,43 +256,8 @@ fn test_trigger_mutual_recursion(db: TempDatabase) {
     conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
 
     // Check that both tables have entries
-    let mut stmt = conn.prepare("SELECT * FROM t ORDER BY rowid").unwrap();
-    let mut t_results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                t_results.push((
-                    row.get_value(0).as_int().unwrap(),
-                    row.get_value(1).cast_text().unwrap().to_string(),
-                ));
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
-
-    let mut stmt = conn.prepare("SELECT * FROM u ORDER BY rowid").unwrap();
-    let mut u_results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                u_results.push((
-                    row.get_value(0).as_int().unwrap(),
-                    row.get_value(1).cast_text().unwrap().to_string(),
-                ));
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let t_results: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM t ORDER BY rowid");
+    let u_results: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM u ORDER BY rowid");
 
     // Verify the chain executed without infinite recursion
     assert!(!t_results.is_empty(), "Expected at least 1 entry in t");
@@ -482,27 +297,8 @@ fn test_after_insert_trigger(db: TempDatabase) {
         .unwrap();
 
     // Verify audit log
-    let mut stmt = conn
-        .prepare("SELECT * FROM audit_log ORDER BY rowid")
-        .unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push((
-                    row.get_value(0).cast_text().unwrap().to_string(),
-                    row.get_value(1).as_int().unwrap(),
-                    row.get_value(2).cast_text().unwrap().to_string(),
-                ));
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String, i64, String)> =
+        conn.exec_rows("SELECT * FROM audit_log ORDER BY rowid");
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0], ("INSERT".to_string(), 1, "apple".to_string()));
@@ -550,27 +346,8 @@ fn test_before_update_of_trigger(db: TempDatabase) {
         .unwrap();
 
     // Verify price history
-    let mut stmt = conn
-        .prepare("SELECT * FROM price_history ORDER BY rowid")
-        .unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push((
-                    row.get_value(0).as_int().unwrap(),
-                    row.get_value(1).as_int().unwrap(),
-                    row.get_value(2).as_int().unwrap(),
-                ));
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT * FROM price_history ORDER BY rowid");
 
     // Should have 2 entries (not 3, because name-only update didn't fire)
     assert_eq!(results.len(), 2);
@@ -611,28 +388,8 @@ fn test_after_update_of_trigger(db: TempDatabase) {
         .unwrap();
 
     // Verify salary changes
-    let mut stmt = conn
-        .prepare("SELECT * FROM salary_changes ORDER BY rowid")
-        .unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push((
-                    row.get_value(0).as_int().unwrap(),
-                    row.get_value(1).as_int().unwrap(),
-                    row.get_value(2).as_int().unwrap(),
-                    row.get_value(3).as_int().unwrap(),
-                ));
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(i64, i64, i64, i64)> =
+        conn.exec_rows("SELECT * FROM salary_changes ORDER BY rowid");
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0], (1, 50000, 55000, 5000));
@@ -679,48 +436,16 @@ fn test_before_delete_trigger(db: TempDatabase) {
     conn.execute(log("DELETE FROM users WHERE id = 3")).unwrap();
 
     // Verify deleted_users table
-    let mut stmt = conn
-        .prepare(log("SELECT * FROM deleted_users ORDER BY id"))
-        .unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push((
-                    row.get_value(0).as_int().unwrap(),
-                    row.get_value(1).cast_text().unwrap().to_string(),
-                    row.get_value(2).as_int().unwrap(),
-                ));
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(i64, String, i64)> =
+        conn.exec_rows("SELECT * FROM deleted_users ORDER BY id");
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0], (2, "bob".to_string(), 12345));
     assert_eq!(results[1], (3, "charlie".to_string(), 12345));
 
     // Verify remaining users
-    let mut stmt = conn.prepare(log("SELECT COUNT(*) FROM users")).unwrap();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                assert_eq!(row.get_value(0).as_int().unwrap(), 1);
-                break;
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let count: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM users");
+    assert_eq!(count[0], (1,));
 }
 
 #[turso_macros::test(mvcc)]
@@ -760,27 +485,8 @@ fn test_after_delete_trigger(db: TempDatabase) {
         .unwrap();
 
     // Verify archive
-    let mut stmt = conn
-        .prepare("SELECT * FROM order_archive ORDER BY order_id")
-        .unwrap();
-    let mut results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                results.push((
-                    row.get_value(0).as_int().unwrap(),
-                    row.get_value(1).as_int().unwrap(),
-                    row.get_value(2).as_int().unwrap(),
-                ));
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT * FROM order_archive ORDER BY order_id");
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0], (1, 100, 50));
@@ -824,52 +530,25 @@ fn test_trigger_with_multiple_statements(db: TempDatabase) {
         .unwrap();
 
     // Verify transactions table
-    let mut stmt = conn
-        .prepare("SELECT * FROM transactions ORDER BY rowid")
-        .unwrap();
-    let mut trans_results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trans_results.push((
-                    row.get_value(0).as_int().unwrap(),
-                    row.get_value(1).as_int().unwrap(),
-                    row.get_value(2).as_int().unwrap(),
-                ));
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let trans_results: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT * FROM transactions ORDER BY rowid");
 
     assert_eq!(trans_results.len(), 2);
     assert_eq!(trans_results[0], (1, 1000, 1500));
     assert_eq!(trans_results[1], (2, 2000, 2500));
 
     // Verify audit table
-    let mut stmt = conn.prepare("SELECT * FROM audit ORDER BY rowid").unwrap();
-    let mut audit_results = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                audit_results.push(row.get_value(0).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let audit_results: Vec<(String,)> = conn.exec_rows("SELECT * FROM audit ORDER BY rowid");
 
     assert_eq!(audit_results.len(), 2);
-    assert_eq!(audit_results[0], "Balance changed for account 1");
-    assert_eq!(audit_results[1], "Balance changed for account 2");
+    assert_eq!(
+        audit_results[0],
+        ("Balance changed for account 1".to_string(),)
+    );
+    assert_eq!(
+        audit_results[1],
+        ("Balance changed for account 2".to_string(),)
+    );
 }
 
 #[turso_macros::test()]
@@ -1053,25 +732,11 @@ fn test_alter_table_drop_column_succeeds_when_trigger_references_other_table(db:
     conn.execute("ALTER TABLE t DROP COLUMN y").unwrap();
 
     // Verify column was dropped
-    let mut stmt = conn.prepare("PRAGMA table_info(t)").unwrap();
-    let mut columns = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                columns.push(row.get_value(1).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let columns: Vec<(String,)> = conn.exec_rows("SELECT name FROM pragma_table_info('t')");
 
     // Should only have x column now
     assert_eq!(columns.len(), 1);
-    assert_eq!(columns[0], "x");
+    assert_eq!(columns[0], ("x".to_string(),));
 }
 
 #[turso_macros::test(mvcc)]
@@ -1098,25 +763,11 @@ fn test_alter_table_drop_column_from_other_table_causes_parse_error_when_trigger
     conn.execute("ALTER TABLE u DROP COLUMN zer").unwrap();
 
     // Verify column was dropped
-    let mut stmt = conn.prepare("PRAGMA table_info(u)").unwrap();
-    let mut columns = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                columns.push(row.get_value(1).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let columns: Vec<(String,)> = conn.exec_rows("SELECT name FROM pragma_table_info('u')");
 
     // Should only have z column now
     assert_eq!(columns.len(), 1);
-    assert_eq!(columns[0], "z");
+    assert_eq!(columns[0], ("z".to_string(),));
 
     // Now trying to insert into t should fail because trigger references non-existent column zer
     let result = conn.execute("INSERT INTO t VALUES (1)");
@@ -1153,23 +804,9 @@ fn test_alter_table_rename_column_propagates_to_trigger_on_owning_table(db: Temp
         .unwrap();
 
     // Verify trigger SQL was updated
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     // Trigger SQL should reference y_new instead of y
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1202,23 +839,9 @@ fn test_alter_table_rename_column_propagates_to_trigger_referencing_other_table(
         .unwrap();
 
     // Verify trigger SQL was updated to reference zoo
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     // Trigger SQL should reference zoo instead of z
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1251,23 +874,9 @@ fn test_alter_table_rename_column_propagates_to_trigger_with_multiple_references
         .unwrap();
 
     // Verify trigger SQL was updated
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     // Trigger SQL should reference y_new instead of y
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1337,31 +946,18 @@ fn test_alter_table_rename_column_propagates_to_multiple_triggers(db: TempDataba
         .unwrap();
 
     // Verify both triggers were updated
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' ORDER BY name")
-        .unwrap();
-    let mut trigger_sqls = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sqls.push(row.get_value(0).cast_text().unwrap().to_string());
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let trigger_sqls: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' ORDER BY name");
 
     // Both triggers should reference y_new
     assert_eq!(trigger_sqls.len(), 2);
     let normalized_t1 = trigger_sqls[0]
+        .0
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
     let normalized_t2 = trigger_sqls[1]
+        .0
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -1422,23 +1018,9 @@ fn test_alter_table_rename_column_in_insert_column_list(db: TempDatabase) {
         .unwrap();
 
     // Verify trigger SQL was updated
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     // Trigger SQL should reference zercher in INSERT column list
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1475,23 +1057,9 @@ fn test_alter_table_rename_column_in_trigger_table_does_not_rewrite_other_table_
     // Verify trigger SQL was updated correctly:
     // - NEW.x should become NEW.x_new (refers to table t)
     // - INSERT INTO u(x, ...) should remain as x (refers to table u, not t)
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
     // NEW.x should be rewritten to NEW.x_new
@@ -1537,23 +1105,9 @@ fn test_alter_table_rename_column_in_insert_target_table_does_not_rewrite_trigge
     // Verify trigger SQL was updated correctly:
     // - NEW.x should remain as NEW.x (refers to table t, not u)
     // - INSERT INTO u(x, ...) should become u(x_new, ...) (refers to table u)
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
     // NEW.x should remain as NEW.x (not rewritten because it refers to table t)
@@ -1602,23 +1156,9 @@ fn test_alter_table_rename_column_update_where_clause_does_not_rewrite_target_ta
         .unwrap();
 
     // Verify trigger SQL: WHERE x should remain as x (refers to table u, not t)
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
     // NEW.x and OLD.x should be rewritten to x_new
@@ -1660,23 +1200,9 @@ fn test_alter_table_rename_column_update_set_column_name_rewritten(db: TempDatab
         .unwrap();
 
     // Verify trigger SQL: SET x should become SET x_new, WHERE u.x should become u.x_new
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
     // SET x should become SET x_new
@@ -1720,23 +1246,9 @@ fn test_alter_table_rename_column_delete_where_clause_does_not_rewrite_target_ta
         .unwrap();
 
     // Verify trigger SQL: WHERE x should remain as x (refers to table u, not t)
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
     // OLD.x should be rewritten to OLD.x_new
@@ -1778,23 +1290,9 @@ fn test_alter_table_rename_column_update_of_column_list_rewritten(db: TempDataba
         .unwrap();
 
     // Verify trigger SQL: UPDATE OF x should become UPDATE OF x_new
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
     // UPDATE OF x should become UPDATE OF x_new
@@ -1831,23 +1329,9 @@ fn test_alter_table_rename_column_update_of_multiple_columns_rewritten(db: TempD
         .unwrap();
 
     // Verify trigger SQL: UPDATE OF x, y should become UPDATE OF x_new, y
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
+    let results: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'");
+    let trigger_sql = &results[0].0;
 
     let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
     // UPDATE OF x, y should become UPDATE OF x_new, y
@@ -1995,4 +1479,78 @@ fn test_alter_table_rename_column_qualified_reference_to_trigger_table(db: TempD
         error_msg.contains("error in trigger") || error_msg.contains("no such column"),
         "Error should mention trigger or column: {error_msg}",
     );
+}
+
+/// Regression test for issue #4801: AFTER trigger INSERT corrupts index cursor position.
+///
+/// When an AFTER UPDATE trigger does INSERT on the same table, it modifies the index being
+/// used for the UPDATE scan. If the code reads columns from the index cursor (optimization
+/// for non-covering indexes), the cursor position becomes stale after the trigger's INSERT,
+/// causing wrong values to be read.
+///
+/// This test uses the exact SQL from the fuzz test seed 1768993693555 that exposed the bug
+/// in the test 'table_index_mutation_fuzz'.
+#[turso_macros::test]
+fn test_after_trigger_insert_does_not_corrupt_index_cursor(db: TempDatabase) {
+    use crate::common::{limbo_exec_rows, sqlite_exec_rows};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    // DDL/DML statements from the fuzz test
+    let setup_stmts = [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c0 INTEGER, c1 INTEGER, c2 INTEGER, c3 INTEGER)",
+        "CREATE INDEX idx_0 ON t(c0, c1, c2)",
+        "CREATE INDEX idx_1 ON t(c0)",
+        "CREATE INDEX idx_2 ON t(LOWER(c1))",
+        "CREATE INDEX idx_3 ON t(c3, c2, c1)",
+        "CREATE TRIGGER test_trigger AFTER UPDATE ON t BEGIN INSERT OR REPLACE INTO t (c0, c1, c2, c3) VALUES (928, NEW.c1, NEW.c2, OLD.c3); END",
+        "INSERT OR IGNORE INTO t (c0, c1, c2, c3) VALUES (305, 505, 678, 408), (925, 33, 642, 768), (583, 336, 680, 881), (550, 569, 563, 307), (582, 496, 313, 909), (646, 904, 180, 6), (860, 120, 210, 757), (932, 252, 319, 425), (408, 927, 967, 472), (968, 655, 488, 815), (192, 492, 320, 583), (290, 819, 155, 412), (229, 397, 804, 872), (382, 602, 311, 134), (980, 231, 975, 87), (40, 982, 849, 979), (389, 110, 692, 784), (122, 17, 894, 15), (449, 34, 426, 718), (35, 553, 253, 866), (330, 314, 578, 799), (886, 650, 297, 945), (114, 798, 799, 339), (957, 424, 572, 357), (691, 192, 538, 906), (210, 676, 612, 188), (416, 555, 714, 692), (235, 851, 840, 175), (265, 625, 617, 161), (320, 655, 841, 693), (832, 354, 796, 910), (128, 87, 181, 298), (293, 5, 124, 647), (437, 43, 72, 59), (35, 974, 600, 448), (346, 726, 63, 230), (733, 887, 74, 528), (804, 583, 691, 264), (599, 130, 119, 263), (119, 712, 874, 40), (612, 711, 314, 876), (323, 885, 816, 999), (889, 154, 563, 566), (219, 803, 49, 686)",
+        "UPDATE t SET c1 = 494, c1 = c2 - 643, c1 = c1 - 603 WHERE c2 = 853",
+        "UPDATE t SET c1 = c1 + 569 WHERE c1 = 171",
+        "UPDATE t SET c3 = c2 - 928 WHERE c1 = 295 AND c1 % 2 = 0",
+        "UPDATE t SET c3 = c1 + 914, c3 = 766 WHERE c1 > 555",
+        "UPDATE t SET c3 = 602 WHERE c1 > 761",
+        "UPDATE t SET c2 = c2 + 26, c2 = 378 WHERE c2 < 41",
+        "UPDATE t SET c2 = 969, c2 = 379, c2 = c2 + 376, c2 = 488 WHERE c1 > 565",
+        // This UPDATE triggered the bug in issue #4801:
+        // - WHERE c3 < 92 causes optimizer to use idx_3 for scanning
+        // - SET c0 = 778 only modifies c0, so c1/c2/c3 are read from existing row
+        // - AFTER trigger INSERTs, modifying idx_3 and corrupting parent's index cursor position
+        "UPDATE t SET c0 = 550, c0 = c0 - 160, c0 = 225, c0 = 778 WHERE c3 < 92 AND c3 % 2 = 0",
+    ];
+
+    // Setup SQLite connection
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    // Setup Limbo connection
+    let limbo_conn = db.connect_limbo();
+
+    // Execute all setup statements on both databases
+    for stmt in &setup_stmts {
+        sqlite_conn.execute(stmt, []).unwrap();
+        limbo_conn.execute(stmt).unwrap();
+    }
+
+    // Compare results
+    let query = "SELECT id, c0, c1, c2, c3 FROM t ORDER BY id";
+    let sqlite_rows = sqlite_exec_rows(&sqlite_conn, query);
+    let limbo_rows = limbo_exec_rows(&limbo_conn, query);
+
+    assert_eq!(
+        sqlite_rows.len(),
+        limbo_rows.len(),
+        "Row count mismatch: SQLite={}, Limbo={}",
+        sqlite_rows.len(),
+        limbo_rows.len()
+    );
+
+    for (i, (sqlite_row, limbo_row)) in sqlite_rows.iter().zip(limbo_rows.iter()).enumerate() {
+        assert_eq!(
+            sqlite_row, limbo_row,
+            "Row {i} differs!\nSQLite: {sqlite_row:?}\nLimbo:  {limbo_row:?}\n\
+             This indicates either a regression back to the bug in issue #4801 or a new bug",
+        );
+    }
 }

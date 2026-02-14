@@ -1,0 +1,61 @@
+---
+source: indexes.sqltest
+expression: "SELECT component, COUNT(*) as count\n    FROM logs\n    GROUP BY component;"
+info:
+  statement_type: SELECT
+  tables:
+    - logs
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--SCAN logs
+
+BYTECODE
+addr  opcode                  p1  p2  p3  p4              p5  comment
+   0          Init             0  42   0                   0  Start at 42
+   1          Null             0   8   0                   0  r[8]=NULL
+   2          SorterOpen       0   1   0  k(1,B)           0  cursor=0
+   3          Integer          0   5   0                   0  r[5]=0; clear group by abort flag
+   4          Null             0   6   0                   0  r[6]=NULL; initialize group by comparison registers to NULL
+   5          Gosub           11  38   0                   0  ; go to clear accumulator subroutine
+   6          OpenRead         2  15   0  k(5,B,B,B,B,B)   0  table=logs, root=15, iDb=0
+   7          Rewind           2  12   0                   0  Rewind table logs
+   8            Column         2   2  10                   0  r[10]=logs.component
+   9            MakeRecord    10   1   9                   0  r[9]=mkrec(r[10..10])
+  10            SorterInsert   0   9   0  0                0  key=r[9]
+  11          Next             2   8   0                   0
+  12          OpenPseudo       1   9   1                   0  1 columns in r[9]
+  13          SorterSort       0  27   0                   0
+  14            SorterData     0   9   1                   0  r[9]=data
+  15            Column         1   0  12                   0  r[12]=pseudo.column 0
+  16            Compare        6  12   1  k(1, Binary)     0  r[6..6]==r[12..12]
+  17            Jump          18  22  18                   0  ; start new group if comparison is not equal
+  18            Gosub          3  31   0                   0  ; check if ended group had data, and output if so
+  19            Move          12   6   1                   0  r[6..6]=r[12..12]
+  20            IfPos          5  41   0                   0  r[5]>0 -> r[5]-=0, goto 41; check abort flag
+  21            Gosub         11  38   0                   0  ; goto clear accumulator subroutine
+  22            AggStep        0  13   8  count            0  accum=r[8] step(r[13])
+  23            If             4  25   0                   0  if r[4] goto 25; don't emit group columns if continuing existing group
+  24            Column         1   0   7                   0  r[7]=pseudo.column 0
+  25            Integer        1   4   0                   0  r[4]=1; indicate data in accumulator
+  26          SorterNext       0  14   0                   0
+  27          Gosub            3  31   0                   0  ; emit row for final group
+  28          Goto             0  41   0                   0  ; group by finished
+  29          Integer          1   5   0                   0  r[5]=1
+  30        Return             3   0   0                   0
+  31        IfPos              4  33   0                   0  r[4]>0 -> r[4]-=0, goto 33; output group by row subroutine start
+  32      Return               3   0   0                   0
+  33      AggFinal             0   8   0  count            0  accum=r[8]
+  34      Copy                 7   1   0                   0  r[1]=r[7]
+  35      Copy                 8   2   0                   0  r[2]=r[8]
+  36      ResultRow            1   2   0                   0  output=r[1..2]
+  37    Return                 3   0   0                   0
+  38    Null                   0   7   8                   0  r[7..8]=NULL; clear accumulator subroutine start
+  39    Integer                0   4   0                   0  r[4]=0
+  40  Return                  11   0   0                   0
+  41  Halt                     0   0   0                   0
+  42  Transaction              0   1  14                   0  iDb=0 tx_mode=Read
+  43  Integer                  1  13   0                   0  r[13]=1
+  44  Goto                     0   1   0                   0

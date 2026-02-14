@@ -1,21 +1,7 @@
-use std::{
-    cell::RefCell,
-    cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-};
-
-use constraints::{
-    constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
-};
-use cost::{Cost, ESTIMATED_HARDCODED_ROWS_PER_TABLE};
-use join::{compute_best_join_order, BestJoinOrderResult};
-use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
-use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
-use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
-
 use crate::{
+    function::Deterministic,
+    index_method::IndexMethodCostEstimate,
+    numeric::Numeric,
     schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
         insert::ROWID_COLUMN,
@@ -23,16 +9,19 @@ use crate::{
             access_method::AccessMethodParams,
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
             cost::RowCountEstimate,
+            order::{ColumnTarget, OrderTarget},
         },
         plan::{
-            ColumnUsedMask, HashJoinOp, IndexMethodQuery, NonFromClauseSubquery,
-            OuterQueryReference, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
+            ColumnUsedMask, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
+            NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
+            SeekKeyComponent,
         },
         trigger_exec::has_relevant_triggers_type_only,
     },
     types::SeekOp,
     util::{
-        exprs_are_equivalent, simple_bind_expr, try_capture_parameters, try_substitute_parameters,
+        count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,
+        try_capture_parameters_column_agnostic, try_substitute_parameters,
     },
     vdbe::{
         affinity::Affinity,
@@ -40,21 +29,385 @@ use crate::{
     },
     LimboError, Result,
 };
+use constraints::{
+    constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
+};
+use cost::Cost;
+use join::{compute_best_join_order, BestJoinOrderResult};
+use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
+use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
+use turso_ext::{ConstraintInfo, ConstraintUsage};
+use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
 use super::{
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, Operation, Plan,
-        Search, SeekDef, SeekKey, SelectPlan, TableReferences, UpdatePlan, WhereTerm,
+        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, MultiIndexBranch,
+        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, TableReferences,
+        UpdatePlan, WhereTerm,
     },
+    planner::TableMask,
 };
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
 pub(crate) mod cost;
+mod cost_params;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod order;
+
+/// A candidate index method that could be used for table access in a join query.
+/// This struct captures all information needed to construct an IndexMethodQuery
+/// operation, allowing the DP join ordering algorithm to consider custom index
+/// methods alongside BTree indexes.
+#[derive(Debug, Clone)]
+pub struct IndexMethodCandidate {
+    /// Index of the table in the joined_tables list
+    pub table_idx: usize,
+    /// The index that defines this index method
+    pub index: Arc<Index>,
+    /// Pattern index from the index method definition that matched
+    pub pattern_idx: usize,
+    /// Arguments captured from pattern matching
+    pub arguments: Vec<ast::Expr>,
+    /// Mapping from synthetic column IDs to pattern column IDs for covered columns
+    pub covered_columns: HashMap<usize, usize>,
+    /// Index in WHERE clause that was covered by this pattern (if any)
+    pub where_covered: Option<usize>,
+    /// Cost estimate from the index method
+    pub cost_estimate: Option<IndexMethodCostEstimate>,
+}
+
+impl IndexMethodCandidate {
+    /// Build the IndexMethodQuery operation from this candidate
+    pub fn to_query(&self) -> IndexMethodQuery {
+        IndexMethodQuery {
+            index: self.index.clone(),
+            pattern_idx: self.pattern_idx,
+            arguments: self.arguments.clone(),
+            covered_columns: self.covered_columns.clone(),
+        }
+    }
+}
+
+/// Result of successfully matching an index method pattern against a query.
+/// This intermediate struct allows both `collect_index_method_candidates` and
+/// `optimize_table_access_with_custom_modules` to share pattern matching logic.
+#[derive(Debug, Clone)]
+struct IndexMethodPatternMatch {
+    /// Pattern index from the index method definition that matched
+    pattern_idx: usize,
+    /// Parameters captured from pattern matching (positional placeholders)
+    parameters: HashMap<i32, ast::Expr>,
+    /// Index in WHERE clause that was covered by this pattern (if any)
+    where_covered: Option<usize>,
+    /// Whether the pattern explicitly handles ORDER BY
+    pattern_has_order_by: bool,
+    /// Whether the pattern explicitly handles LIMIT
+    pattern_has_limit: bool,
+    /// Pattern result columns (needed for covered columns calculation)
+    pattern_columns: Vec<ast::ResultColumn>,
+}
+
+/// Try to match an index method pattern against a query's clauses.
+#[allow(clippy::too_many_arguments)]
+fn try_match_index_method_pattern(
+    pattern: &ast::Select,
+    table: &JoinedTable,
+    query_where_terms: &[WhereTerm],
+    order_by: &[(Box<ast::Expr>, SortOrder)],
+    limit: &Option<Box<Expr>>,
+    offset: &Option<Box<Expr>>,
+    pattern_idx: usize,
+    soft_bind_errors: bool,
+) -> Option<IndexMethodPatternMatch> {
+    let mut pattern = pattern.clone();
+    if pattern.with.is_some() || !pattern.body.compounds.is_empty() {
+        return None;
+    }
+
+    let ast::OneSelect::Select {
+        columns,
+        from: Some(ast::FromClause { select, joins }),
+        distinctness: None,
+        where_clause: ref mut pattern_where_clause,
+        group_by: None,
+        window_clause,
+    } = &mut pattern.body.select
+    else {
+        if soft_bind_errors {
+            return None;
+        }
+        panic!("unexpected select pattern body");
+    };
+
+    if !window_clause.is_empty() || !joins.is_empty() {
+        return None;
+    }
+
+    let ast::SelectTable::Table(name, _, _) = select.as_ref() else {
+        if soft_bind_errors {
+            return None;
+        }
+        panic!("unexpected from clause");
+    };
+
+    // Bind expressions to this table
+    for column in columns.iter_mut() {
+        if let ast::ResultColumn::Expr(e, _) = column {
+            if soft_bind_errors {
+                if simple_bind_expr(table, &[], e).is_err() {
+                    return None;
+                }
+            } else {
+                simple_bind_expr(table, &[], e).ok()?;
+            }
+        }
+    }
+    for column in pattern.order_by.iter_mut() {
+        if soft_bind_errors {
+            if simple_bind_expr(table, columns, &mut column.expr).is_err() {
+                return None;
+            }
+        } else {
+            simple_bind_expr(table, columns, &mut column.expr).ok()?;
+        }
+    }
+    if let Some(pattern_where) = pattern_where_clause {
+        if soft_bind_errors {
+            if simple_bind_expr(table, columns, pattern_where).is_err() {
+                return None;
+            }
+        } else {
+            simple_bind_expr(table, columns, pattern_where).ok()?;
+        }
+    }
+
+    if name.name.as_str() != table.table.get_name() {
+        return None;
+    }
+
+    let pattern_has_order_by = !pattern.order_by.is_empty();
+    let pattern_has_limit = pattern.limit.is_some();
+
+    // If pattern has ORDER BY, it must match exactly
+    if pattern_has_order_by && order_by.len() != pattern.order_by.len() {
+        return None;
+    }
+
+    let mut where_query_covered: Option<usize> = None;
+    let mut parameters = HashMap::default();
+
+    // Match ORDER BY if pattern has it
+    if pattern_has_order_by {
+        for (pattern_column, (query_column, query_order)) in
+            pattern.order_by.iter().zip(order_by.iter())
+        {
+            if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
+                return None;
+            }
+            let num_col_args = count_fts_column_args(&pattern_column.expr);
+            let captured = if num_col_args > 0 {
+                try_capture_parameters_column_agnostic(
+                    &pattern_column.expr,
+                    query_column,
+                    num_col_args,
+                )
+            } else {
+                try_capture_parameters(&pattern_column.expr, query_column)
+            };
+            parameters.extend(captured?);
+        }
+    }
+
+    // Match LIMIT if pattern has it
+    match (pattern.limit.as_ref().map(|x| &x.expr), limit) {
+        (Some(_), None) => return None,
+        (Some(pattern_limit), Some(query_limit)) => {
+            let captured = try_capture_parameters(pattern_limit, query_limit)?;
+            parameters.extend(captured);
+        }
+        (None, Some(_)) | (None, None) => {}
+    }
+
+    // Match OFFSET if pattern has it
+    match (
+        pattern.limit.as_ref().and_then(|x| x.offset.as_ref()),
+        offset,
+    ) {
+        (Some(_), None) => return None,
+        (Some(pattern_off), Some(query_off)) => {
+            let captured = try_capture_parameters(pattern_off, query_off)?;
+            parameters.extend(captured);
+        }
+        (None, Some(_)) | (None, None) => {}
+    }
+
+    // Match WHERE clause
+    if let Some(pattern_where) = pattern_where_clause {
+        for (i, query_where) in query_where_terms.iter().enumerate() {
+            let num_col_args = count_fts_column_args(pattern_where);
+            let captured = if num_col_args > 0 {
+                try_capture_parameters_column_agnostic(
+                    pattern_where,
+                    &query_where.expr,
+                    num_col_args,
+                )
+            } else {
+                try_capture_parameters(pattern_where, &query_where.expr)
+            };
+            let Some(captured) = captured else {
+                continue;
+            };
+            parameters.extend(captured);
+            where_query_covered = Some(i);
+            break;
+        }
+    }
+
+    // Pattern requires WHERE but we didn't match any
+    if pattern_where_clause.is_some() && where_query_covered.is_none() {
+        return None;
+    }
+
+    let where_covered_completely = query_where_terms.is_empty()
+        || (where_query_covered.is_some() && query_where_terms.len() == 1);
+
+    // When WHERE is not completely covered, skip patterns with ORDER BY/LIMIT
+    // because post-filtering would disrupt the order or apply limits incorrectly
+    if !where_covered_completely && (pattern_has_order_by || pattern_has_limit) {
+        return None;
+    }
+
+    Some(IndexMethodPatternMatch {
+        pattern_idx,
+        parameters,
+        where_covered: where_query_covered,
+        pattern_has_order_by,
+        pattern_has_limit,
+        pattern_columns: columns.clone(),
+    })
+}
+
+/// Build covered columns mapping from pattern columns.
+/// Returns a HashMap mapping synthetic column IDs to pattern column IDs.
+fn build_covered_columns_mapping(
+    pattern_columns: &[ast::ResultColumn],
+    parameters: &HashMap<i32, ast::Expr>,
+) -> HashMap<usize, usize> {
+    let mut covered_column_id = 1_000_000;
+    let mut covered_columns = HashMap::default();
+    for (pattern_column_id, pattern_column) in pattern_columns.iter().enumerate() {
+        let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
+            continue;
+        };
+        let Some(_substituted) = try_substitute_parameters(pattern_expr, parameters) else {
+            continue;
+        };
+        covered_columns.insert(covered_column_id, pattern_column_id);
+        covered_column_id += 1;
+    }
+    covered_columns
+}
+
+/// Sort parameters by key and extract just the expressions as a Vec.
+fn sorted_arguments_from_parameters(parameters: &HashMap<i32, ast::Expr>) -> Vec<ast::Expr> {
+    let mut arguments: Vec<_> = parameters.iter().collect();
+    arguments.sort_by_key(|(&i, _)| i);
+    arguments.iter().map(|(_, e)| (*e).clone()).collect()
+}
+
+/// Collect index method candidates for all tables that have custom index methods.
+/// This function performs pattern matching but does NOT apply the operations,
+/// allowing the DP join ordering algorithm to consider index methods as candidates.
+#[allow(clippy::too_many_arguments)]
+fn collect_index_method_candidates(
+    table_references: &TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    where_clause: &[WhereTerm],
+    order_by: &[(Box<ast::Expr>, SortOrder)],
+    group_by: &Option<GroupBy>,
+    limit: &Option<Box<Expr>>,
+    offset: &Option<Box<Expr>>,
+    base_table_rows: &[RowCountEstimate],
+    params: &cost_params::CostModelParams,
+) -> Result<Vec<IndexMethodCandidate>> {
+    let mut candidates = Vec::new();
+
+    // Group by is not supported for index methods
+    if group_by.is_some() {
+        return Ok(candidates);
+    }
+
+    let tables = table_references.joined_tables();
+    for (table_idx, table) in tables.iter().enumerate() {
+        let Some(indexes) = available_indexes.get(table.table.get_name()) else {
+            continue;
+        };
+
+        for index in indexes {
+            let Some(module) = &index.index_method else {
+                continue;
+            };
+            if index.is_backing_btree_index() {
+                continue;
+            }
+
+            let definition = module.definition();
+            for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+                // Use shared helper for pattern matching
+                let Some(pattern_match) = try_match_index_method_pattern(
+                    pattern,
+                    table,
+                    where_clause,
+                    order_by,
+                    limit,
+                    offset,
+                    pattern_idx,
+                    true, // continue on binding failures
+                ) else {
+                    continue;
+                };
+
+                // Build covered columns mapping from pattern match
+                let covered_columns = build_covered_columns_mapping(
+                    &pattern_match.pattern_columns,
+                    &pattern_match.parameters,
+                );
+
+                // Get cost estimate from the index method
+                let cost_estimate = module.init().ok().and_then(|cursor| {
+                    let base_rows = base_table_rows
+                        .get(table_idx)
+                        .map(|r| **r)
+                        .unwrap_or(params.rows_per_table_fallback);
+                    cursor.estimate_cost(pattern_match.pattern_idx, base_rows)
+                });
+
+                // Sort and collect arguments
+                let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
+
+                candidates.push(IndexMethodCandidate {
+                    table_idx,
+                    index: index.clone(),
+                    pattern_idx: pattern_match.pattern_idx,
+                    arguments,
+                    covered_columns,
+                    where_covered: pattern_match.where_covered,
+                    cost_estimate,
+                });
+
+                // Found a match for this table+index, try next index
+                break;
+            }
+        }
+    }
+
+    Ok(candidates)
+}
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Schema) -> Result<()> {
@@ -76,12 +429,65 @@ pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Sch
     Ok(())
 }
 
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+/// Transform MATCH expressions to fts_match() function calls.
+fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
+    use super::ast::{FunctionTail, LikeOperator, Name};
+    use super::expr::{walk_expr_mut, WalkControl};
+
+    for term in where_clause.iter_mut() {
+        let _ = walk_expr_mut(&mut term.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+            match e {
+                Expr::Like {
+                    lhs,
+                    not,
+                    op: LikeOperator::Match,
+                    rhs,
+                    escape: _,
+                } => {
+                    // Transform MATCH to fts_match():
+                    // - `col MATCH 'query'` -> `fts_match(col, 'query')`
+                    // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
+                    let mut args: Vec<Box<Expr>> = match lhs.as_ref() {
+                        Expr::Parenthesized(cols) => cols.clone(),
+                        _ => vec![lhs.clone()],
+                    };
+                    args.push(rhs.clone());
+
+                    let func_call = Expr::FunctionCall {
+                        name: Name::exact("fts_match".to_string()),
+                        distinctness: None,
+                        args,
+                        order_by: vec![],
+                        filter_over: FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    };
+                    if *not {
+                        // For NOT MATCH, just wrap the whole thing in a unary NOT
+                        *e = Expr::Unary(ast::UnaryOperator::Not, Box::new(func_call));
+                    } else {
+                        *e = func_call;
+                    }
+                    Ok(WalkControl::Continue)
+                }
+                _ => Ok(WalkControl::Continue),
+            }
+        });
+    }
+}
+
 /**
  * Make a few passes over the plan to optimize it.
  * TODO: these could probably be done in less passes,
  * but having them separate makes them easier to understand
  */
 pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+    // Transform MATCH expressions to fts_match() for FTS optimizer recognition
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    transform_match_to_fts_match(&mut plan.where_clause);
+
     optimize_subqueries(plan, schema)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -112,6 +518,9 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 }
 
 fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    transform_match_to_fts_match(&mut plan.where_clause);
+
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -132,7 +541,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
-        &[],
+        &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
     )?;
@@ -145,6 +554,8 @@ fn optimize_update_plan(
     plan: &mut UpdatePlan,
     schema: &Schema,
 ) -> Result<()> {
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    transform_match_to_fts_match(&mut plan.where_clause);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -160,7 +571,7 @@ fn optimize_update_plan(
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
-        &[],
+        &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
     )?;
@@ -188,6 +599,15 @@ fn optimize_update_plan(
             TriggerEvent::Update,
             Some(&updated_cols),
             btree_table,
+        ) {
+            break 'requires true;
+        }
+
+        // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
+        // which can corrupt the iteration order when iterating via an index.
+        if matches!(
+            plan.or_conflict,
+            Some(turso_parser::ast::ResolveType::Replace)
         ) {
             break 'requires true;
         }
@@ -249,6 +669,7 @@ fn add_ephemeral_table_to_update_plan(
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
+        check_constraints: vec![],
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
@@ -288,6 +709,9 @@ fn add_ephemeral_table_to_update_plan(
                 internal_id: table.internal_id,
                 table: table.table.clone(),
                 col_used_mask: table.col_used_mask.clone(),
+                cte_select: None,
+                cte_explicit_columns: vec![],
+                cte_id: None,
             });
     }
 
@@ -328,6 +752,7 @@ fn add_ephemeral_table_to_update_plan(
         query_destination: QueryDestination::EphemeralTable {
             cursor_id: temp_cursor_id,
             table: ephemeral_table,
+            rowid_mode: EphemeralRowidMode::FromResultColumns,
         },
         join_order,
         offset: None,
@@ -335,7 +760,8 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        non_from_clause_subqueries: vec![],
+        // Move subqueries from the main plan to the ephemeral plan since the WHERE clause was moved
+        non_from_clause_subqueries: plan.non_from_clause_subqueries.drain(..).collect(),
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
@@ -346,7 +772,25 @@ fn add_ephemeral_table_to_update_plan(
 fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
-            optimize_select_plan(&mut from_clause_subquery.plan, schema)?;
+            let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+            // Use match to handle both SelectPlan and CompoundSelect variants
+            match from_clause_subquery.plan.as_mut() {
+                Plan::Select(select_plan) => optimize_select_plan(select_plan, schema)?,
+                Plan::CompoundSelect {
+                    left, right_most, ..
+                } => {
+                    optimize_select_plan(right_most, schema)?;
+                    for (select_plan, _) in left {
+                        optimize_select_plan(select_plan, schema)?;
+                    }
+                }
+                Plan::Delete(_) | Plan::Update(_) => {
+                    return Err(LimboError::InternalError(
+                        "DELETE/UPDATE plans should not appear in FROM clause subqueries"
+                            .to_string(),
+                    ));
+                }
+            }
         }
     }
 
@@ -355,7 +799,6 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn optimize_table_access_with_custom_modules(
-    schema: &Schema,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
@@ -366,13 +809,17 @@ fn optimize_table_access_with_custom_modules(
     offset: &mut Option<Box<Expr>>,
 ) -> Result<bool> {
     let tables = table_references.joined_tables_mut();
-    assert_eq!(tables.len(), 1);
+    if tables.is_empty() {
+        return Ok(false);
+    }
 
     // group by is not supported for now
     if group_by.is_some() {
         return Ok(false);
     }
 
+    // Only optimize the first table with custom index methods.
+    // This allows FTS to be used as the driving table in joins.
     let table = &mut tables[0];
     let Some(indexes) = available_indexes.get(table.table.get_name()) else {
         return Ok(false);
@@ -385,125 +832,43 @@ fn optimize_table_access_with_custom_modules(
             continue;
         }
         let definition = module.definition();
-        'pattern: for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
-            let mut pattern = pattern.clone();
-            assert!(pattern.with.is_none());
-            assert!(pattern.body.compounds.is_empty());
-            let ast::OneSelect::Select {
-                columns,
-                from: Some(ast::FromClause { select, joins }),
-                distinctness: None,
-                ref mut where_clause,
-                group_by: None,
-                window_clause,
-            } = &mut pattern.body.select
-            else {
-                panic!("unexpected select pattern body");
-            };
-            assert!(window_clause.is_empty());
-            assert!(joins.is_empty());
-            let ast::SelectTable::Table(name, _, _) = select.as_ref() else {
-                panic!("unexpected from clause");
+        for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+            let Some(pattern_match) = try_match_index_method_pattern(
+                pattern,
+                table,
+                where_query,
+                order_by,
+                limit,
+                offset,
+                pattern_idx,
+                false, // panic on binding failures
+            ) else {
+                continue;
             };
 
-            for column in columns.iter_mut() {
-                if let ast::ResultColumn::Expr(e, _) = column {
-                    simple_bind_expr(schema, table, &[], e)?;
-                }
-            }
-            for column in pattern.order_by.iter_mut() {
-                simple_bind_expr(schema, table, columns, &mut column.expr)?;
-            }
-            if let Some(pattern_where) = where_clause {
-                simple_bind_expr(schema, table, columns, pattern_where)?;
-            }
-
-            if name.name.as_str() != table.table.get_name() {
-                continue;
-            }
-            if order_by.len() != pattern.order_by.len() {
-                continue;
-            }
-
-            let mut where_query_covered = None;
-            let mut parameters = HashMap::new();
-
-            for (pattern_column, (query_column, query_order)) in
-                pattern.order_by.iter().zip(order_by.iter())
-            {
-                if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
-                    continue 'pattern;
-                }
-                let Some(captured) = try_capture_parameters(&pattern_column.expr, query_column)
-                else {
-                    continue 'pattern;
-                };
-                parameters.extend(captured);
-            }
-            match (pattern.limit.as_ref().map(|x| &x.expr), &limit) {
-                (None, Some(_)) | (Some(_), None) => continue,
-                (Some(pattern_limit), Some(query_limit)) => {
-                    let Some(captured) = try_capture_parameters(pattern_limit, query_limit) else {
-                        continue 'pattern;
-                    };
-                    parameters.extend(captured);
-                }
-                (None, None) => {}
-            }
-            match (
-                pattern.limit.as_ref().and_then(|x| x.offset.as_ref()),
-                &offset,
-            ) {
-                (None, Some(_)) | (Some(_), None) => continue,
-                (Some(pattern_off), Some(query_off)) => {
-                    let Some(captured) = try_capture_parameters(pattern_off, query_off) else {
-                        continue 'pattern;
-                    };
-                    parameters.extend(captured);
-                }
-                (None, None) => {}
-            }
-            if let Some(pattern_where) = where_clause {
-                for (i, query_where) in where_query.iter().enumerate() {
-                    let captured = try_capture_parameters(pattern_where, &query_where.expr);
-                    let Some(captured) = captured else {
-                        continue;
-                    };
-                    parameters.extend(captured);
-                    where_query_covered = Some(i);
-                    break;
-                }
-            }
-
-            if where_clause.is_some() && where_query_covered.is_none() {
-                continue;
-            }
-
-            let where_covered_completely =
-                where_query.is_empty() || where_query_covered.is_some() && where_query.len() == 1;
-
-            if !where_covered_completely
-                && (!order_by.is_empty() || limit.is_some() || offset.is_some())
-            {
-                continue;
-            }
-
-            if let Some(where_covered) = where_query_covered {
+            // Mark WHERE clause as consumed
+            if let Some(where_covered) = pattern_match.where_covered {
                 where_query[where_covered].consumed = true;
             }
 
-            // todo: fix this
+            // Build covered columns mapping and update result_columns.
+            // This differs from collect_index_method_candidates: we modify result_columns
+            // and increment covered_column_id per matching query column, not per pattern column.
             let mut covered_column_id = 1_000_000;
-            let mut covered_columns = HashMap::new();
-            for (patter_column_id, pattern_column) in columns.iter().enumerate() {
-                let ast::ResultColumn::Expr(pattern, _) = pattern_column else {
+            let mut covered_columns = HashMap::default();
+            for (pattern_column_id, pattern_column) in
+                pattern_match.pattern_columns.iter().enumerate()
+            {
+                let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
                     continue;
                 };
-                let Some(pattern) = try_substitute_parameters(pattern, &parameters) else {
+                let Some(substituted) =
+                    try_substitute_parameters(pattern_expr, &pattern_match.parameters)
+                else {
                     continue;
                 };
                 for query_column in result_columns.iter_mut() {
-                    if !exprs_are_equivalent(&query_column.expr, &pattern) {
+                    if !exprs_are_equivalent(&query_column.expr, &substituted) {
                         continue;
                     }
                     query_column.expr = ast::Expr::Column {
@@ -512,21 +877,35 @@ fn optimize_table_access_with_custom_modules(
                         column: covered_column_id,
                         is_rowid_alias: false,
                     };
-                    covered_columns.insert(covered_column_id, patter_column_id);
+                    covered_columns.insert(covered_column_id, pattern_column_id);
                     covered_column_id += 1;
                 }
             }
-            let _ = order_by.drain(..);
-            let _ = limit.take();
-            let _ = offset.take();
-            let mut arguments = parameters.iter().collect::<Vec<_>>();
-            arguments.sort_by_key(|(&i, _)| i);
+
+            // Calculate whether WHERE is completely covered for ORDER BY/LIMIT clearing
+            let where_covered_completely = where_query.is_empty()
+                || (pattern_match.where_covered.is_some() && where_query.len() == 1);
+
+            // Only clear ORDER BY/LIMIT/OFFSET if:
+            // 1. The pattern explicitly handles them (has ORDER BY/LIMIT), AND
+            // 2. WHERE is completely covered (no post-filtering needed)
+            // Otherwise, keep them so they're applied after post-filtering
+            if pattern_match.pattern_has_order_by && where_covered_completely {
+                let _ = order_by.drain(..);
+            }
+            if pattern_match.pattern_has_limit && where_covered_completely {
+                let _ = limit.take();
+                let _ = offset.take();
+            }
+
+            // Sort and collect arguments
+            let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
 
             table.op = Operation::IndexMethodQuery(IndexMethodQuery {
                 index: index.clone(),
-                pattern_idx,
+                pattern_idx: pattern_match.pattern_idx,
                 covered_columns,
-                arguments: arguments.iter().map(|(_, e)| (*e).clone()).collect(),
+                arguments,
             });
             return Ok(true);
         }
@@ -568,7 +947,11 @@ fn register_expression_index_usages_for_plan(
 }
 
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
-fn base_row_estimate(schema: &Schema, table: &JoinedTable) -> RowCountEstimate {
+fn base_row_estimate(
+    schema: &Schema,
+    table: &JoinedTable,
+    params: &cost_params::CostModelParams,
+) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
             if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
@@ -581,9 +964,9 @@ fn base_row_estimate(schema: &Schema, table: &JoinedTable) -> RowCountEstimate {
                     return RowCountEstimate::AnalyzeStats(rows as f64);
                 }
             }
-            RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
+            RowCountEstimate::hardcoded_fallback(params)
         }
-        _ => RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64),
+        _ => RowCountEstimate::hardcoded_fallback(params),
     }
 }
 
@@ -611,6 +994,16 @@ fn optimize_table_access(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
+    // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
+    // Otherwise, use the compile-time static for zero overhead.
+    #[cfg(feature = "optimizer_params")]
+    let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
+    #[cfg(not(feature = "optimizer_params"))]
+    let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+
+    if table_references.joined_tables().is_empty() {
+        return Ok(None);
+    }
     if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
         crate::bail_parse_error!(
             "Only up to {} tables can be joined",
@@ -618,16 +1011,26 @@ fn optimize_table_access(
         );
     }
 
-    register_expression_index_usages_for_plan(
-        table_references,
-        result_columns,
-        order_by.as_slice(),
-        group_by.as_ref(),
-    );
+    let has_expression_index = table_references.joined_tables().iter().any(|t| {
+        matches!(&t.table, Table::BTree(btree) if available_indexes
+            .get(&btree.name)
+            .is_some_and(|indexes| indexes.iter().any(|index| index.is_expression_index())))
+    });
 
-    if table_references.joined_tables().len() == 1 {
+    if has_expression_index {
+        register_expression_index_usages_for_plan(
+            table_references,
+            result_columns,
+            order_by.as_slice(),
+            group_by.as_ref(),
+        );
+    }
+
+    // For single-table queries, try to optimize with custom index methods directly.
+    // This is the fast path that preserves the original behavior.
+    let is_single_table = table_references.joined_tables().len() == 1;
+    if is_single_table {
         let optimized = optimize_table_access_with_custom_modules(
-            schema,
             result_columns,
             table_references,
             available_indexes,
@@ -642,63 +1045,119 @@ fn optimize_table_access(
         }
     }
 
-    let access_methods_arena = RefCell::new(Vec::new());
+    let mut access_methods_arena = Vec::new();
+
+    // For multi-table queries, collect index method candidates to pass to the DP algorithm.
+    // This allows the optimizer to consider index methods at any position in the join order.
+    let base_table_rows_for_candidates = table_references
+        .joined_tables()
+        .iter()
+        .map(|t| base_row_estimate(schema, t, params))
+        .collect::<Vec<_>>();
+
+    let index_method_candidates = if !is_single_table {
+        collect_index_method_candidates(
+            table_references,
+            available_indexes,
+            where_clause,
+            order_by,
+            group_by,
+            limit,
+            offset,
+            &base_table_rows_for_candidates,
+            params,
+        )?
+    } else {
+        Vec::new()
+    };
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut(), table_references);
-    let constraints_per_table = constraints_from_where_clause(
+    let mut constraints_per_table = constraints_from_where_clause(
         where_clause,
         table_references,
         available_indexes,
         subqueries,
         schema,
+        params,
     )?;
+
     let base_table_rows = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t))
+        .map(|t| base_row_estimate(schema, t, params))
         .collect::<Vec<_>>();
 
-    // Currently the expressions we evaluate as constraints are binary expressions that will never be true for a NULL operand.
+    // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)
+    // will never be true for a NULL operand.
     // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
     // the outer join can be converted into an inner join.
     // for example:
     // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
     // there can never be a situation where null columns are emitted for t2 because t2.id = 5 will never be true in that case.
     // hence: we can convert the outer join into an inner join.
-    for (i, t) in table_references
-        .joined_tables_mut()
-        .iter_mut()
-        .enumerate()
-        .filter(|(_, t)| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|join_info| join_info.outer)
-        })
-    {
-        if constraints_per_table[i]
-            .constraints
-            .iter()
-            .any(|c| where_clause[c.where_clause_pos.0].from_outer_join.is_none())
+    //
+    // Converting a LEFT JOIN into an INNER JOIN is an optimization opportunity:
+    // it can enable join reordering and let more predicates participate in key selection.
+    // -> recompute constraints if we rewrote a LEFT JOIN into an INNER JOIN.
+    loop {
+        let mut outer_join_rewritten = false;
+        for (i, t) in table_references
+            .joined_tables_mut()
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.join_info
+                    .as_ref()
+                    .is_some_and(|join_info| join_info.outer)
+            })
         {
-            t.join_info.as_mut().unwrap().outer = false;
-            for term in where_clause.iter_mut() {
-                if let Some(from_outer_join) = term.from_outer_join {
-                    if from_outer_join == t.internal_id {
-                        term.from_outer_join = None;
+            // Check if there's a constraint that would filter out NULL rows,
+            // allowing us to convert the LEFT JOIN into an INNER JOIN for join reordering purposes.
+            // Most binary ops like x = foo filter out NULL rows, but
+            // IS NULL constraints do NOT - they specifically KEEP them.
+            // So we should not convert LEFT JOIN to INNER JOIN based on IS NULL constraints.
+            if constraints_per_table[i].constraints.iter().any(|c| {
+                let is_from_where = where_clause[c.where_clause_pos.0].from_outer_join.is_none();
+                let is_is_null = c.operator == ast::Operator::Is.into();
+                is_from_where && !is_is_null
+            }) {
+                t.join_info.as_mut().unwrap().outer = false;
+                for term in where_clause.iter_mut() {
+                    if let Some(from_outer_join) = term.from_outer_join {
+                        if from_outer_join == t.internal_id {
+                            term.from_outer_join = None;
+                        }
                     }
                 }
+                outer_join_rewritten = true;
             }
-            continue;
         }
+        if !outer_join_rewritten {
+            break;
+        }
+        constraints_per_table = constraints_from_where_clause(
+            where_clause,
+            table_references,
+            available_indexes,
+            subqueries,
+            schema,
+            params,
+        )?;
     }
 
     let Some(best_join_order_result) = compute_best_join_order(
-        table_references.joined_tables_mut(),
+        table_references.joined_tables(),
         maybe_order_target.as_ref(),
         &constraints_per_table,
         &base_table_rows,
-        &access_methods_arena,
+        &mut access_methods_arena,
         where_clause,
         subqueries,
+        &index_method_candidates,
+        params,
+        &schema.analyze_stats,
+        available_indexes,
+        table_references,
+        schema,
     )?
     else {
         return Ok(None);
@@ -726,13 +1185,15 @@ fn optimize_table_access(
         best_plan
     };
 
+    let mut sort_eliminated = false;
+
     // Eliminate sorting if possible.
-    if let Some(order_target) = maybe_order_target {
+    if let Some(order_target) = maybe_order_target.as_ref() {
         let satisfies_order_target = plan_satisfies_order_target(
             &best_plan,
             &access_methods_arena,
             table_references.joined_tables_mut(),
-            &order_target,
+            order_target,
         );
         if satisfies_order_target {
             match order_target.1 {
@@ -748,6 +1209,7 @@ fn optimize_table_access(
                 }
             }
         }
+        sort_eliminated = satisfies_order_target;
     }
 
     let (best_access_methods, best_table_numbers) = (
@@ -755,30 +1217,85 @@ fn optimize_table_access(
         best_plan.table_numbers().collect::<Vec<_>>(),
     );
 
-    // Collect hash join build table indices. These tables should NOT be in the join_order
-    // because they are fully consumed during hash table building (similar to how ephemeral
-    // index source tables work). The build table's cursor is still opened and used, but
-    // it doesn't participate in the main loop iteration structure.
-    let hash_join_build_tables: Vec<usize> = best_access_methods
-        .iter()
-        .filter_map(|&am_idx| {
-            let arena = access_methods_arena.borrow();
-            arena.get(am_idx).and_then(|am| {
-                if let AccessMethodParams::HashJoin {
-                    build_table_idx, ..
-                } = &am.params
-                {
-                    Some(*build_table_idx)
-                } else {
-                    None
-                }
+    // Collect hash join build/probe table indices. Build tables are excluded from the main
+    // join order because they are consumed during hash build. A table may appear as both
+    // probe and build (probe->build chaining) only when the build input is materialized.
+    let (hash_join_build_tables, hash_join_probe_tables): (Vec<usize>, Vec<usize>) =
+        best_access_methods
+            .iter()
+            .filter_map(|&am_idx| {
+                let arena = &access_methods_arena;
+                arena.get(am_idx).and_then(|am| {
+                    if let AccessMethodParams::HashJoin {
+                        build_table_idx,
+                        probe_table_idx,
+                        ..
+                    } = &am.params
+                    {
+                        Some((*build_table_idx, *probe_table_idx))
+                    } else {
+                        None
+                    }
+                })
             })
-        })
+            .unzip();
+    #[cfg(debug_assertions)]
+    {
+        let mut probe_tables: HashSet<usize> = HashSet::default();
+        let mut build_tables: HashMap<usize, bool> = HashMap::default();
+        let mut pos_by_table: Vec<Option<usize>> =
+            vec![None; table_references.joined_tables().len()];
+        for (pos, table_idx) in best_table_numbers.iter().enumerate() {
+            pos_by_table[*table_idx] = Some(pos);
+        }
+
+        for &am_idx in best_access_methods.iter() {
+            let arena = &access_methods_arena;
+            let Some(am) = arena.get(am_idx) else {
+                continue;
+            };
+            if let AccessMethodParams::HashJoin {
+                build_table_idx,
+                probe_table_idx,
+                materialize_build_input,
+                ..
+            } = &am.params
+            {
+                if let (Some(build_pos), Some(probe_pos)) = (
+                    pos_by_table[*build_table_idx],
+                    pos_by_table[*probe_table_idx],
+                ) {
+                    crate::turso_assert!(
+                        probe_pos == build_pos + 1,
+                        "hash join build/probe tables are not adjacent in join order"
+                    );
+                }
+                probe_tables.insert(*probe_table_idx);
+                build_tables.insert(*build_table_idx, *materialize_build_input);
+            }
+        }
+
+        for (build_table_idx, materialize_build_input) in build_tables {
+            if probe_tables.contains(&build_table_idx) {
+                crate::turso_assert!(
+                    materialize_build_input,
+                    "probe->build chaining requires materialized build input"
+                );
+            }
+        }
+    }
+    let hash_join_build_only_tables: HashSet<usize> = hash_join_build_tables
+        .iter()
+        .copied()
+        .filter(|table_idx| !hash_join_probe_tables.contains(table_idx))
         .collect();
 
     let best_join_order: Vec<JoinOrderMember> = best_table_numbers
         .iter()
-        .filter(|table_number| !hash_join_build_tables.contains(table_number))
+        .filter(|table_number| {
+            !hash_join_build_tables.contains(table_number)
+                || hash_join_probe_tables.contains(table_number)
+        })
         .map(|&table_number| JoinOrderMember {
             table_id: table_references.joined_tables_mut()[table_number].internal_id,
             original_idx: table_number,
@@ -793,13 +1310,28 @@ fn optimize_table_access(
     // We iterate over ALL tables (including hash join build tables) to set their operations,
     // even though build tables are not in best_join_order.
     for (i, &table_idx) in best_table_numbers.iter().enumerate() {
-        let access_method = &access_methods_arena.borrow()[best_access_methods[i]];
-        match &access_method.params {
+        // Skip tables that already have an IndexMethodQuery operation set.
+        // This happens when the first table was optimized with a custom index (e.g., FTS)
+        // and we're continuing to optimize remaining tables in a multi-table query.
+        if matches!(
+            table_references.joined_tables()[table_idx].op,
+            Operation::IndexMethodQuery(_)
+        ) {
+            continue;
+        }
+        let access_method = &mut access_methods_arena[best_access_methods[i]];
+        match &mut access_method.params {
             AccessMethodParams::BTreeTable {
                 iter_dir,
                 index,
                 constraint_refs,
             } => {
+                maybe_remove_index_candidate(
+                    index,
+                    &table_references.joined_tables()[table_idx],
+                    maybe_order_target.as_ref(),
+                    sort_eliminated,
+                );
                 if constraint_refs.is_empty() {
                     let is_leftmost_table = i == 0;
                     let uses_index = index.is_some();
@@ -840,7 +1372,7 @@ fn optimize_table_access(
                     let join_order_pos = best_join_order
                         .iter()
                         .position(|m| m.original_idx == table_idx)
-                        .unwrap_or(best_join_order.len().saturating_sub(1));
+                        .unwrap_or_else(|| best_join_order.len().saturating_sub(1));
 
                     // Build a mapping from table_col_pos to index_col_pos.
                     // Multiple constraints on the same column should share the same index_col_pos.
@@ -919,6 +1451,10 @@ fn optimize_table_access(
                         .join_info
                         .as_ref()
                         .is_some_and(|join_info| join_info.outer);
+                    // Build-only hash-join tables do not have a main-loop cursor,
+                    // so leave cross-table constraints for probe-side evaluation.
+                    let defer_cross_table_constraints =
+                        hash_join_build_only_tables.contains(&table_idx);
                     for cref in constraint_refs.iter() {
                         for constraint_vec_pos in &[cref.eq, cref.lower_bound, cref.upper_bound] {
                             let Some(constraint_vec_pos) = constraint_vec_pos else {
@@ -939,6 +1475,9 @@ fn optimize_table_access(
                                 // this will cause a null row to be emitted for EVERY row of t1.
                                 // Note: in most cases like this, the LEFT JOIN could just be converted into an INNER JOIN (because e.g. t2.id=5 statically excludes any null rows),
                                 // but that optimization should not be done here - it should be done before the join order optimization happens.
+                                continue;
+                            }
+                            if defer_cross_table_constraints && !constraint.lhs_mask.is_empty() {
                                 continue;
                             }
                             where_term.consumed = true;
@@ -1003,11 +1542,46 @@ fn optimize_table_access(
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::Scan(Scan::Subquery);
             }
+            AccessMethodParams::MaterializedSubquery {
+                index,
+                constraint_refs,
+            } => {
+                // Mark constraints as consumed
+                // RangeConstraintRef.eq contains the position in the constraints array for equality constraints
+                let table_constraints = constraints_per_table
+                    .iter()
+                    .find(|c| c.table_id == table_references.joined_tables()[table_idx].internal_id)
+                    .expect("should have constraints for this table");
+
+                for cref in constraint_refs.iter() {
+                    if let Some(eq_pos) = cref.eq {
+                        let constraint = &table_constraints.constraints[eq_pos];
+                        where_clause[constraint.where_clause_pos.0].consumed = true;
+                    }
+                }
+
+                // Build seek definition from the constraints
+                let seek_def = build_seek_def_from_constraints(
+                    &table_constraints.constraints,
+                    constraint_refs,
+                    IterationDirection::Forwards,
+                    where_clause,
+                    Some(table_references),
+                )?;
+
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::Search(Search::Seek {
+                        index: Some(index.clone()),
+                        seek_def,
+                    });
+            }
             AccessMethodParams::HashJoin {
                 build_table_idx,
                 probe_table_idx,
                 join_keys,
                 mem_budget,
+                materialize_build_input,
+                use_bloom_filter,
             } => {
                 // Mark WHERE clause terms as consumed since we're using hash join
                 for join_key in join_keys.iter() {
@@ -1020,8 +1594,121 @@ fn optimize_table_access(
                         probe_table_idx: *probe_table_idx,
                         join_keys: join_keys.clone(),
                         mem_budget: *mem_budget,
+                        materialize_build_input: *materialize_build_input,
+                        use_bloom_filter: *use_bloom_filter,
                     });
             }
+            AccessMethodParams::IndexMethod {
+                query,
+                where_covered,
+            } => {
+                // Mark WHERE clause term as consumed if the index method covered it
+                if let Some(idx) = where_covered {
+                    where_clause[*idx].consumed = true;
+                }
+                // Set up the index method query operation
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::IndexMethodQuery(query.clone());
+            }
+            AccessMethodParams::MultiIndexScan {
+                branches,
+                where_term_idx,
+                set_op,
+                additional_consumed_terms,
+            } => {
+                // Mark the primary WHERE clause term as consumed
+                where_clause[*where_term_idx].consumed = true;
+                // For intersection, also mark additional consumed terms
+                for term_idx in additional_consumed_terms.iter() {
+                    where_clause[*term_idx].consumed = true;
+                }
+
+                // Build the MultiIndexScanOp from the branch parameters
+                let mut multi_idx_branches: Vec<MultiIndexBranch> = Vec::new();
+                for branch in branches.iter() {
+                    // Build seek_def from constraint_refs using the branch's own constraint
+                    // (not constraints_per_table, since the branch constraint was created separately)
+                    let seek_def = build_seek_def_from_constraints(
+                        &[branch.constraint.clone()],
+                        &branch.constraint_refs,
+                        IterationDirection::Forwards, // Multi-index always scans forward
+                        where_clause,
+                        Some(table_references),
+                    )?;
+                    multi_idx_branches.push(MultiIndexBranch {
+                        index: branch.index.clone(),
+                        seek_def,
+                        estimated_rows: branch.estimated_rows,
+                    });
+                }
+
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::MultiIndexScan(MultiIndexScanOp {
+                        branches: multi_idx_branches,
+                        where_term_idx: *where_term_idx,
+                        set_op: *set_op,
+                        additional_consumed_terms: additional_consumed_terms.clone(),
+                    });
+            }
+        }
+    }
+
+    let mut probe_pos_by_table: Vec<Option<usize>> =
+        vec![None; table_references.joined_tables().len()];
+    for (pos, member) in best_join_order.iter().enumerate() {
+        let table = &table_references.joined_tables()[member.original_idx];
+        if matches!(table.op, Operation::HashJoin(_)) {
+            probe_pos_by_table[member.original_idx] = Some(pos);
+        }
+    }
+
+    // If hash-join build constraints are still evaluated later (not consumed),
+    // avoid materializing the build input to reduce redundant scans.
+    for table in table_references.joined_tables_mut().iter_mut() {
+        let Operation::HashJoin(hash_join_op) = &mut table.op else {
+            continue;
+        };
+        if !hash_join_op.materialize_build_input {
+            continue;
+        }
+        let Some(probe_pos) = best_join_order
+            .iter()
+            .position(|member| member.original_idx == hash_join_op.probe_table_idx)
+        else {
+            continue;
+        };
+        let build_table_was_prior_probe = probe_pos_by_table
+            .get(hash_join_op.build_table_idx)
+            .copied()
+            .flatten()
+            .is_some_and(|pos| pos < probe_pos);
+        if build_table_was_prior_probe {
+            continue;
+        }
+        let prior_mask = TableMask::from_table_number_iter(
+            best_join_order[..probe_pos]
+                .iter()
+                .map(|member| member.original_idx),
+        );
+        let join_key_indices: HashSet<usize> = hash_join_op
+            .join_keys
+            .iter()
+            .map(|key| key.where_clause_idx)
+            .collect();
+        let build_constraints = &constraints_per_table[hash_join_op.build_table_idx];
+        let mut has_prior_constraints = false;
+        for constraint in build_constraints.constraints.iter() {
+            if !constraint.lhs_mask.intersects(&prior_mask) {
+                continue;
+            }
+            if join_key_indices.contains(&constraint.where_clause_pos.0) {
+                continue;
+            }
+            has_prior_constraints = true;
+            break;
+        }
+        if !has_prior_constraints {
+            hash_join_op.materialize_build_input = false;
         }
     }
 
@@ -1138,6 +1825,52 @@ fn eliminate_constant_conditions(
     Ok(ConstantConditionEliminationResult::Continue)
 }
 
+/// Check if the order by collation matches the index columns collations.
+/// Only remove the index if sort was eliminated.
+fn maybe_remove_index_candidate(
+    index: &mut Option<Arc<Index>>,
+    table_reference: &JoinedTable,
+    order_target: Option<&OrderTarget>,
+    sort_eliminated: bool,
+) {
+    if !sort_eliminated {
+        return;
+    }
+    if let Some((idx, order_target)) = index.as_mut().zip(order_target) {
+        for col_order in &order_target.0 {
+            // Only check columns from this table
+            if col_order.table_id != table_reference.internal_id {
+                continue;
+            }
+
+            // Find matching index column
+            let matching_idx_col = match &col_order.target {
+                ColumnTarget::Column(col_no) => {
+                    idx.columns.iter().find(|ic| ic.pos_in_table == *col_no)
+                }
+                ColumnTarget::RowId => {
+                    continue;
+                }
+                ColumnTarget::Expr(_expr) => {
+                    continue;
+                }
+            };
+
+            if let Some(idx_col) = matching_idx_col {
+                let idx_collation = idx_col.collation;
+
+                // If ORDER BY collation doesn't match index collation, this index can't satisfy the ordering
+                if idx_collation.is_some_and(|idx_collation| col_order.collation != idx_collation)
+                    && sort_eliminated
+                {
+                    *index = None;
+                    return;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlwaysTrueOrFalse {
     AlwaysTrue,
@@ -1215,11 +1948,14 @@ impl Optimizable for ast::Expr {
                     .expect("table not found");
                 let columns = table_ref.columns();
                 let column = &columns[*column];
-                column.primary_key() || column.notnull()
+                // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
+                // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
+                column.is_rowid_alias() || column.notnull()
             }
             Expr::RowId { .. } => true,
             Expr::InList { lhs, rhs, .. } => {
-                lhs.is_nonnull(tables) && rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables))
+                lhs.is_nonnull(tables)
+                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables)))
             }
             Expr::InSelect { .. } => false,
             Expr::InTable { .. } => false,
@@ -1231,6 +1967,8 @@ impl Optimizable for ast::Expr {
                 ast::Literal::Blob(_) => true,
                 ast::Literal::Keyword(_) => true,
                 ast::Literal::Null => false,
+                ast::Literal::True => true,
+                ast::Literal::False => true,
                 ast::Literal::CurrentDate => true,
                 ast::Literal::CurrentTime => true,
                 ast::Literal::CurrentTimestamp => true,
@@ -1277,9 +2015,10 @@ impl Optimizable for ast::Expr {
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
             Expr::Collate(expr, _) => expr.is_constant(resolver),
-            Expr::DoublyQualified(_, _, _) => {
-                panic!("DoublyQualified should have been rewritten as Column")
-            }
+            // Not constant. Normally rewritten to Expr::Column by the optimizer,
+            // but CHECK constraints bypass the rewrite pass and legitimately
+            // contain DoublyQualified nodes.
+            Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
             Expr::FunctionCall { args, name, .. } => {
                 let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
@@ -1292,8 +2031,8 @@ impl Optimizable for ast::Expr {
             Expr::Column { .. } => false,
             Expr::RowId { .. } => false,
             Expr::InList { lhs, rhs, .. } => {
-                lhs.is_constant(resolver) && rhs.is_empty()
-                    || rhs.iter().all(|v| v.is_constant(resolver))
+                lhs.is_constant(resolver)
+                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_constant(resolver)))
             }
             Expr::InSelect { .. } => {
                 false // might be constant, too annoying to check subqueries etc. implement later
@@ -1313,9 +2052,10 @@ impl Optimizable for ast::Expr {
             Expr::Name(_) => false,
             Expr::NotNull(expr) => expr.is_constant(resolver),
             Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
-            Expr::Qualified(_, _) => {
-                panic!("Qualified should have been rewritten as Column")
-            }
+            // Not constant. Normally rewritten to Expr::Column by the optimizer,
+            // but CHECK constraints bypass the rewrite pass and legitimately
+            // contain Qualified nodes.
+            Expr::Qualified(_, _) => false,
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
@@ -1346,24 +2086,14 @@ impl Optimizable for ast::Expr {
                     Ok(None)
                 }
                 ast::Literal::String(s) => {
+                    // Use Numeric::from to match SQLite's string-to-numeric conversion,
+                    // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0)
                     let without_quotes = s.trim_matches('\'');
-                    if let Ok(int_value) = without_quotes.parse::<i64>() {
-                        return Ok(Some(if int_value == 0 {
-                            AlwaysTrueOrFalse::AlwaysFalse
-                        } else {
-                            AlwaysTrueOrFalse::AlwaysTrue
-                        }));
+                    let numeric = Numeric::from(without_quotes);
+                    match numeric.to_bool() {
+                        true => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
+                        false => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),
                     }
-
-                    if let Ok(float_value) = without_quotes.parse::<f64>() {
-                        return Ok(Some(if float_value == 0.0 {
-                            AlwaysTrueOrFalse::AlwaysFalse
-                        } else {
-                            AlwaysTrueOrFalse::AlwaysTrue
-                        }));
-                    }
-
-                    Ok(Some(AlwaysTrueOrFalse::AlwaysFalse))
                 }
                 _ => Ok(None),
             },
@@ -1831,5 +2561,80 @@ pub trait TakeOwnership {
 impl TakeOwnership for ast::Expr {
     fn take_ownership(&mut self) -> Self {
         std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Optimizable;
+    use crate::translate::emitter::Resolver;
+    use crate::{schema::Schema, SymbolTable};
+    use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
+
+    fn empty_resolver<'a>(schema: &'a Schema, syms: &'a SymbolTable) -> Resolver<'a> {
+        Resolver::new(schema, syms)
+    }
+
+    fn no_tail() -> FunctionTail {
+        FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        }
+    }
+
+    fn fn_call(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::FunctionCall {
+            name: Name::exact(name.to_string()),
+            distinctness: None,
+            args: args.into_iter().map(Box::new).collect(),
+            order_by: vec![],
+            filter_over: no_tail(),
+        }
+    }
+
+    #[test]
+    fn constant_classifier_for_coalesce_with_in_list() {
+        let schema = Schema::new();
+        let syms = SymbolTable::new();
+        let resolver = empty_resolver(&schema, &syms);
+
+        let expr = fn_call(
+            "coalesce",
+            vec![
+                fn_call(
+                    "length",
+                    vec![Expr::Literal(ast::Literal::String("a".into()))],
+                ),
+                Expr::InList {
+                    lhs: Box::new(fn_call(
+                        "hex",
+                        vec![Expr::Literal(ast::Literal::Blob("01".into()))],
+                    )),
+                    not: false,
+                    rhs: vec![Box::new(Expr::Literal(ast::Literal::Blob("02".into())))],
+                },
+            ],
+        );
+
+        assert!(expr.is_constant(&resolver));
+    }
+
+    #[test]
+    fn constant_classifier_for_quote_of_column() {
+        let schema = Schema::new();
+        let syms = SymbolTable::new();
+        let resolver = empty_resolver(&schema, &syms);
+
+        let expr = fn_call(
+            "quote",
+            vec![Expr::Column {
+                database: None,
+                table: TableInternalId::default(),
+                column: 0,
+                is_rowid_alias: false,
+            }],
+        );
+
+        assert!(!expr.is_constant(&resolver));
     }
 }

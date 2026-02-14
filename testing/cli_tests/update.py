@@ -14,7 +14,7 @@ class UpdateTest(BaseModel):
     blob_size: int = 1024
     vals: int = 1000
     updates: int = 1
-    db_path: str = "testing/update.db"
+    db_path: str = "testing/system/update.db"
 
     def init_db(self):
         with TestTursoShell(

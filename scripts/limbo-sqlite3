@@ -7,11 +7,11 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 TURSODB="$PROJECT_ROOT/target/debug/tursodb"
 
 # Add experimental features for testing
-EXPERIMENTAL_FLAGS="--experimental-views --experimental-strict"
+EXPERIMENTAL_FLAGS="--experimental-views --experimental-strict --experimental-triggers --experimental-attach"
 
 # if RUST_LOG is non-empty, enable tracing output
 if [ -n "$RUST_LOG" ]; then
-   TESTING="true" "$TURSODB" -m list -q $EXPERIMENTAL_FLAGS -t testing/test.log "$@"
+   TESTING="true" "$TURSODB" -m list -q $EXPERIMENTAL_FLAGS -t testing/system/test.log "$@"
 else
    TESTING="true" "$TURSODB" -m list -q $EXPERIMENTAL_FLAGS "$@"
 fi

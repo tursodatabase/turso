@@ -1,0 +1,125 @@
+@database :memory:
+
+test values-1 {
+    values(1, 2);
+}
+expect {
+    1|2
+}
+
+test values-2 {
+    values(1, 2), (3, 4);
+}
+expect {
+    1|2
+    3|4
+}
+
+test values-3 {
+    values(1+1, 2*3);
+}
+expect {
+    2|6
+}
+
+test values-in-from {
+    select * from (values(3, 4, 5), (5, 6, 7), (8, 9, 10));
+}
+expect {
+    3|4|5
+    5|6|7
+    8|9|10
+}
+
+test values-in-join {
+    select * from (values(1, 2)) join (values(3, 4), (5, 6));
+}
+expect {
+    1|2|3|4
+    1|2|5|6
+}
+
+setup dqs_dml {
+    .dbconfig dqs_dml on
+}
+
+@backend cli
+@setup dqs_dml
+test values-double-quotes-simple {
+    VALUES ("double_quoted_string");
+}
+expect {
+    double_quoted_string
+}
+
+@backend cli
+@setup dqs_dml
+test values-double-quotes-multiple {
+    VALUES ("first", "second"), ("third", "fourth");
+}
+expect {
+    first|second
+    third|fourth
+}
+
+@backend cli
+@setup dqs_dml
+test values-mixed-quotes {
+    VALUES ("double", 'single'), ('single', "double");
+}
+expect {
+    double|single
+    single|double
+}
+
+@backend cli
+@setup dqs_dml
+test values-double-quotes-subquery {
+    SELECT * FROM (VALUES ("subquery_string"));
+}
+expect {
+    subquery_string
+}
+
+# regression test for: https://github.com/tursodatabase/turso/issues/2158
+test values-between {
+    CREATE TABLE t0 (c0);
+    INSERT INTO t0 VALUES ((0 BETWEEN 0 AND 0)), (0);
+    SELECT * FROM t0;
+}
+expect {
+    1
+    0
+}
+
+test values-illegal-column-ref {
+    CREATE TABLE t0 (c0);
+    INSERT INTO t0 VALUES (c0);
+}
+expect error {
+}
+
+# Unquoted identifiers in VALUES should produce a parse error
+test values-unquoted-identifier-single {
+    values(asdf);
+}
+expect error {
+}
+
+test values-unquoted-identifier-mixed {
+    values(1, asdf);
+}
+expect error {
+}
+
+# Also verify correlated VALUES references outer columns row-by-row
+test values-correlated-values-in-select {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO users (name) VALUES ('jack'), ('jill');
+    SELECT id, (VALUES(name)) AS name_again FROM users;
+}
+expect {
+    1|jack
+    2|jill
+}
+

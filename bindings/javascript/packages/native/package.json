@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/database",
-  "version": "0.4.0-pre.14",
+  "version": "0.5.0-pre.11",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -29,7 +29,7 @@
     "vitest": "^3.2.4"
   },
   "scripts": {
-    "napi-build": "napi build --platform --release --esm --manifest-path ../../Cargo.toml --output-dir .",
+    "napi-build": "napi build --platform --profile release-official --esm --manifest-path ../../Cargo.toml --output-dir .",
     "napi-dirs": "napi create-npm-dirs",
     "napi-artifacts": "napi artifacts --output-dir .",
     "tsc-build": "npm exec tsc",
@@ -47,7 +47,7 @@
     ]
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.4.0-pre.14"
+    "@tursodatabase/database-common": "^0.5.0-pre.11"
   },
   "imports": {
     "#index": "./index.js"

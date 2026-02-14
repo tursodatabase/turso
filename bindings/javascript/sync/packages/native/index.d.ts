@@ -231,17 +231,18 @@ export type JsPartialBootstrapStrategy =
 export interface JsPartialSyncOpts {
   bootstrapStrategy: JsPartialBootstrapStrategy
   segmentSize?: number
-  speculativeLoad?: boolean
+  prefetch?: boolean
 }
 
 export type JsProtocolRequest =
-  | { type: 'Http', method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }
+  | { type: 'Http', url?: string, method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }
   | { type: 'FullRead', path: string }
   | { type: 'FullWrite', path: string, content: Array<number> }
   | { type: 'Transform', mutations: Array<DatabaseRowMutationJs> }
 
 export interface SyncEngineOpts {
   path: string
+  remoteUrl?: string
   clientName?: string
   walPullBatchSize?: number
   longPollTimeoutMs?: number

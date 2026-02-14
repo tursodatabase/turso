@@ -36,14 +36,16 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod connection;
 pub mod params;
 mod rows;
 pub mod transaction;
 pub mod value;
 
-use transaction::TransactionBehavior;
-#[cfg(feature = "conn_raw_api")]
-use turso_core::types::WalFrameInfo;
+#[cfg(feature = "sync")]
+pub mod sync;
+
+pub use connection::Connection;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -51,51 +53,95 @@ pub use params::IntoParams;
 
 use std::fmt::Debug;
 use std::future::Future;
-use std::num::NonZero;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::task::Poll;
-pub use turso_core::EncryptionOpts;
-use turso_core::OpenFlags;
 
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
-use crate::transaction::DropBehavior;
+
+/// Assert that a type implements both Send and Sync at compile time.
+/// Usage: assert_send_sync!(MyType);
+/// Usage: assert_send_sync!(Type1, Type2, Type3);
+macro_rules! assert_send_sync {
+    ($($t:ty),+ $(,)?) => {
+        #[cfg(test)]
+        $(const _: () = {
+            const fn _assert_send<T: ?Sized + Send>() {}
+            const fn _assert_sync<T: ?Sized + Sync>() {}
+            _assert_send::<$t>();
+            _assert_sync::<$t>();
+        };)+
+    };
+}
+
+pub(crate) use assert_send_sync;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("SQL conversion failure: `{0}`")]
     ToSqlConversionFailure(BoxError),
-    #[error("Mutex lock error: {0}")]
-    MutexError(String),
-    #[error("SQL execution failure: `{0}`")]
-    SqlExecutionFailure(String),
-    #[error("WAL operation error: `{0}`")]
-    WalOperationError(String),
     #[error("Query returned no rows")]
     QueryReturnedNoRows,
     #[error("Conversion failure: `{0}`")]
     ConversionFailure(String),
+    #[error("{0}")]
+    Busy(String),
+    #[error("{0}")]
+    BusySnapshot(String),
+    #[error("{0}")]
+    Interrupt(String),
+    #[error("{0}")]
+    Error(String),
+    #[error("{0}")]
+    Misuse(String),
+    #[error("{0}")]
+    Constraint(String),
+    #[error("{0}")]
+    Readonly(String),
+    #[error("{0}")]
+    DatabaseFull(String),
+    #[error("{0}")]
+    NotAdb(String),
+    #[error("{0}")]
+    Corrupt(String),
+    #[error("I/O error: {0}")]
+    IoError(std::io::ErrorKind),
 }
 
-impl From<turso_core::LimboError> for Error {
-    fn from(err: turso_core::LimboError) -> Self {
-        Error::SqlExecutionFailure(err.to_string())
+impl From<turso_sdk_kit::rsapi::TursoError> for Error {
+    fn from(value: turso_sdk_kit::rsapi::TursoError) -> Self {
+        match value {
+            turso_sdk_kit::rsapi::TursoError::Busy(err) => Error::Busy(err),
+            turso_sdk_kit::rsapi::TursoError::BusySnapshot(err) => Error::BusySnapshot(err),
+            turso_sdk_kit::rsapi::TursoError::Interrupt(err) => Error::Interrupt(err),
+            turso_sdk_kit::rsapi::TursoError::Error(err) => Error::Error(err),
+            turso_sdk_kit::rsapi::TursoError::Misuse(err) => Error::Misuse(err),
+            turso_sdk_kit::rsapi::TursoError::Constraint(err) => Error::Constraint(err),
+            turso_sdk_kit::rsapi::TursoError::Readonly(err) => Error::Readonly(err),
+            turso_sdk_kit::rsapi::TursoError::DatabaseFull(err) => Error::DatabaseFull(err),
+            turso_sdk_kit::rsapi::TursoError::NotAdb(err) => Error::NotAdb(err),
+            turso_sdk_kit::rsapi::TursoError::Corrupt(err) => Error::Corrupt(err),
+            turso_sdk_kit::rsapi::TursoError::IoError(kind) => Error::IoError(kind),
+        }
     }
 }
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
 
 /// A builder for `Database`.
 pub struct Builder {
     path: String,
-    enable_mvcc: bool,
     enable_encryption: bool,
+    enable_triggers: bool,
+    enable_attach: bool,
+    enable_strict: bool,
+    enable_index_method: bool,
     vfs: Option<String>,
-    encryption_opts: Option<EncryptionOpts>,
+    encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
 }
 
 impl Builder {
@@ -103,16 +149,14 @@ impl Builder {
     pub fn new_local(path: &str) -> Self {
         Self {
             path: path.to_string(),
-            enable_mvcc: false,
             enable_encryption: false,
+            enable_triggers: false,
+            enable_attach: false,
+            enable_strict: false,
+            enable_index_method: false,
             vfs: None,
             encryption_opts: None,
         }
-    }
-
-    pub fn with_mvcc(mut self, mvcc_enabled: bool) -> Self {
-        self.enable_mvcc = mvcc_enabled;
-        self
     }
 
     pub fn experimental_encryption(mut self, encryption_enabled: bool) -> Self {
@@ -120,8 +164,28 @@ impl Builder {
         self
     }
 
-    pub fn with_encryption(mut self, opts: EncryptionOpts) -> Self {
+    pub fn with_encryption(mut self, opts: turso_sdk_kit::rsapi::EncryptionOpts) -> Self {
         self.encryption_opts = Some(opts);
+        self
+    }
+
+    pub fn experimental_triggers(mut self, triggers_enabled: bool) -> Self {
+        self.enable_triggers = triggers_enabled;
+        self
+    }
+
+    pub fn experimental_attach(mut self, attach_enabled: bool) -> Self {
+        self.enable_attach = attach_enabled;
+        self
+    }
+
+    pub fn experimental_strict(mut self, strict_enabled: bool) -> Self {
+        self.enable_strict = strict_enabled;
+        self
+    }
+
+    pub fn experimental_index_method(mut self, index_method_enabled: bool) -> Self {
+        self.enable_index_method = index_method_enabled;
         self
     }
 
@@ -129,74 +193,47 @@ impl Builder {
         self.vfs = Some(vfs);
         self
     }
+    fn build_features_string(&self) -> Option<String> {
+        let mut features = Vec::new();
+        if self.enable_encryption {
+            features.push("encryption");
+        }
+        if self.enable_triggers {
+            features.push("triggers");
+        }
+        if self.enable_attach {
+            features.push("attach");
+        }
+        if self.enable_strict {
+            features.push("strict");
+        }
+        if self.enable_index_method {
+            features.push("index_method");
+        }
+        if features.is_empty() {
+            return None;
+        }
+        Some(features.join(","))
+    }
 
     /// Build the database.
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
-        let io = self.get_io()?;
-        let opts = turso_core::DatabaseOpts::default()
-            .with_mvcc(self.enable_mvcc)
-            .with_encryption(self.enable_encryption);
-        let db = turso_core::Database::open_file_with_flags(
-            io,
-            self.path.as_str(),
-            OpenFlags::default(),
-            opts,
-            self.encryption_opts.clone(),
-        )?;
+        let features = self.build_features_string();
+        let db =
+            turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
+                path: self.path,
+                experimental_features: features,
+                async_io: false,
+                encryption: self.encryption_opts,
+                vfs: self.vfs,
+                io: None,
+                db_file: None,
+            });
+        let result = db.open()?;
+        // async_io is false - so db.open() will return result immediately
+        assert!(!result.is_io());
         Ok(Database { inner: db })
-    }
-
-    fn get_io(&self) -> Result<Arc<dyn turso_core::IO>> {
-        let vfs_choice = self.vfs.as_deref().unwrap_or("");
-
-        if self.path == ":memory:" && vfs_choice.is_empty() {
-            return Ok(Arc::new(turso_core::MemoryIO::new()));
-        }
-
-        match vfs_choice {
-            "memory" => Ok(Arc::new(turso_core::MemoryIO::new())),
-            "syscall" => {
-                #[cfg(all(target_family = "unix", not(miri)))]
-                {
-                    Ok(Arc::new(
-                        turso_core::UnixIO::new()
-                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
-                    ))
-                }
-                #[cfg(any(not(target_family = "unix"), miri))]
-                {
-                    Ok(Arc::new(
-                        turso_core::PlatformIO::new()
-                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
-                    ))
-                }
-            }
-            #[cfg(all(target_os = "linux", not(miri)))]
-            "io_uring" => Ok(Arc::new(
-                turso_core::UringIO::new()
-                    .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
-            )),
-            #[cfg(any(not(target_os = "linux"), miri))]
-            "io_uring" => Err(Error::SqlExecutionFailure(
-                "io_uring is only available on Linux targets".to_string(),
-            )),
-            "" => {
-                // Default behavior: memory for ":memory:", platform IO for files
-                if self.path == ":memory:" {
-                    Ok(Arc::new(turso_core::MemoryIO::new()))
-                } else {
-                    Ok(Arc::new(
-                        turso_core::PlatformIO::new()
-                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
-                    ))
-                }
-            }
-            _ => Ok(Arc::new(
-                turso_core::PlatformIO::new()
-                    .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
-            )),
-        }
     }
 }
 
@@ -205,11 +242,8 @@ impl Builder {
 /// The `Database` object points to a database and allows you to connect to it
 #[derive(Clone)]
 pub struct Database {
-    inner: Arc<turso_core::Database>,
+    inner: Arc<turso_sdk_kit::rsapi::TursoDatabase>,
 }
-
-unsafe impl Send for Database {}
-unsafe impl Sync for Database {}
 
 impl Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -221,323 +255,22 @@ impl Database {
     /// Connect to the database.
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
-        Ok(Connection::create(conn))
-    }
-}
-
-/// Atomic wrapper for [DropBehavior]
-struct AtomicDropBehavior {
-    inner: AtomicU8,
-}
-
-impl AtomicDropBehavior {
-    fn new(behavior: DropBehavior) -> Self {
-        Self {
-            inner: AtomicU8::new(behavior.into()),
-        }
-    }
-
-    fn load(&self, ordering: Ordering) -> DropBehavior {
-        self.inner.load(ordering).into()
-    }
-
-    fn store(&self, behavior: DropBehavior, ordering: Ordering) {
-        self.inner.store(behavior.into(), ordering);
-    }
-}
-
-/// A database connection.
-pub struct Connection {
-    inner: Arc<Mutex<Arc<turso_core::Connection>>>,
-    transaction_behavior: TransactionBehavior,
-    /// If there is a dangling transaction after it was dropped without being finished,
-    /// [Connection::dangling_tx] will be set to the [DropBehavior] of the dangling transaction,
-    /// and the corresponding action will be taken when a new transaction is requested
-    /// or the connection queries/executes.
-    /// We cannot do this eagerly on Drop because drop is not async.
-    ///
-    /// By default, the value is [DropBehavior::Ignore] which effectively does nothing.
-    dangling_tx: AtomicDropBehavior,
-}
-
-impl Clone for Connection {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-            transaction_behavior: self.transaction_behavior,
-            dangling_tx: AtomicDropBehavior::new(self.dangling_tx.load(Ordering::SeqCst)),
-        }
-    }
-}
-
-unsafe impl Send for Connection {}
-unsafe impl Sync for Connection {}
-
-impl Connection {
-    pub fn create(conn: Arc<turso_core::Connection>) -> Self {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let connection = Connection {
-            inner: Arc::new(Mutex::new(conn)),
-            transaction_behavior: TransactionBehavior::Deferred,
-            dangling_tx: AtomicDropBehavior::new(DropBehavior::Ignore),
-        };
-        connection
-    }
-
-    async fn maybe_handle_dangling_tx(&self) -> Result<()> {
-        match self.dangling_tx.load(Ordering::SeqCst) {
-            DropBehavior::Rollback => {
-                let mut stmt = self.prepare("ROLLBACK").await?;
-                stmt.execute(()).await?;
-                self.dangling_tx
-                    .store(DropBehavior::Ignore, Ordering::SeqCst);
-            }
-            DropBehavior::Commit => {
-                let mut stmt = self.prepare("COMMIT").await?;
-                stmt.execute(()).await?;
-                self.dangling_tx
-                    .store(DropBehavior::Ignore, Ordering::SeqCst);
-            }
-            DropBehavior::Ignore => {}
-            DropBehavior::Panic => {
-                panic!("Transaction dropped unexpectedly.");
-            }
-        }
-        Ok(())
-    }
-
-    /// Query the database with SQL.
-    pub async fn query(&self, sql: &str, params: impl IntoParams) -> Result<Rows> {
-        self.maybe_handle_dangling_tx().await?;
-        let mut stmt = self.prepare(sql).await?;
-        stmt.query(params).await
-    }
-
-    /// Execute SQL statement on the database.
-    pub async fn execute(&self, sql: &str, params: impl IntoParams) -> Result<u64> {
-        self.maybe_handle_dangling_tx().await?;
-        let mut stmt = self.prepare(sql).await?;
-        stmt.execute(params).await
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_frame_count(&self) -> Result<u64> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_state()
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
-            .map(|state| state.max_frame)
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn try_wal_watermark_read_page(
-        &self,
-        page_idx: u32,
-        page: &mut [u8],
-        frame_watermark: Option<u64>,
-    ) -> Result<bool> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.try_wal_watermark_read_page(page_idx, page, frame_watermark)
-            .map_err(|e| {
-                Error::WalOperationError(format!("try_wal_watermark_read_page failed: {e}"))
-            })
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_changed_pages_after(frame_watermark)
-            .map_err(|e| Error::WalOperationError(format!("wal_changed_pages_after failed: {e}")))
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_insert_begin(&self) -> Result<()> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_insert_begin()
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_insert_end(&self, force_commit: bool) -> Result<()> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_insert_end(force_commit)
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_end failed: {e}")))
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_insert_frame(frame_no, frame)
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_frame failed: {e}")))
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_get_frame(frame_no, frame)
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_frame failed: {e}")))
-    }
-
-    /// Execute a batch of SQL statements on the database.
-    pub async fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.maybe_handle_dangling_tx().await?;
-        self.prepare_execute_batch(sql).await?;
-        Ok(())
-    }
-
-    /// Prepare a SQL statement for later execution.
-    pub async fn prepare(&self, sql: &str) -> Result<Statement> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-
-        let stmt = conn.prepare(sql)?;
-
-        #[allow(clippy::arc_with_non_send_sync)]
-        let statement = Statement {
-            inner: Arc::new(Mutex::new(stmt)),
-        };
-        Ok(statement)
-    }
-
-    async fn prepare_execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
-        self.maybe_handle_dangling_tx().await?;
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.prepare_execute_batch(sql)?;
-        Ok(())
-    }
-
-    /// Query a pragma.
-    pub fn pragma_query<F>(&self, pragma_name: &str, mut f: F) -> Result<()>
-    where
-        F: FnMut(&Row) -> turso_core::Result<()>,
-    {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-
-        let rows: Vec<Row> = conn
-            .pragma_query(pragma_name)
-            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?
-            .iter()
-            .map(|row| row.iter().collect::<Row>())
-            .collect();
-
-        rows.iter().try_for_each(|row| {
-            f(row).map_err(|e| {
-                Error::SqlExecutionFailure(format!("Error executing user defined function: {e}"))
-            })
-        })?;
-        Ok(())
-    }
-
-    /// Returns the rowid of the last row inserted.
-    pub fn last_insert_rowid(&self) -> i64 {
-        let conn = self.inner.lock().unwrap();
-        conn.last_insert_rowid()
-    }
-
-    /// Flush dirty pages to disk.
-    /// This will write the dirty pages to the WAL.
-    pub fn cacheflush(&self) -> Result<()> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        let completions = conn.cacheflush()?;
-        let pager = conn.get_pager();
-        for c in completions {
-            pager.io.wait_for_completion(c)?;
-        }
-        Ok(())
-    }
-
-    pub fn is_autocommit(&self) -> Result<bool> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-
-        Ok(conn.get_auto_commit())
-    }
-
-    /// Sets maximum total accumuated timeout. If the duration is None or Zero, we unset the busy handler for this Connection
-    ///
-    /// This api defers slighty from: https://www.sqlite.org/c3ref/busy_timeout.html
-    ///
-    /// Instead of sleeping for linear amount of time specified by the user,
-    /// we will sleep in phases, until the the total amount of time is reached.
-    /// This means we first sleep of 1ms, then if we still return busy, we sleep for 2 ms, and repeat until a maximum of 100 ms per phase.
-    ///
-    /// Example:
-    /// 1. Set duration to 5ms
-    /// 2. Step through query -> returns Busy -> sleep/yield for 1 ms
-    /// 3. Step through query -> returns Busy -> sleep/yield for 2 ms
-    /// 4. Step through query -> returns Busy -> sleep/yield for 2 ms (totaling 5 ms of sleep)
-    /// 5. Step through query -> returns Busy -> return Busy to user
-    pub fn busy_timeout(&self, duration: std::time::Duration) -> Result<()> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.set_busy_timeout(duration);
-        Ok(())
-    }
-}
-
-impl Debug for Connection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Connection").finish()
+        Ok(Connection::create(conn, None))
     }
 }
 
 /// A prepared statement.
+#[derive(Clone)]
 pub struct Statement {
-    inner: Arc<Mutex<turso_core::Statement>>,
+    conn: Connection,
+    inner: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
 }
-
-impl Clone for Statement {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-unsafe impl Send for Statement {}
-unsafe impl Sync for Statement {}
 
 struct Execute {
-    stmt: Arc<Mutex<turso_core::Statement>>,
+    stmt: Statement,
 }
 
-unsafe impl Send for Execute {}
-unsafe impl Sync for Execute {}
+assert_send_sync!(Execute);
 
 impl Future for Execute {
     type Output = Result<u64>;
@@ -546,52 +279,69 @@ impl Future for Execute {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let mut stmt = self.stmt.lock().unwrap();
-        match stmt.step_with_waker(cx.waker()) {
-            Ok(turso_core::StepResult::Row) => Poll::Ready(Err(Error::SqlExecutionFailure(
-                "unexpected row during execution".to_string(),
-            ))),
-            Ok(turso_core::StepResult::Done) => {
-                let changes = stmt.n_change();
-                assert!(changes >= 0);
-                Poll::Ready(Ok(changes as u64))
+        match self.stmt.step(None, cx)? {
+            Poll::Ready(_) => {
+                let n_change = self.stmt.inner.lock().unwrap().n_change();
+                Poll::Ready(Ok(n_change as u64))
             }
-            Ok(turso_core::StepResult::IO) => {
-                stmt.run_once()?;
-                Poll::Pending
-            }
-            Ok(turso_core::StepResult::Busy) => Poll::Ready(Err(Error::SqlExecutionFailure(
-                "database is locked".to_string(),
-            ))),
-            Ok(turso_core::StepResult::Interrupt) => {
-                Poll::Ready(Err(Error::SqlExecutionFailure("interrupted".to_string())))
-            }
-            Err(err) => Poll::Ready(Err(err.into())),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl Statement {
+    fn step(
+        &self,
+        columns: Option<usize>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Option<Row>>> {
+        let mut stmt = self.inner.lock().unwrap();
+        match stmt.step(Some(cx.waker()))? {
+            turso_sdk_kit::rsapi::TursoStatusCode::Row => {
+                if let Some(columns) = columns {
+                    let mut values = Vec::with_capacity(columns);
+                    for i in 0..columns {
+                        let value = stmt.row_value(i)?;
+                        values.push(value.to_owned());
+                    }
+                    Poll::Ready(Ok(Some(Row { values })))
+                } else {
+                    Poll::Ready(Err(Error::Misuse(
+                        "unexpected row during execution".to_string(),
+                    )))
+                }
+            }
+            turso_sdk_kit::rsapi::TursoStatusCode::Done => Poll::Ready(Ok(None)),
+            turso_sdk_kit::rsapi::TursoStatusCode::Io => {
+                stmt.run_io()?;
+                if let Some(extra_io) = &self.conn.extra_io {
+                    extra_io(cx.waker().clone())?;
+                }
+                Poll::Pending
+            }
+        }
+    }
     /// Query the database with this prepared statement.
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
+        self.reset()?;
+
+        let mut stmt = self.inner.lock().unwrap();
         let params = params.into_params()?;
         match params {
             params::Params::None => (),
             params::Params::Positional(values) => {
                 for (i, value) in values.into_iter().enumerate() {
-                    let mut stmt = self.inner.lock().unwrap();
-                    stmt.bind_at(NonZero::new(i + 1).unwrap(), value.into());
+                    stmt.bind_positional(i + 1, value.into())?;
                 }
             }
             params::Params::Named(values) => {
                 for (name, value) in values.into_iter() {
-                    let mut stmt = self.inner.lock().unwrap();
-                    let i = stmt.parameters().index(name).unwrap();
-                    stmt.bind_at(i, value.into());
+                    let position = stmt.named_position(name)?;
+                    stmt.bind_positional(position, value.into())?;
                 }
             }
         }
-        let rows = Rows::new(&self.inner);
+        let rows = Rows::new(self.clone());
         Ok(rows)
     }
 
@@ -599,7 +349,7 @@ impl Statement {
     pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
         {
             // Reset the statement before executing
-            self.inner.lock().unwrap().reset();
+            self.inner.lock().unwrap().reset()?;
         }
         let params = params.into_params()?;
         match params {
@@ -607,24 +357,19 @@ impl Statement {
             params::Params::Positional(values) => {
                 for (i, value) in values.into_iter().enumerate() {
                     let mut stmt = self.inner.lock().unwrap();
-                    stmt.bind_at(NonZero::new(i + 1).unwrap(), value.into());
+                    stmt.bind_positional(i + 1, value.into())?;
                 }
             }
             params::Params::Named(values) => {
                 for (name, value) in values.into_iter() {
                     let mut stmt = self.inner.lock().unwrap();
-                    let i = stmt.parameters().index(&name).ok_or(
-                        turso_core::LimboError::InvalidArgument(
-                            format!("Unknown parameter '{name}' for query '{}'. Make sure you're using the correct parameter syntax - named: (:foo), positional: (?, ?)", stmt.get_sql())
-                        ))?;
-                    stmt.bind_at(i, value.into());
+                    let position = stmt.named_position(name)?;
+                    stmt.bind_positional(position, value.into())?;
                 }
             }
         }
 
-        let execute = Execute {
-            stmt: self.inner.clone(),
-        };
+        let execute = Execute { stmt: self.clone() };
         execute.await
     }
 
@@ -632,12 +377,15 @@ impl Statement {
     pub fn columns(&self) -> Vec<Column> {
         let stmt = self.inner.lock().unwrap();
 
-        let n = stmt.num_columns();
+        let n = stmt.column_count();
 
         let mut cols = Vec::with_capacity(n);
 
         for i in 0..n {
-            let name = stmt.get_column_name(i).into_owned();
+            let name = stmt
+                .column_name(i)
+                .expect("column index must be within valid range")
+                .into_owned();
             cols.push(Column {
                 name,
                 decl_type: None, // TODO
@@ -648,9 +396,10 @@ impl Statement {
     }
 
     /// Reset internal statement state after previous execution so it can be reused again
-    pub fn reset(&self) {
+    pub fn reset(&self) -> Result<()> {
         let mut stmt = self.inner.lock().unwrap();
-        stmt.reset();
+        stmt.reset()?;
+        Ok(())
     }
 
     /// Execute a query that returns the first [`Row`].
@@ -822,7 +571,7 @@ mod tests {
 
         match query_result_after_wal_delete {
             Ok(_) => panic!("Query succeeded after WAL deletion and DB reopen, but was expected to fail because the table definition should have been in the WAL."),
-            Err(Error::SqlExecutionFailure(msg)) => {
+            Err(Error::Error(msg)) => {
                 assert!(
                     msg.contains("no such table: test_large_persistence"),
                     "Expected 'test_large_persistence not found' error, but got: {msg}"

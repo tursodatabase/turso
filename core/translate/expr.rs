@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use crate::sync::Arc;
+use crate::translate::optimizer::constraints::ConstraintOperator;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
@@ -6,6 +7,8 @@ use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
@@ -15,7 +18,7 @@ use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
 };
 use crate::translate::optimizer::TakeOwnership;
-use crate::translate::plan::{Operation, ResultSetColumn};
+use crate::translate::plan::{Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
@@ -25,7 +28,7 @@ use crate::vdbe::{
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
-use crate::{turso_assert, Result, Value};
+use crate::{turso_assert, Numeric, Result, Value};
 
 use super::collate::CollationSeq;
 
@@ -218,7 +221,20 @@ macro_rules! expect_arguments_even {
 ///
 /// A "NOT IN" operator is computed by first computing the equivalent IN
 /// operator, then interchanging the TRUE and FALSE results.
-// todo: Check right affinities
+/// Compute the affinity for an IN expression.
+/// For `x IN (y1, y2, ..., yN)`, the affinity is determined by the LHS expression `x`.
+/// This follows SQLite's `exprINAffinity()` function.
+fn in_expr_affinity(lhs: &ast::Expr, referenced_tables: Option<&TableReferences>) -> Affinity {
+    // For parenthesized expressions (vectors), we take the first element's affinity
+    // since scalar IN comparisons only use the first element
+    match lhs {
+        Expr::Parenthesized(exprs) if !exprs.is_empty() => {
+            get_expr_affinity(&exprs[0], referenced_tables)
+        }
+        _ => get_expr_affinity(lhs, referenced_tables),
+    }
+}
+
 #[instrument(skip(program, referenced_tables, resolver), level = Level::DEBUG)]
 fn translate_in_list(
     program: &mut ProgramBuilder,
@@ -237,6 +253,11 @@ fn translate_in_list(
     let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
     let mut check_null_reg = 0;
     let label_ok = program.allocate_label();
+
+    // Compute the affinity for the IN comparison based on the LHS expression
+    // This follows SQLite's exprINAffinity() approach
+    let affinity = in_expr_affinity(lhs, referenced_tables);
+    let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
 
     if condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null {
         check_null_reg = program.alloc_register();
@@ -268,8 +289,7 @@ fn translate_in_list(
                     lhs: lhs_reg,
                     rhs: rhs_reg,
                     target_pc: label_ok,
-                    // Use affinity instead
-                    flags: CmpInsFlags::default(),
+                    flags: cmp_flags,
                     collation: program.curr_collation(),
                 });
             } else {
@@ -278,13 +298,12 @@ fn translate_in_list(
                     target_pc: label_ok,
                 });
             }
-            // sqlite3VdbeChangeP5(v, zAff[0]);
         } else if lhs_reg != rhs_reg {
             program.emit_insn(Insn::Ne {
                 lhs: lhs_reg,
                 rhs: rhs_reg,
                 target_pc: condition_metadata.jump_target_when_false,
-                flags: CmpInsFlags::default(),
+                flags: cmp_flags.jump_if_null(),
                 collation: program.curr_collation(),
             });
         } else {
@@ -415,9 +434,12 @@ pub fn translate_condition_expr(
             )?;
         }
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            // In a binary OR, never jump to the parent 'jump_target_when_false' label on the first condition, because
-            // the second condition CAN also be true. Instead we instruct the child expression to jump to a local
-            // false label.
+            // In a binary OR, never jump to the parent 'jump_target_when_false' or
+            // 'jump_target_when_null' label on the first condition, because the second
+            // condition CAN also be true. Instead we instruct the child expression to
+            // jump to a local false label so the right side of OR gets evaluated.
+            // This is critical for cases like `x IN (NULL, 3) OR b` where the left side
+            // evaluates to NULL — we must still evaluate the right side.
             let jump_target_when_false = program.allocate_label();
             translate_condition_expr(
                 program,
@@ -426,6 +448,7 @@ pub fn translate_condition_expr(
                 ConditionMetadata {
                     jump_if_condition_is_true: true,
                     jump_target_when_false,
+                    jump_target_when_null: jump_target_when_false,
                     ..condition_metadata
                 },
                 resolver,
@@ -438,6 +461,55 @@ pub fn translate_condition_expr(
                 condition_metadata,
                 resolver,
             )?;
+        }
+        // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE in conditions
+        // Delegate to translate_expr which handles these correctly with IsTrue instruction
+        ast::Expr::Binary(_, ast::Operator::Is | ast::Operator::IsNot, e2)
+            if matches!(
+                e2.as_ref(),
+                ast::Expr::Literal(ast::Literal::True) | ast::Expr::Literal(ast::Literal::False)
+            ) =>
+        {
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
+        }
+        // Handle IS NULL/IS NOT NULL in conditions using IsNull/NotNull opcodes.
+        // "a IS NULL" is parsed as Binary(a, Is, Null), but we need to use the IsNull opcode
+        // (not Eq/Ne with null_eq flag) for correct NULL handling in WHERE clauses.
+        ast::Expr::Binary(e1, ast::Operator::Is, e2)
+            if matches!(e2.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+        {
+            let cur_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), e1, cur_reg, resolver)?;
+            if condition_metadata.jump_if_condition_is_true {
+                program.emit_insn(Insn::IsNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_true,
+                });
+            } else {
+                program.emit_insn(Insn::NotNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_false,
+                });
+            }
+        }
+        ast::Expr::Binary(e1, ast::Operator::IsNot, e2)
+            if matches!(e2.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+        {
+            let cur_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), e1, cur_reg, resolver)?;
+            if condition_metadata.jump_if_condition_is_true {
+                program.emit_insn(Insn::NotNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_true,
+                });
+            } else {
+                program.emit_insn(Insn::IsNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_false,
+                });
+            }
         }
         ast::Expr::Binary(e1, op, e2) => {
             let result_reg = program.alloc_register();
@@ -534,13 +606,13 @@ pub fn translate_condition_expr(
         }
         ast::Expr::Parenthesized(exprs) => {
             if exprs.len() == 1 {
-                let _ = translate_condition_expr(
+                translate_condition_expr(
                     program,
                     referenced_tables,
                     &exprs[0],
                     condition_metadata,
                     resolver,
-                );
+                )?;
             } else {
                 crate::bail_parse_error!(
                     "parenthesized conditional should have exactly one expression"
@@ -654,7 +726,15 @@ pub fn translate_expr(
     }
 
     // At the very start we try to satisfy the expression from an expression index
-    if try_emit_expression_index_value(program, referenced_tables, expr, target_register)? {
+    let has_expression_indexes = referenced_tables.is_some_and(|tables| {
+        tables
+            .joined_tables()
+            .iter()
+            .any(|t| !t.expression_index_usages.is_empty())
+    });
+    if has_expression_indexes
+        && try_emit_expression_index_value(program, referenced_tables, expr, target_register)?
+    {
         if let Some(span) = constant_span {
             program.constant_span_end(span);
         }
@@ -678,11 +758,13 @@ pub fn translate_expr(
                     Ok(target_register)
                 }
                 SubqueryType::In { cursor_id } => {
-                    // jump here when we can definitely skip the row
+                    // jump here when we can definitely skip the row (result = 0/false)
                     let label_skip_row = program.allocate_label();
-                    // jump here when we can definitely include the row
+                    // jump here when we can definitely include the row (result = 1/true)
                     let label_include_row = program.allocate_label();
-                    // jump here when we need to make extra null-related checks, because sql null is the greatest thing ever
+                    // jump here when the result should be NULL (unknown)
+                    let label_null_result = program.allocate_label();
+                    // jump here when we need to make extra null-related checks
                     let label_null_rewind = program.allocate_label();
                     let label_null_checks_loop_start = program.allocate_label();
                     let label_null_checks_next = program.allocate_label();
@@ -707,89 +789,131 @@ pub fn translate_expr(
                             resolver,
                         )?;
                         if !lhs_column.is_nonnull(referenced_tables.as_ref().unwrap()) {
+                            // If LHS is NULL, we need to check if ephemeral is empty first.
+                            // - If empty: IN returns FALSE, NOT IN returns TRUE
+                            // - If not empty: result is NULL (unknown)
+                            // Jump to label_null_rewind which does Rewind and handles empty case.
                             program.emit_insn(Insn::IsNull {
                                 reg: lhs_column_regs_start + i,
-                                target_pc: if *not_in {
-                                    label_null_rewind
-                                } else {
-                                    label_skip_row
-                                },
+                                target_pc: label_null_rewind,
                             });
                         }
                     }
+
+                    // Compute and apply affinity for the LHS columns before the index probe.
+                    // This follows SQLite's approach where OP_Affinity is emitted before
+                    // Found/NotFound operations on ephemeral indices for IN subqueries.
+
+                    let affinity = lhs_columns
+                        .iter()
+                        .map(|col| get_expr_affinity(col, referenced_tables));
+
+                    // Only emit Affinity instruction if there's meaningful affinity to apply
+                    // (i.e., not all BLOB/NONE affinity)
+                    if affinity.clone().any(|a| a != Affinity::Blob) {
+                        if let Ok(count) = std::num::NonZeroUsize::try_from(lhs_column_count) {
+                            program.emit_insn(Insn::Affinity {
+                                start_reg: lhs_column_regs_start,
+                                count,
+                                affinities: affinity.clone().map(|a| a.aff_mask()).collect(),
+                            });
+                        }
+                    }
+
+                    // For NOT IN: empty ephemeral or no all-NULL row means TRUE (include)
+                    // For IN: empty ephemeral or no all-NULL row means FALSE (skip)
+                    let label_on_no_null = if *not_in {
+                        label_include_row
+                    } else {
+                        label_skip_row
+                    };
+
                     if *not_in {
-                        // WHERE ... NOT IN (SELECT ...)
-                        // We must skip the row if we find a match.
+                        // NOT IN: skip row if value is found
                         program.emit_insn(Insn::Found {
                             cursor_id: *cursor_id,
                             target_pc: label_skip_row,
                             record_reg: lhs_column_regs_start,
                             num_regs: lhs_column_count,
                         });
-                        // Ok, so Found didn't return a match.
-                        // Because SQL NULL, we need do extra checks to see if we can include the row.
-                        // Consider:
-                        // 1. SELECT * FROM T WHERE 1 NOT IN (SELECT NULL),
-                        // 2. SELECT * FROM T WHERE 1 IN (SELECT NULL) -- or anything else where the subquery evaluates to NULL.
-                        // _Both_ of these queries should return nothing, because... SQL NULL.
-                        // The same goes for e.g. SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, NULL).
-                        // However, it does _NOT_ apply for SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, 1).
-                        // BUT: it DOES apply for SELECT * FROM T WHERE (2,2) NOT IN ((1,1), (NULL, NULL))!!!
-                        // Ergo: if the subquery result has _ANY_ tuples with all NULLs, we need to NOT include the row.
-                        //
-                        // So, if we didn't found a match (and hence, so far, our 'NOT IN' condition still applies),
-                        // we must still rewind the subquery's ephemeral index cursor and go through ALL rows and compare each LHS column (with !=) to the corresponding column in the ephemeral index.
-                        // Comparison instructions have the default behavior that if either operand is NULL, the comparison is completely skipped.
-                        // That means: if we, for ANY row in the ephemeral index, get through all the != comparisons without jumping,
-                        // it means our subquery result has a tuple that is exactly NULL (or (NULL, NULL) etc.),
-                        // in which case we need to NOT include the row.
-                        // If ALL the rows jump at one of the != comparisons, it means our subquery result has no tuples with all NULLs -> we can include the row.
-                        program.preassign_label_to_next_insn(label_null_rewind);
-                        program.emit_insn(Insn::Rewind {
-                            cursor_id: *cursor_id,
-                            pc_if_empty: label_include_row,
-                        });
-                        program.preassign_label_to_next_insn(label_null_checks_loop_start);
-                        let column_check_reg = program.alloc_register();
-                        for i in 0..lhs_column_count {
-                            program.emit_insn(Insn::Column {
-                                cursor_id: *cursor_id,
-                                column: i,
-                                dest: column_check_reg,
-                                default: None,
-                            });
-                            program.emit_insn(Insn::Ne {
-                                lhs: lhs_column_regs_start + i,
-                                rhs: column_check_reg,
-                                target_pc: label_null_checks_next,
-                                flags: CmpInsFlags::default(),
-                                collation: program.curr_collation(),
-                            });
-                        }
-                        program.emit_insn(Insn::Goto {
-                            target_pc: label_skip_row,
-                        });
-                        program.preassign_label_to_next_insn(label_null_checks_next);
-                        program.emit_insn(Insn::Next {
-                            cursor_id: *cursor_id,
-                            pc_if_next: label_null_checks_loop_start,
-                        })
                     } else {
-                        // WHERE ... IN (SELECT ...)
-                        // We can skip the row if we don't find a match
+                        // IN: if value found, include row; otherwise check for NULLs
                         program.emit_insn(Insn::NotFound {
                             cursor_id: *cursor_id,
-                            target_pc: label_skip_row,
+                            target_pc: label_null_rewind,
                             record_reg: lhs_column_regs_start,
                             num_regs: lhs_column_count,
                         });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: label_include_row,
+                        });
                     }
+
+                    // Null checking loop: scan ephemeral for any all-NULL tuples.
+                    // If found, result is NULL (unknown). If not found, result depends on IN vs NOT IN.
+                    program.preassign_label_to_next_insn(label_null_rewind);
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id: *cursor_id,
+                        pc_if_empty: label_on_no_null,
+                    });
+                    program.preassign_label_to_next_insn(label_null_checks_loop_start);
+                    let column_check_reg = program.alloc_register();
+                    for (i, affinity) in affinity.enumerate().take(lhs_column_count) {
+                        program.emit_insn(Insn::Column {
+                            cursor_id: *cursor_id,
+                            column: i,
+                            dest: column_check_reg,
+                            default: None,
+                        });
+                        // Ne with NULL operand does NOT jump (comparison is NULL/unknown)
+                        program.emit_insn(Insn::Ne {
+                            lhs: lhs_column_regs_start + i,
+                            rhs: column_check_reg,
+                            target_pc: label_null_checks_next,
+                            flags: CmpInsFlags::default().with_affinity(affinity),
+                            collation: program.curr_collation(),
+                        });
+                    }
+                    // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_null_result,
+                    });
+                    program.preassign_label_to_next_insn(label_null_checks_next);
+                    program.emit_insn(Insn::Next {
+                        cursor_id: *cursor_id,
+                        pc_if_next: label_null_checks_loop_start,
+                    });
+                    // Loop exhausted without finding all-NULL row
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_on_no_null,
+                    });
+                    // Final result handling:
+                    // label_include_row: result = 1 (TRUE)
+                    // label_skip_row: result = 0 (FALSE)
+                    // label_null_result: result = NULL (unknown)
+                    let label_done = program.allocate_label();
                     program.preassign_label_to_next_insn(label_include_row);
                     program.emit_insn(Insn::Integer {
                         value: 1,
                         dest: target_register,
                     });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_done,
+                    });
                     program.preassign_label_to_next_insn(label_skip_row);
+                    program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: target_register,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_done,
+                    });
+                    program.preassign_label_to_next_insn(label_null_result);
+                    program.emit_insn(Insn::Null {
+                        dest: target_register,
+                        dest_end: None,
+                    });
+                    program.preassign_label_to_next_insn(label_done);
                     Ok(target_register)
                 }
                 SubqueryType::RowValue {
@@ -806,9 +930,39 @@ pub fn translate_expr(
             }
         }
         ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("expression should have been rewritten in optmizer")
+            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
         }
         ast::Expr::Binary(e1, op, e2) => {
+            // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE specially.
+            // These use truth semantics (only non-zero numbers are truthy) rather than equality.
+            if let Some((is_not, is_true_literal)) = match (op, e2.as_ref()) {
+                (ast::Operator::Is, ast::Expr::Literal(ast::Literal::True)) => Some((false, true)),
+                (ast::Operator::Is, ast::Expr::Literal(ast::Literal::False)) => {
+                    Some((false, false))
+                }
+                (ast::Operator::IsNot, ast::Expr::Literal(ast::Literal::True)) => {
+                    Some((true, true))
+                }
+                (ast::Operator::IsNot, ast::Expr::Literal(ast::Literal::False)) => {
+                    Some((true, false))
+                }
+                _ => None,
+            } {
+                let reg = program.alloc_register();
+                translate_expr(program, referenced_tables, e1, reg, resolver)?;
+                // For NULL: IS variants return 0, IS NOT variants return 1
+                // For non-NULL: IS TRUE/IS NOT FALSE return truthy, IS FALSE/IS NOT TRUE return !truthy
+                let null_value = is_not;
+                let invert = is_not == is_true_literal;
+                program.emit_insn(Insn::IsTrue {
+                    reg,
+                    dest: target_register,
+                    null_value,
+                    invert,
+                });
+                return Ok(target_register);
+            }
+
             binary_expr_shared(
                 program,
                 referenced_tables,
@@ -916,9 +1070,12 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Cast { expr, type_name } => {
-            let type_name = type_name.as_ref().unwrap(); // TODO: why is this optional?
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-            let type_affinity = Affinity::affinity(&type_name.name);
+            // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
+            let type_affinity = type_name
+                .as_ref()
+                .map(|t| Affinity::affinity(&t.name))
+                .unwrap_or(Affinity::Numeric);
             program.emit_insn(Insn::Cast {
                 reg: target_register,
                 affinity: type_affinity,
@@ -1284,15 +1441,21 @@ pub fn translate_expr(
                                     srf.to_string()
                                 );
                             };
-                            let mut start_reg = None;
-                            for arg in args.iter() {
-                                let reg = program.alloc_register();
-                                start_reg = Some(start_reg.unwrap_or(reg));
-                                translate_expr(program, referenced_tables, arg, reg, resolver)?;
+                            // Allocate all registers upfront to ensure they're consecutive,
+                            // since translate_expr may allocate internal registers.
+                            let start_reg = program.alloc_registers(args.len());
+                            for (i, arg) in args.iter().enumerate() {
+                                translate_expr(
+                                    program,
+                                    referenced_tables,
+                                    arg,
+                                    start_reg + i,
+                                    resolver,
+                                )?;
                             }
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
-                                start_reg: start_reg.unwrap(),
+                                start_reg,
                                 dest: target_register,
                                 func: func_ctx,
                             });
@@ -1444,9 +1607,7 @@ pub fn translate_expr(
                                 )?;
                             }
                             program.emit_insn(Insn::Function {
-                                // Only constant patterns for LIKE are supported currently, so this
-                                // is always 1
-                                constant_mask: 1,
+                                constant_mask: 0,
                                 start_reg: func_registers,
                                 dest: target_register,
                                 func: func_ctx,
@@ -1603,20 +1764,16 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::UnixEpoch => {
-                            let mut start_reg = 0;
-                            if args.len() > 1 {
-                                crate::bail_parse_error!("epoch function with > 1 arguments. Modifiers are not yet supported.");
-                            }
-                            if args.len() == 1 {
-                                let arg_reg = program.alloc_register();
-                                let _ = translate_expr(
+                            let start_reg = program.alloc_registers(args.len().max(1));
+                            for (i, arg) in args.iter().enumerate() {
+                                // register containing result of each argument expression
+                                translate_expr(
                                     program,
                                     referenced_tables,
-                                    &args[0],
-                                    arg_reg,
+                                    arg,
+                                    start_reg + i,
                                     resolver,
                                 )?;
-                                start_reg = arg_reg;
                             }
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
@@ -1768,7 +1925,10 @@ pub fn translate_expr(
                                 );
                             }
 
+                            // Allocate both registers first to ensure they're consecutive,
+                            // since translate_expr may allocate internal registers.
                             let first_reg = program.alloc_register();
+                            let second_reg = program.alloc_register();
                             translate_expr(
                                 program,
                                 referenced_tables,
@@ -1776,8 +1936,7 @@ pub fn translate_expr(
                                 first_reg,
                                 resolver,
                             )?;
-                            let second_reg = program.alloc_register();
-                            let _ = translate_expr(
+                            translate_expr(
                                 program,
                                 referenced_tables,
                                 &args[1],
@@ -1816,9 +1975,9 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::Replace => {
-                            if !args.len() == 3 {
+                            if args.len() != 3 {
                                 crate::bail_parse_error!(
-                                    "function {}() requires exactly 3 arguments",
+                                    "wrong number of arguments to function {}()",
                                     srf.to_string()
                                 )
                             }
@@ -2096,6 +2255,19 @@ pub fn translate_expr(
                         Ok(target_register)
                     }
                 },
+                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+                Func::Fts(_) => {
+                    // FTS functions are handled via index method pattern matching.
+                    // If we reach here, no index matched, so translate as a regular function call.
+                    translate_function(
+                        program,
+                        args,
+                        referenced_tables,
+                        resolver,
+                        target_register,
+                        func_ctx,
+                    )
+                }
                 Func::AlterTable(_) => unreachable!(),
             }
         }
@@ -2109,13 +2281,10 @@ pub fn translate_expr(
                 crate::bail_parse_error!("unknown function {}", name.as_str());
             }
 
-            let func_ctx = FuncCtx {
-                func: func_type.unwrap(),
-                arg_count: args_count,
-            };
+            let func = func_type.unwrap();
 
             // Check if this function supports the (*) syntax by verifying it can be called with 0 args
-            match &func_ctx.func {
+            match &func {
                 Func::Agg(_) => {
                     crate::bail_parse_error!(
                         "misuse of {} function {}(*)",
@@ -2125,6 +2294,74 @@ pub fn translate_expr(
                             "aggregate"
                         },
                         name.as_str()
+                    )
+                }
+                // For functions that need star expansion (json_object, jsonb_object),
+                // expand the * to all columns from the referenced tables as key-value pairs
+                _ if func.needs_star_expansion() => {
+                    let tables = referenced_tables.ok_or_else(|| {
+                        crate::LimboError::ParseError(format!(
+                            "{}(*) requires a FROM clause",
+                            name.as_str()
+                        ))
+                    })?;
+
+                    // Verify there's at least one table to expand
+                    if tables.joined_tables().is_empty() {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "{}(*) requires a FROM clause",
+                            name.as_str()
+                        )));
+                    }
+
+                    // Build arguments: alternating column_name (as string literal), column_value (as column reference)
+                    let mut args: Vec<Box<ast::Expr>> = Vec::new();
+
+                    for table in tables.joined_tables().iter() {
+                        for (col_idx, col) in table.columns().iter().enumerate() {
+                            // Skip hidden columns (like rowid in some cases)
+                            if col.hidden() {
+                                continue;
+                            }
+
+                            // Add column name as a string literal
+                            // Note: ast::Literal::String values must be wrapped in single quotes
+                            // because sanitize_string() strips the first and last character
+                            let col_name = col
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("column{}", col_idx + 1));
+                            let quoted_col_name = format!("'{col_name}'");
+                            args.push(Box::new(ast::Expr::Literal(ast::Literal::String(
+                                quoted_col_name,
+                            ))));
+
+                            // Add column reference using Expr::Column
+                            args.push(Box::new(ast::Expr::Column {
+                                database: None,
+                                table: table.internal_id,
+                                column: col_idx,
+                                is_rowid_alias: col.is_rowid_alias(),
+                            }));
+                        }
+                    }
+
+                    // Create a synthetic FunctionCall with the expanded arguments
+                    let synthetic_call = ast::Expr::FunctionCall {
+                        name: name.clone(),
+                        distinctness: None,
+                        args,
+                        filter_over: filter_over.clone(),
+                        order_by: vec![],
+                    };
+
+                    // Recursively call translate_expr with the synthetic function call
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        &synthetic_call,
+                        target_register,
+                        resolver,
                     )
                 }
                 // For supported functions, delegate to the existing FunctionCall logic
@@ -2263,15 +2500,65 @@ pub fn translate_expr(
                                 unreachable!("Either index or table cursor must be opened");
                             }
                         } else {
+                            let is_btree_index = index_cursor_id.is_some_and(|cid| {
+                                program.get_cursor_type(cid).is_some_and(|ct| ct.is_index())
+                            });
+                            // FIXME(https://github.com/tursodatabase/turso/issues/4801):
+                            // This is a defensive workaround for cursor desynchronization.
+                            //
+                            // When `use_covering_index` is false, both table AND index cursors
+                            // are open and positioned at the same row. If we read some columns
+                            // from the index cursor and others from the table cursor, we rely
+                            // on both cursors staying synchronized.
+                            //
+                            // The problem: AFTER triggers can INSERT into the same table,
+                            // which modifies the index btree. This repositions or invalidates
+                            // the parent program's index cursor, while the table cursor remains
+                            // at the correct position. Result: we read a mix of data from
+                            // different rows - corruption.
+                            //
+                            // Why does the table cursor not have this problem? Because it's
+                            // explicitly re-sought by rowid (via NotExists instruction) before
+                            // each use. The rowid is stored in a register and used as a stable
+                            // key. The index cursor, by contrast, just trusts its internal
+                            // position (page + cell index) without re-seeking.
+                            //
+                            // Why not check if the table has triggers and allow the optimization
+                            // when there are none? Several reasons:
+                            // 1. ProgramBuilder.trigger indicates if THIS program is a trigger
+                            //    subprogram, not whether the table has triggers.
+                            // 2. In translate_expr(), we lack context about which table is being
+                            //    modified or whether we're even in an UPDATE/INSERT/DELETE.
+                            // 3. Triggers can be recursive (trigger on T inserts into U, whose
+                            //    trigger inserts back into T).
+                            //
+                            // The proper fix is to implement SQLite's `saveAllCursors()` approach:
+                            // before ANY btree write, find all cursors pointing to that btree
+                            // (by root_page) and save their positions. When those cursors are
+                            // next accessed, they re-seek to their saved position. This could
+                            // be done lazily with a generation number per btree - cursors check
+                            // if the generation changed and re-seek if needed. This would
+                            // require a global cursor registry and significant refactoring.
+                            //
+                            // For now, we only read from the index cursor when `use_covering_index`
+                            // is true, meaning only the index cursor exists (no table cursor to
+                            // get out of sync with). This foregoes the optimization of reading
+                            // individual columns from a non-covering index.
                             let read_from_index = if is_from_outer_query_scope {
-                                index_cursor_id.is_some()
+                                is_btree_index
+                            } else if is_btree_index && use_covering_index {
+                                index.as_ref().is_some_and(|idx| {
+                                    idx.column_table_pos_to_index_pos(*column).is_some()
+                                })
                             } else {
-                                use_covering_index
+                                false
                             };
                             let read_cursor = if read_from_index {
                                 index_cursor_id.expect("index cursor should be opened")
                             } else {
-                                table_cursor_id.expect("table cursor should be opened")
+                                table_cursor_id
+                                    .or(index_cursor_id)
+                                    .expect("cursor should be opened")
                             };
                             let column = if read_from_index {
                                 let index = program.resolve_index_for_cursor_id(
@@ -2299,13 +2586,80 @@ pub fn translate_expr(
                     Ok(target_register)
                 }
                 Table::FromClauseSubquery(from_clause_subquery) => {
-                    // If we are reading a column from a subquery, we instead copy the column from the
-                    // subquery's result registers.
-                    program.emit_insn(Insn::Copy {
-                        src_reg: from_clause_subquery
+                    // For outer-scope references to materialized subqueries, read from the index cursor
+                    // (the coroutine result registers are not updated during index scans).
+                    if is_from_outer_query_scope {
+                        if let Some(cursor_id) =
+                            program.resolve_any_index_cursor_id_for_table_safe(*table_ref_id)
+                        {
+                            let index = program.resolve_index_for_cursor_id(cursor_id);
+                            let idx_col = index
+                                .columns
+                                .iter()
+                                .position(|c| c.pos_in_table == *column)
+                                .expect("index column not found for subquery column");
+                            program.emit_insn(Insn::Column {
+                                cursor_id,
+                                column: idx_col,
+                                dest: target_register,
+                                default: None,
+                            });
+                            return Ok(target_register);
+                        }
+                    }
+
+                    // Check if this subquery was materialized with an ephemeral index.
+                    // If so, read from the index cursor; otherwise copy from result registers.
+                    if let Some(refs) = referenced_tables {
+                        if let Some(table_reference) = refs
+                            .joined_tables()
+                            .iter()
+                            .find(|t| t.internal_id == *table_ref_id)
+                        {
+                            // Check if the operation is Search::Seek with an ephemeral index
+                            if let Operation::Search(Search::Seek {
+                                index: Some(index), ..
+                            }) = &table_reference.op
+                            {
+                                if index.ephemeral {
+                                    // Read from the index cursor. Index columns may be reordered
+                                    // (key columns first), so find the index column position that
+                                    // corresponds to the original subquery column position.
+                                    let idx_col = index
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.pos_in_table == *column)
+                                        .expect("index column not found for subquery column");
+                                    let cursor_id = program.resolve_cursor_id(&CursorKey::index(
+                                        *table_ref_id,
+                                        index.clone(),
+                                    ));
+                                    program.emit_insn(Insn::Column {
+                                        cursor_id,
+                                        column: idx_col,
+                                        dest: target_register,
+                                        default: None,
+                                    });
+                                    return Ok(target_register);
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback: copy from result registers (coroutine-based subquery)
+                    let result_columns_start = if is_from_outer_query_scope {
+                        // For outer query subqueries, look up the register from the program builder
+                        // since the cloned subquery doesn't have the register set yet.
+                        program.get_subquery_result_reg(*table_ref_id).expect(
+                            "Outer query subquery result_columns_start_reg must be set in program",
+                        )
+                    } else {
+                        from_clause_subquery
                             .result_columns_start_reg
                             .expect("Subquery result_columns_start_reg must be set")
-                            + *column,
+                    };
+                    program.emit_insn(Insn::Copy {
+                        src_reg: result_columns_start + *column,
                         dst_reg: target_register,
                         extra_amount: 0,
                     });
@@ -2326,18 +2680,20 @@ pub fn translate_expr(
             database: _,
             table: table_ref_id,
         } => {
-            let (index, use_covering_index) = {
-                if let Some(table_reference) = referenced_tables
-                    .unwrap()
-                    .find_joined_table_by_internal_id(*table_ref_id)
-                {
-                    (
-                        table_reference.op.index(),
-                        table_reference.utilizes_covering_index(),
-                    )
-                } else {
-                    (None, false)
-                }
+            // When a cursor override is active, always read rowid from the override cursor.
+            let has_cursor_override = program.has_cursor_override(*table_ref_id);
+            let (index, use_covering_index) = if has_cursor_override {
+                (None, false)
+            } else if let Some(table_reference) = referenced_tables
+                .unwrap()
+                .find_joined_table_by_internal_id(*table_ref_id)
+            {
+                (
+                    table_reference.op.index(),
+                    table_reference.utilizes_covering_index(),
+                )
+            } else {
+                (None, false)
             };
 
             if use_covering_index {
@@ -2517,15 +2873,15 @@ pub fn translate_expr(
             (UnaryOperator::Negative, ast::Expr::Literal(ast::Literal::Numeric(numeric_value))) => {
                 let numeric_value = "-".to_owned() + numeric_value;
                 match parse_numeric_literal(&numeric_value)? {
-                    Value::Integer(int_value) => {
+                    Value::Numeric(Numeric::Integer(int_value)) => {
                         program.emit_insn(Insn::Integer {
                             value: int_value,
                             dest: target_register,
                         });
                     }
-                    Value::Float(real_value) => {
+                    Value::Numeric(Numeric::Float(real_value)) => {
                         program.emit_insn(Insn::Real {
-                            value: real_value,
+                            value: real_value.into(),
                             dest: target_register,
                         });
                     }
@@ -2553,15 +2909,15 @@ pub fn translate_expr(
             }
             (UnaryOperator::BitwiseNot, ast::Expr::Literal(ast::Literal::Numeric(num_val))) => {
                 match parse_numeric_literal(num_val)? {
-                    Value::Integer(int_value) => {
+                    Value::Numeric(Numeric::Integer(int_value)) => {
                         program.emit_insn(Insn::Integer {
                             value: !int_value,
                             dest: target_register,
                         });
                     }
-                    Value::Float(real_value) => {
+                    Value::Numeric(Numeric::Float(real_value)) => {
                         program.emit_insn(Insn::Integer {
-                            value: !(real_value as i64),
+                            value: !(f64::from(real_value) as i64),
                             dest: target_register,
                         });
                     }
@@ -3298,8 +3654,63 @@ fn translate_like_base(
                 },
             });
         }
-        ast::LikeOperator::Match => crate::bail_parse_error!("MATCH in LIKE is not supported"),
-        ast::LikeOperator::Regexp => crate::bail_parse_error!("REGEXP in LIKE is not supported"),
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        ast::LikeOperator::Match => {
+            // Transform MATCH to fts_match():
+            // - `col MATCH 'query'` -> `fts_match(col, 'query')`
+            // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
+            let columns: Vec<&ast::Expr> = match lhs.as_ref() {
+                ast::Expr::Parenthesized(cols) => cols.iter().map(|c| c.as_ref()).collect(),
+                other => vec![other],
+            };
+            let arg_count = columns.len() + 1; // columns + query
+            let start_reg = program.alloc_registers(arg_count);
+
+            for (i, col) in columns.iter().enumerate() {
+                translate_expr(program, referenced_tables, col, start_reg + i, resolver)?;
+            }
+            translate_expr(
+                program,
+                referenced_tables,
+                rhs,
+                start_reg + columns.len(),
+                resolver,
+            )?;
+
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg,
+                dest: target_register,
+                func: FuncCtx {
+                    func: Func::Fts(FtsFunc::Match),
+                    arg_count,
+                },
+            });
+        }
+        #[cfg(any(not(feature = "fts"), target_family = "wasm"))]
+        ast::LikeOperator::Match => {
+            crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
+        }
+        ast::LikeOperator::Regexp => {
+            if escape.is_some() {
+                crate::bail_parse_error!("wrong number of arguments to function regexp()");
+            }
+            let func = resolver.resolve_function("regexp", 2);
+            let Some(func) = func else {
+                crate::bail_parse_error!("no such function: regexp");
+            };
+            let arg_count = 2;
+            let start_reg = program.alloc_registers(arg_count);
+            // regexp(pattern, haystack) — pattern is rhs, haystack is lhs
+            translate_expr(program, referenced_tables, rhs, start_reg, resolver)?;
+            translate_expr(program, referenced_tables, lhs, start_reg + 1, resolver)?;
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg,
+                dest: target_register,
+                func: FuncCtx { func, arg_count },
+            });
+        }
     }
 
     Ok(target_register)
@@ -3398,20 +3809,28 @@ pub fn sanitize_string(input: &str) -> String {
 /// e.g. t.x = 5 -> Some((t.x, =, 5))
 pub fn as_binary_components(
     expr: &ast::Expr,
-) -> Result<Option<(&ast::Expr, ast::Operator, &ast::Expr)>> {
+) -> Result<Option<(&ast::Expr, ConstraintOperator, &ast::Expr)>> {
     match unwrap_parens(expr)? {
         ast::Expr::Binary(lhs, operator, rhs)
             if matches!(
                 operator,
                 ast::Operator::Equals
+                    | ast::Operator::NotEquals
                     | ast::Operator::Greater
                     | ast::Operator::Less
                     | ast::Operator::GreaterEquals
                     | ast::Operator::LessEquals
+                    | ast::Operator::Is
+                    | ast::Operator::IsNot
             ) =>
         {
-            Ok(Some((lhs.as_ref(), *operator, rhs.as_ref())))
+            Ok(Some((lhs.as_ref(), (*operator).into(), rhs.as_ref())))
         }
+        ast::Expr::Like { lhs, not, rhs, .. } => Ok(Some((
+            lhs.as_ref(),
+            ConstraintOperator::Like { not: *not },
+            rhs.as_ref(),
+        ))),
         _ => Ok(None),
     }
 }
@@ -3437,7 +3856,7 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
         ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
             1 => {
                 paren_count += 1;
-                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap().clone())?;
+                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap())?;
                 paren_count += count;
                 Ok((expr, paren_count))
             }
@@ -3771,6 +4190,13 @@ pub fn bind_and_rewrite_expr<'a>(
                     // - x in the inner query refers to t2.x.
                     if match_result.is_none() {
                         for outer_ref in referenced_tables.outer_query_refs().iter() {
+                            // CTEs (FromClauseSubquery) in outer_query_refs are only for table
+                            // lookup (e.g., FROM cte1), not for column resolution. Columns from
+                            // CTEs should only be accessible when the CTE is explicitly in the
+                            // FROM clause, not as implicit outer references.
+                            if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
+                                continue;
+                            }
                             let col_idx = outer_ref.table.columns().iter().position(|c| {
                                 c.name
                                     .as_ref()
@@ -3850,12 +4276,14 @@ pub fn bind_and_rewrite_expr<'a>(
                             .as_ref()
                             .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                     });
-                    if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
-                        *expr = row_id_expr;
-
-                        return Ok(WalkControl::Continue);
-                    }
+                    // User-defined columns take precedence over rowid aliases
+                    // (oid, rowid, _rowid_). Only fall back to parse_row_id()
+                    // when no matching user column exists.
                     let Some(col_idx) = col_idx else {
+                        if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
+                            *expr = row_id_expr;
+                            return Ok(WalkControl::Continue);
+                        }
                         crate::bail_parse_error!("no such column: {}", normalized_id);
                     };
                     let col = tbl.columns().get(col_idx).unwrap();
@@ -3947,12 +4375,106 @@ pub fn bind_and_rewrite_expr<'a>(
                         )));
                     }
                 }
+                Expr::FunctionCallStar { name, filter_over } => {
+                    // For functions that need star expansion (json_object, jsonb_object),
+                    // expand the * to all columns from the referenced tables as key-value pairs
+                    // This needs to happen during bind/rewrite so WHERE clauses can use these functions
+                    if let Some(referenced_tables) = &mut referenced_tables {
+                        if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), 0)
+                        {
+                            if func.needs_star_expansion() {
+                                // Only expand if there are actual tables - otherwise leave as
+                                // FunctionCallStar so translate_expr can generate the error
+                                if !referenced_tables.joined_tables().is_empty() {
+                                    // Mark all columns as used so the optimizer doesn't
+                                    // create partial covering indexes that would miss columns
+                                    for table in referenced_tables.joined_tables_mut().iter_mut() {
+                                        for col_idx in 0..table.columns().len() {
+                                            table.mark_column_used(col_idx);
+                                        }
+                                    }
+
+                                    // Build arguments: alternating column_name (as string literal), column_value (as column reference)
+                                    let mut args: Vec<Box<ast::Expr>> = Vec::new();
+
+                                    for table in referenced_tables.joined_tables().iter() {
+                                        for (col_idx, col) in table.columns().iter().enumerate() {
+                                            // Skip hidden columns (like rowid in some cases)
+                                            if col.hidden() {
+                                                continue;
+                                            }
+
+                                            // Add column name as a string literal
+                                            let col_name = col.name.clone().unwrap_or_else(|| {
+                                                format!("column{}", col_idx + 1)
+                                            });
+                                            let quoted_col_name = format!("'{col_name}'");
+                                            args.push(Box::new(ast::Expr::Literal(
+                                                ast::Literal::String(quoted_col_name),
+                                            )));
+
+                                            // Add column reference using Expr::Column
+                                            args.push(Box::new(ast::Expr::Column {
+                                                database: None,
+                                                table: table.internal_id,
+                                                column: col_idx,
+                                                is_rowid_alias: col.is_rowid_alias(),
+                                            }));
+                                        }
+                                    }
+
+                                    // Replace FunctionCallStar with expanded FunctionCall
+                                    *expr = ast::Expr::FunctionCall {
+                                        name: name.clone(),
+                                        distinctness: None,
+                                        args,
+                                        filter_over: filter_over.clone(),
+                                        order_by: vec![],
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
             Ok(WalkControl::Continue)
         },
     )?;
     Ok(())
+}
+
+/// Rewrite BETWEEN expressions to Binary expressions with AND/OR.
+/// This is a subset of bind_and_rewrite_expr that only handles BETWEEN rewriting.
+pub fn rewrite_between_expr(expr: &mut ast::Expr) {
+    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } = e
+        {
+            let (lower_op, upper_op) = if *not {
+                (ast::Operator::Greater, ast::Operator::Greater)
+            } else {
+                (ast::Operator::LessEquals, ast::Operator::LessEquals)
+            };
+            let start = start.take_ownership();
+            let lhs_v = lhs.take_ownership();
+            let end = end.take_ownership();
+
+            let lower = ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
+            let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
+
+            *e = if *not {
+                ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
+            } else {
+                ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
+            };
+        }
+        Ok(WalkControl::Continue)
+    });
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
@@ -4223,15 +4745,15 @@ pub fn emit_literal(
     match literal {
         ast::Literal::Numeric(val) => {
             match parse_numeric_literal(val)? {
-                Value::Integer(int_value) => {
+                Value::Numeric(Numeric::Integer(int_value)) => {
                     program.emit_insn(Insn::Integer {
                         value: int_value,
                         dest: target_register,
                     });
                 }
-                Value::Float(real_value) => {
+                Value::Numeric(Numeric::Float(real_value)) => {
                     program.emit_insn(Insn::Real {
-                        value: real_value,
+                        value: real_value.into(),
                         dest: target_register,
                     });
                 }
@@ -4270,6 +4792,20 @@ pub fn emit_literal(
             program.emit_insn(Insn::Null {
                 dest: target_register,
                 dest_end: None,
+            });
+            Ok(target_register)
+        }
+        ast::Literal::True => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target_register,
+            });
+            Ok(target_register)
+        }
+        ast::Literal::False => {
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: target_register,
             });
             Ok(target_register)
         }
@@ -4335,7 +4871,7 @@ pub fn emit_function_call(
 pub fn process_returning_clause(
     returning: &mut [ast::ResultColumn],
     table_references: &mut TableReferences,
-    connection: &std::sync::Arc<crate::Connection>,
+    connection: &crate::sync::Arc<crate::Connection>,
 ) -> Result<Vec<ResultSetColumn>> {
     let mut result_columns = Vec::with_capacity(returning.len());
 
@@ -4545,7 +5081,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             1
         }
         Expr::DoublyQualified(..) => 1,
-        Expr::Exists(_) => todo!(),
+        Expr::Exists(_) => 1, // EXISTS returns a single boolean value (0 or 1)
         Expr::FunctionCall { name, args, .. } => {
             for (pos, arg) in args.iter().enumerate() {
                 let evs_arg = expr_vector_size(arg)?;
@@ -4587,9 +5123,10 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
-        Expr::Like { lhs, rhs, .. } => {
+        Expr::Like { lhs, rhs, op, .. } => {
             let evs_lhs = expr_vector_size(lhs)?;
-            if evs_lhs != 1 {
+            // MATCH allows multi-column LHS: (col1, col2) MATCH 'query'
+            if evs_lhs != 1 && *op != ast::LikeOperator::Match {
                 crate::bail_parse_error!(
                     "left operand of LIKE must return 1 value. Got: ({evs_lhs})"
                 );
@@ -4616,7 +5153,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::Parenthesized(exprs) => exprs.len(),
         Expr::Qualified(..) => 1,
         Expr::Raise(..) => crate::bail_parse_error!("RAISE is not supported"),
-        Expr::Subquery(_) => todo!(),
+        Expr::Subquery(_) => {
+            crate::bail_parse_error!("Scalar subquery is not supported in this context")
+        }
         Expr::Unary(unary_operator, expr) => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {

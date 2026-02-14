@@ -33,8 +33,9 @@ type tursoDbConnection struct {
 	conn    TursoConnection
 	extraIo func() error
 
-	mu     sync.Mutex
-	closed bool
+	mu          sync.Mutex
+	closed      bool
+	busyTimeout int // current busy timeout in milliseconds
 	// keep flags for configuration if needed
 	async bool
 }
@@ -47,9 +48,10 @@ type tursoDbStatement struct {
 }
 
 type tursoDbRows struct {
-	conn    *tursoDbConnection
-	stmt    TursoStatement
-	columns []string
+	conn      *tursoDbConnection
+	stmt      TursoStatement
+	columns   []string
+	decltypes []string
 
 	closed bool
 	err    error
@@ -88,15 +90,11 @@ func Setup(config TursoConfig) error {
 // Implement sql.Driver methods
 func (d *tursoDbDriver) Open(dsn string) (driver.Conn, error) {
 	InitLibrary(turso_libs.LoadTursoLibraryConfig{})
-	path, experimental, async, err := parseDSN(dsn)
+	config, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	db, err := turso_database_new(TursoDatabaseConfig{
-		Path:                 path,
-		ExperimentalFeatures: experimental,
-		AsyncIO:              async,
-	})
+	db, err := turso_database_new(config)
 	if err != nil {
 		return nil, err
 	}
@@ -109,10 +107,24 @@ func (d *tursoDbDriver) Open(dsn string) (driver.Conn, error) {
 		turso_database_deinit(db)
 		return nil, err
 	}
+	// Apply busy timeout - use default if not explicitly set
+	// A value of -1 in config means explicitly disabled (no timeout)
+	// A value of 0 means use the default timeout
+	// A positive value is used as-is
+	timeout := config.BusyTimeout
+	if timeout == 0 {
+		timeout = DefaultBusyTimeout // Apply sensible default
+	} else if timeout < 0 {
+		timeout = 0 // -1 means explicitly disable
+	}
+	if timeout > 0 {
+		turso_connection_set_busy_timeout_ms(c, int64(timeout))
+	}
 	return &tursoDbConnection{
-		db:    db,
-		conn:  c,
-		async: async,
+		db:          db,
+		conn:        c,
+		busyTimeout: timeout,
+		async:       config.AsyncIO,
 	}, nil
 }
 
@@ -302,6 +314,124 @@ func (c *tursoDbConnection) checkOpen() error {
 	return nil
 }
 
+// SetBusyTimeout sets the busy timeout for this connection in milliseconds.
+// Pass 0 to disable the busy handler (immediate SQLITE_BUSY on contention).
+// This method is thread-safe.
+func (c *tursoDbConnection) SetBusyTimeout(timeoutMs int) error {
+	if err := c.checkOpen(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if timeoutMs < 0 {
+		timeoutMs = 0
+	}
+	turso_connection_set_busy_timeout_ms(c.conn, int64(timeoutMs))
+	c.busyTimeout = timeoutMs
+	return nil
+}
+
+// GetBusyTimeout returns the current busy timeout in milliseconds.
+// Returns 0 if the busy handler is disabled.
+func (c *tursoDbConnection) GetBusyTimeout() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.busyTimeout
+}
+
+// --- Connector Pattern ---
+
+// ConnectorOption configures a TursoConnector.
+type ConnectorOption func(*TursoConnector)
+
+// WithBusyTimeout sets the busy timeout in milliseconds.
+// Use 0 to disable the busy handler, -1 to use the default (5000ms).
+func WithBusyTimeout(ms int) ConnectorOption {
+	return func(c *TursoConnector) {
+		c.busyTimeout = ms
+	}
+}
+
+// TursoConnector implements driver.Connector for programmatic configuration.
+type TursoConnector struct {
+	dsn         string
+	busyTimeout int // -1 = use default, 0 = disabled, >0 = custom
+}
+
+// NewConnector creates a new TursoConnector with the given DSN and options.
+// By default, uses the DefaultBusyTimeout (5000ms).
+func NewConnector(dsn string, opts ...ConnectorOption) (*TursoConnector, error) {
+	c := &TursoConnector{
+		dsn:         dsn,
+		busyTimeout: -1, // -1 means use default
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c, nil
+}
+
+// Connect implements driver.Connector.
+func (c *TursoConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	InitLibrary(turso_libs.LoadTursoLibraryConfig{})
+	config, err := parseDSN(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Override busy timeout from connector if set
+	if c.busyTimeout >= 0 {
+		// If connector explicitly sets 0, that means disabled
+		// We use -1 internally to signal "disabled" to Open logic
+		if c.busyTimeout == 0 {
+			config.BusyTimeout = -1 // Will be converted to 0 in Open
+		} else {
+			config.BusyTimeout = c.busyTimeout
+		}
+	}
+	// If busyTimeout is -1 (use default) and DSN didn't set one, leave it as 0
+	// which will trigger the default in Open()
+
+	db, err := turso_database_new(config)
+	if err != nil {
+		return nil, err
+	}
+	if err := turso_database_open(db); err != nil {
+		turso_database_deinit(db)
+		return nil, err
+	}
+	conn, err := turso_database_connect(db)
+	if err != nil {
+		turso_database_deinit(db)
+		return nil, err
+	}
+
+	// Apply busy timeout - same logic as Open()
+	timeout := config.BusyTimeout
+	if timeout == 0 {
+		timeout = DefaultBusyTimeout
+	} else if timeout < 0 {
+		timeout = 0
+	}
+	if timeout > 0 {
+		turso_connection_set_busy_timeout_ms(conn, int64(timeout))
+	}
+
+	return &tursoDbConnection{
+		db:          db,
+		conn:        conn,
+		busyTimeout: timeout,
+		async:       config.AsyncIO,
+	}, nil
+}
+
+// Driver implements driver.Connector.
+func (c *TursoConnector) Driver() driver.Driver {
+	return &tursoDbDriver{}
+}
+
+// Ensure TursoConnector implements driver.Connector
+var _ driver.Connector = (*TursoConnector)(nil)
+
 // --- driver.Stmt and friends ---
 
 // Ensure tursoDbStatement implements required interfaces.
@@ -361,10 +491,13 @@ func (r *tursoDbRows) Columns() []string {
 	}
 	n := int(turso_statement_column_count(r.stmt))
 	names := make([]string, n)
+	decltypes := make([]string, n)
 	for i := 0; i < n; i++ {
 		names[i] = turso_statement_column_name(r.stmt, i)
+		decltypes[i] = turso_statement_column_decltype(r.stmt, i)
 	}
 	r.columns = names
+	r.decltypes = decltypes
 	return r.columns
 }
 
@@ -382,6 +515,8 @@ func (r *tursoDbRows) Next(dest []driver.Value) error {
 	if r.closed {
 		return io.EOF
 	}
+	// Ensure decltypes are populated
+	_ = r.Columns()
 	for {
 		status, err := turso_statement_step(r.stmt)
 		if err != nil {
@@ -405,7 +540,17 @@ func (r *tursoDbRows) Next(dest []driver.Value) error {
 				case TURSO_TYPE_REAL:
 					dest[i] = turso_statement_row_value_double(r.stmt, i)
 				case TURSO_TYPE_TEXT:
-					dest[i] = turso_statement_row_value_text(r.stmt, i)
+					text := turso_statement_row_value_text(r.stmt, i)
+					// Check if column type indicates a time value
+					if i < len(r.decltypes) && isTimeColumn(r.decltypes[i]) {
+						if t, err := parseTimeString(text); err == nil {
+							dest[i] = t
+						} else {
+							dest[i] = text
+						}
+					} else {
+						dest[i] = text
+					}
 				case TURSO_TYPE_BLOB:
 					dest[i] = turso_statement_row_value_bytes(r.stmt, i)
 				default:
@@ -473,32 +618,40 @@ func (tx *tursoDbTx) Rollback() error {
 
 // Helpers
 
-// parseDSN supports format: <path>[?experimental=<string>&async=0|1]
-func parseDSN(dsn string) (path string, experimental string, async bool, err error) {
-	path = dsn
-	async = false
-	experimental = ""
+// parseDSN supports format: <path>[?experimental=<string>&async=0|1&vfs=<string>&encryption_cipher=<string>&encryption_hexkey=<string>&_busy_timeout=<int>]
+func parseDSN(dsn string) (TursoDatabaseConfig, error) {
+	config := TursoDatabaseConfig{Path: dsn}
 	qMark := strings.IndexByte(dsn, '?')
 	if qMark >= 0 {
-		path = dsn[:qMark]
+		config.Path = dsn[:qMark]
 		rawQuery := dsn[qMark+1:]
-		vals, e := url.ParseQuery(rawQuery)
-		if e != nil {
-			return "", "", false, e
+		vals, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			return TursoDatabaseConfig{}, err
 		}
 		if v := vals.Get("experimental"); v != "" {
-			experimental = v
+			config.ExperimentalFeatures = v
 		}
 		if v := vals.Get("async"); v != "" {
-			async = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+			config.AsyncIO = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+		}
+		if v := vals.Get("vfs"); v != "" {
+			config.Vfs = v
+		}
+		if v := vals.Get("encryption_cipher"); v != "" {
+			config.Encryption.Cipher = v
+		}
+		if v := vals.Get("encryption_hexkey"); v != "" {
+			config.Encryption.Hexkey = v
+		}
+		if v := vals.Get("_busy_timeout"); v != "" {
+			var timeout int
+			if _, err := fmt.Sscanf(v, "%d", &timeout); err == nil {
+				config.BusyTimeout = timeout
+			}
 		}
 	}
-	path, err = url.QueryUnescape(path)
-	if err != nil {
-		// if unescape failed, fall back to raw
-		err = nil
-	}
-	return path, experimental, async, err
+	return config, nil
 }
 
 func (c *tursoDbConnection) executeFully(ctx context.Context, stmt TursoStatement) (uint64, error) {
@@ -670,4 +823,43 @@ func bindOne(stmt TursoStatement, position int, v any) error {
 		// Fallback to fmt to string
 		return turso_statement_bind_positional_text(stmt, position, fmt.Sprint(v))
 	}
+}
+
+// isTimeColumn checks if the column declared type indicates a time/date column.
+// This matches the behavior of github.com/mattn/go-sqlite3.
+func isTimeColumn(decltype string) bool {
+	if decltype == "" {
+		return false
+	}
+	// Case-insensitive exact match for TIMESTAMP, DATETIME, DATE
+	// Matches go-sqlite3 behavior: https://github.com/mattn/go-sqlite3/blob/master/sqlite3_type.go
+	upper := strings.ToUpper(decltype)
+	return upper == "TIMESTAMP" || upper == "DATETIME" || upper == "DATE"
+}
+
+// SQLiteTimestampFormats are the timestamp formats supported by go-sqlite3.
+// https://github.com/mattn/go-sqlite3/blob/master/sqlite3.go
+var SQLiteTimestampFormats = []string{
+	"2006-01-02 15:04:05.999999999-07:00",
+	"2006-01-02T15:04:05.999999999-07:00",
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04",
+	"2006-01-02T15:04",
+	"2006-01-02",
+}
+
+// parseTimeString attempts to parse a string as a time.Time value.
+// This matches the behavior of github.com/mattn/go-sqlite3.
+func parseTimeString(s string) (time.Time, error) {
+	// Strip trailing "Z" suffix before parsing (go-sqlite3 behavior)
+	s = strings.TrimSuffix(s, "Z")
+	for _, format := range SQLiteTimestampFormats {
+		if t, err := time.ParseInLocation(format, s, time.UTC); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot parse %q as time", s)
 }

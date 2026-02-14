@@ -73,6 +73,16 @@ impl Predicate {
         Self(expr).parens()
     }
 
+    /// Create a predicate from a column reference
+    pub fn column(name: String) -> Self {
+        Self(ast::Expr::Id(ast::Name::exact(name)))
+    }
+
+    /// Create a predicate from a SimValue literal
+    pub fn value(val: SimValue) -> Self {
+        Self(ast::Expr::Literal(val.into()))
+    }
+
     pub fn parens(self) -> Self {
         let expr = ast::Expr::Parenthesized(vec![Box::new(self.0)]);
         Self(expr)
@@ -126,7 +136,7 @@ pub fn expr_to_value<T: TableContext>(
         } => {
             let lhs = expr_to_value(lhs, row, table)?;
             let rhs = expr_to_value(rhs, row, table)?;
-            let res = lhs.like_compare(&rhs, *op);
+            let res = lhs.like_compare(&rhs, *op).ok()?;
             let value: SimValue = if *not { !res } else { res }.into();
             Some(value)
         }

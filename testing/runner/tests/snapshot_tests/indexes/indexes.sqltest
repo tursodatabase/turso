@@ -1,0 +1,370 @@
+# Index Usage Patterns Snapshot Tests
+# These snapshots capture EXPLAIN QUERY PLAN output for various index usage scenarios
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    -- Products table for simple index lookup tests
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        sku TEXT NOT NULL,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        price REAL NOT NULL,
+        stock_qty INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    -- Simple single-column index on SKU
+    CREATE INDEX idx_products_sku ON products(sku);
+
+    -- Index on category for comparison tests
+    CREATE INDEX idx_products_category ON products(category);
+
+    -- Index on price for range scan tests
+    CREATE INDEX idx_products_price ON products(price);
+
+    -- Orders table for composite index tests
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        order_date TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_amount REAL NOT NULL,
+        shipping_method TEXT NOT NULL
+    );
+
+    -- Composite index on customer_id and order_date
+    CREATE INDEX idx_orders_customer_date ON orders(customer_id, order_date);
+
+    -- Composite index on status and shipping_method
+    CREATE INDEX idx_orders_status_shipping ON orders(status, shipping_method);
+
+    -- Inventory table for covering index tests
+    CREATE TABLE inventory (
+        id INTEGER PRIMARY KEY,
+        warehouse_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        last_updated TEXT NOT NULL
+    );
+
+    -- Covering index: includes quantity so lookups don't need table access
+    CREATE INDEX idx_inventory_covering ON inventory(warehouse_id, product_id, quantity);
+
+    -- Events table for range scan and OR tests
+    CREATE TABLE events (
+        id INTEGER PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        severity INTEGER NOT NULL,
+        timestamp TEXT NOT NULL,
+        source TEXT NOT NULL,
+        message TEXT NOT NULL
+    );
+
+    -- Index on severity for range scans
+    CREATE INDEX idx_events_severity ON events(severity);
+
+    -- Index on timestamp for range scans
+    CREATE INDEX idx_events_timestamp ON events(timestamp);
+
+    -- Index on event_type for OR tests
+    CREATE INDEX idx_events_type ON events(event_type);
+
+    -- Logs table without indexes for full scan comparison
+    CREATE TABLE logs (
+        id INTEGER PRIMARY KEY,
+        level TEXT NOT NULL,
+        component TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        message TEXT NOT NULL
+    );
+}
+
+# =============================================================================
+# 1. Simple Index Lookup - WHERE indexed_col = ?
+# =============================================================================
+
+# Simple equality lookup on indexed column
+@setup schema
+snapshot simple-index-equality-lookup {
+    SELECT id, name, price FROM products WHERE sku = 'ABC123';
+}
+
+# Primary key lookup (implicit index)
+@setup schema
+snapshot primary-key-lookup {
+    SELECT id, sku, name FROM products WHERE id = 42;
+}
+
+# Simple index lookup with additional non-indexed filter
+@setup schema
+snapshot simple-index-with-filter {
+    SELECT id, name, price FROM products WHERE sku = 'ABC123' AND stock_qty > 0;
+}
+
+# =============================================================================
+# 2. Composite Index - Multi-column index with partial and full usage
+# =============================================================================
+
+# Full composite index usage (both columns in WHERE)
+@setup schema
+snapshot composite-index-full-usage {
+    SELECT id, status, total_amount
+    FROM orders
+    WHERE customer_id = 100 AND order_date = '2024-01-15';
+}
+
+# Partial composite index usage (first column only - should use index)
+@setup schema
+snapshot composite-index-first-column-only {
+    SELECT id, order_date, total_amount
+    FROM orders
+    WHERE customer_id = 100;
+}
+
+# Partial composite index usage (second column only - may not use index efficiently)
+@setup schema
+snapshot composite-index-second-column-only {
+    SELECT id, customer_id, total_amount
+    FROM orders
+    WHERE order_date = '2024-01-15';
+}
+
+# Composite index with range on second column
+@setup schema
+snapshot composite-index-range-on-second {
+    SELECT id, order_date, total_amount
+    FROM orders
+    WHERE customer_id = 100 AND order_date >= '2024-01-01' AND order_date < '2024-02-01';
+}
+
+# Composite index with ORDER BY matching index order
+@setup schema
+snapshot composite-index-order-by-match {
+    SELECT id, order_date, total_amount
+    FROM orders
+    WHERE customer_id = 100
+    ORDER BY order_date;
+}
+
+# =============================================================================
+# 3. Covering Index - Query satisfied entirely by index (no table lookup)
+# =============================================================================
+
+# Covering index: all requested columns are in the index
+@setup schema
+snapshot covering-index-all-columns {
+    SELECT warehouse_id, product_id, quantity
+    FROM inventory
+    WHERE warehouse_id = 1 AND product_id = 500;
+}
+
+# Covering index: subset of indexed columns
+@setup schema
+snapshot covering-index-subset {
+    SELECT warehouse_id, quantity
+    FROM inventory
+    WHERE warehouse_id = 1;
+}
+
+# Non-covering query: needs column not in index (requires table lookup)
+@setup schema
+snapshot non-covering-needs-table-lookup {
+    SELECT warehouse_id, product_id, quantity, last_updated
+    FROM inventory
+    WHERE warehouse_id = 1 AND product_id = 500;
+}
+
+# Covering index with aggregation
+@setup schema
+snapshot covering-index-with-aggregation {
+    SELECT warehouse_id, SUM(quantity) as total_qty
+    FROM inventory
+    WHERE warehouse_id = 1
+    GROUP BY warehouse_id;
+}
+
+# =============================================================================
+# 4. Index Range Scan - BETWEEN, >, <, >=, <=
+# =============================================================================
+
+# Range scan with BETWEEN
+@setup schema
+snapshot range-scan-between {
+    SELECT id, event_type, severity FROM events WHERE severity BETWEEN 3 AND 7;
+}
+
+# Range scan with greater than
+@setup schema
+snapshot range-scan-greater-than {
+    SELECT id, event_type, severity FROM events WHERE severity > 5;
+}
+
+# Range scan with less than
+@setup schema
+snapshot range-scan-less-than {
+    SELECT id, event_type, severity FROM events WHERE severity < 3;
+}
+
+# Range scan with greater than or equal
+@setup schema
+snapshot range-scan-greater-equal {
+    SELECT id, event_type, severity FROM events WHERE severity >= 5;
+}
+
+# Range scan with less than or equal
+@setup schema
+snapshot range-scan-less-equal {
+    SELECT id, event_type, severity FROM events WHERE severity <= 3;
+}
+
+# Range scan on timestamp (text comparison)
+@setup schema
+snapshot range-scan-timestamp {
+    SELECT id, event_type, timestamp
+    FROM events
+    WHERE timestamp >= '2024-01-01' AND timestamp < '2024-02-01';
+}
+
+# Range scan combined with equality on another index
+@setup schema
+snapshot range-scan-with-equality {
+    SELECT id, name, price
+    FROM products
+    WHERE category = 'Electronics' AND price BETWEEN 100 AND 500;
+}
+
+# =============================================================================
+# 5. Index with OR - Optimizer decision to use index vs full scan
+# =============================================================================
+
+# OR on same indexed column (may use index union or full scan)
+@setup schema
+snapshot or-same-column {
+    SELECT id, event_type, severity
+    FROM events
+    WHERE event_type = 'ERROR' OR event_type = 'CRITICAL';
+}
+
+# OR on different indexed columns
+@setup schema
+snapshot or-different-columns {
+    SELECT id, event_type, severity
+    FROM events
+    WHERE event_type = 'ERROR' OR severity > 8;
+}
+
+# OR with one indexed and one non-indexed column
+@setup schema
+snapshot or-indexed-and-non-indexed {
+    SELECT id, event_type, source
+    FROM events
+    WHERE event_type = 'ERROR' OR source = 'auth-service';
+}
+
+# IN clause (similar to multiple ORs)
+@setup schema
+snapshot in-clause-multiple-values {
+    SELECT id, event_type, severity
+    FROM events
+    WHERE event_type IN ('ERROR', 'WARNING', 'CRITICAL');
+}
+
+# Complex OR with AND combinations
+@setup schema
+snapshot or-with-and-combinations {
+    SELECT id, event_type, severity, source
+    FROM events
+    WHERE (event_type = 'ERROR' AND severity > 5)
+       OR (event_type = 'WARNING' AND severity > 7);
+}
+
+# =============================================================================
+# 6. No Index (Full Scan) - For comparison
+# =============================================================================
+
+# Full table scan on table without indexes
+@setup schema
+snapshot full-scan-no-index {
+    SELECT id, level, message FROM logs WHERE level = 'ERROR';
+}
+
+# Full table scan with non-indexed column filter
+@setup schema
+snapshot full-scan-non-indexed-column {
+    SELECT id, sku, name FROM products WHERE name LIKE '%Widget%';
+}
+
+# Full scan with aggregation
+@setup schema
+snapshot full-scan-with-aggregation {
+    SELECT component, COUNT(*) as count
+    FROM logs
+    GROUP BY component;
+}
+
+# Full scan required due to function on indexed column
+@setup schema
+snapshot full-scan-function-on-indexed {
+    SELECT id, sku, name FROM products WHERE UPPER(sku) = 'ABC123';
+}
+
+# Full scan due to leading wildcard in LIKE
+@setup schema
+snapshot full-scan-leading-wildcard {
+    SELECT id, sku, name FROM products WHERE sku LIKE '%123';
+}
+
+# =============================================================================
+# 7. Additional Index Patterns
+# =============================================================================
+
+# Index used for ORDER BY without WHERE clause
+@setup schema
+snapshot index-for-order-by {
+    SELECT id, sku, price FROM products ORDER BY price LIMIT 10;
+}
+
+# Index used for MIN/MAX optimization
+@setup schema
+snapshot index-for-min {
+    SELECT MIN(price) FROM products;
+}
+
+@setup schema
+snapshot index-for-max {
+    SELECT MAX(price) FROM products;
+}
+
+# Index with NOT equal (typically cannot use index efficiently)
+@setup schema
+snapshot index-not-equal {
+    SELECT id, sku, name FROM products WHERE category != 'Discontinued';
+}
+
+# Multiple indexes available - optimizer choice
+@setup schema
+snapshot multiple-indexes-choice {
+    SELECT id, sku, name, price
+    FROM products
+    WHERE category = 'Electronics' AND price < 100;
+}
+
+# Join using indexed columns
+@setup schema
+snapshot join-with-index {
+    SELECT o.id, o.order_date, i.quantity
+    FROM orders o
+    JOIN inventory i ON o.id = i.product_id
+    WHERE o.customer_id = 100;
+}
+
+# Subquery with indexed lookup
+@setup schema
+snapshot subquery-with-index {
+    SELECT id, sku, name
+    FROM products
+    WHERE id IN (SELECT product_id FROM inventory WHERE warehouse_id = 1);
+}

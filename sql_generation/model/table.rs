@@ -2,7 +2,7 @@ use std::{fmt::Display, hash::Hash, ops::Deref};
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use turso_core::{numeric::Numeric, types};
+use turso_core::{numeric::Numeric, types, LimboError};
 use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;
@@ -58,6 +58,11 @@ impl Table {
             indexes: vec![],
         }
     }
+
+    /// Returns true if any column has UNIQUE or PRIMARY KEY.
+    pub fn has_any_unique_column(&self) -> bool {
+        self.columns.iter().any(|c| c.has_unique_or_pk())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +86,25 @@ impl PartialEq for Column {
 }
 
 impl Eq for Column {}
+
+impl Column {
+    /// True if this column participates in a UNIQUE or PRIMARY KEY constraint.
+    pub fn has_unique_or_pk(&self) -> bool {
+        self.constraints.iter().any(|c| {
+            matches!(
+                c,
+                ColumnConstraint::Unique(_) | ColumnConstraint::PrimaryKey { .. }
+            )
+        })
+    }
+
+    #[inline]
+    pub fn is_primary_key(&self) -> bool {
+        self.constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
+    }
+}
 
 impl Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -175,8 +199,8 @@ impl Display for SimValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
             types::Value::Null => write!(f, "NULL"),
-            types::Value::Integer(i) => write!(f, "{i}"),
-            types::Value::Float(fl) => write!(f, "{fl}"),
+            types::Value::Numeric(Numeric::Integer(i)) => write!(f, "{i}"),
+            types::Value::Numeric(Numeric::Float(fl)) => write!(f, "{fl}"),
             value @ types::Value::Text(..) => write!(f, "'{value}'"),
             types::Value::Blob(b) => write!(f, "{}", to_sqlite_blob(b)),
         }
@@ -184,17 +208,28 @@ impl Display for SimValue {
 }
 
 impl SimValue {
-    pub const FALSE: Self = SimValue(types::Value::Integer(0));
-    pub const TRUE: Self = SimValue(types::Value::Integer(1));
+    pub const FALSE: Self = SimValue(types::Value::Numeric(Numeric::Integer(0)));
+    pub const TRUE: Self = SimValue(types::Value::Numeric(Numeric::Integer(1)));
     pub const NULL: Self = SimValue(types::Value::Null);
 
     pub fn as_bool(&self) -> bool {
-        Numeric::from(&self.0).try_into_bool().unwrap_or_default()
+        Numeric::from_value(&self.0)
+            .map(|v| v.to_bool())
+            .unwrap_or_default()
     }
 
     #[inline]
     fn is_null(&self) -> bool {
         matches!(self.0, types::Value::Null)
+    }
+
+    pub fn unique_for_type(column_type: &ColumnType, offset: i64) -> Self {
+        match column_type {
+            ColumnType::Integer => SimValue(types::Value::from_i64(offset)),
+            ColumnType::Float => SimValue(types::Value::from_f64(offset as f64)),
+            ColumnType::Text => SimValue(types::Value::Text(format!("u{offset}").into())),
+            ColumnType::Blob => SimValue(types::Value::Blob(format!("u{offset}").into_bytes())),
+        }
     }
 
     // The result of any binary operator is either a numeric value or NULL, except for the || concatenation operator, and the -> and ->> extract operators which can return values of any type.
@@ -250,16 +285,20 @@ impl SimValue {
     }
 
     // TODO: support more operators. Copy the implementation for exec_glob
-    pub fn like_compare(&self, other: &Self, operator: ast::LikeOperator) -> bool {
+    pub fn like_compare(
+        &self,
+        other: &Self,
+        operator: ast::LikeOperator,
+    ) -> Result<bool, LimboError> {
         match operator {
             ast::LikeOperator::Glob => todo!(),
             ast::LikeOperator::Like => {
                 // TODO: support ESCAPE `expr` option in AST
                 // TODO: regex cache
                 types::Value::exec_like(
-                    None,
                     other.0.to_string().as_str(),
                     self.0.to_string().as_str(),
+                    None,
                 )
             }
             ast::LikeOperator::Match => todo!(),
@@ -271,7 +310,7 @@ impl SimValue {
         let new_value = match operator {
             ast::UnaryOperator::BitwiseNot => self.0.exec_bit_not(),
             ast::UnaryOperator::Negative => {
-                SimValue(types::Value::Integer(0))
+                SimValue(types::Value::from_i64(0))
                     .binary_compare(self, ast::Operator::Subtract)
                     .0
             }
@@ -358,8 +397,8 @@ impl From<&ast::Literal> for SimValue {
                     .collect(),
             ),
             ast::Literal::Keyword(keyword) => match keyword.to_uppercase().as_str() {
-                "TRUE" => types::Value::Integer(1),
-                "FALSE" => types::Value::Integer(0),
+                "TRUE" => types::Value::from_i64(1),
+                "FALSE" => types::Value::from_i64(0),
                 "NULL" => types::Value::Null,
                 _ => unimplemented!("Unsupported keyword literal: {}", keyword),
             },
@@ -379,8 +418,8 @@ impl From<&SimValue> for ast::Literal {
     fn from(value: &SimValue) -> Self {
         match &value.0 {
             types::Value::Null => Self::Null,
-            types::Value::Integer(i) => Self::Numeric(i.to_string()),
-            types::Value::Float(f) => Self::Numeric(f.to_string()),
+            types::Value::Numeric(Numeric::Integer(i)) => Self::Numeric(i.to_string()),
+            types::Value::Numeric(Numeric::Float(f)) => Self::Numeric(f.to_string()),
             text @ types::Value::Text(..) => Self::String(escape_singlequotes(&text.to_string())),
             types::Value::Blob(blob) => Self::Blob(hex::encode(blob)),
         }

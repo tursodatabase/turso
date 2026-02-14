@@ -24,6 +24,7 @@ typedef enum
     TURSO_IO = 3,
     TURSO_BUSY = 4,
     TURSO_INTERRUPT = 5,
+    TURSO_BUSY_SNAPSHOT = 6,
     TURSO_ERROR = 127,
     TURSO_MISUSE = 128,
     TURSO_CONSTRAINT = 129,
@@ -31,6 +32,7 @@ typedef enum
     TURSO_DATABASE_FULL = 131,
     TURSO_NOTADB = 132,
     TURSO_CORRUPT = 133,
+    TURSO_IOERR = 134,
 } turso_status_code_t;
 
 // enumeration of value types supported by the database
@@ -96,6 +98,8 @@ typedef struct
  */
 typedef struct
 {
+    /** Parameter which defines who drives the IO - callee or the caller (non-zero parameter value interpreted as async IO) */
+    uint64_t async_io;
     /** Path to the database file or `:memory:`
      * zero-terminated C string
      */
@@ -104,8 +108,21 @@ typedef struct
      * zero-terminated C string or null pointer
      */
     const char *experimental_features;
-    /** Parameter which defines who drives the IO - callee or the caller */
-    bool async_io;
+    /** optional VFS parameter explicitly specifying FS backend for the database.
+     * Available options are:
+     * - "memory": in-memory backend
+     * - "syscall": generic syscall backend
+     * - "io_uring": IO uring (supported only on Linux)
+     */
+    const char *vfs;
+    /** optional encryption cipher
+     * as encryption is experimental - experimental_features must have "encryption" in the list
+     */
+    const char *encryption_cipher;
+    /** optional encryption hexkey
+     * as encryption is experimental - experimental_features must have "encryption" in the list
+     */
+    const char *encryption_hexkey;
 } turso_database_config_t;
 
 /** Setup global database info */
@@ -122,7 +139,9 @@ turso_status_code_t turso_database_new(
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
 
-/** Open database */
+/** Open database
+ *  Can return TURSO_IO result if async_io=true is set
+ */
 turso_status_code_t turso_database_open(
     const turso_database_t *database,
     /** Optional return error parameter (can be null) */
@@ -135,6 +154,9 @@ turso_status_code_t turso_database_connect(
     turso_connection_t **connection,
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
+
+/** Set busy timeout for the connection */
+void turso_connection_set_busy_timeout_ms(const turso_connection_t *self, int64_t timeout_ms);
 
 /** Get autocommit state of the connection */
 bool turso_connection_get_autocommit(const turso_connection_t *self);
@@ -204,9 +226,13 @@ turso_status_code_t turso_statement_run_io(const turso_statement_t *self, const 
 turso_status_code_t turso_statement_reset(const turso_statement_t *self, const char **error_opt_out);
 
 /** Finalize a statement
+ * finalize returns TURSO_DONE if finalization completed
  * This method must be called in the end of statement execution (either successfull or not)
  */
 turso_status_code_t turso_statement_finalize(const turso_statement_t *self, const char **error_opt_out);
+
+/** return amount of row modifications (insert/delete operations) made by the most recent executed statement */
+int64_t turso_statement_n_change(const turso_statement_t *self);
 
 /** Get column count */
 int64_t turso_statement_column_count(const turso_statement_t *self);
@@ -215,6 +241,12 @@ int64_t turso_statement_column_count(const turso_statement_t *self);
  * C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method
  */
 const char *turso_statement_column_name(const turso_statement_t *self, size_t index);
+
+/** Get the column declared type at the index (e.g. "INTEGER", "TEXT", "DATETIME", etc.)
+ * Returns NULL if the column type is not available.
+ * C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method
+ */
+const char *turso_statement_column_decltype(const turso_statement_t *self, size_t index);
 
 /** Get the row value at the the index for a current statement state
  * SAFETY: returned pointers will be valid only until next invocation of statement operation (step, finalize, reset, etc)
@@ -238,7 +270,10 @@ int64_t turso_statement_row_value_int(const turso_statement_t *self, size_t inde
  */
 double turso_statement_row_value_double(const turso_statement_t *self, size_t index);
 
-/** Return named argument position in a statement */
+/** Return named argument position in a statement
+    Return positive integer with 1-indexed position if named parameter was found
+    Return -1 if parameter was not found
+*/
 int64_t turso_statement_named_position(
     const turso_statement_t *self,
     /* zero-terminated C string */

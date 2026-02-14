@@ -1,8 +1,20 @@
-import { expect, test } from 'vitest'
+import { expect, test, afterAll } from 'vitest'
 import { Database, connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js'
+import { MainWorker } from './index-default.js'
+
+afterAll(() => {
+    MainWorker?.terminate();
+})
 
 const localeCompare = (a, b) => a.x.localeCompare(b.x);
 const intCompare = (a, b) => a.x - b.x;
+
+test('open non-sync db', async () => {
+    const db = await connect({ path: 'local.db' });
+    await db.exec("CREATE TABLE t(x)");
+    await db.exec("INSERT INTO t VALUES (1), (2), (3)");
+    expect(await (await db.prepare("SELECT * FROM t").all())).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
+})
 
 test('checkpoint-and-actions', async () => {
     {

@@ -61,7 +61,10 @@ export interface EncryptionOpts {
     // base64 encoded encryption key (must be either 16 or 32 bytes depending on the cipher)
     key: string,
     // encryption cipher algorithm
-    cipher: 'aes256gcm' | 'aes128gcm' | 'chacha20poly1305' | 'aegis256'
+    // - aes256gcm, aes128gcm, chacha20poly1305: 28 reserved bytes
+    // - aegis128l, aegis128x2, aegis128x4: 32 reserved bytes
+    // - aegis256, aegis256x2, aegis256x4: 48 reserved bytes
+    cipher: 'aes256gcm' | 'aes128gcm' | 'chacha20poly1305' | 'aegis128l' | 'aegis128x2' | 'aegis128x4' | 'aegis256' | 'aegis256x2' | 'aegis256x4'
 }
 export interface DatabaseOpts {
     /**
@@ -74,7 +77,7 @@ export interface DatabaseOpts {
      * optional url of the remote database (e.g. libsql://db-org.turso.io)
      * (if omitted - local-only database will be created)
      * 
-     * you can also promide function which will return URL or null
+     * you can also provide function which will return URL or null
      * in this case local database will be created and sync will be "switched-on" whenever the url will return non-empty value
      * note, that all other parameters (like encryption) must be set in advance in order for the "deferred" sync to work properly
      */
@@ -109,8 +112,9 @@ export interface DatabaseOpts {
     tracing?: 'error' | 'warn' | 'info' | 'debug' | 'trace',
     /**
      * optional parameter to enable partial sync for the database
+     * WARNING: This feature is EXPERIMENTAL
      */
-    partialSync?: {
+    partialSyncExperimental?: {
         /* bootstrap strategy configuration
             - prefix strategy loads first N bytes locally at the startup
             - query strategy loads pages touched by the provided SQL statement
@@ -120,8 +124,8 @@ export interface DatabaseOpts {
             (so, if loading page 1 with segment_size=128kb then 32 pages [1..32] will be loaded)
         */
         segmentSize?: number,
-        /* optional parameter which makes sync engine to speculatively load pages which probably will be accessed soon */
-        speculativeLoad?: boolean,
+        /* optional parameter which makes sync engine to prefetch pages which probably will be accessed soon */
+        prefetch?: boolean,
     }
 }
 export interface DatabaseStats {

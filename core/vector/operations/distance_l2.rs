@@ -202,6 +202,9 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
+        // Dense uses simsimd, sparse uses rust impl. These can differ by up to 1e-4
+        // (as demonstrated by prop_vector_distance_l2_rust_vs_simsimd_f32).
+        let tolerance = 1e-4;
         let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
         let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
         let d1 = vector_distance_l2(&v1, &v2).unwrap();
@@ -210,7 +213,7 @@ mod tests {
         let sparse2 = vector_convert(v2, VectorType::Float32Sparse).unwrap();
         let d2 = vector_f32_sparse_distance_l2(sparse1.as_f32_sparse(), sparse2.as_f32_sparse());
 
-        (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-6
+        (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < tolerance
     }
 
     #[quickcheck]

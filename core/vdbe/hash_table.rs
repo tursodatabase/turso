@@ -1,23 +1,23 @@
 use crate::{
     error::LimboError,
-    io::{Buffer, Completion, File, OpenFlags, IO},
+    io::{Buffer, Completion, TempFile, IO},
     io_yield_one,
-    storage::sqlite3_ondisk::{read_varint, write_varint},
+    numeric::Numeric,
+    return_if_io,
+    storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
+    sync::{
+        atomic::{self, AtomicUsize},
+        Arc, RwLock,
+    },
     translate::collate::CollationSeq,
     turso_assert,
     types::{IOCompletions, IOResult, Value, ValueRef},
     CompletionError, Result,
 };
-use parking_lot::RwLock;
 use rapidhash::fast::RapidHasher;
+use std::cmp::{Eq, Ordering};
 use std::hash::Hasher;
-use std::sync::{atomic, Arc};
 use std::{cell::RefCell, collections::VecDeque};
-use std::{
-    cmp::{Eq, Ordering},
-    sync::atomic::AtomicUsize,
-};
-use tempfile;
 use turso_macros::AtomicEnum;
 
 const DEFAULT_SEED: u64 = 1337;
@@ -41,6 +41,15 @@ const FLOAT_HASH: u8 = 2;
 const TEXT_HASH: u8 = 3;
 const BLOB_HASH: u8 = 4;
 
+#[inline]
+/// Hash text case-insensitively without allocation (ASCII-only for SQLite NOCASE).
+/// SQLite's NOCASE collation only considers ASCII case, so to_ascii_lowercase() is correct.
+fn hash_text_nocase(hasher: &mut impl Hasher, text: &str) {
+    for byte in text.bytes() {
+        hasher.write_u8(byte.to_ascii_lowercase());
+    }
+}
+
 /// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
 fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
@@ -51,21 +60,30 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
             ValueRef::Null => {
                 hasher.write_u8(NULL_HASH);
             }
-            ValueRef::Integer(i) => {
-                hasher.write_u8(INT_HASH);
-                hasher.write_i64(*i);
+            ValueRef::Numeric(Numeric::Integer(i)) => {
+                // Hash integers in the same bucket as numerically equivalent REALs so e.g. 10 and 10.0 have the same hash.
+                let f = *i as f64;
+                if (f as i64) == *i && f.is_finite() {
+                    hasher.write_u8(FLOAT_HASH);
+                    let bits = normalized_f64_bits(f);
+                    hasher.write(&bits.to_le_bytes());
+                } else {
+                    // Fallback to the integer domain when the float representation would lose precision.
+                    hasher.write_u8(INT_HASH);
+                    hasher.write_i64(*i);
+                }
             }
-            ValueRef::Float(f) => {
+            ValueRef::Numeric(Numeric::Float(f)) => {
                 hasher.write_u8(FLOAT_HASH);
-                hasher.write(&f.to_le_bytes());
+                let bits = normalized_f64_bits(f64::from(*f));
+                hasher.write(&bits.to_le_bytes());
             }
             ValueRef::Text(text) => {
                 let collation = collations.get(idx).unwrap_or(&CollationSeq::Binary);
                 hasher.write_u8(TEXT_HASH);
                 match collation {
                     CollationSeq::NoCase => {
-                        let lowercase = text.as_str().to_lowercase();
-                        hasher.write(lowercase.as_bytes());
+                        hash_text_nocase(&mut hasher, text.as_str());
                     }
                     CollationSeq::Rtrim => {
                         let trimmed = text.as_str().trim_end();
@@ -83,6 +101,16 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
         }
     }
     hasher.finish()
+}
+
+/// Normalize signed zero so 0.0 and -0.0 hash the same.
+#[inline]
+fn normalized_f64_bits(f: f64) -> u64 {
+    if f == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        f.to_bits()
+    }
 }
 
 /// Check if any of the key values is NULL.
@@ -116,8 +144,9 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
     match (v1, v2) {
         // NULL = NULL is false in SQL (actually NULL, which is falsy)
         (ValueRef::Null, _) | (_, ValueRef::Null) => false,
-        (ValueRef::Integer(i1), ValueRef::Integer(i2)) => i1 == i2,
-        (ValueRef::Float(f1), ValueRef::Float(f2)) => f1 == f2,
+        (ValueRef::Numeric(n1), ValueRef::Numeric(n2)) => {
+            ValueRef::Numeric(n1) == ValueRef::Numeric(n2)
+        }
         (ValueRef::Blob(b1), ValueRef::Blob(b2)) => b1 == b2,
         (ValueRef::Text(t1), ValueRef::Text(t2)) => {
             // Use collation for text comparison
@@ -125,6 +154,28 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
         }
         _ => false,
     }
+}
+
+/// DISTINCT equality: NULLs compare equal to NULL.
+fn values_equal_distinct(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
+    match (v1, v2) {
+        (ValueRef::Null, ValueRef::Null) => true,
+        (ValueRef::Null, _) | (_, ValueRef::Null) => false,
+        _ => values_equal(v1, v2, collation),
+    }
+}
+
+fn keys_equal_distinct(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) -> bool {
+    if key1.len() != key2.len() {
+        return false;
+    }
+    for (idx, (v1, v2)) in key1.iter().zip(key2.iter()).enumerate() {
+        let collation = collations.get(idx).copied().unwrap_or(CollationSeq::Binary);
+        if !values_equal_distinct(v1.as_ref(), *v2, collation) {
+            return false;
+        }
+    }
+    true
 }
 
 /// State machine states for hash table operations.
@@ -184,17 +235,110 @@ impl HashEntry {
     }
 
     /// Get the size of this entry in bytes (approximate).
+    /// This is a lightweight estimate for memory budgeting, not a precise measurement.
     fn size_bytes(&self) -> usize {
+        Self::size_from_values(&self.key_values, &self.payload_values)
+    }
+
+    fn size_from_values(key_values: &[Value], payload_values: &[Value]) -> usize {
         let value_size = |v: &Value| match v {
             Value::Null => 1,
-            Value::Integer(_) => 8,
-            Value::Float(_) => 8,
+            Value::Numeric(_) => 8,
             Value::Text(t) => t.as_str().len(),
             Value::Blob(b) => b.len(),
         };
-        let key_size: usize = self.key_values.iter().map(value_size).sum();
-        let payload_size: usize = self.payload_values.iter().map(value_size).sum();
+        let key_size: usize = key_values.iter().map(value_size).sum();
+        let payload_size: usize = payload_values.iter().map(value_size).sum();
         key_size + payload_size + 8 + 8 // +8 for hash, +8 for rowid
+    }
+
+    /// Calculate the serialized size of a single Value.
+    #[inline]
+    fn value_serialized_size(v: &Value) -> usize {
+        1 + match v {
+            Value::Null => 0,
+            Value::Numeric(_) => 8,
+            Value::Text(t) => {
+                let len = t.as_str().len();
+                varint_len(len as u64) + len
+            }
+            Value::Blob(b) => varint_len(b.len() as u64) + b.len(),
+        }
+    }
+
+    /// Calculate the exact serialized size of this entry.
+    fn serialized_size(&self) -> usize {
+        8 + 8 // hash + rowid
+            + varint_len(self.key_values.len() as u64)
+            + self.key_values.iter().map(Self::value_serialized_size).sum::<usize>()
+            + varint_len(self.payload_values.len() as u64)
+            + self.payload_values.iter().map(Self::value_serialized_size).sum::<usize>()
+    }
+
+    /// Serialize this entry directly to a slice, returns bytes written.
+    /// The caller must ensure the slice is large enough (use serialized_size()).
+    fn serialize_to_slice(&self, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+
+        // Write hash and rowid
+        buf[offset..offset + 8].copy_from_slice(&self.hash.to_le_bytes());
+        offset += 8;
+        buf[offset..offset + 8].copy_from_slice(&self.rowid.to_le_bytes());
+        offset += 8;
+
+        // Write number of keys and key values
+        offset += write_varint(&mut buf[offset..], self.key_values.len() as u64);
+        for value in &self.key_values {
+            offset += Self::serialize_value_to_slice(value, &mut buf[offset..]);
+        }
+
+        // Write number of payload values and payload values
+        offset += write_varint(&mut buf[offset..], self.payload_values.len() as u64);
+        for value in &self.payload_values {
+            offset += Self::serialize_value_to_slice(value, &mut buf[offset..]);
+        }
+
+        offset
+    }
+
+    /// Helper to serialize a single Value directly to a slice. Returns bytes written.
+    #[inline]
+    fn serialize_value_to_slice(value: &Value, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+        match value {
+            Value::Null => {
+                buf[offset] = NULL_HASH;
+                offset += 1;
+            }
+            Value::Numeric(Numeric::Integer(i)) => {
+                buf[offset] = INT_HASH;
+                offset += 1;
+                buf[offset..offset + 8].copy_from_slice(&i.to_le_bytes());
+                offset += 8;
+            }
+            Value::Numeric(Numeric::Float(f)) => {
+                buf[offset] = FLOAT_HASH;
+                offset += 1;
+                buf[offset..offset + 8].copy_from_slice(&f64::from(*f).to_le_bytes());
+                offset += 8;
+            }
+            Value::Text(t) => {
+                buf[offset] = TEXT_HASH;
+                offset += 1;
+                let bytes = t.as_str().as_bytes();
+                offset += write_varint(&mut buf[offset..], bytes.len() as u64);
+                buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+                offset += bytes.len();
+            }
+            Value::Blob(b) => {
+                buf[offset] = BLOB_HASH;
+                offset += 1;
+                offset += write_varint(&mut buf[offset..], b.len() as u64);
+                buf[offset..offset + b.len()].copy_from_slice(b);
+                offset += b.len();
+            }
+        }
+        offset
     }
 
     /// Serialize this entry to bytes for disk storage.
@@ -226,13 +370,13 @@ impl HashEntry {
             Value::Null => {
                 buf.push(NULL_HASH);
             }
-            Value::Integer(i) => {
+            Value::Numeric(Numeric::Integer(i)) => {
                 buf.push(INT_HASH);
                 buf.extend_from_slice(&i.to_le_bytes());
             }
-            Value::Float(f) => {
+            Value::Numeric(Numeric::Float(f)) => {
                 buf.push(FLOAT_HASH);
-                buf.extend_from_slice(&f.to_le_bytes());
+                buf.extend_from_slice(&f64::from(*f).to_le_bytes());
             }
             Value::Text(t) => {
                 buf.push(TEXT_HASH);
@@ -318,7 +462,7 @@ impl HashEntry {
                 let i =
                     i64::from_le_bytes(buf[offset..offset + 8].try_into().expect("expect 8 bytes"));
                 offset += 8;
-                Value::Integer(i)
+                Value::from_i64(i)
             }
             FLOAT_HASH => {
                 if offset + 8 > buf.len() {
@@ -329,7 +473,7 @@ impl HashEntry {
                 let f =
                     f64::from_le_bytes(buf[offset..offset + 8].try_into().expect("expect 8 bytes"));
                 offset += 8;
-                Value::Float(f)
+                Value::from_f64(f)
             }
             TEXT_HASH => {
                 let (str_len, varint_len) = read_varint(&buf[offset..])?;
@@ -339,8 +483,12 @@ impl HashEntry {
                         "HashEntry: buffer too small for text".to_string(),
                     ));
                 }
-                let s = String::from_utf8(buf[offset..offset + str_len as usize].to_vec())
-                    .map_err(|_| LimboError::Corrupt("Invalid UTF-8 in text".to_string()))?;
+                // SAFETY: We serialized this data ourselves, so it should be valid UTF-8.
+                // Skipping validation here for performance in the spill/reload path.
+                // Doing checked utf8 construction here is a massive performance hit.
+                let s = unsafe {
+                    String::from_utf8_unchecked(buf[offset..offset + str_len as usize].to_vec())
+                };
                 offset += str_len as usize;
                 Value::Text(s.into())
             }
@@ -410,20 +558,6 @@ impl HashBucket {
 
     fn size_bytes(&self) -> usize {
         self.entries.iter().map(|e| e.size_bytes()).sum()
-    }
-}
-
-/// Temporary file for spilled partitions.
-struct TempFile {
-    _temp_dir: tempfile::TempDir,
-    file: Arc<dyn File>,
-}
-
-impl core::ops::Deref for TempFile {
-    type Target = Arc<dyn File>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.file
     }
 }
 
@@ -585,6 +719,8 @@ pub struct HashTableConfig {
     pub num_keys: usize,
     /// Collation sequences for each join key.
     pub collations: Vec<CollationSeq>,
+    /// Only spill to a file when != TempStore::Memory
+    pub temp_store: crate::TempStore,
 }
 
 impl Default for HashTableConfig {
@@ -594,6 +730,7 @@ impl Default for HashTableConfig {
             mem_budget: DEFAULT_MEM_BUDGET,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         }
     }
 }
@@ -611,33 +748,14 @@ struct SpillState {
 }
 
 impl SpillState {
-    fn new(io: &Arc<dyn IO>) -> Result<Self> {
+    fn new(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<Self> {
         Ok(SpillState {
             partition_buffers: (0..NUM_PARTITIONS)
                 .map(|_| PartitionBuffer::new())
                 .collect(),
             partitions: Vec::new(),
             next_spill_offset: 0,
-            temp_file: {
-                let temp_dir = tempfile::tempdir()?;
-                let file: Arc<dyn File> = io.open_file(
-                    temp_dir
-                        .as_ref()
-                        .join("hash_join_spill")
-                        .to_str()
-                        .ok_or_else(|| {
-                            LimboError::InternalError(
-                                "temp file path is not valid UTF-8".to_string(),
-                            )
-                        })?,
-                    OpenFlags::Create,
-                    false,
-                )?;
-                TempFile {
-                    _temp_dir: temp_dir,
-                    file,
-                }
-            },
+            temp_file: TempFile::with_temp_store(io, temp_store)?,
         })
     }
 
@@ -654,7 +772,7 @@ impl SpillState {
     }
 }
 
-/// HashTable is the build-side data structure used for hash joins. It behaves like a
+/// HashTable is the build-side data structure used for hash joins and DISTINCT. It behaves like a
 /// standard in-memory hash table until a configurable memory budget is exceeded, at
 /// which point it transparently switches to a grace-hash-join style layout and spills
 /// partitions to disk.
@@ -675,7 +793,7 @@ impl SpillState {
 ///
 /// - Construction:
 ///   - `mem_budget` is an approximate upper bound on memory consumed by the
-///     build side for this join. It applies to:
+///     build side for this join or DISTINCT set. It applies to:
 ///       * `mem_used`: the base in-memory structures (buckets in non-spilled
 ///         mode, plus any never-spilled partitions).
 ///       * `loaded_partitions_mem`: additional resident memory for partitions
@@ -779,6 +897,8 @@ impl SpillState {
 ///     simply updates their position in the LRU without changing the memory
 ///     accounting.
 pub struct HashTable {
+    /// Initial bucket count used to reinitialize after spills.
+    initial_buckets: usize,
     /// The hash buckets (used when not spilled).
     buckets: Vec<HashBucket>,
     /// Number of entries in the table.
@@ -806,11 +926,17 @@ pub struct HashTable {
     spill_state: Option<SpillState>,
     /// Index of current spilled partition being probed
     current_spill_partition_idx: usize,
+    /// Track non-empty buckets for fast clear in distinct/group-by usage.
+    non_empty_buckets: Vec<usize>,
     /// LRU of loaded partitions to cap probe-time memory
     loaded_partitions_lru: RefCell<VecDeque<usize>>,
     /// Memory used by resident (loaded or in-memory) partitions
     loaded_partitions_mem: usize,
+    /// Temp storage mode (memory vs file) for spilled data
+    temp_store: crate::TempStore,
 }
+
+crate::assert::assert_send!(HashTable);
 
 enum SpillAction {
     AlreadyLoaded,
@@ -835,6 +961,7 @@ impl HashTable {
             .map(|_| HashBucket::new())
             .collect();
         Self {
+            initial_buckets: config.initial_buckets,
             buckets,
             num_entries: 0,
             mem_used: 0,
@@ -851,6 +978,8 @@ impl HashTable {
             current_spill_partition_idx: 0,
             loaded_partitions_lru: VecDeque::new().into(),
             loaded_partitions_mem: 0,
+            non_empty_buckets: Vec::new(),
+            temp_store: config.temp_store,
         }
     }
 
@@ -862,6 +991,7 @@ impl HashTable {
     /// Insert a row into the hash table, returns IOResult because this may spill to disk.
     /// When memory budget is exceeded, triggers grace hash join by partitioning and spilling.
     /// Rows with NULL join keys are skipped since NULL != NULL in SQL.
+    /// (This is specific to hash join semantics, not DISTINCT.)
     pub fn insert(
         &mut self,
         key_values: Vec<Value>,
@@ -900,7 +1030,7 @@ impl HashTable {
                 );
                 // First time exceeding budget, trigger spill
                 // Move all existing bucket entries into partition buffers
-                self.spill_state = Some(SpillState::new(&self.io)?);
+                self.spill_state = Some(SpillState::new(&self.io, self.temp_store)?);
                 self.redistribute_to_partitions();
                 self.state = HashTableState::Spilled;
             };
@@ -921,6 +1051,9 @@ impl HashTable {
         } else {
             // Normal mode, insert into hash bucket
             let bucket_idx = (hash as usize) % self.buckets.len();
+            if self.buckets[bucket_idx].entries.is_empty() {
+                self.non_empty_buckets.push(bucket_idx);
+            }
             self.buckets[bucket_idx].insert(entry);
         }
 
@@ -928,6 +1061,156 @@ impl HashTable {
         self.mem_used += entry_size;
 
         Ok(IOResult::Done(()))
+    }
+
+    /// Insert keys into the hash table if not already present.
+    /// Returns true if inserted, false if duplicate found.
+    /// Unlike hash join inserts, DISTINCT keeps NULLs and treats NULL==NULL.
+    pub fn insert_distinct(
+        &mut self,
+        key_values: &[Value],
+        key_refs: &[ValueRef],
+    ) -> Result<IOResult<bool>> {
+        turso_assert!(
+            self.state == HashTableState::Building || self.state == HashTableState::Spilled,
+            "Cannot insert into hash table in state {:?}",
+            self.state
+        );
+
+        let hash = hash_join_key(key_refs, &self.collations);
+
+        if self.spill_state.is_some() {
+            let partition_idx = partition_from_hash(hash);
+            // Check partition buffer for duplicates
+            let has_buffer_dup = {
+                let spill_state = self.spill_state.as_ref().expect("spill state exists");
+                let buffer = &spill_state.partition_buffers[partition_idx];
+                buffer.entries.iter().any(|entry| {
+                    entry.hash == hash
+                        && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
+                })
+            };
+            if has_buffer_dup {
+                return Ok(IOResult::Done(false));
+            }
+
+            // Ensure spilled partition is loaded before checking
+            let has_partition = {
+                let spill_state = self.spill_state.as_ref().expect("spill state exists");
+                spill_state.find_partition(partition_idx).is_some()
+            };
+            if has_partition && !self.is_partition_loaded(partition_idx) {
+                return_if_io!(self.load_spilled_partition(partition_idx));
+            }
+
+            // Check loaded partition for duplicates
+            let has_spilled_dup = 'has_spilled_dup: {
+                let spill_state = self.spill_state.as_ref().expect("spill state exists");
+                let Some(partition) = spill_state.find_partition(partition_idx) else {
+                    break 'has_spilled_dup false;
+                };
+                if partition.buckets.is_empty() {
+                    break 'has_spilled_dup false;
+                }
+                let bucket_idx = (hash as usize) % partition.buckets.len();
+                let bucket = &partition.buckets[bucket_idx];
+                bucket.entries.iter().any(|entry| {
+                    entry.hash == hash
+                        && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
+                })
+            };
+            if has_spilled_dup {
+                return Ok(IOResult::Done(false));
+            }
+
+            let entry_size = HashEntry::size_from_values(key_values, &[]);
+            if let Some(c) = self.spill_partitions_for_entry(entry_size)? {
+                if !c.succeeded() {
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                }
+            }
+
+            {
+                let spill_state = self.spill_state.as_mut().expect("spill state exists");
+                spill_state.partition_buffers[partition_idx].insert(HashEntry::new(
+                    hash,
+                    key_values.to_vec(),
+                    0,
+                ));
+            }
+            self.num_entries += 1;
+            self.mem_used += entry_size;
+            return Ok(IOResult::Done(true));
+        }
+
+        // Non-spilled mode: check main buckets
+        let bucket_idx = (hash as usize) % self.buckets.len();
+        let bucket = &self.buckets[bucket_idx];
+        for entry in &bucket.entries {
+            if entry.hash == hash
+                && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
+            {
+                return Ok(IOResult::Done(false));
+            }
+        }
+
+        let entry_size = HashEntry::size_from_values(key_values, &[]);
+        if self.mem_used + entry_size > self.mem_budget {
+            if self.spill_state.is_none() {
+                self.spill_state = Some(SpillState::new(&self.io, self.temp_store)?);
+                self.redistribute_to_partitions();
+                self.state = HashTableState::Spilled;
+            }
+            return self.insert_distinct(key_values, key_refs);
+        }
+
+        if self.buckets[bucket_idx].entries.is_empty() {
+            self.non_empty_buckets.push(bucket_idx);
+        }
+        self.buckets[bucket_idx].insert(HashEntry::new(hash, key_values.to_vec(), 0));
+        self.num_entries += 1;
+        self.mem_used += entry_size;
+        Ok(IOResult::Done(true))
+    }
+
+    /// Clear all entries and reset spill state.
+    pub fn clear(&mut self) {
+        if self.num_entries == 0 && self.spill_state.is_none() {
+            self.state = HashTableState::Building;
+            self.current_probe_keys = None;
+            self.current_probe_hash = None;
+            self.probe_bucket_idx = 0;
+            self.probe_entry_idx = 0;
+            self.current_spill_partition_idx = 0;
+            self.loaded_partitions_lru.borrow_mut().clear();
+            self.loaded_partitions_mem = 0;
+            self.non_empty_buckets.clear();
+            return;
+        }
+
+        if self.spill_state.is_some() {
+            // Drop spilled partitions and reset buckets.
+            self.spill_state = None;
+            let bucket_count = self.initial_buckets.max(1);
+            self.buckets = (0..bucket_count).map(|_| HashBucket::new()).collect();
+            self.non_empty_buckets.clear();
+        } else {
+            for &idx in &self.non_empty_buckets {
+                self.buckets[idx].entries.clear();
+            }
+            self.non_empty_buckets.clear();
+        }
+
+        self.num_entries = 0;
+        self.mem_used = 0;
+        self.state = HashTableState::Building;
+        self.current_probe_keys = None;
+        self.current_probe_hash = None;
+        self.probe_bucket_idx = 0;
+        self.probe_entry_idx = 0;
+        self.current_spill_partition_idx = 0;
+        self.loaded_partitions_lru.borrow_mut().clear();
+        self.loaded_partitions_mem = 0;
     }
 
     /// Redistribute existing bucket entries into partition buffers for grace hash join.
@@ -958,6 +1241,7 @@ impl HashTable {
     }
 
     /// Spill the given partition buffer to disk and return the pending completion.
+    /// Uses single-pass serialization directly into the I/O buffer to avoid intermediate copies.
     fn spill_partition(&mut self, partition_idx: usize) -> Result<Option<Completion>> {
         let spill_state = self.spill_state.as_mut().expect("Spill state must exist");
         let partition = &spill_state.partition_buffers[partition_idx];
@@ -965,22 +1249,30 @@ impl HashTable {
             return Ok(None);
         }
 
-        // Serialize entries from partition buffer
-        let estimated_size: usize = partition.entries.iter().map(|e| e.size_bytes() + 9).sum();
-        let mut serialized_data = Vec::with_capacity(estimated_size);
-        let mut len_buf = [0u8; 9];
-        let mut entry_buf = Vec::new();
-
+        // Phase 1: Calculate sizes and cache them to avoid recomputation
+        let num_entries = partition.entries.len();
+        let mut entry_sizes = Vec::with_capacity(num_entries);
+        let mut total_size = 0usize;
         for entry in &partition.entries {
-            entry.serialize(&mut entry_buf);
-            let len_varint_size = write_varint(&mut len_buf, entry_buf.len() as u64);
-            serialized_data.extend_from_slice(&len_buf[..len_varint_size]);
-            serialized_data.extend_from_slice(&entry_buf);
-            entry_buf.clear();
+            let entry_size = entry.serialized_size();
+            entry_sizes.push(entry_size);
+            total_size += varint_len(entry_size as u64) + entry_size;
         }
 
+        // Allocate I/O buffer and serialize using cached sizes
+        let buffer = Buffer::new_temporary(total_size);
+        let buf = buffer.as_mut_slice();
+        let mut offset = 0;
+
+        for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
+            offset += write_varint(&mut buf[offset..], entry_size as u64);
+            offset += entry.serialize_to_slice(&mut buf[offset..]);
+        }
+
+        turso_assert!(offset == total_size, "serialized size mismatch");
+
         let file_offset = spill_state.next_spill_offset;
-        let data_size = serialized_data.len();
+        let data_size = total_size;
         let num_entries = spill_state.partition_buffers[partition_idx].entries.len();
         let mem_freed = spill_state.partition_buffers[partition_idx].mem_used;
 
@@ -1000,8 +1292,6 @@ impl HashTable {
 
         io_state.set(SpillIOState::WaitingForWrite);
 
-        let buffer = Buffer::new_temporary(data_size);
-        buffer.as_mut_slice().copy_from_slice(&serialized_data);
         let buffer_ref = Arc::new(buffer);
         let _buffer_ref_clone = buffer_ref.clone();
         let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
@@ -1027,25 +1317,178 @@ impl HashTable {
         Ok(Some(completion))
     }
 
-    /// Spill as many whole partitions as needed to keep the incoming entry within budget.
-    fn spill_partitions_for_entry(&mut self, entry_size: usize) -> Result<Option<Completion>> {
-        loop {
-            if self.mem_used + entry_size <= self.mem_budget {
-                return Ok(None);
+    /// Spill multiple partitions in a single I/O operation.
+    /// This batches the work to reduce syscall overhead when freeing large amounts of memory.
+    fn spill_multiple_partitions(
+        &mut self,
+        partition_indices: &[usize],
+    ) -> Result<Option<Completion>> {
+        if partition_indices.is_empty() {
+            return Ok(None);
+        }
+
+        // If only one partition, use the simpler single-partition path
+        if partition_indices.len() == 1 {
+            return self.spill_partition(partition_indices[0]);
+        }
+
+        let spill_state = self.spill_state.as_mut().expect("Spill state must exist");
+
+        // Phase 1: Calculate total size and per-partition metadata
+        struct PartitionMeta {
+            idx: usize,
+            num_entries: usize,
+            data_size: usize,
+            mem_freed: usize,
+            entry_sizes: Vec<usize>,
+        }
+
+        let mut metas = Vec::with_capacity(partition_indices.len());
+        let mut total_size = 0usize;
+
+        for &partition_idx in partition_indices {
+            let partition = &spill_state.partition_buffers[partition_idx];
+            if partition.is_empty() {
+                continue;
             }
 
-            let required_free = self.mem_used + entry_size - self.mem_budget;
-            let Some(partition_idx) = self.next_partition_to_spill(required_free) else {
-                return Ok(None);
-            };
+            let mut entry_sizes = Vec::with_capacity(partition.entries.len());
+            let mut partition_size = 0usize;
+            for entry in &partition.entries {
+                let entry_size = entry.serialized_size();
+                entry_sizes.push(entry_size);
+                partition_size += varint_len(entry_size as u64) + entry_size;
+            }
 
-            if let Some(c) = self.spill_partition(partition_idx)? {
-                // Wait for caller to re-enter after the I/O completes.
-                if !c.finished() {
-                    return Ok(Some(c));
-                }
+            metas.push(PartitionMeta {
+                idx: partition_idx,
+                num_entries: partition.entries.len(),
+                data_size: partition_size,
+                mem_freed: partition.mem_used,
+                entry_sizes,
+            });
+            total_size += partition_size;
+        }
+
+        if metas.is_empty() {
+            return Ok(None);
+        }
+
+        // Allocate single I/O buffer and serialize all partitions
+        let buffer = Buffer::new_temporary(total_size);
+        let buf = buffer.as_mut_slice();
+        let mut offset = 0;
+        let base_file_offset = spill_state.next_spill_offset;
+
+        // Track where each partition's data starts in the buffer
+        let mut partition_offsets = Vec::with_capacity(metas.len());
+
+        for meta in &metas {
+            partition_offsets.push(offset);
+            let partition = &spill_state.partition_buffers[meta.idx];
+
+            for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
+                offset += write_varint(&mut buf[offset..], entry_size as u64);
+                offset += entry.serialize_to_slice(&mut buf[offset..]);
             }
         }
+
+        turso_assert!(offset == total_size, "serialized size mismatch");
+
+        // Update partition metadata and clear buffers
+        let mut total_mem_freed = 0usize;
+        let mut io_states = Vec::with_capacity(metas.len());
+
+        for (meta, &partition_offset) in metas.iter().zip(partition_offsets.iter()) {
+            let file_offset = base_file_offset + partition_offset as u64;
+
+            spill_state.partition_buffers[meta.idx].clear();
+            total_mem_freed += meta.mem_freed;
+
+            // Find existing partition or create new one
+            let io_state = if let Some(existing) = spill_state.find_partition_mut(meta.idx) {
+                existing.add_chunk(file_offset, meta.data_size, meta.num_entries);
+                existing.io_state.clone()
+            } else {
+                let mut new_partition = SpilledPartition::new(meta.idx);
+                new_partition.add_chunk(file_offset, meta.data_size, meta.num_entries);
+                let io_state = new_partition.io_state.clone();
+                spill_state.partitions.push(new_partition);
+                io_state
+            };
+
+            io_state.set(SpillIOState::WaitingForWrite);
+            io_states.push(io_state);
+        }
+
+        // Submit single I/O write
+        let buffer_ref = Arc::new(buffer);
+        let _buffer_ref_clone = buffer_ref.clone();
+        let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
+            Ok(_) => {
+                let _buf = _buffer_ref_clone.clone();
+                tracing::trace!(
+                    "Successfully wrote {} batched partitions to disk",
+                    io_states.len()
+                );
+                for io_state in &io_states {
+                    io_state.set(SpillIOState::WriteComplete);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Error writing batched partitions to disk: {e:?}");
+                for io_state in &io_states {
+                    io_state.set(SpillIOState::Error);
+                }
+            }
+        });
+
+        let completion = Completion::new_write(write_complete);
+        let file = spill_state.temp_file.file.clone();
+        let completion = file.pwrite(base_file_offset, buffer_ref, completion)?;
+
+        // Update state
+        self.mem_used -= total_mem_freed;
+        spill_state.next_spill_offset += total_size as u64;
+        Ok(Some(completion))
+    }
+
+    /// Spill as many whole partitions as needed to keep the incoming entry within budget.
+    /// Uses batch spilling to combine multiple partitions into a single I/O operation.
+    fn spill_partitions_for_entry(&mut self, entry_size: usize) -> Result<Option<Completion>> {
+        if self.mem_used + entry_size <= self.mem_budget {
+            return Ok(None);
+        }
+
+        // Collect all partitions that need to be spilled
+        let mut partitions_to_spill = Vec::new();
+        let mut projected_mem_used = self.mem_used;
+
+        let spill_state = self.spill_state.as_ref().expect("spill state must exist");
+
+        // Sort partitions by size (largest first) to minimize number of spills
+        let mut candidates: Vec<(usize, usize)> = spill_state
+            .partition_buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.is_empty())
+            .map(|(idx, p)| (idx, p.mem_used))
+            .collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by mem_used
+
+        for (partition_idx, mem_used) in candidates {
+            if projected_mem_used + entry_size <= self.mem_budget {
+                break;
+            }
+            partitions_to_spill.push(partition_idx);
+            projected_mem_used -= mem_used;
+        }
+
+        if partitions_to_spill.is_empty() {
+            return Ok(None);
+        }
+
+        self.spill_multiple_partitions(&partitions_to_spill)
     }
 
     /// Convert a never-spilled partition buffer into in-memory buckets for probing.
@@ -1408,10 +1851,12 @@ impl HashTable {
                                     .extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
                                 buffer_len.fetch_add(bytes_read as usize, atomic::Ordering::SeqCst);
                                 io_state.set(SpillIOState::ReadComplete);
+                                None
                             }
                             Err(e) => {
                                 tracing::error!("Error reading spilled partition chunk: {e:?}");
                                 io_state.set(SpillIOState::Error);
+                                None
                             }
                         },
                     );
@@ -1641,21 +2086,21 @@ mod hashtests {
     fn test_hash_function_consistency() {
         // Test that the same keys produce the same hash
         let keys1 = vec![
-            ValueRef::Integer(42),
+            ValueRef::from_i64(42),
             ValueRef::Text(crate::types::TextRef::new(
                 "hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
         let keys2 = vec![
-            ValueRef::Integer(42),
+            ValueRef::from_i64(42),
             ValueRef::Text(crate::types::TextRef::new(
                 "hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
         let keys3 = vec![
-            ValueRef::Integer(43),
+            ValueRef::from_i64(43),
             ValueRef::Text(crate::types::TextRef::new(
                 "hello",
                 crate::types::TextSubtype::Text,
@@ -1672,17 +2117,41 @@ mod hashtests {
     }
 
     #[test]
+    fn test_hash_function_numeric_equivalence() {
+        let collations = vec![CollationSeq::Binary];
+
+        // Zero variants should hash identically
+        let h_zero = hash_join_key(&[ValueRef::from_f64(0.0)], &collations);
+        let h_neg_zero = hash_join_key(&[ValueRef::from_f64(-0.0)], &collations);
+        let h_int_zero = hash_join_key(&[ValueRef::from_i64(0)], &collations);
+        assert_eq!(h_zero, h_neg_zero);
+        assert_eq!(h_zero, h_int_zero);
+
+        // Integer/float representations of the same numeric value should match
+        let h_ten_int = hash_join_key(&[ValueRef::from_i64(10)], &collations);
+        let h_ten_float = hash_join_key(&[ValueRef::from_f64(10.0)], &collations);
+        assert_eq!(h_ten_int, h_ten_float);
+
+        let h_neg_ten_int = hash_join_key(&[ValueRef::from_i64(-10)], &collations);
+        let h_neg_ten_float = hash_join_key(&[ValueRef::from_f64(-10.0)], &collations);
+        assert_eq!(h_neg_ten_int, h_neg_ten_float);
+
+        // Positive/negative values should still differ
+        assert_ne!(h_ten_int, h_neg_ten_int);
+    }
+
+    #[test]
     fn test_keys_equal() {
-        let key1 = vec![Value::Integer(42), Value::Text("hello".to_string().into())];
+        let key1 = vec![Value::from_i64(42), Value::Text("hello".to_string().into())];
         let key2 = vec![
-            ValueRef::Integer(42),
+            ValueRef::from_i64(42),
             ValueRef::Text(crate::types::TextRef::new(
                 "hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
         let key3 = vec![
-            ValueRef::Integer(43),
+            ValueRef::from_i64(43),
             ValueRef::Text(crate::types::TextRef::new(
                 "hello",
                 crate::types::TextSubtype::Text,
@@ -1702,34 +2171,35 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
         // Insert some entries (late materialization - only store rowids)
-        let key1 = vec![Value::Integer(1)];
+        let key1 = vec![Value::from_i64(1)];
         let _ = ht.insert(key1.clone(), 100, vec![]).unwrap();
 
-        let key2 = vec![Value::Integer(2)];
+        let key2 = vec![Value::from_i64(2)];
         let _ = ht.insert(key2.clone(), 200, vec![]).unwrap();
 
         let _ = ht.finalize_build();
 
         // Probe for key1
-        let result = ht.probe(key1.clone());
+        let result = ht.probe(key1);
         assert!(result.is_some());
         let entry1 = result.unwrap();
-        assert_eq!(entry1.key_values[0].as_ref(), ValueRef::Integer(1));
+        assert_eq!(entry1.key_values[0].as_ref(), ValueRef::from_i64(1));
         assert_eq!(entry1.rowid, 100);
 
         // Probe for key2
         let result = ht.probe(key2);
         assert!(result.is_some());
         let entry2 = result.unwrap();
-        assert_eq!(entry2.key_values[0].as_ref(), ValueRef::Integer(2));
+        assert_eq!(entry2.key_values[0].as_ref(), ValueRef::from_i64(2));
         assert_eq!(entry2.rowid, 200);
 
         // Probe for non-existent key
-        let result = ht.probe(vec![Value::Integer(999)]);
+        let result = ht.probe(vec![Value::from_i64(999)]);
         assert!(result.is_none());
     }
 
@@ -1741,12 +2211,13 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
         // Insert multiple entries (late materialization - only store rowids)
         for i in 0..10 {
-            let key = vec![Value::Integer(i)];
+            let key = vec![Value::from_i64(i)];
             let _ = ht.insert(key, i * 100, vec![]).unwrap();
         }
 
@@ -1754,10 +2225,10 @@ mod hashtests {
 
         // Verify all entries can be found
         for i in 0..10 {
-            let result = ht.probe(vec![Value::Integer(i)]);
+            let result = ht.probe(vec![Value::from_i64(i)]);
             assert!(result.is_some());
             let entry = result.unwrap();
-            assert_eq!(entry.key_values[0].as_ref(), ValueRef::Integer(i));
+            assert_eq!(entry.key_values[0].as_ref(), ValueRef::from_i64(i));
             assert_eq!(entry.rowid, i * 100);
         }
     }
@@ -1770,11 +2241,12 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
         // Insert multiple entries with the same key
-        let key = vec![Value::Integer(42)];
+        let key = vec![Value::from_i64(42)];
         for i in 0..3 {
             let _ = ht.insert(key.clone(), 1000 + i, vec![]).unwrap();
         }
@@ -1782,7 +2254,7 @@ mod hashtests {
         let _ = ht.finalize_build();
 
         // Probe should return first match
-        let result = ht.probe(key.clone());
+        let result = ht.probe(key);
         assert!(result.is_some());
         assert_eq!(result.unwrap().rowid, 1000);
 
@@ -1806,10 +2278,10 @@ mod hashtests {
         let entry = HashEntry::new(
             12345,
             vec![
-                Value::Integer(42),
+                Value::from_i64(42),
                 Value::Text("hello".to_string().into()),
                 Value::Null,
-                Value::Float(std::f64::consts::PI),
+                Value::from_f64(std::f64::consts::PI),
             ],
             100,
         );
@@ -1825,13 +2297,66 @@ mod hashtests {
 
         for (v1, v2) in deserialized.key_values.iter().zip(entry.key_values.iter()) {
             match (v1, v2) {
-                (Value::Integer(i1), Value::Integer(i2)) => assert_eq!(i1, i2),
+                (Value::Numeric(Numeric::Integer(i1)), Value::Numeric(Numeric::Integer(i2))) => {
+                    assert_eq!(i1, i2)
+                }
                 (Value::Text(t1), Value::Text(t2)) => assert_eq!(t1.as_str(), t2.as_str()),
-                (Value::Float(f1), Value::Float(f2)) => assert!((f1 - f2).abs() < 1e-10),
+                (Value::Numeric(Numeric::Float(f1)), Value::Numeric(Numeric::Float(f2))) => {
+                    assert!((f64::from(*f1) - f64::from(*f2)).abs() < 1e-10)
+                }
                 (Value::Null, Value::Null) => {}
                 _ => panic!("Value type mismatch"),
             }
         }
+    }
+
+    #[test]
+    fn test_serialize_to_slice_matches_serialize() {
+        // Test that serialize_to_slice produces identical output to serialize
+        let entry = HashEntry::new_with_payload(
+            12345,
+            vec![
+                Value::from_i64(42),
+                Value::Text("hello world".to_string().into()),
+                Value::Null,
+                Value::from_f64(std::f64::consts::PI),
+            ],
+            100,
+            vec![Value::Blob(vec![1, 2, 3, 4, 5]), Value::from_i64(-999)],
+        );
+
+        // Serialize using the Vec-based method
+        let mut vec_buf = Vec::new();
+        entry.serialize(&mut vec_buf);
+
+        // Serialize using the slice-based method
+        let size = entry.serialized_size();
+        assert_eq!(
+            size,
+            vec_buf.len(),
+            "serialized_size must match actual size"
+        );
+
+        let mut slice_buf = vec![0u8; size];
+        let written = entry.serialize_to_slice(&mut slice_buf);
+        assert_eq!(written, size, "bytes written must match serialized_size");
+
+        // Both methods must produce identical output
+        assert_eq!(
+            vec_buf, slice_buf,
+            "serialize and serialize_to_slice must produce identical output"
+        );
+
+        // Verify the output is valid by deserializing
+        let (deserialized, consumed) = HashEntry::deserialize(&slice_buf).unwrap();
+        assert_eq!(consumed, size);
+        assert_eq!(deserialized.hash, entry.hash);
+        assert_eq!(deserialized.rowid, entry.rowid);
+        assert_eq!(deserialized.key_values.len(), entry.key_values.len());
+        assert_eq!(
+            deserialized.payload_values.len(),
+            entry.payload_values.len()
+        );
     }
 
     #[test]
@@ -1900,6 +2425,30 @@ mod hashtests {
     }
 
     #[test]
+    fn test_hash_nocase_preserves_non_ascii() {
+        use crate::types::{TextRef, TextSubtype};
+
+        // SQLite NOCASE only affects ASCII a-z/A-Z.
+        // Non-ASCII characters like ü should hash identically regardless of case conversion.
+        let keys1 = vec![ValueRef::Text(TextRef::new("über", TextSubtype::Text))];
+        let keys2 = vec![ValueRef::Text(TextRef::new("ÜBER", TextSubtype::Text))];
+
+        // Under NOCASE: ASCII portion differs (b/B), so hashes should differ
+        // (because SQLite NOCASE doesn't handle Unicode case folding)
+        let nocase_coll = vec![CollationSeq::NoCase];
+        let h1 = hash_join_key(&keys1, &nocase_coll);
+        let h2 = hash_join_key(&keys2, &nocase_coll);
+
+        // The 'b' and 'B' will be lowercased to 'b', but the 'ü' and 'Ü' are not
+        // ASCII so they remain as-is. Since ü != Ü at byte level, hashes will differ.
+        // This is correct SQLite NOCASE behavior (ASCII-only case folding).
+        assert_ne!(
+            h1, h2,
+            "non-ASCII chars should not be case-folded by NOCASE"
+        );
+    }
+
+    #[test]
     fn test_values_equal_with_collations() {
         use crate::types::{TextRef, TextSubtype};
 
@@ -1933,7 +2482,7 @@ mod hashtests {
 
     #[test]
     fn test_hash_entry_deserialization_truncated() {
-        let entry = HashEntry::new(123, vec![Value::Integer(1), Value::Text("abc".into())], 42);
+        let entry = HashEntry::new(123, vec![Value::from_i64(1), Value::Text("abc".into())], 42);
 
         let mut buf = Vec::new();
         entry.serialize(&mut buf);
@@ -1950,7 +2499,7 @@ mod hashtests {
 
     #[test]
     fn test_hash_entry_deserialization_garbage_type_tag() {
-        let entry = HashEntry::new(1, vec![Value::Integer(10)], 7);
+        let entry = HashEntry::new(1, vec![Value::from_i64(10)], 7);
         let mut buf = Vec::new();
         entry.serialize(&mut buf);
 
@@ -1973,7 +2522,7 @@ mod hashtests {
     fn insert_many_force_spill(ht: &mut HashTable, start: i64, count: i64) {
         for i in 0..count {
             let rowid = start + i;
-            let key = vec![Value::Integer(rowid)];
+            let key = vec![Value::from_i64(rowid)];
             let _ = ht.insert(key, rowid, vec![]);
         }
     }
@@ -1987,6 +2536,7 @@ mod hashtests {
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -1997,7 +2547,7 @@ mod hashtests {
         assert!(ht.has_spilled(), "hash table should have spilled");
 
         // Pick a key and find its partition
-        let probe_key = vec![Value::Integer(10)];
+        let probe_key = vec![Value::from_i64(10)];
         let partition_idx = ht.partition_for_keys(&probe_key);
 
         // Load that partition into memory
@@ -2026,6 +2576,7 @@ mod hashtests {
             mem_budget: 8 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2036,8 +2587,8 @@ mod hashtests {
         let _ = ht.finalize_build().unwrap();
         assert!(ht.has_spilled());
 
-        let key_a = vec![Value::Integer(1)];
-        let key_b = vec![Value::Integer(10_001)];
+        let key_a = vec![Value::from_i64(1)];
+        let key_b = vec![Value::from_i64(10_001)];
         let pa = ht.partition_for_keys(&key_a);
         let pb = ht.partition_for_keys(&key_b);
         assert_ne!(pa, pb);
@@ -2067,10 +2618,11 @@ mod hashtests {
             mem_budget: 8 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
-        let key = vec![Value::Integer(42)];
+        let key = vec![Value::from_i64(42)];
         for i in 0..1024 {
             match ht.insert(key.clone(), 1000 + i, vec![]).unwrap() {
                 IOResult::Done(()) => {}
@@ -2111,25 +2663,26 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
         // Insert entries with payload values (simulating cached result columns)
-        let key1 = vec![Value::Integer(1)];
+        let key1 = vec![Value::from_i64(1)];
         let payload1 = vec![
             Value::Text("Alice".into()),
-            Value::Integer(30),
-            Value::Float(1000.50),
+            Value::from_i64(30),
+            Value::from_f64(1000.50),
         ];
-        let _ = ht.insert(key1.clone(), 100, payload1.clone()).unwrap();
+        let _ = ht.insert(key1.clone(), 100, payload1).unwrap();
 
-        let key2 = vec![Value::Integer(2)];
+        let key2 = vec![Value::from_i64(2)];
         let payload2 = vec![
             Value::Text("Bob".into()),
-            Value::Integer(25),
-            Value::Float(2000.75),
+            Value::from_i64(25),
+            Value::from_f64(2000.75),
         ];
-        let _ = ht.insert(key2.clone(), 200, payload2.clone()).unwrap();
+        let _ = ht.insert(key2.clone(), 200, payload2).unwrap();
 
         let _ = ht.finalize_build();
 
@@ -2141,8 +2694,8 @@ mod hashtests {
         assert!(entry1.has_payload());
         assert_eq!(entry1.payload_values.len(), 3);
         assert_eq!(entry1.payload_values[0], Value::Text("Alice".into()));
-        assert_eq!(entry1.payload_values[1], Value::Integer(30));
-        assert_eq!(entry1.payload_values[2], Value::Float(1000.50));
+        assert_eq!(entry1.payload_values[1], Value::from_i64(30));
+        assert_eq!(entry1.payload_values[2], Value::from_f64(1000.50));
 
         let result = ht.probe(key2);
         assert!(result.is_some());
@@ -2150,8 +2703,8 @@ mod hashtests {
         assert_eq!(entry2.rowid, 200);
         assert!(entry2.has_payload());
         assert_eq!(entry2.payload_values[0], Value::Text("Bob".into()));
-        assert_eq!(entry2.payload_values[1], Value::Integer(25));
-        assert_eq!(entry2.payload_values[2], Value::Float(2000.75));
+        assert_eq!(entry2.payload_values[1], Value::from_i64(25));
+        assert_eq!(entry2.payload_values[2], Value::from_f64(2000.75));
     }
 
     #[test]
@@ -2162,11 +2715,12 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
         // Insert entry with NULL values in payload
-        let key = vec![Value::Integer(1)];
+        let key = vec![Value::from_i64(1)];
         let payload = vec![Value::Null, Value::Text("test".into()), Value::Null];
         let _ = ht.insert(key.clone(), 100, payload).unwrap();
 
@@ -2191,19 +2745,20 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 2,
             collations: vec![CollationSeq::Binary, CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
         // Insert entry with NULL key - should be silently skipped
-        let null_key = vec![Value::Null, Value::Integer(1)];
+        let null_key = vec![Value::Null, Value::from_i64(1)];
         let _ = ht.insert(null_key.clone(), 100, vec![]).unwrap();
 
         // Insert entry with non-NULL keys
-        let valid_key = vec![Value::Integer(1), Value::Integer(2)];
+        let valid_key = vec![Value::from_i64(1), Value::from_i64(2)];
         let _ = ht.insert(valid_key.clone(), 200, vec![]).unwrap();
 
         // Insert another entry where second key is NULL
-        let null_key2 = vec![Value::Integer(1), Value::Null];
+        let null_key2 = vec![Value::from_i64(1), Value::Null];
         let _ = ht.insert(null_key2.clone(), 300, vec![]).unwrap();
 
         let _ = ht.finalize_build();
@@ -2233,13 +2788,14 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
         // Insert entry with blob payload
-        let key = vec![Value::Integer(1)];
+        let key = vec![Value::from_i64(1)];
         let blob_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let payload = vec![Value::Blob(blob_data.clone()), Value::Integer(42)];
+        let payload = vec![Value::Blob(blob_data.clone()), Value::from_i64(42)];
         let _ = ht.insert(key.clone(), 100, payload).unwrap();
 
         let _ = ht.finalize_build();
@@ -2249,7 +2805,7 @@ mod hashtests {
         let entry = result.unwrap();
         assert_eq!(entry.payload_values.len(), 2);
         assert_eq!(entry.payload_values[0], Value::Blob(blob_data));
-        assert_eq!(entry.payload_values[1], Value::Integer(42));
+        assert_eq!(entry.payload_values[1], Value::from_i64(42));
     }
 
     #[test]
@@ -2260,30 +2816,31 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
         // Insert multiple entries with the same key but different payloads
-        let key = vec![Value::Integer(42)];
+        let key = vec![Value::from_i64(42)];
         let _ = ht
             .insert(
                 key.clone(),
                 100,
-                vec![Value::Text("first".into()), Value::Integer(1)],
+                vec![Value::Text("first".into()), Value::from_i64(1)],
             )
             .unwrap();
         let _ = ht
             .insert(
                 key.clone(),
                 200,
-                vec![Value::Text("second".into()), Value::Integer(2)],
+                vec![Value::Text("second".into()), Value::from_i64(2)],
             )
             .unwrap();
         let _ = ht
             .insert(
                 key.clone(),
                 300,
-                vec![Value::Text("third".into()), Value::Integer(3)],
+                vec![Value::Text("third".into()), Value::from_i64(3)],
             )
             .unwrap();
 
@@ -2295,18 +2852,18 @@ mod hashtests {
         let entry1 = result.unwrap();
         assert_eq!(entry1.rowid, 100);
         assert_eq!(entry1.payload_values[0], Value::Text("first".into()));
-        assert_eq!(entry1.payload_values[1], Value::Integer(1));
+        assert_eq!(entry1.payload_values[1], Value::from_i64(1));
 
         // next_match should return subsequent matches with their payloads
         let entry2 = ht.next_match().unwrap();
         assert_eq!(entry2.rowid, 200);
         assert_eq!(entry2.payload_values[0], Value::Text("second".into()));
-        assert_eq!(entry2.payload_values[1], Value::Integer(2));
+        assert_eq!(entry2.payload_values[1], Value::from_i64(2));
 
         let entry3 = ht.next_match().unwrap();
         assert_eq!(entry3.rowid, 300);
         assert_eq!(entry3.payload_values[0], Value::Text("third".into()));
-        assert_eq!(entry3.payload_values[1], Value::Integer(3));
+        assert_eq!(entry3.payload_values[1], Value::from_i64(3));
 
         // No more matches
         assert!(ht.next_match().is_none());
@@ -2317,12 +2874,12 @@ mod hashtests {
         // Test that payload values survive serialization/deserialization
         let entry = HashEntry::new_with_payload(
             12345,
-            vec![Value::Integer(1), Value::Text("key".into())],
+            vec![Value::from_i64(1), Value::Text("key".into())],
             100,
             vec![
                 Value::Text("payload_text".into()),
-                Value::Integer(999),
-                Value::Float(std::f64::consts::PI),
+                Value::from_i64(999),
+                Value::from_f64(std::f64::consts::PI),
                 Value::Null,
                 Value::Blob(vec![1, 2, 3, 4]),
             ],
@@ -2338,7 +2895,7 @@ mod hashtests {
         assert_eq!(deserialized.hash, entry.hash);
         assert_eq!(deserialized.rowid, entry.rowid);
         assert_eq!(deserialized.key_values.len(), 2);
-        assert_eq!(deserialized.key_values[0], Value::Integer(1));
+        assert_eq!(deserialized.key_values[0], Value::from_i64(1));
         assert_eq!(deserialized.key_values[1], Value::Text("key".into()));
 
         // Verify payload values
@@ -2347,10 +2904,10 @@ mod hashtests {
             deserialized.payload_values[0],
             Value::Text("payload_text".into())
         );
-        assert_eq!(deserialized.payload_values[1], Value::Integer(999));
+        assert_eq!(deserialized.payload_values[1], Value::from_i64(999));
         assert_eq!(
             deserialized.payload_values[2],
-            Value::Float(std::f64::consts::PI)
+            Value::from_f64(std::f64::consts::PI)
         );
         assert_eq!(deserialized.payload_values[3], Value::Null);
         assert_eq!(
@@ -2362,7 +2919,7 @@ mod hashtests {
     #[test]
     fn test_hash_entry_empty_payload() {
         // Test that entries without payload work correctly
-        let entry = HashEntry::new(12345, vec![Value::Integer(1)], 100);
+        let entry = HashEntry::new(12345, vec![Value::from_i64(1)], 100);
 
         assert!(!entry.has_payload());
         assert!(entry.payload_values.is_empty());
@@ -2379,15 +2936,15 @@ mod hashtests {
 
     #[test]
     fn test_hash_entry_size_includes_payload() {
-        let entry_no_payload = HashEntry::new(12345, vec![Value::Integer(1)], 100);
+        let entry_no_payload = HashEntry::new(12345, vec![Value::from_i64(1)], 100);
 
         let entry_with_payload = HashEntry::new_with_payload(
             12345,
-            vec![Value::Integer(1)],
+            vec![Value::from_i64(1)],
             100,
             vec![
                 Value::Text("a]long payload string".into()),
-                Value::Integer(42),
+                Value::from_i64(42),
             ],
         );
 

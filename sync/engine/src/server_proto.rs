@@ -14,18 +14,26 @@ pub enum PageUpdatesEncodingReq {
 
 #[derive(prost::Message)]
 pub struct PullUpdatesReqProtoBody {
+    /// requested encoding of the pages
     #[prost(enumeration = "PageUpdatesEncodingReq", tag = "1")]
     pub encoding: i32,
+    /// revision of the requested pages on server side; can be None - in which case server will pick latest revision
     #[prost(string, tag = "2")]
     pub server_revision: String,
+    /// client revision
     #[prost(string, tag = "3")]
     pub client_revision: String,
+    /// timeout to wait for new changes before returning empty response; used only if client_revision is set and server_revision is not
     #[prost(uint32, tag = "4")]
     pub long_poll_timeout_ms: u32,
+    /// server pages to select for sending; empty set will be interpreted as request for all pages
+    /// if not empty - then server_pages_selector holds bytes for RoaringBitmap with bits set for pages to return
     #[prost(bytes, tag = "5")]
     pub server_pages_selector: Bytes,
+    /// server query which select pages for sending
     #[prost(string, tag = "7")]
     pub server_query_selector: String,
+    /// client pages
     #[prost(bytes, tag = "6")]
     pub client_pages: Bytes,
 }
@@ -55,6 +63,7 @@ pub struct PageSetZstdEncodingProto {
 pub struct PullUpdatesRespProtoBody {
     #[prost(string, tag = "1")]
     pub server_revision: String,
+    // db size in pages (e.g. for 4kb db file db_size equals to 1)
     #[prost(uint64, tag = "2")]
     pub db_size: u64,
     #[prost(optional, message, tag = "3")]

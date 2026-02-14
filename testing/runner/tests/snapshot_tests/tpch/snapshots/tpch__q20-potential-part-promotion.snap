@@ -1,0 +1,170 @@
+---
+source: tpch.sqltest
+expression: |-
+  select
+          s_name,
+          s_address
+      from
+          supplier,
+          nation
+      where
+          s_suppkey in (
+              select
+                  ps_suppkey
+              from
+                  partsupp
+              where
+                  ps_partkey in (
+                      select
+                          p_partkey
+                      from
+                          part
+                      where
+                          p_name like 'frosted%'
+                  )
+                  and ps_availqty > (
+                      select
+                          0.5 * sum(l_quantity)
+                      from
+                          lineitem
+                      where
+                          l_partkey = ps_partkey
+                          and l_suppkey = ps_suppkey
+                          and l_shipdate >= '1994-01-01'
+                          and l_shipdate < '1995-01-01'
+                  )
+          )
+          and s_nationkey = n_nationkey
+          and n_name = 'IRAN'
+      order by
+          s_name;
+info:
+  statement_type: SELECT
+  tables:
+  - lineitem
+  - part
+  - partsupp
+  - supplier
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN part
+|--SCAN partsupp
+|--SCAN lineitem
+|--SCAN supplier
+|--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
+`--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode           p1   p2  p3  p4                                     p5  comment
+   0    Init            0  102   0                                          0  Start at 102
+   1    OpenEphemeral   1    0   0                                          0  cursor=1 is_table=false
+   2    Once           13    0   0                                          0  goto 13
+   3    OpenEphemeral   0    0   0                                          0  cursor=0 is_table=false
+   4    OpenRead        2    4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
+   5    Rewind          2   13   0                                          0  Rewind table part
+   6      Column        2    1   5                                          0  r[5]=part.p_name
+   7      Function      1    4   3  like(2)                                 0  r[3]=func(r[4..5])
+   8      IfNot         3   12   1                                          0  if !r[3] goto 12
+   9      RowId         2    2   0                                          0  r[2]=part.rowid
+  10      MakeRecord    2    1   6                                          0  r[6]=mkrec(r[2..2]); for ephemeral_index_where_sub_t5
+  11      IdxInsert     0    6   0                                          8  key=r[6]
+  12    Next            2    6   0                                          0
+  13    OpenRead        3    6   0  k(6,B,B,B,B,B)                          0  table=partsupp, root=6, iDb=0
+  14    Rewind          3   64   0                                          0  Rewind table partsupp
+  15      BeginSubrtn   8    0   0                                          0  r[8]=NULL
+  16      Null          0    1   0                                          0  r[1]=NULL
+  17      Null          0   10   0                                          0  r[10]=NULL
+  18      Integer       1   11   0                                          0  r[11]=1; LIMIT counter
+  19      IfNot        11   35   0                                          0  if !r[11] goto 35
+  20      OpenRead      4   10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+  21      Rewind        4   35   0                                          0  Rewind table lineitem
+  22        Column      4    1  13                                          0  r[13]=lineitem.l_partkey
+  23        Column      3    0  14                                          0  r[14]=partsupp.ps_partkey
+  24        Ne         13   14  34  Binary                                  0  if r[13]!=r[14] goto 34
+  25        Column      4    2  16                                          0  r[16]=lineitem.l_suppkey
+  26        Column      3    1  17                                          0  r[17]=partsupp.ps_suppkey
+  27        Ne         16   17  34  Binary                                  0  if r[16]!=r[17] goto 34
+  28        Column      4   10  19                                          0  r[19]=lineitem.l_shipdate
+  29        Lt         19   20  34  Binary                                  0  if r[19]<r[20] goto 34
+  30        Column      4   10  22                                          0  r[22]=lineitem.l_shipdate
+  31        Ge         22   23  34  Binary                                  0  if r[22]>=r[23] goto 34
+  32        Column      4    4  24                                          0  r[24]=lineitem.l_quantity
+  33        AggStep     0   24  10  sum                                     0  accum=r[10] step(r[24])
+  34      Next          4   22   0                                          0
+  35      AggFinal      0   10   0  sum                                     0  accum=r[10]
+  36      Copy         10   26   0                                          0  r[26]=r[10]
+  37      Multiply     25   26   9                                          0  r[9]=r[25]*r[26]
+  38      Copy          9    1   0                                          0  r[1]=r[9]
+  39    Return          8    0   1                                          0
+  40    Integer         0   27   0                                          0  r[27]=0
+  41    Column          3    0  28                                          0  r[28]=partsupp.ps_partkey
+  42    Affinity       28    1   0                                          0  r[28..29] = D
+  43    NotFound        0   45  28                                          0  if not found goto 45
+  44    Goto            0   51   0                                          0
+  45    Rewind          0   53   0                                          0  Rewind  ephemeral_index_where_sub_t5
+  46      Column        0    0  29                                          0  r[29]=ephemeral_index_where_sub_t5.p_partkey
+  47      Ne           28   29  49  Binary                                  0  if r[28]!=r[29] goto 49
+  48      Goto          0   55   0                                          0
+  49    Next            0   46   0                                          0
+  50    Goto            0   53   0                                          0
+  51    Integer         1   27   0                                          0  r[27]=1
+  52    Goto            0   56   0                                          0
+  53    Integer         0   27   0                                          0  r[27]=0
+  54    Goto            0   56   0                                          0
+  55    Null            0   27   0                                          0  r[27]=NULL
+  56    IfNot          27   63   1                                          0  if !r[27] goto 63
+  57    Column          3    2  31                                          0  r[31]=partsupp.ps_availqty
+  58    Copy            1   32   0                                          0  r[32]=r[1]
+  59    Le             31   32  63  Binary                                  0  if r[31]<=r[32] goto 63
+  60    Column          3    1   7                                          0  r[7]=partsupp.ps_suppkey
+  61    MakeRecord      7    1  33                                          0  r[33]=mkrec(r[7..7]); for ephemeral_index_where_sub_t3
+  62    IdxInsert       1   33   0                                          8  key=r[33]
+  63  Next              3   15   0                                          0
+  64  SorterOpen        5    1   0  k(1,B)                                  0  cursor=5
+  65  OpenRead          6    5   0  k(7,B,B,B,B,B,B,B)                      0  table=supplier, root=5, iDb=0
+  66  OpenRead          7    2   0  k(4,B,B,B,B)                            0  table=nation, root=2, iDb=0
+  67  Rewind            6   94   0                                          0  Rewind table supplier
+  68    Integer         0   37   0                                          0  r[37]=0
+  69    RowId           6   38   0                                          0  r[38]=supplier.rowid
+  70    Affinity       38    1   0                                          0  r[38..39] = D
+  71    NotFound        1   73  38                                          0  if not found goto 73
+  72    Goto            0   79   0                                          0
+  73    Rewind          1   81   0                                          0  Rewind  ephemeral_index_where_sub_t3
+  74      Column        1    0  39                                          0  r[39]=ephemeral_index_where_sub_t3.ps_suppkey
+  75      Ne           38   39  77  Binary                                  0  if r[38]!=r[39] goto 77
+  76      Goto          0   83   0                                          0
+  77    Next            1   74   0                                          0
+  78    Goto            0   81   0                                          0
+  79    Integer         1   37   0                                          0  r[37]=1
+  80    Goto            0   84   0                                          0
+  81    Integer         0   37   0                                          0  r[37]=0
+  82    Goto            0   84   0                                          0
+  83    Null            0   37   0                                          0  r[37]=NULL
+  84    IfNot          37   93   1                                          0  if !r[37] goto 93
+  85    Column          6    3  40                                          0  r[40]=supplier.s_nationkey
+  86    SeekRowid       7   40  93                                          0  if (r[40]!=cursor 7 for table nation.rowid) goto 93
+  87    Column          7    1  42                                          0  r[42]=nation.n_name
+  88    Ne             42   43  93  Binary                                  0  if r[42]!=r[43] goto 93
+  89    Column          6    1  44                                          0  r[44]=supplier.s_name
+  90    Column          6    2  45                                          0  r[45]=supplier.s_address
+  91    MakeRecord     44    2  36                                          0  r[36]=mkrec(r[44..45])
+  92    SorterInsert    5   36   0  0                                       0  key=r[36]
+  93  Next              6   68   0                                          0
+  94  OpenPseudo        8   36   2                                          0  2 columns in r[36]
+  95  SorterSort        5  101   0                                          0
+  96    SorterData      5   36   8                                          0  r[36]=data
+  97    Column          8    0  34                                          0  r[34]=pseudo.column 0
+  98    Column          8    1  35                                          0  r[35]=pseudo.column 1
+  99    ResultRow      34    2   0                                          0  output=r[34..35]
+ 100  SorterNext        5   96   0                                          0
+ 101  Halt              0    0   0                                          0
+ 102  Transaction       0    1   8                                          0  iDb=0 tx_mode=Read
+ 103  String8           0    4   0  frosted%                                0  r[4]='frosted%'
+ 104  String8           0   20   0  1994-01-01                              0  r[20]='1994-01-01'
+ 105  String8           0   23   0  1995-01-01                              0  r[23]='1995-01-01'
+ 106  Real              0   25   0  0.5                                     0  r[25]=0.5
+ 107  String8           0   43   0  IRAN                                    0  r[43]='IRAN'
+ 108  Goto              0    1   0                                          0

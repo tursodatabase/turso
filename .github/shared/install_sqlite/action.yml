@@ -1,12 +1,12 @@
 name: "Install SQLite"
-description: "Downloads SQLite directly from https://sqlite.org"
+description: "Installs sqlite3 CLI for compat tests that invoke it as a subprocess (make test-compat)"
 
 runs:
   using: "composite"
   steps:
     - name: Install SQLite
       env:
-        SQLITE_VERSION: "3490100"
+        SQLITE_VERSION: "3510100"
         YEAR: 2025
       run: |
         curl -o /tmp/sqlite.zip https://sqlite.org/$YEAR/sqlite-tools-linux-x64-$SQLITE_VERSION.zip > /dev/null

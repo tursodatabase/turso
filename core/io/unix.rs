@@ -1,9 +1,10 @@
 use super::{Completion, File, OpenFlags, IO};
 use crate::error::LimboError;
-use crate::io::clock::{Clock, DefaultClock, Instant};
+use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
+use crate::io::FileSyncType;
 use crate::Result;
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{self, FlockOperation},
@@ -26,8 +27,12 @@ impl UnixIO {
 }
 
 impl Clock for UnixIO {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 
@@ -77,14 +82,7 @@ fn try_pwritev_raw(
             )
         }
     } else {
-        unsafe {
-            libc::pwritev(
-                fd,
-                iov.as_ptr(),
-                iov.len() as i32,
-                off as libc::off_t,
-            )
-        }
+        unsafe { libc::pwritev(fd, iov.as_ptr(), iov.len() as i32, off as libc::off_t) }
     };
     if n < 0 {
         Err(std::io::Error::last_os_error())
@@ -110,8 +108,10 @@ impl IO for UnixIO {
         let unix_file = Arc::new(UnixFile {
             file: Arc::new(Mutex::new(file)),
         });
-        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
-            unix_file.lock_file(!flags.contains(OpenFlags::ReadOnly))?;
+        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+            && !flags.contains(OpenFlags::ReadOnly)
+        {
+            unix_file.lock_file(true)?;
         }
         Ok(unix_file)
     }
@@ -310,18 +310,22 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
         let file = self.file.lock();
 
         let result = unsafe {
-            #[cfg(not(target_vendor = "apple"))]
-            {
-                libc::fsync(file.as_raw_fd())
-            }
-
             #[cfg(target_vendor = "apple")]
             {
-                libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
+                match sync_type {
+                    FileSyncType::Fsync => libc::fsync(file.as_raw_fd()),
+                    FileSyncType::FullFsync => libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC),
+                }
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                // FullFsync has no effect on non-Apple platforms
+                let _ = sync_type;
+                libc::fsync(file.as_raw_fd())
             }
         };
 
@@ -329,11 +333,13 @@ impl File for UnixFile {
             let e = std::io::Error::last_os_error();
             Err(e.into())
         } else {
+            #[cfg(target_vendor = "apple")]
+            match sync_type {
+                FileSyncType::FullFsync => trace!("fcntl(F_FULLFSYNC)"),
+                FileSyncType::Fsync => trace!("fsync"),
+            }
             #[cfg(not(target_vendor = "apple"))]
             trace!("fsync");
-
-            #[cfg(target_vendor = "apple")]
-            trace!("fcntl(F_FULLSYNC)");
 
             c.complete(0);
             Ok(c)

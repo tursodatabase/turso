@@ -1,6 +1,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use turso_core::types::Text;
+use std::time::Duration;
+
+use turso_core::{types::Text, IOResult};
 use turso_sdk_kit_macros::signature;
 
 use crate::rsapi::{
@@ -67,7 +69,8 @@ pub extern "C" fn turso_database_open(
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match database.open() {
-        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Ok(IOResult::Done(..)) => c::turso_status_code_t::TURSO_OK,
+        Ok(IOResult::IO(..)) => c::turso_status_code_t::TURSO_IO,
         Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
@@ -89,6 +92,20 @@ pub extern "C" fn turso_database_connect(
             c::turso_status_code_t::TURSO_OK
         }
         Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_connection_set_busy_timeout_ms(
+    connection: *const c::turso_connection_t,
+    timeout_ms: i64,
+) {
+    if timeout_ms < 0 {
+        return;
+    }
+    if let Ok(connection) = unsafe { TursoConnection::ref_from_capi(connection) } {
+        connection.set_busy_timeout(Duration::from_millis(timeout_ms as u64));
     }
 }
 
@@ -218,7 +235,7 @@ pub extern "C" fn turso_statement_execute(
         Ok(statement) => statement,
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
-    match statement.execute() {
+    match statement.execute(None) {
         Ok(result) => {
             if !rows_changed.is_null() {
                 unsafe { *rows_changed = result.rows_changed };
@@ -239,7 +256,7 @@ pub extern "C" fn turso_statement_step(
         Ok(statement) => statement,
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
-    match statement.step() {
+    match statement.step(None) {
         Ok(status) => status.to_capi(),
         Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
@@ -271,10 +288,20 @@ pub extern "C" fn turso_statement_finalize(
         Ok(statement) => statement,
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
-    match statement.finalize() {
+    match statement.finalize(None) {
         Ok(status) => status.to_capi(),
         Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_statement_n_change(statement: *const c::turso_statement_t) -> i64 {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(_) => return 0,
+    };
+    statement.n_change()
 }
 
 #[no_mangle]
@@ -306,6 +333,22 @@ pub extern "C" fn turso_statement_column_count(statement: *const c::turso_statem
 
 #[no_mangle]
 #[signature(c)]
+pub extern "C" fn turso_statement_column_decltype(
+    statement: *const c::turso_statement_t,
+    index: usize,
+) -> *const std::ffi::c_char {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(_) => return std::ptr::null(),
+    };
+    match statement.column_decltype(index) {
+        Some(decltype) => str_to_c_string(&decltype),
+        None => std::ptr::null(),
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
 pub extern "C" fn turso_statement_row_value_kind(
     statement: *const c::turso_statement_t,
     index: usize,
@@ -317,8 +360,12 @@ pub extern "C" fn turso_statement_row_value_kind(
     let value = statement.row_value(index);
     match value {
         Ok(turso_core::ValueRef::Null) => c::turso_type_t::TURSO_TYPE_NULL,
-        Ok(turso_core::ValueRef::Integer(..)) => c::turso_type_t::TURSO_TYPE_INTEGER,
-        Ok(turso_core::ValueRef::Float(..)) => c::turso_type_t::TURSO_TYPE_REAL,
+        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(..))) => {
+            c::turso_type_t::TURSO_TYPE_INTEGER
+        }
+        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Float(..))) => {
+            c::turso_type_t::TURSO_TYPE_REAL
+        }
         Ok(turso_core::ValueRef::Text(..)) => c::turso_type_t::TURSO_TYPE_TEXT,
         Ok(turso_core::ValueRef::Blob(..)) => c::turso_type_t::TURSO_TYPE_BLOB,
         Err(_) => c::turso_type_t::TURSO_TYPE_UNKNOWN,
@@ -373,7 +420,7 @@ pub extern "C" fn turso_statement_row_value_int(
     };
     let value = statement.row_value(index);
     match value {
-        Ok(turso_core::ValueRef::Integer(value)) => value,
+        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(value))) => value,
         _ => 0,
     }
 }
@@ -390,7 +437,7 @@ pub extern "C" fn turso_statement_row_value_double(
     };
     let value = statement.row_value(index);
     match value {
-        Ok(turso_core::ValueRef::Float(value)) => value,
+        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Float(value))) => f64::from(value),
         _ => 0.0,
     }
 }
@@ -452,7 +499,7 @@ pub extern "C" fn turso_statement_bind_positional_int(
         Ok(statement) => statement,
         Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
-    match statement.bind_positional(position, turso_core::Value::Integer(value)) {
+    match statement.bind_positional(position, turso_core::Value::from_i64(value)) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
         Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
@@ -469,7 +516,7 @@ pub extern "C" fn turso_statement_bind_positional_double(
         Ok(statement) => statement,
         Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
-    match statement.bind_positional(position, turso_core::Value::Float(value)) {
+    match statement.bind_positional(position, turso_core::Value::from_f64(value)) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
         Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
@@ -491,7 +538,11 @@ pub extern "C" fn turso_statement_bind_positional_text(
         Ok(text) => text,
         Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
-    match statement.bind_positional(position, turso_core::Value::Text(Text::new(text))) {
+    // we can't guarantee lifetime for the provided text - so we explicitly copy it to the owned string
+    match statement.bind_positional(
+        position,
+        turso_core::Value::Text(Text::new(text.to_string())),
+    ) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
         Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
@@ -558,10 +609,10 @@ pub fn value_from_c_value(stmt: *mut c::turso_statement_t, index: usize) -> turs
             c::turso_type_t::TURSO_TYPE_UNKNOWN => panic!("unknown value kind"),
             c::turso_type_t::TURSO_TYPE_NULL => turso_core::Value::Null,
             c::turso_type_t::TURSO_TYPE_INTEGER => {
-                turso_core::Value::Integer(turso_statement_row_value_int(stmt, index))
+                turso_core::Value::from_i64(turso_statement_row_value_int(stmt, index))
             }
             c::turso_type_t::TURSO_TYPE_REAL => {
-                turso_core::Value::Float(turso_statement_row_value_double(stmt, index))
+                turso_core::Value::from_f64(turso_statement_row_value_double(stmt, index))
             }
             c::turso_type_t::TURSO_TYPE_TEXT => {
                 let ptr = turso_statement_row_value_bytes_ptr(stmt, index);
@@ -594,9 +645,9 @@ mod tests {
             turso_statement_bind_positional_blob, turso_statement_bind_positional_double,
             turso_statement_bind_positional_int, turso_statement_bind_positional_null,
             turso_statement_bind_positional_text, turso_statement_column_count,
-            turso_statement_deinit, turso_statement_execute, turso_statement_named_position,
-            turso_statement_run_io, turso_statement_step, turso_status_code_t, turso_str_deinit,
-            turso_version,
+            turso_statement_deinit, turso_statement_execute, turso_statement_n_change,
+            turso_statement_named_position, turso_statement_run_io, turso_statement_step,
+            turso_status_code_t, turso_str_deinit, turso_version,
         },
         value_from_c_value,
     };
@@ -633,8 +684,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -653,8 +703,7 @@ mod tests {
             let path = CString::new("not/existing/path").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -663,7 +712,7 @@ mod tests {
             let mut error = std::ptr::null();
             let status = turso_database_open(db, &mut error);
 
-            assert_eq!(status, turso_status_code_t::TURSO_ERROR);
+            assert_eq!(status, turso_status_code_t::TURSO_IOERR);
             assert_eq!(
                 std::ffi::CStr::from_ptr(error).to_str().unwrap(),
                 "I/O error: entity not found"
@@ -679,8 +728,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -704,8 +752,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -727,6 +774,7 @@ mod tests {
                 std::ptr::null_mut(),
             );
             assert_eq!(status, turso_status_code_t::TURSO_OK);
+            assert_eq!(turso_statement_n_change(statement), 0);
 
             turso_statement_deinit(statement);
             turso_connection_deinit(connection);
@@ -740,8 +788,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -781,8 +828,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -826,10 +872,77 @@ mod tests {
             assert_eq!(status, turso_status_code_t::TURSO_ERROR);
             assert_eq!(
                 std::ffi::CStr::from_ptr(error).to_str().unwrap(),
-                "Parse error: Table t already exists"
+                "Parse error: table t already exists"
             );
 
             turso_str_deinit(error);
+
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_db_stmt_insert() {
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let status = turso_database_open(db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let mut connection = std::ptr::null_mut();
+            let status = turso_database_connect(db, &mut connection, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let ddl = c"CREATE TABLE t(x)";
+            let mut statement = std::ptr::null_mut();
+            let status = turso_connection_prepare_single(
+                connection,
+                ddl.as_ptr(),
+                &mut statement,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            loop {
+                let status =
+                    turso_statement_execute(statement, std::ptr::null_mut(), std::ptr::null_mut());
+                if status == turso_status_code_t::TURSO_DONE {
+                    break;
+                }
+                let status = turso_statement_run_io(statement, std::ptr::null_mut());
+                assert_eq!(status, turso_status_code_t::TURSO_DONE);
+            }
+            turso_statement_deinit(statement);
+
+            let dml = c"INSERT INTO t VALUES (1), (2), (3)";
+            let mut statement = std::ptr::null_mut();
+            let status = turso_connection_prepare_single(
+                connection,
+                dml.as_ptr(),
+                &mut statement,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            loop {
+                let status =
+                    turso_statement_execute(statement, std::ptr::null_mut(), std::ptr::null_mut());
+                if status == turso_status_code_t::TURSO_DONE {
+                    break;
+                }
+                let status = turso_statement_run_io(statement, std::ptr::null_mut());
+                assert_eq!(status, turso_status_code_t::TURSO_DONE);
+            }
+            assert_eq!(turso_statement_n_change(statement), 3);
+            turso_statement_deinit(statement);
 
             turso_connection_deinit(connection);
             turso_database_deinit(db);
@@ -842,8 +955,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -895,8 +1007,8 @@ mod tests {
                 collected,
                 vec![
                     turso_core::Value::Null,
-                    turso_core::Value::Integer(2),
-                    turso_core::Value::Float(2.71),
+                    turso_core::Value::from_i64(2),
+                    turso_core::Value::from_f64(2.71),
                     turso_core::Value::Text(Text::new("5")),
                     turso_core::Value::Blob(vec![6]),
                 ]
@@ -910,8 +1022,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -992,8 +1103,8 @@ mod tests {
                 collected,
                 vec![
                     turso_core::Value::Null,
-                    turso_core::Value::Integer(2),
-                    turso_core::Value::Float(2.71),
+                    turso_core::Value::from_i64(2),
+                    turso_core::Value::from_f64(2.71),
                     turso_core::Value::Text(Text::new("5")),
                     turso_core::Value::Blob(vec![6]),
                 ]
@@ -1007,8 +1118,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -1034,14 +1144,14 @@ mod tests {
             assert_eq!(
                 turso_statement_bind_positional_null(
                     statement,
-                    turso_statement_named_position(statement, c"e".as_ptr()) as usize
+                    turso_statement_named_position(statement, c":e".as_ptr()) as usize
                 ),
                 turso_status_code_t::TURSO_OK
             );
             assert_eq!(
                 turso_statement_bind_positional_int(
                     statement,
-                    turso_statement_named_position(statement, c"d".as_ptr()) as usize,
+                    turso_statement_named_position(statement, c":d".as_ptr()) as usize,
                     2
                 ),
                 turso_status_code_t::TURSO_OK
@@ -1049,7 +1159,7 @@ mod tests {
             assert_eq!(
                 turso_statement_bind_positional_double(
                     statement,
-                    turso_statement_named_position(statement, c"c".as_ptr()) as usize,
+                    turso_statement_named_position(statement, c":c".as_ptr()) as usize,
                     2.71
                 ),
                 turso_status_code_t::TURSO_OK
@@ -1058,7 +1168,7 @@ mod tests {
             assert_eq!(
                 turso_statement_bind_positional_text(
                     statement,
-                    turso_statement_named_position(statement, c"b".as_ptr()) as usize,
+                    turso_statement_named_position(statement, c":b".as_ptr()) as usize,
                     text.as_ptr() as *const std::ffi::c_char,
                     text.len()
                 ),
@@ -1068,7 +1178,7 @@ mod tests {
             assert_eq!(
                 turso_statement_bind_positional_blob(
                     statement,
-                    turso_statement_named_position(statement, c"a".as_ptr()) as usize,
+                    turso_statement_named_position(statement, c":a".as_ptr()) as usize,
                     blob.as_ptr(),
                     blob.len()
                 ),
@@ -1105,8 +1215,8 @@ mod tests {
                 collected,
                 vec![
                     turso_core::Value::Null,
-                    turso_core::Value::Integer(2),
-                    turso_core::Value::Float(2.71),
+                    turso_core::Value::from_i64(2),
+                    turso_core::Value::from_f64(2.71),
                     turso_core::Value::Text(Text::new("5")),
                     turso_core::Value::Blob(vec![6]),
                 ]

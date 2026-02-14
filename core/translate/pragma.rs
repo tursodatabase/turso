@@ -1,13 +1,16 @@
 //! VDBE bytecode generation for pragma statements.
 //! More info: https://www.sqlite.org/pragma.html.
 
+use crate::sync::Arc;
 use chrono::Datelike;
-use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
-use super::integrity_check::translate_integrity_check;
+use super::integrity_check::{
+    translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
+};
+use crate::function::Func;
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
 use crate::storage::encryption::{CipherMode, EncryptionKey};
@@ -20,7 +23,7 @@ use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
+use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Numeric, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -30,6 +33,17 @@ fn list_pragmas(program: &mut ProgramBuilder) {
         program.emit_result_row(register, 1);
     }
     program.add_pragma_result_column("pragma_list".into());
+}
+
+/// Parse max_errors from an optional value expression.
+/// Returns the parsed integer if value is a numeric literal, otherwise returns the default.
+fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
+    match value {
+        Some(Expr::Literal(Literal::Numeric(n))) => {
+            n.parse::<usize>().unwrap_or(MAX_INTEGRITY_CHECK_ERRORS)
+        }
+        _ => MAX_INTEGRITY_CHECK_ERRORS,
+    }
 }
 
 pub fn translate_pragma(
@@ -58,16 +72,19 @@ pub fn translate_pragma(
     };
 
     let (mut program, mode) = match body {
-        None => query_pragma(pragma, resolver.schema, None, pager, connection, program)?,
+        None => query_pragma(pragma, resolver, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
-            PragmaName::TableInfo | PragmaName::TableXinfo => query_pragma(
-                pragma,
-                resolver.schema,
-                Some(*value),
-                pager,
-                connection,
-                program,
-            )?,
+            // These pragmas take a parameter but are queries, not setters
+            PragmaName::IndexInfo
+            | PragmaName::IndexXinfo
+            | PragmaName::IndexList
+            | PragmaName::TableList
+            | PragmaName::TableInfo
+            | PragmaName::TableXinfo
+            | PragmaName::IntegrityCheck
+            | PragmaName::QuickCheck => {
+                query_pragma(pragma, resolver, Some(*value), pager, connection, program)?
+            }
             _ => update_pragma(pragma, resolver, *value, pager, connection, program)?,
         },
     };
@@ -113,8 +130,8 @@ fn update_pragma(
         PragmaName::ApplicationId => {
             let data = parse_signed_number(&value)?;
             let app_id_value = match data {
-                Value::Integer(i) => i as i32,
-                Value::Float(f) => f as i32,
+                Value::Numeric(Numeric::Integer(i)) => i as i32,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
                 _ => bail_parse_error!("expected integer, got {:?}", data),
             };
 
@@ -129,8 +146,8 @@ fn update_pragma(
         PragmaName::BusyTimeout => {
             let data = parse_signed_number(&value)?;
             let busy_timeout_ms = match data {
-                Value::Integer(i) => i as i32,
-                Value::Float(f) => f as i32,
+                Value::Numeric(Numeric::Integer(i)) => i as i32,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
                 _ => bail_parse_error!("expected integer, got {:?}", data),
             };
             let busy_timeout_ms = busy_timeout_ms.max(0);
@@ -139,11 +156,16 @@ fn update_pragma(
         }
         PragmaName::CacheSize => {
             let cache_size = match parse_signed_number(&value)? {
-                Value::Integer(size) => size,
-                Value::Float(size) => size as i64,
+                Value::Numeric(Numeric::Integer(size)) => size,
+                Value::Numeric(Numeric::Float(size)) => f64::from(size) as i64,
                 _ => bail_parse_error!("Invalid value for cache size pragma"),
             };
             update_cache_size(cache_size, pager, connection)?;
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::CacheSpill => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.get_pager().set_spill_enabled(enabled);
             Ok((program, TransactionMode::None))
         }
         PragmaName::Encoding => {
@@ -163,6 +185,7 @@ fn update_pragma(
                 dest: result_reg,
                 new_mode: Some(mode_str),
             });
+
             program.emit_result_row(result_reg, 1);
             program.add_pragma_result_column("journal_mode".into());
             Ok((program, TransactionMode::None))
@@ -170,7 +193,7 @@ fn update_pragma(
         PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
-            resolver.schema,
+            resolver,
             Some(value),
             pager,
             connection,
@@ -179,7 +202,7 @@ fn update_pragma(
         PragmaName::ModuleList => Ok((program, TransactionMode::None)),
         PragmaName::PageCount => query_pragma(
             PragmaName::PageCount,
-            resolver.schema,
+            resolver,
             None,
             pager,
             connection,
@@ -188,8 +211,8 @@ fn update_pragma(
         PragmaName::MaxPageCount => {
             let data = parse_signed_number(&value)?;
             let max_page_count_value = match data {
-                Value::Integer(i) => i as usize,
-                Value::Float(f) => f as usize,
+                Value::Numeric(Numeric::Integer(i)) => i as usize,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as usize,
                 _ => unreachable!(),
             };
 
@@ -206,8 +229,8 @@ fn update_pragma(
         PragmaName::UserVersion => {
             let data = parse_signed_number(&value)?;
             let version_value = match data {
-                Value::Integer(i) => i as i32,
-                Value::Float(f) => f as i32,
+                Value::Numeric(Numeric::Integer(i)) => i as i32,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
                 _ => unreachable!(),
             };
 
@@ -239,8 +262,8 @@ fn update_pragma(
         }
         PragmaName::PageSize => {
             let page_size = match parse_signed_number(&value)? {
-                Value::Integer(size) => size,
-                Value::Float(size) => size as i64,
+                Value::Numeric(Numeric::Integer(size)) => size,
+                Value::Numeric(Numeric::Float(size)) => f64::from(size) as i64,
                 _ => bail_parse_error!("Invalid value for page size pragma"),
             };
             update_page_size(connection, page_size as u32)?;
@@ -323,6 +346,7 @@ fn update_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
+        PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             // todo(sivukhin): ideally, we should consistently update capture_data_changes connection flag only after successfull execution of schema change statement
@@ -342,7 +366,7 @@ fn update_pragma(
                         ast::CreateTableBody::ColumnsAndConstraints {
                             columns: turso_cdc_table_columns(),
                             constraints: vec![],
-                            options: ast::TableOptions::NONE,
+                            options: ast::TableOptions::empty(),
                         },
                         program,
                         &connection,
@@ -353,9 +377,13 @@ fn update_pragma(
             Ok((program, TransactionMode::Write))
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
+        PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
+        PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
+        PragmaName::IndexList => unreachable!("index_list cannot be set"),
+        PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
-            resolver.schema,
+            resolver,
             Some(value),
             pager,
             connection,
@@ -363,7 +391,7 @@ fn update_pragma(
         ),
         PragmaName::FreelistCount => query_pragma(
             PragmaName::FreelistCount,
-            resolver.schema,
+            resolver,
             Some(value),
             pager,
             connection,
@@ -383,9 +411,23 @@ fn update_pragma(
         }
         PragmaName::Synchronous => {
             use crate::SyncMode;
-            let mode = match parse_pragma_enabled(&value) {
-                true => SyncMode::Full,
-                false => SyncMode::Off,
+            let mode = if let Expr::Literal(Literal::Numeric(n)) = &value {
+                match n.as_str() {
+                    "0" => SyncMode::Off,
+                    "1" => SyncMode::Normal,
+                    _ => SyncMode::Full, // SQLite defaults to NORMAL for invalid values, but we want to default to a higher durability level so deviating here.
+                }
+            } else {
+                let name_bytes = match &value {
+                    Expr::Literal(Literal::Keyword(name)) => name.as_bytes(),
+                    Expr::Name(name) | Expr::Id(name) => name.as_str().as_bytes(),
+                    _ => b"",
+                };
+                match_ignore_ascii_case!(match name_bytes {
+                    b"OFF" | b"0" => SyncMode::Off,
+                    b"NORMAL" | b"1" => SyncMode::Normal,
+                    _ => SyncMode::Full,
+                })
             };
             connection.set_sync_mode(mode);
             Ok((program, TransactionMode::None))
@@ -397,7 +439,7 @@ fn update_pragma(
         }
         PragmaName::MvccCheckpointThreshold => {
             let threshold = match parse_signed_number(&value)? {
-                Value::Integer(size) if size >= -1 => size,
+                Value::Numeric(Numeric::Integer(size)) if size >= -1 => size,
                 _ => bail_parse_error!(
                     "mvcc_checkpoint_threshold must be -1, 0, or a positive integer"
                 ),
@@ -411,17 +453,71 @@ fn update_pragma(
             connection.set_foreign_keys_enabled(enabled);
             Ok((program, TransactionMode::None))
         }
+        PragmaName::IgnoreCheckConstraints => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_check_constraints_ignored(enabled);
+            Ok((program, TransactionMode::None))
+        }
+        #[cfg(target_vendor = "apple")]
+        PragmaName::Fullfsync => {
+            let enabled = parse_pragma_enabled(&value);
+            let sync_type = if enabled {
+                crate::io::FileSyncType::FullFsync
+            } else {
+                crate::io::FileSyncType::Fsync
+            };
+            connection.set_sync_type(sync_type);
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::TempStore => {
+            use crate::TempStore;
+            // Try to parse as a string first (default, file, memory)
+            let temp_store = if let Expr::Literal(Literal::Numeric(n)) = &value {
+                // Numeric value: 0, 1, or 2
+                match n.as_str() {
+                    "0" => TempStore::Default,
+                    "1" => TempStore::File,
+                    "2" => TempStore::Memory,
+                    _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
+                }
+            } else {
+                // Try as keyword/identifier: DEFAULT, FILE, MEMORY
+                let name_bytes = match &value {
+                    Expr::Literal(Literal::Keyword(name)) => name.as_bytes(),
+                    Expr::Name(name) | Expr::Id(name) => name.as_str().as_bytes(),
+                    Expr::Literal(Literal::String(s)) => s.as_bytes(),
+                    _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
+                };
+                match_ignore_ascii_case!(match name_bytes {
+                    b"DEFAULT" | b"0" => TempStore::Default,
+                    b"FILE" | b"1" => TempStore::File,
+                    b"MEMORY" | b"2" => TempStore::Memory,
+                    _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
+                })
+            };
+            connection.set_temp_store(temp_store);
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::FunctionList => query_pragma(
+            PragmaName::FunctionList,
+            resolver,
+            Some(value),
+            pager,
+            connection,
+            program,
+        ),
     }
 }
 
 fn query_pragma(
     pragma: PragmaName,
-    schema: &Schema,
+    resolver: &Resolver,
     value: Option<ast::Expr>,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<(ProgramBuilder, TransactionMode)> {
+    let schema = resolver.schema;
     let register = program.alloc_register();
     match pragma {
         PragmaName::ApplicationId => {
@@ -442,6 +538,13 @@ fn query_pragma(
         }
         PragmaName::CacheSize => {
             program.emit_int(connection.get_cache_size() as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::CacheSpill => {
+            let spill_enabled = connection.get_pager().get_spill_enabled();
+            program.emit_int(spill_enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))
@@ -516,6 +619,9 @@ fn query_pragma(
                 dest: register,
             });
             program.emit_result_row(register, 3);
+            program.add_pragma_result_column("busy".to_string());
+            program.add_pragma_result_column("log".to_string());
+            program.add_pragma_result_column("checkpointed".to_string());
             Ok((program, TransactionMode::None))
         }
         PragmaName::ModuleList => {
@@ -526,6 +632,49 @@ fn query_pragma(
             }
 
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::FunctionList => {
+            // 6 columns: name, builtin, type, enc, narg, flags
+            let base_reg = register;
+            program.alloc_registers(5);
+
+            const SQLITE_DETERMINISTIC: i64 = 0x800;
+            const SQLITE_INNOCUOUS: i64 = 0x200000;
+
+            // Built-in functions
+            for entry in Func::builtin_function_list() {
+                let mut flags: i64 = 0;
+                if entry.deterministic {
+                    flags |= SQLITE_DETERMINISTIC;
+                }
+                flags |= SQLITE_INNOCUOUS;
+
+                program.emit_string8(entry.name, base_reg);
+                program.emit_int(1, base_reg + 1); // builtin = 1
+                program.emit_string8(entry.func_type.to_string(), base_reg + 2);
+                program.emit_string8("utf8".to_string(), base_reg + 3);
+                program.emit_int(entry.narg as i64, base_reg + 4);
+                program.emit_int(flags, base_reg + 5);
+                program.emit_result_row(base_reg, 6);
+            }
+
+            // External (extension) functions
+            for (name, is_agg, argc) in connection.get_syms_functions() {
+                let func_type = if is_agg { "a" } else { "s" };
+                program.emit_string8(name, base_reg);
+                program.emit_int(0, base_reg + 1); // builtin = 0
+                program.emit_string8(func_type.to_string(), base_reg + 2);
+                program.emit_string8("utf8".to_string(), base_reg + 3);
+                program.emit_int(argc as i64, base_reg + 4);
+                program.emit_int(0, base_reg + 5); // flags = 0 for extensions
+                program.emit_result_row(base_reg, 6);
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
             Ok((program, TransactionMode::None))
         }
         PragmaName::PageCount => {
@@ -546,6 +695,232 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::Read))
+        }
+        PragmaName::IndexInfo => {
+            let index_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 3 columns: seqno, cid, name
+            program.alloc_registers(2);
+
+            if let Some(index_name) = index_name {
+                let index = schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
+
+                if let Some(index) = index {
+                    for (seqno, col) in index.columns.iter().enumerate() {
+                        program.emit_int(seqno as i64, base_reg);
+                        program.emit_int(col.pos_in_table as i64, base_reg + 1);
+                        program.emit_string8(col.name.clone(), base_reg + 2);
+                        program.emit_result_row(base_reg, 3);
+                    }
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::IndexXinfo => {
+            let index_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 6 columns: seqno, cid, name, desc, coll, key
+            program.alloc_registers(5);
+
+            if let Some(index_name) = index_name {
+                let index = schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
+
+                if let Some(index) = index {
+                    for (seqno, col) in index.columns.iter().enumerate() {
+                        let desc = matches!(col.order, ast::SortOrder::Desc);
+                        let coll = col
+                            .collation
+                            .map(|c| c.to_string().to_uppercase())
+                            .unwrap_or_else(|| "BINARY".to_string());
+
+                        program.emit_int(seqno as i64, base_reg);
+                        program.emit_int(col.pos_in_table as i64, base_reg + 1);
+                        program.emit_string8(col.name.clone(), base_reg + 2);
+                        program.emit_int(desc as i64, base_reg + 3);
+                        program.emit_string8(coll, base_reg + 4);
+                        program.emit_int(1, base_reg + 5); // key column
+                        program.emit_result_row(base_reg, 6);
+                    }
+
+                    // Emit trailing rowid row if the index has one
+                    if index.has_rowid {
+                        let seqno = index.columns.len();
+                        program.emit_int(seqno as i64, base_reg);
+                        program.emit_int(-1, base_reg + 1);
+                        program.emit_string8(String::new(), base_reg + 2);
+                        program.emit_int(0, base_reg + 3);
+                        program.emit_string8("BINARY".to_string(), base_reg + 4);
+                        program.emit_int(0, base_reg + 5); // not a key column
+                        program.emit_result_row(base_reg, 6);
+                    }
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::IndexList => {
+            let table_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 5 columns: seq, name, unique, origin, partial
+            program.alloc_registers(4);
+
+            if let Some(table_name) = table_name {
+                if let Some(table) = schema.get_table(&table_name) {
+                    let pk_cols: Vec<String> = table
+                        .btree()
+                        .map(|bt| {
+                            bt.primary_key_columns
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    for (seq, index) in schema.get_indices(&table_name).enumerate() {
+                        let origin = if index.name.starts_with("sqlite_autoindex_") {
+                            let idx_cols: Vec<&str> =
+                                index.columns.iter().map(|c| c.name.as_str()).collect();
+                            if idx_cols.len() == pk_cols.len()
+                                && idx_cols
+                                    .iter()
+                                    .zip(pk_cols.iter())
+                                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                            {
+                                "pk"
+                            } else {
+                                "u"
+                            }
+                        } else {
+                            "c"
+                        };
+
+                        program.emit_int(seq as i64, base_reg);
+                        program.emit_string8(index.name.clone(), base_reg + 1);
+                        program.emit_int(index.unique as i64, base_reg + 2);
+                        program.emit_string8(origin.to_string(), base_reg + 3);
+                        program.emit_int(index.where_clause.is_some() as i64, base_reg + 4);
+                        program.emit_result_row(base_reg, 5);
+                    }
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::TableList => {
+            let name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 6 columns: schema, name, type, ncol, wr, strict
+            program.alloc_registers(5);
+
+            let emit_table_row = |program: &mut ProgramBuilder,
+                                  name: &str,
+                                  obj_type: &str,
+                                  ncol: usize,
+                                  wr: bool,
+                                  strict: bool| {
+                program.emit_string8("main".to_string(), base_reg);
+                program.emit_string8(name.to_string(), base_reg + 1);
+                program.emit_string8(obj_type.to_string(), base_reg + 2);
+                program.emit_int(ncol as i64, base_reg + 3);
+                program.emit_int(wr as i64, base_reg + 4);
+                program.emit_int(strict as i64, base_reg + 5);
+                program.emit_result_row(base_reg, 6);
+            };
+
+            if let Some(name) = name {
+                // Specific table/view lookup
+                if let Some(table) = schema.get_table(&name) {
+                    let (wr, strict) = match table.btree() {
+                        Some(bt) => (!bt.has_rowid, bt.is_strict),
+                        None => (false, false),
+                    };
+                    emit_table_row(
+                        &mut program,
+                        table.get_name(),
+                        "table",
+                        table.columns().len(),
+                        wr,
+                        strict,
+                    );
+                } else if let Some(view) = schema.get_view(&name) {
+                    emit_table_row(
+                        &mut program,
+                        &view.name,
+                        "view",
+                        view.columns.len(),
+                        false,
+                        false,
+                    );
+                }
+            } else {
+                // List all tables and views (only BTree tables, not built-in virtual tables)
+                for table in schema.tables.values() {
+                    let Some(bt) = table.btree() else {
+                        continue;
+                    };
+                    emit_table_row(
+                        &mut program,
+                        &bt.name,
+                        "table",
+                        bt.columns.len(),
+                        !bt.has_rowid,
+                        bt.is_strict,
+                    );
+                }
+                for view in schema.views.values() {
+                    emit_table_row(
+                        &mut program,
+                        &view.name,
+                        "view",
+                        view.columns.len(),
+                        false,
+                        false,
+                    );
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
         }
         PragmaName::TableInfo => {
             let name = match value {
@@ -632,7 +1007,7 @@ fn query_pragma(
                 pager
                     .io
                     .block(|| pager.with_header(|header| header.page_size.get()))
-                    .unwrap_or(connection.get_page_size().get()) as i64,
+                    .unwrap_or_else(|_| connection.get_page_size().get()) as i64,
                 register,
             );
             program.emit_result_row(register, 1);
@@ -657,7 +1032,13 @@ fn query_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::IntegrityCheck => {
-            translate_integrity_check(schema, &mut program)?;
+            let max_errors = parse_max_errors_from_value(&value);
+            translate_integrity_check(schema, &mut program, resolver, max_errors)?;
+            Ok((program, TransactionMode::Read))
+        }
+        PragmaName::QuickCheck => {
+            let max_errors = parse_max_errors_from_value(&value);
+            translate_quick_check(schema, &mut program, resolver, max_errors)?;
             Ok((program, TransactionMode::Read))
         }
         PragmaName::UnstableCaptureDataChangesConn => {
@@ -767,6 +1148,31 @@ fn query_pragma(
             let enabled = connection.foreign_keys_enabled();
             let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::IgnoreCheckConstraints => {
+            let ignored = connection.check_constraints_ignored();
+            let register = program.alloc_register();
+            program.emit_int(ignored as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        #[cfg(target_vendor = "apple")]
+        PragmaName::Fullfsync => {
+            let enabled = connection.get_sync_type() == crate::io::FileSyncType::FullFsync;
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::TempStore => {
+            let temp_store = connection.get_temp_store();
+            let register = program.alloc_register();
+            program.emit_int(temp_store as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))

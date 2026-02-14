@@ -1,4 +1,4 @@
-import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-wasm-common"
+import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from "@tursodatabase/database-wasm-common"
 import { DatabasePromise } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, initThreadPool, MainWorker, Database as NativeDatabase } from "./index-bundle.js";
@@ -46,11 +46,33 @@ class Database extends DatabasePromise {
     #worker: Worker | null;
     constructor(opts: DatabaseOpts) {
         if (opts.url == null) {
-            super(new NativeDatabase(opts.path, { tracing: opts.tracing }) as any);
+            super(
+                new NativeDatabase(opts.path, { tracing: opts.tracing }) as any,
+                () => ioNotifier.waitForCompletion(),
+            );
             this.#engine = null;
             return;
         }
 
+        let partialSyncOpts = undefined;
+        if (opts.partialSyncExperimental != null) {
+            switch (opts.partialSyncExperimental.bootstrapStrategy.kind) {
+                case "prefix":
+                    partialSyncOpts = {
+                        bootstrapStrategy: { type: "Prefix", length: opts.partialSyncExperimental.bootstrapStrategy.length },
+                        segmentSize: opts.partialSyncExperimental.segmentSize,
+                        prefetch: opts.partialSyncExperimental.prefetch,
+                    };
+                    break;
+                case "query":
+                    partialSyncOpts = {
+                        bootstrapStrategy: { type: "Query", query: opts.partialSyncExperimental.bootstrapStrategy.query },
+                        segmentSize: opts.partialSyncExperimental.segmentSize,
+                        prefetch: opts.partialSyncExperimental.prefetch,
+                    };
+                    break;
+            }
+        }
         const engine = new SyncEngine({
             path: opts.path,
             clientName: opts.clientName,
@@ -60,6 +82,7 @@ class Database extends DatabasePromise {
             tracing: opts.tracing,
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
             remoteEncryption: opts.remoteEncryption?.cipher,
+            partialSyncOpts: partialSyncOpts
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);
@@ -92,7 +115,7 @@ class Database extends DatabasePromise {
         const memory = db.memory;
         const io = memory ? memoryIO() : BrowserIO;
         const run = runner(runOpts, io, engine);
-        super(engine.db() as unknown as any, () => run.wait());
+        super(db, () => run.wait());
 
         this.#runner = run;
         this.#engine = engine;
@@ -106,6 +129,14 @@ class Database extends DatabasePromise {
         if (this.connected) {
             return;
         } else if (this.#engine == null) {
+            if (!this.memory) {
+                const worker = await init();
+                await Promise.all([
+                    registerFileAtWorker(worker, this.name),
+                    registerFileAtWorker(worker, `${this.name}-wal`)
+                ]);
+                this.#worker = worker;
+            }
             await super.connect();
         } else {
             if (!this.memory) {

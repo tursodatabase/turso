@@ -25,6 +25,8 @@ typedef enum
 // sync engine IO HTTP request fields
 typedef struct
 {
+    // optional url extracted from the saved configuration of metadata file
+    turso_slice_ref_t url;
     // method name slice (e.g. GET, POST, etc)
     turso_slice_ref_t method;
     // method path slice
@@ -101,6 +103,9 @@ typedef struct
 {
     // path to the main database file (auxilary files like metadata, WAL, revert, changes will derive names from this path)
     const char *path;
+    // optional remote url (libsql://..., https://... or http://...)
+    // this URL will be saved in the database metadata file in order to be able to reuse it if later client will be constructed without explicit remote url
+    const char *remote_url;
     // arbitrary client name which will be used as a prefix for unique client id
     const char *client_name;
     // long poll timeout for pull method (if not zero, server will hold connection for the given timeout until new changes will appear)
@@ -116,9 +121,13 @@ typedef struct
     // optional parameter which defines segment size for lazy loading from remote server
     // one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
     size_t partial_bootstrap_segment_size;
-    // optional parameter which defines if speculative pages load must be enabled
+    // optional parameter which defines if pages prefetch must be enabled
     // one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
-    bool partial_bootstrap_speculative_load;
+    bool partial_bootstrap_prefetch;
+    // optional base64-encoded encryption key for remote encrypted databases
+    const char *remote_encryption_key;
+    // optional encryption cipher name (e.g. "aes256gcm", "chacha20poly1305")
+    const char *remote_encryption_cipher;
 } turso_sync_database_config_t;
 
 /// opaque pointer to the TursoDatabaseSync instance
@@ -139,16 +148,6 @@ turso_status_code_t turso_sync_database_new(
     const turso_sync_database_config_t *sync_config,
     /** reference to pointer which will be set to database instance in case of TURSO_OK result */
     const turso_sync_database_t **database,
-    /** Optional return error parameter (can be null) */
-    const char **error_opt_out);
-
-/** Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access)
- * AsyncOperation returns None
- */
-turso_status_code_t turso_sync_database_init(
-    const turso_sync_database_t *self,
-    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
-    const turso_sync_operation_t **operation,
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
 
@@ -241,9 +240,9 @@ turso_status_code_t turso_sync_database_apply_changes(
     const char **error_opt_out);
 
 /** Resume async operation
- * If return error status - turso_status_t must be properly cleaned up
  * If return TURSO_IO - caller must drive IO
  * If return TURSO_DONE - caller must inspect result and clean up it or use it accordingly
+ * It's safe to call turso_sync_operation_resume multiple times even after operation completion (in case of repeat calls after completion - final result always will be returned)
  */
 turso_status_code_t turso_sync_operation_resume(
     const turso_sync_operation_t *self,

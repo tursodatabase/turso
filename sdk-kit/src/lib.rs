@@ -46,10 +46,7 @@ impl ConcurrentGuard {
             .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Err(TursoError {
-                code: rsapi::TursoStatusCode::Misuse,
-                message: Some("concurrent use forbidden".to_string()),
-            });
+            return Err(TursoError::Misuse("concurrent use forbidden".to_string()));
         };
         Ok(ConcurrentGuardToken { guard: self })
     }

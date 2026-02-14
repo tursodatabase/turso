@@ -141,17 +141,20 @@ pub fn init_group_by<'a>(
          * then the collating sequence of the column is used to determine sort order.
          * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
          */
-        let collations = group_by
+        let order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = group_by
             .exprs
             .iter()
-            .map(|expr| get_collseq_from_expr(expr, &plan.table_references))
+            .zip(sort_order.iter())
+            .map(|(expr, ord)| {
+                let collation = get_collseq_from_expr(expr, &plan.table_references)?;
+                Ok((*ord, collation))
+            })
             .collect::<Result<Vec<_>>>()?;
 
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sort_cursor,
             columns: column_count,
-            order: sort_order.clone(),
-            collations,
+            order_and_collations,
         });
         let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
         GroupByRowSource::Sorter {
@@ -863,7 +866,7 @@ pub fn group_by_emit_row_phase<'a>(
         ),
     });
 
-    // Reopen ephemeral indexes for distinct aggregates (effectively clearing them).
+    // Clear hash tables for distinct aggregates
     plan.aggregates
         .iter()
         .filter_map(|agg| {
@@ -877,9 +880,8 @@ pub fn group_by_emit_row_phase<'a>(
             let ctx = ctx
                 .as_ref()
                 .expect("distinct aggregate context not populated");
-            program.emit_insn(Insn::OpenEphemeral {
-                cursor_id: ctx.cursor_id,
-                is_table: false,
+            program.emit_insn(Insn::HashClear {
+                hash_table_id: ctx.hash_table_id,
             });
         });
 

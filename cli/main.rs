@@ -7,6 +7,8 @@ mod input;
 mod manual;
 mod mcp_server;
 mod opcodes_dictionary;
+mod read_state_machine;
+mod sync_server;
 
 use config::CONFIG_DIR;
 use mcp_server::TursoMcpServer;
@@ -15,6 +17,8 @@ use std::{
     path::PathBuf,
     sync::{atomic::Ordering, LazyLock},
 };
+
+use crate::sync_server::TursoSyncServer;
 
 #[cfg(all(feature = "mimalloc", not(target_family = "wasm"), not(miri)))]
 #[global_allocator]
@@ -40,11 +44,23 @@ fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
     mcp_server.run()
 }
 
+fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
+    let address = app.opts.sync_server_address.clone().unwrap();
+    let conn = app.get_connection();
+    let interrupt_count = app.get_interrupt_count();
+    let sync_server = TursoSyncServer::new(address, conn, interrupt_count);
+
+    sync_server.run()
+}
+
 fn main() -> anyhow::Result<()> {
     let (mut app, _guard) = app::Limbo::new()?;
 
     if app.is_mcp_mode() {
         return run_mcp_server(app);
+    }
+    if app.is_sync_server_mode() {
+        return run_sync_server(app);
     }
 
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {

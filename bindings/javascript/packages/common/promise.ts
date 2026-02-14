@@ -70,6 +70,11 @@ class Database {
    * @param {string} sql - The SQL statement string to prepare.
    */
   prepare(sql) {
+    // Only throw if we connected before but now the database is closed
+    // Allow implicit connection if not connected yet
+    if (this.connected && !this.open) {
+      throw new TypeError("The database connection is not open");
+    }
     if (!sql) {
       throw new RangeError("The supplied SQL string contains no statements");
     }
@@ -180,14 +185,16 @@ class Database {
    * @param {string} sql - The string containing SQL statements to execute
    */
   async exec(sql) {
+    if (!this.open) {
+      throw new TypeError("The database connection is not open");
+    }
     await this.execLock.acquire();
     const exec = this.db.executor(sql);
     try {
       while (true) {
         const stepResult = exec.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.ioLoopAsync();
-          await this.ioStep();
+          await this.io();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -225,6 +232,13 @@ class Database {
    */
   async close() {
     this.db.close();
+  }
+
+  async io() {
+    // For WASM browser builds, ioStep awaits a promise that resolves when
+    // the OPFS Worker completes the I/O (via IONotifier in wasm-common).
+    // For in-memory / Node.js builds, ioStep is a no-op since I/O is synchronous.
+    await this.ioStep();
   }
 }
 
@@ -335,8 +349,8 @@ class Statement {
     throw new Error("not implemented");
   }
 
-  get reader() {
-    throw new Error("not implemented");
+  get reader(): boolean {
+    return this.stmt.must().columns().length > 0;
   }
 
   get database() {
@@ -428,7 +442,7 @@ class Statement {
       while (true) {
         const stepResult = await stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.ioLoopAsync();
+          await this.io();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -479,7 +493,6 @@ class Statement {
   }
 
   async io() {
-    await this.db.ioLoopAsync();
     await this.ioStep();
   }
 

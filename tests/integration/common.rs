@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Connection, Database, FromValueRow, Row, StepResult, IO};
+use turso_core::{Clock, Connection, Database, FromValueRow, Row, IO};
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -16,6 +16,8 @@ pub struct TempDatabase {
     pub db_flags: turso_core::OpenFlags,
     #[allow(dead_code)]
     pub init_sql: Option<String>,
+    #[allow(dead_code)]
+    pub enable_mvcc: bool,
 }
 unsafe impl Send for TempDatabase {}
 
@@ -26,6 +28,71 @@ pub struct TempDatabaseBuilder {
     opts: Option<turso_core::DatabaseOpts>,
     flags: Option<turso_core::OpenFlags>,
     init_sql: Option<String>,
+    enable_mvcc: bool,
+    io_uring: bool,
+}
+
+struct TestIo {
+    io: Arc<dyn IO>,
+}
+
+impl Clock for TestIo {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+        self.io.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+        self.io.current_time_wall_clock()
+    }
+}
+
+impl IO for TestIo {
+    // we don't sleep in test io in order to make tests faster
+    fn sleep(&self, _duration: std::time::Duration) {}
+
+    fn open_file(
+        &self,
+        path: &str,
+        flags: turso_core::OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        self.io.open_file(path, flags, direct)
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.io.remove_file(path)
+    }
+    fn cancel(&self, c: &[turso_core::Completion]) -> turso_core::Result<()> {
+        self.io.cancel(c)
+    }
+    fn drain(&self) -> turso_core::Result<()> {
+        self.io.drain()
+    }
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        self.io.fill_bytes(dest);
+    }
+    fn generate_random_number(&self) -> i64 {
+        self.io.generate_random_number()
+    }
+    fn get_memory_io(&self) -> Arc<turso_core::MemoryIO> {
+        self.io.get_memory_io()
+    }
+    fn register_fixed_buffer(
+        &self,
+        ptr: std::ptr::NonNull<u8>,
+        len: usize,
+    ) -> turso_core::Result<u32> {
+        self.io.register_fixed_buffer(ptr, len)
+    }
+    fn step(&self) -> turso_core::Result<()> {
+        self.io.step()
+    }
+    fn wait_for_completion(&self, c: turso_core::Completion) -> turso_core::Result<()> {
+        self.io.wait_for_completion(c)
+    }
+    fn yield_now(&self) {
+        self.io.yield_now();
+    }
 }
 
 impl TempDatabaseBuilder {
@@ -36,6 +103,8 @@ impl TempDatabaseBuilder {
             opts: None,
             flags: None,
             init_sql: None,
+            enable_mvcc: false,
+            io_uring: false,
         }
     }
 
@@ -76,6 +145,16 @@ impl TempDatabaseBuilder {
         self
     }
 
+    pub fn with_mvcc(mut self, enable: bool) -> Self {
+        self.enable_mvcc = enable;
+        self
+    }
+
+    pub fn with_io_uring(mut self, enable: bool) -> Self {
+        self.io_uring = enable;
+        self
+    }
+
     pub fn build(self) -> TempDatabase {
         let opts = self
             .opts
@@ -103,7 +182,22 @@ impl TempDatabaseBuilder {
             connection.execute(init_sql, ()).unwrap();
         }
 
-        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let io = if !self.io_uring {
+            Arc::new(TestIo {
+                io: Arc::new(turso_core::PlatformIO::new().unwrap()),
+            })
+        } else {
+            #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
+            {
+                panic!("io_uring feature must be enable for testing with UringIO")
+            }
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            {
+                Arc::new(TestIo {
+                    io: Arc::new(turso_core::UringIO::new().unwrap()),
+                })
+            }
+        };
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
@@ -112,6 +206,14 @@ impl TempDatabaseBuilder {
             None,
         )
         .unwrap();
+
+        // Enable MVCC via turso connection if requested
+        if self.enable_mvcc {
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'experimental_mvcc'")
+                .expect("enable mvcc");
+        }
+
         TempDatabase {
             path: db_path,
             io,
@@ -119,6 +221,7 @@ impl TempDatabaseBuilder {
             db_opts: opts,
             db_flags: flags,
             init_sql: self.init_sql,
+            enable_mvcc: self.enable_mvcc,
         }
     }
 }
@@ -137,11 +240,13 @@ impl TempDatabase {
         Self::builder().with_db_name(db_name).build()
     }
 
-    pub fn new_with_opts(db_name: &str, opts: turso_core::DatabaseOpts) -> Self {
-        Self::builder()
-            .with_db_name(db_name)
-            .with_opts(opts)
-            .build()
+    /// Creates a new database with MVCC mode enabled.
+    pub fn new_with_mvcc(db_name: &str) -> Self {
+        let db = Self::new(db_name);
+        let conn = db.connect_limbo();
+        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+            .expect("enable mvcc");
+        db
     }
 
     pub fn new_with_existent(db_path: &Path) -> Self {
@@ -176,7 +281,7 @@ impl TempDatabase {
 
     pub fn limbo_database(&self) -> Arc<turso_core::Database> {
         log::debug!("conneting to limbo");
-        Database::open_file(self.io.clone(), self.path.to_str().unwrap(), false).unwrap()
+        Database::open_file(self.io.clone(), self.path.to_str().unwrap()).unwrap()
     }
 
     #[allow(dead_code)]
@@ -278,35 +383,26 @@ pub fn limbo_exec_rows(
 ) -> Vec<Vec<rusqlite::types::Value>> {
     let mut stmt = conn.prepare(query).unwrap();
     let mut rows = Vec::new();
-    'outer: loop {
-        let row = loop {
-            let result = stmt.step().unwrap();
-            match result {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    break row;
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
 
-                turso_core::StepResult::Done => break 'outer,
-                r => panic!("unexpected result {r:?}: expecting single row"),
-            }
-        };
+    stmt.run_with_row_callback(|row| {
         let row = row
             .get_values()
             .map(|x| match x {
                 turso_core::Value::Null => rusqlite::types::Value::Null,
-                turso_core::Value::Integer(x) => rusqlite::types::Value::Integer(*x),
-                turso_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(x)) => {
+                    rusqlite::types::Value::Integer(*x)
+                }
+                turso_core::Value::Numeric(turso_core::Numeric::Float(x)) => {
+                    rusqlite::types::Value::Real(f64::from(*x))
+                }
                 turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
                 turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
             })
             .collect();
         rows.push(row);
-    }
+        Ok(())
+    })
+    .unwrap();
     rows
 }
 
@@ -320,39 +416,26 @@ pub fn try_limbo_exec_rows(
 ) -> Result<Vec<Vec<rusqlite::types::Value>>, turso_core::LimboError> {
     let mut stmt = conn.prepare(query)?;
     let mut rows = Vec::new();
-    'outer: loop {
-        let row = loop {
-            let result = stmt.step()?;
-            match result {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    break row;
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once()?;
-                    continue;
-                }
 
-                turso_core::StepResult::Done => break 'outer,
-                r => {
-                    return Err(turso_core::LimboError::InternalError(format!(
-                        "unexpected result {r:?}: expecting single row"
-                    )))
-                }
-            }
-        };
+    stmt.run_with_row_callback(|row| {
         let row = row
             .get_values()
             .map(|x| match x {
                 turso_core::Value::Null => rusqlite::types::Value::Null,
-                turso_core::Value::Integer(x) => rusqlite::types::Value::Integer(*x),
-                turso_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(x)) => {
+                    rusqlite::types::Value::Integer(*x)
+                }
+                turso_core::Value::Numeric(turso_core::Numeric::Float(x)) => {
+                    rusqlite::types::Value::Real(f64::from(*x))
+                }
                 turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
                 turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
             })
             .collect();
         rows.push(row);
-    }
+        Ok(())
+    })?;
+
     Ok(rows)
 }
 
@@ -378,59 +461,25 @@ pub fn limbo_exec_rows_fallible(
 ) -> Result<Vec<Vec<rusqlite::types::Value>>, turso_core::LimboError> {
     let mut stmt = conn.prepare(query)?;
     let mut rows = Vec::new();
-    'outer: loop {
-        let row = loop {
-            let result = stmt.step()?;
-            match result {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    break row;
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once()?;
-                    continue;
-                }
-
-                turso_core::StepResult::Done => break 'outer,
-                r => {
-                    return Err(turso_core::LimboError::InternalError(format!(
-                        "TEST: unexpected result {r:?}: expecting single row"
-                    )))
-                }
-            }
-        };
+    stmt.run_with_row_callback(|row| {
         let row = row
             .get_values()
             .map(|x| match x {
                 turso_core::Value::Null => rusqlite::types::Value::Null,
-                turso_core::Value::Integer(x) => rusqlite::types::Value::Integer(*x),
-                turso_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(x)) => {
+                    rusqlite::types::Value::Integer(*x)
+                }
+                turso_core::Value::Numeric(turso_core::Numeric::Float(x)) => {
+                    rusqlite::types::Value::Real(f64::from(*x))
+                }
                 turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
                 turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
             })
             .collect();
         rows.push(row);
-    }
+        Ok(())
+    })?;
     Ok(rows)
-}
-
-pub fn limbo_exec_rows_error(
-    _db: &TempDatabase,
-    conn: &Arc<turso_core::Connection>,
-    query: &str,
-) -> turso_core::Result<()> {
-    let mut stmt = conn.prepare(query)?;
-    loop {
-        let result = stmt.step()?;
-        match result {
-            turso_core::StepResult::IO => {
-                stmt.run_once()?;
-                continue;
-            }
-            turso_core::StepResult::Done => return Ok(()),
-            r => panic!("unexpected result {r:?}: expecting single row"),
-        }
-    }
 }
 
 pub fn rng_from_time() -> (ChaCha8Rng, u64) {
@@ -477,26 +526,21 @@ pub fn run_query_core(
     mut on_row: Option<impl FnMut(&Row)>,
 ) -> anyhow::Result<()> {
     if let Some(ref mut rows) = conn.query(query)? {
-        loop {
-            match rows.step()? {
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Done => break,
-                StepResult::Row => {
-                    if let Some(on_row) = on_row.as_mut() {
-                        let row = rows.row().unwrap();
-                        on_row(row)
-                    }
-                }
-                r => panic!("unexpected step result: {r:?}"),
-            }
-        }
+        #[allow(clippy::type_complexity)]
+        let handler: Box<dyn FnMut(&Row) -> turso_core::Result<()>> =
+            if let Some(on_row) = on_row.as_mut() {
+                Box::new(|row| {
+                    on_row(row);
+                    Ok(())
+                })
+            } else {
+                Box::new(|_| Ok(()))
+            };
+        rows.run_with_row_callback(handler)?;
     };
     Ok(())
 }
 
-#[allow(dead_code)]
 pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
     let conn = rusqlite::Connection::open(db_path)?;
     let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
@@ -517,6 +561,41 @@ pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Compute dbhash of the test database.
+pub fn compute_dbhash(tmp_db: &TempDatabase) -> turso_dbhash::DbHashResult {
+    let path = tmp_db.path.to_str().unwrap();
+    turso_dbhash::hash_database(path, &turso_dbhash::DbHashOptions::default())
+        .expect("dbhash failed")
+}
+
+/// Compute dbhash with custom options.
+#[allow(dead_code)]
+pub fn compute_dbhash_with_options(
+    tmp_db: &TempDatabase,
+    options: &turso_dbhash::DbHashOptions,
+) -> turso_dbhash::DbHashResult {
+    let path = tmp_db.path.to_str().unwrap();
+    turso_dbhash::hash_database(path, options).expect("dbhash failed")
+}
+
+/// Assert that checkpoint does not change database content.
+/// Computes hash before and after checkpoint, asserts they match.
+pub fn assert_checkpoint_preserves_content(conn: &Arc<Connection>, tmp_db: &TempDatabase) {
+    do_flush(conn, tmp_db).unwrap();
+    let hash_before = compute_dbhash(tmp_db);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    do_flush(conn, tmp_db).unwrap();
+    let hash_after = compute_dbhash(tmp_db);
+
+    assert_eq!(
+        hash_before.hash, hash_after.hash,
+        "Checkpoint changed database content! before={}, after={}",
+        hash_before.hash, hash_after.hash
+    );
+}
+
 pub trait ExecRows<T> {
     #[allow(dead_code)]
     fn exec_rows(&self, query: &str) -> Vec<T>;
@@ -531,24 +610,10 @@ macro_rules! impl_exec_rows_for_tuple {
             fn exec_rows(&self, query: &str) -> Vec<($($T,)+)> {
                 let mut stmt = self.prepare(query).unwrap();
                 let mut rows = Vec::new();
-                'outer: loop {
-                    let row = loop {
-                        let result = stmt.step().unwrap();
-                        match result {
-                            turso_core::StepResult::Row => {
-                                let row = stmt.row().unwrap();
-                                break row;
-                            }
-                            turso_core::StepResult::IO => {
-                                stmt.run_once().unwrap();
-                                continue;
-                            }
-                            turso_core::StepResult::Done => break 'outer,
-                            r => panic!("unexpected result {r:?}"),
-                        }
-                    };
+                stmt.run_with_row_callback(|row| {
                     rows.push(($(row.get($idx).unwrap(),)+));
-                }
+                    Ok(())
+                }).unwrap();
                 rows
             }
         }
@@ -570,10 +635,9 @@ mod tests {
     use tempfile::{NamedTempFile, TempDir};
     use turso_core::{Database, StepResult, IO};
 
-    use crate::common::do_flush;
+    use crate::common::{do_flush, ExecRows};
 
-    use super::{limbo_exec_rows, limbo_exec_rows_error, TempDatabase};
-    use rusqlite::types::Value;
+    use super::TempDatabase;
 
     #[test]
     fn test_statement_columns() -> anyhow::Result<()> {
@@ -620,9 +684,8 @@ mod tests {
             let db =
                 TempDatabase::new_with_existent_with_flags(&path, turso_core::OpenFlags::default());
             let conn = db.connect_limbo();
-            let ret = limbo_exec_rows(&conn, "CREATE table t (a)");
-            assert!(ret.is_empty(), "{ret:?}");
-            limbo_exec_rows(&conn, "INSERT INTO t values (1)");
+            conn.execute("CREATE table t (a)").unwrap();
+            conn.execute("INSERT INTO t values (1)").unwrap();
             conn.close().unwrap()
         }
 
@@ -632,10 +695,10 @@ mod tests {
                 turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
             );
             let conn = db.connect_limbo();
-            let ret = limbo_exec_rows(&conn, "SELECT * from t");
-            assert_eq!(ret, vec![vec![Value::Integer(1)]]);
+            let ret: Vec<(i64,)> = conn.exec_rows("SELECT * from t");
+            assert_eq!(ret, vec![(1,)]);
 
-            let err = limbo_exec_rows_error(&db, &conn, "INSERT INTO t values (1)").unwrap_err();
+            let err = conn.execute("INSERT INTO t values (1)").unwrap_err();
             assert!(matches!(err, turso_core::LimboError::ReadOnly), "{err:?}");
         }
         Ok(())
@@ -648,7 +711,7 @@ mod tests {
         let db = TempDatabase::new_empty();
         let conn = db.connect_limbo();
 
-        let _ = limbo_exec_rows(&conn, "CREATE TABLE t (x INTEGER UNIQUE)");
+        conn.execute("CREATE TABLE t (x INTEGER UNIQUE)").unwrap();
 
         // Insert 100 random integers between -1000 and 1000
         let mut expected = Vec::new();
@@ -661,22 +724,16 @@ mod tests {
             }
             i += 1;
             expected.push(val);
-            let ret = limbo_exec_rows(&conn, &format!("INSERT INTO t VALUES ({val})"));
-            assert!(ret.is_empty(), "Insert failed for value {val}: {ret:?}");
+            conn.execute(format!("INSERT INTO t VALUES ({val})"))
+                .unwrap();
         }
 
         // Sort expected values to match index order
         expected.sort();
 
         // Query all values and verify they come back in sorted order
-        let ret = limbo_exec_rows(&conn, "SELECT x FROM t");
-        let actual: Vec<i64> = ret
-            .into_iter()
-            .map(|row| match &row[0] {
-                Value::Integer(i) => *i,
-                _ => panic!("Expected integer value"),
-            })
-            .collect();
+        let ret: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+        let actual: Vec<i64> = ret.into_iter().map(|row| row.0).collect();
 
         assert_eq!(actual, expected, "Values not returned in sorted order");
 
@@ -689,22 +746,18 @@ mod tests {
         let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
-        let _ = limbo_exec_rows(&conn, "CREATE TABLE t (x BLOB UNIQUE)");
+        conn.execute("CREATE TABLE t (x BLOB UNIQUE)").unwrap();
 
         // Insert 11 unique 1MB blobs
         for i in 0..11 {
             println!("Inserting blob #{i}");
-            let ret = limbo_exec_rows(&conn, "INSERT INTO t VALUES (randomblob(1024*1024))");
-            assert!(ret.is_empty(), "Insert #{i} failed: {ret:?}");
+            conn.execute("INSERT INTO t VALUES (randomblob(1024*1024))")
+                .unwrap()
         }
 
         // Verify we have 11 rows
-        let ret = limbo_exec_rows(&conn, "SELECT count(*) FROM t");
-        assert_eq!(
-            ret,
-            vec![vec![Value::Integer(11)]],
-            "Expected 11 rows but got {ret:?}",
-        );
+        let ret: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+        assert_eq!(ret, vec![(11,)], "Expected 11 rows but got {ret:?}",);
 
         Ok(())
     }
@@ -722,16 +775,16 @@ mod tests {
         let conn1 = db.connect_limbo();
 
         // Create test table
-        let _ = limbo_exec_rows(&conn1, "CREATE TABLE t (x INTEGER)");
+        conn1.execute("CREATE TABLE t (x INTEGER)").unwrap();
 
         // Begin transaction on first connection and insert a value
-        let _ = limbo_exec_rows(&conn1, "BEGIN");
-        let _ = limbo_exec_rows(&conn1, "INSERT INTO t VALUES (42)");
+        conn1.execute("BEGIN").unwrap();
+        conn1.execute("INSERT INTO t VALUES (42)").unwrap();
         do_flush(&conn1, &db)?;
 
         // Second connection should not see uncommitted changes
         let conn2 = db.connect_limbo();
-        let ret = limbo_exec_rows(&conn2, "SELECT x FROM t");
+        let ret: Vec<(i64,)> = conn2.exec_rows("SELECT x FROM t");
         assert!(
             ret.is_empty(),
             "DIRTY READ: Second connection saw uncommitted changes: {ret:?}"
@@ -753,21 +806,21 @@ mod tests {
         let conn1 = db.connect_limbo();
 
         // Create test table
-        let _ = limbo_exec_rows(&conn1, "CREATE TABLE t (x INTEGER)");
+        conn1.execute("CREATE TABLE t (x INTEGER)").unwrap();
 
         // Begin transaction on first connection
-        let _ = limbo_exec_rows(&conn1, "BEGIN");
-        let ret = limbo_exec_rows(&conn1, "SELECT x FROM t");
+        conn1.execute("BEGIN").unwrap();
+        let ret: Vec<(i64,)> = conn1.exec_rows("SELECT x FROM t");
         assert!(ret.is_empty(), "Expected 0 rows but got {ret:?}");
 
         // Commit a value from the second connection
         let conn2 = db.connect_limbo();
-        let _ = limbo_exec_rows(&conn2, "BEGIN");
-        let _ = limbo_exec_rows(&conn2, "INSERT INTO t VALUES (42)");
-        let _ = limbo_exec_rows(&conn2, "COMMIT");
+        conn2.execute("BEGIN").unwrap();
+        conn2.execute("INSERT INTO t VALUES (42)").unwrap();
+        conn2.execute("COMMIT").unwrap();
 
         // First connection should not see the committed value
-        let ret = limbo_exec_rows(&conn1, "SELECT x FROM t");
+        let ret: Vec<(i64,)> = conn1.exec_rows("SELECT x FROM t");
         assert!(
             ret.is_empty(),
             "SNAPSHOT ISOLATION VIOLATION: Older txn saw committed changes from newer txn: {ret:?}"
@@ -789,30 +842,26 @@ mod tests {
         let conn = db.connect_limbo();
 
         // Create test table
-        let _ = limbo_exec_rows(&conn, "CREATE TABLE t (x INTEGER)");
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
 
         // Begin transaction on first connection and insert a value
-        let _ = limbo_exec_rows(&conn, "BEGIN");
-        let _ = limbo_exec_rows(&conn, "INSERT INTO t VALUES (42)");
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (42)").unwrap();
         do_flush(&conn, &db)?;
 
         // Rollback the transaction
-        let _ = limbo_exec_rows(&conn, "ROLLBACK");
+        conn.execute("ROLLBACK").unwrap();
 
         // Now actually commit a row
-        let _ = limbo_exec_rows(&conn, "INSERT INTO t VALUES (69)");
+        conn.execute("INSERT INTO t VALUES (69)").unwrap();
 
         // Reopen the database
         let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
         // Should only see the last committed value
-        let ret = limbo_exec_rows(&conn, "SELECT x FROM t");
-        assert_eq!(
-            ret,
-            vec![vec![Value::Integer(69)]],
-            "Expected 1 row but got {ret:?}"
-        );
+        let ret: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+        assert_eq!(ret, vec![(69,)], "Expected 1 row but got {ret:?}");
 
         Ok(())
     }
@@ -829,11 +878,11 @@ mod tests {
         let conn = db.connect_limbo();
 
         // Create test table
-        let _ = limbo_exec_rows(&conn, "CREATE TABLE t (x INTEGER)");
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
 
         // Begin transaction and insert a value
-        let _ = limbo_exec_rows(&conn, "BEGIN");
-        let _ = limbo_exec_rows(&conn, "INSERT INTO t VALUES (42)");
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (42)").unwrap();
 
         // Flush to WAL but don't commit
         do_flush(&conn, &db)?;
@@ -843,7 +892,7 @@ mod tests {
         let conn = db.connect_limbo();
 
         // Should see no rows since transaction was never committed
-        let ret = limbo_exec_rows(&conn, "SELECT x FROM t");
+        let ret: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
         assert!(ret.is_empty(), "Expected 0 rows but got {ret:?}");
 
         Ok(())
@@ -858,7 +907,7 @@ mod tests {
         // Open database
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path, false)?;
+        let db = Database::open_file(io, &db_path)?;
 
         const NUM_CONNECTIONS: usize = 5;
         let mut connections = Vec::new();
@@ -913,5 +962,27 @@ mod tests {
         assert_eq!(found_tables.len(), 0, "Should find no tables in schema");
 
         Ok(())
+    }
+
+    #[turso_macros::test]
+    /// https://github.com/tursodatabase/turso/issues/4146
+    fn test_bit_out_of_bounds_minimal(tmp_db: TempDatabase) {
+        let conn = tmp_db.connect_limbo();
+
+        conn.execute("CREATE TABLE shimmering_l_361 (funny_aldred_362 TEXT, amiable_fides_363 INTEGER, stellar_ronan_364 REAL, agreeable_fdca_365 BLOB, remarkable_squat_366 REAL, dynamic_hoyt_367 INTEGER, educated_vega_368 TEXT, blithesome_turgenev_369 REAL, plucky_sheppard_370 TEXT, knowledgeable_bacca_371 INTEGER, hilarious_urcuchillay_372 INTEGER, amiable_bluestein_373 BLOB, perfect_leval_374 REAL, outstanding_yarros_375 REAL, philosophical_montgomery_376 REAL, plucky_french_377 REAL, engrossing_joyce_378 BLOB, persistent_maxwell_379 REAL, proficient_balaji_380 TEXT, ample_igualada_381 BLOB, agreeable_maryamdeluz_382 TEXT, glittering_hakiel_383 REAL, generous_odin_384 REAL, wondrous_paasen_385 INTEGER, determined_dawley_386 BLOB, spectacular_borders_387 REAL, giving_hapgood_388 REAL, proficient_murtaugh_389 REAL, lovely_kinna_390 BLOB, captivating_seymour_391 REAL, proficient_hoyt_392 INTEGER, glimmering_leighton_393 BLOB, optimistic_noche_394 REAL, open_minded_tcherkesoff_395 BLOB, patient_sills_396 BLOB, shining_gerson_397 REAL, romantic_ling_398 REAL, imaginative_barrio_399 REAL, powerful_suekama_400 INTEGER, gorgeous_perkins_401 REAL, propitious_driscoll_402 REAL, approachable_zhihui_403 BLOB, ample_chanial_404 REAL, excellent_burgos_405 TEXT, nice_calabrese_406 TEXT, glistening_res_407 TEXT, mirthful_greenrevolutionary_408 BLOB, magnificent_khola_409 REAL, spellbinding_pouget_410 INTEGER, patient_cascade_411 INTEGER, passionate_again_412 BLOB, productive_teacher_413 INTEGER, rousing_woodbine_414 TEXT, stunning_baverel_415 TEXT, sincere_tompsett_416 TEXT, bountiful_avrich_417 INTEGER, nice_gouldhawke_418 INTEGER, perfect_greenhead_419 BLOB, willing_brown_420 REAL, determined_g_421 TEXT, fortuitous_walia_422 REAL, zestful_fruge_423 TEXT, lovely_thorn_424 BLOB, glittering_rebelnet_425 INTEGER, vibrant_karamustafa_426 REAL, optimistic_jacquier_427 TEXT, qualified_lowens_428 BLOB, splendid_muller_429 INTEGER, honest_levy_430 REAL, warmhearted_gordon_431 INTEGER, gorgeous_jacquier_432 BLOB, technological_ludens_433 BLOB, imaginative_thropy_434 REAL, flexible_cairns_435 REAL, remarkable_mcclelland_436 TEXT, remarkable_brian_437 INTEGER, honest_kanavalchyk_438 REAL, passionate_qruz_439 REAL, sleek_monaghan_440 REAL, adaptable_ray_441 TEXT, mirthful_castoriadis_442 REAL, unique_tonak_443 INTEGER, gregarious_shantz_444 BLOB, excellent_lesoleil_445 REAL, marvelous_roca_446 BLOB, glistening_dent_447 INTEGER, splendid_abra_448 INTEGER, fearless_jasiewicz_449 BLOB, imaginative_gardell_450 REAL, persistent_dockes_451 BLOB, imaginative_a_452 INTEGER, kind_konok_453 REAL, awesome_orsetti_454 REAL, zestful_escalante_455 INTEGER, knowledgeable_giollamoir_456 INTEGER, elegant_mckernan_457 REAL, knowledgeable_lesoleil_458 TEXT, wondrous_agacino_459 INTEGER, glowing_mob_460 REAL, lustrous_obrien_461 REAL, bountiful_tzu_462 REAL, sincere_pointblank_463 TEXT, imaginative_wright_464 BLOB, productive_kumper_465 BLOB, organized_hs_466 BLOB, moving_omowali_467 TEXT, relaxed_mason_468 INTEGER);").unwrap();
+
+        conn.execute("CREATE TABLE sensible_samudzi_342 (outstanding_dubovik_343 TEXT, captivating_comeau_344 TEXT, qualified_casteu_345 INTEGER, thoughtful_bee_346 REAL, spellbinding_budiati_347 REAL, thoughtful_bryant_348 REAL, hardworking_mother_349 TEXT, captivating_bulgaria_350 INTEGER);").unwrap();
+        conn.execute("CREATE TABLE plucky_maximilienne_680 (creative_again_681 INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE super_vernet_712 (bountiful_cairns_713 REAL, super_correspondents_714 BLOB, fabulous_janeiro_715 BLOB, responsible_shilton_716 BLOB, loving_seaweed_717 TEXT);").unwrap();
+
+        conn.execute("CREATE INDEX idx_shimmering_l_361_frank_st ON shimmering_l_361 (patient_cascade_411 DESC, zestful_fruge_423 ASC, ample_chanial_404 ASC, proficient_balaji_380 DESC, flexible_cairns_435 ASC, productive_kumper_465 ASC, gregarious_shantz_444 ASC, mirthful_castoriadis_442 ASC, gorgeous_perkins_401 ASC, captivating_seymour_391 ASC, warmhearted_gordon_431 DESC, imaginative_thropy_434 DESC, agreeable_fdca_365 DESC, lovely_kinna_390 DESC, imaginative_gardell_450 ASC, persistent_dockes_451 DESC, blithesome_turgenev_369 ASC, outstanding_yarros_375 ASC, willing_brown_420 DESC, patient_sills_396 ASC, sincere_pointblank_463 ASC, sincere_tompsett_416 DESC, fearless_jasiewicz_449 ASC, relaxed_mason_468 ASC, bountiful_avrich_417 DESC, lovely_thorn_424 ASC, remarkable_brian_437 DESC, vibrant_karamustafa_426 DESC, moving_omowali_467 DESC, imaginative_barrio_399 ASC, nice_calabrese_406 DESC, agreeable_maryamdeluz_382 ASC, stellar_ronan_364 DESC, propitious_driscoll_402 DESC, lustrous_obrien_461 ASC, plucky_french_377 DESC, amiable_bluestein_373 ASC, excellent_burgos_405 DESC, splendid_abra_448 ASC, excellent_lesoleil_445 DESC, perfect_greenhead_419 ASC, perfect_leval_374 ASC, glistening_dent_447 ASC, glittering_rebelnet_425 DESC, knowledgeable_bacca_371 DESC, productive_teacher_413 DESC, honest_kanavalchyk_438 ASC, optimistic_noche_394 DESC, magnificent_khola_409 DESC, honest_levy_430 ASC, remarkable_mcclelland_436 DESC, proficient_murtaugh_389 DESC, hilarious_urcuchillay_372 ASC, elegant_mckernan_457 ASC, philosophical_montgomery_376 ASC, plucky_sheppard_370 DESC, fortuitous_walia_422 DESC, nice_gouldhawke_418 ASC, funny_aldred_362 ASC, engrossing_joyce_378 ASC, knowledgeable_giollamoir_456 DESC, powerful_suekama_400 ASC, optimistic_jacquier_427 DESC, sleek_monaghan_440 DESC, spellbinding_pouget_410 ASC, stunning_baverel_415 ASC, imaginative_a_452 DESC, ample_igualada_381 ASC, approachable_zhihui_403 ASC, passionate_qruz_439 ASC, qualified_lowens_428 ASC, shining_gerson_397 ASC, amiable_fides_363 ASC, generous_odin_384 DESC, knowledgeable_lesoleil_458 ASC, giving_hapgood_388 ASC, splendid_muller_429 DESC, gorgeous_jacquier_432 DESC, bountiful_tzu_462 ASC);").unwrap();
+
+        conn.execute("INSERT INTO plucky_maximilienne_680 VALUES (1);")
+            .unwrap();
+
+        conn.execute("CREATE TRIGGER trigger_plucky_maximilienne_680_1169180867 BEFORE UPDATE ON plucky_maximilienne_680 BEGIN UPDATE shimmering_l_361 SET determined_g_421 = 'diligent_marmol', lovely_thorn_424 = X'6361707469766174696E675F7072616461', adaptable_ray_441 = 'energetic_tee', rousing_woodbine_414 = 'stupendous_gethin', perfect_greenhead_419 = X'6272696C6C69616E745F6461727474', ample_igualada_381 = X'7368696E696E675F6E616F756D6F76', knowledgeable_bacca_371 = 8795766455619870255, productive_kumper_465 = X'666162756C6F75735F6261636B', spellbinding_pouget_410 = -2080320213985020508, mirthful_castoriadis_442 = -5622911538.309956, open_minded_tcherkesoff_395 = X'70657273697374656E745F6B657272', imaginative_wright_464 = X'70726F647563746976655F7061736F', amiable_bluestein_373 = X'617765736F6D655F626F7A6F6B69', zestful_escalante_455 = -3488495773897908929, proficient_hoyt_392 = 2109777389586581121, gregarious_shantz_444 = X'676F7267656F75735F68616E636F78', knowledgeable_giollamoir_456 = 1807255432535784487, fortuitous_walia_422 = 5716860416.539839, giving_hapgood_388 = -7945368599.58225, sincere_pointblank_463 = 'blithesome_moon', excellent_burgos_405 = 'fantastic_grey', glistening_dent_447 = -8720078206077868004, excellent_lesoleil_445 = -8308316719.976472, imaginative_barrio_399 = 2586704785.5247574, gorgeous_jacquier_432 = X'696E6372656469626C655F657272616E646F6E6561', nice_gouldhawke_418 = -9218489973071029860, stunning_baverel_415 = 'elegant_macsimoin', gorgeous_perkins_401 = 1858284188.5782166, patient_cascade_411 = 5434496617634431287, glimmering_leighton_393 = X'70617373696F6E6174655F636F6F7264696E61646F73', blithesome_turgenev_369 = 539105039.8303547, lovely_kinna_390 = X'67656E65726F75735F706F696E74626C616E6B', propitious_driscoll_402 = 6110709419.661383 WHERE (shimmering_l_361.flexible_cairns_435 != -2665602268.6225224); UPDATE super_vernet_712 SET responsible_shilton_716 = X'6D617276656C6F75735F6172636865676F6E6F73' WHERE (TRUE); INSERT INTO sensible_samudzi_342 VALUES ('frank_olympics', 'splendid_academy', 6786370686344360623, -8674635739.474007, -4807591805.499456, 2818384407.6066933, 'insightful_fiorina', -4425841829162377840), ('productive_duch', 'ravishing_asher', 957231539187121006, -9936535798.322428, 3542340933.6666107, 6847954059.14608, 'loving_seminatore', 3269958273313428337); END;").unwrap();
+
+        conn.execute("UPDATE plucky_maximilienne_680 SET creative_again_681 = 2 WHERE creative_again_681 = 1;").unwrap();
     }
 }

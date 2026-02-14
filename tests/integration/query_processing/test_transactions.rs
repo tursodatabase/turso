@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use turso_core::{Connection, LimboError, Result, Statement, StepResult, Value};
 
-use crate::common::TempDatabase;
+use crate::common::{assert_checkpoint_preserves_content, TempDatabase};
 
 // Test a scenario where there are two concurrent deferred transactions:
 //
@@ -41,7 +41,7 @@ fn test_deferred_transaction_restart(tmp_db: TempDatabase) {
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {
         let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
 }
 
@@ -70,7 +70,7 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {
         let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(0));
     }
 
     conn1
@@ -78,13 +78,16 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
         .unwrap();
 
     let result = conn2.execute("INSERT INTO test (id, value) VALUES (2, 'second')");
-    assert!(matches!(result, Err(LimboError::Busy)));
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "Expected Busy because write lock is taken, got: {result:?}"
+    );
 
     conn1.execute("COMMIT").unwrap();
 
     // T2 still cannot write because its snapshot is stale and it cannot restart
     let result = conn2.execute("INSERT INTO test (id, value) VALUES (2, 'second')");
-    assert!(matches!(result, Err(LimboError::Busy)));
+    assert!(matches!(result, Err(LimboError::BusySnapshot)), "Expected BusySnapshot because while write lock is free, the connection's snapshot is stale, got: {result:?}");
 
     // T2 must rollback and start fresh
     conn2.execute("ROLLBACK").unwrap();
@@ -98,7 +101,7 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {
         let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
 }
 
@@ -118,7 +121,7 @@ fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     let mut stmt = conn.query("select sum(x) from t")?.unwrap();
     if let StepResult::Row = stmt.step()? {
         let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
 
     Ok(())
@@ -140,36 +143,22 @@ fn test_transaction_visibility(tmp_db: TempDatabase) {
         .unwrap();
 
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(1));
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(1));
+        Ok(())
+    })
+    .unwrap();
 
     conn1
         .execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY, value TEXT)")
         .unwrap();
 
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test2").unwrap().unwrap();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(0));
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[turso_macros::test]
@@ -203,9 +192,9 @@ fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDat
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)],
-            vec![Value::Integer(2)],
-            vec![Value::Integer(4)]
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(4)]
         ]
     );
 }
@@ -229,15 +218,15 @@ fn test_deferred_fk_violation_rollback_in_autocommit(tmp_db: TempDatabase) {
     // This insert should fail because parent(1) doesn't exist
     // and the deferred FK violation should be caught at statement end in autocommit mode
     let result = conn.execute("INSERT INTO child VALUES(1,1)");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::ForeignKeyConstraint(_))));
 
-    // Do a truncating checkpoint
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // Do a truncating checkpoint with dbhash verification
+    assert_checkpoint_preserves_content(&conn, &tmp_db);
 
     // Verify that the child table is empty (the insert was rolled back)
     let stmt = conn.query("SELECT COUNT(*) FROM child").unwrap().unwrap();
     let row = helper_read_single_row(stmt);
-    assert_eq!(row, vec![Value::Integer(0)]);
+    assert_eq!(row, vec![Value::from_i64(0)]);
 }
 
 #[turso_macros::test(mvcc)]
@@ -296,7 +285,7 @@ fn test_mvcc_transactions_deferred(tmp_db: TempDatabase) {
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {
         let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
 }
 
@@ -317,7 +306,7 @@ fn test_mvcc_insert_select_basic(tmp_db: TempDatabase) {
         .unwrap()
         .unwrap();
     let row = helper_read_single_row(stmt);
-    assert_eq!(row, vec![Value::Integer(1), Value::build_text("first")]);
+    assert_eq!(row, vec![Value::from_i64(1), Value::build_text("first")]);
 }
 
 #[turso_macros::test(mvcc)]
@@ -353,10 +342,7 @@ fn test_mvcc_update_basic(tmp_db: TempDatabase) {
 
 #[test]
 fn test_mvcc_concurrent_insert_basic() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_update_basic.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_update_basic.db");
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -382,8 +368,8 @@ fn test_mvcc_concurrent_insert_basic() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::build_text("first")],
-            vec![Value::Integer(2), Value::build_text("second")],
+            vec![Value::from_i64(1), Value::build_text("first")],
+            vec![Value::from_i64(2), Value::build_text("second")],
         ]
     );
 }
@@ -431,10 +417,7 @@ fn test_mvcc_update_same_row_twice(tmp_db: TempDatabase) {
 
 #[test]
 fn test_mvcc_concurrent_conflicting_update() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_concurrent_conflicting_update.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_concurrent_conflicting_update.db");
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -460,10 +443,7 @@ fn test_mvcc_concurrent_conflicting_update() {
 
 #[test]
 fn test_mvcc_concurrent_conflicting_update_2() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_concurrent_conflicting_update.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_concurrent_conflicting_update.db");
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -489,10 +469,7 @@ fn test_mvcc_concurrent_conflicting_update_2() {
 
 #[test]
 fn test_mvcc_checkpoint_works() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_checkpoint_works.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_checkpoint_works.db");
 
     // Create table
     let conn = tmp_db.connect_limbo();
@@ -557,7 +534,7 @@ fn test_mvcc_checkpoint_works() {
     // Build expected results
     let expected: Vec<Vec<Value>> = expected_rows
         .into_iter()
-        .map(|(id, value)| vec![Value::Integer(id as i64), Value::build_text(value)])
+        .map(|(id, value)| vec![Value::from_i64(id as i64), Value::build_text(value)])
         .collect();
 
     assert_eq!(rows, expected);
@@ -594,9 +571,8 @@ fn query_and_log(conn: &Arc<Connection>, query: &str) -> Result<Option<Statement
 
 #[test]
 fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
-    let tmp_db = TempDatabase::new_with_opts(
+    let tmp_db = TempDatabase::new_with_mvcc(
         "test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -654,10 +630,7 @@ fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
     drop(tmp_db);
 
     // Close and reopen database
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Verify table1 rows
@@ -668,7 +641,7 @@ fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
 
     let expected1: Vec<Vec<Value>> = expected_rows1
         .into_iter()
-        .map(|(id, value)| vec![Value::Integer(id as i64), Value::Integer(value as i64)])
+        .map(|(id, value)| vec![Value::from_i64(id as i64), Value::from_i64(value as i64)])
         .collect();
 
     assert_eq!(rows, expected1);
@@ -681,7 +654,7 @@ fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
 
     let expected2: Vec<Vec<Value>> = expected_rows2
         .into_iter()
-        .map(|(id, value)| vec![Value::Integer(id as i64), Value::Integer(value as i64)])
+        .map(|(id, value)| vec![Value::from_i64(id as i64), Value::from_i64(value as i64)])
         .collect();
 
     assert_eq!(rows, expected2);
@@ -709,10 +682,7 @@ fn test_non_mvcc_to_mvcc() {
     drop(tmp_db);
 
     // Reopen in mvcc mode
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Query should work
@@ -720,45 +690,25 @@ fn test_non_mvcc_to_mvcc() {
     let rows = helper_read_all_rows(stmt);
 
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[0][0], Value::from_i64(1));
     assert_eq!(rows[0][1], Value::Text("hello".into()));
 }
 
 fn helper_read_all_rows(mut stmt: turso_core::Statement) -> Vec<Vec<Value>> {
     let mut ret = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                ret.push(stmt.row().unwrap().get_values().cloned().collect());
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        ret.push(row.get_values().cloned().collect());
+        Ok(())
+    })
+    .unwrap();
+
     ret
 }
 
 fn helper_read_single_row(mut stmt: turso_core::Statement) -> Vec<Value> {
-    let mut read_count = 0;
-    let mut ret = None;
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                assert_eq!(read_count, 0);
-                read_count += 1;
-                let row = stmt.row().unwrap();
-                ret = Some(row.get_values().cloned().collect());
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    let ret = stmt.run_one_step_blocking(|| Ok(()), || Ok(())).unwrap();
 
-    ret.unwrap()
+    ret.map(|row| row.get_values().cloned().collect()).unwrap()
 }
 
 // Helper function to verify table contents
@@ -769,17 +719,14 @@ fn verify_table_contents(conn: &Arc<Connection>, expected: Vec<i64>) {
     let rows = helper_read_all_rows(stmt);
     let expected_values: Vec<Vec<Value>> = expected
         .into_iter()
-        .map(|x| vec![Value::Integer(x)])
+        .map(|x| vec![Value::from_i64(x)])
         .collect();
     assert_eq!(rows, expected_values);
 }
 
 #[test]
 fn test_mvcc_recovery_with_index_and_deletes() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_recovery_with_index_and_deletes.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_recovery_with_index_and_deletes.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table with unique constraint (creates an index)
@@ -799,10 +746,7 @@ fn test_mvcc_recovery_with_index_and_deletes() {
     drop(tmp_db);
 
     // Reopen database (triggers logical log recovery)
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Verify only rows 1, 3, 5 exist
@@ -814,18 +758,17 @@ fn test_mvcc_recovery_with_index_and_deletes() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)],
-            vec![Value::Integer(3)],
-            vec![Value::Integer(5)],
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(3)],
+            vec![Value::from_i64(5)],
         ]
     );
 }
 
 #[test]
 fn test_mvcc_checkpoint_before_delete_then_verify_same_session() {
-    let tmp_db = TempDatabase::new_with_opts(
+    let tmp_db = TempDatabase::new_with_mvcc(
         "test_mvcc_checkpoint_before_delete_then_verify_same_session.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -844,10 +787,7 @@ fn test_mvcc_checkpoint_before_delete_then_verify_same_session() {
 
 #[test]
 fn test_mvcc_checkpoint_before_delete_then_reopen() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_checkpoint_before_delete_then_reopen.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_checkpoint_before_delete_then_reopen.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -864,10 +804,7 @@ fn test_mvcc_checkpoint_before_delete_then_reopen() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -875,10 +812,8 @@ fn test_mvcc_checkpoint_before_delete_then_reopen() {
 
 #[test]
 fn test_mvcc_delete_then_checkpoint_then_verify_same_session() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_delete_then_checkpoint_then_verify_same_session.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_delete_then_checkpoint_then_verify_same_session.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -896,10 +831,7 @@ fn test_mvcc_delete_then_checkpoint_then_verify_same_session() {
 
 #[test]
 fn test_mvcc_delete_then_checkpoint_then_reopen() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_delete_then_checkpoint_then_reopen.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_delete_then_checkpoint_then_reopen.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -916,10 +848,7 @@ fn test_mvcc_delete_then_checkpoint_then_reopen() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -927,10 +856,7 @@ fn test_mvcc_delete_then_checkpoint_then_reopen() {
 
 #[test]
 fn test_mvcc_delete_then_reopen_no_checkpoint() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_delete_then_reopen_no_checkpoint.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_delete_then_reopen_no_checkpoint.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -946,10 +872,32 @@ fn test_mvcc_delete_then_reopen_no_checkpoint() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    tracing::info!("Reopening database");
+    let tmp_db = TempDatabase::new_with_existent(&path);
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_delete_then_reopen_no_checkpoint_2() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_delete_then_reopen_no_checkpoint.db");
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x unique, y unique)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value, value * 10 FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    tracing::info!("Reopening database");
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -957,9 +905,8 @@ fn test_mvcc_delete_then_reopen_no_checkpoint() {
 
 #[test]
 fn test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session() {
-    let tmp_db = TempDatabase::new_with_opts(
+    let tmp_db = TempDatabase::new_with_mvcc(
         "test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -979,10 +926,8 @@ fn test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session() {
 
 #[test]
 fn test_mvcc_checkpoint_delete_checkpoint_then_reopen() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_checkpoint_delete_checkpoint_then_reopen.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_checkpoint_delete_checkpoint_then_reopen.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -1000,10 +945,7 @@ fn test_mvcc_checkpoint_delete_checkpoint_then_reopen() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -1011,10 +953,8 @@ fn test_mvcc_checkpoint_delete_checkpoint_then_reopen() {
 
 #[test]
 fn test_mvcc_index_before_checkpoint_delete_after_checkpoint() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_index_before_checkpoint_delete_after_checkpoint.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_index_before_checkpoint_delete_after_checkpoint.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -1031,10 +971,7 @@ fn test_mvcc_index_before_checkpoint_delete_after_checkpoint() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -1042,10 +979,8 @@ fn test_mvcc_index_before_checkpoint_delete_after_checkpoint() {
 
 #[test]
 fn test_mvcc_index_after_checkpoint_delete_after_index() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_index_after_checkpoint_delete_after_index.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_index_after_checkpoint_delete_after_index.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -1062,10 +997,7 @@ fn test_mvcc_index_after_checkpoint_delete_after_index() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -1073,10 +1005,7 @@ fn test_mvcc_index_after_checkpoint_delete_after_index() {
 
 #[test]
 fn test_mvcc_multiple_deletes_with_checkpoints() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_multiple_deletes_with_checkpoints.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_multiple_deletes_with_checkpoints.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -1097,10 +1026,7 @@ fn test_mvcc_multiple_deletes_with_checkpoints() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3, 5]);
@@ -1108,10 +1034,7 @@ fn test_mvcc_multiple_deletes_with_checkpoints() {
 
 #[test]
 fn test_mvcc_no_index_checkpoint_delete_reopen() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_no_index_checkpoint_delete_reopen.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_no_index_checkpoint_delete_reopen.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -1127,10 +1050,7 @@ fn test_mvcc_no_index_checkpoint_delete_reopen() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -1138,9 +1058,8 @@ fn test_mvcc_no_index_checkpoint_delete_reopen() {
 
 #[test]
 fn test_mvcc_checkpoint_before_insert_delete_after_checkpoint() {
-    let tmp_db = TempDatabase::new_with_opts(
+    let tmp_db = TempDatabase::new_with_mvcc(
         "test_mvcc_checkpoint_before_insert_delete_after_checkpoint.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1166,10 +1085,7 @@ fn test_mvcc_checkpoint_before_insert_delete_after_checkpoint() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 4]);
@@ -1183,10 +1099,7 @@ fn test_mvcc_checkpoint_before_insert_delete_after_checkpoint() {
 /// Seeking for various rowids should find them in the correct location.
 #[test]
 fn test_mvcc_dual_seek_table_rowid_basic() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_table_rowid_basic.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_table_rowid_basic.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert initial rows
@@ -1203,10 +1116,7 @@ fn test_mvcc_dual_seek_table_rowid_basic() {
     drop(tmp_db);
 
     // Reopen to ensure btree is populated and MV store is empty
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Insert more rows into MVCC
@@ -1254,10 +1164,7 @@ fn test_mvcc_dual_seek_table_rowid_basic() {
 /// Btree has odd numbers (1,3,5,7,9), MVCC has even numbers (2,4,6,8,10).
 #[test]
 fn test_mvcc_dual_seek_interleaved_rows() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_interleaved_rows.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_interleaved_rows.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert odd rows
@@ -1274,10 +1181,7 @@ fn test_mvcc_dual_seek_interleaved_rows() {
     drop(tmp_db);
 
     // Reopen
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Insert even rows into MVCC
@@ -1293,7 +1197,7 @@ fn test_mvcc_dual_seek_interleaved_rows() {
     assert_eq!(rows.len(), 10);
     for (i, row) in rows.iter().enumerate() {
         let expected_x = (i + 1) as i64;
-        assert_eq!(row[0], Value::Integer(expected_x));
+        assert_eq!(row[0], Value::from_i64(expected_x));
         let expected_source = if expected_x % 2 == 1 { "btree" } else { "mvcc" };
         assert_eq!(
             row[1],
@@ -1319,10 +1223,7 @@ fn test_mvcc_dual_seek_interleaved_rows() {
 /// Test index seek with rows in both btree and MVCC.
 #[test]
 fn test_mvcc_dual_seek_index_basic() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_index_basic.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_index_basic.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table with index
@@ -1342,10 +1243,7 @@ fn test_mvcc_dual_seek_index_basic() {
     drop(tmp_db);
 
     // Reopen
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Insert more rows into MVCC
@@ -1375,10 +1273,10 @@ fn test_mvcc_dual_seek_index_basic() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(4)],
-            vec![Value::Integer(5)],
-            vec![Value::Integer(6)],
-            vec![Value::Integer(7)],
+            vec![Value::from_i64(4)],
+            vec![Value::from_i64(5)],
+            vec![Value::from_i64(6)],
+            vec![Value::from_i64(7)],
         ]
     );
 }
@@ -1387,10 +1285,7 @@ fn test_mvcc_dual_seek_index_basic() {
 /// The seek should find the MVCC version (which shadows btree).
 #[test]
 fn test_mvcc_dual_seek_with_update() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_with_update.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_with_update.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert rows
@@ -1411,10 +1306,7 @@ fn test_mvcc_dual_seek_with_update() {
     drop(tmp_db);
 
     // Reopen
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Update row 3 (creates MVCC version that shadows btree)
@@ -1442,11 +1334,11 @@ fn test_mvcc_dual_seek_with_update() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::build_text("original_1")],
-            vec![Value::Integer(2), Value::build_text("original_2")],
-            vec![Value::Integer(3), Value::build_text("updated_3")],
-            vec![Value::Integer(4), Value::build_text("original_4")],
-            vec![Value::Integer(5), Value::build_text("original_5")],
+            vec![Value::from_i64(1), Value::build_text("original_1")],
+            vec![Value::from_i64(2), Value::build_text("original_2")],
+            vec![Value::from_i64(3), Value::build_text("updated_3")],
+            vec![Value::from_i64(4), Value::build_text("original_4")],
+            vec![Value::from_i64(5), Value::build_text("original_5")],
         ]
     );
 }
@@ -1455,10 +1347,7 @@ fn test_mvcc_dual_seek_with_update() {
 /// The seek should NOT find the deleted row.
 #[test]
 fn test_mvcc_dual_seek_with_delete() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_with_delete.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_with_delete.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert rows
@@ -1475,10 +1364,7 @@ fn test_mvcc_dual_seek_with_delete() {
     drop(tmp_db);
 
     // Reopen
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Delete row 3
@@ -1506,10 +1392,10 @@ fn test_mvcc_dual_seek_with_delete() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)],
-            vec![Value::Integer(2)],
-            vec![Value::Integer(4)],
-            vec![Value::Integer(5)],
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(4)],
+            vec![Value::from_i64(5)],
         ]
     );
 }
@@ -1517,10 +1403,7 @@ fn test_mvcc_dual_seek_with_delete() {
 /// Test range seek (GT, LT operations) with dual iteration.
 #[test]
 fn test_mvcc_dual_seek_range_operations() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_range_operations.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_range_operations.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert rows
@@ -1537,10 +1420,7 @@ fn test_mvcc_dual_seek_range_operations() {
     drop(tmp_db);
 
     // Reopen
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Insert more rows into MVCC
@@ -1556,10 +1436,10 @@ fn test_mvcc_dual_seek_range_operations() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(3)],
-            vec![Value::Integer(4)],
-            vec![Value::Integer(5)],
-            vec![Value::Integer(6)],
+            vec![Value::from_i64(3)],
+            vec![Value::from_i64(4)],
+            vec![Value::from_i64(5)],
+            vec![Value::from_i64(6)],
         ]
     );
 
@@ -1571,9 +1451,9 @@ fn test_mvcc_dual_seek_range_operations() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)],
-            vec![Value::Integer(2)],
-            vec![Value::Integer(3)],
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(3)],
         ]
     );
 
@@ -1585,9 +1465,432 @@ fn test_mvcc_dual_seek_range_operations() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(3)],
-            vec![Value::Integer(4)],
-            vec![Value::Integer(5)],
+            vec![Value::from_i64(3)],
+            vec![Value::from_i64(4)],
+            vec![Value::from_i64(5)],
+        ]
+    );
+}
+
+#[test]
+fn test_commit_without_mvcc() {
+    let tmp_db = TempDatabase::new("test_commit_without_mvcc.db");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+
+    assert!(
+        !conn.get_auto_commit(),
+        "should not be in autocommit mode after BEGIN"
+    );
+
+    conn.execute("INSERT INTO test (id, value) VALUES (1, 'hello')")
+        .unwrap();
+
+    conn.execute("COMMIT")
+        .expect("COMMIT should succeed for non-MVCC transactions");
+
+    assert!(
+        conn.get_auto_commit(),
+        "should be back in autocommit mode after COMMIT"
+    );
+
+    let stmt = conn
+        .query("SELECT value FROM test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::Text("hello".into()));
+}
+
+#[test]
+fn test_rollback_without_mvcc() {
+    let tmp_db = TempDatabase::new("test_rollback_without_mvcc.db");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    conn.execute("INSERT INTO test (id, value) VALUES (1, 'initial')")
+        .unwrap();
+
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+
+    assert!(
+        !conn.get_auto_commit(),
+        "should not be in autocommit mode after BEGIN"
+    );
+
+    conn.execute("UPDATE test SET value = 'modified' WHERE id = 1")
+        .unwrap();
+
+    conn.execute("ROLLBACK")
+        .expect("ROLLBACK should succeed for non-MVCC transactions");
+
+    assert!(
+        conn.get_auto_commit(),
+        "should be back in autocommit mode after ROLLBACK"
+    );
+
+    let stmt = conn
+        .query("SELECT value FROM test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::Text("initial".into()));
+}
+
+#[test]
+fn test_wal_savepoint_rollback_on_constraint_violation() {
+    let tmp_db = TempDatabase::new("test_90969.db");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA cache_size = 200").unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, val TEXT)")
+        .unwrap();
+
+    let padding = "x".repeat(2000);
+    conn.execute("BEGIN").unwrap();
+    for i in 1..=1000 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, {i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+
+    let result =
+        conn.execute("UPDATE t SET val = 'modified', u = CASE WHEN id = 1000 THEN 1 ELSE u END");
+    assert!(
+        matches!(result, Err(LimboError::Constraint(_))),
+        "Expected UNIQUE constraint violation, got: {result:?}"
+    );
+
+    let stmt = conn
+        .query("SELECT val FROM t WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    let Value::Text(val) = &row[0] else {
+        panic!("Expected text value");
+    };
+    assert_eq!(
+        val.as_str(),
+        &padding,
+        "Row should have original value after failed UPDATE rollback"
+    );
+
+    conn.execute("INSERT INTO t VALUES (1001, 1001, 'new')")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rusqlite_conn = rusqlite::Connection::open(tmp_db.path.clone()).unwrap();
+    let result: String = rusqlite_conn
+        .pragma_query_value(None, "integrity_check", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        result, "ok",
+        "Database should pass integrity check after savepoint rollback"
+    );
+
+    let stmt = conn.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::from_i64(1001));
+}
+
+#[turso_macros::test]
+/// INSERT OR FAIL should keep changes made by the statement before the error.
+/// Unlike ABORT (the default), FAIL does not roll back successful inserts within the same statement.
+fn test_insert_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")
+        .unwrap();
+
+    // INSERT OR FAIL with multiple rows - (3, 'third') succeeds, then (1, 'conflict') fails
+    let result = conn.execute("INSERT OR FAIL INTO t VALUES (3, 'third'), (1, 'conflict')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify that row 3 was inserted (FAIL keeps prior changes)
+    let stmt = conn.query("SELECT id FROM t ORDER BY id").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(3)], // This row should exist due to FAIL semantics
+        ]
+    );
+}
+
+#[turso_macros::test]
+/// INSERT OR ABORT (default) should rollback all changes from the statement on error.
+fn test_insert_or_abort_rolls_back_statement(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")
+        .unwrap();
+
+    // INSERT OR ABORT with multiple rows - (3, 'third') would succeed, but (1, 'conflict') fails
+    // and rolls back the entire statement
+    let result = conn.execute("INSERT OR ABORT INTO t VALUES (3, 'third'), (1, 'conflict')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify that row 3 was NOT inserted (ABORT rolls back statement)
+    let stmt = conn.query("SELECT id FROM t ORDER BY id").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            // Row 3 should NOT be here due to ABORT semantics
+        ]
+    );
+}
+
+#[turso_macros::test]
+/// INSERT OR ROLLBACK in a transaction should rollback the entire transaction on error.
+fn test_insert_or_rollback_rolls_back_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'outside')").unwrap();
+
+    // Start a transaction and insert a row
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'inside')").unwrap();
+
+    // INSERT OR ROLLBACK causes the entire transaction to roll back
+    let result = conn.execute("INSERT OR ROLLBACK INTO t VALUES (1, 'conflict')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify that row 2 was rolled back (ROLLBACK affects entire transaction)
+    let stmt = conn.query("SELECT id FROM t ORDER BY id").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1)], // Only the original row should remain
+        ]
+    );
+
+    // Verify we're back in autocommit mode
+    assert!(conn.get_auto_commit());
+}
+
+#[turso_macros::test]
+/// INSERT OR ROLLBACK with unique constraint in transaction should rollback the entire transaction.
+fn test_insert_or_rollback_unique_constraint_in_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+
+    // Start a transaction
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
+
+    // INSERT OR ROLLBACK with unique constraint violation
+    let result = conn.execute("INSERT OR ROLLBACK INTO t VALUES (3, 'alice')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify that row 2 (bob) was rolled back
+    let stmt = conn
+        .query("SELECT name FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::Text("alice".into())],]);
+
+    // Verify we're back in autocommit mode
+    assert!(conn.get_auto_commit());
+}
+
+#[turso_macros::test]
+/// INSERT OR ROLLBACK in autocommit mode should behave like ABORT (single statement = transaction).
+fn test_insert_or_rollback_in_autocommit(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+
+    // INSERT OR ROLLBACK in autocommit mode
+    let result = conn.execute("INSERT OR ROLLBACK INTO t VALUES (1, 'conflict')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify the original row is still there
+    let stmt = conn
+        .query("SELECT val FROM t WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::Text("first".into())],]);
+}
+
+#[turso_macros::test]
+/// INSERT OR FAIL with unique constraint should keep successfully inserted rows.
+fn test_insert_or_fail_unique_constraint(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')")
+        .unwrap();
+
+    // INSERT OR FAIL - (3, 'charlie') succeeds, then (4, 'alice') fails
+    let result = conn.execute("INSERT OR FAIL INTO t VALUES (3, 'charlie'), (4, 'alice')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify charlie was inserted (FAIL keeps prior changes)
+    let stmt = conn
+        .query("SELECT name FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Text("alice".into())],
+            vec![Value::Text("bob".into())],
+            vec![Value::Text("charlie".into())], // This should exist due to FAIL
+        ]
+    );
+}
+
+#[turso_macros::test]
+/// UPDATE OR FAIL should keep changes made by the statement before the error.
+/// Unlike ABORT (the default), FAIL does not roll back successful updates within the same statement.
+fn test_update_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+
+    // UPDATE OR FAIL - try to set val=20 which conflicts with id=2
+    let result = conn.execute("UPDATE OR FAIL t SET val = 20 WHERE id = 1");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify original values (single row update, so nothing before the error to keep)
+    let stmt = conn
+        .query("SELECT id, val FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
+        ]
+    );
+}
+
+#[turso_macros::test]
+/// UPDATE OR ABORT (default) should rollback all changes from the statement on error.
+fn test_update_or_abort_rolls_back_statement(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+
+    // UPDATE OR ABORT - try to set val=20 which conflicts with id=2
+    let result = conn.execute("UPDATE OR ABORT t SET val = 20 WHERE id = 1");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify original values (ABORT rolls back statement)
+    let stmt = conn
+        .query("SELECT id, val FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
+        ]
+    );
+}
+
+#[turso_macros::test]
+/// UPDATE OR ROLLBACK in a transaction should rollback the entire transaction on error.
+fn test_update_or_rollback_rolls_back_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    // Start a transaction and make some changes
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE t SET val = 100 WHERE id = 1").unwrap();
+
+    // UPDATE OR ROLLBACK causes the entire transaction to roll back
+    let result = conn.execute("UPDATE OR ROLLBACK t SET val = 30 WHERE id = 2");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify that all changes were rolled back (including the first UPDATE)
+    let stmt = conn
+        .query("SELECT id, val FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(10)], // Rolled back
+            vec![Value::from_i64(2), Value::from_i64(20)], // Unchanged
+            vec![Value::from_i64(3), Value::from_i64(30)], // Unchanged
+        ]
+    );
+
+    // Verify we're back in autocommit mode
+    assert!(conn.get_auto_commit());
+}
+
+#[turso_macros::test]
+/// UPDATE OR ROLLBACK in autocommit mode should work like ABORT.
+fn test_update_or_rollback_in_autocommit(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+
+    // UPDATE OR ROLLBACK in autocommit mode
+    let result = conn.execute("UPDATE OR ROLLBACK t SET val = 20 WHERE id = 1");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify original values
+    let stmt = conn
+        .query("SELECT id, val FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
         ]
     );
 }

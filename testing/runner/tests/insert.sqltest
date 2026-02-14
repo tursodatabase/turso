@@ -1,0 +1,1845 @@
+@database :memory:
+
+setup dqs_dml {
+    .dbconfig dqs_dml on
+}
+
+test basic-insert {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1);
+    select * from temp;
+}
+expect {
+    1
+}
+
+test must-be-int-insert {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1),(2.0),('3'),('4.0');
+    select * from temp;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@requires strict "uses STRICT tables"
+test strict-basic-creation {
+    CREATE TABLE test1 (id INTEGER, name TEXT, price REAL) STRICT;
+    INSERT INTO test1 VALUES(1, 'item1', 10.5);
+    SELECT * FROM test1;
+}
+expect {
+    1|item1|10.5
+}
+
+test self-insert-sum-pk {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t(b) VALUES(1),(2);
+    INSERT INTO t(b) SELECT sum(b) FROM t;
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+# Reproducer for https://github.com/tursodatabase/turso/issues/2822
+@requires strict "uses STRICT tables"
+test strict-type-case-insensitivity {
+    CREATE TABLE test1 (id integer, name text, price real) STRICT;
+    INSERT INTO test1 VALUES(1, 'item1', 10.5);
+    SELECT * FROM test1;
+}
+expect {
+    1|item1|10.5
+}
+
+@requires strict "uses STRICT tables"
+test strict-require-datatype {
+    CREATE TABLE test2 (id INTEGER, name) STRICT;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-valid-datatypes {
+    CREATE TABLE test2 (id INTEGER, value DATETIME) STRICT;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-type-enforcement {
+    CREATE TABLE test3 (id INTEGER, name TEXT, price REAL) STRICT;
+    INSERT INTO test3 VALUES(1, 'item1', 'not-a-number');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-type-coercion {
+    CREATE TABLE test4 (id INTEGER, name TEXT, price REAL) STRICT;
+    INSERT INTO test4 VALUES(1, 'item1', '10.5');
+    SELECT typeof(price), price FROM test4;
+}
+expect {
+    real|10.5
+}
+
+@requires strict "uses STRICT tables"
+test strict-any-flexibility {
+    CREATE TABLE test5 (id INTEGER, data ANY) STRICT;
+    INSERT INTO test5 VALUES(1, 100);
+    INSERT INTO test5 VALUES(2, 'text');
+    INSERT INTO test5 VALUES(3, 3.14);
+    SELECT id, typeof(data) FROM test5 ORDER BY id;
+}
+expect {
+    1|integer
+    2|text
+    3|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-any-preservation {
+    CREATE TABLE test6 (id INTEGER, code ANY) STRICT;
+    INSERT INTO test6 VALUES(1, '000123');
+    SELECT typeof(code), code FROM test6;
+}
+expect {
+    text|000123
+}
+
+@requires strict "uses STRICT tables"
+test strict-int-vs-integer-pk {
+    CREATE TABLE test8 (id INT PRIMARY KEY, name TEXT) STRICT
+    INSERT INTO test8 VALUES(NULL, 'test');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-integer-pk-behavior {
+    CREATE TABLE test9 (id INTEGER PRIMARY KEY, name TEXT) STRICT;
+    INSERT INTO test9 VALUES(NULL, 'test');
+    SELECT id, name FROM test9;
+}
+expect {
+    1|test
+}
+
+@requires strict "uses STRICT tables"
+test strict-mixed-inserts {
+    CREATE TABLE test11 (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    price REAL,
+    quantity INT,
+    tags ANY
+    ) STRICT;
+    INSERT INTO test11 VALUES(1, 'item1', 10.5, 5, 'tag1');
+    INSERT INTO test11 VALUES(2, 'item2', 20.75, 10, 42);
+    SELECT id, name, price, quantity, typeof(tags) FROM test11 ORDER BY id;
+}
+expect {
+    1|item1|10.5|5|text
+    2|item2|20.75|10|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-update-basic {
+    CREATE TABLE test1 (id INTEGER, name TEXT, price REAL) STRICT;
+    INSERT INTO test1 VALUES(1, 'item1', 10.5);
+    UPDATE test1 SET price = 15.75 WHERE id = 1;
+    SELECT * FROM test1;
+}
+expect {
+    1|item1|15.75
+}
+
+@requires strict "uses STRICT tables"
+test strict-update-type-enforcement {
+    CREATE TABLE test2 (id INTEGER, name TEXT, price REAL) STRICT;
+    INSERT INTO test2 VALUES(1, 'item1', 10.5);
+    UPDATE test2 SET price = 'not-a-number' WHERE id = 1;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-update-type-coercion {
+    CREATE TABLE test3 (id INTEGER, name TEXT, price REAL) STRICT;
+    INSERT INTO test3 VALUES(1, 'item1', 10.5);
+    UPDATE test3 SET price = '15.75' WHERE id = 1;
+    SELECT id, typeof(price), price FROM test3;
+}
+expect {
+    1|real|15.75
+}
+
+@requires strict "uses STRICT tables"
+test strict-update-any-flexibility {
+    CREATE TABLE test4 (id INTEGER, data ANY) STRICT;
+    INSERT INTO test4 VALUES(1, 100);
+    UPDATE test4 SET data = 'text' WHERE id = 1;
+    INSERT INTO test4 VALUES(2, 'original');
+    UPDATE test4 SET data = 3.14 WHERE id = 2;
+    SELECT id, typeof(data), data FROM test4 ORDER BY id;
+}
+expect {
+    1|text|text
+    2|real|3.14
+}
+
+@requires strict "uses STRICT tables"
+test strict-update-any-preservation {
+    CREATE TABLE test5 (id INTEGER, code ANY) STRICT;
+    INSERT INTO test5 VALUES(1, 'text');
+    UPDATE test5 SET code = '000123' WHERE id = 1;
+    SELECT typeof(code), code FROM test5;
+}
+expect {
+    text|000123
+}
+
+@requires strict "uses STRICT tables"
+test strict-update-not-null-constraint {
+    CREATE TABLE test7 (id INTEGER, name TEXT NOT NULL) STRICT;
+    INSERT INTO test7 VALUES(1, 'name');
+    UPDATE test7 SET name = NULL WHERE id = 1;
+}
+expect error {
+}
+
+# Uncomment following test case when unique constraint is added
+@requires strict "uses STRICT tables"
+test strict-update-pk-constraint {
+    CREATE TABLE test8 (id INTEGER PRIMARY KEY, name TEXT) STRICT;
+    INSERT INTO test8 VALUES(1, 'name1');
+    INSERT INTO test8 VALUES(2, 'name2');
+    UPDATE test8 SET id = 2 WHERE id = 1;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-update-multiple-columns {
+    CREATE TABLE test9 (id INTEGER, name TEXT, price REAL, quantity INT) STRICT;
+    INSERT INTO test9 VALUES(1, 'item1', 10.5, 5);
+    UPDATE test9 SET name = 'updated', price = 20.75, quantity = 10 WHERE id = 1;
+    SELECT * FROM test9;
+}
+expect {
+    1|updated|20.75|10
+}
+
+@requires strict "uses STRICT tables"
+test strict-update-where-clause {
+    CREATE TABLE test10 (id INTEGER, category TEXT, price REAL) STRICT;
+    INSERT INTO test10 VALUES(1, 'A', 10);
+    INSERT INTO test10 VALUES(2, 'A', 20);
+    INSERT INTO test10 VALUES(3, 'B', 30);
+    UPDATE test10 SET price = price * 2 WHERE category = 'A';
+    SELECT id, price FROM test10 ORDER BY id;
+}
+expect {
+    1|20.0
+    2|40.0
+    3|30.0
+}
+
+@requires strict "uses STRICT tables"
+test strict-update-expression {
+    CREATE TABLE test11 (id INTEGER, name TEXT, price REAL, discount REAL) STRICT;
+    INSERT INTO test11 VALUES(1, 'item1', 100, 0.1);
+    UPDATE test11 SET price = price - (price * discount);
+    SELECT id, price FROM test11;
+}
+expect {
+    1|90.0
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-basic {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('42.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    42|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-zero {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('0.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    0|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-negative {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('-5.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -5|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-scientific {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('1e2');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    100|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-fractional-error {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('1.5');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-integer-to-real-basic {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('42');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    42.0|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-integer-to-real-negative {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('-7');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -7.0|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-integer-to-real-zero {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    0.0|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-real {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('3.14');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    3.14|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-string-to-real-error {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('hello');
+}
+expect error {
+}
+
+test duplicate-set {
+    CREATE TABLE t (x, y);
+    INSERT INTO t VALUES(1, 'A');
+    UPDATE t SET y = 'B', y = 'C', y = 'D' WHERE x = 1;
+    SELECT x, y FROM t;
+}
+expect {
+    1|D
+}
+
+test named-insert-1 {
+    CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT, col_b TEXT, col_c TEXT, col_d TEXT);
+    INSERT INTO test (col_b, col_d, col_a, col_c) VALUES ('1', '2', '3', '4');
+    SELECT * FROM test;
+}
+expect {
+    1|3|1|4|2
+}
+
+test named-insert-2 {
+    CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT DEFAULT 'Empty', col_b TEXT, col_c TEXT, col_d TEXT);
+    INSERT INTO test (col_b, col_d, col_c) VALUES ('1', '2', '4');
+    SELECT * FROM test;
+}
+expect {
+    1|Empty|1|4|2
+}
+
+test multi-rows {
+    CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col);
+    INSERT INTO test (col) VALUES (1),(1);
+    SELECT * FROM test;
+}
+expect {
+    1|1
+    2|1
+}
+
+test unique_insert_no_pkey {
+    CREATE TABLE t2 (x INTEGER, y INTEGER UNIQUE);
+    INSERT INTO t2 (y) VALUES (1);
+    INSERT INTO t2 (y) VALUES (6);
+    SELECT * FROM t2;
+}
+expect {
+    |1
+    |6
+}
+
+test unique_insert_with_pkey {
+    CREATE TABLE t2 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE);
+    INSERT INTO t2 (y) VALUES (1);
+    INSERT INTO t2 (y) VALUES (6);
+    SELECT * FROM t2;
+}
+expect {
+    1|1
+    2|6
+}
+
+test not_null_insert {
+    CREATE TABLE t2 (y INTEGER NOT NULL);
+    INSERT INTO t2 (y) VALUES (1);
+    INSERT INTO t2 (y) VALUES (6);
+    SELECT * FROM t2;
+}
+expect {
+    1
+    6
+}
+
+test not_null_primary_key {
+    CREATE TABLE t2 (y INT PRIMARY KEY NOT NULL);
+    INSERT INTO t2 (y) VALUES (1);
+    INSERT INTO t2 (y) VALUES (NULL);
+}
+expect error {
+}
+
+test not_null_insert_select {
+    CREATE TABLE t2 (y INT PRIMARY KEY NOT NULL);
+    CREATE TABLE d (y INT);
+    INSERT INTO d (y) VALUES (1);
+    INSERT INTO d (y) VALUES (NULL);
+    INSERT INTO t2 (y) SELECT y FROM d;
+}
+expect error {
+}
+
+test not_null_insert_multiple_values {
+    CREATE TABLE t2 (y INT PRIMARY KEY NOT NULL);
+    INSERT INTO t2 (y) VALUES (1), (NULL);
+}
+expect error {
+}
+
+test insert_from_select_1 {
+    CREATE TABLE t (a);
+    CREATE TABLE t2 (b, c);
+    INSERT INTO t2 values (1, 2), (10, 20);
+    INSERT INTO t SELECT b FROM t2;
+    SELECT * FROM t;
+    INSERT INTO t SELECT c FROM t2;
+    SELECT * FROM t;
+}
+expect {
+    1
+    10
+    1
+    10
+    2
+    20
+}
+
+test insert_from_select_where {
+    CREATE TABLE t (a);
+    CREATE TABLE t2 (b, c);
+    INSERT INTO t2 values (1, 2), (10, 20);
+    INSERT INTO t SELECT b FROM t2 WHERE b < 10;
+    SELECT * FROM t;
+    INSERT INTO t SELECT c FROM t2 WHERE c > 2;
+    SELECT * FROM t;
+}
+expect {
+    1
+    1
+    20
+}
+
+test insert_from_select_union_all {
+    CREATE TABLE t1 (x INTEGER);
+    CREATE TABLE t2 (x INTEGER);
+    CREATE TABLE t3 (x INTEGER);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(4),(5),(6);
+    INSERT INTO t3 VALUES(7),(8),(9);
+    INSERT INTO t1 SELECT x FROM t2 UNION ALL SELECT x FROM t3;
+    SELECT * FROM t1;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+}
+
+test insert_from_select_union_all_where {
+    CREATE TABLE t1 (x INTEGER);
+    CREATE TABLE t2 (x INTEGER);
+    CREATE TABLE t3 (x INTEGER);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(4),(5),(6);
+    INSERT INTO t3 VALUES(7),(8),(9);
+    INSERT INTO t1 SELECT x FROM t2 WHERE x != 4 UNION ALL SELECT x FROM t3 WHERE x == 8;
+    SELECT * FROM t1;
+}
+expect {
+    1
+    2
+    3
+    5
+    6
+    8
+}
+
+test insert_from_select_union_all_values {
+    CREATE TABLE t(a, b);
+    INSERT INTO t(a, b) SELECT * FROM (VALUES(3, 3)) UNION ALL VALUES(4, 4);
+    SELECT a, b FROM t ORDER BY rowid;
+}
+expect {
+    3|3
+    4|4
+}
+
+test values-union-all {
+    CREATE TABLE test (a INTEGER NOT NULL, b INTEGER NOT NULL);
+    INSERT INTO test(a, b) VALUES(3, 3) UNION ALL VALUES(4, 4);
+    SELECT a, b FROM test ORDER BY rowid;
+}
+expect {
+    3|3
+    4|4
+}
+
+test insert_from_select_same_table {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b);
+    INSERT INTO t(b) VALUES (1),(2),(3);
+    SELECT * FROM t;
+    INSERT INTO t(b) SELECT b FROM t;
+    SELECT * FROM t;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    1|1
+    2|2
+    3|3
+    4|1
+    5|2
+    6|3
+}
+
+test insert_from_select_same_table_2 {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b, c);
+    INSERT INTO t(b, c) VALUES (1, 100),(2, 200),(3, 300);
+    SELECT * FROM t;
+    INSERT INTO t(b, c) SELECT b,c FROM t;
+    SELECT * FROM t;
+}
+expect {
+    1|1|100
+    2|2|200
+    3|3|300
+    1|1|100
+    2|2|200
+    3|3|300
+    4|1|100
+    5|2|200
+    6|3|300
+}
+
+test insert_from_select_union {
+    CREATE TABLE t (a, b);
+    CREATE TABLE t2 (b, c);
+    INSERT INTO t2 VALUES (1, 100), (2, 200);
+    INSERT INTO t SELECT * FROM t UNION SELECT * FROM t2;
+    SELECT * FROM t;
+}
+expect {
+    1|100
+    2|200
+}
+
+test insert_from_select_union-2 {
+    CREATE TABLE t (a, b);
+    CREATE TABLE t2 (b, c);
+    INSERT INTO t SELECT * FROM t UNION values(1, 100), (2, 200);
+    SELECT * FROM t;
+}
+expect {
+    1|100
+    2|200
+}
+
+test insert_from_select_intersect {
+    CREATE TABLE t (a, b);
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE t2 (a, b);
+    INSERT INTO t1 VALUES (1, 100), (2, 200);
+    INSERT INTO t2 VALUES (2, 200), (3, 300);
+    INSERT INTO t SELECT * FROM t1 INTERSECT SELECT * FROM t2;
+    SELECT * FROM t;
+}
+expect {
+    2|200
+}
+
+test insert_from_select_intersect-2 {
+    CREATE TABLE t (a, b);
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE t2 (a, b);
+    CREATE TABLE t3 (a, b);
+    INSERT INTO t1 VALUES (1, 100), (2, 200);
+    INSERT INTO t2 VALUES (2, 200), (3, 300);
+    INSERT INTO t3 VALUES (2, 200), (4, 400);
+    INSERT INTO t SELECT * FROM t1 INTERSECT SELECT * FROM t2 INTERSECT SELECT * FROM t3;
+    SELECT * FROM t;
+}
+expect {
+    2|200
+}
+
+test insert_from_select_except {
+    CREATE TABLE t (a, b);
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE t2 (a, b);
+    INSERT INTO t1 VALUES (1, 100), (2, 200);
+    INSERT INTO t2 VALUES (2, 200), (3, 300);
+    INSERT INTO t SELECT * FROM t1 EXCEPT SELECT * FROM t2;
+    SELECT * FROM t;
+}
+expect {
+    1|100
+}
+
+test negative-primary-integer-key {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    insert into t values (-2),(13);
+    select * from t order by a asc;
+}
+expect {
+    -2
+    13
+}
+
+test not-null-rowid-alias {
+    CREATE TABLE t (a INTEGER PRIMARY KEY NOT NULL, b);
+    insert into t values (1, 2);
+    select * from t;
+}
+expect {
+    1|2
+}
+
+test rowid-overflow-random-generation {
+    CREATE TABLE q (x INTEGER PRIMARY KEY, y);
+    INSERT INTO q VALUES (9223372036854775807, 1);
+    INSERT INTO q(y) VALUES (2);
+    INSERT INTO q(y) VALUES (3);
+    SELECT COUNT(*) FROM q;
+}
+expect {
+    3
+}
+
+# regression test for incorrect processing of record header in the case of large text columns
+test large-text-index-seek {
+    CREATE TABLE t (x TEXT, y);
+    CREATE INDEX t_idx ON t(x);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'a', 1);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'b', 2);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'c', 3);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'd', 4);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'e', 5);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'f', 6);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'g', 7);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'h', 8);
+    SELECT COUNT(*) FROM t WHERE x >= replace(hex(zeroblob(100)), '00', 'a');
+}
+expect {
+    8
+}
+
+@backend cli
+@setup dqs_dml
+test double-quote-string-literals {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, "Dave");
+    INSERT INTO test (id,name) VALUES (2, 'Alice');
+    SELECT * FROM test ORDER BY id;
+}
+expect {
+    1|Dave
+    2|Alice
+}
+
+@backend cli
+@setup dqs_dml
+test mixed-quote-types {
+    CREATE TABLE mixed (a TEXT, b TEXT, c TEXT);
+    INSERT INTO mixed (a,b,c) VALUES ("double", 'single', "another");
+    SELECT * FROM mixed;
+} 
+expect {
+    double|single|another
+}
+
+@backend cli
+@setup dqs_dml
+test double-quote-regression-original-case {
+    CREATE TABLE users (
+        id INTEGER,
+        name TEXT,
+        email TEXT
+    );
+    INSERT INTO users (name) values ("Dave");
+    SELECT name FROM users;
+} 
+expect {
+    Dave
+}
+
+@backend cli
+@setup dqs_dml
+test double-quote-multiple-rows {
+    CREATE TABLE items (id INTEGER, description TEXT, category TEXT);
+    INSERT INTO items (id, description, category) VALUES
+        (1, "First_item", "category_a"),
+        (2, 'Second_item', "category_b"),
+        (3, "Third_item", 'category_c');
+    SELECT id, description, category FROM items ORDER BY id;
+} 
+expect {
+    1|First_item|category_a
+    2|Second_item|category_b
+    3|Third_item|category_c
+}
+
+@backend cli
+@setup dqs_dml
+test double-quote-inner-quotes-preservation {
+    CREATE TABLE inner_quotes_test (id INTEGER, content TEXT);
+    INSERT INTO inner_quotes_test VALUES (1, '"foo"');
+    INSERT INTO inner_quotes_test VALUES (2, "'bar'");
+    SELECT id, content FROM inner_quotes_test ORDER BY id;
+} 
+expect {
+    1|"foo"
+    2|'bar'
+}
+
+# regression test for incorrect order of column in insert
+test insert-tricky-column-order-values {
+    create table t (x, y, z);
+    insert into t(z, x) values (1, 2), (3, 4);
+    insert into t(y, z) values (5, 6), (7, 8);
+    select * from t;
+}
+expect {
+    2||1
+    4||3
+    |5|6
+    |7|8
+}
+
+test insert-tricky-column-order-table {
+    create table t (x, y, z);
+    create table q (x, y, z);
+    insert into q values (1, 2, 3), (4, 5, 6);
+    insert into t(z, x) select y, x from q;
+    insert into t(y, z) select z, y from q;
+    select * from t;
+}
+expect {
+    1||2
+    4||5
+    |3|2
+    |6|5
+}
+
+test insert-explicit-rowid {
+    create table t (x, y, z);
+    insert into t(z, x, y, rowid) values (1, 2, 3, 4), (5, 6, 7, 8);
+    insert into t(z, x, y, rowid) values (9, 10, 11, 12);
+    select rowid, x, y, z from t;
+}
+expect {
+    4|2|3|1
+    8|6|7|5
+    12|10|11|9
+}
+
+test insert-explicit-rowid-with-rowidalias {
+    create table t (x, y INTEGER PRIMARY KEY, z);
+    insert into t(z, x, y, rowid) values (1, 2, 3, 4), (5, 6, 7, 8);
+    insert into t(z, x, y, rowid) values (9, 10, 11, 12);
+    insert into t(z, x, rowid, y) values (-1, -2, -3, -4), (-5, -6, -7, -8);
+    insert into t(z, x, rowid, y) values (-9, -10, -11, -12);
+    select rowid, x, y, z from t;
+}
+expect {
+    -12|-10|-12|-9
+    -8|-6|-8|-5
+    -4|-2|-4|-1
+    4|2|4|1
+    8|6|8|5
+    12|10|12|9
+}
+
+test null-value-insert-null-type-column {
+    CREATE TABLE test (id INTEGER,name NULL);
+    INSERT INTO test (id, name) VALUES (1, NULL);
+    SELECT * FROM test;
+}
+expect {
+    1|
+}
+
+# https://github.com/tursodatabase/turso/issues/1710
+test uniq_constraint {
+    CREATE TABLE test (id INTEGER unique);
+    insert into test values (1);
+    insert into test values (1);
+}
+expect error {
+    UNIQUE constraint failed: test.id \(19\)
+}
+
+test insert-explicit-rowid-conflict {
+    create table t (x);
+    insert into t(rowid, x) values (1, 1);
+    insert into t(rowid, x) values (1, 2);
+}
+expect error {
+    UNIQUE constraint failed: t.rowid \(19\)
+}
+
+# RETURNING clause tests
+test returning-basic-column {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5) RETURNING id;
+}
+expect {
+    1
+}
+
+test returning-multiple-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5) RETURNING id, name;
+}
+expect {
+    1|test
+}
+
+test returning-all-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5) RETURNING *;
+}
+expect {
+    1|test|10.5
+}
+
+test returning-literal {
+    CREATE TABLE test (id INTEGER);
+    INSERT INTO test (id) VALUES (1) RETURNING 42;
+}
+expect {
+    42
+}
+
+test returning-arithmetic {
+    CREATE TABLE test (id INTEGER, value INTEGER);
+    INSERT INTO test (id, value) VALUES (1, 10) RETURNING 2 * value;
+}
+expect {
+    20
+}
+
+test returning-complex-expression {
+    CREATE TABLE test (id INTEGER, x INTEGER, y INTEGER);
+    INSERT INTO test (id, x, y) VALUES (1, 5, 3) RETURNING x + y * 2;
+}
+expect {
+    11
+}
+
+test returning-function-call {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'hello') RETURNING upper(name);
+}
+expect {
+    HELLO
+}
+
+test returning-mixed-expressions {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10) RETURNING id, upper(name), value * 3;
+}
+expect {
+    1|TEST|30
+}
+
+test returning-multiple-rows {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'first'), (2, 'second') RETURNING id, name;
+}
+expect {
+    1|first
+    2|second
+}
+
+test returning-with-autoincrement {
+    CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+    INSERT INTO test (name) VALUES ('test') RETURNING id, name;
+}
+expect {
+    1|test
+}
+
+test returning-rowid {
+    CREATE TABLE test (name TEXT);
+    INSERT INTO test (name) VALUES ('test') RETURNING rowid, name;
+}
+expect {
+    1|test
+}
+
+test returning-null-values {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, NULL, NULL) RETURNING id, name, value;
+}
+expect {
+    1||
+}
+
+test null-insert-in-nulltype-column-notnull-constraint {
+    CREATE TABLE test (id INTEGER,name NULL NOT NULL);
+    INSERT INTO test (id, name) VALUES (1, NULL);
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+test returning-true-literal {
+    CREATE TABLE test (id INTEGER, value TEXT);
+    INSERT INTO test (id, value) VALUES (1, true) RETURNING id, value;
+}
+expect {
+    1|1
+}
+
+test returning-false-literal {
+    CREATE TABLE test (id INTEGER, value TEXT);
+    INSERT INTO test (id, value) VALUES (1, false) RETURNING id, value;
+}
+expect {
+    1|0
+}
+
+test boolean-literal-edgecase {
+    CREATE TABLE true (id INTEGER, value TEXT);
+    INSERT INTO true (id, value) VALUES (1, true) RETURNING id, value;
+}
+expect {
+    1|1
+}
+
+test boolean-literal-edgecase-false {
+    CREATE TABLE false (id INTEGER, true TEXT);
+    INSERT INTO false (id, true) VALUES (1, false) RETURNING id, false;
+}
+expect {
+    1|0
+}
+
+test default-values-population {
+    CREATE TABLE t (x INTEGER PRIMARY KEY, y DEFAULT 666, z);
+    INSERT INTO t DEFAULT VALUES;
+    INSERT INTO t DEFAULT VALUES;
+    SELECT * FROM t;
+}
+expect {
+    1|666|
+    2|666|
+}
+
+test set-explicit-null-default-value {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x DEFAULT 1);
+    INSERT INTO t(id, x) VALUES (1, 2);
+    SELECT * FROM t;
+    UPDATE t SET x = NULL WHERE id = 1;
+    SELECT * FROM t;
+}
+expect {
+    1|2
+    1|
+}
+
+test insert-select-nested-subquery {
+    CREATE TABLE t (x);
+    INSERT INTO T VALUES (1);
+    INSERT INTO T SELECT * FROM (SELECT * FROM t);
+    SELECT * FROM t;
+}
+expect {
+    1
+    1
+}
+
+# Regression test for: https://github.com/tursodatabase/turso/issues/3567 (used to panic, now returns unique constraint error)
+test insert-rowid-select-rowid {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t(rowid) SELECT rowid FROM t;
+}
+expect error {
+}
+
+test insert-rowidalias-select-rowid {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t(a) SELECT rowid FROM t;
+}
+expect error {
+}
+
+test insert-rowid-select-rowid-success {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (2);
+    INSERT INTO t(a) SELECT rowid FROM t;
+    SELECT * FROM t;
+}
+expect {
+    2
+    1
+}
+
+# Due to a bug in SQLite, this check is needed to maintain backwards compatibility with rowid alias
+# SQLite docs: https://sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
+# Issue: https://github.com/tursodatabase/turso/issues/3665
+test insert-rowid-backwards-compability {
+    CREATE TABLE t(a INTEGER PRIMARY KEY DESC);
+    INSERT INTO t(a) VALUES (123);
+    SELECT rowid, * FROM t;
+}
+expect {
+    1|123
+}
+
+test insert-rowid-backwards-compability-2 {
+    CREATE TABLE t(a INTEGER, PRIMARY KEY (a DESC));
+    INSERT INTO t(a) VALUES (123);
+    SELECT rowid, * FROM t;
+}
+expect {
+    123|123
+}
+
+test ignore-pk-conflict {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1),(2),(3);
+    INSERT OR IGNORE INTO t VALUES (2);
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+test ignore-unique-conflict {
+    CREATE TABLE t(a INTEGER, b TEXT UNIQUE);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT OR IGNORE INTO t VALUES (3,'y');
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|y
+}
+
+test ignore-multi-unique-conflict {
+    CREATE TABLE t(a UNIQUE, b UNIQUE, c);
+    INSERT INTO t VALUES (1,10,100),(2,20,200);
+    INSERT OR IGNORE INTO t VALUES (1,30,300);  -- conflicts on a
+    INSERT OR IGNORE INTO t VALUES (3,20,300);  -- conflicts on b
+    INSERT OR IGNORE INTO t VALUES (1,20,300);  -- conflicts on both
+    SELECT a,b,c FROM t ORDER BY a;
+}
+expect {
+    1|10|100
+    2|20|200
+}
+
+test ignore-some-conflicts-multirow {
+    CREATE TABLE t(a INTEGER UNIQUE);
+    INSERT INTO t VALUES (2),(4);
+    INSERT OR IGNORE INTO t VALUES (1),(2),(3),(4),(5);
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test ignore-from-select {
+    CREATE TABLE src(x);
+    INSERT INTO src VALUES (1),(2),(2),(3);
+    CREATE TABLE dst(a INTEGER UNIQUE);
+    INSERT INTO dst VALUES (2);
+    INSERT OR IGNORE INTO dst SELECT x FROM src;
+    SELECT a FROM dst ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+test ignore-null-in-unique {
+    CREATE TABLE t(a INTEGER UNIQUE);
+    INSERT INTO t VALUES (1),(NULL),(NULL);
+    INSERT OR IGNORE INTO t VALUES (1),(NULL);
+    SELECT COUNT(*) FROM t WHERE a IS NULL;
+}
+expect {
+    3
+}
+
+test ignore-preserves-rowid {
+    CREATE TABLE t(data TEXT UNIQUE);
+    INSERT INTO t VALUES ('x'),('y'),('z');
+    SELECT rowid, data FROM t WHERE data='y';
+    INSERT OR IGNORE INTO t VALUES ('y');
+    SELECT rowid, data FROM t WHERE data='y';
+}
+expect {
+    2|y
+    2|y
+}
+
+test ignore-intra-statement-dups {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT OR IGNORE INTO t VALUES (5,'first'),(6,'x'),(5,'second'),(5,'third');
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    5|first
+    6|x
+}
+
+# Tests for incorrect provided column count
+test wrong-column-count-values-too-few {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 2);
+}
+expect error {
+}
+
+test wrong-column-count-values-too-many {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 2, 3);
+}
+expect error {
+}
+
+test wrong-column-count-values-specified-columns-too-few {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t(a, b, c) VALUES (1, 2);
+}
+expect error {
+}
+
+test wrong-column-count-values-specified-columns-too-many {
+    CREATE TABLE t(a, b);
+    INSERT INTO t(a, b) VALUES (1, 2, 3);
+}
+expect error {
+}
+
+test wrong-column-count-select-named-too-few {
+    CREATE TABLE src(x, y);
+    INSERT INTO src VALUES (1, 2);
+    CREATE TABLE dst(a, b, c);
+    INSERT INTO dst SELECT x, y FROM src;
+}
+expect error {
+}
+
+test wrong-column-count-select-named-too-many {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3);
+    CREATE TABLE dst(a, b);
+    INSERT INTO dst SELECT x, y, z FROM src;
+}
+expect error {
+}
+
+test wrong-column-count-select-star-too-few {
+    CREATE TABLE src(x, y);
+    INSERT INTO src VALUES (1, 2);
+    CREATE TABLE dst(a, b, c);
+    INSERT INTO dst SELECT * FROM src;
+}
+expect error {
+}
+
+test wrong-column-count-select-star-too-many {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3);
+    CREATE TABLE dst(a, b);
+    INSERT INTO dst SELECT * FROM src;
+}
+expect error {
+}
+
+test wrong-column-count-specified-columns-select-mismatch {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3);
+    CREATE TABLE dst(a, b, c, d);
+    INSERT INTO dst(a, b) SELECT x, y, z FROM src;
+}
+expect error {
+}
+
+test wrong-column-count-partial-columns-values-too-few {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t(b, c) VALUES (2);
+}
+expect error {
+}
+
+test wrong-column-count-partial-columns-values-too-many {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t(a) VALUES (1, 2);
+}
+expect error {
+}
+
+# https://github.com/tursodatabase/turso/issues/3951
+test insert-999999999 {
+    create table t(a);
+    insert into t(a, a) values (2, 3);
+    select * from t;
+}
+expect {
+    2
+}
+
+test insert-on-conflict-do-nothing-single-row {
+    CREATE TABLE t(a unique, b text);
+    INSERT INTO t VALUES (2, 'foo'),(3, 'bar');
+    INSERT OR IGNORE INTO t values (2, 'baz');
+    SELECT * FROM t;
+}
+expect {
+    2|foo
+    3|bar
+}
+
+test insert-on-conflict-replace-single-row {
+    CREATE TABLE t(a unique, b text);
+    INSERT INTO t VALUES (2, 'foo'),(3, 'bar');
+    INSERT OR REPLACE INTO t values (2, 'baz');
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    2|baz
+    3|bar
+}
+
+test insert-on-conflict-do-nothing-multiple-rows {
+    CREATE TABLE t(a unique);
+    INSERT INTO t VALUES (2),(3);
+    INSERT OR IGNORE INTO t values (1),(2),(3);
+    SELECT * FROM t order by a;
+}
+expect {
+    1
+    2
+    3
+}
+
+test onconflict-ignore-existing {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT OR IGNORE INTO t VALUES (2,'yy'),(3,'z'),(2,'zzz');
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|y
+    3|z
+}
+
+test onconflict-ignore-selfdup-values {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT OR IGNORE INTO t VALUES (1,'one'),(1,'two'),(1,'three');
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|one
+}
+
+test onconflict-ignore-selfdup-values-targeted {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
+    INSERT INTO t(a,b) VALUES (100,1);
+    INSERT INTO t(a,b) VALUES (200,1) ON CONFLICT(b) DO NOTHING;
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    100|1
+}
+
+test onconflict-ignore-selfdup-multirow-targeted {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
+    INSERT INTO t(a,b) VALUES (1,10),(2,20);
+    INSERT INTO t(a,b) VALUES (3,30),(4,30) ON CONFLICT(b) DO NOTHING;
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    1|10
+    2|20
+    3|30
+}
+
+test onconflict-replace-existing {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT OR REPLACE INTO t VALUES (2,'yy'),(3,'z');
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|yy
+    3|z
+}
+
+test onconflict-replace-selfdup-values-lastwins {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT OR REPLACE INTO t VALUES (5,'one'),(5,'two'),(5,'three');
+    SELECT a,b FROM t;
+}
+expect {
+    5|three
+}
+
+test onconflict-replace-existing-then-selfdup-lastwins {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT INTO t VALUES (5,'orig');
+    INSERT OR REPLACE INTO t VALUES (5,'first'),(5,'second');
+    SELECT a,b FROM t;
+}
+expect {
+    5|second
+}
+
+test onconflict-replace-pk-rowid-alias {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT OR REPLACE INTO t(a,b) VALUES (1,'foo'),(1,'bar');
+    SELECT a,b FROM t;
+}
+expect {
+    1|bar
+}
+
+test onconflict-replace-from-select-selfdup {
+    CREATE TABLE src(x);
+    INSERT INTO src VALUES (1),(1),(2);
+    CREATE TABLE t(a INTEGER UNIQUE);
+    INSERT OR REPLACE INTO t SELECT x FROM src;
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+test onconflict-replace-notnull-default-existing-null {
+    CREATE TABLE t(
+    a INTEGER PRIMARY KEY,
+    b TEXT NOT NULL DEFAULT 'd'
+    );
+    INSERT INTO t VALUES (1,'x');
+    INSERT OR REPLACE INTO t(a,b) VALUES (1,NULL);
+    SELECT a,b FROM t;
+}
+expect {
+    1|d
+}
+
+test onconflict-replace-notnull-default-existing-omit {
+    CREATE TABLE t(
+    a INTEGER PRIMARY KEY,
+    b TEXT NOT NULL DEFAULT 'd'
+    );
+    INSERT INTO t VALUES (1,'x');
+    INSERT OR REPLACE INTO t(a) VALUES (1);
+    SELECT a,b FROM t;
+}
+expect {
+    1|d
+}
+
+# need to assert row survival after failed REPLACE due to NOT NULL constraint
+# so we create table t here
+setup table_t {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
+    INSERT INTO t VALUES (1,'x');
+}
+
+@setup table_t
+test test-1_1 {
+    INSERT OR REPLACE INTO t(a,b) VALUES (1,NULL);
+}
+expect error {
+}
+
+@setup table_t
+test test-1_2 {
+    SELECT a,b FROM t;
+}
+expect {
+    1|x
+}
+
+test onconflict-replace-composite-unique-existing {
+    CREATE TABLE t(
+    a INTEGER,
+    b INTEGER,
+    c TEXT,
+    UNIQUE(a,b)
+    );
+    INSERT INTO t VALUES (1,1,'x'),(1,2,'y');
+    INSERT OR REPLACE INTO t VALUES (1,2,'yy');
+    SELECT a,b,c FROM t ORDER BY a,b;
+}
+expect {
+    1|1|x
+    1|2|yy
+}
+
+test onconflict-replace-composite-unique-selfdup-lastwins {
+    CREATE TABLE t(
+    a INTEGER,
+    b INTEGER,
+    c TEXT,
+    UNIQUE(a,b)
+    );
+    INSERT OR REPLACE INTO t VALUES
+    (1,1,'one'),
+    (1,1,'two'),
+    (1,1,'three');
+    SELECT a,b,c FROM t;
+}
+expect {
+    1|1|three
+}
+
+test onconflict-replace-unique-index-existing {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE UNIQUE INDEX t_a_u ON t(a);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT OR REPLACE INTO t VALUES (2,'yy'),(3,'z');
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|yy
+    3|z
+}
+
+test onconflict-replace-unique-index-selfdup-lastwins {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE UNIQUE INDEX t_a_u ON t(a);
+    INSERT OR REPLACE INTO t VALUES (5,'one'),(5,'two'),(5,'three');
+    SELECT a,b FROM t;
+}
+expect {
+    5|three
+}
+
+@skip-if mvcc "not supported in MVCC mode"
+test partial-expr-index-upsert-conflict {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT,
+        c0 TEXT,
+        c1 INT
+    );
+    CREATE UNIQUE INDEX idx_expr_partial ON t(UPPER(k), length(c0)) WHERE c1 IS NOT NULL;
+    INSERT INTO t(id, k, c0, c1) VALUES (1, 'foo', 'abcd', 1);
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'bar', 'wxyz', 1);
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'baz', 'xx', 5)
+    ON CONFLICT(id) DO UPDATE SET k = 'foo', c0 = 'zzzz', c1 = 1;
+}
+expect error {
+}
+
+@skip-if mvcc "not supported in MVCC mode"
+test partial-expr-index-update-removes-entry {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT,
+        c0 TEXT,
+        c1 INT
+    );
+    CREATE UNIQUE INDEX idx_expr_partial ON t(UPPER(k), length(c0)) WHERE c1 IS NOT NULL;
+    INSERT INTO t(id, k, c0, c1) VALUES (1, 'foo', 'abcd', 1);
+    UPDATE t SET c1 = NULL WHERE id = 1;
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'FOO', 'zzzz', 5);
+    SELECT k || '|' || c0 || '|' || coalesce(c1, 'NULL') FROM t ORDER BY id;
+}
+expect {
+    foo|abcd|NULL
+    FOO|zzzz|5
+}
+
+@skip-if mvcc "not supported in MVCC mode"
+test partial-expr-index-delete-clears-entry {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT,
+        c0 TEXT,
+        c1 INT
+    );
+    CREATE UNIQUE INDEX idx_expr_partial ON t(UPPER(k), length(c0)) WHERE c1 IS NOT NULL;
+    INSERT INTO t(id, k, c0, c1) VALUES (1, 'foo', 'abcd', 3);
+    DELETE FROM t WHERE id = 1;
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'FOO', 'zzzz', 3);
+    SELECT upper(k) || '|' || length(c0) || '|' || c1 FROM t;
+}
+expect {
+    FOO|4|3
+}
+
+test collate-unique-index-upsert {
+    CREATE TABLE co (name TEXT, v);
+    CREATE UNIQUE INDEX co_name_nocase ON co(name COLLATE NOCASE);
+    INSERT INTO co VALUES ('Alice', 1);
+    INSERT INTO co VALUES ('aLiCe', 9)
+        ON CONFLICT DO UPDATE SET v = excluded.v;
+    SELECT name, v FROM co;
+}
+expect {
+    Alice|9
+}
+
+@requires trigger "uses trigger"
+test upsert-fires-after-update-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('updated'); END;
+    INSERT INTO t VALUES (1, 100);
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT * FROM log;
+}
+expect {
+    updated
+}
+
+@requires trigger "uses trigger"
+test upsert-fires-before-update-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('before'); END;
+    INSERT INTO t VALUES (1, 100);
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT * FROM log;
+}
+expect {
+    before
+}
+
+@requires trigger "uses trigger"
+test upsert-fires-after-update-trigger-2 {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('after'); END;
+    INSERT INTO t VALUES (1, 100);
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT * FROM log;
+}
+expect {
+    after
+}
+
+@requires trigger "uses trigger"
+test upsert-fires-before-and-after-triggers {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, msg TEXT);
+    CREATE TRIGGER trg_before BEFORE UPDATE ON t BEGIN INSERT INTO log(msg) VALUES ('before'); END;
+    CREATE TRIGGER trg_after AFTER UPDATE ON t BEGIN INSERT INTO log(msg) VALUES ('after'); END;
+    INSERT INTO t VALUES (1, 100);
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT msg FROM log ORDER BY seq;
+}
+expect {
+    before
+    after
+}
+
+@requires trigger "uses trigger"
+test upsert-trigger-causes-fk-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id PRIMARY KEY);
+    CREATE TABLE child_deferred(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE child_immediate(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES parent(id));
+    CREATE TRIGGER trg AFTER UPDATE OF pid ON child_deferred BEGIN INSERT INTO child_immediate VALUES (NEW.id + 1000, NEW.pid); END;
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child_deferred VALUES (1, 1);
+    INSERT INTO child_deferred VALUES (1, 999) ON CONFLICT(id) DO UPDATE SET pid=excluded.pid;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# INSERT OR IGNORE with NOT NULL constraint violation tests
+test ignore-notnull-single-row {
+    CREATE TABLE t(a INTEGER, b INT NOT NULL, c INTEGER);
+    INSERT OR IGNORE INTO t VALUES (1, NULL, 3);
+    SELECT * FROM t;
+}
+expect {
+}
+
+test ignore-notnull-multi-row {
+    CREATE TABLE t(a INTEGER, b INT NOT NULL, c INTEGER);
+    INSERT OR IGNORE INTO t VALUES (1, 2, 3), (4, NULL, 6), (7, 8, 9);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|2|3
+    7|8|9
+}
+
+test ignore-notnull-all-null {
+    CREATE TABLE t(a INTEGER, b INT NOT NULL);
+    INSERT OR IGNORE INTO t VALUES (1, NULL), (2, NULL), (3, NULL);
+    SELECT * FROM t;
+}
+expect {
+}
+
+test ignore-notnull-multiple-notnull-cols {
+    CREATE TABLE t(a INT NOT NULL, b INT NOT NULL, c INTEGER);
+    INSERT OR IGNORE INTO t VALUES (1, 2, 3), (NULL, 5, 6), (7, NULL, 9), (10, 11, 12);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|2|3
+    10|11|12
+}
+
+test ignore-notnull-from-select {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3), (4, NULL, 6), (7, 8, 9);
+    CREATE TABLE dst(a INTEGER, b INT NOT NULL, c INTEGER);
+    INSERT OR IGNORE INTO dst SELECT * FROM src;
+    SELECT * FROM dst ORDER BY a;
+}
+expect {
+    1|2|3
+    7|8|9
+}
+
+test ignore-notnull-with-unique {
+    CREATE TABLE t(a INTEGER UNIQUE, b INT NOT NULL);
+    INSERT INTO t VALUES (1, 10);
+    INSERT OR IGNORE INTO t VALUES (1, 20), (2, NULL), (3, 30);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    3|30
+}
+
+# INSERT INTO ... SELECT ... UNION ... tests (GitHub issue #3946)
+# Ensures all rows from all branches of a compound select are inserted
+test insert-select-union-all-branches {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
+    INSERT INTO t2 SELECT id, name FROM t1 UNION SELECT 3, 'c';
+    SELECT * FROM t2 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+test insert-select-union-all-all-branches {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1), (2);
+    INSERT INTO t SELECT 3 UNION ALL SELECT 4;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test insert-select-union-three-branches {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'a');
+    INSERT INTO t2 SELECT id, val FROM t1 UNION SELECT 2, 'b' UNION SELECT 3, 'c';
+    SELECT * FROM t2 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+test insert-select-union-with-table-reference {
+    CREATE TABLE t(a PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 'x');
+    INSERT INTO t SELECT a+1, 'y' FROM t UNION SELECT a+2, 'z' FROM t;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|y
+    3|z
+}
+
+# Tests for float-to-integer conversion on INTEGER PRIMARY KEY columns
+# SQLite requires values to be STRICTLY between i64::MIN and i64::MAX
+
+# i64::MIN as float literal should fail (boundary value excluded)
+test insert-integer-pk-i64-min-float-error {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (-9223372036854775808.0);
+}
+expect error {
+}
+
+# i64::MAX as float literal should fail (boundary value excluded)
+test insert-integer-pk-i64-max-float-error {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (9223372036854775807.0);
+}
+expect error {
+}
+
+# Values strictly inside i64 range should work
+test insert-integer-pk-large-float-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (426601719749026560.0);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    426601719749026560|integer
+}
+
+# Negative large float inside range should work
+test insert-integer-pk-large-negative-float-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (-426601719749026560.0);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -426601719749026560|integer
+}
+
+# Float near i64::MIN boundary (but inside) should work
+test insert-integer-pk-near-min-float-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (-9223372036854774784.0);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -9223372036854774784|integer
+}
+
+# Computed overflow that produces valid float should work
+test insert-integer-pk-computed-overflow-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (5949738080128696532 * 2434505998659733097 % -586451354473716618);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    426601719749026560|integer
+}
+
+# Regression: INSERT OR REPLACE with UNIQUE index must not corrupt
+# neighboring index entries. The IdxInsert after conflict resolution must
+# re-seek the cursor (USE_SEEK must be disabled when the conflict path
+# includes IdxDelete, which repositions the cursor). See issue #5131.
+test insert-or-replace-unique-index-no-corruption {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE);
+    INSERT INTO t SELECT value, 'a'||value FROM generate_series(1, 134);
+    INSERT OR REPLACE INTO t VALUES(9999, 'a134');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test insert-or-replace-unique-index-no-corruption-2 {
+    CREATE TABLE t(a, b, c);
+    CREATE UNIQUE INDEX idx ON t(a, b);
+    INSERT INTO t SELECT value, value, value FROM generate_series(1, 135);
+    INSERT OR REPLACE INTO t VALUES (50, 50, 999);
+    SELECT count(*) FROM t WHERE a = 50 AND b = 50;
+}
+expect {
+    1
+}
+
+test insert-or-replace-data-correctness {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE);
+    INSERT INTO t SELECT value, 'a'||value FROM generate_series(1, 134);
+    INSERT OR REPLACE INTO t VALUES(9999, 'a134');
+    SELECT id, a FROM t WHERE a = 'a133';
+}
+expect {
+    133|a133
+}
+

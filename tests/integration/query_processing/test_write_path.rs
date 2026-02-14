@@ -1,9 +1,12 @@
-use crate::common::{self, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check};
+use crate::common::{
+    self, compute_dbhash, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check, ExecRows,
+};
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
-use turso_core::{CheckpointMode, Connection, LimboError, Row, Statement, StepResult, Value};
+use turso_core::vdbe::StepResult;
+use turso_core::{CheckpointMode, Connection, LimboError, Numeric, Row, Statement, Value};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -33,48 +36,23 @@ fn test_simple_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     let list_query = "SELECT * FROM test LIMIT 1";
     let insert_query = format!("INSERT INTO test VALUES (1, '{}')", huge_text.as_str());
-
-    match conn.query(insert_query) {
-        Ok(Some(ref mut rows)) => loop {
-            match rows.step()? {
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Done => break,
-                _ => unreachable!(),
-            }
-        },
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("{err}");
-        }
-    };
+    conn.execute(&insert_query).unwrap();
 
     // this flush helped to review hex of test.db
     do_flush(&conn, &tmp_db)?;
 
     match conn.query(list_query) {
-        Ok(Some(ref mut rows)) => loop {
-            match rows.step()? {
-                StepResult::Row => {
-                    let row = rows.row().unwrap();
-                    let id = row.get::<i64>(0).unwrap();
-                    let text = row.get::<&str>(0).unwrap();
-                    assert_eq!(1, id);
-                    compare_string(&huge_text, text);
-                }
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Interrupt => break,
-                StepResult::Done => break,
-                StepResult::Busy => unreachable!(),
-            }
-        },
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("{err}");
+        Ok(Some(ref mut rows)) => {
+            rows.run_with_row_callback(|row| {
+                let id = row.get::<i64>(0).unwrap();
+                let text = row.get::<&str>(0).unwrap();
+                assert_eq!(1, id);
+                compare_string(&huge_text, text);
+                Ok(())
+            })?;
         }
+        Ok(None) => {}
+        Err(err) => return Err(anyhow::anyhow!(err)),
     }
     do_flush(&conn, &tmp_db)?;
     Ok(())
@@ -98,48 +76,26 @@ fn test_sequential_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     for (i, huge_text) in huge_texts.iter().enumerate().take(iterations) {
         let insert_query = format!("INSERT INTO test VALUES ({}, '{}')", i, huge_text.as_str());
-        match conn.query(insert_query) {
-            Ok(Some(ref mut rows)) => loop {
-                match rows.step()? {
-                    StepResult::IO => {
-                        rows.run_once()?;
-                    }
-                    StepResult::Done => break,
-                    _ => unreachable!(),
-                }
-            },
-            Ok(None) => {}
-            Err(err) => {
-                eprintln!("{err}");
-            }
-        };
+        conn.execute(&insert_query)?;
     }
 
     let list_query = "SELECT * FROM test LIMIT 1";
     let mut current_index = 0;
     match conn.query(list_query) {
-        Ok(Some(ref mut rows)) => loop {
-            match rows.step()? {
-                StepResult::Row => {
-                    let row = rows.row().unwrap();
-                    let id = row.get::<i64>(0).unwrap();
-                    let text = row.get::<String>(1).unwrap();
-                    let huge_text = &huge_texts[current_index];
-                    compare_string(huge_text, text);
-                    assert_eq!(current_index, id as usize);
-                    current_index += 1;
-                }
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Interrupt => break,
-                StepResult::Done => break,
-                StepResult::Busy => unreachable!(),
-            }
-        },
+        Ok(Some(ref mut rows)) => {
+            rows.run_with_row_callback(|row| {
+                let id = row.get::<i64>(0).unwrap();
+                let text = row.get::<String>(1).unwrap();
+                let huge_text = &huge_texts[current_index];
+                compare_string(huge_text, text);
+                assert_eq!(current_index, id as usize);
+                current_index += 1;
+                Ok(())
+            })?;
+        }
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{err}");
+            return Err(anyhow::anyhow!(err));
         }
     }
     do_flush(&conn, &tmp_db)?;
@@ -169,8 +125,8 @@ fn test_sequential_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
         common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
             let first_value = row.get::<&Value>(0).expect("missing id");
             let id = match first_value {
-                turso_core::Value::Integer(i) => *i as i32,
-                turso_core::Value::Float(f) => *f as i32,
+                turso_core::Value::Numeric(Numeric::Integer(i)) => *i as i32,
+                turso_core::Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
                 _ => unreachable!(),
             };
             assert_eq!(current_read_index, id);
@@ -201,7 +157,7 @@ fn test_regression_multi_row_insert(tmp_db: TempDatabase) -> anyhow::Result<()> 
     common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
         let first_value = row.get::<&Value>(0).expect("missing id");
         let id = match first_value {
-            Value::Float(f) => *f as i32,
+            Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
             _ => panic!("expected float"),
         };
         actual_ids.push(id);
@@ -224,18 +180,17 @@ fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     conn.execute("insert into test values (2)")?;
 
     let mut stmt = conn.prepare("select * from test")?;
-
     loop {
         match stmt.step()? {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
                 assert_eq!(
                     *row.get::<&Value>(0).unwrap(),
-                    turso_core::Value::Integer(1)
+                    turso_core::Value::from_i64(1)
                 );
                 break;
             }
-            StepResult::IO => stmt.run_once()?,
+            StepResult::IO => stmt._io().step()?,
             _ => break,
         }
     }
@@ -248,11 +203,11 @@ fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 let row = stmt.row().unwrap();
                 assert_eq!(
                     *row.get::<&Value>(0).unwrap(),
-                    turso_core::Value::Integer(1)
+                    turso_core::Value::from_i64(1)
                 );
                 break;
             }
-            StepResult::IO => stmt.run_once()?,
+            StepResult::IO => stmt._io().step()?,
             _ => break,
         }
     }
@@ -271,13 +226,18 @@ fn test_wal_checkpoint(tmp_db: TempDatabase) -> anyhow::Result<()> {
         log::info!("iteration #{i}");
         let insert_query = format!("INSERT INTO test VALUES ({i})");
         do_flush(&conn, &tmp_db)?;
+        let hash_before = compute_dbhash(&tmp_db);
         conn.checkpoint(CheckpointMode::Passive {
             upper_bound_inclusive: None,
         })?;
+        let hash_after = compute_dbhash(&tmp_db);
+        assert_eq!(
+            hash_before.hash, hash_after.hash,
+            "checkpoint changed database content!!!!!!"
+        );
         common::run_query(&tmp_db, &conn, &insert_query)?;
     }
 
-    do_flush(&conn, &tmp_db)?;
     let list_query = "SELECT * FROM test LIMIT 1";
     let mut current_index = 0;
     common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
@@ -369,8 +329,8 @@ fn test_write_delete_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
         common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
             let first_value = row.get::<&Value>(0).expect("missing id");
             let id = match first_value {
-                turso_core::Value::Integer(i) => *i as i32,
-                turso_core::Value::Float(f) => *f as i32,
+                turso_core::Value::Numeric(Numeric::Integer(i)) => *i as i32,
+                turso_core::Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
                 _ => unreachable!(),
             };
             assert_eq!(current_read_index, id);
@@ -385,8 +345,8 @@ fn test_write_delete_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 |row| {
                     let first_value = row.get::<&Value>(0).expect("missing id");
                     let id = match first_value {
-                        turso_core::Value::Integer(i) => *i as i32,
-                        turso_core::Value::Float(f) => *f as i32,
+                        turso_core::Value::Numeric(Numeric::Integer(i)) => *i as i32,
+                        turso_core::Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
                         _ => unreachable!(),
                     };
                     assert_eq!(i, id);
@@ -928,14 +888,8 @@ pub fn upsert_conflict(limbo: TempDatabase) {
     ] {
         conn.execute(sql).unwrap();
     }
-    assert_eq!(
-        vec![vec![
-            rusqlite::types::Value::Integer(1),
-            rusqlite::types::Value::Integer(2),
-            rusqlite::types::Value::Integer(42),
-        ]],
-        limbo_exec_rows(&conn, "SELECT * FROM t")
-    );
+    let rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1, 2, 42)]);
 }
 
 #[turso_macros::test]
@@ -1038,14 +992,14 @@ pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
                     match stmt2.step().unwrap() {
                         StepResult::Row => rows += 1,
                         StepResult::Done => break,
-                        StepResult::IO => stmt2.run_once().unwrap(),
+                        StepResult::IO => stmt2._io().step().unwrap(),
                         r => panic!("unexpected step result: {r:?}"),
                     }
                 }
                 assert_eq!(rows, 3);
             }
             StepResult::Done => break,
-            StepResult::IO => stmt1.run_once().unwrap(),
+            StepResult::IO => stmt1._io().step().unwrap(),
             r => panic!("unexpected step result: {r:?}"),
         }
     }
@@ -1069,7 +1023,7 @@ pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) 
                 loop {
                     match stmt2.step() {
                         Ok(StepResult::Done) => break,
-                        Ok(StepResult::IO) => stmt2.run_once().unwrap(),
+                        Ok(StepResult::IO) => stmt2._io().step().unwrap(),
                         Ok(StepResult::Busy) => {
                             busy = true;
                             break;
@@ -1080,20 +1034,15 @@ pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) 
                 assert!(busy);
             }
             StepResult::Done => break,
-            StepResult::IO => stmt1.run_once().unwrap(),
+            StepResult::IO => stmt1._io().step().unwrap(),
             r => panic!("unexpected step result: {r:?}"),
         }
     }
-    assert_eq!(
-        limbo_exec_rows(&conn1, "SELECT * FROM t"),
-        vec![
-            vec![rusqlite::types::Value::Integer(1)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)]
-        ]
-    );
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
     conn1.execute("ROLLBACK").unwrap();
-    assert!(limbo_exec_rows(&conn1, "SELECT * FROM t").is_empty());
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert!(rows.is_empty());
 }
 
 #[turso_macros::test]
@@ -1114,7 +1063,7 @@ pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase
                 loop {
                     match stmt2.step() {
                         Ok(StepResult::Done) => break,
-                        Ok(StepResult::IO) => stmt2.run_once().unwrap(),
+                        Ok(StepResult::IO) => stmt2._io().step().unwrap(),
                         Ok(StepResult::Busy) => {
                             busy = true;
                             break;
@@ -1125,27 +1074,15 @@ pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase
                 assert!(busy);
             }
             StepResult::Done => break,
-            StepResult::IO => stmt1.run_once().unwrap(),
+            StepResult::IO => stmt1._io().step().unwrap(),
             r => panic!("unexpected step result: {r:?}"),
         }
     }
-    assert_eq!(
-        limbo_exec_rows(&conn1, "SELECT * FROM t"),
-        vec![
-            vec![rusqlite::types::Value::Integer(1)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)]
-        ]
-    );
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
     conn1.execute("COMMIT").unwrap();
-    assert_eq!(
-        limbo_exec_rows(&conn1, "SELECT * FROM t"),
-        vec![
-            vec![rusqlite::types::Value::Integer(1)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)]
-        ]
-    );
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
 }
 
 #[test]
@@ -1165,48 +1102,499 @@ fn test_unique_complex_key() {
     let tmp_db = TempDatabase::builder().with_db_path(db_path.path()).build();
     let conn = tmp_db.connect_limbo();
 
+    let rows: Vec<(String, String, String)> = conn.exec_rows("SELECT * FROM t");
     assert_eq!(
-        limbo_exec_rows(&conn, "SELECT * FROM t"),
+        rows,
         vec![
-            vec![
-                rusqlite::types::Value::Text("1".into()),
-                rusqlite::types::Value::Text("2".into()),
-                rusqlite::types::Value::Text("a".into()),
-            ],
-            vec![
-                rusqlite::types::Value::Text("3".into()),
-                rusqlite::types::Value::Text("4".into()),
-                rusqlite::types::Value::Text("b".into()),
-            ]
+            ("1".to_string(), "2".to_string(), "a".to_string()),
+            ("3".to_string(), "4".to_string(), "b".to_string()),
         ]
     );
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT a, b FROM t");
     assert_eq!(
-        limbo_exec_rows(&conn, "SELECT a, b FROM t"),
+        rows,
         vec![
-            vec![
-                rusqlite::types::Value::Text("1".into()),
-                rusqlite::types::Value::Text("2".into()),
-            ],
-            vec![
-                rusqlite::types::Value::Text("3".into()),
-                rusqlite::types::Value::Text("4".into()),
-            ]
+            ("1".to_string(), "2".to_string()),
+            ("3".to_string(), "4".to_string()),
         ]
     );
 
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![("1".to_string(),), ("3".to_string(),)]);
+
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT b FROM t");
+    assert_eq!(rows, vec![("2".to_string(),), ("4".to_string(),)]);
+}
+
+#[turso_macros::test]
+pub fn test_conflict_autocommit(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    let conn2 = limbo.db.connect().unwrap();
+    conn1
+        .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    assert!(matches!(
+        conn1.execute("INSERT INTO t VALUES (1, 0)").unwrap_err(),
+        LimboError::Constraint(_)
+    ));
+    conn2.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     assert_eq!(
-        limbo_exec_rows(&conn, "SELECT a FROM t"),
         vec![
-            vec![rusqlite::types::Value::Text("1".into()),],
-            vec![rusqlite::types::Value::Text("3".into()),]
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+        ],
+        limbo_exec_rows(&conn1, "SELECT * FROM t")
+    );
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+        ],
+        limbo_exec_rows(&conn2, "SELECT * FROM t")
+    );
+}
+
+#[turso_macros::test]
+pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    let conn2 = limbo.db.connect().unwrap();
+    conn1
+        .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    assert!(matches!(
+        conn1
+            .execute("INSERT INTO t VALUES (2, 20), (1, 0), (3, 30)")
+            .unwrap_err(),
+        LimboError::Constraint(_)
+    ));
+    conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ],
+        ],
+        limbo_exec_rows(&conn1, "SELECT * FROM t")
+    );
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ],
+        ],
+        limbo_exec_rows(&conn2, "SELECT * FROM t")
+    );
+}
+
+#[turso_macros::test]
+pub fn test_conflict_inside_txn(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    let conn2 = limbo.db.connect().unwrap();
+    conn1
+        .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn1.execute("BEGIN").unwrap();
+    conn1.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    assert!(matches!(
+        conn1.execute("INSERT INTO t VALUES (1, 0)").unwrap_err(),
+        LimboError::Constraint(_)
+    ));
+    conn1.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(3),
+                rusqlite::types::Value::Integer(30),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ]
+        ],
+        limbo_exec_rows(&conn1, "SELECT * FROM t")
+    );
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(3),
+                rusqlite::types::Value::Integer(30),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ]
+        ],
+        limbo_exec_rows(&conn2, "SELECT * FROM t")
+    );
+}
+
+#[test]
+pub fn test_reopen_database_wal_restart() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    {
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn1 = tmp_db.connect_limbo();
+        conn1.execute("CREATE TABLE t (x);").unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(1000000))")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(1000000))")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(1000000))")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(2000000))")
+            .unwrap();
+
+        conn1.execute("PRAGMA wal_checkpoint(RESTART)").unwrap();
+
+        conn1.execute("CREATE TABLE q(x)").unwrap();
+        println!(
+            "create table err: {:?}",
+            conn1.execute("CREATE TABLE q(x)").unwrap_err()
+        );
+    }
+    // reopen database
+    {
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn2 = tmp_db.connect_limbo();
+        println!("rows: {:?}", limbo_exec_rows(&conn2, "SELECT * FROM q"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+/// Test for a bug found by whopper
+/// It is slightly fragile and can be removed if it will be unclear how to maintain it
+///
+/// Here, we simulate BusySnapshot condition when during IO in between of begin_read_tx and begin_write_tx, another connection commited some change
+pub fn test_busy_snapshot_immediate() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&db_path)
+        .with_io_uring(true)
+        .build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    let mut stmt1 = conn1.prepare("CREATE TABLE t1(x)").unwrap();
+    let mut stmt2 = conn2.prepare("CREATE TABLE t2(x)").unwrap();
+
+    // stmt1 will yield with IO as it needs to allocate first page
+    let result = stmt1.step();
+    assert!(matches!(result, Ok(StepResult::IO)));
+
+    // run stmt2 to completion and commit changes
+    loop {
+        tmp_db.io.step().unwrap();
+        let result = stmt2.step();
+        match result {
+            Ok(StepResult::IO) => continue,
+            Ok(StepResult::Done) => break,
+            result => panic!("unexpected result: {result:?}"),
+        }
+    }
+    drop(stmt2);
+
+    // stmt1 WAL view is stale - so it is return Busy error
+    // (as we didn't have any transaction started before - turso return Busy result so top-level executor will retry statement implicitly)
+    let result = stmt1.step();
+    assert!(matches!(result, Ok(StepResult::Busy)));
+    drop(stmt1);
+
+    conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+    let rows = limbo_exec_rows(&conn1, "SELECT name FROM sqlite_master");
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Text("t2".to_string())],
+            vec![rusqlite::types::Value::Text("t1".to_string())],
         ]
     );
+}
+
+#[test]
+/// Test for a bug found by whopper
+/// It is slightly fragile and can be removed if it will be unclear how to maintain it
+///
+/// Here, we simulate BusySnapshot condition when transaction upgraded in the middle, but since its started another connection commited changes
+pub fn test_busy_snapshot_txn_upgrade() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("CREATE TABLE t(x)").unwrap();
+    conn1.execute("BEGIN").unwrap();
+    conn1.execute("SELECT * FROM t").unwrap();
+    let mut stmt1 = conn1.prepare("INSERT INTO t VALUES (1)").unwrap();
+    let mut stmt2 = conn2.prepare("INSERT INTO t VALUES (2)").unwrap();
+
+    loop {
+        let result = stmt2.step();
+        match result {
+            Ok(StepResult::IO) => continue,
+            Ok(StepResult::Done) => break,
+            result => panic!("unexpected result: {result:?}"),
+        }
+    }
+    drop(stmt2);
+
+    // stmt1 WAL view is stale - so it is return Busy error
+    let result = stmt1.step();
+    println!("result: {result:?}");
+    assert!(matches!(result, Err(LimboError::BusySnapshot)));
+    drop(stmt1);
+}
+
+#[test]
+/// Test for a bug found by whopper
+/// It is slightly fragile and can be removed if it will be unclear how to maintain it
+///
+/// Here, we check that page cache will not be reused for last checkpoint because it is stale (insert happened since last statement over connection)
+/// The tricky part is that auto-checkpoint happens in between which can result in reuse of a page if checkpoint epoch do not properly incremented during auto-checkpoint
+pub fn test_auto_checkpoint_restart() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    tracing::info!("conn: 1: create_new_table_1");
+    conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+    tracing::info!("conn: 1: insert");
+    conn1.execute("INSERT INTO t1 VALUES (1)").unwrap();
+
+    tracing::info!("conn: 2: select_sqlite_master");
+    let mut stmt = conn2.prepare("SELECT * FROM sqlite_master").unwrap();
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Row) => break,
+            _ => continue,
+        }
+    }
+
+    tracing::info!("conn: 1: checkpoint");
+    conn1.execute("PRAGMA wal_checkpoint(RESTART)").unwrap();
+
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Done) => break,
+            _ => continue,
+        }
+    }
+
+    tracing::info!("conn: 1: insert");
+    conn1.execute("CREATE TABLE t2(x)").unwrap();
+
+    tracing::info!("conn: 2: checkpoint");
+    conn2.execute("PRAGMA wal_checkpoint(RESTART)").unwrap();
+}
+
+#[test]
+pub fn test_wal_truncate_checkpoint() {
+    let mut stop = false;
+    for interrupt_at in 1.. {
+        tracing::info!("interrupt_at: {}", interrupt_at);
+        if stop {
+            break;
+        }
+        let _ = env_logger::try_init();
+        let db_path = tempfile::NamedTempFile::new().unwrap();
+        let (_file, db_path) = db_path.keep().unwrap();
+        tracing::info!("path: {:?}", db_path);
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn1 = tmp_db.connect_limbo();
+        let conn2 = tmp_db.connect_limbo();
+
+        tracing::info!("conn: 1: create_new_table_1");
+        conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+        tracing::info!("conn: 1: insert");
+        conn1.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        conn1.execute("INSERT INTO t1 VALUES (2)").unwrap();
+        conn1.execute("INSERT INTO t1 VALUES (3)").unwrap();
+
+        tracing::info!("conn: 1: wal truncate: start");
+        let mut stmt = conn1.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        for _ in 0..interrupt_at {
+            let result = stmt.step().unwrap();
+            if matches!(result, StepResult::Done) {
+                stop = true;
+                break;
+            }
+        }
+
+        tracing::info!("conn: 2: insert");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (4)");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (5)");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (6)");
+
+        tracing::info!("conn: 1: wal truncate: finish");
+        loop {
+            match stmt.step() {
+                Ok(StepResult::Done) | Err(_) => break,
+                _ => continue,
+            }
+        }
+
+        tracing::info!("conn: 1: integrity check");
+        conn1.execute("PRAGMA integrity_check").unwrap();
+    }
+}
+
+#[test]
+pub fn test_empty_wal_truncate_checkpoint() {
+    let mut stop = false;
+    for interrupt_at in 1.. {
+        tracing::info!("interrupt_at: {}", interrupt_at);
+        if stop {
+            break;
+        }
+        let _ = env_logger::try_init();
+        let db_path = tempfile::NamedTempFile::new().unwrap();
+        let (_file, db_path) = db_path.keep().unwrap();
+        tracing::info!("path: {:?}", db_path);
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn1 = tmp_db.connect_limbo();
+        let conn2 = tmp_db.connect_limbo();
+
+        tracing::info!("conn: 1: create_new_table_1");
+        conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+        tracing::info!("conn: 1: make sure wal is empty");
+        conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        tracing::info!("conn: 1: wal truncate: start");
+        let mut stmt = conn1.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        for _ in 0..interrupt_at {
+            let result = stmt.step().unwrap();
+            if matches!(result, StepResult::Done) {
+                stop = true;
+                break;
+            }
+        }
+
+        tracing::info!("conn: 2: insert");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (4)");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (5)");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (6)");
+
+        tracing::info!("conn: 1: wal truncate: finish");
+        loop {
+            match stmt.step() {
+                Ok(StepResult::Done) | Err(_) => break,
+                _ => continue,
+            }
+        }
+
+        tracing::info!("conn: 1: integrity check");
+        conn1.execute("PRAGMA integrity_check").unwrap();
+    }
+}
+
+#[test]
+pub fn test_mvcc_stale_snapshot_after_schema_updated() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&db_path)
+        .with_mvcc(true)
+        .build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    // Setup: create initial table
+    conn1
+        .execute("CREATE TABLE t (key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
+    // conn1: Start a CONCURRENT transaction
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    // Do something to establish the MVCC snapshot
+    conn1.execute("SELECT * FROM t").unwrap();
+    // conn2: Modify schema while conn1's CONCURRENT transaction is active
+    conn2.execute("CREATE TABLE t2 (x)").unwrap();
+    // conn1: Try to COMMIT - should fail with SchemaConflict
+    let commit_result = conn1.execute("COMMIT");
+    assert!(matches!(commit_result, Err(LimboError::SchemaConflict)));
+
+    // conn2: Insert a row and commit (this happens AFTER conn1's original snapshot)
+    conn2
+        .execute("INSERT INTO t VALUES ('test_key', 'test_value')")
+        .unwrap();
+
+    // conn1: Start a new CONCURRENT transaction
+    // BUG: This should get a fresh MVCC snapshot, but it reuses the old one
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+
+    // conn1: SELECT should see the row inserted by conn2
+    // BUG: Due to stale snapshot, this returns empty result
+    let rows: Vec<(String, String)> = conn1.exec_rows("SELECT * FROM t WHERE key = 'test_key'");
 
     assert_eq!(
-        limbo_exec_rows(&conn, "SELECT b FROM t"),
-        vec![
-            vec![rusqlite::types::Value::Text("2".into()),],
-            vec![rusqlite::types::Value::Text("4".into()),]
-        ]
+        rows,
+        vec![("test_key".to_string(), "test_value".to_string())]
     );
+
+    conn1.execute("COMMIT").unwrap();
 }

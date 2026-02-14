@@ -3,7 +3,9 @@ use pyo3::{
     types::{PyBytes, PyTuple},
 };
 use std::sync::Arc;
-use turso_sdk_kit::rsapi::{self, TursoError, TursoStatusCode, Value, ValueRef};
+use turso_sdk_kit::rsapi::{
+    self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value, ValueRef,
+};
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -17,7 +19,13 @@ pub enum PyTursoStatusCode {
     Row = 2,
     Io = 3,
 }
-create_exception!(turso, Busy, PyException, "database is busy");
+create_exception!(turso, Busy, PyException, "database is locked");
+create_exception!(
+    turso,
+    BusySnapshot,
+    PyException,
+    "database snapshot is stale"
+);
 create_exception!(turso, Interrupt, PyException, "interrupted");
 create_exception!(turso, Error, PyException, "generic error");
 create_exception!(turso, Misuse, PyException, "API misuse");
@@ -26,29 +34,29 @@ create_exception!(turso, Readonly, PyException, "database is readonly");
 create_exception!(turso, DatabaseFull, PyException, "database is full");
 create_exception!(turso, NotAdb, PyException, "not a database`");
 create_exception!(turso, Corrupt, PyException, "database corrupted");
+create_exception!(turso, IoError, PyException, "I/O error");
 
 pub(crate) fn turso_error_to_py_err(err: TursoError) -> PyErr {
-    match err.code {
-        rsapi::TursoStatusCode::Busy => Busy::new_err(err.message),
-        rsapi::TursoStatusCode::Interrupt => Interrupt::new_err(err.message),
-        rsapi::TursoStatusCode::Error => Error::new_err(err.message),
-        rsapi::TursoStatusCode::Misuse => Misuse::new_err(err.message),
-        rsapi::TursoStatusCode::Constraint => Constraint::new_err(err.message),
-        rsapi::TursoStatusCode::Readonly => Readonly::new_err(err.message),
-        rsapi::TursoStatusCode::DatabaseFull => DatabaseFull::new_err(err.message),
-        rsapi::TursoStatusCode::NotAdb => NotAdb::new_err(err.message),
-        rsapi::TursoStatusCode::Corrupt => Corrupt::new_err(err.message),
-        _ => Error::new_err("unexpected status from the sdk-kit".to_string()),
+    match err {
+        rsapi::TursoError::Busy(message) => Busy::new_err(message),
+        rsapi::TursoError::BusySnapshot(message) => BusySnapshot::new_err(message),
+        rsapi::TursoError::Interrupt(message) => Interrupt::new_err(message),
+        rsapi::TursoError::Error(message) => Error::new_err(message),
+        rsapi::TursoError::Misuse(message) => Misuse::new_err(message),
+        rsapi::TursoError::Constraint(message) => Constraint::new_err(message),
+        rsapi::TursoError::Readonly(message) => Readonly::new_err(message),
+        rsapi::TursoError::DatabaseFull(message) => DatabaseFull::new_err(message),
+        rsapi::TursoError::NotAdb(message) => NotAdb::new_err(message),
+        rsapi::TursoError::Corrupt(message) => Corrupt::new_err(message),
+        rsapi::TursoError::IoError(kind) => IoError::new_err(format!("{kind:?}")),
     }
 }
 
 fn turso_status_to_py(status: TursoStatusCode) -> PyTursoStatusCode {
     match status {
-        TursoStatusCode::Ok => PyTursoStatusCode::Ok,
         TursoStatusCode::Done => PyTursoStatusCode::Done,
         TursoStatusCode::Row => PyTursoStatusCode::Row,
         TursoStatusCode::Io => PyTursoStatusCode::Io,
-        _ => panic!("unexpected status code: {status:?}"),
     }
 }
 
@@ -92,6 +100,22 @@ impl PyTursoSetupConfig {
 }
 
 #[pyclass]
+#[derive(Clone)]
+pub struct PyTursoEncryptionConfig {
+    pub cipher: String,
+    pub hexkey: String,
+}
+
+#[pymethods]
+impl PyTursoEncryptionConfig {
+    #[new]
+    #[pyo3(signature = (cipher, hexkey))]
+    fn new(cipher: String, hexkey: String) -> Self {
+        Self { cipher, hexkey }
+    }
+}
+
+#[pyclass]
 pub struct PyTursoDatabaseConfig {
     pub path: String,
 
@@ -99,20 +123,33 @@ pub struct PyTursoDatabaseConfig {
     /// this field is intentionally just a string in order to make enablement of experimental features as flexible as possible
     pub experimental_features: Option<String>,
 
-    /// if true, library methods will return Io status code and delegate Io loop to the caller
-    /// if false, library will spin IO itself in case of Io status code and never return it to the caller
-    pub async_io: bool,
+    /// optional VFS parameter explicitly specifying FS backend for the database.
+    /// Available options are:
+    /// - "memory": in-memory backend
+    /// - "syscall": generic syscall backend
+    /// - "io_uring": IO uring (supported only on Linux)
+    pub vfs: Option<String>,
+
+    /// optional encryption parameters
+    /// as encryption is experimental - experimental_features must have "encryption" in the list
+    pub encryption: Option<PyTursoEncryptionConfig>,
 }
 
 #[pymethods]
 impl PyTursoDatabaseConfig {
     #[new]
-    #[pyo3(signature = (path, experimental_features=None, async_io=false))]
-    fn new(path: String, experimental_features: Option<String>, async_io: bool) -> Self {
+    #[pyo3(signature = (path, experimental_features=None, vfs=None, encryption=None))]
+    fn new(
+        path: String,
+        experimental_features: Option<String>,
+        vfs: Option<String>,
+        encryption: Option<&PyTursoEncryptionConfig>,
+    ) -> Self {
         Self {
             path,
             experimental_features,
-            async_io,
+            vfs,
+            encryption: encryption.cloned(),
         }
     }
 }
@@ -157,11 +194,18 @@ pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTurs
     let database = rsapi::TursoDatabase::new(rsapi::TursoDatabaseConfig {
         path: config.path.clone(),
         experimental_features: config.experimental_features.clone(),
-        async_io: config.async_io,
+        async_io: false,
+        encryption: config.encryption.as_ref().map(|encryption| EncryptionOpts {
+            cipher: encryption.cipher.clone(),
+            hexkey: encryption.hexkey.clone(),
+        }),
+        vfs: config.vfs.clone(),
         io: None,
         db_file: None,
     });
-    database.open().map_err(turso_error_to_py_err)?;
+    let result = database.open().map_err(turso_error_to_py_err)?;
+    // async_io is false - so db.open() will return result immediately
+    assert!(!result.is_io());
     Ok(PyTursoDatabase { database })
 }
 
@@ -241,7 +285,7 @@ impl PyTursoStatement {
     /// The caller must always either use [Self::step] or [Self::execute] methods for single statement - but never mix them together
     pub fn step(&mut self) -> PyResult<PyTursoStatusCode> {
         Ok(turso_status_to_py(
-            self.statement.step().map_err(turso_error_to_py_err)?,
+            self.statement.step(None).map_err(turso_error_to_py_err)?,
         ))
     }
 
@@ -253,7 +297,10 @@ impl PyTursoStatement {
     ///
     /// The caller must always either use [Self::step] or [Self::execute] methods for single statement - but never mix them together
     pub fn execute(&mut self) -> PyResult<PyTursoExecutionResult> {
-        let result = self.statement.execute().map_err(turso_error_to_py_err)?;
+        let result = self
+            .statement
+            .execute(None)
+            .map_err(turso_error_to_py_err)?;
         Ok(PyTursoExecutionResult {
             status: turso_status_to_py(result.status),
             rows_changed: result.rows_changed,
@@ -299,7 +346,9 @@ impl PyTursoStatement {
     /// Note, that if statement wasn't started (no step / execute methods was called) - finalize will not execute the statement
     pub fn finalize(&mut self) -> PyResult<PyTursoStatusCode> {
         Ok(turso_status_to_py(
-            self.statement.finalize().map_err(turso_error_to_py_err)?,
+            self.statement
+                .finalize(None)
+                .map_err(turso_error_to_py_err)?,
         ))
     }
     /// Reset the statement by clearing bindings and reclaiming memory of the program from previous run
@@ -313,8 +362,8 @@ impl PyTursoStatement {
 fn db_value_to_py(py: Python, value: rsapi::ValueRef) -> PyResult<Py<PyAny>> {
     match value {
         ValueRef::Null => Ok(py.None()),
-        ValueRef::Integer(i) => Ok(i.into_pyobject(py)?.into()),
-        ValueRef::Float(f) => Ok(f.into_pyobject(py)?.into()),
+        ValueRef::Numeric(Numeric::Integer(i)) => Ok(i.into_pyobject(py)?.into()),
+        ValueRef::Numeric(Numeric::Float(f)) => Ok(f64::from(f).into_pyobject(py)?.into()),
         ValueRef::Text(s) => Ok(s.as_str().into_pyobject(py)?.into()),
         ValueRef::Blob(b) => Ok(PyBytes::new(py, b).into()),
     }
@@ -325,9 +374,9 @@ fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         Ok(Value::Null)
     } else if let Ok(integer) = obj.extract::<i64>() {
-        Ok(Value::Integer(integer))
+        Ok(Value::from_i64(integer))
     } else if let Ok(float) = obj.extract::<f64>() {
-        Ok(Value::Float(float))
+        Ok(Value::from_f64(float))
     } else if let Ok(string) = obj.extract::<String>() {
         Ok(Value::Text(string.into()))
     } else if let Ok(bytes) = obj.cast::<PyBytes>() {

@@ -1,10 +1,14 @@
 [package]
 name = "turso_sdk_kit"
+description = "Turso SDK kit"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[features]
+encryption = ["turso_core/encryption"]
 
 [lib]
 doc = false
@@ -12,11 +16,15 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 env_logger = { workspace = true, default-features = false }
-turso_core = { workspace = true, features = ["conn_raw_api"] }
+turso_core = { workspace = true, features = ["conn_raw_api", "io_uring"] }
 turso_sdk_kit_macros = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+parking_lot = { workspace = true, features = ["send_guard"] } # otherwise, TursoDatabase is not Send with an error: `*mut ()` cannot be sent between threads safely
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [build-dependencies]
 bindgen = "0.69.5"

@@ -1,6 +1,7 @@
 // Simplified DBSP integration for incremental view maintenance
 // For now, we'll use a basic approach and can expand to full DBSP later
 
+use crate::numeric::Numeric;
 use crate::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -48,14 +49,14 @@ impl Hash128 {
             // Add type prefix to distinguish between types
             match value {
                 Value::Null => s.push_str("N:"),
-                Value::Integer(n) => {
+                Value::Numeric(Numeric::Integer(n)) => {
                     s.push_str("I:");
                     s.push_str(&n.to_string());
                 }
-                Value::Float(f) => {
+                Value::Numeric(Numeric::Float(f)) => {
                     s.push_str("F:");
                     // Use to_bits to ensure consistent representation
-                    s.push_str(&f.to_bits().to_string());
+                    s.push_str(&f64::from(*f).to_bits().to_string());
                 }
                 Value::Text(t) => {
                     s.push_str("T:");
@@ -157,7 +158,7 @@ impl HashableRow {
     fn compute_hash(rowid: i64, values: &[Value]) -> Hash128 {
         // Include rowid in the hash by prepending it to values
         let mut all_values = Vec::with_capacity(values.len() + 1);
-        all_values.push(Value::Integer(rowid));
+        all_values.push(Value::from_i64(rowid));
         all_values.extend_from_slice(values);
         Hash128::hash_values(&all_values)
     }
@@ -244,7 +245,7 @@ impl Delta {
         }
 
         // Use a HashMap to accumulate weights
-        let mut consolidated: HashMap<HashableRow, isize> = HashMap::new();
+        let mut consolidated: HashMap<HashableRow, isize> = HashMap::default();
 
         for (row, weight) in self.changes.drain(..) {
             *consolidated.entry(row).or_insert(0) += weight;
@@ -497,12 +498,12 @@ mod tests {
         let mut delta = Delta::new();
 
         // Test INSERT
-        delta.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
+        delta.insert(1, vec![Value::from_i64(1), Value::from_i64(100)]);
         assert_eq!(delta.len(), 1);
 
         // Test UPDATE (DELETE + INSERT) - order matters!
-        delta.delete(1, vec![Value::Integer(1), Value::Integer(100)]);
-        delta.insert(1, vec![Value::Integer(1), Value::Integer(200)]);
+        delta.delete(1, vec![Value::from_i64(1), Value::from_i64(100)]);
+        delta.insert(1, vec![Value::from_i64(1), Value::from_i64(200)]);
         assert_eq!(delta.len(), 3); // Should have 3 operations before consolidation
 
         // Verify order is preserved
@@ -521,7 +522,7 @@ mod tests {
         assert_eq!(final_row.0.rowid, 1);
         assert_eq!(
             final_row.0.values,
-            vec![Value::Integer(1), Value::Integer(200)]
+            vec![Value::from_i64(1), Value::from_i64(200)]
         );
         assert_eq!(final_row.1, 1);
     }
@@ -531,8 +532,8 @@ mod tests {
         let mut delta = Delta::new();
 
         // Insert same row twice
-        delta.insert(2, vec![Value::Integer(2), Value::Integer(300)]);
-        delta.insert(2, vec![Value::Integer(2), Value::Integer(300)]);
+        delta.insert(2, vec![Value::from_i64(2), Value::from_i64(300)]);
+        delta.insert(2, vec![Value::from_i64(2), Value::from_i64(300)]);
 
         assert_eq!(delta.len(), 2);
 

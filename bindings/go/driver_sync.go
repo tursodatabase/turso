@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,27 +19,34 @@ import (
 	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
 )
 
+// TursoPartialSyncConfig configures partial sync behavior.
 type TursoPartialSyncConfig struct {
 	// if positive, prefix partial bootstrap strategy will be used
-	BoostrapStrategyPrefix int
+	BootstrapStrategyPrefix int
 	// if not empty, query partial bootstrap strategy will be used
-	BoostrapStrategyQuery string
+	BootstrapStrategyQuery string
 	// optional parameter which defines segment size for lazy loading from remote server
-	// one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
+	// one of valid BootstrapStrategy* values MUST be set in order for this setting to have some effect
 	SegmentSize int
-	// optional parameter which defines if speculative pages load must be enabled
-	// one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
-	SpeculativeLoad bool
+	// optional parameter which defines if pages prefetch must be enabled
+	// one of valid BootstrapStrategy* values MUST be set in order for this setting to have some effect
+	Prefetch bool
 }
 
 // Public configuration for a synced database.
 type TursoSyncDbConfig struct {
-	// path to the main database file locally
+	// Path to the main database file locally.
+	// Supports DSN-style options: "mydb.db?_busy_timeout=5000"
+	// Supported options:
+	//   - _busy_timeout: busy timeout in milliseconds (default: 5000, use -1 to disable)
 	Path string
 
 	// remote url for the sync
 	// remote_url MUST be used in all sync engine operations: during bootstrap and all further operations
 	RemoteUrl string
+
+	// remote namespace for the sync client (optional)
+	Namespace string
 
 	// token for remote authentication
 	// auth token value WILL not have any prefix and must be used as "Authorization" header prepended with "Bearer " prefix
@@ -54,10 +63,17 @@ type TursoSyncDbConfig struct {
 	BootstrapIfEmpty *bool
 
 	// configuration for partial sync (disabled by default)
-	PartialSyncConfig TursoPartialSyncConfig
+	// WARNING: This feature is EXPERIMENTAL
+	PartialSyncExperimental TursoPartialSyncConfig
 
 	// pass it as-is to the underlying connection
 	ExperimentalFeatures string
+
+	// BusyTimeout in milliseconds for database connections.
+	// Default is 5000ms (5 seconds). Set to -1 to disable busy handler.
+	// Can also be specified via Path DSN: "mydb.db?_busy_timeout=10000"
+	// If both are set, this field takes precedence.
+	BusyTimeout int
 }
 
 // statistics for the synced database.
@@ -85,10 +101,12 @@ type TursoSyncDbStats struct {
 // TursoSyncDb is a high-level synced database wrapper built over driver_db.go and bindings_sync.go.
 // It provides push/pull sync operations and creates SQL connections backed by the sync engine.
 type TursoSyncDb struct {
-	db        TursoSyncDatabase
-	baseURL   string
-	authToken string
-	client    *http.Client
+	db          TursoSyncDatabase
+	baseURL     string
+	authToken   string
+	namespace   string
+	client      *http.Client
+	busyTimeout int // busy timeout in milliseconds (0 = disabled)
 
 	mu sync.Mutex
 }
@@ -99,9 +117,6 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	if strings.TrimSpace(config.Path) == "" {
 		return nil, errors.New("turso: empty Path in TursoSyncDbConfig")
 	}
-	if strings.TrimSpace(config.RemoteUrl) == "" {
-		return nil, errors.New("turso: empty RemoteUrl in TursoSyncDbConfig")
-	}
 	clientName := config.ClientName
 	if clientName == "" {
 		clientName = "turso-sync-go"
@@ -111,22 +126,38 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		bootstrap = *config.BootstrapIfEmpty
 	}
 
+	// Parse DSN-style options from Path (e.g., "mydb.db?_busy_timeout=5000")
+	dbPath, dsnOpts := parseSyncDSN(config.Path)
+
+	// Determine busy timeout: explicit config field takes precedence over DSN
+	busyTimeout := config.BusyTimeout
+	if busyTimeout == 0 {
+		// Not explicitly set in config, check DSN
+		if dsnOpts.BusyTimeout != 0 {
+			busyTimeout = dsnOpts.BusyTimeout
+		}
+		// If still 0, will use default when creating connections
+	}
+
+	remoteUrl := normalizeUrl(config.RemoteUrl)
 	// Create sync database holder
 	dbCfg := TursoDatabaseConfig{
-		Path:                 config.Path,
+		Path:                 dbPath,
 		ExperimentalFeatures: config.ExperimentalFeatures,
 		AsyncIO:              true, // MUST be true for external IO handling
 	}
 	syncCfg := TursoSyncDatabaseConfig{
-		Path:                            config.Path,
-		ClientName:                      clientName,
-		LongPollTimeoutMs:               config.LongPollTimeoutMs,
-		BootstrapIfEmpty:                bootstrap,
-		ReservedBytes:                   0,
-		PartialBootstrapStrategyPrefix:  config.PartialSyncConfig.BoostrapStrategyPrefix,
-		PartialBootstrapStrategyQuery:   config.PartialSyncConfig.BoostrapStrategyQuery,
-		PartialBootstrapSegmentSize:     config.PartialSyncConfig.SegmentSize,
-		PartialBootstrapSpeculativeLoad: config.PartialSyncConfig.SpeculativeLoad,
+		Path:                           dbPath,
+		RemoteUrl:                      remoteUrl,
+		Namespace:                      config.Namespace,
+		ClientName:                     clientName,
+		LongPollTimeoutMs:              config.LongPollTimeoutMs,
+		BootstrapIfEmpty:               bootstrap,
+		ReservedBytes:                  0,
+		PartialBootstrapStrategyPrefix: config.PartialSyncExperimental.BootstrapStrategyPrefix,
+		PartialBootstrapStrategyQuery:  config.PartialSyncExperimental.BootstrapStrategyQuery,
+		PartialBootstrapSegmentSize:    config.PartialSyncExperimental.SegmentSize,
+		PartialBootstrapPrefetch:       config.PartialSyncExperimental.Prefetch,
 	}
 	sdb, err := turso_sync_database_new(dbCfg, syncCfg)
 	if err != nil {
@@ -134,9 +165,11 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	}
 
 	d := &TursoSyncDb{
-		db:        sdb,
-		baseURL:   strings.TrimRight(config.RemoteUrl, "/"),
-		authToken: strings.TrimSpace(config.AuthToken),
+		db:          sdb,
+		baseURL:     strings.TrimRight(remoteUrl, "/"),
+		authToken:   strings.TrimSpace(config.AuthToken),
+		namespace:   config.Namespace,
+		busyTimeout: busyTimeout,
 		client: &http.Client{
 			// No global timeout to allow long-poll; rely on request context.
 			Transport: &http.Transport{
@@ -188,7 +221,21 @@ func (c *tursoSyncConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 	// Integrate with the base driver; provide extra IO hook to process one IO item per iteration.
 	extra := func() error { return c.db.processOneIo() }
-	return NewConnection(conn, extra), nil
+	dbConn := NewConnection(conn, extra)
+
+	// Apply busy timeout - use default if not explicitly set
+	timeout := c.db.busyTimeout
+	if timeout == 0 {
+		timeout = DefaultBusyTimeout // Apply sensible default
+	} else if timeout < 0 {
+		timeout = 0 // -1 means explicitly disable
+	}
+	if timeout > 0 {
+		turso_connection_set_busy_timeout_ms(conn, int64(timeout))
+	}
+	dbConn.busyTimeout = timeout
+
+	return dbConn, nil
 }
 
 func (c *tursoSyncConnector) Driver() driver.Driver { return &tursoDbDriver{} }
@@ -373,6 +420,17 @@ func (d *TursoSyncDb) processIoQueue(ctx context.Context) error {
 	return turso_sync_database_io_step_callbacks(d.db)
 }
 
+func buildHostname(baseURL, namespace string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	if namespace == "" {
+		return u.Host, nil
+	}
+	return namespace + "." + u.Host, nil
+}
+
 // handleIoItem performs execution of a single IO item.
 // It streams data in chunks for HTTP and file operations to avoid loading whole payloads in memory.
 func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) error {
@@ -385,7 +443,7 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 			return err
 		}
 		// Build URL
-		url := joinURL(d.baseURL, req.Path)
+		buildUrl := joinUrl(d.baseURL, req.Path)
 
 		// Build headers
 		hdr := make(http.Header, req.Headers+2)
@@ -413,12 +471,17 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 		if len(req.Body) > 0 {
 			body = bytes.NewReader(req.Body)
 		}
-		httpReq, err := http.NewRequestWithContext(ctx, req.Method, url, body)
+		httpReq, err := http.NewRequestWithContext(ctx, req.Method, buildUrl, body)
 		if err != nil {
 			_ = turso_sync_database_io_poison(item, err.Error())
 			_ = turso_sync_database_io_done(item)
 			return err
 		}
+		host, err := buildHostname(d.baseURL, d.namespace)
+		if err != nil {
+			return err
+		}
+		httpReq.Host = host
 		httpReq.Header = hdr
 
 		resp, err := d.client.Do(httpReq)
@@ -526,16 +589,44 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 	}
 }
 
-func joinURL(base, p string) string {
-	if p == "" {
-		return base
-	}
-	if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
-		return p
-	}
-	b := strings.TrimRight(base, "/")
+func joinUrl(base, p string) string {
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
 	}
-	return b + p
+	return strings.TrimRight(base, "/") + p
+}
+
+func normalizeUrl(base string) string {
+	if cut, ok := strings.CutPrefix(base, "libsql://"); ok {
+		return "https://" + cut
+	}
+	return base
+}
+
+// syncDSNOptions holds options parsed from DSN-style path
+type syncDSNOptions struct {
+	BusyTimeout int // 0 = not set, >0 = custom, <0 = disabled
+}
+
+// parseSyncDSN parses a DSN-style path like "mydb.db?_busy_timeout=5000"
+// and returns the clean path and parsed options.
+func parseSyncDSN(dsn string) (string, syncDSNOptions) {
+	var opts syncDSNOptions
+	qMark := strings.IndexByte(dsn, '?')
+	if qMark < 0 {
+		return dsn, opts
+	}
+	path := dsn[:qMark]
+	rawQuery := dsn[qMark+1:]
+	vals, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return dsn, opts // Return original on parse error
+	}
+	if v := vals.Get("_busy_timeout"); v != "" {
+		var timeout int
+		if _, err := fmt.Sscanf(v, "%d", &timeout); err == nil {
+			opts.BusyTimeout = timeout
+		}
+	}
+	return path, opts
 }

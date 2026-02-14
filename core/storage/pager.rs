@@ -1,35 +1,52 @@
+use crate::assert::assert_send_sync;
+#[cfg(target_vendor = "apple")]
+use crate::io::AtomicFileSyncType;
+use crate::io::FileSyncType;
+use crate::io::WriteBatch;
+use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
-use crate::storage::wal::IOV_MAX;
+use crate::storage::wal::PreparedFrames;
 use crate::storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
     sqlite3_ondisk::{
-        self, parse_wal_frame_header, DatabaseHeader, PageContent, PageSize, PageType,
+        self, parse_wal_frame_header, DatabaseHeader, OverflowCell, PageSize, PageType,
+        CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES, LEAF_PAGE_HEADER_SIZE_BYTES,
+        MINIMUM_CELL_SIZE,
     },
-    wal::{CheckpointResult, Wal},
+    wal::{CheckpointResult, RollbackTo, Wal, IOV_MAX},
 };
+use crate::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
+use crate::sync::Arc;
+use crate::sync::{Mutex, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
     io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
     IOResult, LimboError, Result, TransactionState,
 };
-use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, IO};
+use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
 use arc_swap::ArcSwapOption;
-use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
-use std::cell::{RefCell, UnsafeCell};
-use std::collections::BTreeSet;
-use std::rc::Rc;
-use std::sync::atomic::{
-    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
-};
-use std::sync::Arc;
+use std::cell::UnsafeCell;
 use tracing::{instrument, trace, Level};
 
-use super::btree::btree_init_page;
-use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey};
-use super::sqlite3_ondisk::begin_write_btree_page;
+use super::btree::offset::{
+    BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK, BTREE_FRAGMENTED_BYTES_COUNT,
+    BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
+};
+use super::btree::{
+    btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min,
+};
+use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
+use super::sqlite3_ondisk::read_varint;
+use super::sqlite3_ondisk::{
+    begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
+    FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
+    FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
+};
 use super::wal::CheckpointMode;
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
@@ -53,39 +70,14 @@ pub struct HeaderRef(PageRef);
 
 impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
-        loop {
-            let state = pager.header_ref_state.read().clone();
-            tracing::trace!("HeaderRef::from_pager - {:?}", state);
-            match state {
-                HeaderRefState::Start => {
-                    // If db is not initialized, return the in-memory page
-                    if let Some(page1) = pager.init_page_1.load_full() {
-                        return Ok(IOResult::Done(Self(page1)));
-                    }
-
-                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                HeaderRefState::CreateHeader { page } => {
-                    turso_assert!(page.is_loaded(), "page should be loaded");
-                    turso_assert!(
-                        page.get().id == DatabaseHeader::PAGE_ID,
-                        "incorrect header page id"
-                    );
-                    *pager.header_ref_state.write() = HeaderRefState::Start;
-                    break Ok(IOResult::Done(Self(page)));
-                }
-            }
-        }
+        let page = return_if_io!(pager.read_header_page());
+        Ok(IOResult::Done(Self(page)))
     }
 
     pub fn borrow(&self) -> &DatabaseHeader {
         // TODO: Instead of erasing mutability, implement `get_mut_contents` and return a shared reference.
-        let content: &PageContent = self.0.get_contents();
-        bytemuck::from_bytes::<DatabaseHeader>(&content.buffer.as_slice()[0..DatabaseHeader::SIZE])
+        let content = self.0.get_contents();
+        bytemuck::from_bytes::<DatabaseHeader>(&content.as_ptr()[0..DatabaseHeader::SIZE])
     }
 }
 
@@ -94,48 +86,24 @@ pub struct HeaderRefMut(PageRef);
 
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
-        loop {
-            let state = pager.header_ref_state.read().clone();
-            tracing::trace!(?state);
-            match state {
-                HeaderRefState::Start => {
-                    // If db is not initialized, return the in-memory page
-                    if let Some(page1) = pager.init_page_1.load_full() {
-                        return Ok(IOResult::Done(Self(page1)));
-                    }
-
-                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                HeaderRefState::CreateHeader { page } => {
-                    turso_assert!(page.is_loaded(), "page should be loaded");
-                    turso_assert!(
-                        page.get().id == DatabaseHeader::PAGE_ID,
-                        "incorrect header page id"
-                    );
-
-                    pager.add_dirty(&page)?;
-                    *pager.header_ref_state.write() = HeaderRefState::Start;
-                    break Ok(IOResult::Done(Self(page)));
-                }
-            }
-        }
+        let page = return_if_io!(pager.read_header_page());
+        pager.add_dirty(&page)?;
+        Ok(IOResult::Done(Self(page)))
     }
 
     pub fn borrow_mut(&self) -> &mut DatabaseHeader {
         let content = self.0.get_contents();
-        bytemuck::from_bytes_mut::<DatabaseHeader>(
-            &mut content.buffer.as_mut_slice()[0..DatabaseHeader::SIZE],
-        )
+        bytemuck::from_bytes_mut::<DatabaseHeader>(&mut content.as_ptr()[0..DatabaseHeader::SIZE])
+    }
+
+    /// Get a reference to the underlying page
+    pub fn page(&self) -> &PageRef {
+        &self.0
     }
 }
 
 pub struct PageInner {
     pub flags: AtomicUsize,
-    pub contents: Option<PageContent>,
     pub id: usize,
     /// If >0, the page is pinned and not eligible for eviction from the page cache.
     /// The reason this is a counter is that multiple nested code paths may signal that
@@ -149,10 +117,544 @@ pub struct PageInner {
     /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
     /// This tracks which version of the page we have in memory
     pub wal_tag: AtomicU64,
+    /// The actual page data buffer. None if not loaded.
+    pub buffer: Option<Arc<Buffer>>,
+    /// Overflow cells during btree operations
+    pub overflow_cells: Vec<OverflowCell>,
 }
+
+// Methods moved from PageContent - these provide btree page access
+impl PageInner {
+    /// Creates a new PageInner from an Arc<Buffer>.
+    pub fn new(buffer: Arc<Buffer>) -> Self {
+        Self {
+            flags: AtomicUsize::new(0),
+            id: 0,
+            pin_count: AtomicUsize::new(0),
+            wal_tag: AtomicU64::new(TAG_UNSET),
+            buffer: Some(buffer),
+            overflow_cells: Vec::new(),
+        }
+    }
+
+    /// Creates a new PageInner with an owned buffer.
+    pub fn from_buffer(buffer: Buffer) -> Self {
+        Self {
+            flags: AtomicUsize::new(0),
+            id: 0,
+            pin_count: AtomicUsize::new(0),
+            wal_tag: AtomicU64::new(TAG_UNSET),
+            buffer: Some(Arc::new(buffer)),
+            overflow_cells: Vec::new(),
+        }
+    }
+    /// Get the page buffer as a mutable slice. Panics if buffer not loaded.
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub fn as_ptr(&self) -> &mut [u8] {
+        self.buffer
+            .as_ref()
+            .expect("buffer not loaded")
+            .as_mut_slice()
+    }
+
+    /// The position where page content starts. It's 100 for page 1 (database file header is 100 bytes),
+    /// 0 for all other pages.
+    #[inline]
+    pub fn offset(&self) -> usize {
+        if self.id == 1 {
+            DatabaseHeader::SIZE
+        } else {
+            0
+        }
+    }
+
+    /// Read a u8 from the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn read_u8(&self, pos: usize) -> u8 {
+        let buf = self.as_ptr();
+        buf[self.offset() + pos]
+    }
+
+    /// Read a u16 from the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn read_u16(&self, pos: usize) -> u16 {
+        let buf = self.as_ptr();
+        let offset = self.offset();
+        u16::from_be_bytes([buf[offset + pos], buf[offset + pos + 1]])
+    }
+
+    /// Read a u32 from the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn read_u32(&self, pos: usize) -> u32 {
+        let buf = self.as_ptr();
+        read_u32(buf, self.offset() + pos)
+    }
+
+    /// Write a u8 to the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn write_u8(&self, pos: usize, value: u8) {
+        tracing::trace!("write_u8(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        buf[self.offset() + pos] = value;
+    }
+
+    /// Write a u16 to the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn write_u16(&self, pos: usize, value: u16) {
+        tracing::trace!("write_u16(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        let offset = self.offset();
+        buf[offset + pos..offset + pos + 2].copy_from_slice(&value.to_be_bytes());
+    }
+
+    /// Write a u32 to the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn write_u32(&self, pos: usize, value: u32) {
+        tracing::trace!("write_u32(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        let offset = self.offset();
+        buf[offset + pos..offset + pos + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    #[inline]
+    pub fn page_type(&self) -> crate::Result<PageType> {
+        self.read_u8(BTREE_PAGE_TYPE).try_into()
+    }
+
+    /// Read a u16 from the page content at the given absolute offset (no db header offset).
+    #[inline]
+    pub fn read_u16_no_offset(&self, pos: usize) -> u16 {
+        let buf = self.as_ptr();
+        u16::from_be_bytes([buf[pos], buf[pos + 1]])
+    }
+
+    /// Read a u32 from the page content at the given absolute offset (no db header offset).
+    #[inline]
+    pub fn read_u32_no_offset(&self, pos: usize) -> u32 {
+        let buf = self.as_ptr();
+        u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+    }
+
+    /// Write a u16 at the given absolute offset (no db header offset).
+    pub fn write_u16_no_offset(&self, pos: usize, value: u16) {
+        tracing::trace!("write_u16_no_offset(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        buf[pos..pos + 2].copy_from_slice(&value.to_be_bytes());
+    }
+
+    /// Write a u32 at the given absolute offset (no db header offset).
+    pub fn write_u32_no_offset(&self, pos: usize, value: u32) {
+        tracing::trace!("write_u32_no_offset(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        buf[pos..pos + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    pub fn write_page_type(&self, value: u8) {
+        self.write_u8(BTREE_PAGE_TYPE, value);
+    }
+
+    pub fn write_rightmost_ptr(&self, value: u32) {
+        self.write_u32(BTREE_RIGHTMOST_PTR, value);
+    }
+
+    pub fn write_first_freeblock(&self, value: u16) {
+        self.write_u16(BTREE_FIRST_FREEBLOCK, value);
+    }
+
+    pub fn write_freeblock(&self, offset: u16, size: u16, next_block: Option<u16>) {
+        self.write_freeblock_next_ptr(offset, next_block.unwrap_or(0));
+        self.write_freeblock_size(offset, size);
+    }
+
+    pub fn write_freeblock_size(&self, offset: u16, size: u16) {
+        self.write_u16_no_offset(offset as usize + 2, size);
+    }
+
+    pub fn write_freeblock_next_ptr(&self, offset: u16, next_block: u16) {
+        self.write_u16_no_offset(offset as usize, next_block);
+    }
+
+    pub fn read_freeblock(&self, offset: u16) -> (u16, u16) {
+        (
+            self.read_u16_no_offset(offset as usize),
+            self.read_u16_no_offset(offset as usize + 2),
+        )
+    }
+
+    pub fn write_cell_count(&self, value: u16) {
+        self.write_u16(BTREE_CELL_COUNT, value);
+    }
+
+    pub fn write_cell_content_area(&self, value: usize) {
+        debug_assert!(value <= PageSize::MAX as usize);
+        let value = value as u16;
+        self.write_u16(BTREE_CELL_CONTENT_AREA, value);
+    }
+
+    pub fn write_fragmented_bytes_count(&self, value: u8) {
+        self.write_u8(BTREE_FRAGMENTED_BYTES_COUNT, value);
+    }
+
+    #[inline]
+    pub fn first_freeblock(&self) -> u16 {
+        self.read_u16(BTREE_FIRST_FREEBLOCK)
+    }
+
+    #[inline]
+    pub fn cell_count(&self) -> usize {
+        self.read_u16(BTREE_CELL_COUNT) as usize
+    }
+
+    #[inline]
+    pub fn cell_pointer_array_size(&self) -> usize {
+        self.cell_count() * CELL_PTR_SIZE_BYTES
+    }
+
+    #[inline]
+    pub fn unallocated_region_start(&self) -> usize {
+        let (cell_ptr_array_start, cell_ptr_array_size) = self.cell_pointer_array_offset_and_size();
+        cell_ptr_array_start + cell_ptr_array_size
+    }
+
+    #[inline]
+    pub fn unallocated_region_size(&self) -> usize {
+        self.cell_content_area() as usize - self.unallocated_region_start()
+    }
+
+    #[inline]
+    pub fn cell_content_area(&self) -> u32 {
+        let offset = self.read_u16(BTREE_CELL_CONTENT_AREA);
+        if offset == 0 {
+            PageSize::MAX
+        } else {
+            offset as u32
+        }
+    }
+
+    #[inline]
+    pub fn header_size(&self) -> usize {
+        let is_interior = self.read_u8(BTREE_PAGE_TYPE) <= PageType::TableInterior as u8;
+        (!is_interior as usize) * LEAF_PAGE_HEADER_SIZE_BYTES
+            + (is_interior as usize) * INTERIOR_PAGE_HEADER_SIZE_BYTES
+    }
+
+    #[inline]
+    pub fn num_frag_free_bytes(&self) -> u8 {
+        self.read_u8(BTREE_FRAGMENTED_BYTES_COUNT)
+    }
+
+    #[inline]
+    pub fn rightmost_pointer(&self) -> crate::Result<Option<u32>> {
+        match self.page_type()? {
+            PageType::IndexInterior | PageType::TableInterior => {
+                Ok(Some(self.read_u32(BTREE_RIGHTMOST_PTR)))
+            }
+            PageType::IndexLeaf | PageType::TableLeaf => Ok(None),
+        }
+    }
+
+    #[inline]
+    pub fn rightmost_pointer_raw(&self) -> crate::Result<Option<*mut u8>> {
+        match self.page_type()? {
+            PageType::IndexInterior | PageType::TableInterior => Ok(Some(unsafe {
+                self.as_ptr()
+                    .as_mut_ptr()
+                    .add(self.offset() + BTREE_RIGHTMOST_PTR)
+            })),
+            PageType::IndexLeaf | PageType::TableLeaf => Ok(None),
+        }
+    }
+
+    #[inline]
+    pub fn cell_get(&self, idx: usize, usable_size: usize) -> crate::Result<BTreeCell> {
+        tracing::trace!("cell_get(idx={})", idx);
+        let buf = self.as_ptr();
+
+        let ncells = self.cell_count();
+        assert!(
+            idx < ncells,
+            "cell_get: idx out of bounds: idx={idx}, ncells={ncells}"
+        );
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+
+        let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
+        read_btree_cell(static_buf, self, cell_pointer, usable_size)
+    }
+
+    #[inline(always)]
+    pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
+        debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
+        let (rowid, _) = read_varint(&buf[cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..])?;
+        Ok(rowid as i64)
+    }
+
+    #[inline(always)]
+    pub fn cell_interior_read_left_child_page(&self, idx: usize) -> crate::Result<u32> {
+        debug_assert!(matches!(
+            self.page_type(),
+            Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
+        ));
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        // Validate cell pointer is within page bounds (need 4 bytes for u32)
+        if cell_pointer + 4 > buf.len() {
+            return Err(crate::LimboError::Corrupt(format!(
+                "cell pointer {} out of bounds for page size {}",
+                cell_pointer,
+                buf.len()
+            )));
+        }
+        Ok(u32::from_be_bytes([
+            buf[cell_pointer],
+            buf[cell_pointer + 1],
+            buf[cell_pointer + 2],
+            buf[cell_pointer + 3],
+        ]))
+    }
+
+    #[inline(always)]
+    pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
+        debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let mut pos = cell_pointer;
+        let (_, nr) = read_varint(&buf[pos..])?;
+        pos += nr;
+        let (rowid, _) = read_varint(&buf[pos..])?;
+        Ok(rowid as i64)
+    }
+
+    /// Fast path for index cells: returns payload slice and overflow info without constructing BTreeCell.
+    ///
+    /// This bypasses the full `cell_get()` to `read_btree_cell()` path for binary search hot loops.
+    /// The returned slice is valid as long as the page is alive.
+    ///
+    /// Returns: (payload_slice, payload_size, first_overflow_page)
+    #[inline(always)]
+    pub fn cell_index_read_payload_ptr(
+        &self,
+        idx: usize,
+        usable_size: usize,
+    ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_offset = self.read_u16(cell_pointer) as usize;
+
+        let page_type = self.page_type()?;
+        let (payload_size, varint_len, header_skip) = match page_type {
+            PageType::IndexInterior => {
+                let (size, len) = read_varint(&buf[cell_offset + 4..])?;
+                (size, len, 4usize)
+            }
+            PageType::IndexLeaf => {
+                let (size, len) = read_varint(&buf[cell_offset..])?;
+                (size, len, 0usize)
+            }
+            _ => unreachable!("cell_index_read_payload_ptr called on non-index page"),
+        };
+
+        let payload_start = cell_offset + header_skip + varint_len;
+
+        let max_local = payload_overflow_threshold_max(page_type, usable_size);
+        let min_local = payload_overflow_threshold_min(page_type, usable_size);
+        let (overflows, local_size) = sqlite3_ondisk::payload_overflows(
+            payload_size as usize,
+            max_local,
+            min_local,
+            usable_size,
+        );
+
+        let (payload_slice, first_overflow) = if overflows {
+            let overflow_ptr_offset = payload_start + local_size - 4;
+            let first_overflow_page = u32::from_be_bytes([
+                buf[overflow_ptr_offset],
+                buf[overflow_ptr_offset + 1],
+                buf[overflow_ptr_offset + 2],
+                buf[overflow_ptr_offset + 3],
+            ]);
+            // SAFETY: valid as long as page is alive
+            let slice = unsafe {
+                std::mem::transmute::<&[u8], &'static [u8]>(
+                    &buf[payload_start..payload_start + local_size - 4],
+                )
+            };
+            (slice, Some(first_overflow_page))
+        } else {
+            // SAFETY: valid as long as page is alive
+            let slice = unsafe {
+                std::mem::transmute::<&[u8], &'static [u8]>(
+                    &buf[payload_start..payload_start + payload_size as usize],
+                )
+            };
+            (slice, None)
+        };
+
+        Ok((payload_slice, payload_size, first_overflow))
+    }
+
+    #[inline]
+    pub fn cell_pointer_array_offset_and_size(&self) -> (usize, usize) {
+        (
+            self.cell_pointer_array_offset(),
+            self.cell_pointer_array_size(),
+        )
+    }
+
+    #[inline]
+    pub fn cell_pointer_array_offset(&self) -> usize {
+        self.offset() + self.header_size()
+    }
+
+    #[inline]
+    pub fn cell_get_raw_start_offset(&self, idx: usize) -> usize {
+        let cell_pointer_array_start = self.cell_pointer_array_offset();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        self.read_u16_no_offset(cell_pointer) as usize
+    }
+
+    #[inline]
+    pub fn cell_get_raw_region(
+        &self,
+        idx: usize,
+        usable_size: usize,
+    ) -> crate::Result<(usize, usize)> {
+        let page_type = self.page_type()?;
+        let max_local = payload_overflow_threshold_max(page_type, usable_size);
+        let min_local = payload_overflow_threshold_min(page_type, usable_size);
+        let cell_count = self.cell_count();
+        Ok(self._cell_get_raw_region_faster(
+            idx,
+            usable_size,
+            cell_count,
+            max_local,
+            min_local,
+            page_type,
+        ))
+    }
+
+    #[inline]
+    pub fn _cell_get_raw_region_faster(
+        &self,
+        idx: usize,
+        usable_size: usize,
+        cell_count: usize,
+        max_local: usize,
+        min_local: usize,
+        page_type: PageType,
+    ) -> (usize, usize) {
+        let buf = self.as_ptr();
+        assert!(idx < cell_count, "cell_get: idx out of bounds");
+        let start = self.cell_get_raw_start_offset(idx);
+        let len = match page_type {
+            PageType::IndexInterior => {
+                let (len_payload, n_payload) = read_varint(&buf[start + 4..]).unwrap();
+                let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+                    len_payload as usize,
+                    max_local,
+                    min_local,
+                    usable_size,
+                );
+                if overflows {
+                    4 + to_read + n_payload
+                } else {
+                    4 + len_payload as usize + n_payload
+                }
+            }
+            PageType::TableInterior => {
+                let (_, n_rowid) = read_varint(&buf[start + 4..]).unwrap();
+                4 + n_rowid
+            }
+            PageType::IndexLeaf => {
+                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
+                let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+                    len_payload as usize,
+                    max_local,
+                    min_local,
+                    usable_size,
+                );
+                if overflows {
+                    to_read + n_payload
+                } else {
+                    let mut size = len_payload as usize + n_payload;
+                    if size < MINIMUM_CELL_SIZE {
+                        size = MINIMUM_CELL_SIZE;
+                    }
+                    size
+                }
+            }
+            PageType::TableLeaf => {
+                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
+                let (_, n_rowid) = read_varint(&buf[start + n_payload..]).unwrap();
+                let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+                    len_payload as usize,
+                    max_local,
+                    min_local,
+                    usable_size,
+                );
+                if overflows {
+                    to_read + n_payload + n_rowid
+                } else {
+                    let mut size = len_payload as usize + n_payload + n_rowid;
+                    if size < MINIMUM_CELL_SIZE {
+                        size = MINIMUM_CELL_SIZE;
+                    }
+                    size
+                }
+            }
+        };
+        (start, len)
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        self.read_u8(BTREE_PAGE_TYPE) > PageType::TableInterior as u8
+    }
+
+    pub fn write_database_header(&self, header: &DatabaseHeader) {
+        let buf = self.as_ptr();
+        buf[0..DatabaseHeader::SIZE].copy_from_slice(bytemuck::bytes_of(header));
+    }
+
+    pub fn debug_print_freelist(&self, usable_space: usize) {
+        let mut pc = self.first_freeblock() as usize;
+        let mut block_num = 0;
+        println!("---- Free List Blocks ----");
+        println!("first freeblock pointer: {pc}");
+        println!("cell content area: {}", self.cell_content_area());
+        println!("fragmented bytes: {}", self.num_frag_free_bytes());
+
+        while pc != 0 && pc <= usable_space {
+            let next = self.read_u16_no_offset(pc);
+            let size = self.read_u16_no_offset(pc + 2);
+
+            println!("block {block_num}: position={pc}, size={size}, next={next}");
+            pc = next as usize;
+            block_num += 1;
+        }
+        println!("--------------");
+    }
+}
+
+/// Type alias for backward compatibility - PageContent is now PageInner
+pub type PageContent = PageInner;
 
 /// WAL tag not set
 pub const TAG_UNSET: u64 = u64::MAX;
+/// WAL write in progress, sentinel value set before starting a WAL write
+/// so we can detect if page was modified during the write
+pub const TAG_WRITE_PENDING: u64 = u64::MAX - 1;
 
 /// Bit layout:
 /// epoch: 20
@@ -184,6 +686,7 @@ pub struct Page {
 // concurrent modifications.
 unsafe impl Send for Page {}
 unsafe impl Sync for Page {}
+crate::assert::assert_send_sync!(Page);
 
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
 // because that is bad bad.
@@ -195,6 +698,8 @@ const PAGE_LOCKED: usize = 0b010;
 const PAGE_DIRTY: usize = 0b1000;
 /// Page's contents are loaded in memory.
 const PAGE_LOADED: usize = 0b10000;
+/// Page has been spilled to WAL (can be evicted even though dirty).
+const PAGE_SPILLED: usize = 0b100000;
 
 impl Page {
     pub fn new(id: i64) -> Self {
@@ -202,10 +707,11 @@ impl Page {
         Self {
             inner: UnsafeCell::new(PageInner {
                 flags: AtomicUsize::new(0),
-                contents: None,
                 id: id as usize,
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
+                buffer: None,
+                overflow_cells: Vec::new(),
             }),
         }
     }
@@ -215,65 +721,116 @@ impl Page {
         unsafe { &mut *self.inner.get() }
     }
 
-    pub fn get_contents(&self) -> &mut PageContent {
-        self.get().contents.as_mut().unwrap()
+    /// Returns a mutable reference to PageInner for accessing page contents.
+    /// Panics if the page buffer is not loaded.
+    pub fn get_contents(&self) -> &mut PageInner {
+        let inner = self.get();
+        debug_assert!(
+            inner.buffer.is_some(),
+            "page {} buffer not loaded",
+            inner.id
+        );
+        inner
     }
 
+    #[inline]
     pub fn is_locked(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_LOCKED != 0
     }
 
+    #[inline]
     pub fn set_locked(&self) {
         self.get().flags.fetch_or(PAGE_LOCKED, Ordering::Acquire);
     }
 
+    #[inline]
     pub fn clear_locked(&self) {
         self.get().flags.fetch_and(!PAGE_LOCKED, Ordering::Release);
     }
 
+    #[inline]
     pub fn is_dirty(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_DIRTY != 0
     }
 
+    #[inline]
+    /// almost never should be called explicitly - instead [Pager::add_dirty] method must be used
     pub fn set_dirty(&self) {
         tracing::debug!("set_dirty(page={})", self.get().id);
         self.clear_wal_tag();
+        // Clear spilled flag since page is being modified again
+        self.get().flags.fetch_and(!PAGE_SPILLED, Ordering::Release);
         self.get().flags.fetch_or(PAGE_DIRTY, Ordering::Release);
     }
 
+    #[inline]
+    /// caller must ensure that [Pager::dirty_pages] will be updated accordingly
     pub fn clear_dirty(&self) {
         tracing::debug!("clear_dirty(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
         self.clear_wal_tag();
     }
 
+    /// Clear the dirty flag without touching wal_tag.
+    /// Used when a WAL frame has been durably written and the tag already encodes it.
+    #[inline]
+    pub fn clear_dirty_keep_wal_tag(&self) {
+        tracing::debug!("clear_dirty_keep_wal_tag(page={})", self.get().id);
+        self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
+    }
+
+    /// Returns true if the page has been spilled to WAL and is safe to evict even while dirty.
+    #[inline]
+    pub fn is_spilled(&self) -> bool {
+        self.get().flags.load(Ordering::Acquire) & PAGE_SPILLED != 0
+    }
+
+    /// Mark the page as spilled to WAL. Spilled pages remain dirty but may be evicted from cache.
+    #[inline]
+    pub fn set_spilled(&self) {
+        tracing::debug!("set_spilled(page={})", self.get().id);
+        self.get().flags.fetch_or(PAGE_SPILLED, Ordering::Release);
+    }
+
+    /// Clear the spilled flag. This is also done implicitly on set_dirty().
+    #[inline]
+    pub fn clear_spilled(&self) {
+        self.get().flags.fetch_and(!PAGE_SPILLED, Ordering::Release);
+    }
+
+    #[inline]
     pub fn is_loaded(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_LOADED != 0
     }
 
+    #[inline]
     pub fn set_loaded(&self) {
         self.get().flags.fetch_or(PAGE_LOADED, Ordering::Release);
     }
 
+    #[inline]
     pub fn clear_loaded(&self) {
         tracing::debug!("clear loaded {}", self.get().id);
         self.get().flags.fetch_and(!PAGE_LOADED, Ordering::Release);
     }
 
-    pub fn is_index(&self) -> bool {
-        match self.get_contents().page_type() {
+    #[inline]
+    pub fn is_index(&self) -> crate::Result<bool> {
+        Ok(match self.get_contents().page_type()? {
             PageType::IndexLeaf | PageType::IndexInterior => true,
             PageType::TableLeaf | PageType::TableInterior => false,
-        }
+        })
     }
 
     /// Increment the pin count by 1. A pin count >0 means the page is pinned and not eligible for eviction from the page cache.
+    #[inline]
     pub fn pin(&self) {
         self.get().pin_count.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Decrement the pin count by 1. If the count reaches 0, the page is no longer
     /// pinned and is eligible for eviction from the page cache.
+    #[inline]
     pub fn unpin(&self) {
         let was_pinned = self.try_unpin();
 
@@ -286,6 +843,7 @@ impl Page {
 
     /// Try to decrement the pin count by 1, but do nothing if it was already 0.
     /// Returns true if the pin count was decremented.
+    #[inline]
     pub fn try_unpin(&self) -> bool {
         self.get()
             .pin_count
@@ -300,6 +858,7 @@ impl Page {
     }
 
     /// Returns true if the page is pinned and thus not eligible for eviction from the page cache.
+    #[inline]
     pub fn is_pinned(&self) -> bool {
         self.get().pin_count.load(Ordering::Acquire) > 0
     }
@@ -328,13 +887,65 @@ impl Page {
     }
 
     #[inline]
+    /// Returns true if the page has a valid WAL tag (i.e., was written to WAL and not modified since).
+    /// Returns false if the wal_tag is TAG_UNSET (page was modified since last WAL write).
+    pub fn has_wal_tag(&self) -> bool {
+        let tag = self.get().wal_tag.load(Ordering::Acquire);
+        let result = tag != TAG_UNSET && tag != TAG_WRITE_PENDING;
+        tracing::debug!(
+            "has_wal_tag(page={}) = {} (tag={:x})",
+            self.get().id,
+            result,
+            tag
+        );
+        result
+    }
+
+    #[inline]
+    /// Mark page as having a WAL write in progress.
+    /// This is set before starting a spill/cacheflush so we can detect
+    /// if the page was modified during the write.
+    pub fn set_write_pending(&self) {
+        tracing::debug!("set_write_pending(page={})", self.get().id);
+        self.get()
+            .wal_tag
+            .store(TAG_WRITE_PENDING, Ordering::Release);
+    }
+
+    #[inline]
+    /// Try to set the WAL tag, but only if the page wasn't modified during the write.
+    /// Returns true if the tag was set, false if the page was modified (wal_tag became TAG_UNSET).
+    pub fn try_set_wal_tag(&self, frame: u64, epoch: u32) -> bool {
+        let new_tag = pack_tag_pair(frame, epoch);
+        let page_id = self.get().id;
+        let current = self.get().wal_tag.load(Ordering::Acquire);
+        // Only set if current tag is not TAG_UNSET (meaning page wasn't modified during write)
+        // TAG_WRITE_PENDING is fine, it means the write was in progress and page wasn't modified
+        if current == TAG_UNSET {
+            tracing::debug!(
+                "try_set_wal_tag(page={}, frame={}) SKIPPED: wal_tag is TAG_UNSET (page was modified)",
+                page_id, frame
+            );
+            return false;
+        }
+        tracing::debug!(
+            "try_set_wal_tag(page={}, frame={}) SUCCESS: current={:x}",
+            page_id,
+            frame,
+            current
+        );
+        self.get().wal_tag.store(new_tag, Ordering::Release);
+        true
+    }
+
+    #[inline]
     pub fn is_valid_for_checkpoint(&self, target_frame: u64, epoch: u32) -> bool {
         let (f, s) = self.wal_tag_pair();
         f == target_frame && s == epoch && !self.is_dirty() && self.is_loaded() && !self.is_locked()
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 /// The state of the current pager cache commit.
 enum CommitState {
     /// Prepare WAL header for commit if needed
@@ -343,29 +954,58 @@ enum CommitState {
     PrepareWalSync,
     /// Get DB size (mostly from page cache - but in rare cases we can read it from disk)
     GetDbSize,
-    /// Appends all frames to the WAL.
-    PrepareFrames {
-        db_size: u32,
-    },
-    /// Fsync the on-disk WAL.
-    SyncWal,
+    /// Scan all dirty pages and issue concurrent reads for evicted (spilled) pages.
+    ScanAndIssueReads { db_size: u32 },
+    /// Wait for all batched reads of evicted pages to complete.
+    WaitBatchedReads { db_size: u32 },
+    /// Collect pages (now all available) and prepare WAL frames.
+    PrepareFrames { db_size: u32 },
+    /// All frames prepared, writes are in flight
+    WaitWrites,
+    /// Writes are complete, wait for WAL sync to complete
+    WaitSync,
+    /// Wait for WAL sync to complete and finalize the WAL commit.
+    /// After this state, the write transaction is durable.
+    /// If autocheckpoint is enabled and the autocheckpoint threshold is reached, checkpoint will be attempted.
+    WalCommitDone,
     /// Checkpoint the WAL to the database file (if needed).
-    Checkpoint,
-    /// Fsync the database file.
-    SyncDbFile,
-    Done,
+    /// This is decoupled from commit - checkpoint failure does not affect commit durability.
+    AutoCheckpoint,
 }
 
-#[derive(Clone, Debug, Default)]
-enum CheckpointState {
+#[derive(Debug, Default)]
+struct CheckpointState {
+    phase: CheckpointPhase,
+    /// The checkpoint result, set after WAL checkpoint completes
+    result: Option<CheckpointResult>,
+    /// The checkpoint mode, used to determine if WAL truncation is needed
+    mode: Option<CheckpointMode>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+enum CheckpointPhase {
     #[default]
-    Checkpoint,
-    SyncDbFile {
-        res: CheckpointResult,
+    NotCheckpointing,
+    Checkpoint {
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
     },
-    CheckpointDone {
-        res: CheckpointResult,
+    /// Truncate the database file if everything was backfilled and file is larger than expected.
+    TruncateDbFile {
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+        /// Whether we've invalidated page 1 from cache (needed because checkpoint may write
+        /// pages directly from WALto DB file, so cached page 1 of the checkpointer connection may have stale database_size)
+        page1_invalidated: bool,
     },
+    /// Sync the database file after checkpoint (if sync_mode != Off and we backfilled any frames from the WAL).
+    SyncDbFile { clear_page_cache: bool },
+    /// Truncate the WAL file after DB file is safely synced (only for TRUNCATE checkpoint mode).
+    /// This must happen AFTER SyncDbFile to ensure data durability.
+    TruncateWalFile { clear_page_cache: bool },
+    /// Finalize: release guard and optionally clear page cache.
+    Finalize { clear_page_cache: bool },
 }
 
 /// The mode of allocating a btree page.
@@ -385,9 +1025,39 @@ pub enum BtreePageAllocMode {
 /// This will keep track of the state of current cache commit in order to not repeat work
 struct CommitInfo {
     completions: Vec<Completion>,
-    result: Option<PagerCommitResult>,
     state: CommitState,
-    time: crate::io::clock::Instant,
+    collected_pages: Vec<PageRef>,
+    page_sources: Vec<PageSource>,
+    page_source_cursor: usize,
+    prepared_frames: Vec<PreparedFrames>,
+}
+
+/// Represents a dirty page that will be committed to the log.
+enum PageSource {
+    /// Cache resident page
+    Cached(usize),
+    /// A page read from disk because it was spilled/evicted from cache
+    Evicted(PageRef),
+}
+
+impl CommitInfo {
+    fn reset(&mut self) {
+        self.completions.clear();
+        self.state = CommitState::PrepareWal;
+        self.collected_pages.clear();
+        self.page_sources.clear();
+        self.prepared_frames.clear();
+        self.page_source_cursor = 0;
+    }
+
+    /// Clear and reserve space for n pages in each vector.
+    fn initialize(&mut self, n: usize) {
+        self.page_sources.clear();
+        self.page_sources.reserve(n.min(IOV_MAX));
+        self.completions.clear();
+        self.completions.reserve(n / 4);
+        self.collected_pages.reserve(n.min(IOV_MAX));
+    }
 }
 
 /// Track the state of the auto-vacuum mode.
@@ -442,7 +1112,10 @@ enum PtrMapPutState {
 #[derive(Debug, Clone)]
 enum HeaderRefState {
     Start,
-    CreateHeader { page: PageRef },
+    CreateHeader {
+        page: PageRef,
+        completion: Option<Completion>,
+    },
 }
 
 #[cfg(not(feature = "omit_autovacuum"))]
@@ -464,15 +1137,27 @@ pub struct Savepoint {
     /// If the database grows during the savepoint and a rollback to the savepoint is performed,
     /// the pages exceeding the database size at the start of the savepoint will be ignored.
     db_size: AtomicU32,
+    /// We might want to rollback.
+    /// WAL max frame at the start of the savepoint.
+    wal_max_frame: AtomicU64,
+    /// WAL checksum at the start of the savepoint.
+    wal_checksum: RwLock<(u32, u32)>,
 }
 
 impl Savepoint {
-    pub fn new(subjournal_offset: u64, db_size: u32) -> Self {
+    pub fn new(
+        subjournal_offset: u64,
+        db_size: u32,
+        wal_max_frame: u64,
+        wal_checksum: (u32, u32),
+    ) -> Self {
         Self {
             start_offset: AtomicU64::new(subjournal_offset),
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(db_size),
+            wal_max_frame: AtomicU64::new(wal_max_frame),
+            wal_checksum: RwLock::new(wal_checksum),
         }
     }
 
@@ -493,18 +1178,15 @@ pub struct Pager {
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
-    pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
+    pub(crate) wal: Option<Arc<dyn Wal>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
-    /// Dirty pages sorted by page number.
-    ///
-    /// We need dirty pages in page number order when we flush them out to ensure
-    /// that the WAL we generate is compatible with SQLite.
-    dirty_pages: Arc<RwLock<BTreeSet<usize>>>,
+    /// Dirty pages as a bitmap, naturally sorted by page number.
+    dirty_pages: Arc<RwLock<RoaringBitmap>>,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
@@ -528,6 +1210,10 @@ pub struct Pager {
     /// represent case where value is not set.
     schema_cookie: AtomicU64,
     free_page_state: RwLock<FreePageState>,
+    /// State machine for async cache spilling.
+    spill_state: RwLock<SpillState>,
+    /// State machine for async cacheflush operation.
+    cacheflush_state: RwLock<CacheFlushState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: AtomicU32,
     header_ref_state: RwLock<HeaderRefState>,
@@ -538,12 +1224,13 @@ pub struct Pager {
     enable_encryption: AtomicBool,
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
+    /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
+    /// Only stored on Apple platforms; on others, always returns Fsync.
+    #[cfg(target_vendor = "apple")]
+    sync_type: AtomicFileSyncType,
 }
 
-// SAFETY: This needs to be audited for thread safety.
-// See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for Pager {}
-unsafe impl Sync for Pager {}
+assert_send_sync!(Pager);
 
 #[cfg(not(feature = "omit_autovacuum"))]
 pub struct VacuumState {
@@ -552,17 +1239,6 @@ pub struct VacuumState {
     /// State machine for [Pager::ptrmap_put]
     ptrmap_put_state: PtrMapPutState,
     btree_create_vacuum_full_state: BtreeCreateVacuumFullState,
-}
-
-#[derive(Debug, Clone)]
-/// The status of the current cache flush.
-pub enum PagerCommitResult {
-    /// The WAL was written to disk and fsynced.
-    WalWritten,
-    /// The WAL was written, fsynced, and a checkpoint was performed.
-    /// The database file was then also fsynced.
-    Checkpointed(CheckpointResult),
-    Rollback,
 }
 
 #[derive(Debug, Clone)]
@@ -575,7 +1251,6 @@ enum AllocatePageState {
     ///   and set the next trunk page as the database's "first freelist trunk page".
     SearchAvailableFreeListLeaf {
         trunk_page: PageRef,
-        current_db_size: u32,
     },
     /// If a freelist leaf is found, reuse it for the page allocation and remove it from the trunk page.
     ReuseFreelistLeaf {
@@ -603,12 +1278,72 @@ enum FreePageState {
     NewTrunk { page: Arc<Page> },
 }
 
+/// State machine for async cache spilling.
+/// Tracks progress of writing dirty pages to WAL or disk.
+#[derive(Debug, Default, Clone)]
+enum SpillState {
+    #[default]
+    /// No spill operation in progress
+    Idle,
+    /// WAL spill in progress, waiting for write completions
+    WritingToWal {
+        /// Pinned pages being spilled
+        pages: Vec<PinGuard>,
+        /// Completions to wait for
+        completions: Vec<Completion>,
+    },
+    /// Writing ephemeral tables pages directly to disk
+    WritingToDisk {
+        /// Pages being spilled
+        pages: Vec<PinGuard>,
+        /// Completions to wait for
+        completions: Vec<Completion>,
+    },
+}
+enum CacheFlushStep {
+    /// Yield to caller with pending I/O, resume with given phase
+    Yield(CacheFlushState, IOCompletions),
+    /// Continue immediately to next phase (no I/O wait)
+    Continue(CacheFlushState),
+    /// Flush complete, return accumulated completions
+    Done(Vec<Completion>),
+}
+
+#[derive(Default)]
+pub enum CacheFlushState {
+    #[default]
+    Init,
+    WalPrepareStart {
+        dirty_ids: Vec<usize>,
+        completion: Completion,
+    },
+    WalPrepareFinish {
+        dirty_ids: Vec<usize>,
+        completion: Completion,
+    },
+    Collecting(CollectingState),
+    WaitingForRead {
+        state: CollectingState,
+        page_id: usize,
+        page: PageRef,
+        completion: Completion,
+    },
+}
+
+#[derive(Default)]
+pub struct CollectingState {
+    pub dirty_ids: Vec<usize>,
+    pub current_idx: usize,
+    pub collected_pages: Vec<PageRef>,
+    pub completions: Vec<Completion>,
+}
+
 impl Pager {
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
-        wal: Option<Rc<RefCell<dyn Wal>>>,
+        wal: Option<Arc<dyn Wal>>,
         io: Arc<dyn crate::io::IO>,
-        page_cache: Arc<RwLock<PageCache>>,
+        page_cache: PageCache,
         buffer_pool: Arc<BufferPool>,
         init_lock: Arc<Mutex<()>>,
         init_page_1: Arc<ArcSwapOption<Page>>,
@@ -618,23 +1353,24 @@ impl Pager {
         } else {
             RwLock::new(AllocatePage1State::Done)
         };
-        let now = io.now();
         Ok(Self {
             db_file,
             wal,
-            page_cache,
+            page_cache: Arc::new(RwLock::new(page_cache)),
             io,
-            dirty_pages: Arc::new(RwLock::new(BTreeSet::new())),
+            dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
-                result: None,
                 completions: Vec::new(),
                 state: CommitState::PrepareWal,
-                time: now,
+                collected_pages: Vec::new(),
+                prepared_frames: Vec::new(),
+                page_sources: Vec::new(),
+                page_source_cursor: 0,
             }),
             syncing: Arc::new(AtomicBool::new(false)),
-            checkpoint_state: RwLock::new(CheckpointState::Checkpoint),
+            checkpoint_state: RwLock::new(CheckpointState::default()),
             buffer_pool,
             auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
             init_lock,
@@ -643,6 +1379,8 @@ impl Pager {
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
             free_page_state: RwLock::new(FreePageState::Start),
+            spill_state: RwLock::new(SpillState::Idle),
+            cacheflush_state: RwLock::new(CacheFlushState::default()),
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
             header_ref_state: RwLock::new(HeaderRefState::Start),
@@ -655,11 +1393,92 @@ impl Pager {
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
             init_page_1,
+            #[cfg(target_vendor = "apple")]
+            sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
         })
+    }
+
+    /// Get the sync type setting.
+    /// On non-Apple platforms, always returns Fsync (compile-time constant).
+    #[cfg(target_vendor = "apple")]
+    #[inline]
+    pub fn get_sync_type(&self) -> FileSyncType {
+        self.sync_type.get()
+    }
+
+    /// Get the sync type setting.
+    /// On non-Apple platforms, always returns Fsync (compile-time constant).
+    #[cfg(not(target_vendor = "apple"))]
+    #[inline]
+    pub fn get_sync_type(&self) -> FileSyncType {
+        FileSyncType::Fsync
+    }
+
+    /// Set the sync type (for PRAGMA fullfsync). Only effective on Apple platforms.
+    #[cfg(target_vendor = "apple")]
+    pub fn set_sync_type(&self, value: FileSyncType) {
+        self.sync_type.set(value);
+    }
+
+    /// Set the sync type. No-op on non-Apple platforms.
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn set_sync_type(&self, _value: FileSyncType) {
+        // No-op: FullFsync only has effect on Apple platforms
     }
 
     pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
         self.init_page_1.clone()
+    }
+
+    /// Read page 1 (the database header page) using the header_ref_state state machine.
+    /// Used by HeaderRef and HeaderRefMut to avoid duplicating the page-loading logic.
+    fn read_header_page(&self) -> Result<IOResult<PageRef>> {
+        loop {
+            let state = self.header_ref_state.read().clone();
+            tracing::trace!("read_header_page - {:?}", state);
+            match state {
+                HeaderRefState::Start => {
+                    // If db is not initialized, return the in-memory page
+                    if let Some(page1) = self.init_page_1.load_full() {
+                        return Ok(IOResult::Done(page1));
+                    }
+
+                    let (page, c) = self.read_page(DatabaseHeader::PAGE_ID as i64)?;
+                    *self.header_ref_state.write() = HeaderRefState::CreateHeader {
+                        page,
+                        completion: c.clone(),
+                    };
+                    if let Some(c) = c {
+                        io_yield_one!(c);
+                    }
+                }
+                HeaderRefState::CreateHeader { page, completion } => {
+                    // Check if the read failed (e.g., due to checksum/decryption error)
+                    if let Some(ref c) = completion {
+                        if let Some(err) = c.get_error() {
+                            *self.header_ref_state.write() = HeaderRefState::Start;
+                            return Err(err.into());
+                        }
+                    }
+                    turso_assert!(page.is_loaded(), "page should be loaded");
+                    turso_assert!(
+                        page.get().id == DatabaseHeader::PAGE_ID,
+                        "incorrect header page id"
+                    );
+                    *self.header_ref_state.write() = HeaderRefState::Start;
+                    return Ok(IOResult::Done(page));
+                }
+            }
+        }
+    }
+
+    /// Set whether cache spilling is enabled.
+    pub fn set_spill_enabled(&self, enabled: bool) {
+        self.page_cache.write().set_spill_enabled(enabled);
+    }
+    /// Get whether cache spilling is enabled.
+    pub fn get_spill_enabled(&self) -> bool {
+        self.page_cache.read().is_spill_enabled()
     }
 
     /// Open the subjournal if not yet open.
@@ -706,7 +1525,7 @@ impl Pager {
             let page_id = page.get().id as u32;
             let contents = page.get_contents();
             let buffer = self.buffer_pool.allocate(page_size + 4);
-            let contents_buffer = contents.buffer.as_slice();
+            let contents_buffer = contents.as_ptr();
             turso_assert!(
                 contents_buffer.len() == page_size,
                 "contents buffer length should be equal to page size"
@@ -747,7 +1566,7 @@ impl Pager {
         let subjournal = self.subjournal.read();
         let subjournal = subjournal.as_ref().unwrap();
 
-        let c = subjournal.write_page(write_offset, page_size, buffer.clone(), c)?;
+        let c = subjournal.write_page(write_offset, page_size, buffer, c)?;
         assert!(c.succeeded(), "memory IO should complete immediately");
         Ok(())
     }
@@ -787,7 +1606,12 @@ impl Pager {
         // the subjournal offset should always be 0 as we should only have max 1 savepoint
         // opened at any given time.
         turso_assert!(subjournal_offset == 0, "subjournal offset should be 0");
-        let savepoint = Savepoint::new(subjournal_offset, db_size);
+        let (wal_max_frame, wal_checksum) = if let Some(wal) = &self.wal {
+            (wal.get_max_frame(), wal.get_last_checksum())
+        } else {
+            (0, (0, 0))
+        };
+        let savepoint = Savepoint::new(subjournal_offset, db_size, wal_max_frame, wal_checksum);
         let mut savepoints = self.savepoints.write();
         turso_assert!(
             savepoints.is_empty(),
@@ -868,7 +1692,7 @@ impl Pager {
             }
             let page_wont_exist_after_rollback = page_id > db_size;
             if page_wont_exist_after_rollback {
-                dirty_pages.remove(&(page_id as usize));
+                dirty_pages.remove(page_id);
                 if let Some(page) = self
                     .page_cache
                     .write()
@@ -901,18 +1725,22 @@ impl Pager {
             self.upsert_page_in_cache(page_id as usize, page, false)?;
         }
 
-        let truncate_completion = self
-            .subjournal
-            .read()
-            .as_ref()
-            .unwrap()
-            .truncate(journal_start_offset)?;
+        let truncate_completion = subjournal.truncate(journal_start_offset)?;
         assert!(
             truncate_completion.succeeded(),
             "memory IO should complete immediately"
         );
 
         self.page_cache.write().truncate(db_size as usize)?;
+
+        if let Some(wal) = &self.wal {
+            let wal_max_frame = savepoint.wal_max_frame.load(Ordering::SeqCst);
+            let wal_checksum = *savepoint.wal_checksum.read();
+            wal.rollback(Some(RollbackTo {
+                frame: wal_max_frame,
+                checksum: wal_checksum,
+            }));
+        }
 
         Ok(true)
     }
@@ -961,8 +1789,8 @@ impl Pager {
         Ok(IOResult::Done(clamped_max))
     }
 
-    pub fn set_wal(&mut self, wal: Rc<RefCell<dyn Wal>>) {
-        wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
+    pub fn set_wal(&mut self, wal: Arc<dyn Wal>) {
+        wal.set_io_context(self.io_ctx.read().clone());
         self.wal = Some(wal);
     }
 
@@ -1023,29 +1851,21 @@ impl Pager {
                     offset_in_ptrmap_page,
                 } => {
                     turso_assert!(ptrmap_page.is_loaded(), "ptrmap_page should be loaded");
-                    let ptrmap_page_inner = ptrmap_page.get();
-                    let ptrmap_pg_no = ptrmap_page_inner.id;
+                    let page_content = ptrmap_page.get_contents();
+                    let ptrmap_pg_no = page_content.id;
 
-                    let page_content: &PageContent = match ptrmap_page_inner.contents.as_ref() {
-                        Some(content) => content,
-                        None => {
-                            return Err(LimboError::InternalError(format!(
-                                "Ptrmap page {ptrmap_pg_no} content not loaded"
-                            )));
-                        }
-                    };
-
-                    let full_buffer_slice: &[u8] = page_content.buffer.as_slice();
+                    let full_buffer_slice: &[u8] = page_content.as_ptr();
 
                     // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
-                    // The actual page data starts at page_content.offset within the full_buffer_slice.
-                    if ptrmap_pg_no != 1 && page_content.offset != 0 {
+                    // The actual page data starts at page_content.offset() within the full_buffer_slice.
+                    if ptrmap_pg_no != 1 && page_content.offset() != 0 {
                         return Err(LimboError::Corrupt(format!(
                             "Ptrmap page {} has unexpected internal offset {}",
-                            ptrmap_pg_no, page_content.offset
+                            ptrmap_pg_no,
+                            page_content.offset()
                         )));
                     }
-                    let ptrmap_page_data_slice: &[u8] = &full_buffer_slice[page_content.offset..];
+                    let ptrmap_page_data_slice: &[u8] = &full_buffer_slice[page_content.offset()..];
                     let actual_data_length = ptrmap_page_data_slice.len();
 
                     // Check if the calculated offset for the entry is within the bounds of the actual page data length.
@@ -1130,19 +1950,11 @@ impl Pager {
                     offset_in_ptrmap_page,
                 } => {
                     turso_assert!(ptrmap_page.is_loaded(), "page should be loaded");
-                    let ptrmap_page_inner = ptrmap_page.get();
-                    let ptrmap_pg_no = ptrmap_page_inner.id;
+                    self.add_dirty(&ptrmap_page)?;
+                    let page_content = ptrmap_page.get_contents();
+                    let ptrmap_pg_no = page_content.id;
 
-                    let page_content = match ptrmap_page_inner.contents.as_ref() {
-                        Some(content) => content,
-                        None => {
-                            return Err(LimboError::InternalError(format!(
-                                "Ptrmap page {ptrmap_pg_no} content not loaded"
-                            )))
-                        }
-                    };
-
-                    let full_buffer_slice = page_content.buffer.as_mut_slice();
+                    let full_buffer_slice = page_content.as_ptr();
 
                     if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
                         return Err(LimboError::InternalError(format!(
@@ -1167,7 +1979,6 @@ impl Pager {
                         ptrmap_page.get().id == ptrmap_pg_no,
                         "ptrmap page has unexpected number"
                     );
-                    self.add_dirty(&ptrmap_page)?;
                     self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Start;
                     break Ok(IOResult::Done(()));
                 }
@@ -1274,7 +2085,9 @@ impl Pager {
                     }
                 }
                 AutoVacuumMode::Incremental => {
-                    unimplemented!()
+                    return Err(LimboError::InternalError(
+                        "Incremental auto-vacuum is not supported".to_string(),
+                    ));
                 }
             }
         }
@@ -1288,7 +2101,7 @@ impl Pager {
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
         // setup overflow page
-        let contents = page.get().contents.as_mut().unwrap();
+        let contents = page.get_contents();
         let buf = contents.as_ptr();
         buf.fill(0);
 
@@ -1305,11 +2118,19 @@ impl Pager {
         _alloc_mode: BtreePageAllocMode,
     ) -> Result<IOResult<PageRef>> {
         let page = return_if_io!(self.allocate_page());
+        debug_assert_eq!(
+            offset,
+            page.get_contents().offset(),
+            "offset parameter {} doesn't match computed offset {} for page {}",
+            offset,
+            page.get_contents().offset(),
+            page.get().id
+        );
         btree_init_page(&page, page_type, offset, self.usable_space());
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().id,
-            page.get_contents().page_type()
+            page.get_contents().page_type().ok()
         );
         Ok(IOResult::Done(page))
     }
@@ -1409,14 +2230,8 @@ impl Pager {
 
     /// Set the schema cookie cache.
     pub fn set_schema_cookie(&self, cookie: Option<u32>) {
-        match cookie {
-            Some(value) => {
-                self.schema_cookie.store(value as u64, Ordering::SeqCst);
-            }
-            None => self
-                .schema_cookie
-                .store(Self::SCHEMA_COOKIE_NOT_SET, Ordering::SeqCst),
-        }
+        let value = cookie.map_or(Self::SCHEMA_COOKIE_NOT_SET, |v| v as u64);
+        self.schema_cookie.store(value, Ordering::SeqCst);
     }
 
     /// Get the schema cookie, using the cached value if available to avoid reading page 1.
@@ -1435,7 +2250,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        let changed = wal.borrow_mut().begin_read_tx()?;
+        let changed = wal.begin_read_tx()?;
         if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
@@ -1445,19 +2260,26 @@ impl Pager {
         Ok(())
     }
 
+    /// MVCC-only: refresh connection-private WAL change counters without starting a read tx and invalidate cache if needed.
+    pub fn mvcc_refresh_if_db_changed(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        if wal.mvcc_refresh_if_db_changed() {
+            // Prevents stale page cache reads after MVCC checkpoints update the DB file.
+            self.clear_page_cache(false);
+            self.set_schema_cookie(None);
+        }
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
         if !self.db_initialized() {
             if let Some(_lock) = self.init_lock.try_lock() {
-                if let IOResult::IO(c) = self.allocate_page1()? {
-                    return Ok(IOResult::IO(c));
-                } else {
-                    return Ok(IOResult::Done(()));
-                }
-            } else {
-                // Give a chance for the allocation to happen elsewhere
-                io_yield_one!(Completion::new_yield());
+                return Ok(self.allocate_page1()?.map(|_| ()));
             }
+            // Give a chance for the allocation to happen elsewhere
+            io_yield_one!(Completion::new_yield());
         }
         Ok(IOResult::Done(()))
     }
@@ -1471,37 +2293,90 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
-        Ok(IOResult::Done(wal.borrow_mut().begin_write_tx()?))
+        Ok(IOResult::Done(wal.begin_write_tx()?))
     }
 
+    /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
+    /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
+    /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<PagerCommitResult>> {
+    pub fn commit_tx(
+        &self,
+        connection: &Connection,
+        update_transaction_state: bool,
+    ) -> Result<IOResult<()>> {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
-            return Ok(IOResult::Done(PagerCommitResult::Rollback));
+            return Ok(IOResult::Done(()));
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
-            return Ok(IOResult::Done(PagerCommitResult::Rollback));
+            return Ok(IOResult::Done(()));
         };
-        let (_, schema_did_change) = match connection.get_tx_state() {
-            TransactionState::Write { schema_did_change } => (true, schema_did_change),
-            _ => (false, false),
-        };
-        tracing::trace!("commit_tx(schema_did_change={})", schema_did_change);
-        let commit_status = return_if_io!(self.commit_dirty_pages(
-            connection.is_wal_auto_checkpoint_disabled(),
-            connection.get_sync_mode(),
-            connection.get_data_sync_retry()
-        ));
-        wal.borrow().end_write_tx();
-        wal.borrow().end_read_tx();
 
-        if schema_did_change {
-            let schema = connection.schema.read().clone();
-            connection.db.update_schema_if_newer(schema);
+        let complete_commit = || {
+            if update_transaction_state {
+                connection.set_tx_state(TransactionState::None);
+            }
+            self.commit_dirty_pages_end();
+        };
+
+        loop {
+            let commit_state = self.commit_info.read().state;
+            tracing::debug!("commit_state: {:?}", commit_state);
+            // we separate auto-checkpoint from the commit in order for checkpoint to be able to backfill WAL till the end
+            // (including new frames from current transaction)
+            // otherwise, we will be unable to do WAL restart
+            match commit_state {
+                CommitState::AutoCheckpoint => {
+                    let checkpoint_result = self.checkpoint(
+                        CheckpointMode::Passive {
+                            upper_bound_inclusive: None,
+                        },
+                        connection.get_sync_mode(),
+                        false,
+                    );
+                    match checkpoint_result {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(_)) => complete_commit(),
+                        Err(err) => {
+                            tracing::info!("auto-checkpoint failed: {err}");
+                            complete_commit();
+                            self.cleanup_after_auto_checkpoint_failure();
+                        }
+                    }
+                    return Ok(IOResult::Done(()));
+                }
+                _ => {
+                    return_if_io!(self.commit_dirty_pages(
+                        connection.is_wal_auto_checkpoint_disabled(),
+                        connection.get_sync_mode(),
+                        connection.get_data_sync_retry(),
+                    ));
+
+                    let schema_did_change = match connection.get_tx_state() {
+                        TransactionState::Write { schema_did_change } => schema_did_change,
+                        _ => false,
+                    };
+
+                    wal.end_write_tx();
+                    wal.end_read_tx();
+                    // we do not set TransactionState::None here - because caller can decide that nothing should be done for this connection
+                    // and skip next calls of the commit_tx methods after IO
+
+                    tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
+                    if schema_did_change {
+                        let schema = connection.schema.read().clone();
+                        connection.db.update_schema_if_newer(schema);
+                    }
+
+                    if self.commit_info.read().state != CommitState::AutoCheckpoint {
+                        complete_commit();
+                        return Ok(IOResult::Done(()));
+                    }
+                }
+            }
         }
-        Ok(IOResult::Done(commit_status))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1522,10 +2397,15 @@ impl Pager {
         if is_write {
             self.clear_savepoints()
                 .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
-            wal.borrow().end_write_tx();
+            // IMPORTANT: rollback() must be called BEFORE end_write_tx() releases the write_lock.
+            // Otherwise, another thread could commit new frames to frame_cache between
+            // end_write_tx() and rollback(), and rollback() would incorrectly remove them.
+            self.rollback(schema_did_change, connection, is_write);
+            wal.end_write_tx();
+        } else {
+            self.rollback(schema_did_change, connection, is_write);
         }
-        wal.borrow().end_read_tx();
-        self.rollback(schema_did_change, connection, is_write);
+        wal.end_read_tx();
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1533,7 +2413,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
-        wal.borrow().end_read_tx();
+        wal.end_read_tx();
     }
 
     /// Reads a page from disk (either WAL or DB file) bypassing page-cache
@@ -1564,10 +2444,8 @@ impl Pager {
             return Ok((page, c));
         };
 
-        if let Some(frame_id) = wal.borrow().find_frame(page_idx as u64, frame_watermark)? {
-            let c = wal
-                .borrow()
-                .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+        if let Some(frame_id) = wal.find_frame(page_idx as u64, frame_watermark)? {
+            let c = wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
             return Ok((page, c));
@@ -1579,29 +2457,44 @@ impl Pager {
     }
 
     /// Reads a page from the database.
-    #[tracing::instrument(skip_all, level = Level::DEBUG)]
+    #[tracing::instrument(skip_all, level = Level::TRACE)]
     pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
         assert!(page_idx >= 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page(page_idx = {})", page_idx);
-        let mut page_cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(page_idx as usize);
-        if let Some(page) = page_cache.get(&page_key)? {
-            tracing::debug!("read_page(page_idx = {}) = cached", page_idx);
-            turso_assert!(
-                page_idx as usize == page.get().id,
-                "attempted to read page {page_idx} but got page {}",
-                page.get().id
-            );
-            return Ok((page, None));
+
+        // First check if page is in cache
+        {
+            let mut page_cache = self.page_cache.write();
+            let page_key = PageCacheKey::new(page_idx as usize);
+            if let Some(page) = page_cache.get(&page_key)? {
+                turso_assert!(
+                    page_idx as usize == page.get().id,
+                    "attempted to read page {page_idx} but got page {}",
+                    page.get().id
+                );
+                return Ok((page, None));
+            }
         }
+
+        tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
+        // Page not in cache, read from disk
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
-        turso_assert!(
-            page_idx as usize == page.get().id,
-            "attempted to read page {page_idx} but got page {}",
-            page.get().id
-        );
-        self.cache_insert(page_idx as usize, page.clone(), &mut page_cache)?;
-        Ok((page, Some(c)))
+        loop {
+            match self.cache_insert(page_idx as usize, page.clone())? {
+                IOResult::Done(()) => {
+                    return Ok((page, Some(c)));
+                }
+                IOResult::IO(IOCompletions::Single(spill_c)) => {
+                    // NOTE: Because `cache_insert` can return completions as *multiple* different states, we cannot
+                    // simply create a new CompletionGroup and return it here without inserting the
+                    // page into the cache. In order to do this, we would need to make read_page
+                    // re-entrant so it continues to call cache_insert and have every caller
+                    // propogate the IOResult. For now, we will wait syncronously for spilling IO
+                    // on cache insertion on read_page.
+                    self.io.wait_for_completion(spill_c)?;
+                }
+            }
+        }
     }
 
     fn begin_read_disk_page(
@@ -1621,21 +2514,37 @@ impl Pager {
         )
     }
 
-    fn cache_insert(
-        &self,
-        page_idx: usize,
-        page: PageRef,
-        page_cache: &mut PageCache,
-    ) -> Result<()> {
-        let page_key = PageCacheKey::new(page_idx);
-        match page_cache.insert(page_key, page) {
-            Ok(_) => {}
-            Err(CacheError::KeyExists) => {
-                unreachable!("Page should not exist in cache after get() miss")
+    /// Insert a page into the cache, with spilling support.
+    /// This handles cache full conditions by spilling dirty pages and retrying.
+    fn cache_insert(&self, page_idx: usize, page: PageRef) -> Result<IOResult<()>> {
+        {
+            let mut page_cache = self.page_cache.write();
+            let page_key = PageCacheKey::new(page_idx);
+            match page_cache.insert(page_key, page.clone()) {
+                Ok(_) => return Ok(IOResult::Done(())),
+                Err(CacheError::KeyExists) => {
+                    unreachable!("Page should not exist in cache after get() miss");
+                }
+                Err(CacheError::Full) => {
+                    // Fall through to spilling
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         }
-        Ok(())
+
+        match self.try_spill_dirty_pages()? {
+            IOResult::Done(true) => {
+                let mut page_cache = self.page_cache.write();
+                let page_key = PageCacheKey::new(page_idx);
+                match page_cache.insert(page_key, page) {
+                    Ok(_) => Ok(IOResult::Done(())),
+                    Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            IOResult::Done(false) => Err(LimboError::Busy),
+            IOResult::IO(c) => Ok(IOResult::IO(c)),
+        }
     }
 
     // Get a page from the cache, if it exists.
@@ -1688,9 +2597,14 @@ impl Pager {
             page.get().id
         );
         self.subjournal_page_if_required(page)?;
-        // TODO: check duplicates?
         let mut dirty_pages = self.dirty_pages.write();
-        dirty_pages.insert(page.get().id);
+        dirty_pages.insert(page.get().id as u32);
+        // Notify cache before marking dirty (page was evictable, now it won't be)
+        // Only notify if page wasn't already dirty
+        if !page.is_dirty() {
+            let key = PageCacheKey::new(page.get().id);
+            self.page_cache.write().notify_page_dirty(key);
+        }
         page.set_dirty();
         Ok(())
     }
@@ -1702,84 +2616,510 @@ impl Pager {
             ));
         };
         Ok(WalState {
-            checkpoint_seq_no: wal.borrow().get_checkpoint_seq(),
-            max_frame: wal.borrow().get_max_frame(),
+            checkpoint_seq_no: wal.get_checkpoint_seq(),
+            max_frame: wal.get_max_frame(),
         })
     }
 
-    /// Flush all dirty pages to disk.
-    /// Unlike commit_dirty_pages, this function does not commit, checkpoint now sync the WAL/Database.
+    /// Flush all dirty pages to disk (async/re-entrant).
+    /// Unlike commit_dirty_pages, this function does not commit, checkpoint nor sync the WAL/Database.
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn cacheflush(&self) -> Result<Vec<Completion>> {
-        let Some(wal) = self.wal.as_ref() else {
-            // TODO: when ephemeral table spills to disk, it should cacheflush pages directly to the temporary database file.
-            // This handling is not yet implemented, but it should be when spilling is implemented.
-            return Err(LimboError::InternalError(
-                "cacheflush() called on database without WAL".to_string(),
-            ));
-        };
-        let dirty_pages = self
-            .dirty_pages
-            .read()
-            .iter()
-            .copied()
-            .collect::<Vec<usize>>();
-        let len = dirty_pages.len().min(IOV_MAX);
-        let mut completions: Vec<Completion> = Vec::new();
-        let mut pages = Vec::with_capacity(len);
+    pub fn cacheflush(&self) -> Result<IOResult<Vec<Completion>>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| LimboError::InternalError("cacheflush() called without WAL".into()))?;
         let page_sz = self.get_page_size().unwrap_or_default();
 
-        let prepare = wal.borrow_mut().prepare_wal_start(page_sz)?;
-        if let Some(c) = prepare {
-            self.io.wait_for_completion(c)?;
-            let c = wal.borrow_mut().prepare_wal_finish()?;
-            self.io.wait_for_completion(c)?;
-        }
+        loop {
+            let phase = std::mem::take(&mut *self.cacheflush_state.write());
 
-        let commit_frame = None; // cacheflush only so we are not setting a commit frame here
-        for (idx, page_id) in dirty_pages.iter().enumerate() {
-            let page = {
-                let mut cache = self.page_cache.write();
-                let page_key = PageCacheKey::new(*page_id);
-                let page = cache.get(&page_key)?.expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
-                let page_type = page.get_contents().maybe_page_type();
-                trace!("cacheflush(page={}, page_type={:?}", page_id, page_type);
-                page
-            };
-            pages.push(page);
-            if pages.len() == IOV_MAX {
-                match wal.borrow_mut().append_frames_vectored(
-                    std::mem::replace(
-                        &mut pages,
-                        Vec::with_capacity(std::cmp::min(IOV_MAX, dirty_pages.len() - idx)),
-                    ),
-                    page_sz,
-                    commit_frame,
-                ) {
-                    Err(e) => {
-                        self.io.cancel(&completions)?;
-                        self.io.drain()?;
-                        return Err(e);
-                    }
-                    Ok(c) => completions.push(c),
+            match self.cacheflush_step(wal, page_sz, phase)? {
+                CacheFlushStep::Yield(next_phase, io) => {
+                    *self.cacheflush_state.write() = next_phase;
+                    return Ok(IOResult::IO(io));
+                }
+                CacheFlushStep::Continue(next_phase) => {
+                    *self.cacheflush_state.write() = next_phase;
+                }
+                CacheFlushStep::Done(completions) => {
+                    *self.cacheflush_state.write() = CacheFlushState::Init;
+                    return Ok(IOResult::Done(completions));
                 }
             }
         }
-        if !pages.is_empty() {
-            match wal
-                .borrow_mut()
-                .append_frames_vectored(pages, page_sz, commit_frame)
-            {
+    }
+
+    /// Executes one step of the cache flush state machine.
+    #[inline]
+    fn cacheflush_step(
+        &self,
+        wal: &Arc<dyn Wal>,
+        page_sz: PageSize,
+        phase: CacheFlushState,
+    ) -> Result<CacheFlushStep> {
+        match phase {
+            CacheFlushState::Init => self.cacheflush_init(wal, page_sz),
+            CacheFlushState::WalPrepareStart {
+                dirty_ids,
+                completion,
+            } => self.cacheflush_wal_prepare_start(wal, dirty_ids, completion),
+            CacheFlushState::WalPrepareFinish {
+                dirty_ids,
+                completion,
+            } => self.cacheflush_wal_prepare_finish(dirty_ids, completion),
+            CacheFlushState::Collecting(state) => self.cacheflush_collect(wal, page_sz, state),
+            CacheFlushState::WaitingForRead {
+                state,
+                page_id,
+                page,
+                completion,
+            } => self.cacheflush_handle_read(wal, page_sz, state, page_id, page, completion),
+        }
+    }
+
+    /// Init phase: gather dirty page IDs and begin WAL preparation.
+    fn cacheflush_init(&self, wal: &Arc<dyn Wal>, page_sz: PageSize) -> Result<CacheFlushStep> {
+        let dirty_ids: Vec<usize> = self.dirty_pages.read().iter().map(|x| x as usize).collect();
+
+        if dirty_ids.is_empty() {
+            return Ok(CacheFlushStep::Done(Vec::new()));
+        }
+
+        // Start WAL preparation
+        match wal.prepare_wal_start(page_sz)? {
+            Some(completion) => Ok(CacheFlushStep::Yield(
+                CacheFlushState::WalPrepareStart {
+                    dirty_ids,
+                    completion: completion.clone(),
+                },
+                IOCompletions::Single(completion),
+            )),
+            None => {
+                // No async prep needed, go straight to finish
+                let completion = wal.prepare_wal_finish(self.get_sync_type())?;
+                Ok(CacheFlushStep::Yield(
+                    CacheFlushState::WalPrepareFinish {
+                        dirty_ids,
+                        completion: completion.clone(),
+                    },
+                    IOCompletions::Single(completion),
+                ))
+            }
+        }
+    }
+
+    #[inline]
+    /// Wait for WAL prepare_start, then call prepare_finish.
+    fn cacheflush_wal_prepare_start(
+        &self,
+        wal: &Arc<dyn Wal>,
+        dirty_ids: Vec<usize>,
+        completion: Completion,
+    ) -> Result<CacheFlushStep> {
+        if !completion.succeeded() {
+            return Ok(CacheFlushStep::Yield(
+                CacheFlushState::WalPrepareStart {
+                    dirty_ids,
+                    completion: completion.clone(),
+                },
+                IOCompletions::Single(completion),
+            ));
+        }
+
+        let finish_completion = wal.prepare_wal_finish(self.get_sync_type())?;
+        Ok(CacheFlushStep::Yield(
+            CacheFlushState::WalPrepareFinish {
+                dirty_ids,
+                completion: finish_completion.clone(),
+            },
+            IOCompletions::Single(finish_completion),
+        ))
+    }
+
+    #[inline]
+    /// Wait for WAL prepare_finish, then start collecting pages.
+    fn cacheflush_wal_prepare_finish(
+        &self,
+        dirty_ids: Vec<usize>,
+        completion: Completion,
+    ) -> Result<CacheFlushStep> {
+        if !completion.succeeded() {
+            return Ok(CacheFlushStep::Yield(
+                CacheFlushState::WalPrepareFinish {
+                    dirty_ids,
+                    completion: completion.clone(),
+                },
+                IOCompletions::Single(completion),
+            ));
+        }
+
+        Ok(CacheFlushStep::Continue(CacheFlushState::Collecting(
+            CollectingState {
+                dirty_ids,
+                current_idx: 0,
+                collected_pages: Vec::new(),
+                completions: Vec::new(),
+            },
+        )))
+    }
+
+    #[inline]
+    /// Main collection loop: fetch pages from cache, handle evictions, write batches.
+    fn cacheflush_collect(
+        &self,
+        wal: &Arc<dyn Wal>,
+        page_sz: PageSize,
+        mut state: CollectingState,
+    ) -> Result<CacheFlushStep> {
+        while state.current_idx < state.dirty_ids.len() {
+            let page_id = state.dirty_ids[state.current_idx];
+            let cache_result = self.page_cache.write().get(&PageCacheKey::new(page_id))?;
+
+            match cache_result {
+                Some(page) => {
+                    trace!(
+                        "cacheflush(page={}, page_type={:?})",
+                        page_id,
+                        page.get_contents().page_type().ok()
+                    );
+                    state.collected_pages.push(page);
+                    state.current_idx += 1;
+                }
+                None => {
+                    // Page evicted, need async read from WAL
+                    trace!("cacheflush: page {} evicted, reading from WAL", page_id);
+                    let (page, completion) =
+                        self.read_page_no_cache(page_id as i64, None, false)?;
+
+                    if !completion.succeeded() {
+                        return Ok(CacheFlushStep::Yield(
+                            CacheFlushState::WaitingForRead {
+                                state,
+                                page_id,
+                                page,
+                                completion: completion.clone(),
+                            },
+                            IOCompletions::Single(completion),
+                        ));
+                    }
+
+                    // Sync read completed immediately
+                    trace!(
+                        "cacheflush(page={}, page_type={:?}) [re-read sync]",
+                        page_id,
+                        page.get_contents().page_type().ok()
+                    );
+                    state.collected_pages.push(page);
+                    state.current_idx += 1;
+                }
+            }
+            if Self::should_flush_batch(&state) {
+                self.flush_page_batch(wal, page_sz, &mut state)?;
+            }
+        }
+        // All pages collected and written
+        Ok(CacheFlushStep::Done(state.completions))
+    }
+
+    /// Handle completion of async page read for evicted page.
+    fn cacheflush_handle_read(
+        &self,
+        wal: &Arc<dyn Wal>,
+        page_sz: PageSize,
+        mut state: CollectingState,
+        page_id: usize,
+        page: PageRef,
+        completion: Completion,
+    ) -> Result<CacheFlushStep> {
+        if !completion.succeeded() {
+            return Ok(CacheFlushStep::Yield(
+                CacheFlushState::WaitingForRead {
+                    state,
+                    page_id,
+                    page,
+                    completion: completion.clone(),
+                },
+                IOCompletions::Single(completion),
+            ));
+        }
+        trace!(
+            "cacheflush(page={}, page_type={:?}) [re-read complete]",
+            page_id,
+            page.get_contents().page_type().ok()
+        );
+        state.collected_pages.push(page);
+        state.current_idx += 1;
+        if Self::should_flush_batch(&state) {
+            self.flush_page_batch(wal, page_sz, &mut state)?;
+        }
+
+        Ok(CacheFlushStep::Continue(CacheFlushState::Collecting(state)))
+    }
+
+    #[inline]
+    fn should_flush_batch(state: &CollectingState) -> bool {
+        let at_capacity = state.collected_pages.len() == IOV_MAX;
+        let at_end = state.current_idx >= state.dirty_ids.len();
+        !state.collected_pages.is_empty() && (at_capacity || at_end)
+    }
+
+    /// Writes accumulated pages to WAL as a single vectored append.
+    #[inline]
+    fn flush_page_batch(
+        &self,
+        wal: &Arc<dyn Wal>,
+        page_sz: PageSize,
+        state: &mut CollectingState,
+    ) -> Result<()> {
+        let pages = std::mem::take(&mut state.collected_pages);
+        // Mark pages as write-pending to detect concurrent modifications
+        for page in &pages {
+            page.set_write_pending();
+        }
+        match wal.append_frames_vectored(pages, page_sz) {
+            Ok(completion) => {
+                state.completions.push(completion);
+                Ok(())
+            }
+            Err(e) => {
+                self.io.cancel(&state.completions)?;
+                self.io.drain()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Attempt to spill dirty pages from the cache to make room for new pages.
+    /// This is called when the cache reaches its spill threshold.
+    ///
+    /// For databases with a WAL: write only spillable dirty pages to WAL,
+    /// then mark them as spilled so they can be evicted even while dirty.
+    /// For ephemeral tables: writes pages directly to the temp database file.
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn try_spill_dirty_pages(&self) -> Result<IOResult<bool>> {
+        let state = self.spill_state.read().clone();
+        match state {
+            SpillState::Idle => {
+                // Check if spilling is needed
+                let spill_result = {
+                    let cache = self.page_cache.read();
+                    cache.check_spill(IOV_MAX)
+                };
+                match spill_result {
+                    SpillResult::NotNeeded | SpillResult::Disabled => {
+                        return Ok(IOResult::Done(false));
+                    }
+                    SpillResult::CacheFull => {
+                        tracing::debug!("try_spill_dirty_pages: cache full, no spillable pages");
+                        return Ok(IOResult::Done(false));
+                    }
+                    SpillResult::PagesToSpill(pages) => {
+                        if pages.is_empty() {
+                            return Ok(IOResult::Done(false));
+                        }
+                        let page_count = pages.len();
+                        tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
+                        if let Some(wal) = self.wal.as_ref() {
+                            let page_sz = self.get_page_size().unwrap_or_default();
+
+                            // Ensure WAL is initialized. Most of the time this is a no-op.
+                            let prepare = wal.prepare_wal_start(page_sz)?;
+                            if let Some(c) = prepare {
+                                self.io.wait_for_completion(c)?;
+                                let c = wal.prepare_wal_finish(self.get_sync_type())?;
+                                self.io.wait_for_completion(c)?;
+                            }
+
+                            let wal_pages: Vec<PageRef> = pages
+                                .iter()
+                                .map(|p| {
+                                    // Set write_pending on all pages before WAL write so callback can
+                                    // detect mid-write modifications.
+                                    p.set_write_pending();
+                                    p.to_page()
+                                })
+                                .collect();
+                            let c = wal.append_frames_vectored(wal_pages, page_sz)?;
+
+                            if c.succeeded() {
+                                // Synchronous completion, WAL tags already set by callback.
+                                {
+                                    let mut cache = self.page_cache.write();
+                                    for page in &pages {
+                                        if page.has_wal_tag() {
+                                            let key = PageCacheKey::new(page.get().id);
+                                            cache.notify_page_spilled(key);
+                                            page.set_spilled();
+                                        }
+                                    }
+                                }
+                                *self.spill_state.write() = SpillState::Idle;
+                                return Ok(IOResult::Done(true));
+                            }
+                            *self.spill_state.write() = SpillState::WritingToWal {
+                                pages,
+                                completions: vec![c.clone()],
+                            };
+                            io_yield_one!(c);
+                        } else {
+                            let mut group = CompletionGroup::new(|_| {});
+                            // Ephemeral table case: write directly to temp file
+                            for page in &pages {
+                                page.set_write_pending();
+                            }
+                            let completions = self.spill_pages_to_disk(&pages)?;
+                            if completions.is_empty() {
+                                self.finish_ephemeral_spill(&pages);
+                                return Ok(IOResult::Done(true));
+                            }
+                            for completion in &completions {
+                                group.add(completion);
+                            }
+                            *self.spill_state.write() = SpillState::WritingToDisk {
+                                pages,
+                                completions: completions.clone(),
+                            };
+                            io_yield_one!(group.build());
+                        }
+                    }
+                }
+            }
+            SpillState::WritingToWal { pages, completions } => {
+                for c in &completions {
+                    if !c.succeeded() {
+                        io_yield_one!(c.clone());
+                    }
+                }
+                // All I/O complete, pages are now in WAL.
+                // Mark spilled pages so they can be evicted while dirty.
+                // Only do so if page wasn't modified since write started (each page has valid wal_tag).
+                let mut spilled_count = 0;
+                {
+                    let mut cache = self.page_cache.write();
+                    for page in &pages {
+                        if page.has_wal_tag() {
+                            let key = PageCacheKey::new(page.get().id);
+                            cache.notify_page_spilled(key);
+                            page.set_spilled();
+                            spilled_count += 1;
+                        } else {
+                            // Page was modified during write, it will need to be re-spilled
+                            tracing::debug!(
+                                "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
+                                page.get().id
+                            );
+                        }
+                    }
+                }
+                if spilled_count == 0 && !pages.is_empty() {
+                    tracing::warn!(
+                        "try_spill_dirty_pages: no pages marked as spilled out of {}, all were modified during write",
+                        pages.len()
+                    );
+                }
+                *self.spill_state.write() = SpillState::Idle;
+                trace!(
+                    "try_spill_dirty_pages: successfully spilled {} / {} pages to WAL",
+                    spilled_count,
+                    pages.len(),
+                );
+                return Ok(IOResult::Done(true));
+            }
+            SpillState::WritingToDisk { pages, completions } => {
+                let all_done = completions.iter().all(|c| c.succeeded());
+                if !all_done {
+                    for c in &completions {
+                        if !c.succeeded() {
+                            io_yield_one!(c.clone());
+                        }
+                    }
+                }
+                // All I/O complete, finish ephemeral spill
+                self.finish_ephemeral_spill(&pages);
+                *self.spill_state.write() = SpillState::Idle;
+                trace!(
+                    "try_spill_dirty_pages: successfully spilled {} pages to disk",
+                    pages.len()
+                );
+                return Ok(IOResult::Done(true));
+            }
+        }
+    }
+
+    /// Wait for any in-flight spill writes to finish.
+    /// This prevents publishing WAL metadata that references frames that are not yet durable.
+    fn wait_for_spill_completions(&self) -> Result<IOResult<()>> {
+        loop {
+            let state = self.spill_state.read().clone();
+            if matches!(state, SpillState::Idle) {
+                return Ok(IOResult::Done(()));
+            }
+            match self.try_spill_dirty_pages()? {
+                IOResult::Done(_) => continue,
+                IOResult::IO(c) => return Ok(IOResult::IO(c)),
+            }
+        }
+    }
+
+    /// Finish a spill operation for ephemeral tables
+    fn finish_ephemeral_spill(&self, pages: &[PinGuard]) {
+        for page in pages {
+            let tag = page.get().wal_tag.load(Ordering::Acquire);
+            // wal tag is set to TAG_UNSET when adding to dirty_pages, meaning that this
+            // page was dirtied after the spill started, so we don't clear the dirty flag in that case
+            if tag != TAG_UNSET {
+                page.clear_dirty();
+            }
+        }
+    }
+    /// Write a set of pages directly to the database file (for ephemeral tables without WAL).
+    /// This is used by try_spill_dirty_pages for ephemeral tables/indexes.
+    fn spill_pages_to_disk(&self, pages: &[PinGuard]) -> Result<Vec<Completion>> {
+        let mut completions: Vec<Completion> = Vec::with_capacity(pages.len());
+        for page in pages {
+            match begin_write_btree_page(self, &page.to_page()) {
                 Ok(c) => completions.push(c),
                 Err(e) => {
-                    tracing::error!("cacheflush: error appending frames: {e}");
                     self.io.cancel(&completions)?;
                     self.io.drain()?;
                     return Err(e);
                 }
             }
         }
+
         Ok(completions)
+    }
+
+    /// Check if the cache needs spilling and attempt to spill if necessary.
+    /// This should be called before inserting new pages into the cache.
+    pub fn ensure_cache_space(&self) -> Result<IOResult<()>> {
+        let needs_spill = {
+            let cache = self.page_cache.read();
+            cache.needs_spill()
+        };
+
+        if needs_spill {
+            match self.try_spill_dirty_pages()? {
+                IOResult::Done(spilled) => {
+                    if spilled {
+                        // After spilling, try to evict clean pages to make room in the cache
+                        let mut cache = self.page_cache.write();
+                        if let Err(e) = cache.make_room_for(1) {
+                            // Cache is completely full with unevictable pages
+                            tracing::error!(
+                                "ensure_cache_space: {e} cache full, could not make room"
+                            );
+                            return Err(LimboError::CacheError(CacheError::Full));
+                        }
+                    }
+                }
+                IOResult::IO(completion) => {
+                    return Ok(IOResult::IO(completion));
+                }
+            }
+        }
+        Ok(IOResult::Done(()))
     }
 
     /// Flush all dirty pages to disk.
@@ -1790,42 +3130,54 @@ impl Pager {
     pub fn commit_dirty_pages(
         &self,
         wal_auto_checkpoint_disabled: bool,
-        sync_mode: crate::SyncMode,
+        sync_mode: SyncMode,
         data_sync_retry: bool,
-    ) -> Result<IOResult<PagerCommitResult>> {
-        match self.commit_dirty_pages_inner(
-            wal_auto_checkpoint_disabled,
-            sync_mode,
-            data_sync_retry,
-        ) {
-            r @ (Ok(IOResult::Done(..)) | Err(..)) => {
-                self.commit_info.write().state = CommitState::PrepareWal;
-                r
+    ) -> Result<IOResult<()>> {
+        {
+            let mut commit_info = self.commit_info.write();
+            if commit_info.state == CommitState::PrepareWal {
+                commit_info.reset();
             }
-            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
         }
+
+        // Wait for spill writes before publishing frames
+        if let IOResult::IO(c) = self.wait_for_spill_completions()? {
+            return Ok(IOResult::IO(c));
+        }
+
+        let result =
+            self.commit_dirty_pages_inner(wal_auto_checkpoint_disabled, sync_mode, data_sync_retry);
+        if result.is_err() {
+            self.commit_info.write().reset();
+        }
+        result
+    }
+
+    pub fn commit_dirty_pages_end(&self) {
+        self.commit_info.write().reset();
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn commit_dirty_pages_inner(
         &self,
         wal_auto_checkpoint_disabled: bool,
-        sync_mode: crate::SyncMode,
+        sync_mode: SyncMode,
         data_sync_retry: bool,
-    ) -> Result<IOResult<PagerCommitResult>> {
+    ) -> Result<IOResult<()>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
-                "commit_dirty_pages() called on database without WAL".to_string(),
+                "commit_dirty_pages() called without WAL".into(),
             ));
         };
 
         loop {
             let state = self.commit_info.read().state;
             trace!(?state);
+
             match state {
                 CommitState::PrepareWal => {
                     let page_sz = self.get_page_size_unchecked();
-                    let c = wal.borrow_mut().prepare_wal_start(page_sz)?;
+                    let c = wal.prepare_wal_start(page_sz)?;
                     let Some(c) = c else {
                         self.commit_info.write().state = CommitState::GetDbSize;
                         continue;
@@ -1836,214 +3188,260 @@ impl Pager {
                     }
                 }
                 CommitState::PrepareWalSync => {
-                    let c = wal.borrow_mut().prepare_wal_finish()?;
+                    let c = wal.prepare_wal_finish(self.get_sync_type())?;
                     self.commit_info.write().state = CommitState::GetDbSize;
                     if !c.succeeded() {
                         io_yield_one!(c);
                     }
                 }
                 CommitState::GetDbSize => {
-                    let db_size = return_if_io!(self.with_header(|header| header.database_size));
-                    self.commit_info.write().state = CommitState::PrepareFrames {
+                    let db_size = return_if_io!(self.with_header(|h| h.database_size));
+                    self.commit_info.write().state = CommitState::ScanAndIssueReads {
                         db_size: db_size.get(),
                     };
                 }
-                CommitState::PrepareFrames { db_size } => {
-                    let now = self.io.now();
-                    self.commit_info.write().time = now;
+                CommitState::ScanAndIssueReads { db_size } => {
+                    let mut commit_info = self.commit_info.write();
+                    let dirty_pages = self.dirty_pages.read();
 
-                    let dirty_ids: Vec<usize> = self.dirty_pages.read().iter().copied().collect();
-                    if dirty_ids.is_empty() {
-                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
+                    if dirty_pages.is_empty() {
+                        return Ok(IOResult::Done(()));
                     }
-
-                    let mut completions = Vec::new();
-                    {
-                        let mut commit_info = self.commit_info.write();
-                        commit_info.completions.clear();
-                    }
-                    let page_sz = self.get_page_size_unchecked();
-                    let mut pages: Vec<PageRef> = Vec::with_capacity(dirty_ids.len().min(IOV_MAX));
-                    let total = dirty_ids.len();
+                    commit_info.initialize(dirty_pages.len() as usize);
                     let mut cache = self.page_cache.write();
-                    for (i, page_id) in dirty_ids.into_iter().enumerate() {
-                        let page = {
-                            let page_key = PageCacheKey::new(page_id);
-                            let page = cache.get(&page_key)?.expect(
-                                "dirty list contained a page that cache dropped (page={page_id})",
-                            );
-                            trace!(
-                                "commit_dirty_pages(page={}, page_type={:?})",
-                                page_id,
-                                page.get_contents().maybe_page_type()
-                            );
-                            page
-                        };
-                        pages.push(page);
 
-                        let end_of_chunk = pages.len() == IOV_MAX || i == total - 1;
-                        if end_of_chunk {
-                            let commit_flag = if i == total - 1 {
-                                // Only the commit frame (final) frame carries the db_size
-                                Some(db_size)
-                            } else {
-                                None
-                            };
-                            let r = wal.borrow_mut().append_frames_vectored(
-                                std::mem::take(&mut pages),
-                                page_sz,
-                                commit_flag,
-                            );
-                            match r {
-                                Ok(c) => completions.push(c),
-                                Err(e) => {
-                                    self.io.cancel(&completions)?;
-                                    return Err(e);
-                                }
-                            }
-                        }
-                    }
-                    self.dirty_pages.write().clear();
-                    // Nothing to append
-                    if completions.is_empty() {
-                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
-                    } else {
-                        // Skip sync if synchronous mode is OFF
-                        if sync_mode == crate::SyncMode::Off {
-                            if wal_auto_checkpoint_disabled || !wal.borrow().should_checkpoint() {
-                                let mut commit_info = self.commit_info.write();
-                                commit_info.completions = completions;
-                                commit_info.result = Some(PagerCommitResult::WalWritten);
-                                commit_info.state = CommitState::Done;
-                                continue;
-                            }
-                            {
-                                let mut commit_info = self.commit_info.write();
-                                commit_info.completions = completions;
-                                commit_info.state = CommitState::Checkpoint;
-                            }
+                    for page_id in dirty_pages.iter() {
+                        let page_id = page_id as usize;
+                        let page_key = PageCacheKey::new(page_id);
+                        if cache.peek(&page_key, false).is_some() {
+                            commit_info.page_sources.push(PageSource::Cached(page_id));
                         } else {
-                            let mut commit_info = self.commit_info.write();
-                            commit_info.completions = completions;
-                            commit_info.state = CommitState::SyncWal;
-                        }
-                    }
-                }
-                CommitState::SyncWal => {
-                    let sync_result = wal.borrow_mut().sync();
-                    let c = match sync_result {
-                        Ok(c) => c,
-                        Err(e) if !data_sync_retry => {
-                            panic!("fsync error (data_sync_retry=off): {e:?}");
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    self.commit_info.write().completions.push(c);
-                    if wal_auto_checkpoint_disabled || !wal.borrow().should_checkpoint() {
-                        let mut commit_info = self.commit_info.write();
-                        commit_info.result = Some(PagerCommitResult::WalWritten);
-                        commit_info.state = CommitState::Done;
-                        continue;
-                    }
-                    self.commit_info.write().state = CommitState::Checkpoint;
-                }
-                CommitState::Checkpoint => {
-                    match self.checkpoint() {
-                        Err(LimboError::Busy) => {
-                            // Auto-checkpoint during commit uses Passive mode, which can return
-                            // Busy if either:
-                            // 1. Another connection is already checkpointing (checkpoint_lock held)
-                            // 2. A reader is active on read slot 0 (read_locks[0] held)
-                            // In either case, skip the checkpoint and complete the commit. The WAL
-                            // frames are already written, so the commit succeeds. Checkpoint will
-                            // happen later when conditions allow.
-                            tracing::debug!("Auto-checkpoint skipped due to busy (lock conflict)");
-                            let mut commit_info = self.commit_info.write();
-                            commit_info.result = Some(PagerCommitResult::WalWritten);
-                            commit_info.state = CommitState::Done;
-                        }
-                        Err(e) => return Err(e),
-                        Ok(IOResult::IO(cmp)) => {
-                            let completion = {
-                                let mut commit_info = self.commit_info.write();
-                                match cmp {
-                                    IOCompletions::Single(c) => {
-                                        commit_info.completions.push(c);
-                                    }
-                                }
-                                let mut group = CompletionGroup::new(|_| {});
-                                for c in commit_info.completions.drain(..) {
-                                    group.add(&c);
-                                }
-                                group.build()
-                            };
-                            // TODO: remove serialization of checkpoint path
-                            io_yield_one!(completion);
-                        }
-                        Ok(IOResult::Done(res)) => {
-                            let mut commit_info = self.commit_info.write();
-                            commit_info.result = Some(PagerCommitResult::Checkpointed(res));
-                            // Skip sync if synchronous mode is OFF
-                            if sync_mode == crate::SyncMode::Off {
-                                commit_info.state = CommitState::Done;
-                            } else {
-                                commit_info.state = CommitState::SyncDbFile;
+                            let (page, completion) =
+                                self.read_page_no_cache(page_id as i64, None, false)?;
+                            commit_info.page_sources.push(PageSource::Evicted(page));
+                            if !completion.finished() {
+                                commit_info.completions.push(completion);
                             }
                         }
                     }
+                    drop(cache);
+                    drop(dirty_pages);
+                    if !commit_info.completions.is_empty() {
+                        commit_info.state = CommitState::WaitBatchedReads { db_size };
+                        drop(commit_info);
+                        io_yield_one!(self.build_commit_completion_group());
+                    }
+                    commit_info.state = CommitState::PrepareFrames { db_size };
                 }
-                CommitState::SyncDbFile => {
-                    let sync_result =
-                        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone());
-                    self.commit_info
-                        .write()
+                CommitState::WaitBatchedReads { db_size } => {
+                    let mut commit_info = self.commit_info.write();
+                    // Wait for all batched reads to complete
+                    let all_done = commit_info.completions.iter().all(|c| c.finished());
+                    if !all_done {
+                        let mut group = CompletionGroup::new(|_| {});
+                        for c in commit_info.completions.iter().filter(|c| !c.finished()) {
+                            group.add(c);
+                        }
+                        io_yield_one!(group.build());
+                    }
+                    // Check for any read errors
+                    let failed = commit_info
                         .completions
-                        .push(match sync_result {
-                            Ok(c) => c,
-                            Err(e) if !data_sync_retry => {
-                                panic!("fsync error on database file (data_sync_retry=off): {e:?}");
-                            }
-                            Err(e) => return Err(e),
-                        });
-                    self.commit_info.write().state = CommitState::Done;
-                }
-                CommitState::Done => {
-                    tracing::debug!(
-                        "total time flushing cache: {} ms",
-                        self.io
-                            .now()
-                            .to_system_time()
-                            .duration_since(self.commit_info.read().time.to_system_time())
-                            .unwrap()
-                            .as_millis()
-                    );
-                    let (should_finish, result, completion) = {
-                        let mut commit_info = self.commit_info.write();
-                        if commit_info.completions.iter().all(|c| c.succeeded()) {
-                            commit_info.completions.clear();
-                            commit_info.state = CommitState::PrepareWal;
-                            (true, commit_info.result.take(), Completion::new_yield())
-                        } else {
-                            let mut group = CompletionGroup::new(|_| {});
-                            for c in commit_info.completions.drain(..) {
-                                group.add(&c);
-                            }
-                            (false, None, group.build())
-                        }
-                    };
-                    if should_finish {
-                        wal.borrow_mut().finish_append_frames_commit()?;
-                        return Ok(IOResult::Done(result.expect("commit result should be set")));
+                        .iter()
+                        .find(|c| !c.succeeded())
+                        .cloned();
+                    if let Some(failed) = failed {
+                        return Err(std::io::Error::other(format!(
+                            "Page read failed during commit: {:?}",
+                            failed.get_error()
+                        ))
+                        .into());
                     }
-                    io_yield_one!(completion);
+                    // All reads complete and successful, proceed to frame preparation
+                    commit_info.completions.clear();
+                    commit_info.state = CommitState::PrepareFrames { db_size };
                 }
+                CommitState::PrepareFrames { db_size } => {
+                    let page_sz = self.get_page_size_unchecked();
+                    let mut commit_info = self.commit_info.write();
+                    let mut cache = self.page_cache.write();
+
+                    'inner: loop {
+                        let cursor = commit_info.page_source_cursor;
+                        if cursor >= commit_info.page_sources.len() {
+                            break 'inner;
+                        }
+
+                        let total = commit_info.page_sources.len();
+                        let is_last = cursor + 1 >= total;
+                        // Linear consumption, no lookup required
+                        let page = match &commit_info.page_sources[cursor] {
+                            PageSource::Cached(page_id) => {
+                                let page_key = PageCacheKey::new(*page_id);
+                                cache
+                                    .get(&page_key)?
+                                    .expect("page evicted between scan and prepare")
+                            }
+                            PageSource::Evicted(page) => page.clone(),
+                        };
+                        commit_info.page_source_cursor += 1;
+                        commit_info.collected_pages.push(page);
+
+                        if commit_info.collected_pages.len() == IOV_MAX || is_last {
+                            self.prepare_collected_frames(
+                                &mut commit_info,
+                                wal,
+                                page_sz,
+                                db_size,
+                                is_last,
+                            )?;
+                        }
+                    }
+                    drop(cache);
+                    if commit_info.prepared_frames.is_empty() {
+                        turso_assert!(
+                            self.dirty_pages.read().is_empty(),
+                            "dirty pages must be empty if no frames prepared"
+                        );
+                        return Ok(IOResult::Done(()));
+                    }
+                    // Submit all WAL writes
+                    let wal_file = wal.wal_file()?;
+                    let mut batch = WriteBatch::new(wal_file);
+                    for prepared in &commit_info.prepared_frames {
+                        batch.writev(prepared.offset, &prepared.bufs);
+                    }
+                    commit_info.completions = batch.submit()?;
+                    commit_info.state = CommitState::WaitWrites;
+                }
+                CommitState::WaitWrites => {
+                    if !self
+                        .commit_info
+                        .read()
+                        .completions
+                        .iter()
+                        .all(|c| c.finished())
+                    {
+                        io_yield_one!(self.build_commit_completion_group());
+                    }
+                    // Check for any write errors
+                    let failed = self
+                        .commit_info
+                        .read()
+                        .completions
+                        .iter()
+                        .find(|c| !c.succeeded())
+                        .cloned();
+
+                    let mut commit_info = self.commit_info.write();
+                    if let Some(failed) = failed {
+                        commit_info.completions.clear();
+                        commit_info.prepared_frames.clear();
+                        return Err(std::io::Error::other(format!(
+                            "WAL write failed: {:?}",
+                            failed.get_error()
+                        ))
+                        .into());
+                    }
+                    commit_info.completions.clear();
+                    // Writes done, submit fsync if needed.
+                    // NORMAL mode skips fsync on WAL commit (but still fsyncs on checkpoint and wal restart).
+                    if sync_mode == SyncMode::Full {
+                        let sync_c = wal.sync(self.get_sync_type())?;
+                        // Reuse the existing Vec instead of allocating a new one
+                        commit_info.completions.push(sync_c);
+                        commit_info.state = CommitState::WaitSync;
+                    } else {
+                        commit_info.state = CommitState::WalCommitDone;
+                    }
+                }
+                // To protect against partial writes, we MUST ensure that all write Completions
+                // finish before submitting the fsync. It is possible that a partial write will
+                // cause an IO backend to resubmit the write (particularly with io_uring) and we
+                // cannot have the fsync submitted before all writes are fully done, even if
+                // they are IO_LINK'd together or we submit the fsync with IO_DRAIN, the only way
+                // to ensure durability in the case of partial writes is to ensure the pwritev
+                // completes before the fsync is submitted.
+                CommitState::WaitSync => {
+                    let sync_c = self.commit_info.read().completions[0].clone();
+                    // Wait for fsync to complete
+                    if !sync_c.finished() {
+                        io_yield_one!(sync_c);
+                    }
+                    // Check for fsync error as we might need to panic on data_sync_retry=off
+                    let mut commit_info = self.commit_info.write();
+                    if !sync_c.succeeded() {
+                        commit_info.completions.clear();
+                        commit_info.prepared_frames.clear();
+
+                        if !data_sync_retry {
+                            panic!(
+                                "fsync error (data_sync_retry=off): {:?}",
+                                sync_c.get_error()
+                            );
+                        }
+                        return Err(std::io::Error::other("WAL fsync failed").into());
+                    }
+                    commit_info.completions.clear();
+                    commit_info.state = CommitState::WalCommitDone;
+                }
+                CommitState::WalCommitDone => {
+                    // all I/O complete, NOW it's safe to advance WAL state
+                    let mut commit_info = self.commit_info.write();
+                    wal.commit_prepared_frames(&commit_info.prepared_frames);
+                    wal.finalize_committed_pages(&commit_info.prepared_frames);
+                    wal.finish_append_frames_commit()?;
+                    self.dirty_pages.write().clear();
+                    commit_info.prepared_frames.clear();
+
+                    let need_checkpoint = !wal_auto_checkpoint_disabled && wal.should_checkpoint();
+                    if need_checkpoint {
+                        commit_info.state = CommitState::AutoCheckpoint;
+                    }
+                    return Ok(IOResult::Done(()));
+                }
+                CommitState::AutoCheckpoint => panic!("checkpoint must be handled externally"),
             }
         }
     }
 
+    /// Prepare collected pages as WAL frames without submitting I/O.
+    fn prepare_collected_frames(
+        &self,
+        commit_info: &mut CommitInfo,
+        wal: &Arc<dyn Wal>,
+        page_sz: PageSize,
+        db_size: u32,
+        is_commit_frame: bool,
+    ) -> Result<()> {
+        let pages = std::mem::take(&mut commit_info.collected_pages);
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let commit_flag = if is_commit_frame { Some(db_size) } else { None };
+        for page in &pages {
+            page.set_write_pending();
+        }
+        // Chain from previous batch if any
+        let prev = commit_info.prepared_frames.last();
+        let prepared = wal.prepare_frames(&pages, page_sz, commit_flag, prev)?;
+        tracing::debug!("prepare_collected_frames: offset={}", prepared.offset);
+        commit_info.prepared_frames.push(prepared);
+        Ok(())
+    }
+
+    fn build_commit_completion_group(&self) -> Completion {
+        let commit_info = self.commit_info.read();
+        let mut group = CompletionGroup::new(|_| {});
+        for c in commit_info.completions.iter() {
+            group.add(c);
+        }
+        group.build()
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
-        let wal = self.wal.as_ref().unwrap().borrow();
+        let wal = self.wal.as_ref().unwrap();
         wal.changed_pages_after(frame_watermark)
     }
 
@@ -2054,7 +3452,6 @@ impl Pager {
                 "wal_get_frame() called on database without WAL".to_string(),
             ));
         };
-        let wal = wal.borrow();
         wal.read_frame_raw(frame_no, frame)
     }
 
@@ -2067,23 +3464,21 @@ impl Pager {
         };
         let (header, raw_page) = parse_wal_frame_header(frame);
 
-        {
-            let mut wal = wal.borrow_mut();
-            wal.write_frame_raw(
-                self.buffer_pool.clone(),
-                frame_no,
-                header.page_number as u64,
-                header.db_size as u64,
-                raw_page,
-            )?;
-            if let Some(page) = self.cache_get(header.page_number as usize)? {
-                let content = page.get_contents();
-                content.as_ptr().copy_from_slice(raw_page);
-                turso_assert!(
-                    page.get().id == header.page_number as usize,
-                    "page has unexpected id"
-                );
-            }
+        wal.write_frame_raw(
+            self.buffer_pool.clone(),
+            frame_no,
+            header.page_number as u64,
+            header.db_size as u64,
+            raw_page,
+            self.get_sync_type(),
+        )?;
+        if let Some(page) = self.cache_get(header.page_number as usize)? {
+            let content = page.get_contents();
+            content.as_ptr().copy_from_slice(raw_page);
+            turso_assert!(
+                page.get().id == header.page_number as usize,
+                "page has unexpected id"
+            );
         }
         if header.page_number == 1 {
             let db_size = self
@@ -2096,13 +3491,20 @@ impl Pager {
             })?;
         }
         if header.is_commit_frame() {
-            for page_id in self.dirty_pages.read().iter() {
-                let page_key = PageCacheKey::new(*page_id);
-                let mut cache = self.page_cache.write();
-                let page = cache.get(&page_key)?.expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
-                page.clear_dirty();
+            let mut dirty_pages = self.dirty_pages.write();
+            tracing::debug!(
+                "wal_callback: commit frame, clearing {} dirty pages",
+                dirty_pages.len()
+            );
+            let mut cache = self.page_cache.write();
+            for page_id in dirty_pages.iter() {
+                let page_key = PageCacheKey::new(page_id as usize);
+                // Page may have been evicted from cache after spilling to WAL
+                if let Some(page) = cache.get(&page_key)? {
+                    page.clear_dirty();
+                }
             }
-            self.dirty_pages.write().clear();
+            dirty_pages.clear();
         }
         Ok(WalFrameInfo {
             page_no: header.page_number,
@@ -2110,38 +3512,250 @@ impl Pager {
         })
     }
 
+    pub fn is_checkpointing(&self) -> bool {
+        self.checkpoint_state.read().phase != CheckpointPhase::NotCheckpointing
+    }
+
+    fn reset_checkpoint_state(&self) {
+        self.clear_checkpoint_state();
+        self.commit_info.write().state = CommitState::PrepareWal;
+    }
+
+    /// Reset checkpoint state machine to initial state.
+    /// Use this to clean up after a failed explicit checkpoint (PRAGMA wal_checkpoint).
+    pub fn clear_checkpoint_state(&self) {
+        let mut state = self.checkpoint_state.write();
+        state.phase = CheckpointPhase::NotCheckpointing;
+        state.result = None;
+        state.mode = None;
+    }
+
+    /// Clean up after a auto-checkpoint failure.
+    /// Auto-checkpoint executed outside of the main transaction - so WAL transaction was already finalized
+    pub fn cleanup_after_auto_checkpoint_failure(&self) {
+        self.reset_checkpoint_state();
+        if let Some(wal) = self.wal.as_ref() {
+            wal.abort_checkpoint();
+        }
+    }
+
     #[instrument(skip_all, level = Level::DEBUG, name = "pager_checkpoint",)]
-    pub fn checkpoint(&self) -> Result<IOResult<CheckpointResult>> {
+    /// Checkpoint the WAL to the database file (if needed).
+    /// Args:
+    /// - mode: The checkpoint mode to use (PASSIVE, FULL, RESTART, TRUNCATE)
+    /// - sync_mode: The fsync mode to use (OFF, NORMAL, FULL)
+    /// - clear_page_cache: Whether to clear the page cache after checkpointing
+    pub fn checkpoint(
+        &self,
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+    ) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "checkpoint() called on database without WAL".to_string(),
             ));
         };
         loop {
-            let state = std::mem::take(&mut *self.checkpoint_state.write());
-            trace!(?state);
-            match state {
-                CheckpointState::Checkpoint => {
-                    let res = return_if_io!(wal.borrow_mut().checkpoint(
-                        self,
-                        CheckpointMode::Passive {
-                            upper_bound_inclusive: None
-                        }
-                    ));
-                    *self.checkpoint_state.write() = CheckpointState::SyncDbFile { res };
+            // Clone the phase to check what state we're in, but keep result in place
+            // This is important because we need to be careful not to e.g. clone and drop the checkpoint result which
+            // causes a drop of CheckpointLocks prematurely and results in a panic.
+            let phase = self.checkpoint_state.read().phase.clone();
+            match phase {
+                CheckpointPhase::NotCheckpointing => {
+                    let mut state = self.checkpoint_state.write();
+                    state.phase = CheckpointPhase::Checkpoint {
+                        mode,
+                        sync_mode,
+                        clear_page_cache,
+                    };
+                    state.mode = Some(mode);
                 }
-                CheckpointState::SyncDbFile { res } => {
-                    let c =
-                        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone())?;
-                    *self.checkpoint_state.write() = CheckpointState::CheckpointDone { res };
+                CheckpointPhase::Checkpoint {
+                    mode,
+                    sync_mode,
+                    clear_page_cache,
+                } => {
+                    let res = return_if_io!(wal.checkpoint(self, mode));
+                    let mut state = self.checkpoint_state.write();
+                    if matches!(mode, CheckpointMode::Truncate { .. })
+                        // `should_truncate` will be true for successful truncate checkpoint
+                        && res.should_truncate()
+                    {
+                        state.phase = CheckpointPhase::TruncateDbFile {
+                            sync_mode,
+                            clear_page_cache,
+                            page1_invalidated: false,
+                        };
+                    } else if res.wal_checkpoint_backfilled == 0
+                        || sync_mode == crate::SyncMode::Off
+                    {
+                        state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                    } else {
+                        state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
+                    }
+                    state.result = Some(res);
+                }
+                CheckpointPhase::TruncateDbFile {
+                    sync_mode,
+                    clear_page_cache,
+                    page1_invalidated,
+                } => {
+                    let should_skip_truncate_db_file = {
+                        let state = self.checkpoint_state.read();
+                        turso_assert!(
+                            matches!(state.mode, Some(CheckpointMode::Truncate { .. })),
+                            "mode should be truncate in CheckpointPhase::TruncateDbFile"
+                        );
+                        let result = state.result.as_ref().expect("result should be set");
+                        // Skip if we already sent truncate
+                        result.db_truncate_sent
+                    };
+
+                    if should_skip_truncate_db_file {
+                        let mut state = self.checkpoint_state.write();
+                        if sync_mode == crate::SyncMode::Off {
+                            // Skip DB sync, proceed to WAL truncation
+                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
+                        } else {
+                            // Sync DB first, then SyncDbFile will transition to TruncateWalFile
+                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
+                        }
+                        continue;
+                    }
+                    // Invalidate page 1 (header) in cache before reading - checkpoint potentially wrote pages
+                    // directly to DB file from the WAL, so the checkpointer connections' page 1 may have stale database_size.
+                    if !page1_invalidated {
+                        let page1_key = PageCacheKey::new(DatabaseHeader::PAGE_ID);
+                        self.page_cache.write().delete(page1_key)?;
+                        let mut state = self.checkpoint_state.write();
+                        state.phase = CheckpointPhase::TruncateDbFile {
+                            sync_mode,
+                            clear_page_cache,
+                            page1_invalidated: true,
+                        };
+                    }
+
+                    // Truncate the database file unless already at correct size
+                    let db_size =
+                        return_if_io!(self.with_header(|header| header.database_size)).get();
+                    let page_size = self.get_page_size().unwrap_or_default();
+                    let expected = (db_size * page_size.get()) as u64;
+                    if expected >= self.db_file.size()? {
+                        // No DB truncation needed, move to next phase
+                        let mut state = self.checkpoint_state.write();
+                        if sync_mode == crate::SyncMode::Off {
+                            // Skip DB sync, proceed to WAL truncation
+                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
+                        } else {
+                            // Sync DB first, then SyncDbFile will transition to TruncateWalFile
+                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
+                        }
+                        continue;
+                    }
+                    let c = self.db_file.truncate(
+                        expected as usize,
+                        Completion::new_trunc(move |_| {
+                            tracing::trace!(
+                                "Database file truncated to expected size: {} bytes",
+                                expected
+                            );
+                        }),
+                    )?;
+                    self.checkpoint_state
+                        .write()
+                        .result
+                        .as_mut()
+                        .expect("result should be set")
+                        .db_truncate_sent = true;
                     io_yield_one!(c);
                 }
-                CheckpointState::CheckpointDone { res } => {
-                    turso_assert!(
-                        !self.syncing.load(Ordering::SeqCst),
-                        "syncing should be done"
-                    );
-                    *self.checkpoint_state.write() = CheckpointState::Checkpoint;
+                CheckpointPhase::SyncDbFile { clear_page_cache } => {
+                    let need_sync_db_file = {
+                        let state = self.checkpoint_state.read();
+                        let result = state.result.as_ref().expect("result should be set");
+                        !result.db_sync_sent
+                    };
+
+                    if !need_sync_db_file {
+                        turso_assert!(
+                            !self.syncing.load(Ordering::SeqCst),
+                            "syncing should be done"
+                        );
+                        // After DB is synced, truncate WAL if in TRUNCATE mode
+                        let is_truncate_mode = {
+                            let state = self.checkpoint_state.read();
+                            matches!(state.mode, Some(CheckpointMode::Truncate { .. }))
+                        };
+                        if is_truncate_mode {
+                            self.checkpoint_state.write().phase =
+                                CheckpointPhase::TruncateWalFile { clear_page_cache };
+                        } else {
+                            self.checkpoint_state.write().phase =
+                                CheckpointPhase::Finalize { clear_page_cache };
+                        }
+                        continue;
+                    }
+
+                    let c = sqlite3_ondisk::begin_sync(
+                        self.db_file.as_ref(),
+                        self.syncing.clone(),
+                        self.get_sync_type(),
+                    )?;
+                    self.checkpoint_state
+                        .write()
+                        .result
+                        .as_mut()
+                        .expect("result should be set")
+                        .db_sync_sent = true;
+                    io_yield_one!(c);
+                }
+                CheckpointPhase::TruncateWalFile { clear_page_cache } => {
+                    // Truncate WAL file after DB is safely synced - this ensures data durability.
+                    // If crash occurred after WAL truncate but before DB sync, data would be lost.
+                    let need_wal_truncate = {
+                        let state = self.checkpoint_state.read();
+                        turso_assert!(
+                            matches!(state.mode, Some(CheckpointMode::Truncate { .. })),
+                            "mode should be truncate in CheckpointPhase::TruncateWalFile"
+                        );
+                        let result = state.result.as_ref().expect("result should be set");
+                        !result.wal_truncate_sent || !result.wal_sync_sent
+                    };
+
+                    if !need_wal_truncate {
+                        self.checkpoint_state.write().phase =
+                            CheckpointPhase::Finalize { clear_page_cache };
+                        continue;
+                    }
+
+                    // Call WAL truncate
+                    return_if_io!(wal.truncate_wal(
+                        self.checkpoint_state
+                            .write()
+                            .result
+                            .as_mut()
+                            .expect("result should be set"),
+                        self.get_sync_type(),
+                    ));
+                }
+                CheckpointPhase::Finalize { clear_page_cache } => {
+                    let mut state = self.checkpoint_state.write();
+                    let mut res = state.result.take().expect("result should be set");
+                    state.phase = CheckpointPhase::NotCheckpointing;
+                    state.mode = None;
+
+                    // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
+                    if clear_page_cache {
+                        self.page_cache.write().clear(false).map_err(|e| {
+                            res.release_guard();
+                            LimboError::InternalError(format!("Failed to clear page cache: {e:?}"))
+                        })?;
+                    }
+
+                    // Release checkpoint guard
+                    res.release_guard();
+
                     return Ok(IOResult::Done(res));
                 }
             }
@@ -2152,10 +3766,10 @@ impl Pager {
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
     pub fn clear_page_cache(&self, clear_dirty: bool) {
-        let dirty_pages = self.dirty_pages.read();
+        let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {
-            let page_key = PageCacheKey::new(*page_id);
+            let page_key = PageCacheKey::new(page_id as usize);
             if let Some(page) = cache.get(&page_key).unwrap_or(None) {
                 page.clear_dirty();
             }
@@ -2163,6 +3777,10 @@ impl Pager {
         cache
             .clear(clear_dirty)
             .expect("Failed to clear page cache");
+        if clear_dirty {
+            drop(dirty_pages);
+            self.dirty_pages.write().clear();
+        }
     }
 
     /// Checkpoint in Truncate mode and delete the WAL file. This method is _only_ to be called
@@ -2175,7 +3793,11 @@ impl Pager {
     /// connection being closed is the last open connection to the database),
     /// then SQLite performs a [checkpoint] before closing the connection and
     /// deletes the WAL file.
-    pub fn checkpoint_shutdown(&self, wal_auto_checkpoint_disabled: bool) -> Result<()> {
+    pub fn checkpoint_shutdown(
+        &self,
+        wal_auto_checkpoint_disabled: bool,
+        sync_mode: crate::SyncMode,
+    ) -> Result<()> {
         let mut attempts = 0;
         {
             let Some(wal) = self.wal.as_ref() else {
@@ -2183,15 +3805,17 @@ impl Pager {
                     "checkpoint_shutdown() called on database without WAL".to_string(),
                 ));
             };
-            let mut wal = wal.borrow_mut();
             // fsync the wal syncronously before beginning checkpoint
-            let c = wal.sync()?;
+            let c = wal.sync(self.get_sync_type())?;
             self.io.wait_for_completion(c)?;
         }
         if !wal_auto_checkpoint_disabled {
-            while let Err(LimboError::Busy) = self.wal_checkpoint(CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            }) {
+            while let Err(LimboError::Busy) = self.blocking_checkpoint(
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+                sync_mode,
+            ) {
                 if attempts == 3 {
                     // don't return error on `close` if we are unable to checkpoint, we can silently fail
                     tracing::warn!(
@@ -2207,76 +3831,16 @@ impl Pager {
         Ok(())
     }
 
+    /// Perform a blocking checkpoint with the specified mode.
+    /// This is a convenience wrapper around `checkpoint()` that blocks until completion.
+    /// Explicit checkpoints clear the page cache after completion.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_checkpoint_start(&self, mode: CheckpointMode) -> Result<IOResult<CheckpointResult>> {
-        let Some(wal) = self.wal.as_ref() else {
-            return Err(LimboError::InternalError(
-                "wal_checkpoint() called on database without WAL".to_string(),
-            ));
-        };
-
-        wal.borrow_mut().checkpoint(self, mode)
-    }
-
-    pub fn wal_checkpoint_finish(
+    pub fn blocking_checkpoint(
         &self,
-        checkpoint_result: &mut CheckpointResult,
-    ) -> Result<IOResult<()>> {
-        'ensure_sync: {
-            if checkpoint_result.num_backfilled != 0 {
-                if checkpoint_result.everything_backfilled() {
-                    let db_size = self
-                        .io
-                        .block(|| self.with_header(|header| header.database_size))?
-                        .get();
-                    let page_size = self.get_page_size().unwrap_or_default();
-                    let expected = (db_size * page_size.get()) as u64;
-                    if expected < self.db_file.size()? {
-                        if !checkpoint_result.db_truncate_sent {
-                            let c = self.db_file.truncate(
-                                expected as usize,
-                                Completion::new_trunc(move |_| {
-                                    tracing::trace!(
-                                        "Database file truncated to expected size: {} bytes",
-                                        expected
-                                    );
-                                }),
-                            )?;
-                            checkpoint_result.db_truncate_sent = true;
-                            io_yield_one!(c);
-                        }
-                        if !checkpoint_result.db_sync_sent {
-                            let c = self.db_file.sync(Completion::new_sync(move |_| {
-                                tracing::trace!("Database file syncd after truncation");
-                            }))?;
-                            checkpoint_result.db_sync_sent = true;
-                            io_yield_one!(c);
-                        }
-                        break 'ensure_sync;
-                    }
-                }
-                if !checkpoint_result.db_sync_sent {
-                    // if we backfilled at all, we have to sync the db-file here
-                    let c = self.db_file.sync(Completion::new_sync(move |_| {}))?;
-                    checkpoint_result.db_sync_sent = true;
-                    io_yield_one!(c);
-                }
-            }
-        }
-        checkpoint_result.release_guard();
-        // TODO: only clear cache of things that are really invalidated
-        self.page_cache
-            .write()
-            .clear(false)
-            .map_err(|e| LimboError::InternalError(format!("Failed to clear page cache: {e:?}")))?;
-        Ok(IOResult::Done(()))
-    }
-
-    #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
-        let mut result = self.io.block(|| self.wal_checkpoint_start(mode))?;
-        self.io.block(|| self.wal_checkpoint_finish(&mut result))?;
-        Ok(result)
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+    ) -> Result<CheckpointResult> {
+        self.io.block(|| self.checkpoint(mode, sync_mode, true))
     }
 
     pub fn freepage_list(&self) -> u32 {
@@ -2290,12 +3854,8 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn free_page(&self, mut page: Option<PageRef>, page_id: usize) -> Result<IOResult<()>> {
         tracing::trace!("free_page(page_id={})", page_id);
-        const TRUNK_PAGE_HEADER_SIZE: usize = 8;
-        const LEAF_ENTRY_SIZE: usize = 4;
+        // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
-
-        const TRUNK_PAGE_NEXT_PAGE_OFFSET: usize = 0; // Offset to next trunk page pointer
-        const TRUNK_PAGE_LEAF_COUNT_OFFSET: usize = 4; // Offset to leaf count
 
         let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
         let header = header_ref.borrow_mut();
@@ -2311,7 +3871,7 @@ impl Pager {
                         )));
                     }
 
-                    let (page, _c) = match page.take() {
+                    let (page, c) = match page.take() {
                         Some(page) => {
                             assert_eq!(
                                 page.get().id,
@@ -2326,19 +3886,24 @@ impl Pager {
                             }
                             (page, None)
                         }
-                        None => {
-                            let (page, c) = self.read_page(page_id as i64)?;
-                            (page, Some(c))
-                        }
+                        None => self.read_page(page_id as i64)?,
                     };
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
+                    // Pin page to prevent eviction while stored in state machine
+                    page.pin();
+
                     if trunk_page_id != 0 {
                         *state = FreePageState::AddToTrunk { page };
                     } else {
                         *state = FreePageState::NewTrunk { page };
+                    }
+                    if let Some(c) = c {
+                        if !c.succeeded() {
+                            io_yield_one!(c);
+                        }
                     }
                 }
                 FreePageState::AddToTrunk { page } => {
@@ -2353,11 +3918,10 @@ impl Pager {
 
                     let trunk_page_contents = trunk_page.get_contents();
                     let number_of_leaf_pages =
-                        trunk_page_contents.read_u32_no_offset(TRUNK_PAGE_LEAF_COUNT_OFFSET);
+                        trunk_page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
 
-                    // Reserve 2 slots for the trunk page header which is 8 bytes or 2*LEAF_ENTRY_SIZE
                     let max_free_list_entries =
-                        (header.usable_space() / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
+                        (header.usable_space() / FREELIST_LEAF_PTR_SIZE) - RESERVED_SLOTS;
 
                     if number_of_leaf_pages < max_free_list_entries as u32 {
                         turso_assert!(
@@ -2367,17 +3931,20 @@ impl Pager {
                         self.add_dirty(&trunk_page)?;
 
                         trunk_page_contents.write_u32_no_offset(
-                            TRUNK_PAGE_LEAF_COUNT_OFFSET,
+                            FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                             number_of_leaf_pages + 1,
                         );
                         trunk_page_contents.write_u32_no_offset(
-                            TRUNK_PAGE_HEADER_SIZE
-                                + (number_of_leaf_pages as usize * LEAF_ENTRY_SIZE),
+                            FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR
+                                + (number_of_leaf_pages as usize * FREELIST_LEAF_PTR_SIZE),
                             page_id as u32,
                         );
 
+                        // Unpin page before finishing - it's added to freelist
+                        page.unpin();
                         break;
                     }
+                    // page remains pinned as it transitions to NewTrunk state
                     *state = FreePageState::NewTrunk { page: page.clone() };
                 }
                 FreePageState::NewTrunk { page } => {
@@ -2388,13 +3955,16 @@ impl Pager {
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
-                    let contents = page.get().contents.as_mut().unwrap();
+                    let contents = page.get_contents();
                     // Point to previous trunk
-                    contents.write_u32_no_offset(TRUNK_PAGE_NEXT_PAGE_OFFSET, trunk_page_id);
+                    contents
+                        .write_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, trunk_page_id);
                     // Zero leaf count
-                    contents.write_u32_no_offset(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
+                    contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, 0);
                     // Update page 1 to point to new trunk
                     header.freelist_trunk_page = (page_id as u32).into();
+                    // Unpin page before finishing - it's now a trunk page
+                    page.unpin();
                     break;
                 }
             }
@@ -2418,12 +3988,12 @@ impl Pager {
                 assert_eq!(default_header.database_size.get(), 0);
                 default_header.database_size = 1.into();
 
-                // based on the IOContext set, we will set the reserved space bytes as required by
-                // either the encryption or checksum, or None if they are not set.
-                let reserved_space_bytes = {
+                // Use cached reserved_space if set (e.g., by sync engine before page allocation),
+                // otherwise fall back to IOContext's encryption/checksum requirements.
+                let reserved_space_bytes = self.get_reserved_space().unwrap_or_else(|| {
                     let io_ctx = self.io_ctx.read();
                     io_ctx.get_reserved_space_bytes()
-                };
+                });
                 default_header.reserved_space = reserved_space_bytes;
                 self.set_reserved_space(reserved_space_bytes);
 
@@ -2439,7 +4009,7 @@ impl Pager {
 
                 self.buffer_pool
                     .finalize_with_page_size(default_header.page_size.get() as usize)?;
-                let page = allocate_new_page(1, &self.buffer_pool, 0);
+                let page = allocate_new_page(1, &self.buffer_pool);
 
                 let contents = page.get_contents();
                 contents.write_database_header(&default_header);
@@ -2458,6 +4028,8 @@ impl Pager {
                 );
                 let c = begin_write_btree_page(self, &page1)?;
 
+                // Pin page1 to prevent eviction while stored in state machine
+                page1.pin();
                 *self.allocate_page1_state.write() = AllocatePage1State::Writing { page: page1 };
                 io_yield_one!(c);
             }
@@ -2471,6 +4043,7 @@ impl Pager {
                 })?;
                 // After we wrote the header page, we may now set this None, to signify we initialized
                 self.init_page_1.store(None);
+                page.unpin();
                 *self.allocate_page1_state.write() = AllocatePage1State::Done;
                 Ok(IOResult::Done(page))
             }
@@ -2492,13 +4065,11 @@ impl Pager {
     ///        SQLite's allocate_page() equivalent has a parameter 'nearby' which is a hint about the page number we want to have for the allocated page.
     ///        We should use this parameter to allocate the page in the same way as SQLite does; instead now we just either take the first available freelist page
     ///        or allocate a new page.
-    /// FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
-        const FREELIST_TRUNK_OFFSET_NEXT_TRUNK: usize = 0;
-        const FREELIST_TRUNK_OFFSET_LEAF_COUNT: usize = 4;
-        const FREELIST_TRUNK_OFFSET_FIRST_LEAF: usize = 8;
+        // Ensure cache has room before allocating (we may spill dirty pages first)
+        return_if_io!(self.ensure_cache_space());
 
         let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
         let header = header_ref.borrow_mut();
@@ -2527,7 +4098,7 @@ impl Pager {
                         {
                             // we will allocate a ptrmap page, so increment size
                             new_db_size += 1;
-                            let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
+                            let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
                             self.add_dirty(&page)?;
                             let page_key = PageCacheKey::new(page.get().id as usize);
                             let mut cache = self.page_cache.write();
@@ -2543,18 +4114,14 @@ impl Pager {
                         continue;
                     }
                     let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as i64)?;
-                    *state = AllocatePageState::SearchAvailableFreeListLeaf {
-                        trunk_page,
-                        current_db_size: new_db_size,
-                    };
+                    // Pin trunk_page to prevent eviction while stored in state machine
+                    trunk_page.pin();
+                    *state = AllocatePageState::SearchAvailableFreeListLeaf { trunk_page };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
                 }
-                AllocatePageState::SearchAvailableFreeListLeaf {
-                    trunk_page,
-                    current_db_size,
-                } => {
+                AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
                     turso_assert!(
                         trunk_page.is_loaded(),
                         "Freelist trunk page {} is not loaded",
@@ -2562,7 +4129,7 @@ impl Pager {
                     );
                     let page_contents = trunk_page.get_contents();
                     let next_trunk_page_id =
-                        page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK);
+                        page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR);
                     let number_of_freelist_leaves =
                         page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
 
@@ -2571,7 +4138,7 @@ impl Pager {
                     if number_of_freelist_leaves != 0 {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
-                            page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF);
+                            page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
                         let (leaf_page, c) = self.read_page(next_leaf_page_id as i64)?;
 
                         turso_assert!(
@@ -2579,6 +4146,10 @@ impl Pager {
                             "Freelist trunk page {} has no leaves",
                             trunk_page.get().id
                         );
+
+                        // Pin leaf_page to prevent eviction while stored in state machine
+                        // trunk_page is already pinned from previous state
+                        leaf_page.pin();
 
                         *state = AllocatePageState::ReuseFreelistLeaf {
                             trunk_page: trunk_page.clone(),
@@ -2592,16 +4163,8 @@ impl Pager {
                     }
 
                     // No freelist leaves on this trunk page.
-                    // If the freelist is completely empty, allocate a new page.
-                    if next_trunk_page_id == 0 {
-                        *state = AllocatePageState::AllocateNewPage {
-                            current_db_size: *current_db_size,
-                        };
-                        continue;
-                    }
-
-                    // Freelist is not empty, so we can reuse the trunk itself as a new page
-                    // and update the database's first freelist trunk page to the next trunk page.
+                    // Reuse the trunk page itself (even if this is the last trunk).
+                    // Update the database's first freelist trunk page to the next trunk page (may be 0 if there are no more trunk pages).
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     self.add_dirty(trunk_page)?;
@@ -2621,6 +4184,8 @@ impl Pager {
                             trunk_page.get().id
                         );
                     }
+                    // Unpin trunk_page before returning - caller takes ownership
+                    trunk_page.unpin();
                     let trunk_page = trunk_page.clone();
                     *state = AllocatePageState::Start;
                     return Ok(IOResult::Done(trunk_page));
@@ -2654,19 +4219,21 @@ impl Pager {
                         );
                     }
 
+                    // Mark trunk page dirty BEFORE modifying it so subjournal captures original content
+                    self.add_dirty(trunk_page)?;
+
                     // Shift left all the other leaf pages in the trunk page and subtract 1 from the leaf count
                     let remaining_leaves_count = (*number_of_freelist_leaves - 1) as usize;
                     {
                         let buf = page_contents.as_ptr();
                         // use copy within the same page
-                        const LEAF_PTR_SIZE_BYTES: usize = 4;
                         let offset_remaining_leaves_start =
-                            FREELIST_TRUNK_OFFSET_FIRST_LEAF + LEAF_PTR_SIZE_BYTES;
+                            FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + FREELIST_LEAF_PTR_SIZE;
                         let offset_remaining_leaves_end = offset_remaining_leaves_start
-                            + remaining_leaves_count * LEAF_PTR_SIZE_BYTES;
+                            + remaining_leaves_count * FREELIST_LEAF_PTR_SIZE;
                         buf.copy_within(
                             offset_remaining_leaves_start..offset_remaining_leaves_end,
-                            FREELIST_TRUNK_OFFSET_FIRST_LEAF,
+                            FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR,
                         );
                     }
                     // write the new leaf count
@@ -2674,9 +4241,11 @@ impl Pager {
                         FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                         remaining_leaves_count as u32,
                     );
-                    self.add_dirty(trunk_page)?;
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
+                    // Unpin both pages before returning - caller takes ownership of leaf_page
+                    trunk_page.unpin();
+                    leaf_page.unpin();
                     let leaf_page = leaf_page.clone();
                     *state = AllocatePageState::Start;
                     return Ok(IOResult::Done(leaf_page));
@@ -2687,7 +4256,7 @@ impl Pager {
                     // if new_db_size reaches the pending page, we need to allocate a new one
                     if Some(new_db_size) == self.pending_byte_page_id() {
                         let richard_hipp_special_page =
-                            allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
+                            allocate_new_page(new_db_size as i64, &self.buffer_pool);
                         self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
                         {
@@ -2707,7 +4276,7 @@ impl Pager {
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
-                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
+                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
                     {
                         // setup page and add to cache
                         self.add_dirty(&page)?;
@@ -2753,8 +4322,17 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback(&self, schema_did_change: bool, connection: &Connection, is_write: bool) {
         tracing::debug!(schema_did_change);
-        self.clear_page_cache(is_write);
         if is_write {
+            let clear_dirty = true;
+            // The page cache only needs to be cleared if we are rolling back a write transaction.
+            // If a read transaction rolls back, and the next read transaction detects that the
+            // database has changed in between (see db_changed() in wal.rs), then the page cache
+            // will be cleared. Since the read transaction itself has not modified anything, it can proceed
+            // with its cached pages in case the database has NOT changed in between.
+            //
+            // Even in the case of a write transaction, clearing the entire page cache is overkill,
+            // since we only need to clear the dirty pages that were modified by the write transaction.
+            self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
         } else {
             turso_assert!(
@@ -2770,18 +4348,18 @@ impl Pager {
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
-                wal.borrow_mut().rollback();
+                wal.rollback(None);
             }
         }
     }
 
     fn reset_internal_states(&self) {
-        *self.checkpoint_state.write() = CheckpointState::Checkpoint;
+        *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
-        self.commit_info.write().state = CommitState::PrepareWal;
-        self.commit_info.write().time = self.io.now();
+        self.commit_info.write().reset();
         *self.allocate_page_state.write() = AllocatePageState::Start;
         *self.free_page_state.write() = FreePageState::Start;
+        *self.spill_state.write() = SpillState::Idle;
         #[cfg(not(feature = "omit_autovacuum"))]
         {
             let mut vacuum_state = self.vacuum_state.write();
@@ -2836,12 +4414,14 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
+        wal.set_io_context(self.io_ctx.read().clone());
         // whenever we set the encryption context, lets reset the page cache. The page cache
         // might have been loaded with page 1 to initialise the connection. During initialisation,
         // we only read the header which is unencrypted, but the rest of the page is. If so, lets
         // clear the cache.
         self.clear_page_cache(false);
+        // Also invalidate cached schema cookie to force re-read of page 1 with encryption
+        self.set_schema_cookie(None);
         Ok(())
     }
 
@@ -2851,7 +4431,7 @@ impl Pager {
             io_ctx.reset_checksum();
         }
         let Some(wal) = self.wal.as_ref() else { return };
-        wal.borrow_mut().set_io_context(self.io_ctx.read().clone())
+        wal.set_io_context(self.io_ctx.read().clone())
     }
 
     pub fn set_reserved_space_bytes(&self, value: u8) {
@@ -2865,14 +4445,14 @@ impl Pager {
     }
 }
 
-pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>, offset: usize) -> PageRef {
+pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef {
     let page = Arc::new(Page::new(page_id));
     {
         let buffer = buffer_pool.get_page();
-        let buffer = Arc::new(buffer);
+        let inner = page.get();
+        inner.buffer = Some(Arc::new(buffer));
         page.set_loaded();
         page.clear_wal_tag();
-        page.get().contents = Some(PageContent::new(offset, buffer));
     }
     page
 }
@@ -2889,17 +4469,16 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
 
     let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
 
-    let contents = PageContent::new(
-        0,
-        Arc::new(Buffer::new_temporary(
-            default_header.page_size.get() as usize
-        )),
-    );
+    {
+        let inner = page.get();
+        inner.buffer = Some(Arc::new(Buffer::new_temporary(
+            default_header.page_size.get() as usize,
+        )));
+    }
 
-    contents.write_database_header(&default_header);
+    page.get_contents().write_database_header(&default_header);
     page.set_loaded();
     page.clear_wal_tag();
-    page.get().contents.replace(contents);
 
     btree_init_page(
         &page,
@@ -2911,7 +4490,7 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
     page
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CreateBTreeFlags(pub u8);
 impl CreateBTreeFlags {
     pub const TABLE: u8 = 0b0001;
@@ -3113,9 +4692,9 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
-    use parking_lot::RwLock;
+    use crate::sync::RwLock;
 
     use crate::storage::page_cache::{PageCache, PageCacheKey};
 
@@ -3148,9 +4727,7 @@ mod tests {
 #[cfg(test)]
 #[cfg(not(feature = "omit_autovacuum"))]
 mod ptrmap_tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
     use super::ptrmap::*;
     use super::*;
@@ -3158,9 +4735,10 @@ mod ptrmap_tests {
     use crate::storage::buffer_pool::BufferPool;
     use crate::storage::database::DatabaseFile;
     use crate::storage::page_cache::PageCache;
-    use crate::storage::pager::Pager;
+    use crate::storage::pager::{default_page1, Pager};
     use crate::storage::sqlite3_ondisk::PageSize;
     use crate::storage::wal::{WalFile, WalFileShared};
+    use arc_swap::ArcSwapOption;
 
     pub fn run_until_done<T>(
         mut action: impl FnMut() -> Result<IOResult<T>>,
@@ -3186,26 +4764,30 @@ mod ptrmap_tests {
         let pages = initial_db_pages + 10;
         let sz = std::cmp::max(std::cmp::min(pages, 64), pages);
         let buffer_pool = BufferPool::begin_init(&io, (sz * page_size) as usize);
-        let page_cache = Arc::new(RwLock::new(PageCache::new(sz as usize)));
 
-        let wal = Rc::new(RefCell::new(WalFile::new(
+        let wal_shared = WalFileShared::new_shared(
+            io.open_file("test.db-wal", OpenFlags::Create, false)
+                .unwrap(),
+        )
+        .unwrap();
+        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             io.clone(),
-            WalFileShared::new_shared(
-                io.open_file("test.db-wal", OpenFlags::Create, false)
-                    .unwrap(),
-            )
-            .unwrap(),
+            wal_shared,
+            last_checksum_and_max_frame,
             buffer_pool.clone(),
-        )));
+        ));
 
+        // For new empty databases, init_page_1 must be Some(page) so allocate_page1() can be called
+        let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
         let pager = Pager::new(
             db_file,
             Some(wal),
             io,
-            page_cache,
+            PageCache::new(sz as usize),
             buffer_pool,
             Arc::new(Mutex::new(())),
-            Default::default(),
+            init_page_1,
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();

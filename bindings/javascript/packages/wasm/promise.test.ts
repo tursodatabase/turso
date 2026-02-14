@@ -1,5 +1,20 @@
-import { expect, test } from 'vitest'
+import { expect, test, afterAll, beforeEach, afterEach } from 'vitest'
 import { connect, Database } from './promise-default.js'
+import { MainWorker } from './index-default.js'
+
+beforeEach((ctx) => {
+    console.log(`[test:start] ${ctx.task.name}`);
+})
+
+afterEach((ctx) => {
+    console.log(`[test:end] ${ctx.task.name} (${ctx.task.result?.state})`);
+})
+
+afterAll(() => {
+    console.log('[afterAll] terminating MainWorker');
+    MainWorker?.terminate();
+    console.log('[afterAll] MainWorker terminated');
+})
 
 test('vector-test', async () => {
     const db = await connect(":memory:");
@@ -12,6 +27,7 @@ test('vector-test', async () => {
         vector_distance_l2(vector64('${JSON.stringify(v1)}'), vector64('${JSON.stringify(v2)}')) as l2f64
     `).all();
     console.info(result);
+    await db.close();
 })
 
 test('explain', async () => {
@@ -103,6 +119,7 @@ test('explain', async () => {
             "p5": 0,
         },
     ]);
+    await db.close();
 })
 
 test('in-memory db', async () => {
@@ -112,6 +129,7 @@ test('in-memory db', async () => {
     const stmt = db.prepare("SELECT * FROM t WHERE x % 2 = ?");
     const rows = await stmt.all([1]);
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
+    await db.close();
 })
 
 
@@ -121,6 +139,7 @@ test('implicit connect', async () => {
     await expect(async () => await defer.all()).rejects.toThrowError(/no such table: t/);
     expect(() => db.prepare("SELECT * FROM t")).toThrowError(/no such table: t/);
     expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
+    await db.close();
 })
 
 test('on-disk db large inserts', async () => {
@@ -143,6 +162,7 @@ test('on-disk db large inserts', async () => {
     expect(rows2).toEqual([{ l: 10 * 4096 }, { l: 10 * 4096 + 1 }, { l: 10 * 4096 + 2 }]);
 
     await db1.prepare("PRAGMA wal_checkpoint(TRUNCATE)").run();
+    await db1.close();
 })
 
 test('on-disk db', async () => {
@@ -162,7 +182,7 @@ test('on-disk db', async () => {
     expect(stmt2.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
     const rows2 = await stmt2.all([1]);
     expect(rows2).toEqual([{ x: 1 }, { x: 3 }]);
-    db2.close();
+    await db2.close();
 })
 
 // attach is not supported in browser for now
@@ -188,6 +208,7 @@ test('blobs', async () => {
     const db = await connect(":memory:");
     const rows = await db.prepare("SELECT x'1020' as x").all();
     expect(rows).toEqual([{ x: new Uint8Array([16, 32]) }])
+    await db.close();
 })
 
 
@@ -204,6 +225,7 @@ test('example-1', async () => {
         { id: 1, name: 'Alice', email: 'alice@example.com' },
         { id: 2, name: 'Bob', email: 'bob@example.com' }
     ]);
+    await db.close();
 })
 
 test('example-2', async () => {
@@ -228,4 +250,31 @@ test('example-2', async () => {
         { name: 'Alice', email: 'alice@example.com' },
         { name: 'Bob', email: 'bob@example.com' }
     ]);
+    await db.close();
+})
+
+test('sorter-wasm', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t (k, v)');
+    for (let i = 0; i < 1024; i++) {
+        await db.exec(`INSERT INTO t VALUES (${i}, randomblob(10 * 1024))`);
+    }
+
+    expect(await db.prepare("SELECT length(v) as l FROM (SELECT v FROM t ORDER BY k)").all()).toEqual(new Array(1024).fill({ l: 10 * 1024 }));
+    await db.close();
+})
+
+test('hash-join-wasm', { timeout: 60_000 }, async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE a (k, v)');
+    await db.exec('CREATE TABLE b (k, v)');
+    for (let i = 0; i < 1024; i++) {
+        await db.exec(`INSERT INTO a VALUES (${i}, randomblob(100 * 1024))`);
+    }
+    for (let i = 0; i < 1024; i++) {
+        await db.exec(`INSERT INTO b VALUES (${i}, randomblob(100 * 1024))`);
+    }
+
+    expect(await db.prepare("SELECT length(a) as a, length(b) as b FROM (SELECT a.v as a, b.v as b FROM a INNER JOIN b ON a.k = b.k)").all()).toEqual(new Array(1024).fill({ a: 100 * 1024, b: 100 * 1024 }));
+    await db.close();
 })

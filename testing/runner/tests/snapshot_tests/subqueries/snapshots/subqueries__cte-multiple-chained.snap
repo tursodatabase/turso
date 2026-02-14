@@ -1,0 +1,115 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH
+      active_customers AS (
+          SELECT id, name
+          FROM customers
+          WHERE created_at >= '2023-01-01'
+      ),
+      customer_orders AS (
+          SELECT customer_id, count(*) AS order_count, sum(total_amount) AS total_spent
+          FROM orders
+          GROUP BY customer_id
+      )
+      SELECT ac.name, co.order_count, co.total_spent
+      FROM active_customers ac
+      JOIN customer_orders co ON co.customer_id = ac.id
+      WHERE co.order_count > 2;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - active_customers
+  - co.customer_id
+  - customer_orders
+  - customers
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH ac USING INDEX ephemeral_subquery_t2
+|  `--SCAN customers
+`--SCAN customer_orders AS co
+   `--SCAN orders USING INDEX idx_orders_customer
+
+BYTECODE
+addr  opcode                  p1  p2  p3  p4            p5  comment
+   0          Init             0  72   0                 0  Start at 72
+   1          OpenEphemeral    0   0   0                 0  cursor=0 is_table=false
+   2          OpenRead         1   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
+   3          Rewind           1  13   0                 0  Rewind table customers
+   4            Column         1   3   6                 0  r[6]=customers.created_at
+   5            Lt             6   7  12  Binary         0  if r[6]<r[7] goto 12
+   6            RowId          1   3   0                 0  r[3]=customers.rowid
+   7            Column         1   1   4                 0  r[4]=customers.name
+   8            Copy           3   9   1                 0  r[9]=r[3]
+   9            Sequence       0  11   0                 0
+  10            MakeRecord     9   3   8                 0  r[8]=mkrec(r[9..11]); for ephemeral_subquery_t2
+  11            IdxInsert      0   8   0                 8  key=r[8]
+  12          Next             1   4   0                 0
+  13          InitCoroutine   12  54  14                 0
+  14          Null             0  21  22                 0  r[21..22]=NULL
+  15          Integer          0  18   0                 0  r[18]=0; clear group by abort flag
+  16          Null             0  19   0                 0  r[19]=NULL; initialize group by comparison registers to NULL
+  17          Gosub           26  50   0                 0  ; go to clear accumulator subroutine
+  18          OpenRead         2   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+  19          OpenRead         3   9   0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
+  20          Rewind           3  37   0                 0  Rewind index idx_orders_customer
+  21            DeferredSeek   3   2   0                 0
+  22            Column         2   1  24                 0  r[24]=orders.customer_id
+  23            Column         2   3  25                 0  r[25]=orders.total_amount
+  24            RealAffinity  25   0   0                 0
+  25            Compare       19  24   1  k(1, Binary)   0  r[19..19]==r[24..24]
+  26            Jump          27  31  27                 0  ; start new group if comparison is not equal
+  27            Gosub         16  41   0                 0  ; check if ended group had data, and output if so
+  28            Move          24  19   1                 0  r[19..19]=r[24..24]
+  29            IfPos         18  53   0                 0  r[18]>0 -> r[18]-=0, goto 53; check abort flag
+  30            Gosub         26  50   0                 0  ; goto clear accumulator subroutine
+  31            AggStep        0  27  21  count          0  accum=r[21] step(r[27])
+  32            AggStep        0  25  22  sum            0  accum=r[22] step(r[25])
+  33            If            17  35   0                 0  if r[17] goto 35; don't emit group columns if continuing existing group
+  34            Column         2   1  20                 0  r[20]=orders.customer_id
+  35            Integer        1  17   0                 0  r[17]=1; indicate data in accumulator
+  36          Next             3  21   0                 0
+  37          Gosub           16  41   0                 0  ; emit row for final group
+  38          Goto             0  53   0                 0  ; group by finished
+  39          Integer          1  18   0                 0  r[18]=1
+  40        Return            16   0   0                 0
+  41        IfPos             17  43   0                 0  r[17]>0 -> r[17]-=0, goto 43; output group by row subroutine start
+  42      Return              16   0   0                 0
+  43      AggFinal             0  21   0  count          0  accum=r[21]
+  44      AggFinal             0  22   0  sum            0  accum=r[22]
+  45      Copy                20  13   0                 0  r[13]=r[20]
+  46      Copy                21  14   0                 0  r[14]=r[21]
+  47      Copy                22  15   0                 0  r[15]=r[22]
+  48      Yield               12   0   0                 0
+  49    Return                16   0   0                 0
+  50    Null                   0  20  22                 0  r[20..22]=NULL; clear accumulator subroutine start
+  51    Integer                0  17   0                 0  r[17]=0
+  52  Return                  26   0   0                 0
+  53  EndCoroutine            12   0   0                 0
+  54  InitCoroutine           12   0  14                 0
+  55    Yield                 12  71   0                 0
+  56    Copy                  14  32   0                 0  r[32]=r[14]
+  57    Le                    32  33  70  Binary         0  if r[32]<=r[33] goto 70
+  58    Copy                  13  34   0                 0  r[34]=r[13]
+  59    IsNull                34  70   0                 0  if (r[34]==NULL) goto 70
+  60    Affinity              34   1   0                 0  r[34..35] = C
+  61    SeekGE                 0  70  34                 0  key=[34..34]
+  62      IdxGT                0  70  34                 0  key=[34..34]
+  63      Column               0   0   1                 0  r[1]=ephemeral_subquery_t2.id
+  64      Column               0   1   2                 0  r[2]=ephemeral_subquery_t2.name
+  65      Column               0   1  28                 0  r[28]=ephemeral_subquery_t2.name
+  66      Copy                14  29   0                 0  r[29]=r[14]
+  67      Copy                15  30   0                 0  r[30]=r[15]
+  68      ResultRow           28   3   0                 0  output=r[28..30]
+  69    Next                   0  62   0                 0
+  70  Goto                     0  55   0                 0
+  71  Halt                     0   0   0                 0
+  72  Transaction              0   1  11                 0  iDb=0 tx_mode=Read
+  73  String8                  0   7   0  2023-01-01     0  r[7]='2023-01-01'
+  74  Integer                  1  27   0                 0  r[27]=1
+  75  Integer                  2  33   0                 0  r[33]=2
+  76  Goto                     0   1   0                 0

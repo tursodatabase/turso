@@ -1,0 +1,489 @@
+# Subqueries and CTEs Query Plan Snapshots
+# These snapshots capture EXPLAIN QUERY PLAN output for various subquery and CTE patterns
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        category_id INTEGER,
+        price REAL NOT NULL,
+        stock INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE categories (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        parent_id INTEGER
+    );
+
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        order_date DATE NOT NULL,
+        total_amount REAL
+    );
+
+    CREATE TABLE order_items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price REAL NOT NULL
+    );
+
+    CREATE TABLE customers (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT,
+        created_at DATE
+    );
+
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        manager_id INTEGER,
+        department TEXT,
+        salary REAL
+    );
+
+    CREATE INDEX idx_products_category ON products(category_id);
+    CREATE INDEX idx_orders_customer ON orders(customer_id);
+    CREATE INDEX idx_order_items_order ON order_items(order_id);
+    CREATE INDEX idx_order_items_product ON order_items(product_id);
+    CREATE INDEX idx_employees_manager ON employees(manager_id);
+}
+
+# =============================================================================
+# SCALAR SUBQUERIES
+# =============================================================================
+
+# Scalar subquery in SELECT - returns single value from aggregation
+@setup schema
+snapshot scalar-subquery-max-price {
+    SELECT
+        name,
+        price,
+        (SELECT max(price) FROM products) AS max_price
+    FROM products
+    WHERE price > 100;
+}
+
+# Scalar subquery with different table
+@setup schema
+snapshot scalar-subquery-cross-table {
+    SELECT
+        c.name,
+        (SELECT count(*) FROM orders WHERE customer_id = c.id) AS order_count
+    FROM customers c;
+}
+
+# =============================================================================
+# EXISTS SUBQUERIES
+# =============================================================================
+
+# EXISTS - correlated existence check
+@setup schema
+snapshot exists-correlated {
+    SELECT c.id, c.name
+    FROM customers c
+    WHERE EXISTS (
+        SELECT 1
+        FROM orders o
+        WHERE o.customer_id = c.id
+            AND o.total_amount > 500
+    );
+}
+
+# EXISTS with multiple conditions
+@setup schema
+snapshot exists-multiple-conditions {
+    SELECT p.id, p.name, p.price
+    FROM products p
+    WHERE EXISTS (
+        SELECT 1
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        WHERE oi.product_id = p.id
+            AND o.order_date >= '2024-01-01'
+    );
+}
+
+# =============================================================================
+# NOT EXISTS SUBQUERIES
+# =============================================================================
+
+# NOT EXISTS - find customers without orders
+@setup schema
+snapshot not-exists-no-orders {
+    SELECT c.id, c.name, c.email
+    FROM customers c
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM orders o
+        WHERE o.customer_id = c.id
+    );
+}
+
+# NOT EXISTS - products never ordered
+@setup schema
+snapshot not-exists-never-ordered {
+    SELECT p.id, p.name, p.stock
+    FROM products p
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM order_items oi
+        WHERE oi.product_id = p.id
+    );
+}
+
+# =============================================================================
+# IN SUBQUERIES
+# =============================================================================
+
+# IN with subquery - simple case
+@setup schema
+snapshot in-subquery-simple {
+    SELECT id, name, price
+    FROM products
+    WHERE category_id IN (
+        SELECT id
+        FROM categories
+        WHERE name LIKE '%Electronics%'
+    );
+}
+
+# IN with aggregation in subquery
+@setup schema
+snapshot in-subquery-aggregation {
+    SELECT c.id, c.name
+    FROM customers c
+    WHERE c.id IN (
+        SELECT o.customer_id
+        FROM orders o
+        GROUP BY o.customer_id
+        HAVING sum(o.total_amount) > 1000
+    );
+}
+
+# NOT IN subquery
+@setup schema
+snapshot not-in-subquery {
+    SELECT id, name, department
+    FROM employees
+    WHERE id NOT IN (
+        SELECT DISTINCT manager_id
+        FROM employees
+        WHERE manager_id IS NOT NULL
+    );
+}
+
+# =============================================================================
+# CORRELATED SUBQUERIES
+# =============================================================================
+
+# Correlated subquery in WHERE - references outer query
+@setup schema
+snapshot correlated-subquery-where {
+    SELECT p.id, p.name, p.price
+    FROM products p
+    WHERE p.price > (
+        SELECT avg(p2.price)
+        FROM products p2
+        WHERE p2.category_id = p.category_id
+    );
+}
+
+# Correlated subquery - employees earning above department average
+@setup schema
+snapshot correlated-subquery-salary {
+    SELECT e.id, e.name, e.department, e.salary
+    FROM employees e
+    WHERE e.salary > (
+        SELECT avg(e2.salary)
+        FROM employees e2
+        WHERE e2.department = e.department
+    );
+}
+
+# Correlated subquery with count
+@setup schema
+snapshot correlated-subquery-count {
+    SELECT o.id, o.order_date, o.total_amount
+    FROM orders o
+    WHERE (
+        SELECT count(*)
+        FROM order_items oi
+        WHERE oi.order_id = o.id
+    ) >= 3;
+}
+
+# =============================================================================
+# DERIVED TABLES (Subqueries in FROM)
+# =============================================================================
+
+# Simple derived table
+@setup schema
+snapshot derived-table-simple {
+    SELECT subq.category_id, subq.avg_price
+    FROM (
+        SELECT category_id, avg(price) AS avg_price
+        FROM products
+        GROUP BY category_id
+    ) AS subq
+    WHERE subq.avg_price > 50;
+}
+
+# Derived table with join
+@setup schema
+snapshot derived-table-join {
+    SELECT c.name, order_stats.total_orders, order_stats.total_spent
+    FROM customers c
+    JOIN (
+        SELECT
+            customer_id,
+            count(*) AS total_orders,
+            sum(total_amount) AS total_spent
+        FROM orders
+        GROUP BY customer_id
+    ) AS order_stats ON order_stats.customer_id = c.id
+    WHERE order_stats.total_spent > 500;
+}
+
+# Nested derived tables
+@setup schema
+snapshot derived-table-nested {
+    SELECT top_customers.name, top_customers.total_spent
+    FROM (
+        SELECT c.name, stats.total_spent
+        FROM customers c
+        JOIN (
+            SELECT customer_id, sum(total_amount) AS total_spent
+            FROM orders
+            GROUP BY customer_id
+        ) AS stats ON stats.customer_id = c.id
+    ) AS top_customers
+    WHERE top_customers.total_spent > 1000
+    ORDER BY top_customers.total_spent DESC;
+}
+
+# =============================================================================
+# SIMPLE CTEs
+# =============================================================================
+
+# Simple CTE - basic usage
+@setup schema
+snapshot cte-simple {
+    WITH high_value_products AS (
+        SELECT id, name, price
+        FROM products
+        WHERE price > 100
+    )
+    SELECT * FROM high_value_products
+    ORDER BY price DESC;
+}
+
+# CTE with aggregation
+@setup schema
+snapshot cte-aggregation {
+    WITH category_stats AS (
+        SELECT
+            category_id,
+            count(*) AS product_count,
+            avg(price) AS avg_price,
+            sum(stock) AS total_stock
+        FROM products
+        GROUP BY category_id
+    )
+    SELECT c.name, cs.product_count, cs.avg_price
+    FROM category_stats cs
+    JOIN categories c ON c.id = cs.category_id
+    WHERE cs.product_count > 5;
+}
+
+# =============================================================================
+# MULTIPLE CTEs
+# =============================================================================
+
+# Multiple CTEs - chained definitions
+@setup schema
+snapshot cte-multiple-chained {
+    WITH
+    active_customers AS (
+        SELECT id, name
+        FROM customers
+        WHERE created_at >= '2023-01-01'
+    ),
+    customer_orders AS (
+        SELECT customer_id, count(*) AS order_count, sum(total_amount) AS total_spent
+        FROM orders
+        GROUP BY customer_id
+    )
+    SELECT ac.name, co.order_count, co.total_spent
+    FROM active_customers ac
+    JOIN customer_orders co ON co.customer_id = ac.id
+    WHERE co.order_count > 2;
+}
+
+# Multiple CTEs - independent definitions
+@setup schema
+snapshot cte-multiple-independent {
+    WITH
+    expensive_products AS (
+        SELECT id, name, price
+        FROM products
+        WHERE price > 500
+    ),
+    large_orders AS (
+        SELECT id, customer_id, total_amount
+        FROM orders
+        WHERE total_amount > 1000
+    ),
+    vip_customers AS (
+        SELECT id, name
+        FROM customers
+        WHERE id IN (SELECT customer_id FROM large_orders)
+    )
+    SELECT v.name, l.total_amount
+    FROM vip_customers v
+    JOIN large_orders l ON l.customer_id = v.id;
+}
+
+# CTEs referencing previous CTEs
+@setup schema
+snapshot cte-referencing-previous {
+    WITH
+    product_sales AS (
+        SELECT
+            oi.product_id,
+            sum(oi.quantity) AS total_quantity,
+            sum(oi.quantity * oi.unit_price) AS total_revenue
+        FROM order_items oi
+        GROUP BY oi.product_id
+    ),
+    top_products AS (
+        SELECT product_id, total_quantity, total_revenue
+        FROM product_sales
+        WHERE total_revenue > 1000
+    ),
+    top_product_details AS (
+        SELECT p.name, p.category_id, tp.total_quantity, tp.total_revenue
+        FROM top_products tp
+        JOIN products p ON p.id = tp.product_id
+    )
+    SELECT tpd.name, c.name AS category_name, tpd.total_revenue
+    FROM top_product_details tpd
+    JOIN categories c ON c.id = tpd.category_id
+    ORDER BY tpd.total_revenue DESC;
+}
+
+# =============================================================================
+# CTE REFERENCED MULTIPLE TIMES
+# =============================================================================
+
+# CTE used multiple times in same query
+@setup schema
+snapshot cte-referenced-multiple-times {
+    WITH order_totals AS (
+        SELECT customer_id, sum(total_amount) AS total
+        FROM orders
+        GROUP BY customer_id
+    )
+    SELECT
+        c.name,
+        ot.total,
+        (SELECT avg(total) FROM order_totals) AS avg_total
+    FROM customers c
+    JOIN order_totals ot ON ot.customer_id = c.id
+    WHERE ot.total > (SELECT avg(total) FROM order_totals);
+}
+
+# CTE used in self-join
+@setup schema
+snapshot cte-self-join {
+    WITH employee_salaries AS (
+        SELECT id, name, department, salary
+        FROM employees
+        WHERE salary IS NOT NULL
+    )
+    SELECT
+        e1.name AS employee,
+        e1.salary AS emp_salary,
+        e2.name AS colleague,
+        e2.salary AS col_salary
+    FROM employee_salaries e1
+    JOIN employee_salaries e2 ON e1.department = e2.department
+        AND e1.id < e2.id
+    WHERE e1.salary > e2.salary * 1.5;
+}
+
+# CTE in subquery and main query
+@setup schema
+snapshot cte-in-subquery-and-main {
+    WITH category_avg AS (
+        SELECT category_id, avg(price) AS avg_price
+        FROM products
+        GROUP BY category_id
+    )
+    SELECT p.name, p.price, ca.avg_price
+    FROM products p
+    JOIN category_avg ca ON ca.category_id = p.category_id
+    WHERE p.price > (
+        SELECT max(avg_price) FROM category_avg
+    ) * 0.8;
+}
+
+# =============================================================================
+# COMPLEX COMBINATIONS
+# =============================================================================
+
+# CTE with EXISTS
+@setup schema
+snapshot cte-with-exists {
+    WITH recent_orders AS (
+        SELECT id, customer_id
+        FROM orders
+        WHERE order_date >= '2024-01-01'
+    )
+    SELECT c.id, c.name
+    FROM customers c
+    WHERE EXISTS (
+        SELECT 1 FROM recent_orders ro
+        WHERE ro.customer_id = c.id
+    );
+}
+
+# CTE with correlated subquery
+@setup schema
+snapshot cte-with-correlated-subquery {
+    WITH dept_avg AS (
+        SELECT department, avg(salary) AS avg_salary
+        FROM employees
+        GROUP BY department
+    )
+    SELECT e.name, e.department, e.salary
+    FROM employees e
+    WHERE e.salary > (
+        SELECT da.avg_salary
+        FROM dept_avg da
+        WHERE da.department = e.department
+    );
+}
+
+# Subquery within CTE
+@setup schema
+snapshot subquery-within-cte {
+    WITH filtered_products AS (
+        SELECT p.id, p.name, p.price
+        FROM products p
+        WHERE p.category_id IN (
+            SELECT id FROM categories WHERE parent_id IS NULL
+        )
+    )
+    SELECT fp.name, fp.price
+    FROM filtered_products fp
+    WHERE fp.price > 100
+    ORDER BY fp.price DESC;
+}

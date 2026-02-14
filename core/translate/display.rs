@@ -13,7 +13,7 @@ use crate::{schema::Table, translate::plan::TableReferences};
 
 use super::plan::{
     Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Scan, Search, SelectPlan,
-    UpdatePlan,
+    SetOperation, UpdatePlan,
 };
 
 impl Display for Aggregate {
@@ -79,8 +79,9 @@ impl Display for SelectPlan {
         writeln!(f, "QUERY PLAN")?;
 
         // Print each table reference with appropriate indentation based on join depth
-        for (i, reference) in self.table_references.joined_tables().iter().enumerate() {
-            let is_last = i == self.table_references.joined_tables().len() - 1;
+        for (i, member) in self.join_order.iter().enumerate() {
+            let reference = &self.table_references.joined_tables()[member.original_idx];
+            let is_last = i == self.join_order.len() - 1;
             let indent = if i == 0 {
                 if is_last { "`--" } else { "|--" }.to_string()
             } else {
@@ -153,6 +154,28 @@ impl Display for SelectPlan {
                 }
                 Operation::HashJoin(_) => {
                     writeln!(f, "{indent}HASH JOIN")?;
+                }
+                Operation::MultiIndexScan(multi_idx) => {
+                    let index_names: Vec<&str> = multi_idx
+                        .branches
+                        .iter()
+                        .map(|b| {
+                            b.index
+                                .as_ref()
+                                .map(|i| i.name.as_str())
+                                .unwrap_or("PRIMARY KEY")
+                        })
+                        .collect();
+                    let op_name = match multi_idx.set_op {
+                        SetOperation::Union => "MULTI-INDEX OR",
+                        SetOperation::Intersection => "MULTI-INDEX AND",
+                    };
+                    writeln!(
+                        f,
+                        "{indent}{op_name} {} ({}) ",
+                        reference.identifier,
+                        index_names.join(", ")
+                    )?;
                 }
             }
         }
@@ -230,6 +253,28 @@ impl Display for DeletePlan {
                 }
                 Operation::HashJoin(_) => {
                     unreachable!("Delete plan should not have hash joins");
+                }
+                Operation::MultiIndexScan(multi_idx) => {
+                    let index_names: Vec<&str> = multi_idx
+                        .branches
+                        .iter()
+                        .map(|b| {
+                            b.index
+                                .as_ref()
+                                .map(|i| i.name.as_str())
+                                .unwrap_or("PRIMARY KEY")
+                        })
+                        .collect();
+                    let op_name = match multi_idx.set_op {
+                        SetOperation::Union => "MULTI-INDEX OR",
+                        SetOperation::Intersection => "MULTI-INDEX AND",
+                    };
+                    writeln!(
+                        f,
+                        "{indent}{op_name} {} ({})",
+                        reference.identifier,
+                        index_names.join(", ")
+                    )?;
                 }
             }
         }
@@ -320,6 +365,9 @@ impl fmt::Display for UpdatePlan {
                 }
                 Operation::HashJoin(_) => {
                     unreachable!("Update plan should not have hash joins");
+                }
+                Operation::MultiIndexScan(_) => {
+                    unreachable!("Update plan should not have multi-index scans");
                 }
             }
         }
@@ -468,11 +516,8 @@ impl ToTokens for JoinedTable {
             }
             Table::FromClauseSubquery(from_clause_subquery) => {
                 s.append(TokenType::TK_LP, None)?;
-                // Could possibly merge the contexts together here
-                from_clause_subquery.plan.to_tokens(
-                    s,
-                    &PlanContext(&[&from_clause_subquery.plan.table_references]),
-                )?;
+                // Plan::to_tokens creates its own context internally, so we pass BlankContext here.
+                from_clause_subquery.plan.to_tokens(s, &BlankContext)?;
                 s.append(TokenType::TK_RP, None)?;
 
                 s.append(TokenType::TK_AS, None)?;
@@ -547,10 +592,12 @@ impl ToTokens for SelectPlan {
             }
 
             if let Some(group_by) = &self.group_by {
-                s.append(TokenType::TK_GROUP, None)?;
-                s.append(TokenType::TK_BY, None)?;
+                if !group_by.exprs.is_empty() {
+                    s.append(TokenType::TK_GROUP, None)?;
+                    s.append(TokenType::TK_BY, None)?;
 
-                s.comma(group_by.exprs.iter(), context)?;
+                    s.comma(group_by.exprs.iter(), context)?;
+                }
 
                 // TODO: not sure where I need to place the group_by.sort_order
                 if let Some(having) = &group_by.having {

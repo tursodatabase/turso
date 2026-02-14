@@ -3,11 +3,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "bindings/dart/rust",
     "bindings/java",
     "bindings/javascript",
     "bindings/javascript/sync",
     "bindings/python",
+    "bindings/dotnet",
     "bindings/rust",
     "cli",
     "core",
@@ -21,52 +21,49 @@ members = [
     "extensions/tests",
     "extensions/fuzzy",
     "macros",
-    "simulator",
+    "testing/simulator",
     "sqlite3",
-    "stress",
+    "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
     "parser",
     "sync/engine",
     "sync/sdk-kit",
     "sql_generation",
-    "whopper",
+    "testing/concurrent-simulator",
     "perf/throughput/turso",
     "perf/throughput/rusqlite",
     "perf/encryption",
+    "tools/dbhash",
     "sdk-kit",
-    "sdk-kit-macros",
+    "sdk-kit-macros", 
+    "testing/differential-oracle/sql_gen_prop", 
+    "testing/differential-oracle/fuzzer",
+    "testing/runner"
 ]
 exclude = ["perf/latency/limbo"]
 
 [workspace.package]
-version = "0.4.0-pre.14"
+version = "0.5.0-pre.11"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.4.0-pre.14" }
-turso_node = { path = "bindings/javascript", version = "0.4.0-pre.14" }
-turso_sdk_kit = { path = "sdk-kit", version = "0.4.0-pre.14" }
-turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.4.0-pre.14" }
-turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.4.0-pre.14" }
-limbo_completion = { path = "extensions/completion", version = "0.4.0-pre.14" }
-turso_core = { path = "core", version = "0.4.0-pre.14" }
-turso_sync_engine = { path = "sync/engine", version = "0.4.0-pre.14" }
-limbo_crypto = { path = "extensions/crypto", version = "0.4.0-pre.14" }
-limbo_csv = { path = "extensions/csv", version = "0.4.0-pre.14" }
-turso_ext = { path = "extensions/core", version = "0.4.0-pre.14" }
-turso_ext_tests = { path = "extensions/tests", version = "0.4.0-pre.14" }
-limbo_ipaddr = { path = "extensions/ipaddr", version = "0.4.0-pre.14" }
-turso_macros = { path = "macros", version = "0.4.0-pre.14" }
-limbo_percentile = { path = "extensions/percentile", version = "0.4.0-pre.14" }
-limbo_regexp = { path = "extensions/regexp", version = "0.4.0-pre.14" }
-limbo_uuid = { path = "extensions/uuid", version = "0.4.0-pre.14" }
-turso_parser = { path = "parser", version = "0.4.0-pre.14" }
-limbo_fuzzy = { path = "extensions/fuzzy", version = "0.4.0-pre.14" }
+turso = { path = "bindings/rust", version = "0.5.0-pre.11" }
+turso_node = { path = "bindings/javascript", version = "0.5.0-pre.11" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.5.0-pre.11" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.5.0-pre.11" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.5.0-pre.11" }
+limbo_completion = { path = "extensions/completion", version = "0.5.0-pre.11" }
+turso_core = { path = "core", version = "0.5.0-pre.11" }
+turso_sync_engine = { path = "sync/engine", version = "0.5.0-pre.11" }
+turso_ext = { path = "extensions/core", version = "0.5.0-pre.11" }
+turso_macros = { path = "macros", version = "0.5.0-pre.11" }
+turso_parser = { path = "parser", version = "0.5.0-pre.11" }
 sql_generation = { path = "sql_generation" }
+turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
 serde = "1.0"
@@ -88,10 +85,15 @@ clap = "4.5.47"
 thiserror = "2.0.16"
 tempfile = "3.20.0"
 indexmap = "2.11.1"
+indicatif = "0.17"
 miette = "7.6.0"
 bitflags = "2.9.4"
 fallible-iterator = "0.3.0"
-criterion = "0.5"
+
+criterion = "0.5.0"
+codspeed-criterion-compat = "4.2.1"
+divan = { package = "codspeed-divan-compat", version = "4.2.1" }
+
 chrono = { version = "0.4.42", default-features = false }
 hex = "0.4"
 antithesis_sdk = { version = "0.2", default-features = false }
@@ -106,13 +108,25 @@ bitmaps = { version = "3.2.1", default-features = false }
 console-subscriber = { version = "0.4.1" }
 either = { version = "1.15" }
 
+# Multi threading testing
+loom = { version = "0.7" }
+shuttle = { version = "0.8.1" }
+
+
 [profile.dev.package.similar]
 opt-level = 3
 
 [profile.release]
 debug = "line-tables-only"
-codegen-units = 1
+codegen-units = 4
 panic = "abort"
+lto = "thin"
+
+# Official release profile - maximum optimization for published binaries
+# Use for CLI releases, PyPI, npm, Maven, NuGet, etc.
+[profile.release-official]
+inherits = "release"
+codegen-units = 1
 lto = true
 
 # override settings for sdk-kit release profiles in order to reduce size of produced binaries
@@ -133,7 +147,22 @@ lto = true
 [profile.bench-profile]
 inherits = "release"
 debug = true
+lto = false               # LTO hides function boundaries
+codegen-units = 16        # Less cross-unit inlining
 
 [profile.dist]
-inherits = "release"
-lto = "thin"
+inherits = "release-official"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)'] }
+
+[workspace.lints.clippy]
+or_fun_call = "deny"
+clear_with_drain = "deny"
+collection_is_never_read = "deny"
+naive_bytecount = "deny"
+stable_sort_primitive = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "deny"
+redundant_clone = "deny"
+assigning_clones = "deny"
