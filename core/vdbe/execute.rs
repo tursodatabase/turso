@@ -7542,7 +7542,7 @@ fn new_rowid_inner(
                         let use_cached_allocator = matches!(
                             program.connection.get_mv_tx(),
                             Some((_, TransactionMode::Concurrent))
-                        );
+                        ) || program.connection.get_auto_commit();
                         match return_if_io!(mvcc_cursor.start_new_rowid(use_cached_allocator)) {
                             NextRowidResult::Uninitialized => {
                                 // we need to find last to initialize it

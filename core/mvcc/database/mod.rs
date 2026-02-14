@@ -3301,6 +3301,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
 
         self.remove_rolled_back_rows_from_write_set(tx_id, touched_table_rowids.clone());
+        // A statement may reserve a rowid and then abort before a table-version is recorded
+        // (e.g. uniqueness/FK failures). Invalidate all allocators so aborted reservations
+        // never leak into future rowid choices.
+        self.invalidate_all_rowid_allocators();
         self.invalidate_rowid_allocators_for_rows(&touched_table_rowids);
     }
 
@@ -3340,6 +3344,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
         for table_id in table_ids {
             self.invalidate_rowid_allocator(table_id);
+        }
+    }
+
+    fn invalidate_all_rowid_allocators(&self) {
+        for allocator in self.table_id_to_last_rowid.read().values() {
+            allocator.invalidate();
         }
     }
 

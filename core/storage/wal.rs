@@ -2253,14 +2253,8 @@ impl WalFile {
         })
     }
 
-    /// Reset connection-private WAL state. Releases any held read lock before
-    /// clearing the slot, so that `end_read_tx()` callers never see a stale
-    /// `NO_LOCK_HELD` while a shared lock is still held.
+    /// Reset connection-private WAL state.
     fn reset_internal_states(&self) {
-        let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
-        if slot != NO_LOCK_HELD {
-            self.with_shared(|shared| shared.read_locks[slot].unlock());
-        }
         self.ongoing_checkpoint.write().reset();
         self.syncing.store(false, Ordering::Release);
     }
