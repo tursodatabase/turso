@@ -515,6 +515,17 @@ impl Schema {
         Ok(())
     }
 
+    /// Load type definitions from CREATE TYPE SQL strings and resolve custom
+    /// type affinities on all STRICT tables. This is the shared entry point
+    /// used by both initial database open and schema reparse.
+    pub fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
+        for sql in type_sqls {
+            self.add_type_from_sql(sql)?;
+        }
+        self.resolve_all_custom_type_affinities();
+        Ok(())
+    }
+
     /// Resolve custom type affinities for all STRICT tables in the schema.
     /// Call this after loading user-defined types from __turso_internal_types
     /// so that columns declared with custom types use the BASE type's affinity.

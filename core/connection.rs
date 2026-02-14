@@ -464,21 +464,8 @@ impl Connection {
                 *schema = fresh.clone();
             });
             let load_result: Result<()> = (|| {
-                let mut type_stmt = self.prepare(format!(
-                    "SELECT name, sql FROM {}",
-                    crate::schema::TURSO_TYPES_TABLE_NAME
-                ))?;
-                let mut type_rows: Vec<String> = Vec::new();
-                type_stmt.run_with_row_callback(|row| {
-                    let sql = row.get::<&str>(1)?.to_string();
-                    type_rows.push(sql);
-                    Ok(())
-                })?;
-                for sql in &type_rows {
-                    fresh.add_type_from_sql(sql)?;
-                }
-                // Resolve column affinities for tables that use these custom types
-                fresh.resolve_all_custom_type_affinities();
+                let type_sqls = self.query_stored_type_definitions()?;
+                fresh.load_type_definitions(&type_sqls)?;
                 Ok(())
             })();
             if let Err(e) = load_result {
@@ -746,6 +733,30 @@ impl Connection {
 
     pub(crate) fn get_deferred_foreign_key_violations(&self) -> isize {
         self.fk_deferred_violations.load(Ordering::Acquire)
+    }
+
+    /// Query the CREATE TYPE SQL definitions stored in __turso_internal_types.
+    /// The connection's schema must already contain the table definitions so
+    /// that `prepare` can resolve the table name. Returns an empty Vec if the
+    /// types table does not exist.
+    pub(crate) fn query_stored_type_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
+        let has_types_table = {
+            let s = self.schema.read();
+            s.tables.contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+        };
+        if !has_types_table {
+            return Ok(Vec::new());
+        }
+        let mut type_stmt = self.prepare(format!(
+            "SELECT name, sql FROM {}",
+            crate::schema::TURSO_TYPES_TABLE_NAME
+        ))?;
+        let mut type_rows = Vec::new();
+        type_stmt.run_with_row_callback(|row| {
+            type_rows.push(row.get::<&str>(1)?.to_string());
+            Ok(())
+        })?;
+        Ok(type_rows)
     }
 
     pub fn maybe_update_schema(&self) {

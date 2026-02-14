@@ -903,6 +903,37 @@ impl Database {
                         Err(e) => return Err(e),
                     }
 
+                    // Load custom types from __turso_internal_types if the table
+                    // exists. The schema loaded by make_from_btree includes the
+                    // table definition but not its contents. We need to read the
+                    // stored type definitions so that DECODE/ENCODE and affinity
+                    // metadata are available to all subsequent connections.
+                    {
+                        let conn = state
+                            .conn
+                            .as_ref()
+                            .expect("conn must be initialized in Init phase");
+                        // Sync the connection's schema from the database so it
+                        // can query __turso_internal_types.
+                        conn.maybe_update_schema();
+                        let load_result: Result<()> = (|| {
+                            let type_sqls = conn.query_stored_type_definitions()?;
+                            if !type_sqls.is_empty() {
+                                let db = state
+                                    .db
+                                    .as_ref()
+                                    .expect("db must be initialized in Init phase");
+                                db.with_schema_mut(|schema| {
+                                    schema.load_type_definitions(&type_sqls)
+                                })?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(e) = load_result {
+                            tracing::warn!("Failed to load custom types during open: {}", e);
+                        }
+                    }
+
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
                 }
 
