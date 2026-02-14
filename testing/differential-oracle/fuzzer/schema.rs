@@ -1,12 +1,12 @@
 //! Schema introspection from a live database.
 //!
 //! Uses PRAGMA commands to query the current database schema and converts it
-//! to the `sql_gen_prop::Schema` format for query generation.
+//! to the `sql_gen::Schema` format for query generation.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sql_gen_prop::{ColumnDef, DataType, Schema, SchemaBuilder, Table};
+use sql_gen::{ColumnDef, DataType, Schema, SchemaBuilder, Table};
 
 /// Introspects schema from a database connection.
 pub struct SchemaIntrospector;
@@ -20,7 +20,7 @@ impl SchemaIntrospector {
         for table_name in table_names {
             let columns = Self::get_columns_turso(conn, &table_name)?;
             if !columns.is_empty() {
-                builder = builder.add_table(Table::new(table_name, columns));
+                builder = builder.table(Table::new(table_name, columns));
             }
         }
 
@@ -35,7 +35,7 @@ impl SchemaIntrospector {
         for table_name in table_names {
             let columns = Self::get_columns_sqlite(conn, &table_name)?;
             if !columns.is_empty() {
-                builder = builder.add_table(Table::new(table_name, columns));
+                builder = builder.table(Table::new(table_name, columns));
             }
         }
 

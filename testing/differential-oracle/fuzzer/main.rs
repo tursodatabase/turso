@@ -3,16 +3,11 @@
 //! This binary runs a differential testing fuzzer that compares Turso
 //! results against SQLite for generated SQL statements.
 
-use std::{
-    io::{IsTerminal, stdin},
-    panic::{self},
-    sync::Arc,
-};
+use std::io::{IsTerminal, stdin};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use differential_fuzzer::{Fuzzer, SimConfig};
-use parking_lot::Mutex;
+use differential_fuzzer::{Fuzzer, GeneratorKind, SimConfig, TreeMode};
 use rand::RngCore;
 
 /// SQLancer-style differential testing fuzzer for Turso.
@@ -45,6 +40,18 @@ struct Args {
     /// Persist database files to disk after simulation.
     #[arg(short, long)]
     keep_files: bool,
+
+    /// SQL generator backend to use.
+    #[arg(short = 'g', long, default_value = "sql-gen", value_enum)]
+    generator: GeneratorKind,
+
+    /// Write a coverage report to simulator-output/coverage.txt.
+    #[arg(long)]
+    coverage: bool,
+
+    /// Use full hierarchical tree in the coverage report instead of simplified flat view.
+    #[arg(long)]
+    full_tree: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -99,42 +106,20 @@ fn run_single(args: &Args) -> Result<()> {
         num_statements: args.num_statements,
         verbose: args.verbose,
         keep_files: args.keep_files,
+        generator: args.generator,
+        coverage: args.coverage,
+        tree_mode: if args.full_tree {
+            TreeMode::Full
+        } else {
+            TreeMode::Simplified
+        },
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
 
     let fuzzer = Fuzzer::new(config)?;
 
-    let panic_info = Arc::new(Mutex::new(None::<String>));
-    let info_clone = Arc::clone(&panic_info);
-
-    let prev_hook = panic::take_hook();
-
-    panic::set_hook(Box::new(move |info| {
-        *info_clone.lock() = Some(info.to_string());
-    }));
-
-    let stats = std::panic::catch_unwind(|| fuzzer.run()).map_err(|err| {
-        let msg = if let Some(s) = err.downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = err.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "Unknown panic".to_string()
-        };
-        let mut err = anyhow::anyhow!("{msg}");
-        if let Some(msg) = panic_info.lock().take() {
-            err = err.context(msg);
-        }
-
-        err
-    });
-    let stats = match stats {
-        Ok(inner) => inner,
-        Err(e) => Err(e),
-    };
-
-    panic::set_hook(prev_hook);
+    let stats = fuzzer.run()?;
 
     if args.keep_files {
         tracing::info!("Persisting database files to disk...");
@@ -153,8 +138,6 @@ fn run_single(args: &Args) -> Result<()> {
             tracing::warn!("Failed to get schema for JSON dump: {e}");
         }
     }
-
-    let stats = stats?;
 
     if stats.oracle_failures > 0 {
         std::process::exit(1);
