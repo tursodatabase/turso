@@ -105,6 +105,7 @@ expect {
 
 # CAST(x AS type) always works for non-parametric custom types even outside
 # STRICT tables, because CAST is an explicit user request, not column-scoped.
+@requires strict "uses custom type CAST"
 test non-strict-cast-explicit {
     SELECT CAST(1 AS boolean);
 }
