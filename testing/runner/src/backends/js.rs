@@ -68,8 +68,7 @@ impl SqlBackend for JsBackend {
     }
 
     fn capabilities(&self) -> HashSet<Capability> {
-        // JS backend does not support triggers or strict tables
-        HashSet::new()
+        HashSet::from_iter([Capability::Trigger])
     }
 
     async fn create_database(
@@ -260,5 +259,17 @@ impl DatabaseInstance for JsDatabaseInstance {
     async fn close(self: Box<Self>) -> Result<(), BackendError> {
         // Temp file will be automatically deleted when self is dropped
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn js_backend_reports_trigger_capability() {
+        let backend = JsBackend::new("node", "bindings/javascript/turso-sql-runner.mjs");
+        let capabilities = backend.capabilities();
+        assert!(capabilities.contains(&Capability::Trigger));
     }
 }

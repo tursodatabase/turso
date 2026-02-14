@@ -1020,6 +1020,10 @@ expect {
     should_stay|-5858539611.59103
     new_row|1.0
 }
+expect @js {
+    should_stay|-5858539611.59103
+    new_row|1
+}
 
 # https://github.com/tursodatabase/turso/issues/5177
 # NEW.rowid_alias in UPDATE trigger WHEN clause should not be NULL

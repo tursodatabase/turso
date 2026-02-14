@@ -1182,7 +1182,7 @@ expect {
 }
 
 test cte-multiple-refs-self-join {
-    WITH t AS (SELECT 1 as x) SELECT * FROM t JOIN t as t2 ON t.x = t2.x;
+    With t AS (SELECT 1 as x) SELECT * FROM t JOIN t as t2 ON t.x = t2.x;
 }
 expect {
     1|1
@@ -1800,4 +1800,3 @@ test glob-is-not-null-precedence {
 expect {
     1
 }
-
