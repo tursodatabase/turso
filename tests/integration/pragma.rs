@@ -368,3 +368,24 @@ fn test_pragma_synchronous_normal(db: TempDatabase) {
     };
     assert_eq!(*count, 7, "all inserts should have succeeded");
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_cache_size_min_value(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Verify it doesn't panic on i64::MIN
+    let min_val = i64::MIN;
+    let query = format!("PRAGMA cache_size = {min_val}");
+    conn.execute(&query).unwrap();
+
+    // Check the value was reset to default (0 in this implementation's logic for overflow)
+    let mut rows = conn.query("PRAGMA cache_size").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value");
+    };
+    assert_eq!(*value, 200);
+}
