@@ -19,6 +19,8 @@ use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation,
 use std::borrow::Cow;
 use std::str::FromStr;
 
+const JSONB_OVERLAP_PAYLOAD_MAX: usize = 7;
+
 #[derive(Debug, Clone, Copy)]
 pub enum Conv {
     Strict,
@@ -131,7 +133,9 @@ fn is_jsonb_blob(slice: &[u8]) -> bool {
     let jsonb = Jsonb::from_raw_data(slice);
     match header.is_scalar() {
         Ok(is_scalar) => {
-            if is_scalar || payload_size <= 7 {
+            // Prevent 64-bit scalar values (e.g., INT, FLOAT) from accidentally matching JSONB Object/Array headers.
+            // ex) 0x7C 12 34 56 78 9A BC DE
+            if is_scalar || payload_size <= JSONB_OVERLAP_PAYLOAD_MAX {
                 jsonb.is_valid()
             } else {
                 jsonb.element_type().is_ok()
@@ -1834,5 +1838,12 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(result.unwrap().to_text().unwrap(), r#"{"field":"value"}"#,);
+    }
+
+    #[test]
+    fn test_is_jsonb_blob_rejects_scalar_like_overlap_header() {
+        let overlapping_scalar = b"|1234567";
+        assert_eq!(overlapping_scalar.len(), JSONB_OVERLAP_PAYLOAD_MAX + 1);
+        assert!(!is_jsonb_blob(overlapping_scalar));
     }
 }
