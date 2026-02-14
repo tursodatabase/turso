@@ -1369,3 +1369,82 @@ test numeric-scale-exceeds-precision-rejected {
 expect error {
     numeric scale
 }
+
+# AFTER UPDATE trigger should see decoded OLD and NEW values, not encoded blobs
+@requires strict "uses STRICT tables"
+test trigger-after-update-old-decoded {
+    CREATE TABLE t_trig(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t_trig VALUES (1, '123.45');
+    CREATE TABLE t_trig_log(old_v TEXT, new_v TEXT) STRICT;
+    CREATE TRIGGER tr_trig AFTER UPDATE ON t_trig BEGIN
+        INSERT INTO t_trig_log VALUES (CAST(OLD.val AS TEXT), CAST(NEW.val AS TEXT));
+    END;
+    UPDATE t_trig SET val = '999.99' WHERE id = 1;
+    SELECT old_v, new_v FROM t_trig_log;
+}
+expect {
+    123.45|999.99
+}
+
+# BEFORE UPDATE trigger should see decoded OLD values
+@requires strict "uses STRICT tables"
+test trigger-before-update-old-decoded {
+    CREATE TABLE t_bu(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t_bu VALUES (1, '500.25');
+    CREATE TABLE t_bu_log(old_v TEXT, new_v TEXT) STRICT;
+    CREATE TRIGGER tr_bu BEFORE UPDATE ON t_bu BEGIN
+        INSERT INTO t_bu_log VALUES (CAST(OLD.val AS TEXT), CAST(NEW.val AS TEXT));
+    END;
+    UPDATE t_bu SET val = '750.50' WHERE id = 1;
+    SELECT old_v, new_v FROM t_bu_log;
+}
+expect {
+    500.25|750.50
+}
+
+# AFTER DELETE trigger should see decoded OLD values
+@requires strict "uses STRICT tables"
+test trigger-after-delete-old-decoded {
+    CREATE TABLE t_ad(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t_ad VALUES (1, '333.33');
+    CREATE TABLE t_ad_log(old_v TEXT) STRICT;
+    CREATE TRIGGER tr_ad AFTER DELETE ON t_ad BEGIN
+        INSERT INTO t_ad_log VALUES (CAST(OLD.val AS TEXT));
+    END;
+    DELETE FROM t_ad WHERE id = 1;
+    SELECT old_v FROM t_ad_log;
+}
+expect {
+    333.33
+}
+
+# BEFORE DELETE trigger should see decoded OLD values
+@requires strict "uses STRICT tables"
+test trigger-before-delete-old-decoded {
+    CREATE TABLE t_bd(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t_bd VALUES (1, '444.44');
+    CREATE TABLE t_bd_log(old_v TEXT) STRICT;
+    CREATE TRIGGER tr_bd BEFORE DELETE ON t_bd BEGIN
+        INSERT INTO t_bd_log VALUES (CAST(OLD.val AS TEXT));
+    END;
+    DELETE FROM t_bd WHERE id = 1;
+    SELECT old_v FROM t_bd_log;
+}
+expect {
+    444.44
+}
+
+# AFTER INSERT trigger should see decoded NEW values
+@requires strict "uses STRICT tables"
+test trigger-after-insert-new-decoded {
+    CREATE TABLE t_ai(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    CREATE TABLE t_ai_log(new_v TEXT) STRICT;
+    CREATE TRIGGER tr_ai AFTER INSERT ON t_ai BEGIN
+        INSERT INTO t_ai_log VALUES (CAST(NEW.val AS TEXT));
+    END;
+    INSERT INTO t_ai VALUES (1, '555.55');
+    SELECT new_v FROM t_ai_log;
+}
+expect {
+    555.55
+}

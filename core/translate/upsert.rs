@@ -1149,7 +1149,8 @@ pub fn emit_upsert(
 
             // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
             // clauses should not suppress errors. Override conflict resolution to Abort.
-            let trigger_ctx_after = TriggerContext::new_with_override_conflict(
+            // NEW values are encoded at this point; fire_trigger will decode them.
+            let trigger_ctx_after = TriggerContext::new_after_with_override_conflict(
                 btree_table,
                 Some(new_registers_after),
                 Some(old_regs),

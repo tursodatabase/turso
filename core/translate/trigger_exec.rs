@@ -26,6 +26,10 @@ pub struct TriggerContext {
     /// This is needed for UPSERT DO UPDATE triggers where SQLite requires
     /// that nested OR IGNORE/REPLACE clauses do not suppress errors.
     pub override_conflict: Option<ast::ResolveType>,
+    /// Whether NEW registers contain encoded custom type values that need decoding.
+    /// True for AFTER triggers (values have been encoded for storage).
+    /// False for BEFORE triggers (values are still user-facing).
+    pub new_encoded: bool,
 }
 
 impl TriggerContext {
@@ -39,6 +43,22 @@ impl TriggerContext {
             new_registers,
             old_registers,
             override_conflict: None,
+            new_encoded: false,
+        }
+    }
+
+    /// Create a trigger context for AFTER triggers where NEW values are encoded.
+    pub fn new_after(
+        table: Arc<BTreeTable>,
+        new_registers: Option<Vec<usize>>,
+        old_registers: Option<Vec<usize>>,
+    ) -> Self {
+        Self {
+            table,
+            new_registers,
+            old_registers,
+            override_conflict: None,
+            new_encoded: true,
         }
     }
 
@@ -56,6 +76,23 @@ impl TriggerContext {
             new_registers,
             old_registers,
             override_conflict: Some(override_conflict),
+            new_encoded: false,
+        }
+    }
+
+    /// Create a trigger context with a conflict resolution override for AFTER triggers.
+    pub fn new_after_with_override_conflict(
+        table: Arc<BTreeTable>,
+        new_registers: Option<Vec<usize>>,
+        old_registers: Option<Vec<usize>>,
+        override_conflict: ast::ResolveType,
+    ) -> Self {
+        Self {
+            table,
+            new_registers,
+            old_registers,
+            override_conflict: Some(override_conflict),
+            new_encoded: true,
         }
     }
 }
@@ -760,6 +797,13 @@ pub fn fire_trigger(
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<()> {
+    // Decode custom type registers so trigger bodies see user-facing values,
+    // not raw encoded blobs from disk.
+    // - OLD registers always come from cursor reads → always encoded → always decode
+    // - NEW registers are only encoded for AFTER triggers (post-encode) → decode when new_encoded
+    let decoded_ctx = decode_trigger_registers(program, resolver, ctx)?;
+    let ctx = &decoded_ctx;
+
     // Evaluate WHEN clause if present
     if let Some(mut when_expr) = trigger.when_clause.clone() {
         // Rewrite NEW/OLD references in WHEN clause to use registers
@@ -801,6 +845,68 @@ pub fn fire_trigger(
     }
 
     Ok(())
+}
+
+/// Decode encoded custom type registers in a TriggerContext.
+/// OLD registers are always decoded (they always come from cursor reads on disk).
+/// NEW registers are decoded only when `ctx.new_encoded` is true (AFTER triggers).
+fn decode_trigger_registers(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    ctx: &TriggerContext,
+) -> Result<TriggerContext> {
+    if !ctx.table.is_strict {
+        // Non-STRICT tables never have custom type encoding
+        return Ok(TriggerContext {
+            table: ctx.table.clone(),
+            new_registers: ctx.new_registers.clone(),
+            old_registers: ctx.old_registers.clone(),
+            override_conflict: ctx.override_conflict,
+            new_encoded: false,
+        });
+    }
+
+    let columns = &ctx.table.columns;
+
+    let decoded_new = if ctx.new_encoded {
+        if let Some(new_regs) = &ctx.new_registers {
+            let rowid_reg = *new_regs.last().expect("NEW registers must include rowid");
+            Some(crate::translate::expr::emit_trigger_decode_registers(
+                program,
+                resolver,
+                columns,
+                &|i| new_regs[i],
+                rowid_reg,
+                true, // is_strict
+            )?)
+        } else {
+            None
+        }
+    } else {
+        ctx.new_registers.clone()
+    };
+
+    let decoded_old = if let Some(old_regs) = &ctx.old_registers {
+        let rowid_reg = *old_regs.last().expect("OLD registers must include rowid");
+        Some(crate::translate::expr::emit_trigger_decode_registers(
+            program,
+            resolver,
+            columns,
+            &|i| old_regs[i],
+            rowid_reg,
+            true, // is_strict
+        )?)
+    } else {
+        None
+    };
+
+    Ok(TriggerContext {
+        table: ctx.table.clone(),
+        new_registers: decoded_new,
+        old_registers: decoded_old,
+        override_conflict: ctx.override_conflict,
+        new_encoded: false, // decoded now
+    })
 }
 
 /// Rewrite NEW/OLD references in WHEN clause expressions (uses Register expressions, not Variable)

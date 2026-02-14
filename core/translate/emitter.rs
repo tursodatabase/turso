@@ -4215,16 +4215,12 @@ fn emit_update_insns<'a>(
             });
             if !relevant_triggers.is_empty() {
                 let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
-                // For custom type columns, decode the encoded register values
-                // so AFTER triggers see user-facing values, not encoded blobs.
-                let new_registers_after = crate::translate::expr::emit_trigger_decode_registers(
-                    program,
-                    &t_ctx.resolver,
-                    &btree_table.columns,
-                    &|i| start + i,
-                    new_rowid_reg,
-                    btree_table.is_strict,
-                )?;
+                // Build raw NEW registers. Values are encoded at this point;
+                // fire_trigger will decode them via decode_trigger_registers.
+                let new_registers_after: Vec<usize> = (0..col_len)
+                    .map(|i| start + i)
+                    .chain(std::iter::once(new_rowid_reg))
+                    .collect();
 
                 // Use preserved OLD registers from BEFORE trigger
                 let old_registers_after = preserved_old_registers;
@@ -4232,14 +4228,14 @@ fn emit_update_insns<'a>(
                 // If the program has a trigger_conflict_override, propagate it to the trigger context.
                 let trigger_ctx_after =
                     if let Some(override_conflict) = program.trigger_conflict_override {
-                        TriggerContext::new_with_override_conflict(
+                        TriggerContext::new_after_with_override_conflict(
                             btree_table,
                             Some(new_registers_after),
                             old_registers_after, // OLD values preserved from BEFORE trigger
                             override_conflict,
                         )
                     } else {
-                        TriggerContext::new(
+                        TriggerContext::new_after(
                             btree_table,
                             Some(new_registers_after),
                             old_registers_after, // OLD values preserved from BEFORE trigger

@@ -732,47 +732,38 @@ pub fn translate_insert(
         .collect()
     });
     if !relevant_after_triggers.is_empty() {
-        // Build NEW registers for AFTER triggers. For custom type columns,
-        // the register values are encoded blobs at this point. Copy and
-        // decode them so triggers see user-facing values.
-        let columns: Vec<crate::schema::Column> = insertion
+        // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
+        // fire_trigger will decode them via decode_trigger_registers.
+        let key_reg = insertion.key_register();
+        let new_registers_after: Vec<usize> = insertion
             .col_mappings
             .iter()
-            .map(|cm| cm.column.clone())
-            .collect();
-        let col_mappings_ref = &insertion.col_mappings;
-        let key_reg = insertion.key_register();
-        let new_registers_after = super::expr::emit_trigger_decode_registers(
-            &mut program,
-            resolver,
-            &columns,
-            &|i| {
-                if col_mappings_ref[i].column.is_rowid_alias() {
+            .map(|cm| {
+                if cm.column.is_rowid_alias() {
                     key_reg
                 } else {
-                    col_mappings_ref[i].register
+                    cm.register
                 }
-            },
-            key_reg,
-            btree_table.is_strict,
-        )?;
+            })
+            .chain(std::iter::once(key_reg))
+            .collect();
         // Determine the conflict resolution to propagate to AFTER triggers (same logic as BEFORE)
         let trigger_ctx_after = if let Some(override_conflict) = program.trigger_conflict_override {
-            TriggerContext::new_with_override_conflict(
+            TriggerContext::new_after_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),
                 None,
                 override_conflict,
             )
         } else if matches!(ctx.on_conflict, ResolveType::Ignore) {
-            TriggerContext::new_with_override_conflict(
+            TriggerContext::new_after_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),
                 None,
                 ResolveType::Ignore,
             )
         } else {
-            TriggerContext::new(btree_table.clone(), Some(new_registers_after), None)
+            TriggerContext::new_after(btree_table.clone(), Some(new_registers_after), None)
         };
         // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
         // not skip post-row work (FK counters, autoincrement, CDC, RETURNING).
