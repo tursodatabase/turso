@@ -1376,7 +1376,7 @@ where
                     Err(_) => return Value::Null,
                 }
             }
-            }
+            
             Some('V') => {
                 let mut temp = p;
                 temp.i_jd += (3 - days_after_mon(&p)) * 86400000;
@@ -1409,7 +1409,7 @@ where
     }
 
     Value::from_text(res)
-}
+}   
 
 #[cfg(test)]
 mod tests {
