@@ -183,6 +183,15 @@ pub enum Stmt {
 
     /// `CREATE VIRTUAL TABLE`
     CreateVirtualTable(CreateVirtualTable),
+    /// `CREATE TYPE`
+    CreateType {
+        /// `IF NOT EXISTS`
+        if_not_exists: bool,
+        /// type name
+        type_name: String,
+        /// type body
+        body: CreateTypeBody,
+    },
     /// `DELETE`
     Delete {
         /// CTE
@@ -232,6 +241,13 @@ pub enum Stmt {
         if_exists: bool,
         /// view name
         view_name: QualifiedName,
+    },
+    /// `DROP TYPE`
+    DropType {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// type name
+        type_name: String,
     },
     /// `INSERT`
     Insert {
@@ -1148,6 +1164,36 @@ pub enum AlterTableBody {
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
 }
 
+/// Operator mapping in a `CREATE TYPE` body
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeOperator {
+    /// operator symbol: "+", "-", "*", "/", "<", "=", etc.
+    pub op: String,
+    /// type name of right operand
+    pub right_type: String,
+    /// function name to call
+    pub func_name: String,
+}
+
+/// Body of a `CREATE TYPE` statement
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreateTypeBody {
+    /// type parameter names, e.g. ["precision", "scale"] for decimal(precision, scale)
+    pub params: Vec<String>,
+    /// base storage type: "text", "integer", "real", "blob"
+    pub base: String,
+    /// encode expression (called on write), uses `value` placeholder for input
+    pub encode: Option<Box<Expr>>,
+    /// decode expression (called on read), uses `value` placeholder for input
+    pub decode: Option<Box<Expr>>,
+    /// operator-to-function mappings
+    pub operators: Vec<TypeOperator>,
+    /// default expression for columns of this type
+    pub default: Option<Box<Expr>>,
+}
+
 /// `CREATE TABLE` body
 // https://sqlite.org/lang_createtable.html
 // https://sqlite.org/syntax/create-table-stmt.html
@@ -1591,6 +1637,8 @@ pub enum PragmaName {
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
+    /// List all available types (built-in and custom)
+    ListTypes,
 }
 
 /// `CREATE TRIGGER` time

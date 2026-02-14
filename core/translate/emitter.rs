@@ -108,7 +108,10 @@ pub struct Resolver<'a> {
     pub schema: &'a Schema,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
-    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize)>,
+    /// Cache entries: (expression, register, needs_custom_type_decode).
+    /// The `needs_custom_type_decode` flag is true for hash-join payload registers
+    /// that contain raw encoded values and need DECODE applied when read.
+    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize, bool)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -135,17 +138,18 @@ impl<'a> Resolver<'a> {
         self.expr_to_reg_cache_enabled = true;
     }
 
-    /// Returns the register for a previously translated expression, if caching is enabled.
+    /// Returns the register and decode flag for a previously translated expression.
     ///
     /// We scan from newest to oldest so later translations win when equivalent
     /// expressions are seen multiple times in the same translation pass.
-    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<usize> {
+    /// Returns `(register, needs_custom_type_decode)`.
+    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<(usize, bool)> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()
                 .rev()
-                .find(|(e, _)| exprs_are_equivalent(expr, e))
-                .map(|(_, reg)| *reg)
+                .find(|(e, _, _)| exprs_are_equivalent(expr, e))
+                .map(|(_, reg, needs_decode)| (*reg, *needs_decode))
         } else {
             None
         }
@@ -2097,6 +2101,7 @@ fn emit_delete_insns_when_triggers_present(
                     trigger,
                     &trigger_ctx,
                     connection,
+                    skip_not_found_label,
                 )?;
             }
         }
@@ -2164,6 +2169,7 @@ fn emit_delete_insns_when_triggers_present(
                     trigger,
                     &trigger_ctx_after,
                     connection,
+                    skip_not_found_label,
                 )?;
             }
         }
@@ -2773,6 +2779,9 @@ fn emit_update_insns<'a>(
         None
     };
 
+    // Label for RAISE(IGNORE) to skip the current row during UPDATE triggers
+    let trigger_ignore_jump_label = program.allocate_label();
+
     if not_exists_check_required {
         program.emit_insn(Insn::NotExists {
             cursor: target_table_cursor_id,
@@ -2916,6 +2925,7 @@ fn emit_update_insns<'a>(
                     trigger,
                     &trigger_ctx,
                     connection,
+                    trigger_ignore_jump_label,
                 )?;
             }
 
@@ -3153,6 +3163,7 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
                         description: column_names,
+                        on_error: None,
                     });
                 }
                 _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
@@ -3209,6 +3220,7 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description,
+                        on_error: None,
                     });
                 }
                 _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
@@ -3235,11 +3247,26 @@ fn emit_update_insns<'a>(
     // This ensures that if a constraint fails, indexes remain consistent.
     if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
+            // Encode only SET clause columns. Non-SET columns were read from disk
+            // and are already encoded; re-encoding them would corrupt data.
+            let set_col_indices: std::collections::HashSet<usize> =
+                set_clauses.iter().map(|(idx, _)| *idx).collect();
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                &t_ctx.resolver,
+                &btree_table.columns,
+                start,
+                Some(&set_col_indices),
+            )?;
+
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
                 count: col_len,
                 check_generated: true,
-                table_reference: Arc::clone(&btree_table),
+                table_reference: BTreeTable::type_check_table_ref(
+                    &btree_table,
+                    t_ctx.resolver.schema,
+                ),
             });
         }
 
@@ -3588,6 +3615,7 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description: column_names,
+                        on_error: None,
                     });
                 }
             }
@@ -3715,6 +3743,7 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description,
+                        on_error: None,
                     });
                 }
             }
@@ -3844,7 +3873,9 @@ fn emit_update_insns<'a>(
             let has_relevant_triggers = relevant_triggers.clone().count() > 0;
             if has_relevant_triggers {
                 let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
-                let new_registers_after = (0..col_len)
+                // Build raw NEW registers. Values are encoded at this point;
+                // fire_trigger will decode them via decode_trigger_registers.
+                let new_registers_after: Vec<usize> = (0..col_len)
                     .map(|i| start + i)
                     .chain(std::iter::once(new_rowid_reg))
                     .collect();
@@ -3855,20 +3886,23 @@ fn emit_update_insns<'a>(
                 // If the program has a trigger_conflict_override, propagate it to the trigger context.
                 let trigger_ctx_after =
                     if let Some(override_conflict) = program.trigger_conflict_override {
-                        TriggerContext::new_with_override_conflict(
+                        TriggerContext::new_after_with_override_conflict(
                             btree_table.clone(),
                             Some(new_registers_after),
                             old_registers_after, // OLD values preserved from BEFORE trigger
                             override_conflict,
                         )
                     } else {
-                        TriggerContext::new(
+                        TriggerContext::new_after(
                             btree_table.clone(),
                             Some(new_registers_after),
                             old_registers_after, // OLD values preserved from BEFORE trigger
                         )
                     };
 
+                // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
+                // not skip post-row work (RETURNING, CDC).
+                let after_trigger_done = program.allocate_label();
                 for trigger in relevant_triggers {
                     fire_trigger(
                         program,
@@ -3876,8 +3910,10 @@ fn emit_update_insns<'a>(
                         trigger,
                         &trigger_ctx_after,
                         connection,
+                        after_trigger_done,
                     )?;
                 }
+                program.preassign_label_to_next_insn(after_trigger_done);
             }
         }
 
@@ -3991,6 +4027,7 @@ fn emit_update_insns<'a>(
     if let Some(label) = check_rowid_not_exists_label {
         program.preassign_label_to_next_insn(label);
     }
+    program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
     Ok(())
 }
@@ -4490,6 +4527,7 @@ fn emit_check_constraint_bytecode(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
+                    on_error: None,
                 });
             }
         }
@@ -4536,14 +4574,14 @@ pub(crate) fn emit_check_constraints<'a>(
         let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(rowid_expr), rowid_reg));
+            .push((Cow::Owned(rowid_expr), rowid_reg, false));
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(rowid_name.to_string()),
         );
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), rowid_reg));
+            .push((Cow::Owned(qualified_expr), rowid_reg, false));
     }
 
     // Map each column to its register (both unqualified and qualified forms).
@@ -4551,14 +4589,14 @@ pub(crate) fn emit_check_constraints<'a>(
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(column_expr), register));
+            .push((Cow::Owned(column_expr), register, false));
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(col_name.to_string()),
         );
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), register));
+            .push((Cow::Owned(qualified_expr), register, false));
     }
 
     resolver.enable_expr_to_reg_cache();

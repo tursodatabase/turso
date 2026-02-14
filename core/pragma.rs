@@ -188,6 +188,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["ignore_check_constraints"],
         ),
+        ListTypes => Pragma::new(
+            PragmaFlags::Result0,
+            &["type", "parent", "encode", "decode", "default", "operators"],
+        ),
     }
 }
 

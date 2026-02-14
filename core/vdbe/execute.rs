@@ -41,8 +41,9 @@ use crate::vector::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
-        SQLITE_CONSTRAINT_PRIMARYKEY,
+        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
+        SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
+        SQLITE_ERROR,
     },
     ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
@@ -137,8 +138,91 @@ macro_rules! return_if_io {
     };
 }
 
+macro_rules! check_arg_count {
+    ($actual:expr, $expected:expr) => {
+        if $actual != $expected {
+            return Err(LimboError::InternalError(format!(
+                "expected {} argument(s), got {}",
+                $expected, $actual
+            )));
+        }
+    };
+}
+
 pub type InsnFunction =
     fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> Result<InsnFunctionStepResult>;
+
+/// Parse a Value (text, int, float, or blob) into a BigDecimal.
+fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
+    use bigdecimal::BigDecimal;
+    use std::str::FromStr;
+    match val {
+        Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
+        Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
+            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
+        Value::Text(t) => BigDecimal::from_str(&t.value)
+            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
+        Value::Blob(b) => crate::numeric::decimal::blob_to_bigdecimal(b),
+        _ => Err(LimboError::Constraint(format!(
+            "cannot convert to numeric: \"{val}\""
+        ))),
+    }
+}
+
+/// Create a sort comparator closure from a custom type `<` operator function name.
+/// Returns None if the function name is not recognized as a comparator.
+fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComparator> {
+    use crate::types::ValueRef;
+    use std::cmp::Ordering;
+    match func_name {
+        "numeric_lt" => Some(std::sync::Arc::new(
+            |a: &ValueRef, b: &ValueRef| -> Ordering {
+                match (a, b) {
+                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
+                    (ValueRef::Null, _) => Ordering::Less,
+                    (_, ValueRef::Null) => Ordering::Greater,
+                    _ => {
+                        // Decode from ValueRef to Value for value_to_bigdecimal
+                        let a_val = a.to_owned();
+                        let b_val = b.to_owned();
+                        match (value_to_bigdecimal(&a_val), value_to_bigdecimal(&b_val)) {
+                            (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
+                            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+                        }
+                    }
+                }
+            },
+        )),
+        "test_uint_lt" => Some(std::sync::Arc::new(
+            |a: &ValueRef, b: &ValueRef| -> Ordering {
+                fn to_u64(v: &ValueRef) -> Option<u64> {
+                    match v {
+                        ValueRef::Null => None,
+                        ValueRef::Numeric(Numeric::Integer(i)) => {
+                            if *i >= 0 {
+                                Some(*i as u64)
+                            } else {
+                                None
+                            }
+                        }
+                        ValueRef::Text(t) => t.to_string().parse::<u64>().ok(),
+                        _ => None,
+                    }
+                }
+                match (a, b) {
+                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
+                    (ValueRef::Null, _) => Ordering::Less,
+                    (_, ValueRef::Null) => Ordering::Greater,
+                    _ => match (to_u64(a), to_u64(b)) {
+                        (Some(a), Some(b)) => a.cmp(&b),
+                        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+                    },
+                }
+            },
+        )),
+        _ => None,
+    }
+}
 
 /// Compare two values using the specified collation for text values.
 /// Non-text values are compared using their natural ordering.
@@ -1686,14 +1770,16 @@ pub fn op_type_check(
                 b"BLOB" if value_type == ValueType::Blob => {}
                 b"TEXT" if value_type == ValueType::Text => {}
                 b"ANY" => {}
-                _ => bail_constraint_error!(
-                    "cannot store {} value in {} column {}.{} ({})",
-                    value_type,
-                    ty_str,
-                    &table_reference.name,
-                    col.name.as_deref().unwrap_or(""),
-                    SQLITE_CONSTRAINT
-                ),
+                _ => {
+                    bail_constraint_error!(
+                        "cannot store {} value in {} column {}.{} ({})",
+                        value_type,
+                        ty_str,
+                        &table_reference.name,
+                        col.name.as_deref().unwrap_or(""),
+                        SQLITE_CONSTRAINT
+                    );
+                }
             });
             Ok(())
         })?;
@@ -1897,6 +1983,7 @@ pub fn halt(
     pager: &Arc<Pager>,
     err_code: usize,
     description: &str,
+    on_error: Option<ResolveType>,
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
@@ -1918,6 +2005,31 @@ pub fn halt(
         vtab_rollback_all(&program.connection)?;
     }
 
+    // Handle RAISE errors - these carry their own resolve type
+    if let Some(resolve_type) = on_error {
+        // RAISE(IGNORE) signals the parent to skip the current row
+        if resolve_type == ResolveType::Ignore {
+            return Err(LimboError::RaiseIgnore);
+        }
+        if err_code > 0 {
+            let error = match resolve_type {
+                ResolveType::Abort => LimboError::RaiseAbort(description.to_string()),
+                ResolveType::Rollback => LimboError::RaiseRollback(description.to_string()),
+                ResolveType::Fail => unreachable!("RAISE(FAIL) rejected at translate time"),
+                ResolveType::Ignore => unreachable!("handled above"),
+                ResolveType::Replace => unreachable!("Replace not valid for RAISE"),
+            };
+
+            // Trigger subprograms must not commit — just propagate the error.
+            // The parent program's abort() handles transaction state.
+            if program.is_trigger_subprogram() {
+                return Err(error);
+            }
+
+            return Err(error);
+        }
+    }
+
     // Determine the constraint error (if any) based on error code
     let constraint_error = match err_code {
         0 => None,
@@ -1933,6 +2045,13 @@ pub fn halt(
         SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
             "UNIQUE constraint failed: {description} (19)"
         ))),
+        SQLITE_CONSTRAINT_FOREIGNKEY => {
+            Some(LimboError::ForeignKeyConstraint(description.to_string()))
+        }
+        SQLITE_CONSTRAINT_TRIGGER => Some(LimboError::Constraint(description.to_string())),
+        // SQLITE_ERROR is a generic error (e.g. ALTER TABLE validation), not a constraint.
+        // Use InternalError so abort() doesn't apply ON CONFLICT resolution to it.
+        SQLITE_ERROR => Some(LimboError::InternalError(description.to_string())),
         _ => Some(LimboError::Constraint(format!(
             "undocumented halt error code {description}"
         ))),
@@ -2093,10 +2212,11 @@ pub fn op_halt(
         Halt {
             err_code,
             description,
+            on_error,
         },
         insn
     );
-    halt(program, state, pager, *err_code, description)
+    halt(program, state, pager, *err_code, description, *on_error)
 }
 
 pub fn op_halt_if_null(
@@ -2114,7 +2234,7 @@ pub fn op_halt_if_null(
         insn
     );
     if state.registers[*target_reg].get_value() == &Value::Null {
-        halt(program, state, pager, *err_code, description)
+        halt(program, state, pager, *err_code, description, None)
     } else {
         state.pc += 1;
         Ok(InsnFunctionStepResult::Step)
@@ -2642,6 +2762,7 @@ pub fn op_program(
         Program {
             params,
             program: subprogram,
+            ignore_jump_target,
         },
         insn
     );
@@ -2688,6 +2809,11 @@ pub fn op_program(
             }
             OpProgramState::Step { is_trigger } => {
                 let is_trigger = *is_trigger;
+                let mut raise_ignore = false;
+                // Track whether the subprogram aborted with an error. When abort()
+                // runs inside the subprogram, it already calls end_trigger_execution(),
+                // so we must not call it again after the loop.
+                let mut subprogram_aborted = false;
                 loop {
                     let mut statement = subprogram.write();
                     let res = statement.step();
@@ -2708,6 +2834,12 @@ pub fn op_program(
                             if program.resolve_type != ResolveType::Ignore {
                                 return Err(LimboError::Constraint(constraint_err));
                             }
+                            subprogram_aborted = true;
+                            break;
+                        }
+                        Err(LimboError::RaiseIgnore) => {
+                            raise_ignore = true;
+                            subprogram_aborted = true;
                             break;
                         }
                         Err(err) => {
@@ -2716,13 +2848,19 @@ pub fn op_program(
                     }
                 }
 
-                // Only end trigger execution if this was a trigger subprogram
-                if is_trigger {
+                // Only end trigger execution for normal completion. Error paths
+                // already called end_trigger_execution() via abort() in the subprogram.
+                if is_trigger && !subprogram_aborted {
                     program.connection.end_trigger_execution();
                 }
 
                 state.op_program_state = OpProgramState::Start;
-                state.pc += 1;
+                if raise_ignore {
+                    // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
+                    state.pc = ignore_jump_target.as_offset_int();
+                } else {
+                    state.pc += 1;
+                }
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
@@ -3856,6 +3994,7 @@ fn update_agg_payload(
     maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut [Value],
     collation: CollationSeq,
+    comparator: &Option<crate::vdbe::sorter::SortComparator>,
 ) -> Result<()> {
     match func {
         AggFunc::Count => {
@@ -4010,8 +4149,14 @@ fn update_agg_payload(
                 return Ok(());
             }
             use std::cmp::Ordering;
-            // Borrow payload[0] only for comparison, then drop before assignment
-            let cmp = compare_with_collation(&arg, &payload[0], Some(collation));
+            // Use custom type comparator if available, otherwise fall back to collation
+            let cmp = if let Some(ref cmp_fn) = comparator {
+                let arg_ref = arg.as_ref();
+                let payload_ref = payload[0].as_ref();
+                cmp_fn(&arg_ref, &payload_ref)
+            } else {
+                compare_with_collation(&arg, &payload[0], Some(collation))
+            };
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
                 AggFunc::Min => cmp == Ordering::Less,
@@ -4186,6 +4331,7 @@ pub fn op_agg_step(
             col,
             delimiter,
             func,
+            comparator_func_name,
         },
         insn
     );
@@ -4215,6 +4361,11 @@ pub fn op_agg_step(
             }
         };
     }
+
+    // Resolve custom type comparator for MIN/MAX if provided
+    let comparator = comparator_func_name
+        .as_deref()
+        .and_then(make_sort_comparator);
 
     // Step the aggregate
     match func {
@@ -4267,7 +4418,7 @@ pub fn op_agg_step(
                 );
             };
             let payload = agg.payload_mut();
-            update_agg_payload(func, arg, maybe_arg2, payload, collation)?;
+            update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
         }
     };
 
@@ -4337,6 +4488,7 @@ pub fn op_sorter_open(
             cursor_id,
             columns: _,
             order_and_collations,
+            comparator_func_names,
         },
         insn
     );
@@ -4360,10 +4512,15 @@ pub fn op_sorter_open(
         .iter()
         .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
         .unzip();
+    let comparators = comparator_func_names
+        .iter()
+        .map(|name| name.as_deref().and_then(make_sort_comparator))
+        .collect();
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
+        comparators,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
@@ -5609,6 +5766,305 @@ pub fn op_function(
                         }
                     }
                     _ => Value::Null,
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::TestUintEncode => {
+                check_arg_count!(arg_count, 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Numeric(Numeric::Integer(i)) => {
+                        if *i < 0 {
+                            return Err(LimboError::InternalError(
+                                "test_uint_encode: negative value".to_string(),
+                            ));
+                        }
+                        Value::build_text(i.to_string())
+                    }
+                    Value::Numeric(Numeric::Float(f)) => {
+                        if *f < 0.0 || f.fract() != 0.0 {
+                            return Err(LimboError::InternalError(
+                                "test_uint_encode: not a non-negative integer".to_string(),
+                            ));
+                        }
+                        Value::build_text((f64::from(*f) as u64).to_string())
+                    }
+                    Value::Text(t) => {
+                        let s = t.to_string();
+                        s.parse::<u64>().map_err(|_| {
+                            LimboError::InternalError(format!(
+                                "test_uint_encode: invalid uint: {s}"
+                            ))
+                        })?;
+                        Value::build_text(s)
+                    }
+                    _ => {
+                        return Err(LimboError::InternalError(
+                            "test_uint_encode: unsupported type".to_string(),
+                        ));
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::TestUintDecode => {
+                check_arg_count!(arg_count, 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    other => other.clone(),
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::TestUintAdd
+            | ScalarFunc::TestUintSub
+            | ScalarFunc::TestUintMul
+            | ScalarFunc::TestUintDiv => {
+                check_arg_count!(arg_count, 2);
+                let a = parse_test_uint(&state.registers[*start_reg])?;
+                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
+                let result = match (a, b) {
+                    (Some(a), Some(b)) => {
+                        let r = match scalar_func {
+                            ScalarFunc::TestUintAdd => a.checked_add(b),
+                            ScalarFunc::TestUintSub => a.checked_sub(b),
+                            ScalarFunc::TestUintMul => a.checked_mul(b),
+                            ScalarFunc::TestUintDiv => {
+                                if b == 0 {
+                                    None
+                                } else {
+                                    Some(a / b)
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                        match r {
+                            Some(v) => Value::build_text(v.to_string()),
+                            None => {
+                                return Err(LimboError::InternalError(
+                                    "test_uint arithmetic overflow/underflow".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => Value::Null,
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::TestUintLt | ScalarFunc::TestUintEq => {
+                check_arg_count!(arg_count, 2);
+                let a = parse_test_uint(&state.registers[*start_reg])?;
+                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
+                let result = match (a, b) {
+                    (Some(a), Some(b)) => {
+                        let cmp = match scalar_func {
+                            ScalarFunc::TestUintLt => a < b,
+                            ScalarFunc::TestUintEq => a == b,
+                            _ => unreachable!(),
+                        };
+                        Value::from_i64(if cmp { 1 } else { 0 })
+                    }
+                    _ => Value::Null,
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::TestReverseEncode | ScalarFunc::TestReverseDecode => {
+                check_arg_count!(arg_count, 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Text(t) => {
+                        let reversed: String = t.to_string().chars().rev().collect();
+                        Value::build_text(reversed)
+                    }
+                    other => {
+                        let s = other.to_string();
+                        let reversed: String = s.chars().rev().collect();
+                        Value::build_text(reversed)
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::BooleanToInt => {
+                check_arg_count!(arg_count, 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Numeric(Numeric::Integer(i)) => match *i {
+                        0 => Value::from_i64(0),
+                        1 => Value::from_i64(1),
+                        _ => {
+                            return Err(LimboError::Constraint(format!(
+                                "invalid input for type boolean: \"{i}\""
+                            )));
+                        }
+                    },
+                    Value::Text(t) => {
+                        let v = &t.value;
+                        match v.to_ascii_lowercase().as_str() {
+                            "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
+                            "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
+                            _ => {
+                                return Err(LimboError::Constraint(format!(
+                                    "invalid input for type boolean: \"{v}\""
+                                )));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(LimboError::Constraint(format!(
+                            "invalid input for type boolean: \"{other}\""
+                        )));
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::IntToBoolean => {
+                check_arg_count!(arg_count, 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Numeric(Numeric::Integer(0)) => Value::build_text("false".to_string()),
+                    _ => Value::build_text("true".to_string()),
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::ValidateIpAddr => {
+                check_arg_count!(arg_count, 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Text(t) => {
+                        let v = &t.value;
+                        v.parse::<std::net::IpAddr>().map_err(|_| {
+                            LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
+                        })?;
+                        val.get_value().clone()
+                    }
+                    other => {
+                        return Err(LimboError::Constraint(format!(
+                            "invalid input for type inet: \"{other}\""
+                        )));
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::NumericEncode => {
+                check_arg_count!(arg_count, 3);
+                let val = &state.registers[*start_reg];
+                let precision_reg = &state.registers[*start_reg + 1];
+                let scale_reg = &state.registers[*start_reg + 2];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    other => {
+                        use crate::numeric::decimal::{
+                            bigdecimal_to_blob, validate_precision_scale,
+                        };
+                        use bigdecimal::BigDecimal;
+                        use std::str::FromStr;
+
+                        let precision = match precision_reg.get_value() {
+                            Value::Numeric(Numeric::Integer(i)) => *i,
+                            _ => {
+                                return Err(LimboError::Constraint(
+                                    "numeric_encode: precision must be an integer".to_string(),
+                                ));
+                            }
+                        };
+                        let scale = match scale_reg.get_value() {
+                            Value::Numeric(Numeric::Integer(i)) => *i,
+                            _ => {
+                                return Err(LimboError::Constraint(
+                                    "numeric_encode: scale must be an integer".to_string(),
+                                ));
+                            }
+                        };
+                        let text = match other {
+                            Value::Numeric(Numeric::Integer(i)) => i.to_string(),
+                            Value::Numeric(Numeric::Float(f)) => f.to_string(),
+                            Value::Text(t) => t.value.to_string(),
+                            _ => {
+                                return Err(LimboError::Constraint(format!(
+                                    "invalid input for type numeric: \"{other}\""
+                                )));
+                            }
+                        };
+                        let bd = BigDecimal::from_str(&text).map_err(|_| {
+                            LimboError::Constraint(format!(
+                                "invalid input for type numeric: \"{text}\""
+                            ))
+                        })?;
+                        let validated = validate_precision_scale(&bd, precision, scale)?;
+                        Value::from_blob(bigdecimal_to_blob(&validated))
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::NumericDecode => {
+                check_arg_count!(arg_count, 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Blob(b) => {
+                        let bd = crate::numeric::decimal::blob_to_bigdecimal(b)?;
+                        Value::build_text(crate::numeric::decimal::format_numeric(&bd))
+                    }
+                    other => {
+                        return Err(LimboError::Constraint(format!(
+                            "numeric_decode: expected blob, got \"{other}\""
+                        )));
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::NumericAdd
+            | ScalarFunc::NumericSub
+            | ScalarFunc::NumericMul
+            | ScalarFunc::NumericDiv => {
+                check_arg_count!(arg_count, 2);
+                let lhs_val = state.registers[*start_reg].get_value().clone();
+                let rhs_val = state.registers[*start_reg + 1].get_value().clone();
+                let result = match (&lhs_val, &rhs_val) {
+                    (Value::Null, _) | (_, Value::Null) => Value::Null,
+                    _ => {
+                        let a = value_to_bigdecimal(&lhs_val)?;
+                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let res = match scalar_func {
+                            ScalarFunc::NumericAdd => a + b,
+                            ScalarFunc::NumericSub => a - b,
+                            ScalarFunc::NumericMul => a * b,
+                            ScalarFunc::NumericDiv => {
+                                use bigdecimal::Zero;
+                                if b.is_zero() {
+                                    return Err(LimboError::Constraint(
+                                        "division by zero".to_string(),
+                                    ));
+                                }
+                                a / b
+                            }
+                            _ => unreachable!(),
+                        };
+                        Value::build_text(crate::numeric::decimal::format_numeric(&res))
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
+                check_arg_count!(arg_count, 2);
+                let lhs_val = state.registers[*start_reg].get_value().clone();
+                let rhs_val = state.registers[*start_reg + 1].get_value().clone();
+                let result = match (&lhs_val, &rhs_val) {
+                    (Value::Null, _) | (_, Value::Null) => Value::Null,
+                    _ => {
+                        let a = value_to_bigdecimal(&lhs_val)?;
+                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let cmp_result = match scalar_func {
+                            ScalarFunc::NumericLt => a < b,
+                            ScalarFunc::NumericEq => a == b,
+                            _ => unreachable!(),
+                        };
+                        Value::from_i64(cmp_result as i64)
+                    }
                 };
                 state.registers[*dest] = Register::Value(result);
             }
@@ -8132,6 +8588,41 @@ pub fn op_drop_view(
         schema.remove_view(view_name)?;
         Ok::<(), crate::LimboError>(())
     })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_drop_type(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(DropType { db, type_name }, insn);
+    if *db > 0 {
+        todo!("temp databases not implemented yet");
+    }
+    let conn = program.connection.clone();
+    conn.with_schema_mut(|schema| {
+        schema.remove_type(type_name);
+        Ok::<(), crate::LimboError>(())
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_add_type(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(AddType { db, sql }, insn);
+    if *db > 0 {
+        todo!("temp databases not implemented yet");
+    }
+    let conn = program.connection.clone();
+    conn.with_schema_mut(|schema| schema.add_type_from_sql(sql))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -11286,6 +11777,31 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     false
 }
 
+fn parse_test_uint(reg: &Register) -> Result<Option<u64>> {
+    match reg.get_value() {
+        Value::Null => Ok(None),
+        Value::Numeric(Numeric::Integer(i)) => {
+            if *i < 0 {
+                Err(LimboError::InternalError(
+                    "test_uint: negative value".to_string(),
+                ))
+            } else {
+                Ok(Some(*i as u64))
+            }
+        }
+        Value::Text(t) => {
+            let s = t.to_string();
+            let v = s
+                .parse::<u64>()
+                .map_err(|_| LimboError::InternalError(format!("test_uint: invalid uint: {s}")))?;
+            Ok(Some(v))
+        }
+        _ => Err(LimboError::InternalError(
+            "test_uint: unsupported type".to_string(),
+        )),
+    }
+}
+
 // Compat for applications that test for SQLite.
 fn execute_sqlite_version() -> String {
     "3.50.4".to_string()
@@ -12552,6 +13068,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
+            &None,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5)); // unchanged
@@ -12566,6 +13083,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
+            &None,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(6));
@@ -12585,6 +13103,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
+            &None,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10));
@@ -12595,6 +13114,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
+            &None,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(15));
@@ -12614,6 +13134,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
+            &None,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10)); // unchanged
@@ -12629,6 +13150,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
+            &None,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5));
@@ -12640,6 +13162,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
+            &None,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -12651,6 +13174,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
+            &None,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -12670,6 +13194,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
+            &None,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(10.0));
@@ -12681,6 +13206,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
+            &None,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(30.0));

@@ -1,5 +1,6 @@
 use crate::{types::AsValueRef, Value, ValueRef};
 
+pub mod decimal;
 pub mod nonnan;
 
 use nonnan::NonNan;

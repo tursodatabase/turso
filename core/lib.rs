@@ -145,6 +145,7 @@ pub use vdbe::{
 
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
+mod turso_types_vtab;
 
 pub(crate) mod sync;
 pub(crate) mod thread;

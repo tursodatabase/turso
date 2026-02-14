@@ -1,14 +1,15 @@
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
-    CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateVirtualTable,
-    DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound, FrameClause, FrameExclude,
-    FrameMode, FromClause, FunctionTail, GroupBy, Indexed, IndexedColumn, InitDeferredPred,
-    InsertBody, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit,
-    Literal, Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder,
-    OneSelect, Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
-    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
-    TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
-    TypeSize, UnaryOperator, Update, Upsert, UpsertDo, UpsertIndex, Window, WindowDef, With,
+    CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
+    CreateVirtualTable, DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound,
+    FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GroupBy, Indexed,
+    IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
+    JoinedSelectTable, LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint,
+    NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
+    QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
+    SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
+    TriggerEvent, TriggerTime, Type, TypeOperator, TypeSize, UnaryOperator, Update, Upsert,
+    UpsertDo, UpsertIndex, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -892,7 +893,8 @@ impl<'a> Parser<'a> {
             TK_INDEX,
             TK_UNIQUE,
             TK_TRIGGER,
-            TK_MATERIALIZED
+            TK_MATERIALIZED,
+            TK_TYPE
         );
         let mut temp = false;
         if first_tok.token_type == TK_TEMP {
@@ -908,6 +910,7 @@ impl<'a> Parser<'a> {
             TK_TRIGGER => self.parse_create_trigger(temp),
             TK_VIRTUAL => self.parse_create_virtual(),
             TK_INDEX | TK_UNIQUE => self.parse_create_index(),
+            TK_TYPE => self.parse_create_type(),
             _ => unreachable!(),
         }
     }
@@ -1480,16 +1483,20 @@ impl<'a> Parser<'a> {
                 eat_assert!(self, TK_RAISE);
                 eat_expect!(self, TK_LP);
 
-                let resolve = match self.peek_no_eof()?.token_type {
+                let (resolve, shorthand) = match self.peek_no_eof()?.token_type {
                     TK_IGNORE => {
                         eat_assert!(self, TK_IGNORE);
-                        ResolveType::Ignore
+                        (ResolveType::Ignore, false)
                     }
-                    _ => self.parse_raise_type()?,
+                    // RAISE('message') shorthand — defaults to ABORT
+                    TK_STRING => (ResolveType::Abort, true),
+                    _ => (self.parse_raise_type()?, false),
                 };
 
                 let expr = if resolve != ResolveType::Ignore {
-                    eat_expect!(self, TK_COMMA);
+                    if !shorthand {
+                        eat_expect!(self, TK_COMMA);
+                    }
                     Some(self.parse_expr(0)?)
                 } else {
                     None
@@ -2938,30 +2945,15 @@ impl<'a> Parser<'a> {
                 eat_expect!(self, TK_RP);
                 let options = self.parse_table_options()?;
 
-                // strict check
+                // strict check: every column must have a datatype specified.
+                // Type names are validated later in the translator to allow custom types.
                 if options.contains_strict() {
                     for c in &columns {
-                        match &c.col_type {
-                            Some(Type { name, .. }) => {
-                                // The datatype must be one of following: INT INTEGER REAL TEXT BLOB ANY
-                                let bytes_name = name.as_bytes();
-                                match_ignore_ascii_case!(match bytes_name {
-                                    b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => {}
-                                    _ => {
-                                        return Err(Error::Custom(format!(
-                                            "unknown datatype for {}.{}: \"{}\"",
-                                            tbl_name, c.col_name, name
-                                        )));
-                                    }
-                                })
-                            }
-                            _ => {
-                                // Every column definition must specify a datatype for that column. The freedom to specify a column without a datatype is removed.
-                                return Err(Error::Custom(format!(
-                                    "missing datatype for {}.{}",
-                                    tbl_name, c.col_name
-                                )));
-                            }
+                        if c.col_type.is_none() {
+                            return Err(Error::Custom(format!(
+                                "missing datatype for {}.{}",
+                                tbl_name, c.col_name
+                            )));
                         }
                     }
                 }
@@ -4018,9 +4010,165 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse `CREATE TYPE [IF NOT EXISTS] name[(param, ...)] BASE base_type
+    ///     [ENCODE expr]
+    ///     [DECODE expr]
+    ///     [DEFAULT expr]
+    ///     [OPERATOR 'op' (right_type) -> func_name]*`
+    fn parse_create_type(&mut self) -> Result<Stmt> {
+        eat_assert!(self, TK_TYPE);
+        let if_not_exists = self.parse_if_not_exists()?;
+
+        // Parse type name
+        let name_tok = self.eat()?;
+        let type_name = match name_tok {
+            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
+            _ => return Err(Error::ParseError("expected type name".to_owned())),
+        };
+
+        // Parse optional parameter list: (param1, param2, ...)
+        let mut params = Vec::new();
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_LP {
+                eat_assert!(self, TK_LP);
+                loop {
+                    let param_tok = self.eat()?;
+                    match param_tok {
+                        Some(t) if t.token_type == TK_ID => {
+                            params.push(from_bytes(t.as_bytes()));
+                        }
+                        _ => return Err(Error::ParseError("expected parameter name".to_owned())),
+                    }
+                    match self.peek()? {
+                        Some(tok) if tok.token_type == TK_COMMA => {
+                            eat_assert!(self, TK_COMMA);
+                        }
+                        _ => break,
+                    }
+                }
+                eat_expect!(self, TK_RP);
+            }
+        }
+
+        // Parse BASE keyword + base type
+        let base_tok = self.eat()?;
+        match base_tok {
+            Some(tok) if tok.token_type == TK_ID => {
+                let kw = from_bytes_as_str(tok.as_bytes());
+                if !kw.eq_ignore_ascii_case("BASE") {
+                    return Err(Error::ParseError(format!("expected BASE, got {kw}")));
+                }
+            }
+            _ => return Err(Error::ParseError("expected BASE keyword".to_owned())),
+        }
+
+        let base_type_tok = self.eat()?;
+        let base = match base_type_tok {
+            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()).to_lowercase(),
+            _ => return Err(Error::ParseError("expected base type name".to_owned())),
+        };
+
+        // Validate base type
+        match base.as_str() {
+            "text" | "integer" | "real" | "blob" => {}
+            _ => {
+                return Err(Error::ParseError(format!(
+                    "invalid base type '{base}', must be one of: text, integer, real, blob"
+                )));
+            }
+        }
+
+        let mut encode = None;
+        let mut decode = None;
+        let mut default = None;
+        let mut operators = Vec::new();
+
+        // Parse optional clauses: ENCODE, DECODE, OPERATOR
+        loop {
+            match self.peek()? {
+                Some(tok) if tok.token_type == TK_ID => {
+                    let kw = from_bytes_as_str(tok.as_bytes()).to_ascii_uppercase();
+                    match kw.as_str() {
+                        "ENCODE" => {
+                            eat_assert!(self, TK_ID);
+                            let expr = self.parse_expr(0)?;
+                            encode = Some(expr);
+                        }
+                        "DECODE" => {
+                            eat_assert!(self, TK_ID);
+                            let expr = self.parse_expr(0)?;
+                            decode = Some(expr);
+                        }
+                        "OPERATOR" => {
+                            eat_assert!(self, TK_ID);
+                            // Parse operator symbol as a string literal: '+'
+                            let op_tok = eat_expect!(self, TK_STRING);
+                            let op_raw = from_bytes(op_tok.as_bytes());
+                            // Strip quotes from string literal
+                            let op = op_raw
+                                .strip_prefix('\'')
+                                .and_then(|s| s.strip_suffix('\''))
+                                .unwrap_or(&op_raw)
+                                .to_owned();
+                            // Parse (right_type)
+                            eat_expect!(self, TK_LP);
+                            let rt_tok = self.eat()?;
+                            let right_type = match rt_tok {
+                                Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
+                                _ => {
+                                    return Err(Error::ParseError(
+                                        "expected type name in OPERATOR clause".to_owned(),
+                                    ))
+                                }
+                            };
+                            eat_expect!(self, TK_RP);
+                            // Parse -> func_name
+                            eat_expect!(self, TK_PTR);
+                            let func_tok = self.eat()?;
+                            let func_name = match func_tok {
+                                Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
+                                _ => {
+                                    return Err(Error::ParseError(
+                                        "expected function name after -> in OPERATOR clause"
+                                            .to_owned(),
+                                    ))
+                                }
+                            };
+                            operators.push(TypeOperator {
+                                op,
+                                right_type,
+                                func_name,
+                            });
+                        }
+                        _ => break,
+                    }
+                }
+                Some(tok) if tok.token_type == TK_DEFAULT => {
+                    eat_assert!(self, TK_DEFAULT);
+                    let expr = self.parse_expr(0)?;
+                    default = Some(expr);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(Stmt::CreateType {
+            if_not_exists,
+            type_name,
+            body: CreateTypeBody {
+                params,
+                base,
+                encode,
+                decode,
+                operators,
+                default,
+            },
+        })
+    }
+
     fn parse_drop_stmt(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_DROP);
-        let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW);
+        let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW, TK_TYPE);
 
         match tok.token_type {
             TK_TABLE => {
@@ -4057,6 +4205,19 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::DropView {
                     if_exists,
                     view_name,
+                })
+            }
+            TK_TYPE => {
+                eat_assert!(self, TK_TYPE);
+                let if_exists = self.parse_if_exists()?;
+                let name_tok = self.eat()?;
+                let type_name = match name_tok {
+                    Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
+                    _ => return Err(Error::ParseError("expected type name".to_owned())),
+                };
+                Ok(Stmt::DropType {
+                    if_exists,
+                    type_name,
                 })
             }
             _ => unreachable!(),
@@ -4204,7 +4365,6 @@ mod tests {
             "CREATE TEMP TABLE baz.foo(bar)",
             "CREATE TABLE foo(d INT AS (a*abs(b)))",
             "CREATE TABLE foo(d INT AS (a*abs(b)))",
-            "CREATE TABLE foo(bar UNKNOWN_INT) STRICT",
             "CREATE TABLE foo(bar) STRICT",
             "CREATE TABLE foo(bar) WITHOUT ROWID",
             "CREATE VIEW foo(bar, bar) AS SELECT 1, 1",
@@ -5185,6 +5345,33 @@ mod tests {
             ),
             (
                 b"SELECT RAISE (ABORT, 'error')".as_slice(),
+                vec![Cmd::Stmt(Stmt::Select(Select {
+                    with: None,
+                    body: SelectBody {
+                        select: OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![ResultColumn::Expr(
+                                Box::new(Expr::Raise(
+                                    ResolveType::Abort,
+                                    Some(Box::new(Expr::Literal(Literal::String(
+                                        "'error'".to_owned(),
+                                    )))),
+                                )),
+                                None,
+                            )],
+                            from: None,
+                            where_clause: None,
+                            group_by: None,
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                }))],
+            ),
+            (
+                b"SELECT RAISE ('error')".as_slice(),
                 vec![Cmd::Stmt(Stmt::Select(Select {
                     with: None,
                     body: SelectBody {

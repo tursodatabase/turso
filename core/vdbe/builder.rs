@@ -160,6 +160,18 @@ pub struct ProgramBuilder {
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
     cursor_overrides: HashMap<usize, CursorID>,
+    /// Maps identifier names to registers for custom type encode/decode expressions.
+    /// When set, `Expr::Id("value")` resolves to the register holding the input value,
+    /// and type parameter names resolve to registers holding their concrete values.
+    pub id_register_overrides: HashMap<String, usize>,
+    /// When set, translate_expr will skip custom type decode for Expr::Column.
+    /// This is used when building ORDER BY sort keys for custom types without a `<` operator,
+    /// so the sorter sorts on the encoded (on-disk) values.
+    pub suppress_custom_type_decode: bool,
+    /// When true, the next `emit_column` call will not bake the default value
+    /// into the Column instruction. Used for custom type columns where the default
+    /// needs to be encoded before use.
+    pub suppress_column_default: bool,
     /// Hash join build signatures keyed by hash table id.
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
@@ -395,6 +407,9 @@ impl ProgramBuilder {
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
+            id_register_overrides: HashMap::default(),
+            suppress_custom_type_decode: false,
+            suppress_column_default: false,
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: HashSet::default(),
             subquery_result_regs: HashMap::default(),
@@ -729,6 +744,7 @@ impl ProgramBuilder {
             } else {
                 String::new()
             },
+            on_error: None,
         });
     }
 
@@ -740,6 +756,7 @@ impl ProgramBuilder {
         self.emit_insn(Insn::Halt {
             err_code,
             description,
+            on_error: None,
         });
     }
 
@@ -1114,6 +1131,9 @@ impl ProgramBuilder {
                 Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
+                Insn::Program {
+                    ignore_jump_target, ..
+                } => resolve(ignore_jump_target, "Program")?,
                 _ => {}
             }
         }
@@ -1296,6 +1316,7 @@ impl ProgramBuilder {
             self.emit_insn(Insn::Halt {
                 err_code: 0,
                 description: description.to_string(),
+                on_error: None,
             });
             return;
         }
@@ -1366,6 +1387,9 @@ impl ProgramBuilder {
                 .get(column)
                 .expect("column index out of bounds");
             if column_def.is_rowid_alias() {
+                // Consume the suppress_column_default flag so it doesn't
+                // leak to the next column (emit_column normally consumes it).
+                self.suppress_column_default = false;
                 self.emit_insn(Insn::RowId {
                     cursor_id,
                     dest: out,
@@ -1414,6 +1438,13 @@ impl ProgramBuilder {
                 ),
                 _ => break 'value None,
             })
+        };
+
+        let default = if self.suppress_column_default {
+            self.suppress_column_default = false;
+            None
+        } else {
+            default
         };
 
         self.emit_insn(Insn::Column {

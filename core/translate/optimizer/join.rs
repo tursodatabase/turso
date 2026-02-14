@@ -1021,9 +1021,13 @@ pub fn compute_best_join_order<'a>(
     // the one we choose, if the cost reduction from avoiding sorting brings it below the cost of the overall best one.
     let mut best_ordered_plan: Option<JoinN> = None;
     let mut best_plan_is_also_ordered = match (naive_plan.as_ref(), maybe_order_target) {
-        (Some(plan), Some(order_target)) => {
-            plan_satisfies_order_target(plan, access_methods_arena, joined_tables, order_target)
-        }
+        (Some(plan), Some(order_target)) => plan_satisfies_order_target(
+            plan,
+            access_methods_arena,
+            joined_tables,
+            order_target,
+            schema,
+        ),
         _ => false,
     };
 
@@ -1239,6 +1243,7 @@ pub fn compute_best_join_order<'a>(
                             access_methods_arena,
                             joined_tables,
                             order_target,
+                            schema,
                         )
                     } else {
                         false
@@ -1281,6 +1286,7 @@ pub fn compute_best_join_order<'a>(
                             access_methods_arena,
                             joined_tables,
                             order_target,
+                            schema,
                         )
                     } else {
                         false

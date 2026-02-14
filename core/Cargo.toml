@@ -99,6 +99,9 @@ branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
 smallvec = "1.15.1"
 fastbloom = "0.14.1"
+bigdecimal = "0.4"
+num-bigint = "0.4"
+num-traits = "0.2"
 
 [target.'cfg(antithesis)'.dependencies]
 antithesis_sdk = { workspace = true, features = ["full"] }

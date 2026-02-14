@@ -145,6 +145,7 @@ fn keyword_or_id_token(input: &[u8]) -> TokenType {
         b"TO" => TokenType::TK_TO,
         b"TRANSACTION" => TokenType::TK_TRANSACTION,
         b"TRIGGER" => TokenType::TK_TRIGGER,
+        b"TYPE" => TokenType::TK_TYPE,
         b"UNBOUNDED" => TokenType::TK_UNBOUNDED,
         b"UNION" => TokenType::TK_UNION,
         b"UNIQUE" => TokenType::TK_UNIQUE,

@@ -23,7 +23,7 @@ use crate::{
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{ResolveType, SortOrder};
 
 /// Metadata for a table during integrity check, used for constraint validation.
 #[derive(Debug, Clone)]
@@ -582,6 +582,8 @@ pub enum Insn {
     Halt {
         err_code: usize,
         description: String,
+        /// Override the program's resolve_type for error handling (used by RAISE).
+        on_error: Option<ResolveType>,
     },
 
     /// Halt the program if P3 is null.
@@ -633,6 +635,9 @@ pub enum Insn {
     Program {
         params: Vec<Value>,
         program: Arc<RwLock<Statement>>,
+        /// Jump target when RAISE(IGNORE) fires in the subprogram.
+        /// Points to the "skip this row" address in the parent program.
+        ignore_jump_target: BranchOffset,
     },
 
     /// Write an integer value into a register.
@@ -805,6 +810,8 @@ pub enum Insn {
         col: usize,
         delimiter: usize,
         func: AggFunc,
+        /// Optional custom type comparator function name for MIN/MAX aggregates.
+        comparator_func_name: Option<String>,
     },
 
     AggFinal {
@@ -827,6 +834,9 @@ pub enum Insn {
         columns: usize,      // P2
         /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
         order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
+        /// Per-column custom type comparator function names for ORDER BY sorting.
+        /// When present, the comparator is used instead of standard value comparison.
+        comparator_func_names: Vec<Option<String>>,
     },
 
     /// Insert a row into the sorter.
@@ -1096,6 +1106,20 @@ pub enum Insn {
         db: usize,
         /// The name of the trigger being dropped
         trigger_name: String,
+    },
+    /// Drop a custom type from the in-memory schema
+    DropType {
+        /// The database within which this type needs to be dropped
+        db: usize,
+        /// The name of the type being dropped
+        type_name: String,
+    },
+    /// Add a custom type to the in-memory schema by parsing its CREATE TYPE SQL
+    AddType {
+        /// The database within which this type needs to be added
+        db: usize,
+        /// The full CREATE TYPE SQL string
+        sql: String,
     },
 
     /// Close a cursor.
@@ -1595,6 +1619,8 @@ impl InsnVariants {
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,
             InsnVariants::DropTrigger => execute::op_drop_trigger,
+            InsnVariants::DropType => execute::op_drop_type,
+            InsnVariants::AddType => execute::op_add_type,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,

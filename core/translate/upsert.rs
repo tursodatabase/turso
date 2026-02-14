@@ -5,7 +5,7 @@ use std::sync::Arc;
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{IndexColumn, ROWID_SENTINEL};
+use crate::schema::{BTreeTable, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, UpdateRowSource};
 use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -477,11 +477,23 @@ pub fn emit_upsert(
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
+            // Encode only SET clause columns. Non-SET columns were copied from
+            // the current row and are already encoded.
+            let set_col_indices: std::collections::HashSet<usize> =
+                set_pairs.iter().map(|(idx, _)| *idx).collect();
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                resolver,
+                &bt.columns,
+                new_start,
+                Some(&set_col_indices),
+            )?;
+
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
                 count: num_cols,
                 check_generated: true,
-                table_reference: Arc::clone(&bt),
+                table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema),
             });
         } else {
             // For non-STRICT tables, apply column affinity to the values.
@@ -555,7 +567,14 @@ pub fn emit_upsert(
             );
 
             for trigger in relevant_before_update_triggers {
-                fire_trigger(program, resolver, trigger, &trigger_ctx, connection)?;
+                fire_trigger(
+                    program,
+                    resolver,
+                    trigger,
+                    &trigger_ctx,
+                    connection,
+                    ctx.loop_labels.row_done,
+                )?;
             }
 
             // BEFORE UPDATE triggers may have altered the btree, need to re-seek
@@ -847,6 +866,7 @@ pub fn emit_upsert(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,
+                    on_error: None,
                 });
                 program.preassign_label_to_next_insn(ok);
             }
@@ -911,6 +931,7 @@ pub fn emit_upsert(
                     .and_then(|c| c.name.as_deref())
                     .unwrap_or("rowid")
             ),
+            on_error: None,
         });
         program.preassign_label_to_next_insn(ok);
 
@@ -1069,16 +1090,28 @@ pub fn emit_upsert(
 
             // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
             // clauses should not suppress errors. Override conflict resolution to Abort.
-            let trigger_ctx_after = TriggerContext::new_with_override_conflict(
+            // NEW values are encoded at this point; fire_trigger will decode them.
+            let trigger_ctx_after = TriggerContext::new_after_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),
                 Some(old_regs),
                 ast::ResolveType::Abort,
             );
 
+            // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
+            // not skip post-row work (RETURNING).
+            let after_trigger_done = program.allocate_label();
             for trigger in relevant_triggers {
-                fire_trigger(program, resolver, trigger, &trigger_ctx_after, connection)?;
+                fire_trigger(
+                    program,
+                    resolver,
+                    trigger,
+                    &trigger_ctx_after,
+                    connection,
+                    after_trigger_done,
+                )?;
             }
+            program.preassign_label_to_next_insn(after_trigger_done);
         }
     }
 

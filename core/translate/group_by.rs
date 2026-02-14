@@ -155,6 +155,7 @@ pub fn init_group_by<'a>(
             cursor_id: sort_cursor,
             columns: column_count,
             order_and_collations,
+            comparator_func_names: vec![],
         });
         let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
         GroupByRowSource::Sorter {
@@ -649,10 +650,11 @@ pub fn group_by_process_single_group(
             {
                 if *in_result {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
-                    t_ctx
-                        .resolver
-                        .expr_to_reg_cache
-                        .push((std::borrow::Cow::Borrowed(expr), next_reg));
+                    t_ctx.resolver.expr_to_reg_cache.push((
+                        std::borrow::Cow::Borrowed(expr),
+                        next_reg,
+                        false,
+                    ));
                     next_reg += 1;
                 }
             }
@@ -675,10 +677,11 @@ pub fn group_by_process_single_group(
                     dest_reg,
                     &t_ctx.resolver,
                 )?;
-                t_ctx
-                    .resolver
-                    .expr_to_reg_cache
-                    .push((std::borrow::Cow::Borrowed(expr), dest_reg));
+                t_ctx.resolver.expr_to_reg_cache.push((
+                    std::borrow::Cow::Borrowed(expr),
+                    dest_reg,
+                    false,
+                ));
             }
         }
     }
@@ -804,6 +807,7 @@ pub fn group_by_emit_row_phase<'a>(
         t_ctx.resolver.expr_to_reg_cache.push((
             std::borrow::Cow::Borrowed(&agg.original_expr),
             agg_result_reg,
+            false,
         ));
     }
 

@@ -5,7 +5,7 @@ use crate::ext::VTabImpl;
 use crate::function::Func;
 use crate::schema::{
     create_table, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
-    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
+    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -20,7 +20,7 @@ use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
-    to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn},
+    to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
 use crate::Connection;
 use crate::{bail_parse_error, Result};
@@ -165,6 +165,56 @@ fn validate(
         for constraint in constraints {
             if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
                 validate_check_expr(expr, table_name, &column_names, resolver)?;
+            }
+        }
+
+        let is_strict = options.contains_strict();
+
+        for c in columns {
+            if let Some(ref col_type) = c.col_type {
+                let type_name = &col_type.name;
+                let name_bytes = type_name.as_bytes();
+                let is_builtin = turso_macros::match_ignore_ascii_case!(match name_bytes {
+                    b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+                    _ => false,
+                });
+
+                if !is_builtin && is_strict {
+                    // On non-STRICT tables any type name is allowed and is
+                    // treated as a plain affinity hint (no encode/decode).
+                    // Custom type validation only applies to STRICT tables.
+                    let type_def = resolver.schema.get_type_def_unchecked(type_name);
+                    {
+                        match type_def {
+                            None => {
+                                bail_parse_error!(
+                                    "unknown datatype for {}.{}: \"{}\"",
+                                    table_name,
+                                    c.col_name,
+                                    type_name
+                                );
+                            }
+                            Some(td) if !td.params.is_empty() => {
+                                // Parametric type: verify the column provides the right
+                                // number of parameters (e.g. numeric(10,2)).
+                                let provided = match &col_type.size {
+                                    Some(ast::TypeSize::TypeSize(_, _)) => 2,
+                                    Some(ast::TypeSize::MaxSize(_)) => 1,
+                                    None => 0,
+                                };
+                                if provided != td.params.len() {
+                                    bail_parse_error!(
+                                        "type \"{}\" requires {} parameter(s), got {}",
+                                        type_name,
+                                        td.params.len(),
+                                        provided
+                                    );
+                                }
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
             }
         }
     }
@@ -1157,6 +1207,283 @@ pub fn translate_drop_table(
         db: 0,
         cookie: Cookie::SchemaVersion,
         value: resolver.schema.schema_version as i32 + 1,
+        p5: 0,
+    });
+
+    Ok(program)
+}
+
+/// Validate an encode or decode expression for safety.
+/// Rejects subqueries, aggregates, and window functions.
+fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Result<()> {
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+                bail_parse_error!("subqueries prohibited in {kind} expressions");
+            }
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => {
+                if filter_over.over_clause.is_some() {
+                    bail_parse_error!("window functions prohibited in {kind} expressions");
+                }
+                if let Some(func) = resolver.resolve_function(name.as_str(), args.len()) {
+                    if matches!(func, Func::Agg(..)) {
+                        bail_parse_error!(
+                            "aggregate functions prohibited in {kind} expressions: {}",
+                            name.as_str()
+                        );
+                    }
+                }
+            }
+            ast::Expr::FunctionCallStar { name, .. } => {
+                bail_parse_error!(
+                    "aggregate functions prohibited in {kind} expressions: {}",
+                    name.as_str()
+                );
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+pub fn translate_create_type(
+    type_name: &str,
+    body: &ast::CreateTypeBody,
+    if_not_exists: bool,
+    resolver: &Resolver,
+    mut program: ProgramBuilder,
+) -> Result<ProgramBuilder> {
+    let normalized_name = normalize_ident(type_name);
+
+    // Check if type already exists
+    if resolver
+        .schema
+        .get_type_def_unchecked(&normalized_name)
+        .is_some()
+    {
+        if if_not_exists {
+            return Ok(program);
+        }
+        bail_parse_error!("type {normalized_name} already exists");
+    }
+
+    // Validate encode/decode expressions for safety
+    if let Some(ref encode) = body.encode {
+        validate_type_expr(encode, "ENCODE", resolver)?;
+    }
+    if let Some(ref decode) = body.decode {
+        validate_type_expr(decode, "DECODE", resolver)?;
+    }
+
+    // Reconstruct the SQL string (without IF NOT EXISTS) using TypeDef::to_sql()
+    let type_def = crate::schema::TypeDef::from_create_type(&normalized_name, body, false);
+    let sql = type_def.to_sql();
+
+    // Ensure sqlite_turso_types table exists (lazy creation)
+    let types_table: Arc<BTreeTable>;
+    let types_root_page: RegisterOrLiteral<i64>;
+
+    if let Some(existing) = resolver.schema.get_btree_table(TURSO_TYPES_TABLE_NAME) {
+        types_table = existing.clone();
+        types_root_page = RegisterOrLiteral::Literal(existing.root_page);
+    } else {
+        // Create the sqlite_turso_types btree
+        let table_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: 0,
+            root: table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        let create_sql =
+            format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)");
+        types_table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
+        types_root_page = RegisterOrLiteral::Register(table_root_reg);
+
+        // Register it in sqlite_schema so it persists
+        let schema_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+        let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: schema_cursor_id,
+            root_page: 1i64.into(),
+            db: 0,
+        });
+        emit_schema_entry(
+            &mut program,
+            resolver,
+            schema_cursor_id,
+            None,
+            SchemaEntryType::Table,
+            TURSO_TYPES_TABLE_NAME,
+            TURSO_TYPES_TABLE_NAME,
+            table_root_reg,
+            Some(create_sql),
+        )?;
+
+        // Parse schema to register the new table in-memory
+        program.emit_insn(Insn::ParseSchema {
+            db: schema_cursor_id,
+            where_clause: Some(format!(
+                "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
+            )),
+        });
+    }
+
+    // Open sqlite_turso_types for writing
+    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: types_cursor_id,
+        root_page: types_root_page,
+        db: 0,
+    });
+
+    // Insert (name, sql) record
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: types_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    let name_reg = program.emit_string8_new_reg(normalized_name);
+    program.emit_string8_new_reg(sql.clone());
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(name_reg),
+        count: to_u16(2),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: types_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+    });
+
+    // Add the type to the in-memory registry
+    program.emit_insn(Insn::AddType { db: 0, sql });
+
+    program.emit_insn(Insn::SetCookie {
+        db: 0,
+        cookie: Cookie::SchemaVersion,
+        value: (resolver.schema.schema_version + 1) as i32,
+        p5: 0,
+    });
+
+    Ok(program)
+}
+
+pub fn translate_drop_type(
+    type_name: &str,
+    if_exists: bool,
+    resolver: &Resolver,
+    mut program: ProgramBuilder,
+) -> Result<ProgramBuilder> {
+    let normalized_name = normalize_ident(type_name);
+
+    // Check if type exists
+    let type_def = resolver.schema.get_type_def_unchecked(&normalized_name);
+    if type_def.is_none() {
+        if if_exists {
+            return Ok(program);
+        }
+        bail_parse_error!("no such type: {normalized_name}");
+    }
+
+    // Check if built-in type
+    if type_def.unwrap().is_builtin {
+        bail_parse_error!("cannot drop built-in type: {normalized_name}");
+    }
+
+    // Check if any table uses this type
+    for (_, table) in resolver.schema.tables.iter() {
+        for col in table.columns() {
+            if normalize_ident(&col.ty_str) == normalized_name {
+                bail_parse_error!(
+                    "cannot drop type {normalized_name}: used by column {} in table {}",
+                    col.name.as_deref().unwrap_or("?"),
+                    table.get_name()
+                );
+            }
+        }
+    }
+
+    // Open cursor to sqlite_turso_types table
+    let types_table = resolver
+        .schema
+        .get_btree_table(TURSO_TYPES_TABLE_NAME)
+        .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {normalized_name}")))?;
+    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: types_cursor_id,
+        root_page: types_table.root_page.into(),
+        db: 0,
+    });
+
+    // Search for matching row: name=type_name (col 0)
+    let name_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: name_reg,
+        value: normalized_name.clone(),
+    });
+
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: types_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    // Read name (col 0)
+    let col0_reg = program.alloc_register();
+    program.emit_column_or_rowid(types_cursor_id, 0, col0_reg);
+
+    let skip_delete_label = program.allocate_label();
+
+    // Check name=type_name
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+
+    // Delete matching row
+    program.emit_insn(Insn::Delete {
+        cursor_id: types_cursor_id,
+        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+        is_part_of_update: false,
+    });
+
+    program.resolve_label(skip_delete_label, program.offset());
+
+    program.emit_insn(Insn::Next {
+        cursor_id: types_cursor_id,
+        pc_if_next: loop_start_label,
+    });
+
+    program.preassign_label_to_next_insn(end_loop_label);
+
+    // Remove from in-memory schema
+    program.emit_insn(Insn::DropType {
+        db: 0,
+        type_name: normalized_name,
+    });
+
+    program.emit_insn(Insn::SetCookie {
+        db: 0,
+        cookie: Cookie::SchemaVersion,
+        value: (resolver.schema.schema_version + 1) as i32,
         p5: 0,
     });
 

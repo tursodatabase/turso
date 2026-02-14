@@ -459,6 +459,30 @@ pub enum ScalarFunc {
     StatInit,
     StatPush,
     StatGet,
+    // Test type functions (for custom type system testing)
+    TestUintEncode,
+    TestUintDecode,
+    TestUintAdd,
+    TestUintSub,
+    TestUintMul,
+    TestUintDiv,
+    TestUintLt,
+    TestUintEq,
+    TestReverseEncode,
+    TestReverseDecode,
+    // Built-in type support functions
+    BooleanToInt,
+    IntToBoolean,
+    ValidateIpAddr,
+    // Numeric type functions
+    NumericEncode,
+    NumericDecode,
+    NumericAdd,
+    NumericSub,
+    NumericMul,
+    NumericDiv,
+    NumericLt,
+    NumericEq,
 }
 
 impl Deterministic for ScalarFunc {
@@ -526,6 +550,27 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::StatInit => false, // internal ANALYZE function
             ScalarFunc::StatPush => false, // internal ANALYZE function
             ScalarFunc::StatGet => false,  // internal ANALYZE function
+            ScalarFunc::TestUintEncode
+            | ScalarFunc::TestUintDecode
+            | ScalarFunc::TestUintAdd
+            | ScalarFunc::TestUintSub
+            | ScalarFunc::TestUintMul
+            | ScalarFunc::TestUintDiv
+            | ScalarFunc::TestUintLt
+            | ScalarFunc::TestUintEq
+            | ScalarFunc::TestReverseEncode
+            | ScalarFunc::TestReverseDecode => true,
+            ScalarFunc::BooleanToInt
+            | ScalarFunc::IntToBoolean
+            | ScalarFunc::ValidateIpAddr
+            | ScalarFunc::NumericEncode
+            | ScalarFunc::NumericDecode
+            | ScalarFunc::NumericAdd
+            | ScalarFunc::NumericSub
+            | ScalarFunc::NumericMul
+            | ScalarFunc::NumericDiv
+            | ScalarFunc::NumericLt
+            | ScalarFunc::NumericEq => true,
         }
     }
 }
@@ -595,6 +640,27 @@ impl Display for ScalarFunc {
             Self::StatInit => "stat_init",
             Self::StatPush => "stat_push",
             Self::StatGet => "stat_get",
+            Self::TestUintEncode => "test_uint_encode",
+            Self::TestUintDecode => "test_uint_decode",
+            Self::TestUintAdd => "test_uint_add",
+            Self::TestUintSub => "test_uint_sub",
+            Self::TestUintMul => "test_uint_mul",
+            Self::TestUintDiv => "test_uint_div",
+            Self::TestUintLt => "test_uint_lt",
+            Self::TestUintEq => "test_uint_eq",
+            Self::TestReverseEncode => "test_reverse_encode",
+            Self::TestReverseDecode => "test_reverse_decode",
+            Self::BooleanToInt => "boolean_to_int",
+            Self::IntToBoolean => "int_to_boolean",
+            Self::ValidateIpAddr => "validate_ipaddr",
+            Self::NumericEncode => "numeric_encode",
+            Self::NumericDecode => "numeric_decode",
+            Self::NumericAdd => "numeric_add",
+            Self::NumericSub => "numeric_sub",
+            Self::NumericMul => "numeric_mul",
+            Self::NumericDiv => "numeric_div",
+            Self::NumericLt => "numeric_lt",
+            Self::NumericEq => "numeric_eq",
         };
         write!(f, "{str}")
     }
@@ -684,6 +750,29 @@ impl ScalarFunc {
             | Self::BinRecordJsonObject => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
+            // Test functions for custom types (1-arg encode/decode, 2-arg operators)
+            Self::TestUintEncode
+            | Self::TestUintDecode
+            | Self::TestReverseEncode
+            | Self::TestReverseDecode => &[1],
+            Self::TestUintAdd
+            | Self::TestUintSub
+            | Self::TestUintMul
+            | Self::TestUintDiv
+            | Self::TestUintLt
+            | Self::TestUintEq => &[2],
+            // Built-in type functions
+            Self::BooleanToInt
+            | Self::IntToBoolean
+            | Self::ValidateIpAddr
+            | Self::NumericDecode => &[1],
+            Self::NumericAdd
+            | Self::NumericSub
+            | Self::NumericMul
+            | Self::NumericDiv
+            | Self::NumericLt
+            | Self::NumericEq => &[2],
+            Self::NumericEncode => &[3],
         }
     }
 }
@@ -1148,6 +1237,29 @@ impl Func {
             "fts_match" => Ok(Self::Fts(FtsFunc::Match)),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             "fts_highlight" => Ok(Self::Fts(FtsFunc::Highlight)),
+            // Test type functions (for custom type system testing)
+            "test_uint_encode" => Ok(Self::Scalar(ScalarFunc::TestUintEncode)),
+            "test_uint_decode" => Ok(Self::Scalar(ScalarFunc::TestUintDecode)),
+            "test_uint_add" => Ok(Self::Scalar(ScalarFunc::TestUintAdd)),
+            "test_uint_sub" => Ok(Self::Scalar(ScalarFunc::TestUintSub)),
+            "test_uint_mul" => Ok(Self::Scalar(ScalarFunc::TestUintMul)),
+            "test_uint_div" => Ok(Self::Scalar(ScalarFunc::TestUintDiv)),
+            "test_uint_lt" => Ok(Self::Scalar(ScalarFunc::TestUintLt)),
+            "test_uint_eq" => Ok(Self::Scalar(ScalarFunc::TestUintEq)),
+            "test_reverse_encode" => Ok(Self::Scalar(ScalarFunc::TestReverseEncode)),
+            "test_reverse_decode" => Ok(Self::Scalar(ScalarFunc::TestReverseDecode)),
+            // Built-in type support functions
+            "boolean_to_int" => Ok(Self::Scalar(ScalarFunc::BooleanToInt)),
+            "int_to_boolean" => Ok(Self::Scalar(ScalarFunc::IntToBoolean)),
+            "validate_ipaddr" => Ok(Self::Scalar(ScalarFunc::ValidateIpAddr)),
+            "numeric_encode" => Ok(Self::Scalar(ScalarFunc::NumericEncode)),
+            "numeric_decode" => Ok(Self::Scalar(ScalarFunc::NumericDecode)),
+            "numeric_add" => Ok(Self::Scalar(ScalarFunc::NumericAdd)),
+            "numeric_sub" => Ok(Self::Scalar(ScalarFunc::NumericSub)),
+            "numeric_mul" => Ok(Self::Scalar(ScalarFunc::NumericMul)),
+            "numeric_div" => Ok(Self::Scalar(ScalarFunc::NumericDiv)),
+            "numeric_lt" => Ok(Self::Scalar(ScalarFunc::NumericLt)),
+            "numeric_eq" => Ok(Self::Scalar(ScalarFunc::NumericEq)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }

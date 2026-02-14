@@ -282,9 +282,9 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test strict-alter-add-column-invalid-varchar {
+test strict-alter-add-column-invalid-type {
     CREATE TABLE t(a INTEGER) STRICT;
-    ALTER TABLE t ADD COLUMN b VARCHAR(100);
+    ALTER TABLE t ADD COLUMN b FAKETYPE;
 }
 expect error {
 }
