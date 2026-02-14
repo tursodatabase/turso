@@ -689,16 +689,17 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
     let vfs_option = opts.vfs.clone();
 
+    let mut builder = Builder::new_local(&db_file);
+    if let Some(ref vfs) = vfs_option {
+        builder = builder.with_io(vfs.clone());
+    }
+    let db = Arc::new(Mutex::new(builder.build().await?));
+
     for thread in 0..opts.nr_threads {
         if stop {
             break;
         }
         let db_file = db_file.clone();
-        let mut builder = Builder::new_local(&db_file);
-        if let Some(ref vfs) = vfs_option {
-            builder = builder.with_io(vfs.clone());
-        }
-        let db = Arc::new(Mutex::new(builder.build().await?));
         let conn = db.lock().await.connect()?;
 
         match opts.tx_mode {
