@@ -1279,9 +1279,10 @@ where
         };
         let mut c1 = curr_norm;
         c1.compute_jd();
-        
+
         // Check for potential overflow before subtraction
-        c1.i_jd.checked_sub(j1.i_jd)
+        c1.i_jd
+            .checked_sub(j1.i_jd)
             .and_then(|diff| diff.checked_div(JD_TO_MS))
             .ok_or(())
     };
@@ -1325,12 +1326,10 @@ where
                 let h = if p.h % 12 == 0 { 12 } else { p.h % 12 };
                 write!(res, "{h:02}").unwrap();
             }
-            Some('j') => {
-                match days_after_jan1(&p) {
-                    Ok(days) => write!(res, "{:03}", days + 1).unwrap(),
-                    Err(_) => return Value::Null,
-                }
-            }
+            Some('j') => match days_after_jan1(&p) {
+                Ok(days) => write!(res, "{:03}", days + 1).unwrap(),
+                Err(_) => return Value::Null,
+            },
             Some('J') => {
                 let val = p.i_jd as f64 / 86400000.0;
                 if val.abs() >= 1_000_000.0 && val.abs() < 10_000_000.0 {
@@ -1367,16 +1366,14 @@ where
                 }
                 write!(res, "{w}").unwrap();
             }
-            Some('U') => {
-                match days_after_jan1(&p) {
-                    Ok(days) => {
-                        let w = (days - days_after_sun(&p) + 7) / 7;
-                        write!(res, "{w:02}").unwrap();
-                    }
-                    Err(_) => return Value::Null,
+            Some('U') => match days_after_jan1(&p) {
+                Ok(days) => {
+                    let w = (days - days_after_sun(&p) + 7) / 7;
+                    write!(res, "{w:02}").unwrap();
                 }
-            }
-            
+                Err(_) => return Value::Null,
+            },
+
             Some('V') => {
                 let mut temp = p;
                 temp.i_jd += (3 - days_after_mon(&p)) * 86400000;
@@ -1393,15 +1390,13 @@ where
             Some('w') => {
                 write!(res, "{}", days_after_sun(&p)).unwrap();
             }
-            Some('W') => {
-                match days_after_jan1(&p) {
-                    Ok(days) => {
-                        let w = (days - days_after_mon(&p) + 7) / 7;
-                        write!(res, "{w:02}").unwrap();
-                    }
-                    Err(_) => return Value::Null,
+            Some('W') => match days_after_jan1(&p) {
+                Ok(days) => {
+                    let w = (days - days_after_mon(&p) + 7) / 7;
+                    write!(res, "{w:02}").unwrap();
                 }
-            }
+                Err(_) => return Value::Null,
+            },
             Some('Y') => write!(res, "{:04}", p.y).unwrap(),
             Some('%') => res.push('%'),
             _ => return Value::Null,
@@ -1409,7 +1404,7 @@ where
     }
 
     Value::from_text(res)
-}   
+}
 
 #[cfg(test)]
 mod tests {
