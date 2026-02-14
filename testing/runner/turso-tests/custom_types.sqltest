@@ -1375,6 +1375,7 @@ expect error {
 
 # AFTER UPDATE trigger should see decoded OLD and NEW values, not encoded blobs
 @requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
 test trigger-after-update-old-decoded {
     CREATE TABLE t_trig(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t_trig VALUES (1, '123.45');
@@ -1389,6 +1390,7 @@ expect {
 
 # BEFORE UPDATE trigger should see decoded OLD values
 @requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
 test trigger-before-update-old-decoded {
     CREATE TABLE t_bu(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t_bu VALUES (1, '500.25');
@@ -1403,6 +1405,7 @@ expect {
 
 # AFTER DELETE trigger should see decoded OLD values
 @requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
 test trigger-after-delete-old-decoded {
     CREATE TABLE t_ad(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t_ad VALUES (1, '333.33');
@@ -1417,6 +1420,7 @@ expect {
 
 # BEFORE DELETE trigger should see decoded OLD values
 @requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
 test trigger-before-delete-old-decoded {
     CREATE TABLE t_bd(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t_bd VALUES (1, '444.44');
@@ -1431,6 +1435,7 @@ expect {
 
 # AFTER INSERT trigger should see decoded NEW values
 @requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
 test trigger-after-insert-new-decoded {
     CREATE TABLE t_ai(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     CREATE TABLE t_ai_log(new_v TEXT) STRICT;
