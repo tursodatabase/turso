@@ -2110,6 +2110,12 @@ test overflows-with-large-days-modifier {
 expect {
 }
 
+test time_date-overflow-issue-5251 {
+    SELECT time_date(2147483647, 2147483647, 2147483647);
+}
+expect {
+}
+
 # Invalid date and time
 test invalid-date {
     SELECT date('2024-07-21 24:00:00');
