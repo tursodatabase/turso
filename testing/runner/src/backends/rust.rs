@@ -94,6 +94,7 @@ impl SqlBackend for RustBackend {
         let db = Builder::new_local(&db_path)
             .experimental_triggers(true)
             .experimental_attach(true)
+            .experimental_index_method(true)
             .build()
             .await
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;

@@ -188,6 +188,7 @@ impl CliDatabaseInstance {
             cmd.arg("--experimental-strict");
             cmd.arg("--experimental-triggers");
             cmd.arg("--experimental-attach");
+            cmd.arg("--experimental-index-method");
         }
 
         if self.readonly {

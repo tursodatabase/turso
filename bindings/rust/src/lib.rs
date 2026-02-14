@@ -139,6 +139,7 @@ pub struct Builder {
     enable_triggers: bool,
     enable_attach: bool,
     enable_strict: bool,
+    enable_index_method: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
 }
@@ -152,6 +153,7 @@ impl Builder {
             enable_triggers: false,
             enable_attach: false,
             enable_strict: false,
+            enable_index_method: false,
             vfs: None,
             encryption_opts: None,
         }
@@ -182,6 +184,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_index_method(mut self, index_method_enabled: bool) -> Self {
+        self.enable_index_method = index_method_enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
         self
@@ -199,6 +206,9 @@ impl Builder {
         }
         if self.enable_strict {
             features.push("strict");
+        }
+        if self.enable_index_method {
+            features.push("index_method");
         }
         if features.is_empty() {
             return None;
