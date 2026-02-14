@@ -8,6 +8,7 @@
 //! test automatically gains coverage as Turso implements new SQL features.
 //! Invariant violations are collected and reported at the end.
 //!
+//! Runs for 10 seconds by default. Override with FUZZ_DURATION_SECS env var.
 //! Reproduce a failure: `SEED=<seed> cargo test -p core_tester --test fuzz_tests custom_types -- --nocapture`
 
 #[cfg(test)]
@@ -250,6 +251,20 @@ mod tests {
         )
         .unwrap();
         conn.execute("CREATE INDEX idx_t3_val ON t3(val)").unwrap();
+        // t4: mutable table for UPDATE/UPSERT/DELETE/INSERT...SELECT patterns
+        conn.execute(
+            "CREATE TABLE t4(id INTEGER PRIMARY KEY, val numeric(10,2), label TEXT) STRICT",
+        )
+        .unwrap();
+        // t4_log: trigger audit log
+        conn.execute("CREATE TABLE t4_log(old_val TEXT, new_val TEXT) STRICT")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr_t4_update AFTER UPDATE ON t4 BEGIN \
+             INSERT INTO t4_log VALUES (CAST(OLD.val AS TEXT), CAST(NEW.val AS TEXT)); \
+             END",
+        )
+        .unwrap();
 
         // --- Populate data ---
         let t1_rows: usize = rng.random_range(50..=100);
@@ -302,25 +317,57 @@ mod tests {
                 .unwrap();
         }
 
+        // Helper to repopulate t4 (mutable table) before each mutation pattern
+        let t4_size: usize = 20;
+        fn repopulate_t4(
+            db: &TempDatabase,
+            conn: &std::sync::Arc<turso_core::Connection>,
+            rng: &mut impl Rng,
+            t4_size: usize,
+        ) {
+            limbo_exec_rows_fallible(db, conn, "DELETE FROM t4").unwrap();
+            limbo_exec_rows_fallible(db, conn, "DELETE FROM t4_log").unwrap();
+            for i in 0..t4_size {
+                let val = random_numeric(rng);
+                let label = LABELS[rng.random_range(0..LABELS.len())];
+                limbo_exec_rows_fallible(
+                    db,
+                    conn,
+                    &format!("INSERT INTO t4 VALUES ({i}, '{val}', '{label}')"),
+                )
+                .unwrap();
+            }
+        }
+        repopulate_t4(&db, &conn, &mut rng, t4_size);
+
         // --- Query loop ---
-        const ITERS: usize = 5000;
-        const NUM_PATTERNS: usize = 18;
+        // Default 10s time budget; override with FUZZ_DURATION_SECS env var.
+        let duration_secs: u64 = std::env::var("FUZZ_DURATION_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
+        const NUM_PATTERNS: usize = 30;
         let mut executed = 0u64;
         let mut skipped = 0u64;
         let mut violations: Vec<String> = Vec::new();
+        let mut iter = 0usize;
+        let mut t4_dirty = false; // track whether t4 was mutated
 
-        for iter in 0..ITERS {
-            if iter % 50 == 0 {
-                println!(
-                    "fuzz_custom_type_invariants: iteration {}/{ITERS} (executed: {executed}, skipped: {skipped}, violations: {})",
-                    iter + 1,
-                    violations.len()
-                );
-            }
+        while std::time::Instant::now() < deadline {
+            iter += 1;
 
             let pattern = rng.random_range(0..NUM_PATTERNS);
+
             let desc = rng.random_bool(0.5);
             let dir = if desc { "DESC" } else { "ASC" };
+
+            // Repopulate t4 only when a mutation pattern is selected AND t4 was previously mutated
+            let is_mutation_pattern = (18..=22).contains(&pattern);
+            if is_mutation_pattern && t4_dirty {
+                repopulate_t4(&db, &conn, &mut rng, t4_size);
+                t4_dirty = false;
+            }
 
             let result: Result<(), String> = (|| {
                 match pattern {
@@ -592,10 +639,343 @@ mod tests {
                         check_multi_column_sort(&rows, 0, 1, &format!("[{iter}] {query}"))?;
                         executed += 1;
                     }
+                    // --- UPDATE custom type column + verify ---
+                    18 => {
+                        let new_val = random_numeric(&mut rng);
+                        let target_id = rng.random_range(0..t4_size);
+                        limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!("UPDATE t4 SET val = '{new_val}' WHERE id = {target_id}"),
+                        )
+                        .map_err(|_| String::new())?;
+                        let query = format!("SELECT val FROM t4 WHERE id = {target_id}");
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        if rows.len() != 1 {
+                            return Err(format!(
+                                "[{iter}] UPDATE: expected 1 row, got {}",
+                                rows.len()
+                            ));
+                        }
+                        let got = parse_numeric_value(&rows[0][0]);
+                        let expected: f64 = new_val.parse().unwrap();
+                        if let Some(g) = got {
+                            if (g - expected).abs() >= 0.015 {
+                                return Err(format!(
+                                    "[{iter}] UPDATE: expected {expected}, got {g}"
+                                ));
+                            }
+                        }
+                        executed += 1;
+                    }
+                    // --- UPDATE + trigger log verification ---
+                    19 => {
+                        let new_val = random_numeric(&mut rng);
+                        let target_id = rng.random_range(0..t4_size);
+                        // Get old value first
+                        let old_query = format!("SELECT val FROM t4 WHERE id = {target_id}");
+                        let old_rows = limbo_exec_rows_fallible(&db, &conn, &old_query)
+                            .map_err(|_| String::new())?;
+                        let old_val = old_rows.first().and_then(|r| parse_numeric_value(&r[0]));
+                        limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!("UPDATE t4 SET val = '{new_val}' WHERE id = {target_id}"),
+                        )
+                        .map_err(|_| String::new())?;
+                        // Check trigger logged the change with decoded values
+                        let log_rows = limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            "SELECT old_val, new_val FROM t4_log",
+                        )
+                        .map_err(|_| String::new())?;
+                        if log_rows.is_empty() {
+                            return Err(format!("[{iter}] Trigger log is empty after UPDATE"));
+                        }
+                        // Verify new_val in trigger log matches what we set
+                        let last_log = log_rows.last().unwrap();
+                        if let Value::Text(logged_new) = &last_log[1] {
+                            let logged: f64 = logged_new.parse().map_err(|_| String::new())?;
+                            let expected: f64 = new_val.parse().unwrap();
+                            if (logged - expected).abs() >= 0.015 {
+                                return Err(format!(
+                                    "[{iter}] Trigger log new_val: expected {expected}, got {logged}"
+                                ));
+                            }
+                        }
+                        // Verify old_val in trigger log matches what was there before
+                        if let (Some(old), Value::Text(logged_old)) = (old_val, &last_log[0]) {
+                            let logged: f64 = logged_old.parse().map_err(|_| String::new())?;
+                            if (logged - old).abs() >= 0.015 {
+                                return Err(format!(
+                                    "[{iter}] Trigger log old_val: expected {old}, got {logged}"
+                                ));
+                            }
+                        }
+                        executed += 1;
+                    }
+                    // --- UPSERT (INSERT ... ON CONFLICT DO UPDATE) ---
+                    20 => {
+                        let new_val = random_numeric(&mut rng);
+                        let target_id = rng.random_range(0..t4_size);
+                        limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!(
+                                "INSERT INTO t4 VALUES ({target_id}, '{new_val}', 'upserted') \
+                                 ON CONFLICT(id) DO UPDATE SET val = excluded.val, label = excluded.label"
+                            ),
+                        )
+                        .map_err(|_| String::new())?;
+                        let query = format!("SELECT val, label FROM t4 WHERE id = {target_id}");
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        if rows.len() != 1 {
+                            return Err(format!(
+                                "[{iter}] UPSERT: expected 1 row, got {}",
+                                rows.len()
+                            ));
+                        }
+                        let got = parse_numeric_value(&rows[0][0]);
+                        let expected: f64 = new_val.parse().unwrap();
+                        if let Some(g) = got {
+                            if (g - expected).abs() >= 0.015 {
+                                return Err(format!(
+                                    "[{iter}] UPSERT: expected {expected}, got {g}"
+                                ));
+                            }
+                        }
+                        if let Value::Text(lbl) = &rows[0][1] {
+                            if lbl != "upserted" {
+                                return Err(format!(
+                                    "[{iter}] UPSERT: expected label 'upserted', got '{lbl}'"
+                                ));
+                            }
+                        }
+                        executed += 1;
+                    }
+                    // --- DELETE + verify count ---
+                    21 => {
+                        // Get count before delete
+                        let before =
+                            limbo_exec_rows_fallible(&db, &conn, "SELECT COUNT(*) FROM t4")
+                                .map_err(|_| String::new())?;
+                        let count_before = match &before[0][0] {
+                            Value::Integer(n) => *n as usize,
+                            _ => return Err(format!("[{iter}] DELETE: bad count")),
+                        };
+                        if count_before == 0 {
+                            // Nothing to delete
+                            executed += 1;
+                            return Ok(());
+                        }
+                        let target_id = rng.random_range(0..t4_size);
+                        limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!("DELETE FROM t4 WHERE id = {target_id}"),
+                        )
+                        .map_err(|_| String::new())?;
+                        // Verify deleted row is gone
+                        let check = limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!("SELECT val FROM t4 WHERE id = {target_id}"),
+                        )
+                        .map_err(|_| String::new())?;
+                        if !check.is_empty() {
+                            return Err(format!("[{iter}] DELETE: row {target_id} still exists"));
+                        }
+                        executed += 1;
+                    }
+                    // --- INSERT...SELECT between custom type tables ---
+                    22 => {
+                        limbo_exec_rows_fallible(&db, &conn, "DELETE FROM t4")
+                            .map_err(|_| String::new())?;
+                        let limit = rng.random_range(5..=15);
+                        limbo_exec_rows_fallible(
+                            &db,
+                            &conn,
+                            &format!(
+                                "INSERT INTO t4(id, val, label) \
+                                 SELECT id, val, label FROM t1 WHERE val IS NOT NULL LIMIT {limit}"
+                            ),
+                        )
+                        .map_err(|_| String::new())?;
+                        // Verify the inserted rows have valid decoded values
+                        let rows =
+                            limbo_exec_rows_fallible(&db, &conn, "SELECT val FROM t4 ORDER BY val")
+                                .map_err(|_| String::new())?;
+                        check_sorted(&rows, 0, false, &format!("[{iter}] INSERT...SELECT"))?;
+                        check_limit(&rows, limit, &format!("[{iter}] INSERT...SELECT"))?;
+                        executed += 1;
+                    }
+                    // --- LEFT JOIN (NULLs on custom type column) ---
+                    23 => {
+                        // Use a value that likely doesn't exist in t2
+                        let fake_val = "9999999.01";
+                        let query = format!(
+                            "SELECT t1.val, t2.amount FROM t1 LEFT JOIN t2 ON t1.val = t2.amount \
+                             WHERE t1.val = '{fake_val}' OR t2.amount IS NULL"
+                        );
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        // Every row should have either matching vals or NULL t2.amount
+                        for (i, row) in rows.iter().enumerate() {
+                            let t1_v = parse_numeric_value(&row[0]);
+                            let t2_v = parse_numeric_value(&row[1]);
+                            match (t1_v, t2_v) {
+                                (Some(a), Some(b)) if (a - b).abs() >= 0.015 => {
+                                    return Err(format!(
+                                        "[{iter}] LEFT JOIN row {i}: t1.val={a} != t2.amount={b}"
+                                    ));
+                                }
+                                _ => {} // NULL t2.amount is fine for LEFT JOIN
+                            }
+                        }
+                        executed += 1;
+                    }
+                    // --- HAVING on custom type ---
+                    24 => {
+                        let query =
+                            "SELECT val, COUNT(*) as cnt FROM t1 GROUP BY val HAVING COUNT(*) > 1"
+                                .to_string();
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        // Every returned row must have count > 1
+                        for (i, row) in rows.iter().enumerate() {
+                            if let Value::Integer(cnt) = &row[1] {
+                                if *cnt <= 1 {
+                                    return Err(format!(
+                                        "[{iter}] HAVING: row {i} has count {cnt} <= 1"
+                                    ));
+                                }
+                            }
+                        }
+                        // All vals should be unique (GROUP BY)
+                        check_no_duplicates(&rows, 0, &format!("[{iter}] HAVING"))?;
+                        executed += 1;
+                    }
+                    // --- Comparison operators: <, >=, <=, !=, BETWEEN ---
+                    25 => {
+                        let threshold = random_numeric(&mut rng);
+                        let t: f64 = threshold.parse().unwrap();
+                        let op_choice = rng.random_range(0..5);
+                        let (op, pred): (&str, Box<dyn Fn(f64) -> bool>) = match op_choice {
+                            0 => ("<", Box::new(move |v| v < t)),
+                            1 => (">=", Box::new(move |v| v >= t)),
+                            2 => ("<=", Box::new(move |v| v <= t)),
+                            3 => ("!=", Box::new(move |v| (v - t).abs() >= 0.005)),
+                            _ => ("=", Box::new(move |v| (v - t).abs() < 0.005)),
+                        };
+                        let query =
+                            format!("SELECT val FROM t1 WHERE val {op} '{threshold}' ORDER BY val");
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        check_sorted(&rows, 0, false, &format!("[{iter}] {query}"))?;
+                        check_all_satisfy(
+                            &rows,
+                            0,
+                            &*pred,
+                            &format!("val {op} {threshold}"),
+                            &format!("[{iter}] {query}"),
+                        )?;
+                        executed += 1;
+                    }
+                    // --- LIMIT + OFFSET ---
+                    26 => {
+                        let limit = rng.random_range(1..=20);
+                        let offset = rng.random_range(0..=t1_total.saturating_sub(1));
+                        let query = format!(
+                            "SELECT val FROM t1 ORDER BY val ASC LIMIT {limit} OFFSET {offset}"
+                        );
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        check_sorted(&rows, 0, false, &format!("[{iter}] {query}"))?;
+                        check_limit(&rows, limit, &format!("[{iter}] {query}"))?;
+                        executed += 1;
+                    }
+                    // --- CAST to/from custom type ---
+                    27 => {
+                        let val = random_numeric(&mut rng);
+                        let query = format!("SELECT CAST('{val}' AS numeric(10,2))");
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        if rows.len() != 1 {
+                            return Err(format!(
+                                "[{iter}] CAST: expected 1 row, got {}",
+                                rows.len()
+                            ));
+                        }
+                        let got = parse_numeric_value(&rows[0][0]);
+                        let expected: f64 = val.parse().unwrap();
+                        if let Some(g) = got {
+                            if (g - expected).abs() >= 0.015 {
+                                return Err(format!("[{iter}] CAST: expected {expected}, got {g}"));
+                            }
+                        }
+                        executed += 1;
+                    }
+                    // --- INTERSECT ---
+                    28 => {
+                        let query = "SELECT val FROM t1 WHERE val IS NOT NULL \
+                             INTERSECT SELECT amount FROM t2 ORDER BY 1"
+                            .to_string();
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        check_sorted(&rows, 0, false, &format!("[{iter}] {query}"))?;
+                        check_no_duplicates(&rows, 0, &format!("[{iter}] {query}"))?;
+                        // Every result must exist in both t1 and t2
+                        let t1_set: HashSet<String> =
+                            t1_vals.iter().map(|v| format!("{v:.2}")).collect();
+                        let t2_set: HashSet<String> =
+                            t2_vals.iter().map(|v| format!("{v:.2}")).collect();
+                        for (i, row) in rows.iter().enumerate() {
+                            if let Some(v) = parse_numeric_value(&row[0]) {
+                                let formatted = format!("{v:.2}");
+                                if !t1_set.contains(&formatted) || !t2_set.contains(&formatted) {
+                                    return Err(format!(
+                                        "[{iter}] INTERSECT row {i}: {v} not in both tables"
+                                    ));
+                                }
+                            }
+                        }
+                        executed += 1;
+                    }
+                    // --- EXCEPT ---
+                    29 => {
+                        let query = "SELECT val FROM t1 WHERE val IS NOT NULL \
+                             EXCEPT SELECT amount FROM t2 ORDER BY 1"
+                            .to_string();
+                        let rows = limbo_exec_rows_fallible(&db, &conn, &query)
+                            .map_err(|_| String::new())?;
+                        check_sorted(&rows, 0, false, &format!("[{iter}] {query}"))?;
+                        check_no_duplicates(&rows, 0, &format!("[{iter}] {query}"))?;
+                        // No result should exist in t2
+                        let t2_set: HashSet<String> =
+                            t2_vals.iter().map(|v| format!("{v:.2}")).collect();
+                        for (i, row) in rows.iter().enumerate() {
+                            if let Some(v) = parse_numeric_value(&row[0]) {
+                                let formatted = format!("{v:.2}");
+                                if t2_set.contains(&formatted) {
+                                    return Err(format!(
+                                        "[{iter}] EXCEPT row {i}: {v} should not be in t2"
+                                    ));
+                                }
+                            }
+                        }
+                        executed += 1;
+                    }
                     _ => unreachable!(),
                 }
                 Ok(())
             })();
+
+            if is_mutation_pattern {
+                t4_dirty = true;
+            }
 
             match result {
                 Ok(()) => {}
@@ -608,7 +988,7 @@ mod tests {
         }
 
         println!(
-            "fuzz_custom_type_invariants: done. seed={seed}, executed={executed}, skipped={skipped}, violations={}",
+            "fuzz_custom_type_invariants: done. seed={seed}, iterations={iter}, executed={executed}, skipped={skipped}, violations={}, duration={duration_secs}s",
             violations.len()
         );
 
