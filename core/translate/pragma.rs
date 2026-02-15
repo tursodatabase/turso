@@ -1248,7 +1248,15 @@ fn query_pragma(
                 let display_name = if type_def.params.is_empty() {
                     type_def.name.clone()
                 } else {
-                    format!("{}({})", type_def.name, type_def.params.join(", "))
+                    let params: Vec<String> = type_def
+                        .params
+                        .iter()
+                        .map(|p| match &p.ty {
+                            Some(ty) => format!("{} {}", p.name, ty),
+                            None => p.name.clone(),
+                        })
+                        .collect();
+                    format!("{}({})", type_def.name, params.join(", "))
                 };
                 program.emit_string8(display_name, base_reg);
                 program.emit_string8(type_def.base.clone(), base_reg + 1);

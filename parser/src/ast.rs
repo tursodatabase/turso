@@ -1183,12 +1183,22 @@ pub struct TypeOperator {
     pub func_name: String,
 }
 
+/// A parameter in a `CREATE TYPE` definition, with an optional type annotation.
+/// e.g. `value text` or `maxlen integer` or just `maxlen` (untyped, backward compat).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeParam {
+    pub name: String,
+    /// Type annotation. None means untyped (backward compat).
+    pub ty: Option<String>,
+}
+
 /// Body of a `CREATE TYPE` statement
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CreateTypeBody {
-    /// type parameter names, e.g. ["precision", "scale"] for decimal(precision, scale)
-    pub params: Vec<String>,
+    /// type parameters, e.g. `(value text, maxlen integer)` for varchar
+    pub params: Vec<TypeParam>,
     /// base storage type: "text", "integer", "real", "blob"
     pub base: String,
     /// encode expression (called on write), uses `value` placeholder for input

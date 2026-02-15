@@ -1332,7 +1332,8 @@ pub fn translate_expr(
                     // If the custom type requires parameters but the CAST
                     // doesn't provide them (e.g. CAST(x AS NUMERIC) vs
                     // CAST(x AS numeric(10,2))), fall through to regular CAST.
-                    if type_def.params.is_empty() || ty_params.len() == type_def.params.len() {
+                    let user_param_count = type_def.user_params().count();
+                    if user_param_count == 0 || ty_params.len() == user_param_count {
                         let mut cast_col = crate::schema::Column::new(
                             None,
                             tn.name.clone(),
@@ -6392,13 +6393,16 @@ pub(crate) fn emit_type_expr(
     // Set up type parameter overrides. Capture the result so we can
     // clean up overrides even if param translation fails.
     let param_result: Result<()> = (|| {
-        for (i, param_name) in type_def.params.iter().enumerate() {
+        // Skip `value` param (already handled above); match remaining params
+        // against the user-provided ty_params by position.
+        let user_params: Vec<_> = type_def.user_params().collect();
+        for (i, param) in user_params.iter().enumerate() {
             if let Some(param_expr) = column.ty_params.get(i) {
                 let reg = program.alloc_register();
                 translate_expr(program, None, param_expr, reg, resolver)?;
                 program
                     .id_register_overrides
-                    .insert(param_name.clone(), reg);
+                    .insert(param.name.clone(), reg);
             }
         }
         Ok(())

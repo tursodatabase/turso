@@ -8,8 +8,8 @@ use crate::ast::{
     NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
     QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
     SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
-    TriggerEvent, TriggerTime, Type, TypeOperator, TypeSize, UnaryOperator, Update, Upsert,
-    UpsertDo, UpsertIndex, Window, WindowDef, With,
+    TriggerEvent, TriggerTime, Type, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update,
+    Upsert, UpsertDo, UpsertIndex, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -4038,19 +4038,29 @@ impl<'a> Parser<'a> {
             _ => return Err(Error::ParseError("expected type name".to_owned())),
         };
 
-        // Parse optional parameter list: (param1, param2, ...)
+        // Parse optional parameter list: (name [type], name [type], ...)
         let mut params = Vec::new();
         if let Some(tok) = self.peek()? {
             if tok.token_type == TK_LP {
                 eat_assert!(self, TK_LP);
                 loop {
                     let param_tok = self.eat()?;
-                    match param_tok {
-                        Some(t) if t.token_type == TK_ID => {
-                            params.push(from_bytes(t.as_bytes()));
-                        }
+                    let param_name = match param_tok {
+                        Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
                         _ => return Err(Error::ParseError("expected parameter name".to_owned())),
-                    }
+                    };
+                    // Check for optional type annotation (next token is ID, not comma/RP)
+                    let param_ty = match self.peek()? {
+                        Some(t) if t.token_type == TK_ID => {
+                            let ty_tok = self.eat()?;
+                            Some(from_bytes(ty_tok.unwrap().as_bytes()).to_lowercase())
+                        }
+                        _ => None,
+                    };
+                    params.push(TypeParam {
+                        name: param_name,
+                        ty: param_ty,
+                    });
                     match self.peek()? {
                         Some(tok) if tok.token_type == TK_COMMA => {
                             eat_assert!(self, TK_COMMA);

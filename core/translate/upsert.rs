@@ -568,6 +568,14 @@ pub fn emit_upsert(
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
+            // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: new_start,
+                count: num_cols,
+                check_generated: true,
+                table_reference: BTreeTable::input_type_check_table_ref(&bt, resolver.schema, None),
+            });
+
             // Encode ALL columns. Both non-SET columns (decoded from disk above)
             // and SET columns (user-facing values from expressions) need encoding
             // before being written to disk.
@@ -579,6 +587,7 @@ pub fn emit_upsert(
                 None,
             )?;
 
+            // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
                 count: num_cols,

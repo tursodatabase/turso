@@ -723,7 +723,10 @@ impl ToTokens for Stmt {
                         if i > 0 {
                             s.append(TK_COMMA, None)?;
                         }
-                        s.append(TK_ID, Some(param))?;
+                        s.append(TK_ID, Some(&param.name))?;
+                        if let Some(ref ty) = param.ty {
+                            s.append(TK_ID, Some(ty))?;
+                        }
                     }
                     s.append(TK_RP, None)?;
                 }

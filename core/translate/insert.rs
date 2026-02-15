@@ -538,11 +538,26 @@ pub fn translate_insert(
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
     if ctx.table.is_strict {
-        // Encode values for columns with custom types before TypeCheck,
-        // so that constraints (NOT NULL, type correctness) are validated
-        // on the encoded result, not the pre-encode input.
+        // Pre-encode TypeCheck: validate input types match the custom type's
+        // declared value type BEFORE encoding. This catches type mismatches
+        // (e.g. TEXT into an INTEGER-based custom type) that would otherwise
+        // be silently converted by the encode expression.
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: insertion.first_col_register(),
+            count: insertion.col_mappings.len(),
+            check_generated: true,
+            table_reference: BTreeTable::input_type_check_table_ref(
+                ctx.table,
+                resolver.schema,
+                None,
+            ),
+        });
+
+        // Encode values for columns with custom types.
         emit_custom_type_encode(&mut program, resolver, &insertion)?;
 
+        // Post-encode TypeCheck: validate that encode produced the correct
+        // storage type (BASE).
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.col_mappings.len(),

@@ -3349,24 +3349,10 @@ fn emit_update_insns<'a>(
                 start,
                 rowid_new_reg,
             )?;
-            if t_ctx
-                .resolver
-                .with_schema(update_database_id, |s| s.has_child_fks(table_name))
-            {
-                // Child-side checks:
-                // this ensures updated row still satisfies child FKs that point OUT from this table
-                emit_fk_child_update_counters(
-                    program,
-                    &table_btree,
-                    table_name,
-                    target_table_cursor_id,
-                    start,
-                    rowid_new_reg,
-                    &set_clauses.iter().map(|(i, _)| *i).collect::<HashSet<_>>(),
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
-            }
+            // Child-side FK checks are deferred to AFTER custom type encoding (see below).
+            // This is because child FK checks probe the parent's index which contains
+            // encoded values, so the NEW values must also be encoded.
+
             // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
             // This checks that no child rows reference the old parent key values.
             // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
@@ -3599,10 +3585,24 @@ fn emit_update_insns<'a>(
     // This ensures that if a constraint fails, indexes remain consistent.
     if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
-            // Encode only SET clause columns. Non-SET columns were read from disk
-            // and are already encoded; re-encoding them would corrupt data.
             let set_col_indices: std::collections::HashSet<usize> =
                 set_clauses.iter().map(|(idx, _)| *idx).collect();
+
+            // Pre-encode TypeCheck: validate SET column input types.
+            // Non-SET columns hold encoded values from disk, so skip them (ANY).
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: start,
+                count: col_len,
+                check_generated: true,
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    &btree_table,
+                    t_ctx.resolver.schema,
+                    Some(&set_col_indices),
+                ),
+            });
+
+            // Encode only SET clause columns. Non-SET columns were read from disk
+            // and are already encoded; re-encoding them would corrupt data.
             crate::translate::expr::emit_custom_type_encode_columns(
                 program,
                 &t_ctx.resolver,
@@ -3611,6 +3611,7 @@ fn emit_update_insns<'a>(
                 Some(&set_col_indices),
             )?;
 
+            // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
                 count: col_len,
@@ -3682,6 +3683,26 @@ fn emit_update_insns<'a>(
                 skip_row_label,
                 Some(&check_constraint_tables),
             )?;
+        }
+    }
+
+    // Child-side FK checks must run AFTER custom type encoding so that NEW values
+    // being probed against the parent's index are encoded (matching the index contents).
+    if connection.foreign_keys_enabled() {
+        if let Some(table_btree) = target_table.table.btree() {
+            if t_ctx.resolver.schema.has_child_fks(table_name) {
+                let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
+                emit_fk_child_update_counters(
+                    program,
+                    &t_ctx.resolver,
+                    &table_btree,
+                    table_name,
+                    target_table_cursor_id,
+                    start,
+                    rowid_new_reg,
+                    &set_clauses.iter().map(|(i, _)| *i).collect::<HashSet<_>>(),
+                )?;
+            }
         }
     }
 

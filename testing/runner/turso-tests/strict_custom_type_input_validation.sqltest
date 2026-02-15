@@ -9,7 +9,6 @@
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test plain-integer-rejects-text {
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount INTEGER) STRICT;
     INSERT INTO t VALUES (1, 'hello');
@@ -23,7 +22,6 @@ expect error {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cents-rejects-text {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
@@ -34,7 +32,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cents-rejects-blob {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
@@ -45,7 +42,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cents-accepts-integer {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
@@ -57,7 +53,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cents-accepts-real-convertible-to-int {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
@@ -69,7 +64,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cents-rejects-real-not-convertible {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
@@ -84,7 +78,6 @@ expect error {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test text-type-accepts-integer-via-affinity {
     CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
     CREATE TABLE t(id INTEGER PRIMARY KEY, val upper_text) STRICT;
@@ -96,7 +89,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test text-type-rejects-blob {
     CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
     CREATE TABLE t(id INTEGER PRIMARY KEY, val upper_text) STRICT;
@@ -107,7 +99,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test text-type-accepts-text {
     CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
     CREATE TABLE t(id INTEGER PRIMARY KEY, val upper_text) STRICT;
@@ -123,7 +114,6 @@ expect {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test real-type-rejects-text {
     CREATE TYPE scaled BASE real ENCODE value * 1.5 DECODE value / 1.5;
     CREATE TABLE t(id INTEGER PRIMARY KEY, val scaled) STRICT;
@@ -138,7 +128,6 @@ expect error {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cents-accepts-null {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
@@ -154,7 +143,6 @@ expect {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test update-rejects-wrong-type {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
@@ -166,7 +154,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test update-accepts-correct-type {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
@@ -183,7 +170,6 @@ expect {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test boolean-accepts-integer {
     CREATE TABLE t(id INTEGER PRIMARY KEY, flag boolean) STRICT;
     INSERT INTO t VALUES (1, 1);
@@ -196,7 +182,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test boolean-accepts-true-false {
     CREATE TABLE t(id INTEGER PRIMARY KEY, flag boolean) STRICT;
     INSERT INTO t VALUES (1, true);

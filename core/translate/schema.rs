@@ -537,19 +537,20 @@ fn validate(
                                     type_name
                                 );
                             }
-                            Some(td) if !td.params.is_empty() => {
+                            Some(td) if td.user_params().next().is_some() => {
                                 // Parametric type: verify the column provides the right
-                                // number of parameters (e.g. numeric(10,2)).
+                                // number of user parameters (excluding `value`).
                                 let provided = match &col_type.size {
                                     Some(ast::TypeSize::TypeSize(_, _)) => 2,
                                     Some(ast::TypeSize::MaxSize(_)) => 1,
                                     None => 0,
                                 };
-                                if provided != td.params.len() {
+                                let expected = td.user_params().count();
+                                if provided != expected {
                                     bail_parse_error!(
                                         "type \"{}\" requires {} parameter(s), got {}",
                                         type_name,
-                                        td.params.len(),
+                                        expected,
                                         provided
                                     );
                                 }

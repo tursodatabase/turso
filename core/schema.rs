@@ -180,7 +180,7 @@ fn quote_string_literal(s: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct TypeDef {
     pub name: String,
-    pub params: Vec<String>,
+    pub params: Vec<turso_parser::ast::TypeParam>,
     pub base: String,
     pub encode: Option<Box<turso_parser::ast::Expr>>,
     pub decode: Option<Box<turso_parser::ast::Expr>>,
@@ -208,6 +208,25 @@ impl TypeDef {
         }
     }
 
+    /// The expected input type for `value` in this custom type.
+    /// Looks for a `value` parameter with a type annotation.
+    /// Falls back to `self.base` if `value` is not declared.
+    pub fn value_input_type(&self) -> &str {
+        for p in &self.params {
+            if p.name.eq_ignore_ascii_case("value") {
+                return p.ty.as_deref().unwrap_or(&self.base);
+            }
+        }
+        &self.base
+    }
+
+    /// The non-value params (user-provided at column declaration time).
+    pub fn user_params(&self) -> impl Iterator<Item = &turso_parser::ast::TypeParam> {
+        self.params
+            .iter()
+            .filter(|p| !p.name.eq_ignore_ascii_case("value"))
+    }
+
     /// Reconstruct the CREATE TYPE SQL string from this definition.
     pub fn to_sql(&self) -> String {
         let mut sql = if self.params.is_empty() {
@@ -217,7 +236,14 @@ impl TypeDef {
                 quote_ident(&self.base)
             )
         } else {
-            let params: Vec<String> = self.params.iter().map(|p| quote_ident(p)).collect();
+            let params: Vec<String> = self
+                .params
+                .iter()
+                .map(|p| match &p.ty {
+                    Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
+                    None => quote_ident(&p.name),
+                })
+                .collect();
             format!(
                 "CREATE TYPE {}({}) BASE {}",
                 quote_ident(&self.name),
@@ -385,21 +411,21 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
 
     let type_sqls: &[&str] = &[
         #[cfg(feature = "uuid")]
-        "CREATE TYPE uuid BASE blob ENCODE uuid_blob(value) DECODE uuid_str(value) DEFAULT uuid4_str()",
-        "CREATE TYPE boolean BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END",
+        "CREATE TYPE uuid(value text) BASE blob ENCODE uuid_blob(value) DECODE uuid_str(value) DEFAULT uuid4_str()",
+        "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END",
         #[cfg(feature = "json")]
-        "CREATE TYPE json BASE text ENCODE json(value) DECODE value",
+        "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
         #[cfg(feature = "json")]
-        "CREATE TYPE jsonb BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(maxlen) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value",
-        "CREATE TYPE date BASE text ENCODE date(value) DECODE value",
-        "CREATE TYPE time BASE text ENCODE time(value) DECODE value",
-        "CREATE TYPE timestamp BASE text ENCODE datetime(value) DECODE value",
-        "CREATE TYPE smallint BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value",
-        "CREATE TYPE bigint BASE integer",
-        "CREATE TYPE inet BASE text ENCODE validate_ipaddr(value) DECODE value",
-        "CREATE TYPE bytea BASE blob",
-        "CREATE TYPE numeric(precision, scale) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' (numeric) -> numeric_add OPERATOR '-' (numeric) -> numeric_sub OPERATOR '*' (numeric) -> numeric_mul OPERATOR '/' (numeric) -> numeric_div OPERATOR '<' (numeric) -> numeric_lt OPERATOR '=' (numeric) -> numeric_eq",
+        "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
+        "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value",
+        "CREATE TYPE date(value text) BASE text ENCODE date(value) DECODE value",
+        "CREATE TYPE time(value text) BASE text ENCODE time(value) DECODE value",
+        "CREATE TYPE timestamp(value text) BASE text ENCODE datetime(value) DECODE value",
+        "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value",
+        "CREATE TYPE bigint(value integer) BASE integer",
+        "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
+        "CREATE TYPE bytea(value blob) BASE blob",
+        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' (numeric) -> numeric_add OPERATOR '-' (numeric) -> numeric_sub OPERATOR '*' (numeric) -> numeric_mul OPERATOR '/' (numeric) -> numeric_div OPERATOR '<' (numeric) -> numeric_lt OPERATOR '=' (numeric) -> numeric_eq",
     ];
 
     for sql in type_sqls {
@@ -2009,6 +2035,38 @@ impl BTreeTable {
         for col in &mut modified.columns {
             if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
                 col.ty_str = type_def.base.to_uppercase();
+            }
+        }
+        Arc::new(modified)
+    }
+
+    /// Create a table ref for pre-encode TypeCheck that validates user input
+    /// against the type's declared `value` input type (or base if not declared).
+    /// For UPDATE, `only_columns` limits which columns are checked — non-SET
+    /// columns hold encoded values and must be skipped (set to ANY).
+    pub fn input_type_check_table_ref(
+        table: &Arc<BTreeTable>,
+        schema: &Schema,
+        only_columns: Option<&std::collections::HashSet<usize>>,
+    ) -> Arc<BTreeTable> {
+        let has_custom = table
+            .columns
+            .iter()
+            .any(|c| schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+        if !has_custom {
+            return Arc::clone(table);
+        }
+        let mut modified = (**table).clone();
+        for (i, col) in modified.columns.iter_mut().enumerate() {
+            if let Some(only) = only_columns {
+                if !only.contains(&i) {
+                    // Non-SET column in UPDATE: holds encoded value, skip check
+                    col.ty_str = "ANY".to_string();
+                    continue;
+                }
+            }
+            if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+                col.ty_str = type_def.value_input_type().to_uppercase();
             }
         }
         Arc::new(modified)
