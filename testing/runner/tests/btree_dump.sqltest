@@ -1,5 +1,6 @@
 @database :memory:
 @skip-file-if mvcc "btree_dump reads physical btree pages, not available for uncheckpointed MVCC data"
+@skip-file-if sqlite "btree_dump is a turso-specific virtual table"
 
 # Dump an index with data
 test btree-dump-index {
