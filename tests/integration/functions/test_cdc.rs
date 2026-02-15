@@ -1547,6 +1547,13 @@ fn test_cdc_version_preserves_old_version(db: TempDatabase) {
             Value::Text("v0".to_string()),
         ]]
     );
+
+    // Connection state should carry "v0" version
+    let info = conn.get_capture_data_changes_info();
+    let info = info.as_ref().expect("CDC should be enabled");
+    assert_eq!(info.mode, turso_core::CaptureDataChangesMode::Full);
+    assert_eq!(info.table, "turso_cdc");
+    assert_eq!(info.version, Some("v0".to_string()));
 }
 
 #[turso_macros::test(mvcc)]

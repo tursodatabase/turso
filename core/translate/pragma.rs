@@ -352,39 +352,39 @@ fn update_pragma(
             let opts =
                 CaptureDataChangesInfo::parse(&value, Some(TURSO_CDC_CURRENT_VERSION.to_string()))?;
             if let Some(info) = &opts {
-                if resolver.schema.get_table(&info.table).is_none() {
-                    program = translate_create_table(
-                        QualifiedName {
-                            db_name: None,
-                            name: ast::Name::exact(info.table.to_string()),
-                            alias: None,
-                        },
-                        resolver,
-                        false,
-                        true, // if_not_exists
-                        ast::CreateTableBody::ColumnsAndConstraints {
-                            columns: turso_cdc_table_columns(),
-                            constraints: vec![],
-                            options: ast::TableOptions::empty(),
-                        },
-                        program,
-                        &connection,
-                    )?;
-                }
-                // InitCdcVersion creates the version table if needed, records the
-                // version (INSERT OR IGNORE), reads back the actual version, and
-                // enables CDC. Always deferred to execution time so:
-                // 1. Version table operations are not captured by CDC
-                // 2. If a version row already exists, we use that version (not the
-                //    current one), since the CDC table schema hasn't been migrated
-                program.emit_insn(Insn::InitCdcVersion {
-                    cdc_table_name: info.table.to_string(),
-                    version: TURSO_CDC_CURRENT_VERSION.to_string(),
-                    cdc_mode: value,
-                });
-            } else {
-                connection.set_capture_data_changes_info(opts);
+                program = translate_create_table(
+                    QualifiedName {
+                        db_name: None,
+                        name: ast::Name::exact(info.table.to_string()),
+                        alias: None,
+                    },
+                    resolver,
+                    false,
+                    true, // if_not_exists
+                    ast::CreateTableBody::ColumnsAndConstraints {
+                        columns: turso_cdc_table_columns(),
+                        constraints: vec![],
+                        options: ast::TableOptions::empty(),
+                    },
+                    program,
+                    &connection,
+                )?;
             }
+            // InitCdcVersion handles both enable and disable:
+            // - For enable: creates version table, records version (INSERT OR
+            //   IGNORE), reads back actual version, enables CDC
+            // - For disable ("off"): just sets CDC to None on connection
+            // Always deferred to execution time so version table operations
+            // are not captured by CDC.
+            let cdc_table_name = opts
+                .as_ref()
+                .map(|i| i.table.to_string())
+                .unwrap_or_default();
+            program.emit_insn(Insn::InitCdcVersion {
+                cdc_table_name,
+                version: TURSO_CDC_CURRENT_VERSION.to_string(),
+                cdc_mode: value,
+            });
             Ok((program, TransactionMode::Write))
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),

@@ -129,9 +129,9 @@ Used by `emit_cdc_insns()` to determine `change_type` value:
 
 **Set:** `core/translate/pragma.rs`
 - Parses mode string via `CaptureDataChangesInfo::parse()` with `TURSO_CDC_CURRENT_VERSION`
-- Auto-creates CDC table if it doesn't exist (`translate_create_table`)
-- If table is new, emits `InitCdcVersion` opcode to create version table at execution time
-- If table already exists, sets mode on connection via `connection.set_capture_data_changes_info(opts)`
+- Always emits `translate_create_table` with `if_not_exists: true` (no schema cache check)
+- Always emits `InitCdcVersion` opcode — handles version table creation and reads back actual version at runtime
+- "off" case: sets `None` on connection directly (no opcode needed)
 
 **Get (read current mode):** `core/translate/pragma.rs`
 - Returns 3 columns: `mode`, `table`, `version`
@@ -160,10 +160,13 @@ Used by `emit_cdc_insns()` to determine `change_type` value:
 
 ### 5. InitCdcVersion Opcode — `core/vdbe/execute.rs`
 
-Executed at runtime when CDC table is newly created:
+Executed at runtime when CDC is enabled (always emitted by PRAGMA SET):
 1. Creates `turso_cdc_version` table if it doesn't exist
-2. Inserts/replaces version row for the CDC table
-3. Calls `CaptureDataChangesInfo::parse(cdc_mode, Some(version))` to enable CDC
+2. `INSERT OR IGNORE` version row — preserves existing version, doesn't overwrite
+3. Reads back actual version from the table
+4. Calls `CaptureDataChangesInfo::parse(cdc_mode, Some(actual_version))` to enable CDC
+
+A dedicated opcode is needed because the PRAGMA SET plan is compiled against the current schema, but creating `turso_cdc_version` is a schema change — you can't compile DML against a table that doesn't exist yet in the same plan.
 
 ## Bytecode Emission (core/translate/emitter.rs)
 
@@ -253,43 +256,11 @@ All bindings expose `cdc_operations` as part of sync stats:
 
 ## Tests
 
-### Integration tests — `tests/integration/functions/test_cdc.rs`
+- **Integration tests:** `tests/integration/functions/test_cdc.rs` — covers all modes, CRUD, transactions, schema changes, version table, backward compatibility. Registered in `tests/integration/functions/mod.rs`.
+- **Sync engine tests:** `sync/engine/src/database_tape.rs` — CDC table reads, tape iteration, replay of schema changes.
+- **JS binding tests:** `bindings/javascript/sync/packages/{wasm,native}/promise.test.ts`
 
-| Test | What it covers |
-|------|----------------|
-| `test_cdc_simple_id` | Mode `id`: INSERT only captures rowid |
-| `test_cdc_simple_before` | Mode `before`: INSERT/UPDATE/DELETE captures before-image |
-| `test_cdc_simple_after` | Mode `after`: INSERT/UPDATE/DELETE captures after-image |
-| `test_cdc_simple_full` | Mode `full`: captures before+after+updates |
-| `test_cdc_crud` | All CRUD operations with mode `id` |
-| `test_cdc_failed_op` | Failed INSERT (unique constraint) doesn't produce CDC entries |
-| `test_cdc_uncaptured_connection` | CDC only captures for enabled connection |
-| `test_cdc_custom_table` | Custom CDC table name |
-| `test_cdc_ignore_changes_in_cdc_table` | Changes to CDC table itself are not re-captured |
-| `test_cdc_transaction` | Transaction boundary: CDC records appear after COMMIT |
-| `test_cdc_independent_connections` | Two connections with different CDC tables |
-| `test_cdc_independent_connections_different_cdc_not_ignore` | Cross-CDC-table operations are captured |
-| `test_cdc_table_columns` | `table_columns_json_array()` helper function |
-| `test_cdc_bin_record` | `bin_record_json_object()` helper function |
-| `test_cdc_schema_changes` | CDC captures CREATE TABLE/INDEX, DROP TABLE/INDEX as sqlite_schema changes |
-| `test_cdc_schema_changes_alter_table` | CDC captures ALTER TABLE with before/after/updates |
-| `test_cdc_version_table_created` | Version table is created when CDC is first enabled |
-| `test_cdc_version_custom_table` | Version table records custom CDC table name |
-| `test_cdc_version_not_created_when_exists` | Re-enabling CDC doesn't duplicate version row |
-| `test_cdc_version_backward_compat_v1_*` | Backward compat: pre-existing v1 tables work with all modes |
-| `test_cdc_pragma_get_returns_version` | PRAGMA GET returns mode, table, and version columns |
-
-Test module registration: `tests/integration/functions/mod.rs`
-
-Note: Many tests use `#[turso_macros::test()]` (non-MVCC) because they require indexes.
-Some use `#[turso_macros::test(mvcc)]`.
-
-### Sync engine tests — `sync/engine/src/database_tape.rs`
-- Internal tests that verify CDC table reads and tape iteration.
-
-### JS binding tests
-- `bindings/javascript/sync/packages/wasm/promise.test.ts` — queries `turso_cdc` directly
-- `bindings/javascript/sync/packages/native/promise.test.ts` — uses `cdcOperations` stat
+Run: `cargo test -- test_cdc` (integration) or `cargo test -p turso_sync_engine -- database_tape` (sync engine).
 
 ## User-facing Documentation
 
