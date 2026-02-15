@@ -15,6 +15,9 @@ use test_runner::{
     backends::rust::RustBackend, create_output, find_all_pending_snapshots, generate_database,
     load_test_files, summarize, tcl_converter,
 };
+use test_runner::DatabaseLocation;
+use test_runner::TestFile;
+use test_runner::parser::ast::CaseModifiers;
 
 #[derive(Parser)]
 #[command(name = "test-runner")]
@@ -107,6 +110,18 @@ enum Commands {
         verbose: bool,
     },
 
+    /// Extract SQL from .sqltest files as seed corpus for fuzzing.
+    /// Writes one .sql file per test block with setup SQL prepended.
+    ExtractSql {
+        /// Test files or directories containing .sqltest files
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// Output directory for extracted .sql seed files
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+
     /// [DEBUG ONLY] Generate test databases and save them to a directory.
     /// This is intended for debugging purposes only - to inspect the database
     /// files that the test runner generates for tests using :default: databases.
@@ -171,6 +186,7 @@ async fn main() -> ExitCode {
             stdout,
             verbose,
         } => convert_files(paths, output_dir, stdout, verbose),
+        Commands::ExtractSql { paths, output_dir } => extract_sql(paths, output_dir),
         Commands::GenerateDb {
             output_dir,
             user_count,
@@ -736,6 +752,205 @@ fn convert_single_file(
     }
 
     (test_count, warning_count)
+}
+
+/// Extract SQL from .sqltest files as individual seed files for fuzzing.
+///
+/// For each test/snapshot block in self-contained files (`:memory:` or `:temp:` databases),
+/// writes a `.sql` file containing the setup SQL followed by the test SQL.
+/// Skips files using `:default:` databases (require pre-populated tables),
+/// tests with `@skip`, and tests whose setup contains `.dbconfig` dot-commands.
+fn extract_sql(paths: Vec<PathBuf>, output_dir: PathBuf) -> ExitCode {
+    // Create output directory
+    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+        eprintln!("Error: failed to create output directory {}: {}", output_dir.display(), e);
+        return ExitCode::from(1);
+    }
+
+    let mut files_processed = 0;
+    let mut files_skipped = 0;
+    let mut seeds_written = 0;
+    let mut tests_skipped = 0;
+
+    // Collect all .sqltest files from paths
+    let mut sqltest_files: Vec<PathBuf> = Vec::new();
+    for path in &paths {
+        if path.is_dir() {
+            let pattern = path.join("**/*.sqltest");
+            match glob::glob(&pattern.to_string_lossy()) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        sqltest_files.push(entry);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: invalid glob pattern: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        } else if path.is_file() {
+            sqltest_files.push(path.clone());
+        } else {
+            eprintln!("Error: {} does not exist", path.display());
+            return ExitCode::from(1);
+        }
+    }
+
+    sqltest_files.sort();
+
+    for file_path in &sqltest_files {
+        let content = match std::fs::read_to_string(file_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Warning: cannot read {}: {}", file_path.display(), e);
+                continue;
+            }
+        };
+
+        let file = match test_runner::parse(&content) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Warning: parse error in {}: {}", file_path.display(), e);
+                continue;
+            }
+        };
+
+        // Skip files using :default: databases (need pre-populated tables)
+        let has_default_db = file.databases.iter().any(|db| {
+            matches!(
+                db.location,
+                DatabaseLocation::Default | DatabaseLocation::DefaultNoRowidAlias
+            )
+        });
+        if has_default_db {
+            files_skipped += 1;
+            continue;
+        }
+
+        let basename = file_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // Process test blocks
+        for test in &file.tests {
+            // Skip tests with @skip (unconditional only — conditional skips are still valid SQL)
+            if let Some(skip) = &test.modifiers.skip {
+                if skip.condition.is_none() {
+                    tests_skipped += 1;
+                    continue;
+                }
+            }
+
+            // Skip negative tests (expect error) — these are invalid SQL by design
+            if matches!(test.expectations.default, test_runner::Expectation::Error(_)) {
+                tests_skipped += 1;
+                continue;
+            }
+
+            // Resolve setup SQL
+            let setup_sql = resolve_setup_sql(&file, &test.modifiers);
+
+            // Skip if setup contains dot-commands (tursodb doesn't support them via stdin)
+            if setup_sql.lines().any(|l| l.trim_start().starts_with('.')) {
+                tests_skipped += 1;
+                continue;
+            }
+
+            let mut sql = String::new();
+            if !setup_sql.is_empty() {
+                sql.push_str(&setup_sql);
+                sql.push('\n');
+            }
+            sql.push_str(&test.sql);
+            if !sql.ends_with('\n') {
+                sql.push('\n');
+            }
+
+            // Normalize: remove leading whitespace from each line (SQLRight parser is sensitive to indentation)
+            let sql = sql.lines()
+                .map(|line| line.trim_start())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let sql = if sql.ends_with('\n') { sql } else { sql + "\n" };
+
+            let seed_name = format!("{}-{}.sql", basename, sanitize_name(&test.name));
+            let seed_path = output_dir.join(&seed_name);
+            if let Err(e) = std::fs::write(&seed_path, &sql) {
+                eprintln!("Error: failed to write {}: {}", seed_path.display(), e);
+                continue;
+            }
+            seeds_written += 1;
+        }
+
+        // Process snapshot blocks (EXPLAIN tests — no error expectations)
+        for snap in &file.snapshots {
+            if let Some(skip) = &snap.modifiers.skip {
+                if skip.condition.is_none() {
+                    tests_skipped += 1;
+                    continue;
+                }
+            }
+
+            let setup_sql = resolve_setup_sql(&file, &snap.modifiers);
+
+            if setup_sql.lines().any(|l| l.trim_start().starts_with('.')) {
+                tests_skipped += 1;
+                continue;
+            }
+
+            let mut sql = String::new();
+            if !setup_sql.is_empty() {
+                sql.push_str(&setup_sql);
+                sql.push('\n');
+            }
+            sql.push_str(&snap.sql);
+            if !sql.ends_with('\n') {
+                sql.push('\n');
+            }
+
+            // Normalize: remove leading whitespace from each line (SQLRight parser is sensitive to indentation)
+            let sql = sql.lines()
+                .map(|line| line.trim_start())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let sql = if sql.ends_with('\n') { sql } else { sql + "\n" };
+
+            let seed_name = format!("{}-{}.sql", basename, sanitize_name(&snap.name));
+            let seed_path = output_dir.join(&seed_name);
+            if let Err(e) = std::fs::write(&seed_path, &sql) {
+                eprintln!("Error: failed to write {}: {}", seed_path.display(), e);
+                continue;
+            }
+            seeds_written += 1;
+        }
+
+        files_processed += 1;
+    }
+
+    eprintln!("Extracted {seeds_written} seeds from {files_processed} files ({files_skipped} files skipped, {tests_skipped} tests skipped)");
+
+    ExitCode::SUCCESS
+}
+
+/// Resolve @setup references into concatenated SQL.
+fn resolve_setup_sql(file: &TestFile, modifiers: &CaseModifiers) -> String {
+    let mut parts = Vec::new();
+    for setup_ref in &modifiers.setups {
+        if let Some(sql) = file.setups.get(&setup_ref.name) {
+            parts.push(sql.as_str());
+        }
+    }
+    parts.join("\n")
+}
+
+/// Sanitize a test name for use as a filename.
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect::<String>()
+        .to_lowercase()
 }
 
 /// Generate test databases for debugging purposes.

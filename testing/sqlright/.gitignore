@@ -1,0 +1,11 @@
+# SQLRight build (cloned repo + compiled binaries)
+/build/
+
+# Auto-extracted seeds from .sqltest corpus
+/seeds/
+
+# Fuzzing results
+/results/
+
+# Coverage reports
+/coverage_report/
