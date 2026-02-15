@@ -8323,7 +8323,6 @@ pub fn op_init_cdc_version(
     let conn = program.connection.clone();
 
     // Step 1: Create version table if needed
-    // Follow the FTS pattern: start_nested → prepare → disable subtransactions → run
     {
         conn.start_nested();
         let mut stmt = conn.prepare(
