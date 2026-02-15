@@ -2,23 +2,23 @@
 
 @requires strict "uses STRICT tables"
 test create-type-basic {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '+' (test_uint) -> test_uint_add
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
-    SELECT name FROM sqlite_turso_types WHERE name = 'test_uint';
+        OPERATOR '+' test_uint_add
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
+    SELECT name FROM sqlite_turso_types WHERE name LIKE 'test_uint%';
 }
 expect {
-    test_uint
+    test_uint(value any)
 }
 
 @requires strict "uses STRICT tables"
 test create-type-if-not-exists {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TYPE IF NOT EXISTS test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    SELECT count(*) FROM sqlite_turso_types WHERE name = 'test_uint';
+    SELECT count(*) FROM sqlite_turso_types WHERE name LIKE 'test_uint%';
 }
 expect {
     1
@@ -26,9 +26,9 @@ expect {
 
 @requires strict "uses STRICT tables"
 test drop-type-basic {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     DROP TYPE test_uint;
-    SELECT count(*) FROM sqlite_turso_types WHERE name = 'test_uint';
+    SELECT count(*) FROM sqlite_turso_types WHERE name LIKE 'test_uint%';
 }
 expect {
     0
@@ -45,7 +45,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test strict-table-with-custom-type {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     INSERT INTO t1 VALUES (2, 100);
@@ -101,9 +101,9 @@ expect {
 
 @requires strict "uses STRICT tables"
 test uint-addition {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '+' (test_uint) -> test_uint_add;
+        OPERATOR '+' test_uint_add;
     CREATE TABLE t1(val test_uint) STRICT;
     INSERT INTO t1 VALUES (20);
     INSERT INTO t1 VALUES (30);
@@ -116,9 +116,9 @@ expect {
 
 @requires strict "uses STRICT tables"
 test uint-comparison-less-than {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt;
+        OPERATOR '<' test_uint_lt;
     CREATE TABLE t1(val test_uint) STRICT;
     INSERT INTO t1 VALUES (9);
     INSERT INTO t1 VALUES (10);
@@ -131,9 +131,9 @@ expect {
 
 @requires strict "uses STRICT tables"
 test uint-comparison-equals {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(val test_uint) STRICT;
     INSERT INTO t1 VALUES (42);
     INSERT INTO t1 VALUES (99);
@@ -187,7 +187,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test null-handling {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(val test_uint) STRICT;
     INSERT INTO t1 VALUES (NULL);
     SELECT COALESCE(val, 'IS_NULL') FROM t1;
@@ -198,7 +198,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test multiple-custom-types {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
     CREATE TABLE t1(a test_uint, b test_reverse) STRICT;
     INSERT INTO t1 VALUES (42, 'hello');
@@ -210,7 +210,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test type-default-literal {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value) DEFAULT 0;
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value) DEFAULT 0;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1(id) VALUES (1);
     INSERT INTO t1(id) VALUES (2);
@@ -238,7 +238,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test type-default-column-override {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value) DEFAULT 0;
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value) DEFAULT 0;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint DEFAULT 42) STRICT;
     INSERT INTO t1(id) VALUES (1);
     SELECT id, val FROM t1;
@@ -309,7 +309,7 @@ expect {
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
-    numeric(value any, precision integer, scale integer)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||+(numeric) -> numeric_add, -(numeric) -> numeric_sub, *(numeric) -> numeric_mul, /(numeric) -> numeric_div, <(numeric) -> numeric_lt, =(numeric) -> numeric_eq
+    numeric(value any, precision integer, scale integer)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
     smallint(value integer)|integer|CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|value||
     time(value text)|text|time (value)|value||
     timestamp(value text)|text|datetime (value)|value||
@@ -319,10 +319,10 @@ expect {
 
 @requires strict "uses STRICT tables"
 test pragma-list-types-with-custom {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '+' (test_uint) -> test_uint_add
+        OPERATOR '+' test_uint_add
         DEFAULT 0;
     PRAGMA list_types;
 }
@@ -339,9 +339,9 @@ expect {
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
-    numeric(value any, precision integer, scale integer)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||+(numeric) -> numeric_add, -(numeric) -> numeric_sub, *(numeric) -> numeric_mul, /(numeric) -> numeric_div, <(numeric) -> numeric_lt, =(numeric) -> numeric_eq
+    numeric(value any, precision integer, scale integer)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
     smallint(value integer)|integer|CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|value||
-    test_uint|text|test_uint_encode (value)|test_uint_decode (value)|0|+(test_uint) -> test_uint_add
+    test_uint(value any)|text|test_uint_encode (value)|test_uint_decode (value)|0|'+' test_uint_add
     time(value text)|text|time (value)|value||
     timestamp(value text)|text|datetime (value)|value||
     uuid(value text)|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|
@@ -360,7 +360,7 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test drop-type-in-use {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     DROP TYPE test_uint;
 }
@@ -369,7 +369,7 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test add-column-custom-type {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
     ALTER TABLE t1 ADD COLUMN val test_uint;
     INSERT INTO t1 VALUES (1, 42);
@@ -413,7 +413,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test add-column-custom-type-default-preexisting {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
     INSERT INTO t1 VALUES (1);
     INSERT INTO t1 VALUES (2);
@@ -427,7 +427,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test custom-type-non-strict-no-encode {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint);
     INSERT INTO t1 VALUES (1, 42);
     SELECT val, typeof(val) FROM t1;
@@ -452,7 +452,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test update-uint-encode {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     UPDATE t1 SET val = 99 WHERE id = 1;
@@ -464,7 +464,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test update-custom-type-null {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     UPDATE t1 SET val = NULL WHERE id = 1;
@@ -476,7 +476,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test replace-with-custom-type {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     REPLACE INTO t1 VALUES (1, 99);
@@ -488,7 +488,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test custom-type-not-null-constraint {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint NOT NULL) STRICT;
     INSERT INTO t1 VALUES (1, NULL);
 }
@@ -1101,9 +1101,9 @@ expect {
 
 @requires strict "uses STRICT tables"
 test derived-operator-not-equals-with-uint {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 10);
     INSERT INTO t1 VALUES (2, 20);
@@ -1117,9 +1117,9 @@ expect {
 
 @requires strict "uses STRICT tables"
 test derived-operator-greater-with-uint {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 10);
     INSERT INTO t1 VALUES (2, 20);
@@ -1132,9 +1132,9 @@ expect {
 
 @requires strict "uses STRICT tables"
 test derived-operator-less-equals-with-uint {
-    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 10);
     INSERT INTO t1 VALUES (2, 20);
@@ -1193,11 +1193,11 @@ expect {
 
 @requires strict "uses STRICT tables"
 test typecheck-validates-base-type-insert {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     INSERT INTO t1 VALUES (2, 100);
@@ -1210,11 +1210,11 @@ expect {
 
 @requires strict "uses STRICT tables"
 test typecheck-validates-base-type-update {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     UPDATE t1 SET val = 100 WHERE id = 1;
@@ -1226,11 +1226,11 @@ expect {
 
 @requires strict "uses STRICT tables"
 test typecheck-validates-base-type-upsert {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     INSERT INTO t1 VALUES (1, 100) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
@@ -1242,11 +1242,11 @@ expect {
 
 @requires strict "uses STRICT tables"
 test order-by-custom-lt-numeric-sort {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 1);
     INSERT INTO t1 VALUES (2, 10);
@@ -1267,11 +1267,11 @@ expect {
 
 @requires strict "uses STRICT tables"
 test order-by-custom-lt-desc {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 1);
     INSERT INTO t1 VALUES (2, 10);
@@ -1292,11 +1292,11 @@ expect {
 
 @requires strict "uses STRICT tables"
 test order-by-custom-lt-with-limit {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 1);
     INSERT INTO t1 VALUES (2, 10);
@@ -1352,11 +1352,11 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test type-roundtrip-special-chars-operator {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     SELECT val FROM t1;
@@ -1367,11 +1367,11 @@ expect {
 
 @requires strict "uses STRICT tables"
 test order-by-custom-lt-many-values {
-    CREATE TYPE test_uint BASE text
+    CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '<' (test_uint) -> test_uint_lt
-        OPERATOR '=' (test_uint) -> test_uint_eq;
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 999);
     INSERT INTO t1 VALUES (2, 1);

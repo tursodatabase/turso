@@ -4026,7 +4026,7 @@ impl<'a> Parser<'a> {
     ///     [ENCODE expr]
     ///     [DECODE expr]
     ///     [DEFAULT expr]
-    ///     [OPERATOR 'op' (right_type) -> func_name]*`
+    ///     [OPERATOR 'op' func_name]*`
     fn parse_create_type(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_TYPE);
         let if_not_exists = self.parse_if_not_exists()?;
@@ -4132,35 +4132,38 @@ impl<'a> Parser<'a> {
                                 .and_then(|s| s.strip_suffix('\''))
                                 .unwrap_or(&op_raw)
                                 .to_owned();
-                            // Parse (right_type)
-                            eat_expect!(self, TK_LP);
-                            let rt_tok = self.eat()?;
-                            let right_type = match rt_tok {
-                                Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
-                                _ => {
-                                    return Err(Error::ParseError(
-                                        "expected type name in OPERATOR clause".to_owned(),
-                                    ))
+                            // New syntax: OPERATOR 'op' func_name
+                            // Old syntax: OPERATOR 'op' (type) -> func_name
+                            // If next token is '(', consume old syntax (ignore type)
+                            let func_name = if matches!(self.peek()?, Some(t) if t.token_type == TK_LP)
+                            {
+                                // Old syntax: skip (type) ->
+                                eat_assert!(self, TK_LP);
+                                self.eat()?; // consume type name
+                                eat_expect!(self, TK_RP);
+                                eat_expect!(self, TK_PTR);
+                                let func_tok = self.eat()?;
+                                match func_tok {
+                                    Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
+                                    _ => {
+                                        return Err(Error::ParseError(
+                                            "expected function name in OPERATOR clause".to_owned(),
+                                        ))
+                                    }
+                                }
+                            } else {
+                                // New syntax: just func_name
+                                let func_tok = self.eat()?;
+                                match func_tok {
+                                    Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
+                                    _ => {
+                                        return Err(Error::ParseError(
+                                            "expected function name in OPERATOR clause".to_owned(),
+                                        ))
+                                    }
                                 }
                             };
-                            eat_expect!(self, TK_RP);
-                            // Parse -> func_name
-                            eat_expect!(self, TK_PTR);
-                            let func_tok = self.eat()?;
-                            let func_name = match func_tok {
-                                Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
-                                _ => {
-                                    return Err(Error::ParseError(
-                                        "expected function name after -> in OPERATOR clause"
-                                            .to_owned(),
-                                    ))
-                                }
-                            };
-                            operators.push(TypeOperator {
-                                op,
-                                right_type,
-                                func_name,
-                            });
+                            operators.push(TypeOperator { op, func_name });
                         }
                         _ => break,
                     }

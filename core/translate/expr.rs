@@ -612,41 +612,14 @@ pub fn translate_condition_expr(
             if let Some(resolved) =
                 find_custom_type_operator(e1, e2, op, Some(referenced_tables), resolver)
             {
-                let func = resolver
-                    .resolve_function(&resolved.func_name, 2)
-                    .ok_or_else(|| {
-                        crate::LimboError::InternalError(format!(
-                            "function not found: {}",
-                            resolved.func_name
-                        ))
-                    })?;
-                let arg_reg = program.alloc_registers(2);
-                let (first, second) = if resolved.swap_args {
-                    (e2.as_ref(), e1.as_ref())
-                } else {
-                    (e1.as_ref(), e2.as_ref())
-                };
-                translate_expr(program, Some(referenced_tables), first, arg_reg, resolver)?;
-                translate_expr(
+                let result_reg = emit_custom_type_operator(
                     program,
                     Some(referenced_tables),
-                    second,
-                    arg_reg + 1,
+                    e1,
+                    e2,
+                    &resolved,
                     resolver,
                 )?;
-                let result_reg = program.alloc_register();
-                program.emit_insn(Insn::Function {
-                    constant_mask: 0,
-                    start_reg: arg_reg,
-                    dest: result_reg,
-                    func: crate::function::FuncCtx { func, arg_count: 2 },
-                });
-                if resolved.negate {
-                    program.emit_insn(Insn::Not {
-                        reg: result_reg,
-                        dest: result_reg,
-                    });
-                }
                 emit_cond_jump(program, condition_metadata, result_reg);
             } else {
                 let result_reg = program.alloc_register();
@@ -1177,32 +1150,19 @@ pub fn translate_expr(
             if let Some(resolved) =
                 find_custom_type_operator(e1, e2, op, referenced_tables, resolver)
             {
-                let func = resolver
-                    .resolve_function(&resolved.func_name, 2)
-                    .ok_or_else(|| {
-                        crate::LimboError::InternalError(format!(
-                            "function not found: {}",
-                            resolved.func_name
-                        ))
-                    })?;
-                let arg_reg = program.alloc_registers(2);
-                let (first, second) = if resolved.swap_args {
-                    (e2.as_ref(), e1.as_ref())
-                } else {
-                    (e1.as_ref(), e2.as_ref())
-                };
-                translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
-                translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
-                program.emit_insn(Insn::Function {
-                    constant_mask: 0,
-                    start_reg: arg_reg,
-                    dest: target_register,
-                    func: crate::function::FuncCtx { func, arg_count: 2 },
-                });
-                if resolved.negate {
-                    program.emit_insn(Insn::Not {
-                        reg: target_register,
-                        dest: target_register,
+                let result_reg = emit_custom_type_operator(
+                    program,
+                    referenced_tables,
+                    e1,
+                    e2,
+                    &resolved,
+                    resolver,
+                )?;
+                if result_reg != target_register {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: result_reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
                     });
                 }
                 return Ok(target_register);
@@ -6199,12 +6159,118 @@ fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
     }
 }
 
-/// Get the custom type name of an expression, if it's a column with a custom type.
-fn expr_custom_type_name<'a>(
+/// Emit bytecode for a resolved custom type operator call.
+/// Handles argument swapping, literal encoding, and result negation.
+fn emit_custom_type_operator(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    resolved: &ResolvedOperator,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let func = resolver
+        .resolve_function(&resolved.func_name, 2)
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!("function not found: {}", resolved.func_name))
+        })?;
+    let (first, second) = if resolved.swap_args {
+        (e2, e1)
+    } else {
+        (e1, e2)
+    };
+
+    // When encoding a literal operand, we must use separate registers for the
+    // function call arguments. translate_expr may place literals in preamble
+    // registers (constant optimization), and encoding in-place would clobber
+    // that register — breaking subsequent loop iterations.
+    let func_start = if let Some(ref encode_info) = resolved.encode_info {
+        if let Some(ref encode_expr) = encode_info.type_def.encode {
+            // Translate operands into temporary registers first.
+            let tmp1 = program.alloc_register();
+            let tmp2 = program.alloc_register();
+            translate_expr(program, referenced_tables, first, tmp1, resolver)?;
+            translate_expr(program, referenced_tables, second, tmp2, resolver)?;
+
+            // Determine which tmp holds the literal and which holds the column.
+            let (lit_tmp, col_tmp) = match encode_info.which {
+                EncodeArg::First if resolved.swap_args => (tmp2, tmp1),
+                EncodeArg::First => (tmp1, tmp2),
+                EncodeArg::Second if resolved.swap_args => (tmp1, tmp2),
+                EncodeArg::Second => (tmp2, tmp1),
+            };
+
+            // Allocate fresh contiguous registers for the function call.
+            let func_args = program.alloc_registers(2);
+            // The literal goes in the same position it occupied in arg layout.
+            let (lit_dst, col_dst) = match encode_info.which {
+                EncodeArg::First if resolved.swap_args => (func_args + 1, func_args),
+                EncodeArg::First => (func_args, func_args + 1),
+                EncodeArg::Second if resolved.swap_args => (func_args, func_args + 1),
+                EncodeArg::Second => (func_args + 1, func_args),
+            };
+
+            // Copy column value as-is.
+            program.emit_insn(Insn::Copy {
+                src_reg: col_tmp,
+                dst_reg: col_dst,
+                extra_amount: 0,
+            });
+            // Encode the literal into the fresh function arg slot.
+            emit_type_expr(
+                program,
+                encode_expr,
+                lit_tmp,
+                lit_dst,
+                &encode_info.column,
+                &encode_info.type_def,
+                resolver,
+            )?;
+            func_args
+        } else {
+            // Type has no encode expression; translate directly into arg slots.
+            let arg_reg = program.alloc_registers(2);
+            translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
+            translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
+            arg_reg
+        }
+    } else {
+        // No encoding needed; translate directly into arg slots.
+        let arg_reg = program.alloc_registers(2);
+        translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
+        translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
+        arg_reg
+    };
+
+    let result_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: func_start,
+        dest: result_reg,
+        func: crate::function::FuncCtx { func, arg_count: 2 },
+    });
+    if resolved.negate {
+        program.emit_insn(Insn::Not {
+            reg: result_reg,
+            dest: result_reg,
+        });
+    }
+    Ok(result_reg)
+}
+
+/// Info about a column with a custom type, extracted from an expression.
+struct ExprCustomTypeInfo {
+    type_name: String,
+    column: crate::schema::Column,
+    type_def: crate::sync::Arc<crate::schema::TypeDef>,
+}
+
+/// If the expression is a column reference to a custom type, return the type info.
+fn expr_custom_type_info(
     expr: &ast::Expr,
-    referenced_tables: Option<&'a TableReferences>,
-    resolver: &'a Resolver,
-) -> Option<String> {
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<ExprCustomTypeInfo> {
     if let ast::Expr::Column {
         table: table_ref_id,
         column,
@@ -6215,27 +6281,77 @@ fn expr_custom_type_name<'a>(
         let (_, table) = tables.find_table_by_internal_id(*table_ref_id)?;
         let col = table.get_column_at(*column)?;
         let type_name = &col.ty_str;
-        if resolver
-            .schema
-            .get_type_def(type_name, table.is_strict())
-            .is_some()
-        {
-            return Some(type_name.to_lowercase());
-        }
+        let type_def = resolver.schema.get_type_def(type_name, table.is_strict())?;
+        return Some(ExprCustomTypeInfo {
+            type_name: type_name.to_lowercase(),
+            column: col.clone(),
+            type_def: crate::sync::Arc::clone(type_def),
+        });
     }
     None
 }
 
-/// Find a custom type operator function for a binary expression.
-/// Returns the function name if either operand has a custom type with a matching operator.
+/// Get the effective type name of a literal expression.
+fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
+    match expr {
+        ast::Expr::Literal(lit) => match lit {
+            ast::Literal::Numeric(s) => {
+                if s.contains('.') || s.contains('e') || s.contains('E') {
+                    Some("real")
+                } else {
+                    Some("integer")
+                }
+            }
+            ast::Literal::String(_) => Some("text"),
+            ast::Literal::Blob(_) => Some("blob"),
+            ast::Literal::True | ast::Literal::False => Some("integer"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Check if a literal type is compatible with a custom type's value input type.
+/// "any" matches everything; otherwise exact match (case-insensitive).
+fn literal_compatible_with_value_type(literal_type: &str, value_input_type: &str) -> bool {
+    value_input_type.eq_ignore_ascii_case("any")
+        || literal_type.eq_ignore_ascii_case(value_input_type)
+}
+
+/// Which operand of a binary expression needs encoding before the operator call.
+enum EncodeArg {
+    /// Encode the first argument (e1 is a literal, e2 is the custom type column)
+    First,
+    /// Encode the second argument (e1 is the custom type column, e2 is a literal)
+    Second,
+}
+
+/// Info needed to encode a literal argument for an operator call.
+struct OperatorEncodeInfo {
+    column: crate::schema::Column,
+    type_def: crate::sync::Arc<crate::schema::TypeDef>,
+    which: EncodeArg,
+}
+
 /// Result of resolving a custom type operator. May be a direct match or derived
 /// from `<` and `=` operators (e.g. `>` is derived as swap_args + `<`).
 struct ResolvedOperator {
     func_name: String,
     swap_args: bool,
     negate: bool,
+    /// If a literal operand needs encoding before the operator call.
+    encode_info: Option<OperatorEncodeInfo>,
 }
 
+/// Find a custom type operator function for a binary expression.
+///
+/// Operators fire when:
+/// 1. Both operands are columns of the same custom type, OR
+/// 2. One operand is a custom type column and the other is a literal whose type
+///    is compatible with the custom type's `value` input type.
+///
+/// When case 2 applies, the literal is encoded before being passed to the operator
+/// function so both arguments are in the same (encoded) representation.
 fn find_custom_type_operator(
     e1: &ast::Expr,
     e2: &ast::Expr,
@@ -6244,21 +6360,15 @@ fn find_custom_type_operator(
     resolver: &Resolver,
 ) -> Option<ResolvedOperator> {
     let op_str = operator_to_str(op)?;
-    let lhs_type = expr_custom_type_name(e1, referenced_tables, resolver);
-    let rhs_type = expr_custom_type_name(e2, referenced_tables, resolver);
+    let lhs_info = expr_custom_type_info(e1, referenced_tables, resolver);
+    let rhs_info = expr_custom_type_info(e2, referenced_tables, resolver);
 
-    // Try to find a direct operator match, then fall back to deriving from < and =.
-    let find_in_type_def = |type_def: &crate::schema::TypeDef,
-                            rhs_ty: &str|
-     -> Option<ResolvedOperator> {
-        // Direct match
+    // Try to find a direct or derived operator match on a type definition.
+    let find_in_type_def = |type_def: &crate::schema::TypeDef| -> Option<(String, bool, bool)> {
+        // Direct match: just check op symbol (no right_type constraint)
         for op_def in &type_def.operators {
-            if op_def.op == op_str && op_def.right_type.to_lowercase() == rhs_ty.to_lowercase() {
-                return Some(ResolvedOperator {
-                    func_name: op_def.func_name.clone(),
-                    swap_args: false,
-                    negate: false,
-                });
+            if op_def.op == op_str {
+                return Some((op_def.func_name.clone(), false, false));
             }
         }
 
@@ -6267,55 +6377,74 @@ fn find_custom_type_operator(
             type_def
                 .operators
                 .iter()
-                .find(|o| o.op == sym && o.right_type.to_lowercase() == rhs_ty.to_lowercase())
+                .find(|o| o.op == sym)
                 .map(|o| o.func_name.clone())
         };
 
         match *op {
             // a > b  →  lt(b, a)
-            ast::Operator::Greater => find_op("<").map(|f| ResolvedOperator {
-                func_name: f,
-                swap_args: true,
-                negate: false,
-            }),
+            ast::Operator::Greater => find_op("<").map(|f| (f, true, false)),
             // a >= b  →  NOT lt(a, b)
-            ast::Operator::GreaterEquals => find_op("<").map(|f| ResolvedOperator {
-                func_name: f,
-                swap_args: false,
-                negate: true,
-            }),
+            ast::Operator::GreaterEquals => find_op("<").map(|f| (f, false, true)),
             // a <= b  →  NOT lt(b, a)
-            ast::Operator::LessEquals => find_op("<").map(|f| ResolvedOperator {
-                func_name: f,
-                swap_args: true,
-                negate: true,
-            }),
+            ast::Operator::LessEquals => find_op("<").map(|f| (f, true, true)),
             // a != b  →  NOT eq(a, b)
-            ast::Operator::NotEquals => find_op("=").map(|f| ResolvedOperator {
-                func_name: f,
-                swap_args: false,
-                negate: true,
-            }),
+            ast::Operator::NotEquals => find_op("=").map(|f| (f, false, true)),
             _ => None,
         }
     };
 
-    // Try to find operator on lhs type first.
-    if let Some(ref lhs_ty) = lhs_type {
-        if let Some(type_def) = resolver.schema.get_type_def_unchecked(lhs_ty) {
-            let rhs_ty = rhs_type.as_deref().unwrap_or(lhs_ty);
-            if let Some(resolved) = find_in_type_def(type_def, rhs_ty) {
-                return Some(resolved);
+    // Case 1: Both operands are custom type columns of the SAME type.
+    if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
+        if lhs.type_name == rhs.type_name {
+            if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
+                return Some(ResolvedOperator {
+                    func_name,
+                    swap_args,
+                    negate,
+                    encode_info: None,
+                });
+            }
+        }
+        // Different custom types: fall through to standard operator.
+        return None;
+    }
+
+    // Case 2: LHS is custom type, RHS is a compatible literal.
+    if let Some(ref lhs) = lhs_info {
+        if let Some(lit_type) = literal_type_name(e2) {
+            if literal_compatible_with_value_type(lit_type, lhs.type_def.value_input_type()) {
+                if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
+                    return Some(ResolvedOperator {
+                        func_name,
+                        swap_args,
+                        negate,
+                        encode_info: Some(OperatorEncodeInfo {
+                            column: lhs.column.clone(),
+                            type_def: lhs.type_def.clone(),
+                            which: EncodeArg::Second,
+                        }),
+                    });
+                }
             }
         }
     }
 
-    // Try rhs type: handles `literal OP custom_type`.
-    if let Some(ref rhs_ty) = rhs_type {
-        if lhs_type.is_none() {
-            if let Some(type_def) = resolver.schema.get_type_def_unchecked(rhs_ty) {
-                if let Some(resolved) = find_in_type_def(type_def, rhs_ty) {
-                    return Some(resolved);
+    // Case 3: RHS is custom type, LHS is a compatible literal (reversed).
+    if let Some(ref rhs) = rhs_info {
+        if let Some(lit_type) = literal_type_name(e1) {
+            if literal_compatible_with_value_type(lit_type, rhs.type_def.value_input_type()) {
+                if let Some((func_name, swap_args, negate)) = find_in_type_def(&rhs.type_def) {
+                    return Some(ResolvedOperator {
+                        func_name,
+                        swap_args,
+                        negate,
+                        encode_info: Some(OperatorEncodeInfo {
+                            column: rhs.column.clone(),
+                            type_def: rhs.type_def.clone(),
+                            which: EncodeArg::First,
+                        }),
+                    });
                 }
             }
         }

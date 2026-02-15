@@ -3,7 +3,6 @@
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-setup-same-type-both-columns {
     -- Both columns are the same custom type → operator fires.
     CREATE TYPE test_uint(value any) BASE text
@@ -23,7 +22,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-same-type-where-eq {
     -- WHERE with = between two custom type columns.
     CREATE TYPE test_uint(value any) BASE text
@@ -44,7 +42,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-same-type-where-lt {
     -- WHERE with < between two custom type columns.
     CREATE TYPE test_uint(value any) BASE text
@@ -65,7 +62,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-literal-add-integer {
     -- Integer literal + custom type column (value any).
     CREATE TYPE test_uint(value any) BASE text
@@ -87,7 +83,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-literal-eq-multi-rows {
     -- Literal comparison with = across multiple rows.
     CREATE TYPE test_uint(value any) BASE text
@@ -109,7 +104,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-literal-lt-multi-rows {
     -- Literal comparison with < across multiple rows (no clobbering).
     CREATE TYPE test_uint(value any) BASE text
@@ -131,7 +125,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-reversed-literal-plus-column {
     -- Reversed: literal + custom_type_column → operator fires with swapped args.
     CREATE TYPE test_uint(value any) BASE text
@@ -154,7 +147,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-derived-gt-literal {
     -- > derived from swap_args(<)
     CREATE TYPE test_uint(value any) BASE text
@@ -176,7 +168,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-derived-gte-literal {
     -- >= derived from NOT(<)
     CREATE TYPE test_uint(value any) BASE text
@@ -199,7 +190,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-derived-lte-literal {
     -- <= derived from NOT(swap_args(<))
     CREATE TYPE test_uint(value any) BASE text
@@ -222,7 +212,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-derived-neq-literal {
     -- != derived from NOT(=)
     CREATE TYPE test_uint(value any) BASE text
@@ -243,7 +232,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-derived-gt-between-columns {
     -- > between two custom type columns.
     CREATE TYPE test_uint(value any) BASE text
@@ -264,7 +252,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-add-literal-multi-row {
     -- numeric(10,2) + integer literal across multiple rows.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
@@ -280,7 +267,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-sub-literal-multi-row {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 42);
@@ -295,7 +281,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-mul-literal-multi-row {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 10);
@@ -310,7 +295,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-div-literal-multi-row {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 100);
@@ -323,7 +307,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-lt-literal-multi-row {
     -- numeric < literal across 4 rows (tests no register clobbering).
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
@@ -339,7 +322,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-eq-literal-multi-row {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 42);
@@ -353,7 +335,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-gt-literal-multi-row {
     -- > (derived) with numeric across 4 rows.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
@@ -369,7 +350,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-gte-literal-multi-row {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 100);
@@ -385,7 +365,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-lte-literal-multi-row {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 100);
@@ -401,7 +380,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-neq-literal-multi-row {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 100);
@@ -415,7 +393,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-between-literal-multi-row {
     -- BETWEEN rewrites to >= AND <=, both derived operators.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
@@ -431,7 +408,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-add-both-columns {
     -- Both columns are numeric → operator fires, no encoding needed.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, a numeric(10,2), b numeric(10,2)) STRICT;
@@ -445,7 +421,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-lt-both-columns {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, a numeric(10,2), b numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 10, 20);
@@ -459,7 +434,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-different-types-no-override {
     -- Different custom types: standard operator, not overridden.
     CREATE TYPE type_a(value any) BASE text
@@ -481,7 +455,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-standard-plus-custom-no-override {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
@@ -498,7 +471,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-order-by-custom-lt {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
@@ -521,7 +493,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-order-by-custom-lt-desc {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
@@ -543,7 +514,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-null-literal-no-override {
     -- NULL literal: operator should not fire (NULL has no type).
     CREATE TYPE test_uint(value any) BASE text
@@ -561,7 +531,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-null-column-value {
     -- Column value is NULL: operator should handle gracefully.
     CREATE TYPE test_uint(value any) BASE text
@@ -582,7 +551,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-nested-expression {
     -- (a + b) + c: inner fires (both custom type columns), outer may or may not.
     CREATE TYPE test_uint(value any) BASE text
@@ -603,7 +571,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-backward-compat-old-syntax {
     -- Old syntax: OPERATOR 'op' (type) -> func_name
     CREATE TYPE test_uint_old(value any) BASE text
@@ -624,7 +591,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-value-integer-with-integer-literal {
     -- value type is "integer", integer literal → compatible → operator fires.
     CREATE TYPE my_int(value integer) BASE integer
@@ -641,7 +607,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-value-integer-with-text-literal-fallback {
     -- value type is "integer", text literal → NOT compatible → standard operator.
     CREATE TYPE my_int(value integer) BASE integer
@@ -657,7 +622,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-many-rows-lt {
     -- 8 rows to stress-test register handling across iterations.
     CREATE TYPE test_uint(value any) BASE text
@@ -685,7 +649,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-many-rows-add {
     -- 8 rows: addition across many iterations.
     CREATE TYPE test_uint(value any) BASE text
@@ -717,7 +680,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-many-rows-numeric-gt {
     -- 8 rows with numeric type: derived > across many iterations.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
@@ -739,7 +701,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-where-and-order-by-combined {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
@@ -763,7 +724,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-numeric-where-and-order-by {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 100);
@@ -782,7 +742,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-reversed-literal-lt {
     -- 5 < val → should use custom operator (literal on LHS).
     CREATE TYPE test_uint(value any) BASE text
@@ -804,7 +763,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-reversed-literal-eq {
     -- 42 = val → should use custom operator (literal on LHS).
     CREATE TYPE test_uint(value any) BASE text

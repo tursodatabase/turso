@@ -1281,7 +1281,7 @@ fn query_pragma(
                     let ops: Vec<String> = type_def
                         .operators
                         .iter()
-                        .map(|op| format!("{}({}) -> {}", op.op, op.right_type, op.func_name))
+                        .map(|op| format!("'{}' {}", op.op, op.func_name))
                         .collect();
                     program.emit_string8(ops.join(", "), base_reg + 5);
                 }

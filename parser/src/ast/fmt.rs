@@ -752,10 +752,6 @@ impl ToTokens for Stmt {
                 for op in &body.operators {
                     s.append(TK_ID, Some("OPERATOR"))?;
                     s.append(TK_STRING, Some(&format!("'{}'", op.op)))?;
-                    s.append(TK_LP, None)?;
-                    s.append(TK_ID, Some(&op.right_type))?;
-                    s.append(TK_RP, None)?;
-                    s.append(TK_ID, Some("->"))?;
                     s.append(TK_ID, Some(&op.func_name))?;
                 }
                 Ok(())
