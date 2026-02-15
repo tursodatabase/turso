@@ -1160,10 +1160,7 @@ fn test_cdc_version_table_created(db: TempDatabase) {
         .unwrap();
     conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         .unwrap();
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT table_name, version FROM turso_cdc_version",
-    );
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
     assert_eq!(
         rows,
         vec![vec![
@@ -1181,10 +1178,7 @@ fn test_cdc_version_custom_table(db: TempDatabase) {
         .unwrap();
     conn.execute("PRAGMA unstable_capture_data_changes_conn('id,my_cdc')")
         .unwrap();
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT table_name, version FROM turso_cdc_version",
-    );
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
     assert_eq!(
         rows,
         vec![vec![
@@ -1208,10 +1202,7 @@ fn test_cdc_version_not_created_when_exists(db: TempDatabase) {
     // Re-enable CDC — turso_cdc table already exists, so no duplicate version row
     conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         .unwrap();
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT table_name, version FROM turso_cdc_version",
-    );
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
     assert_eq!(
         rows,
         vec![vec![
@@ -1237,20 +1228,17 @@ fn setup_backward_compat_v1(db: &TempDatabase, mode: &str) -> Arc<turso_core::Co
         "CREATE TABLE turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
     )
     .unwrap();
-    conn.execute(
-        "INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v1')",
-    )
-    .unwrap();
-
-    // Enable CDC — table already exists so InitCdcVersion opcode is NOT emitted
-    conn.execute(format!("PRAGMA unstable_capture_data_changes_conn('{mode}')"))
+    conn.execute("INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v1')")
         .unwrap();
 
+    // Enable CDC — table already exists so InitCdcVersion opcode is NOT emitted
+    conn.execute(format!(
+        "PRAGMA unstable_capture_data_changes_conn('{mode}')"
+    ))
+    .unwrap();
+
     // Verify version table is unchanged
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT table_name, version FROM turso_cdc_version",
-    );
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
     assert_eq!(
         rows,
         vec![vec![
@@ -1260,8 +1248,7 @@ fn setup_backward_compat_v1(db: &TempDatabase, mode: &str) -> Arc<turso_core::Co
     );
 
     // Perform insert, update, delete
-    conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)")
-        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
     conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
     conn.execute("DELETE FROM t WHERE x = 3").unwrap();
     conn.execute("DELETE FROM t WHERE x = 1").unwrap();

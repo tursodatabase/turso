@@ -349,7 +349,8 @@ fn update_pragma(
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
-            let opts = CaptureDataChangesInfo::parse(&value, Some(TURSO_CDC_CURRENT_VERSION.to_string()))?;
+            let opts =
+                CaptureDataChangesInfo::parse(&value, Some(TURSO_CDC_CURRENT_VERSION.to_string()))?;
             if let Some(info) = &opts {
                 if resolver.schema.get_table(&info.table).is_none() {
                     program = translate_create_table(

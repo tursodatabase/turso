@@ -17,7 +17,6 @@ use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
 };
 use crate::vdbe::insn::{to_u16, CmpInsFlags};
-use crate::{CaptureDataChangesExt, Connection};
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -40,6 +39,7 @@ use crate::{
         insn::{IdxInsertFlags, InsertFlags, Insn},
     },
 };
+use crate::{CaptureDataChangesExt, Connection};
 
 // The following comment is copied directly from SQLite source and should be used as a guiding light
 // whenever we encounter compatibility bugs related to conflict clause handling:
