@@ -33,7 +33,7 @@ use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
     registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup,
+    StepResult, TxnCleanup, AUTO_ANALYZE_FULL_SCAN, AUTO_ANALYZE_INDEX_RANGE_SCAN,
 };
 use crate::vector::{
     vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
@@ -1320,7 +1320,7 @@ pub fn op_open_pseudo(
 }
 
 pub fn op_rewind(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -1352,6 +1352,12 @@ pub fn op_rewind(
             _ => panic!("Rewind on non-btree/materialized-view cursor"),
         }
     };
+    if program.connection.auto_analyze_enabled()
+        && program.auto_analyze_has_flag(*cursor_id, AUTO_ANALYZE_FULL_SCAN)
+    {
+        state.auto_analyze.note_scan_start(*cursor_id, is_empty);
+    }
+
     if is_empty {
         state.pc = pc_if_empty.as_offset_int();
     } else {
@@ -1382,6 +1388,11 @@ pub fn op_last(
         return_if_io!(cursor.last());
         cursor.is_empty()
     };
+    if program.connection.auto_analyze_enabled()
+        && program.auto_analyze_has_flag(*cursor_id, AUTO_ANALYZE_FULL_SCAN)
+    {
+        state.auto_analyze.note_scan_start(*cursor_id, is_empty);
+    }
     if is_empty {
         state.pc = pc_if_empty.as_offset_int();
     } else {
@@ -1837,8 +1848,18 @@ pub fn op_next(
                 state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
+        let track_scan = program.connection.auto_analyze_enabled()
+            && program.auto_analyze_flags(*cursor_id) != 0;
+        if track_scan {
+            state.auto_analyze.note_scan_step(*cursor_id);
+        }
         state.pc = pc_if_next.as_offset_int();
     } else {
+        let track_scan = program.connection.auto_analyze_enabled()
+            && program.auto_analyze_flags(*cursor_id) != 0;
+        if track_scan {
+            state.auto_analyze.note_scan_end(*cursor_id);
+        }
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
@@ -1884,8 +1905,18 @@ pub fn op_prev(
                 state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
+        let track_scan = program.connection.auto_analyze_enabled()
+            && program.auto_analyze_flags(*cursor_id) != 0;
+        if track_scan {
+            state.auto_analyze.note_scan_step(*cursor_id);
+        }
         state.pc = pc_if_prev.as_offset_int();
     } else {
+        let track_scan = program.connection.auto_analyze_enabled()
+            && program.auto_analyze_flags(*cursor_id) != 0;
+        if track_scan {
+            state.auto_analyze.note_scan_end(*cursor_id);
+        }
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
@@ -3159,6 +3190,10 @@ pub fn op_seek(
         Insn::SeekLT { .. } => SeekOp::LT,
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+    let track_range_scan = is_index
+        && program.connection.auto_analyze_enabled()
+        && program.auto_analyze_has_flag(*cursor_id, AUTO_ANALYZE_INDEX_RANGE_SCAN);
+
     match seek_internal(
         program,
         state,
@@ -3169,10 +3204,16 @@ pub fn op_seek(
         op,
     ) {
         Ok(SeekInternalResult::Found) => {
+            if track_range_scan {
+                state.auto_analyze.note_scan_start(*cursor_id, false);
+            }
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(SeekInternalResult::NotFound) => {
+            if track_range_scan {
+                state.auto_analyze.note_scan_start(*cursor_id, true);
+            }
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
@@ -6665,6 +6706,16 @@ pub fn op_insert(
 
                     return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
                 }
+                if program.connection.auto_analyze_enabled()
+                    && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
+                    && !flag.has(InsertFlags::IS_UPDATE)
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                {
+                    // Track row insert for incremental stats update
+                    // Skip for IS_UPDATE (in-place update) and UPDATE_ROWID_CHANGE
+                    // (rowid change already tracked via Delete + Insert)
+                    state.auto_analyze.note_row_insert(table_name);
+                }
                 // Increment metrics for row write
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
 
@@ -6870,6 +6921,12 @@ pub fn op_delete(
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.delete());
+                }
+                if program.connection.auto_analyze_enabled() && !is_part_of_update {
+                    // Track row delete for incremental stats update
+                    // Skip for is_part_of_update (UPDATE with rowid change - the
+                    // subsequent Insert won't be tracked either, so net change is 0)
+                    state.auto_analyze.note_row_delete(table_name);
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
@@ -9132,6 +9189,25 @@ pub fn op_count(
     // For optimized COUNT(*) queries, the count represents rows that would be read
     // SQLite tracks this differently (as pages read), but for consistency we track as rows
     if *exact {
+        if program.connection.auto_analyze_enabled() {
+            if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
+                match cursor_type {
+                    CursorType::BTreeTable(table) => {
+                        state
+                            .auto_analyze
+                            .record_exact_count(&table.name, count as u64);
+                    }
+                    CursorType::BTreeIndex(index) => {
+                        if !index.ephemeral && index.where_clause.is_none() {
+                            state
+                                .auto_analyze
+                                .record_exact_count(&index.table_name, count as u64);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         state.metrics.rows_read = state.metrics.rows_read.saturating_add(count as u64);
     }
 

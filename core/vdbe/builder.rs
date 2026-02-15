@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
@@ -120,6 +120,8 @@ pub struct ProgramBuilder {
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
     /// again. Hence, the key is optional.
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
+    /// Auto-analyze scan flags keyed by cursor id.
+    auto_analyze_scan_flags: HashMap<CursorID, u8>,
     /// A vector where index=label number, value=resolved offset. Resolved in build().
     label_to_resolved_offset: Vec<Option<(InsnReference, JumpTarget)>>,
     // Bitmask of cursors that have emitted a SeekRowid instruction.
@@ -371,6 +373,7 @@ impl ProgramBuilder {
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
+            auto_analyze_scan_flags: HashMap::with_capacity_and_hasher(5, FxBuildHasher),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             seekrowid_emitted_bitmask: 0,
@@ -647,6 +650,16 @@ impl ProgramBuilder {
 
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {
         self._alloc_cursor_id(None, cursor_type)
+    }
+
+    pub fn mark_auto_analyze_full_scan(&mut self, cursor_id: CursorID) {
+        let flags = self.auto_analyze_scan_flags.entry(cursor_id).or_insert(0);
+        *flags |= super::AUTO_ANALYZE_FULL_SCAN;
+    }
+
+    pub fn mark_auto_analyze_index_range_scan(&mut self, cursor_id: CursorID) {
+        let flags = self.auto_analyze_scan_flags.entry(cursor_id).or_insert(0);
+        *flags |= super::AUTO_ANALYZE_INDEX_RANGE_SCAN;
     }
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
@@ -1445,10 +1458,17 @@ impl ProgramBuilder {
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
 
+        let mut auto_analyze_scan_flags = vec![0u8; self.cursor_ref.len()];
+        for (cursor_id, flags) in self.auto_analyze_scan_flags.drain() {
+            if let Some(slot) = auto_analyze_scan_flags.get_mut(cursor_id) {
+                *slot |= flags;
+            }
+        }
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
+            auto_analyze_scan_flags,
             comments: self.comments,
             parameters: self.parameters,
             change_cnt_on,

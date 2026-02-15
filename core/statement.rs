@@ -163,6 +163,12 @@ impl Statement {
             self.busy_handler_state = None; // Reset busy state on completion
             drop(conn_metrics);
 
+            if matches!(self.query_mode, QueryMode::Normal) {
+                self.program
+                    .connection
+                    .record_auto_analyze(&self.program, &self.state);
+            }
+
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
             let sql = self.program.sql.trim_start();
             if sql.to_ascii_uppercase().starts_with("ANALYZE") {

@@ -175,91 +175,102 @@ pub fn init_loop(
         let (table_cursor_id, index_cursor_id) =
             table.open_cursors(program, mode.clone(), t_ctx.resolver.schema)?;
         match &table.op {
-            Operation::Scan(Scan::BTreeTable { index, .. }) => match (&mode, &table.table) {
-                (OperationMode::SELECT, Table::BTree(btree)) => {
-                    let root_page = btree.root_page;
-                    if let Some(cursor_id) = table_cursor_id {
-                        program.emit_insn(Insn::OpenRead {
-                            cursor_id,
-                            root_page,
-                            db: table.database_id,
-                        });
-                    }
-                    if let Some(index_cursor_id) = index_cursor_id {
-                        program.emit_insn(Insn::OpenRead {
-                            cursor_id: index_cursor_id,
-                            root_page: index.as_ref().unwrap().root_page,
-                            db: table.database_id,
-                        });
-                    }
-                }
-                (OperationMode::DELETE, Table::BTree(btree)) => {
-                    let root_page = btree.root_page;
-                    program.emit_insn(Insn::OpenWrite {
-                        cursor_id: table_cursor_id
-                            .expect("table cursor is always opened in OperationMode::DELETE"),
-                        root_page: root_page.into(),
-                        db: table.database_id,
-                    });
-                    if let Some(index_cursor_id) = index_cursor_id {
-                        program.emit_insn(Insn::OpenWrite {
-                            cursor_id: index_cursor_id,
-                            root_page: index.as_ref().unwrap().root_page.into(),
-                            db: table.database_id,
-                        });
-                    }
-                    // For delete, we need to open all the other indexes too for writing
-                    for index in t_ctx.resolver.schema.get_indices(&btree.name) {
-                        if table
-                            .op
-                            .index()
-                            .is_some_and(|table_index| table_index.name == index.name)
-                        {
-                            continue;
+            Operation::Scan(Scan::BTreeTable { index, .. }) => {
+                if let Some(index) = index {
+                    if index.where_clause.is_none() {
+                        if let Some(cursor_id) = index_cursor_id {
+                            program.mark_auto_analyze_full_scan(cursor_id);
                         }
-                        let cursor_id = program.alloc_cursor_index(
-                            Some(CursorKey::index(table.internal_id, index.clone())),
-                            index,
-                        )?;
-                        program.emit_insn(Insn::OpenWrite {
-                            cursor_id,
-                            root_page: index.root_page.into(),
-                            db: table.database_id,
-                        });
                     }
+                } else if let Some(cursor_id) = table_cursor_id {
+                    program.mark_auto_analyze_full_scan(cursor_id);
                 }
-                (OperationMode::UPDATE(update_mode), Table::BTree(btree)) => {
-                    let root_page = btree.root_page;
-                    match &update_mode {
-                        UpdateRowSource::Normal => {
-                            program.emit_insn(Insn::OpenWrite {
-                                cursor_id: table_cursor_id.expect(
-                                    "table cursor is always opened in OperationMode::UPDATE",
-                                ),
-                                root_page: root_page.into(),
+                match (&mode, &table.table) {
+                    (OperationMode::SELECT, Table::BTree(btree)) => {
+                        let root_page = btree.root_page;
+                        if let Some(cursor_id) = table_cursor_id {
+                            program.emit_insn(Insn::OpenRead {
+                                cursor_id,
+                                root_page,
                                 db: table.database_id,
                             });
                         }
-                        UpdateRowSource::PrebuiltEphemeralTable { target_table, .. } => {
-                            let target_table_cursor_id = program
-                                .resolve_cursor_id(&CursorKey::table(target_table.internal_id));
-                            program.emit_insn(Insn::OpenWrite {
-                                cursor_id: target_table_cursor_id,
-                                root_page: target_table.btree().unwrap().root_page.into(),
+                        if let Some(index_cursor_id) = index_cursor_id {
+                            program.emit_insn(Insn::OpenRead {
+                                cursor_id: index_cursor_id,
+                                root_page: index.as_ref().unwrap().root_page,
                                 db: table.database_id,
                             });
                         }
                     }
-                    if let Some(index_cursor_id) = index_cursor_id {
+                    (OperationMode::DELETE, Table::BTree(btree)) => {
+                        let root_page = btree.root_page;
                         program.emit_insn(Insn::OpenWrite {
-                            cursor_id: index_cursor_id,
-                            root_page: index.as_ref().unwrap().root_page.into(),
+                            cursor_id: table_cursor_id
+                                .expect("table cursor is always opened in OperationMode::DELETE"),
+                            root_page: root_page.into(),
                             db: table.database_id,
                         });
+                        if let Some(index_cursor_id) = index_cursor_id {
+                            program.emit_insn(Insn::OpenWrite {
+                                cursor_id: index_cursor_id,
+                                root_page: index.as_ref().unwrap().root_page.into(),
+                                db: table.database_id,
+                            });
+                        }
+                        // For delete, we need to open all the other indexes too for writing
+                        for index in t_ctx.resolver.schema.get_indices(&btree.name) {
+                            if table
+                                .op
+                                .index()
+                                .is_some_and(|table_index| table_index.name == index.name)
+                            {
+                                continue;
+                            }
+                            let cursor_id = program.alloc_cursor_index(
+                                Some(CursorKey::index(table.internal_id, index.clone())),
+                                index,
+                            )?;
+                            program.emit_insn(Insn::OpenWrite {
+                                cursor_id,
+                                root_page: index.root_page.into(),
+                                db: table.database_id,
+                            });
+                        }
                     }
+                    (OperationMode::UPDATE(update_mode), Table::BTree(btree)) => {
+                        let root_page = btree.root_page;
+                        match &update_mode {
+                            UpdateRowSource::Normal => {
+                                program.emit_insn(Insn::OpenWrite {
+                                    cursor_id: table_cursor_id.expect(
+                                        "table cursor is always opened in OperationMode::UPDATE",
+                                    ),
+                                    root_page: root_page.into(),
+                                    db: table.database_id,
+                                });
+                            }
+                            UpdateRowSource::PrebuiltEphemeralTable { target_table, .. } => {
+                                let target_table_cursor_id = program
+                                    .resolve_cursor_id(&CursorKey::table(target_table.internal_id));
+                                program.emit_insn(Insn::OpenWrite {
+                                    cursor_id: target_table_cursor_id,
+                                    root_page: target_table.btree().unwrap().root_page.into(),
+                                    db: table.database_id,
+                                });
+                            }
+                        }
+                        if let Some(index_cursor_id) = index_cursor_id {
+                            program.emit_insn(Insn::OpenWrite {
+                                cursor_id: index_cursor_id,
+                                root_page: index.as_ref().unwrap().root_page.into(),
+                                db: table.database_id,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Operation::Scan(Scan::VirtualTable { .. }) => {
                 if let Table::Virtual(tbl) = &table.table {
                     let is_write = matches!(
@@ -338,6 +349,9 @@ pub fn init_loop(
                 {
                     // Ephemeral index cursor are opened ad-hoc when needed.
                     if !index.ephemeral {
+                        if let Some(cursor_id) = index_cursor_id {
+                            program.mark_auto_analyze_index_range_scan(cursor_id);
+                        }
                         match mode {
                             OperationMode::SELECT => {
                                 program.emit_insn(Insn::OpenRead {

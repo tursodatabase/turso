@@ -44,7 +44,13 @@ pub fn translate_select(
         query_destination,
         connection,
     )?;
-    optimize_plan(&mut program, &mut select_plan, resolver.schema)?;
+    let auto_stats = connection.auto_analyze_stats_snapshot();
+    optimize_plan(
+        &mut program,
+        &mut select_plan,
+        resolver.schema,
+        auto_stats.as_ref(),
+    )?;
     let num_result_cols;
     let opts = match &select_plan {
         Plan::Select(select) => {

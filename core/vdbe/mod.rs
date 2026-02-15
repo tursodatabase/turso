@@ -67,6 +67,7 @@ use crate::connection::AttachedDatabasesFingerprint;
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
+use crate::util::normalize_ident;
 use crate::{
     AtomicBool, CaptureDataChangesMode, Connection, MvStore, Result, SyncMode, TransactionState,
 };
@@ -82,7 +83,7 @@ use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     num::NonZero,
     ops::Deref,
     sync::{
@@ -326,6 +327,149 @@ pub(crate) struct DeferredSeekState {
     pub table_cursor_id: CursorID,
 }
 
+#[derive(Debug, Default, Clone)]
+/// Tracks a single cursor's table scan for auto-analyze row counts.
+///
+/// A scan is considered valid only when the cursor is rewound once and then
+/// advanced monotonically until EOF. We count the first row on Rewind/Last
+/// (note_scan_start) and each successful Next/Prev step (note_scan_step).
+/// If the same cursor is rewound more than once during a statement, the scan
+/// is invalidated to avoid double-counting from repeated or partial scans.
+pub(crate) struct AutoAnalyzeScanState {
+    /// Number of rows observed so far in this scan.
+    pub(crate) row_count: u64,
+    /// True once the scan reached EOF or the table was empty.
+    pub(crate) completed: bool,
+    /// Number of Rewind/Last calls observed for this cursor in the statement.
+    pub(crate) rewind_count: u32,
+    /// True once the scan becomes unreliable (e.g., multiple rewinds).
+    pub(crate) invalidated: bool,
+}
+
+impl AutoAnalyzeScanState {
+    fn reset(&mut self) {
+        self.row_count = 0;
+        self.completed = false;
+        self.rewind_count = 0;
+        self.invalidated = false;
+    }
+}
+
+#[derive(Debug, Default)]
+/// Per-statement auto-analyze tracking during program execution.
+pub(crate) struct AutoAnalyzeRuntime {
+    /// Scan state indexed by cursor id.
+    pub(crate) scan_states: Vec<AutoAnalyzeScanState>,
+    /// Exact row counts from OP_Count, keyed by normalized table name.
+    pub(crate) exact_counts: HashMap<String, u64>,
+    /// Row count deltas from INSERT/DELETE operations, keyed by normalized table name.
+    /// Positive = net inserts, negative = net deletes.
+    pub(crate) row_count_deltas: HashMap<String, i64>,
+    /// Raw table names that have row count deltas (for cheap de-dup).
+    row_count_deltas_raw: HashSet<String>,
+}
+
+impl AutoAnalyzeRuntime {
+    pub(crate) fn new(max_cursors: usize) -> Self {
+        Self {
+            scan_states: vec![AutoAnalyzeScanState::default(); max_cursors],
+            exact_counts: HashMap::new(),
+            row_count_deltas: HashMap::new(),
+            row_count_deltas_raw: HashSet::new(),
+        }
+    }
+
+    /// Reset the auto-analyze runtime state.
+    pub(crate) fn reset(&mut self, max_cursors: Option<usize>) {
+        if let Some(max_cursors) = max_cursors {
+            self.scan_states
+                .resize(max_cursors, AutoAnalyzeScanState::default());
+        }
+        for state in &mut self.scan_states {
+            state.reset();
+        }
+        self.exact_counts.clear();
+        self.row_count_deltas.clear();
+        self.row_count_deltas_raw.clear();
+    }
+
+    /// Record that a table scan has started (Rewind/Last).
+    /// Counts the first row immediately, and marks completion for empty tables.
+    pub(crate) fn note_scan_start(&mut self, cursor_id: CursorID, is_empty: bool) {
+        let Some(scan_state) = self.scan_states.get_mut(cursor_id) else {
+            return;
+        };
+        scan_state.rewind_count = scan_state.rewind_count.saturating_add(1);
+        if scan_state.rewind_count > 1 {
+            scan_state.invalidated = true;
+            scan_state.completed = false;
+            scan_state.row_count = 0;
+            return;
+        }
+        if scan_state.invalidated || scan_state.completed {
+            return;
+        }
+        if is_empty {
+            scan_state.completed = true;
+        } else {
+            scan_state.row_count = scan_state.row_count.saturating_add(1);
+        }
+    }
+
+    /// Mark that a step has occurred in ongoing scan (Next/Prev).
+    pub(crate) fn note_scan_step(&mut self, cursor_id: CursorID) {
+        let Some(scan_state) = self.scan_states.get_mut(cursor_id) else {
+            return;
+        };
+        if scan_state.invalidated || scan_state.completed {
+            return;
+        }
+        scan_state.row_count = scan_state.row_count.saturating_add(1);
+    }
+
+    /// Record that an ongoing scan has ended (EOF reached).
+    pub(crate) fn note_scan_end(&mut self, cursor_id: CursorID) {
+        let Some(scan_state) = self.scan_states.get_mut(cursor_id) else {
+            return;
+        };
+        if scan_state.invalidated {
+            return;
+        }
+        scan_state.completed = true;
+    }
+
+    /// Record the exact row count for a table.
+    pub(crate) fn record_exact_count(&mut self, table_name: &str, row_count: u64) {
+        let table_name = normalize_ident(table_name);
+        self.exact_counts.insert(table_name, row_count);
+    }
+
+    /// Record that a row was inserted into a table.
+    /// This allows incremental row count updates instead of full invalidation.
+    pub(crate) fn note_row_insert(&mut self, table_name: &str) {
+        if !self.row_count_deltas_raw.contains(table_name) {
+            self.row_count_deltas_raw.insert(table_name.to_string());
+        }
+        let table_name = normalize_ident(table_name);
+        *self.row_count_deltas.entry(table_name).or_insert(0) += 1;
+    }
+
+    /// Record that a row was deleted from a table.
+    /// This allows incremental row count updates instead of full invalidation.
+    pub(crate) fn note_row_delete(&mut self, table_name: &str) {
+        if !self.row_count_deltas_raw.contains(table_name) {
+            self.row_count_deltas_raw.insert(table_name.to_string());
+        }
+        let table_name = normalize_ident(table_name);
+        *self.row_count_deltas.entry(table_name).or_insert(0) -= 1;
+    }
+
+    /// Check if a table has any writes (deltas).
+    pub(crate) fn has_any_writes(&self) -> bool {
+        !self.row_count_deltas.is_empty()
+    }
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -352,6 +496,7 @@ pub struct ProgramState {
     op_integrity_check_state: OpIntegrityCheckState,
     /// Metrics collected during statement execution
     pub metrics: StatementMetrics,
+    pub(crate) auto_analyze: AutoAnalyzeRuntime,
     op_open_ephemeral_state: OpOpenEphemeralState,
     op_program_state: OpProgramState,
     op_new_rowid_state: OpNewRowidState,
@@ -441,6 +586,7 @@ impl ProgramState {
             op_idx_delete_state: None,
             op_integrity_check_state: OpIntegrityCheckState::Start,
             metrics: StatementMetrics::new(),
+            auto_analyze: AutoAnalyzeRuntime::new(max_cursors),
             op_open_ephemeral_state: OpOpenEphemeralState::Start,
             op_program_state: OpProgramState::Start,
             op_new_rowid_state: OpNewRowidState::Start,
@@ -546,6 +692,7 @@ impl ProgramState {
         self.op_idx_delete_state = None;
         self.op_integrity_check_state = OpIntegrityCheckState::Start;
         self.metrics = StatementMetrics::new();
+        self.auto_analyze.reset(max_cursors);
         self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         self.op_new_rowid_state = OpNewRowidState::Start;
         self.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
@@ -779,6 +926,9 @@ pub struct ExplainState {
     subprogram_start_pc: Option<usize>,
 }
 
+pub(crate) const AUTO_ANALYZE_FULL_SCAN: u8 = 1 << 0;
+pub(crate) const AUTO_ANALYZE_INDEX_RANGE_SCAN: u8 = 1 << 1;
+
 #[derive(Clone)]
 pub struct PreparedProgram {
     pub max_registers: usize,
@@ -786,6 +936,7 @@ pub struct PreparedProgram {
     // ProgramBuilder
     pub insns: Vec<(Insn, usize)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
+    pub auto_analyze_scan_flags: Vec<u8>,
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
@@ -906,6 +1057,17 @@ impl Program {
 }
 
 impl Program {
+    pub(crate) fn auto_analyze_flags(&self, cursor_id: usize) -> u8 {
+        self.auto_analyze_scan_flags
+            .get(cursor_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn auto_analyze_has_flag(&self, cursor_id: usize, flag: u8) -> bool {
+        self.auto_analyze_flags(cursor_id) & flag != 0
+    }
+
     fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
         self.connection.get_pager_from_database_index(idx)
     }

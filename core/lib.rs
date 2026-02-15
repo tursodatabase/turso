@@ -58,7 +58,7 @@ pub use function::MathFunc;
 use crate::busy::{BusyHandler, BusyHandlerCallback};
 use crate::index_method::IndexMethod;
 use crate::schema::Trigger;
-use crate::stats::refresh_analyze_stats;
+use crate::stats::{refresh_analyze_stats, AutoAnalyzeStats};
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::{AtomicCipherMode, SQLITE_HEADER, TURSO_HEADER_PREFIX};
 use crate::storage::journal_mode;
@@ -1214,6 +1214,8 @@ impl Database {
             page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_checkpoint_disabled: AtomicBool::new(false),
             capture_data_changes: RwLock::new(CaptureDataChangesMode::Off),
+            auto_analyze_enabled: AtomicBool::new(false),
+            auto_analyze_stats: RwLock::new(AutoAnalyzeStats::default()),
             closed: AtomicBool::new(false),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),

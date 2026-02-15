@@ -1,26 +1,32 @@
 #[cfg(target_family = "windows")]
 use crate::error::CompletionError;
-use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
-    Arc, RwLock,
-};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
+use crate::vdbe::builder::CursorType;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, PlatformIO, IO},
-    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
-    util::IOExt,
+    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats,
+    stats::AutoAnalyzeStats,
+    translate, turso_assert,
+    util::{normalize_ident, IOExt},
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
     AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesMode,
     CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
     DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
     LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
     Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
+};
+use crate::{
+    schema::is_system_table,
+    sync::{
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
+        Arc, RwLock,
+    },
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -78,6 +84,8 @@ pub struct Connection {
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
     pub(super) wal_auto_checkpoint_disabled: AtomicBool,
     pub(super) capture_data_changes: RwLock<CaptureDataChangesMode>,
+    pub(super) auto_analyze_enabled: AtomicBool,
+    pub(super) auto_analyze_stats: RwLock<AutoAnalyzeStats>,
     pub(super) closed: AtomicBool,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
@@ -1540,6 +1548,143 @@ impl Connection {
 
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
+    }
+
+    pub fn auto_analyze_enabled(&self) -> bool {
+        self.auto_analyze_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_auto_analyze_enabled(&self, enabled: bool) {
+        self.auto_analyze_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            self.auto_analyze_stats.write().clear();
+        }
+    }
+
+    pub fn auto_analyze_stats_snapshot(&self) -> Option<AutoAnalyzeStats> {
+        if !self.auto_analyze_enabled() {
+            return None;
+        }
+        Some(self.auto_analyze_stats.read().clone())
+    }
+
+    /// Record information from the relevant Program into the auto-analyze stats, if enabled
+    pub(crate) fn record_auto_analyze(&self, program: &vdbe::Program, state: &vdbe::ProgramState) {
+        if !self.auto_analyze_enabled() {
+            return;
+        }
+
+        let auto_state = &state.auto_analyze;
+        let has_scan_signal = auto_state
+            .scan_states
+            .iter()
+            .any(|scan| !scan.invalidated && (scan.completed || scan.row_count > 0));
+        if !has_scan_signal && auto_state.exact_counts.is_empty() && !auto_state.has_any_writes() {
+            return;
+        }
+
+        // Collect index ranges to clear for tables with any writes
+        // (INSERT/DELETE invalidate index range stats since selectivity may have changed)
+        let index_ranges_to_clear = if !auto_state.has_any_writes() {
+            Vec::new()
+        } else {
+            let schema = self.schema.read();
+            auto_state
+                .row_count_deltas
+                .keys()
+                .flat_map(|table| schema.get_indices(table).map(|index| index.name.clone()))
+                .collect()
+        };
+
+        let mut stats = self.auto_analyze_stats.write();
+
+        // Clear index range stats for any tables with writes
+        for index_name in index_ranges_to_clear {
+            stats.remove_index_range(&index_name);
+        }
+
+        // Apply row count deltas for INSERT/DELETE (if we have an existing count)
+        for (table, delta) in &auto_state.row_count_deltas {
+            if is_system_table(table) {
+                continue;
+            }
+            if let Some(current_count) = stats.row_count(table) {
+                // Apply delta, clamping to 0 minimum
+                let new_count = if *delta >= 0 {
+                    current_count.saturating_add(*delta as u64)
+                } else {
+                    current_count.saturating_sub(delta.unsigned_abs())
+                };
+                stats.set_row_count(table, new_count);
+            }
+            // If we don't have a row count yet, we can't apply a delta
+        }
+
+        // Record exact counts from OP_Count
+        for (table, row_count) in &auto_state.exact_counts {
+            if is_system_table(table) {
+                continue;
+            }
+            // Exact count overrides any delta-based updates
+            stats.set_row_count(table, *row_count);
+        }
+
+        // Record row counts from completed full scans
+        for (cursor_id, scan_state) in auto_state.scan_states.iter().enumerate() {
+            if scan_state.invalidated {
+                continue;
+            }
+            let Some((_, cursor_type)) = program.cursor_ref.get(cursor_id) else {
+                continue;
+            };
+            let scan_flags = program.auto_analyze_flags(cursor_id);
+            let is_full_scan = scan_flags & crate::vdbe::AUTO_ANALYZE_FULL_SCAN != 0;
+            if is_full_scan {
+                if !scan_state.completed {
+                    continue;
+                }
+                match cursor_type {
+                    CursorType::BTreeTable(table) => {
+                        let table_name = normalize_ident(&table.name);
+                        if is_system_table(&table_name) {
+                            continue;
+                        }
+                        stats.set_row_count(&table_name, scan_state.row_count);
+                    }
+                    CursorType::BTreeIndex(index) => {
+                        if index.ephemeral || index.where_clause.is_some() {
+                            continue;
+                        }
+                        let table_name = normalize_ident(&index.table_name);
+                        if is_system_table(&table_name) {
+                            continue;
+                        }
+                        stats.set_row_count(&table_name, scan_state.row_count);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            if scan_flags & crate::vdbe::AUTO_ANALYZE_INDEX_RANGE_SCAN == 0 {
+                continue;
+            }
+            // Range scans can exit before EOF (e.g., point lookups), so keep any observed rows.
+            if !scan_state.completed && scan_state.row_count == 0 {
+                continue;
+            }
+            let CursorType::BTreeIndex(index) = cursor_type else {
+                continue;
+            };
+            if index.ephemeral {
+                continue;
+            }
+            let table_name = normalize_ident(&index.table_name);
+            if is_system_table(&table_name) {
+                continue;
+            }
+            stats.set_index_range_row_count(&index.name, scan_state.row_count);
+        }
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {

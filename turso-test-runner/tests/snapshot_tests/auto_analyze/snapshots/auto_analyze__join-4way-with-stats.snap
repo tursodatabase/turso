@@ -1,0 +1,82 @@
+---
+source: auto_analyze.sqltest
+expression: |-
+  SELECT c.name, o.id, p.name, oi.quantity
+      FROM orders o
+      JOIN customers c ON c.id = o.customer_id
+      JOIN order_items oi ON oi.order_id = o.id
+      JOIN products p ON p.id = oi.product_id
+      WHERE c.region = 'North';
+info:
+  statement_type: SELECT
+  tables:
+  - c.id
+  - customers
+  - oi.order_id
+  - order_items
+  - orders
+  - p.id
+  - products
+  setup_blocks:
+  - schema
+  - data
+  - auto_analyze_warmup
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH o USING INDEX idx_orders_customer
+|--SCAN customers AS c
+|--SEARCH oi USING INDEX idx_items_order
+`--SEARCH p USING INDEX ephemeral_products_t4
+
+BYTECODE
+addr  opcode                p1  p2  p3  p4              p5  comment
+   0  Init                   0  46   0                   0  Start at 46
+   1  OpenRead               0   6   0  k(2,B)           0  index=idx_orders_customer, root=6, iDb=0
+   2  OpenRead               1   2   0  k(4,B,B,B,B)     0  table=customers, root=2, iDb=0
+   3  OpenRead               2   5   0  k(5,B,B,B,B,B)   0  table=order_items, root=5, iDb=0
+   4  OpenRead               3   9   0  k(2,B)           0  index=idx_items_order, root=9, iDb=0
+   5  OpenRead               4   3   0  k(4,B,B,B,B)     0  table=products, root=3, iDb=0
+   6  Rewind                 1  45   0                   0  Rewind table customers
+   7    Column               1   2   6                   0  r[6]=customers.region
+   8    Ne                   6   7  44  Binary           0  if r[6]!=r[7] goto 44
+   9    RowId                1   8   0                   0  r[8]=customers.rowid
+  10    SeekGE               0  44   8                   0  key=[8..8]
+  11      IdxGT              0  44   8                   0  key=[8..8]
+  12      IdxRowId           0   9   0                   0  r[9]=cursor 0 for index idx_orders_customer.rowid
+  13      SeekGE             3  43   9                   0  key=[9..9]
+  14        IdxGT            3  43   9                   0  key=[9..9]
+  15        DeferredSeek     3   2   0                   0
+  16        Once            26   0   0                   0  goto 26
+  17        OpenAutoindex    5   0   0                   0  cursor=5
+  18        Rewind           4  19   0                   0  Rewind table products
+  19          RowId          4  10   0                   0  r[10]=products.rowid
+  20          Column         4   1  11                   0  r[11]=products.name
+  21          RowId          4  12   0                   0  r[12]=products.rowid
+  22          MakeRecord    10   3  13                   0  r[13]=mkrec(r[10..12]); for ephemeral_products_t4
+  23          FilterAdd      5  10   1                   0  bloom_filter_add(r[10..11])
+  24          IdxInsert      5  13  10                   0  key=r[13]
+  25        Next             4  19   0                   0
+  26        Column           2   2  14                   0  r[14]=order_items.product_id
+  27        IsNull          14  42   0                   0  if (r[14]==NULL) goto 42
+  28        Affinity        14   1   0                   0  r[14..15] = C
+  29        Filter           5  42  14                   1  if !bloom_filter(r[14..15]) goto 42
+  30        SeekGE           5  42  14                   0  key=[14..14]
+  31          IdxGT          5  42  14                   0  key=[14..14]
+  32          DeferredSeek   5   4   0                   0
+  33          IdxRowId       5  16   0                   0  r[16]=cursor 5 for index ephemeral_products_t4.rowid
+  34          Column         2   2  17                   0  r[17]=order_items.product_id
+  35          Ne            16  17  41  Binary           0  if r[16]!=r[17] goto 41
+  36          Column         1   1   1                   0  r[1]=customers.name
+  37          IdxRowId       0   2   0                   0  r[2]=cursor 0 for index idx_orders_customer.rowid
+  38          Column         5   1   3                   0  r[3]=ephemeral_products_t4.name
+  39          Column         2   3   4                   0  r[4]=order_items.quantity
+  40          ResultRow      1   4   0                   0  output=r[1..4]
+  41        Next             5  31   0                   0
+  42      Next               3  14   0                   0
+  43    Next                 0  11   0                   0
+  44  Next                   1   7   0                   0
+  45  Halt                   0   0   0                   0
+  46  Transaction            0   1  13                   0  iDb=0 tx_mode=Read
+  47  String8                0   7   0  North            0  r[7]='North'
+  48  Goto                   0   1   0                   0

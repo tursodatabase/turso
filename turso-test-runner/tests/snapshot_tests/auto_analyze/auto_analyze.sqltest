@@ -1,0 +1,338 @@
+# Auto-Analyze Query Plan Snapshots
+# These snapshots capture EXPLAIN QUERY PLAN output demonstrating how auto_analyze
+# improves query planning by collecting statistics during normal query execution.
+#
+# The tests demonstrate:
+# - Join ordering improvements when table sizes are known
+# - Index selection based on collected statistics
+# - Progressive improvement of query plans
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids"
+
+# ============================================================================
+# Schema: E-commerce database with tables of varying sizes
+# ============================================================================
+# - customers: 100 rows (small dimension table)
+# - products: 50 rows (small dimension table)
+# - orders: 5000 rows (medium fact table)
+# - order_items: 15000 rows (large detail table)
+
+setup schema {
+    CREATE TABLE customers (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        region TEXT,
+        created_at INTEGER
+    );
+
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        category TEXT,
+        price REAL
+    );
+
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        product_id INTEGER,
+        quantity INTEGER,
+        order_date INTEGER
+    );
+
+    CREATE TABLE order_items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER,
+        product_id INTEGER,
+        quantity INTEGER,
+        unit_price REAL
+    );
+
+    -- Indexes for common query patterns
+    CREATE INDEX idx_orders_customer ON orders(customer_id);
+    CREATE INDEX idx_orders_product ON orders(product_id);
+    CREATE INDEX idx_orders_date ON orders(order_date);
+    CREATE INDEX idx_items_order ON order_items(order_id);
+    CREATE INDEX idx_items_product ON order_items(product_id);
+    CREATE INDEX idx_products_category ON products(category);
+    CREATE INDEX idx_customers_region ON customers(region);
+}
+
+setup data {
+    -- customers: 100 rows
+    INSERT INTO customers
+    SELECT value, 'Customer ' || value,
+           CASE value % 5
+               WHEN 0 THEN 'North'
+               WHEN 1 THEN 'South'
+               WHEN 2 THEN 'East'
+               WHEN 3 THEN 'West'
+               ELSE 'Central'
+           END,
+           1700000000 + value * 86400
+    FROM generate_series(1, 100);
+
+    -- products: 50 rows
+    INSERT INTO products
+    SELECT value, 'Product ' || value,
+           CASE value % 4
+               WHEN 0 THEN 'Electronics'
+               WHEN 1 THEN 'Clothing'
+               WHEN 2 THEN 'Food'
+               ELSE 'Other'
+           END,
+           9.99 + (value % 100) * 0.5
+    FROM generate_series(1, 50);
+
+    -- orders: 5000 rows
+    INSERT INTO orders
+    SELECT value,
+           (value % 100) + 1,
+           (value % 50) + 1,
+           (value % 10) + 1,
+           1700000000 + (value % 365) * 86400
+    FROM generate_series(1, 5000);
+
+    -- order_items: 15000 rows
+    INSERT INTO order_items
+    SELECT value,
+           (value % 5000) + 1,
+           (value % 50) + 1,
+           (value % 5) + 1,
+           9.99 + (value % 20) * 0.25
+    FROM generate_series(1, 15000);
+}
+
+setup auto_analyze_warmup {
+    -- Enable auto_analyze and collect stats via COUNT(*)
+    -- Use INSERT INTO table to consume results (setup blocks can't return rows)
+    PRAGMA autoanalyze = 1;
+    CREATE TABLE _aa_warmup (c INTEGER);
+    INSERT INTO _aa_warmup SELECT count(*) FROM customers;
+    INSERT INTO _aa_warmup SELECT count(*) FROM products;
+    INSERT INTO _aa_warmup SELECT count(*) FROM orders;
+    INSERT INTO _aa_warmup SELECT count(*) FROM order_items;
+    DROP TABLE _aa_warmup;
+}
+
+# ============================================================================
+# Test 1: 4-way join with auto_analyze stats
+# With stats, optimizer should prefer smaller tables first
+# ============================================================================
+
+@setup schema
+@setup data
+@setup auto_analyze_warmup
+snapshot join-4way-with-stats {
+    SELECT c.name, o.id, p.name, oi.quantity
+    FROM orders o
+    JOIN customers c ON c.id = o.customer_id
+    JOIN order_items oi ON oi.order_id = o.id
+    JOIN products p ON p.id = oi.product_id
+    WHERE c.region = 'North';
+}
+
+# ============================================================================
+# Test 2: Simple 2-way join with stats
+# With stats: should start with customers (100 rows) instead of orders (5000)
+# ============================================================================
+
+@setup schema
+@setup data
+@setup auto_analyze_warmup
+snapshot join-2way-large-first-with-stats {
+    SELECT o.id, c.name
+    FROM orders o
+    JOIN customers c ON c.id = o.customer_id;
+}
+
+# ============================================================================
+# Test 3: 3-way join involving the largest table with stats
+# order_items (15000) -> orders (5000) -> customers (100)
+# ============================================================================
+
+@setup schema
+@setup data
+@setup auto_analyze_warmup
+snapshot join-3way-largest-first-with-stats {
+    SELECT oi.quantity, o.id, c.name
+    FROM order_items oi
+    JOIN orders o ON o.id = oi.order_id
+    JOIN customers c ON c.id = o.customer_id;
+}
+
+# ============================================================================
+# Test 4: Join with selective predicate on small table
+# Should prefer starting with filtered customers
+# ============================================================================
+
+@setup schema
+@setup data
+@setup auto_analyze_warmup
+snapshot join-selective-predicate-with-stats {
+    SELECT c.name, o.id, oi.quantity
+    FROM order_items oi
+    JOIN orders o ON o.id = oi.order_id
+    JOIN customers c ON c.id = o.customer_id
+    WHERE c.region = 'North' AND c.name LIKE 'Customer 1%';
+}
+
+# ============================================================================
+# Test 5: Join with index usage on medium table
+# ============================================================================
+
+@setup schema
+@setup data
+@setup auto_analyze_warmup
+snapshot join-with-index-lookup-with-stats {
+    SELECT o.id, o.quantity, c.name
+    FROM orders o
+    JOIN customers c ON c.id = o.customer_id
+    WHERE o.customer_id = 42;
+}
+
+# ============================================================================
+# Test 6: Self-join scenario
+# ============================================================================
+
+@setup schema
+@setup data
+@setup auto_analyze_warmup
+snapshot self-join-with-stats {
+    SELECT o1.id, o2.id, o1.customer_id
+    FROM orders o1
+    JOIN orders o2 ON o1.customer_id = o2.customer_id
+    WHERE o1.id < o2.id
+    LIMIT 100;
+}
+
+# ============================================================================
+# Test 7: Aggregation with join
+# ============================================================================
+
+@setup schema
+@setup data
+@setup auto_analyze_warmup
+snapshot agg-join-with-stats {
+    SELECT c.region, COUNT(*) as order_count, SUM(o.quantity) as total_qty
+    FROM orders o
+    JOIN customers c ON c.id = o.customer_id
+    GROUP BY c.region;
+}
+
+# ============================================================================
+# Test 8: Subquery with join
+# ============================================================================
+
+@setup schema
+@setup data
+@setup auto_analyze_warmup
+snapshot subquery-join-with-stats {
+    SELECT c.name, c.region
+    FROM customers c
+    WHERE c.id IN (
+        SELECT DISTINCT o.customer_id
+        FROM orders o
+        JOIN order_items oi ON oi.order_id = o.id
+        WHERE oi.quantity > 3
+    );
+}
+
+# ============================================================================
+# Schema 2: Extreme size differences
+# ============================================================================
+
+setup extreme_schema {
+    CREATE TABLE tiny (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE small (id INTEGER PRIMARY KEY, tiny_id INTEGER);
+    CREATE TABLE medium (id INTEGER PRIMARY KEY, small_id INTEGER);
+    CREATE TABLE large (id INTEGER PRIMARY KEY, medium_id INTEGER);
+    CREATE TABLE huge (id INTEGER PRIMARY KEY, large_id INTEGER);
+}
+
+setup extreme_data {
+    -- tiny: 5 rows
+    INSERT INTO tiny SELECT value, value FROM generate_series(1, 5);
+    -- small: 50 rows
+    INSERT INTO small SELECT value, (value % 5) + 1 FROM generate_series(1, 50);
+    -- medium: 500 rows
+    INSERT INTO medium SELECT value, (value % 50) + 1 FROM generate_series(1, 500);
+    -- large: 5000 rows
+    INSERT INTO large SELECT value, (value % 500) + 1 FROM generate_series(1, 5000);
+    -- huge: 20000 rows
+    INSERT INTO huge SELECT value, (value % 5000) + 1 FROM generate_series(1, 20000);
+}
+
+setup extreme_warmup {
+    PRAGMA autoanalyze = 1;
+    CREATE TABLE _aa_warmup2 (c INTEGER);
+    INSERT INTO _aa_warmup2 SELECT count(*) FROM tiny;
+    INSERT INTO _aa_warmup2 SELECT count(*) FROM small;
+    INSERT INTO _aa_warmup2 SELECT count(*) FROM medium;
+    INSERT INTO _aa_warmup2 SELECT count(*) FROM large;
+    INSERT INTO _aa_warmup2 SELECT count(*) FROM huge;
+    DROP TABLE _aa_warmup2;
+}
+
+# ============================================================================
+# Test 9: 5-way join with extreme size differences
+# ============================================================================
+
+@setup extreme_schema
+@setup extreme_data
+@setup extreme_warmup
+snapshot join-5way-extreme-with-stats {
+    SELECT t.val, s.id, m.id, l.id, h.id
+    FROM huge h
+    JOIN large l ON l.id = h.large_id
+    JOIN medium m ON m.id = l.medium_id
+    JOIN small s ON s.id = m.small_id
+    JOIN tiny t ON t.id = s.tiny_id;
+}
+
+# ============================================================================
+# Test 10: Reversed FROM order (small to large)
+# With stats, should recognize optimal order is already in FROM clause
+# ============================================================================
+
+@setup extreme_schema
+@setup extreme_data
+@setup extreme_warmup
+snapshot join-5way-optimal-order-with-stats {
+    SELECT t.val, s.id, m.id, l.id, h.id
+    FROM tiny t
+    JOIN small s ON s.tiny_id = t.id
+    JOIN medium m ON m.small_id = s.id
+    JOIN large l ON l.medium_id = m.id
+    JOIN huge h ON h.large_id = l.id;
+}
+
+# ============================================================================
+# Test 11: LEFT JOIN ordering
+# ============================================================================
+
+@setup schema
+@setup data
+@setup auto_analyze_warmup
+snapshot left-join-with-stats {
+    SELECT c.name, o.id
+    FROM orders o
+    LEFT JOIN customers c ON c.id = o.customer_id
+    WHERE o.quantity > 5;
+}
+
+# ============================================================================
+# Test 12: Mixed join types
+# ============================================================================
+
+@setup schema
+@setup data
+@setup auto_analyze_warmup
+snapshot mixed-joins-with-stats {
+    SELECT c.name, o.id, p.name
+    FROM customers c
+    LEFT JOIN orders o ON o.customer_id = c.id
+    JOIN products p ON p.id = o.product_id
+    WHERE c.region = 'North';
+}
