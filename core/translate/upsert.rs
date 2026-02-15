@@ -459,7 +459,7 @@ pub fn emit_upsert(
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: new_start + *col_idx,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: String::from(table.get_name()) + col.name.as_ref().unwrap(),
+                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
             });
         }
         if col.is_rowid_alias() {
