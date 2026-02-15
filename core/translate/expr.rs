@@ -1305,6 +1305,22 @@ pub fn translate_expr(
                         emit_function_call(program, func_ctx, &[start_reg], target_register)?;
                         Ok(target_register)
                     }
+                    VectorFunc::Vector8 => {
+                        let args = expect_arguments_exact!(args, 1, vector_func);
+                        let start_reg = program.alloc_register();
+                        translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
+
+                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
+                        Ok(target_register)
+                    }
+                    VectorFunc::Vector1Bit => {
+                        let args = expect_arguments_exact!(args, 1, vector_func);
+                        let start_reg = program.alloc_register();
+                        translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
+
+                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
+                        Ok(target_register)
+                    }
                     VectorFunc::VectorExtract => {
                         let args = expect_arguments_exact!(args, 1, vector_func);
                         let start_reg = program.alloc_register();

@@ -40,7 +40,24 @@ pub fn vector_distance_l2(v1: &Vector, v2: &Vector) -> Result<f64> {
             v1.as_f32_sparse(),
             v2.as_f32_sparse(),
         )),
+        VectorType::Float1Bit => Err(LimboError::ConversionError(
+            "L2 distance is not supported for float1bit vectors".to_string(),
+        )),
+        VectorType::Float8 => Ok(vector_f8_distance_l2(v1, v2)),
     }
+}
+
+fn vector_f8_distance_l2(v1: &Vector, v2: &Vector) -> f64 {
+    let (data1, alpha1, shift1) = v1.as_f8_data();
+    let (data2, alpha2, shift2) = v2.as_f8_data();
+    let mut sum = 0.0f64;
+    for i in 0..v1.dims {
+        let f1 = alpha1 as f64 * data1[i] as f64 + shift1 as f64;
+        let f2 = alpha2 as f64 * data2[i] as f64 + shift2 as f64;
+        let d = f1 - f2;
+        sum += d * d;
+    }
+    sum.sqrt()
 }
 
 #[allow(dead_code)]

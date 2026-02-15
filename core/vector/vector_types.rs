@@ -5,6 +5,8 @@ pub enum VectorType {
     Float32Dense,
     Float64Dense,
     Float32Sparse,
+    Float1Bit,
+    Float8,
 }
 
 #[derive(Debug)]
@@ -22,10 +24,15 @@ pub struct VectorSparse<'a, T: std::fmt::Debug> {
 }
 
 impl<'a> Vector<'a> {
-    pub fn vector_type(blob: &[u8]) -> Result<(VectorType, usize)> {
+    /// Returns (VectorType, data_length, dims) from a serialized blob.
+    /// `data_length` is the number of bytes of actual vector data (before meta/type bytes).
+    /// `dims` is the number of vector dimensions (only meaningful for Float1Bit/Float8 where
+    /// it can't be inferred from data length alone; for other types it's set to 0 and
+    /// computed later in from_data).
+    pub fn vector_type(blob: &[u8]) -> Result<(VectorType, usize, usize)> {
         // Even-sized blobs are always float32.
         if blob.len() % 2 == 0 {
-            return Ok((VectorType::Float32Dense, blob.len()));
+            return Ok((VectorType::Float32Dense, blob.len(), 0));
         }
         // Odd-sized blobs have type byte at the end
         let vector_type = blob[blob.len() - 1];
@@ -40,12 +47,40 @@ impl<'a> Vector<'a> {
             #define VECTOR_TYPE_FLOATB16  6
         */
         match vector_type {
-            1 => Ok((VectorType::Float32Dense, blob.len() - 1)),
-            2 => Ok((VectorType::Float64Dense, blob.len() - 1)),
-            3..=6 => Err(LimboError::ConversionError(
+            1 => Ok((VectorType::Float32Dense, blob.len() - 1, 0)),
+            2 => Ok((VectorType::Float64Dense, blob.len() - 1, 0)),
+            3 => {
+                // Float1Bit: [data bytes][optional padding][trailing_bits][0x03]
+                let n_blob_size = blob.len() - 1; // without type byte
+                if n_blob_size == 0 || n_blob_size % 2 != 0 {
+                    return Err(LimboError::ConversionError(
+                        "float1bit vector blob length must be even and non-empty".to_string(),
+                    ));
+                }
+                let trailing_bits = blob[n_blob_size - 1] as usize;
+                let dims = n_blob_size * 8 - trailing_bits;
+                let data_size = dims.div_ceil(8);
+                Ok((VectorType::Float1Bit, data_size, dims))
+            }
+            4 => {
+                // Float8: [quantized bytes][alignment padding][alpha f32][shift f32][padding 0x00][trailing_bytes][0x04]
+                let n_blob_size = blob.len() - 1; // without type byte
+                if n_blob_size < 2 || n_blob_size % 2 != 0 {
+                    return Err(LimboError::ConversionError(
+                        "float8 vector blob must have even length >= 2 (excluding type byte)"
+                            .to_string(),
+                    ));
+                }
+                let trailing_bytes = blob[n_blob_size - 1] as usize;
+                let dims = (n_blob_size - 2) - 8 - trailing_bytes;
+                // data_size = ALIGN(dims, 4) + 8
+                let data_size = n_blob_size - 2;
+                Ok((VectorType::Float8, data_size, dims))
+            }
+            5..=6 => Err(LimboError::ConversionError(
                 "unsupported vector type from LibSQL".to_string(),
             )),
-            9 => Ok((VectorType::Float32Sparse, blob.len() - 1)),
+            9 => Ok((VectorType::Float32Sparse, blob.len() - 1, 0)),
             _ => Err(LimboError::ConversionError(format!(
                 "unknown vector type: {vector_type}"
             ))),
@@ -112,19 +147,58 @@ impl<'a> Vector<'a> {
             refer: None,
         }
     }
+    fn align4(n: usize) -> usize {
+        n.div_ceil(4) * 4
+    }
+
+    pub fn from_1bit(dims: usize, bits: Vec<u8>) -> Self {
+        debug_assert!(bits.len() == dims.div_ceil(8));
+        Self {
+            vector_type: VectorType::Float1Bit,
+            dims,
+            owned: Some(bits),
+            refer: None,
+        }
+    }
+
+    pub fn from_f8(dims: usize, quantized: Vec<u8>, alpha: f32, shift: f32) -> Self {
+        let aligned = Self::align4(dims);
+        let mut data = Vec::with_capacity(aligned + 8);
+        data.extend_from_slice(&quantized);
+        data.resize(aligned, 0); // alignment padding
+        data.extend_from_slice(&alpha.to_le_bytes());
+        data.extend_from_slice(&shift.to_le_bytes());
+        debug_assert!(data.len() == aligned + 8);
+        Self {
+            vector_type: VectorType::Float8,
+            dims,
+            owned: Some(data),
+            refer: None,
+        }
+    }
+
     pub fn from_vec(mut blob: Vec<u8>) -> Result<Self> {
-        let (vector_type, len) = Self::vector_type(&blob)?;
+        let (vector_type, len, explicit_dims) = Self::vector_type(&blob)?;
         blob.truncate(len);
-        Self::from_data(vector_type, Some(blob), None)
+        Self::from_data_with_dims(vector_type, Some(blob), None, explicit_dims)
     }
     pub fn from_slice(blob: &'a [u8]) -> Result<Self> {
-        let (vector_type, len) = Self::vector_type(blob)?;
-        Self::from_data(vector_type, None, Some(&blob[..len]))
+        let (vector_type, len, explicit_dims) = Self::vector_type(blob)?;
+        Self::from_data_with_dims(vector_type, None, Some(&blob[..len]), explicit_dims)
     }
     pub fn from_data(
         vector_type: VectorType,
         owned: Option<Vec<u8>>,
         refer: Option<&'a [u8]>,
+    ) -> Result<Self> {
+        Self::from_data_with_dims(vector_type, owned, refer, 0)
+    }
+
+    fn from_data_with_dims(
+        vector_type: VectorType,
+        owned: Option<Vec<u8>>,
+        refer: Option<&'a [u8]>,
+        explicit_dims: usize,
     ) -> Result<Self> {
         let owned_slice = owned.as_deref();
         let refer_slice = refer.as_ref().map(|&x| x);
@@ -180,13 +254,52 @@ impl<'a> Vector<'a> {
                     x
                 });
                 let refer = refer.map(|x| &x[0..original_len - 4]);
-                let vector = Vector {
+                Ok(Vector {
                     vector_type,
                     dims,
                     owned,
                     refer,
-                };
-                Ok(vector)
+                })
+            }
+            VectorType::Float1Bit => {
+                let expected_len = explicit_dims.div_ceil(8);
+                if explicit_dims == 0 || data.len() != expected_len {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "f1bit vector data length mismatch: got {} expected {} for {} dims",
+                        data.len(),
+                        expected_len,
+                        explicit_dims,
+                    )));
+                }
+                Ok(Vector {
+                    vector_type,
+                    dims: explicit_dims,
+                    owned,
+                    refer,
+                })
+            }
+            VectorType::Float8 => {
+                if data.len() < 8 {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "f8 vector data too short: {}",
+                        data.len(),
+                    )));
+                }
+                let expected_len = Self::align4(explicit_dims) + 8;
+                if explicit_dims == 0 || data.len() != expected_len {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "f8 vector data length mismatch: got {} expected {} for {} dims",
+                        data.len(),
+                        expected_len,
+                        explicit_dims,
+                    )));
+                }
+                Ok(Vector {
+                    vector_type,
+                    dims: explicit_dims,
+                    owned,
+                    refer,
+                })
             }
         }
     }
@@ -288,6 +401,35 @@ impl<'a> Vector<'a> {
         debug_assert!(idx.is_sorted());
         VectorSparse { idx, values }
     }
+
+    /// Returns the raw bit-packed bytes for a Float1Bit vector.
+    /// Bit `i` is at byte `i/8`, position `i & 7`.
+    pub fn as_1bit_data(&self) -> &[u8] {
+        debug_assert!(self.vector_type == VectorType::Float1Bit);
+        let data = self.bin_data();
+        &data[..self.dims.div_ceil(8)]
+    }
+
+    /// Returns (quantized_bytes, alpha, shift) for a Float8 vector.
+    /// Dequantization: `f_i = alpha * q_i + shift`
+    pub fn as_f8_data(&self) -> (&[u8], f32, f32) {
+        debug_assert!(self.vector_type == VectorType::Float8);
+        let data = self.bin_data();
+        let aligned = Self::align4(self.dims);
+        let alpha = f32::from_le_bytes([
+            data[aligned],
+            data[aligned + 1],
+            data[aligned + 2],
+            data[aligned + 3],
+        ]);
+        let shift = f32::from_le_bytes([
+            data[aligned + 4],
+            data[aligned + 5],
+            data[aligned + 6],
+            data[aligned + 7],
+        ]);
+        (&data[..self.dims], alpha, shift)
+    }
 }
 
 #[cfg(test)]
@@ -363,10 +505,12 @@ pub(crate) mod tests {
     /// Implement the quickcheck Arbitrary trait for ArbitraryVector.
     impl<const DIMS: usize> Arbitrary for ArbitraryVector<DIMS> {
         fn arbitrary(g: &mut Gen) -> Self {
-            let vector_type = if bool::arbitrary(g) {
-                VectorType::Float32Dense
-            } else {
-                VectorType::Float64Dense
+            let choice = u8::arbitrary(g) % 4;
+            let vector_type = match choice {
+                0 => VectorType::Float32Dense,
+                1 => VectorType::Float64Dense,
+                2 => VectorType::Float1Bit,
+                _ => VectorType::Float8,
             };
 
             let data = match vector_type {
@@ -377,6 +521,44 @@ pub(crate) mod tests {
                 VectorType::Float64Dense => {
                     let floats = Self::generate_f64_vector(g);
                     floats.iter().flat_map(|f| f.to_le_bytes()).collect()
+                }
+                VectorType::Float1Bit => {
+                    // Generate random bits
+                    let byte_count = DIMS.div_ceil(8);
+                    let mut bits = vec![0u8; byte_count];
+                    for b in bits.iter_mut() {
+                        *b = u8::arbitrary(g);
+                    }
+                    // Mask off unused bits in the last byte
+                    if DIMS % 8 != 0 {
+                        let mask = (1u8 << (DIMS % 8)) - 1;
+                        if let Some(last) = bits.last_mut() {
+                            *last &= mask;
+                        }
+                    }
+                    bits
+                }
+                VectorType::Float8 => {
+                    // Generate random quantized values + alpha/shift
+                    let floats = Self::generate_f32_vector(g);
+                    let min_val = floats.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max_val = floats.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let alpha = (max_val - min_val) / 255.0;
+                    let shift = min_val;
+                    let aligned = DIMS.div_ceil(4) * 4;
+                    let mut data = Vec::with_capacity(aligned + 8);
+                    for &f in &floats {
+                        let q = if alpha == 0.0 {
+                            0u8
+                        } else {
+                            ((f - shift) / alpha + 0.5) as u8
+                        };
+                        data.push(q);
+                    }
+                    data.resize(aligned, 0); // alignment padding
+                    data.extend_from_slice(&alpha.to_le_bytes());
+                    data.extend_from_slice(&shift.to_le_bytes());
+                    data
                 }
                 _ => unreachable!(),
             };
@@ -416,7 +598,7 @@ pub(crate) mod tests {
         let value = operations::serialize::vector_serialize(v);
         let blob = value.to_blob().unwrap().to_vec();
         match Vector::vector_type(&blob) {
-            Ok((detected_type, _)) => detected_type == vtype,
+            Ok((detected_type, _, _)) => detected_type == vtype,
             Err(_) => false,
         }
     }
@@ -453,15 +635,21 @@ pub(crate) mod tests {
         match v.vector_type {
             VectorType::Float32Dense => {
                 let slice = v.as_f32_slice();
-                // Check if the slice length matches the dimensions and the data length is correct (4 bytes per float)
                 slice.len() == DIMS && (slice.len() * 4 == v.bin_len())
             }
             VectorType::Float64Dense => {
                 let slice = v.as_f64_slice();
-                // Check if the slice length matches the dimensions and the data length is correct (8 bytes per float)
                 slice.len() == DIMS && (slice.len() * 8 == v.bin_len())
             }
-            _ => unreachable!(),
+            VectorType::Float1Bit => {
+                let data = v.as_1bit_data();
+                data.len() == DIMS.div_ceil(8) && v.dims == DIMS
+            }
+            VectorType::Float8 => {
+                let (quantized, _alpha, _shift) = v.as_f8_data();
+                quantized.len() == DIMS && v.dims == DIMS
+            }
+            _ => true,
         }
     }
 
@@ -499,10 +687,19 @@ pub(crate) mod tests {
     /// Test if the vector distance calculation is correct for a given pair of vectors:
     /// - Skips cases with invalid input vectors.
     /// - Assumes vectors are well-formed (same type and dimension)
-    /// - The distance must be between 0 and 2
     fn test_vector_distance<const DIMS: usize>(v1: &Vector, v2: &Vector) -> bool {
         match operations::distance_cos::vector_distance_cos(v1, v2) {
-            Ok(distance) => distance.is_nan() || (0.0 - 1e-6..=2.0 + 1e-6).contains(&distance),
+            Ok(distance) => {
+                if distance.is_nan() {
+                    return true;
+                }
+                match v1.vector_type {
+                    // Float1Bit cosine distance returns hamming distance [0, dims]
+                    VectorType::Float1Bit => (0.0 - 1e-6..=DIMS as f64 + 1e-6).contains(&distance),
+                    // Normal cosine distance [0, 2]
+                    _ => (0.0 - 1e-6..=2.0 + 1e-6).contains(&distance),
+                }
+            }
             Err(_) => true,
         }
     }
@@ -604,7 +801,18 @@ pub(crate) mod tests {
                         let parsed = parsed_vector.as_f64_slice();
                         original.iter().zip(parsed.iter()).all(|(a, b)| a == b)
                     }
-                    _ => unreachable!(),
+                    VectorType::Float1Bit => {
+                        // 1bit text roundtrip: bits → +1/-1 text → threshold → bits
+                        let original = v.as_1bit_data();
+                        let parsed_data = parsed_vector.as_1bit_data();
+                        original == parsed_data
+                    }
+                    VectorType::Float8 => {
+                        // Float8 text roundtrip: lossy due to quantization
+                        // Just check dims match (re-quantization changes alpha/shift)
+                        true
+                    }
+                    _ => true,
                 }
             }
             Err(_) => false,

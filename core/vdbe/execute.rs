@@ -36,8 +36,8 @@ use crate::vdbe::{
     StepResult, TxnCleanup,
 };
 use crate::vector::{
-    vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
-    vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
+    vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
+    vector_distance_dot, vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
 use crate::{
     error::{
@@ -5630,6 +5630,14 @@ pub fn op_function(
                 }
                 VectorFunc::Vector64 => {
                     let result = vector64(args)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::Vector8 => {
+                    let result = vector8(args)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::Vector1Bit => {
+                    let result = vector1bit(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorExtract => {

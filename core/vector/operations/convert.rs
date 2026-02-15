@@ -4,10 +4,10 @@ use crate::{
 };
 
 pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
+    if v.vector_type == target_type {
+        return Ok(v);
+    }
     match (v.vector_type, target_type) {
-        (VectorType::Float32Dense, VectorType::Float32Dense)
-        | (VectorType::Float64Dense, VectorType::Float64Dense)
-        | (VectorType::Float32Sparse, VectorType::Float32Sparse) => Ok(v),
         (VectorType::Float32Dense, VectorType::Float64Dense) => Ok(Vector::from_f64(
             v.as_f32_slice().iter().map(|&x| x as f64).collect(),
         )),
@@ -52,7 +52,128 @@ pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
             }
             Ok(Vector::from_f64(data))
         }
+        // Float1Bit conversions
+        (VectorType::Float32Dense, VectorType::Float1Bit) => {
+            let dims = v.dims;
+            let byte_count = dims.div_ceil(8);
+            let mut bits = vec![0u8; byte_count];
+            for (i, &val) in v.as_f32_slice().iter().enumerate() {
+                if val > 0.0 {
+                    bits[i / 8] |= 1 << (i & 7);
+                }
+            }
+            Ok(Vector::from_1bit(dims, bits))
+        }
+        (VectorType::Float64Dense, VectorType::Float1Bit) => {
+            let dims = v.dims;
+            let byte_count = dims.div_ceil(8);
+            let mut bits = vec![0u8; byte_count];
+            for (i, &val) in v.as_f64_slice().iter().enumerate() {
+                if val > 0.0 {
+                    bits[i / 8] |= 1 << (i & 7);
+                }
+            }
+            Ok(Vector::from_1bit(dims, bits))
+        }
+        (VectorType::Float1Bit, VectorType::Float32Dense) => {
+            let data = v.as_1bit_data();
+            let floats: Vec<f32> = (0..v.dims)
+                .map(|i| {
+                    if (data[i / 8] >> (i & 7)) & 1 == 1 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                })
+                .collect();
+            Ok(Vector::from_f32(floats))
+        }
+        (VectorType::Float1Bit, VectorType::Float64Dense) => {
+            let data = v.as_1bit_data();
+            let floats: Vec<f64> = (0..v.dims)
+                .map(|i| {
+                    if (data[i / 8] >> (i & 7)) & 1 == 1 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                })
+                .collect();
+            Ok(Vector::from_f64(floats))
+        }
+        // Float8 conversions
+        (VectorType::Float32Dense, VectorType::Float8) => {
+            convert_floats_to_f8(v.as_f32_slice().iter().copied(), v.dims)
+        }
+        (VectorType::Float64Dense, VectorType::Float8) => {
+            convert_floats_to_f8(v.as_f64_slice().iter().map(|&x| x as f32), v.dims)
+        }
+        (VectorType::Float8, VectorType::Float32Dense) => {
+            let (quantized, alpha, shift) = v.as_f8_data();
+            let floats: Vec<f32> = quantized
+                .iter()
+                .map(|&q| alpha * q as f32 + shift)
+                .collect();
+            Ok(Vector::from_f32(floats))
+        }
+        (VectorType::Float8, VectorType::Float64Dense) => {
+            let (quantized, alpha, shift) = v.as_f8_data();
+            let floats: Vec<f64> = quantized
+                .iter()
+                .map(|&q| alpha as f64 * q as f64 + shift as f64)
+                .collect();
+            Ok(Vector::from_f64(floats))
+        }
+        // Cross-conversions via intermediate
+        (VectorType::Float1Bit, VectorType::Float8) => {
+            let f32_vec = vector_convert(v, VectorType::Float32Dense)?;
+            vector_convert(f32_vec, VectorType::Float8)
+        }
+        (VectorType::Float8, VectorType::Float1Bit) => {
+            let f32_vec = vector_convert(v, VectorType::Float32Dense)?;
+            vector_convert(f32_vec, VectorType::Float1Bit)
+        }
+        (VectorType::Float1Bit, VectorType::Float32Sparse)
+        | (VectorType::Float8, VectorType::Float32Sparse)
+        | (VectorType::Float32Sparse, VectorType::Float1Bit)
+        | (VectorType::Float32Sparse, VectorType::Float8) => {
+            let f32_vec = vector_convert(v, VectorType::Float32Dense)?;
+            vector_convert(f32_vec, target_type)
+        }
+        _ => unreachable!(
+            "unexpected conversion: {:?} -> {:?}",
+            v.vector_type, target_type
+        ),
     }
+}
+
+fn convert_floats_to_f8(
+    values: impl Iterator<Item = f32> + Clone,
+    dims: usize,
+) -> Result<Vector<'static>> {
+    let mut min_val = f32::INFINITY;
+    let mut max_val = f32::NEG_INFINITY;
+    for val in values.clone() {
+        if val < min_val {
+            min_val = val;
+        }
+        if val > max_val {
+            max_val = val;
+        }
+    }
+    let alpha = (max_val - min_val) / 255.0;
+    let shift = min_val;
+    let mut quantized = Vec::with_capacity(dims);
+    for val in values {
+        let q = if alpha == 0.0 {
+            0u8
+        } else {
+            let v = (val - shift) / alpha + 0.5;
+            (v as i32).clamp(0, 255) as u8
+        };
+        quantized.push(q);
+    }
+    Ok(Vector::from_f8(dims, quantized, alpha, shift))
 }
 
 #[cfg(test)]
