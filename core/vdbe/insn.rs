@@ -1461,6 +1461,13 @@ pub enum Insn {
     /// then enable CDC on the connection. Runs nested SQL at VDBE execution time
     /// (same pattern as ParseSchema). CDC is enabled after version table operations
     /// so those operations are not captured.
+    ///
+    /// A dedicated opcode is needed because the PRAGMA SET handler may create the
+    /// CDC table (via translate_create_table) and then needs to insert data into
+    /// turso_cdc_version — which requires a schema change followed by DML against
+    /// the new table. This is hard to express in a single translation plan since
+    /// plans are compiled against a fixed schema, so the version table operations
+    /// are deferred to execution time via this opcode.
     InitCdcVersion {
         cdc_table_name: String,
         version: String,
