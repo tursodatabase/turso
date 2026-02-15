@@ -2,6 +2,7 @@ use turso_parser::ast;
 
 use crate::{
     function::AggFunc,
+    schema::Table,
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
@@ -91,6 +92,11 @@ pub fn emit_ungrouped_aggregation<'a>(
     // This ensures literals return their values and column references return NULL (since cursor
     // is not on a valid row). The once-flag mechanism normally evaluates non-agg columns on first
     // iteration, but if there were no iterations, we must do it here.
+    //
+    // For direct table access, Column on an invalid cursor returns NULL naturally. But for
+    // coroutine-based sources (CTEs, FROM-clause subqueries), the output registers still hold
+    // the last yielded row's values. We null those registers first so that expressions
+    // referencing coroutine columns evaluate to NULL instead of leaking stale values.
     if let Some(once_flag) = t_ctx.reg_nonagg_emit_once_flag {
         let skip_nonagg_eval = program.allocate_label();
         // If once-flag is non-zero (loop ran at least once), skip evaluation
@@ -99,6 +105,25 @@ pub fn emit_ungrouped_aggregation<'a>(
             target_pc: skip_nonagg_eval,
             jump_if_null: false,
         });
+        // Null out coroutine output registers so column references from CTEs/subqueries
+        // don't leak stale values from the last yielded row.
+        for table_ref in plan.table_references.joined_tables() {
+            if let Table::FromClauseSubquery(subquery) = &table_ref.table {
+                if let Some(start_reg) = subquery.result_columns_start_reg {
+                    let num_cols = subquery.columns.len();
+                    if num_cols > 0 {
+                        program.emit_insn(Insn::Null {
+                            dest: start_reg,
+                            dest_end: if num_cols > 1 {
+                                Some(start_reg + num_cols - 1)
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                }
+            }
+        }
         // Evaluate non-aggregate columns now (with cursor in invalid state, columns return NULL)
         // Must use no_constant_opt to prevent constant hoisting which would place the label
         // after the hoisted constants, causing infinite loops in compound selects.
