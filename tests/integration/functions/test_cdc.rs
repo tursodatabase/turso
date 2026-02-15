@@ -1218,3 +1218,94 @@ fn test_cdc_version_not_created_when_exists(db: TempDatabase) {
         ]]
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_backward_compat_v1(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Simulate a database that already has the v1 CDC table and version table
+    // (as if created by a previous version of the code)
+    conn.execute(
+        "CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+    ).unwrap();
+    conn.execute(
+        "CREATE TABLE turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v1')",
+    )
+    .unwrap();
+
+    // Enable CDC — table already exists so InitCdcVersion opcode is NOT emitted
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+        .unwrap();
+
+    // Verify version table is unchanged
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT table_name, version FROM turso_cdc_version",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("turso_cdc".to_string()),
+            Value::Text("v1".to_string()),
+        ]]
+    );
+
+    // Verify changes are captured correctly with insert, update, delete
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+    conn.execute("UPDATE t SET y = 100 WHERE x = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 2").unwrap();
+
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(2),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(2),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+}
