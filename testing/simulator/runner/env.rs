@@ -19,10 +19,10 @@ use turso_core::Database;
 use crate::generation::Shadow;
 use crate::model::Query;
 use crate::profiles::Profile;
-use crate::runner::SimIO;
 use crate::runner::cli::IoBackend;
 use crate::runner::io::SimulatorIO;
 use crate::runner::memory::io::MemorySimIO;
+use crate::runner::{DurableIOEvent, FileType, SimIO};
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
 
@@ -44,6 +44,119 @@ pub enum TransactionMode {
     Read = 0,
     Concurrent = 1,
     Write = 2,
+}
+
+/// Tracks what data is actually durable
+#[derive(Debug, Clone, Default)]
+pub struct DurabilityState {
+    /// Tables recoverable from WAL
+    pub wal_durable: Vec<Table>,
+    /// Tables recoverable from DB
+    pub db_durable: Vec<Table>,
+
+    /// Tracks table renames that are durable
+    pub renamed_tables: std::collections::HashMap<String, String>,
+}
+
+impl DurabilityState {
+    /// Process an IO event and update durability state.
+    pub fn process_event(
+        &mut self,
+        event: &DurableIOEvent,
+        committed: &[Table],
+        pending_renames: &[(String, String)],
+    ) -> bool {
+        let wal_header_size = turso_core::storage::sqlite3_ondisk::WAL_HEADER_SIZE;
+        let file_type = match event {
+            DurableIOEvent::Sync { file_path, .. } => FileType::from_path(file_path),
+        };
+
+        match event {
+            DurableIOEvent::Sync {
+                prev_durable_size,
+                new_durable_size,
+                ..
+            } => {
+                if file_type == FileType::Wal
+                    && *new_durable_size > wal_header_size
+                    && new_durable_size != prev_durable_size
+                {
+                    self.wal_durable = committed.to_vec();
+                    for (old_name, new_name) in pending_renames {
+                        self.renamed_tables
+                            .insert(old_name.clone(), new_name.clone());
+                    }
+                    let committed_names: std::collections::HashSet<_> =
+                        committed.iter().map(|t| &t.name).collect();
+                    self.db_durable
+                        .retain(|t| committed_names.contains(&t.name));
+
+                    let db_durable_names: std::collections::HashSet<_> =
+                        self.db_durable.iter().map(|t| &t.name).collect();
+                    self.renamed_tables
+                        .retain(|old_name, _| db_durable_names.contains(old_name));
+
+                    tracing::info!(
+                        "DURABILITY: WAL sync - {} tables WAL-durable",
+                        self.wal_durable.len()
+                    );
+                    return true;
+                }
+
+                // If the WAL is durably truncated to the header (or 0), treat it as a completed
+                // checkpoint. The committed state is now recoverable from the DB file alone.
+                if file_type == FileType::Wal
+                    && *prev_durable_size > wal_header_size
+                    && *new_durable_size <= wal_header_size
+                    && !self.wal_durable.is_empty()
+                {
+                    let count = self.wal_durable.len();
+                    self.db_durable = std::mem::take(&mut self.wal_durable);
+                    self.renamed_tables.clear();
+                    tracing::info!(
+                        "DURABILITY: checkpoint complete (wal_durable_size={} -> {}) - {} tables DB-durable",
+                        prev_durable_size,
+                        new_durable_size,
+                        count
+                    );
+                }
+            }
+        }
+        false
+    }
+
+    /// Returns tables that should be recoverable after crash/power-loss.
+    pub fn expected_recoverable(&self) -> Vec<Table> {
+        use std::collections::HashSet;
+
+        let wal_names: HashSet<_> = self.wal_durable.iter().map(|t| t.name.clone()).collect();
+        let mut result = self.wal_durable.clone();
+
+        // Add DB-durable tables not in WAL.
+        for table in &self.db_durable {
+            if wal_names.contains(&table.name) {
+                continue;
+            }
+
+            // skip if table was renamed to something in WAL.
+            if let Some(new_name) = self.renamed_tables.get(&table.name) {
+                if wal_names.contains(new_name) {
+                    continue;
+                }
+            }
+
+            result.push(table.clone());
+        }
+
+        result
+    }
+
+    /// Clear all durability state.
+    pub fn clear(&mut self) {
+        self.wal_durable.clear();
+        self.db_durable.clear();
+        self.renamed_tables.clear();
+    }
 }
 
 /// Represents a single operation during a transaction, applied in order.
@@ -286,6 +399,7 @@ pub struct ShadowTables<'a> {
 pub struct ShadowTablesMut<'a> {
     commited_tables: &'a mut Vec<Table>,
     transaction_tables: &'a mut Option<TransactionTables>,
+    pending_renames: &'a mut Vec<(String, String)>,
 }
 
 impl<'a> ShadowTables<'a> {
@@ -569,6 +683,8 @@ where
                             .find(|t| &t.name == old_name)
                             .expect("Table should exist in committed tables");
                         committed.name = new_name.clone();
+                        self.pending_renames
+                            .push((old_name.clone(), new_name.clone()));
                     }
                     TxOperation::AddColumn { table_name, column } => {
                         let committed = self
@@ -735,6 +851,10 @@ pub(crate) struct SimulatorEnv {
     connection_last_query: Bitmap<64>,
     // Table data that is committed into the database or wal
     pub committed_tables: Vec<Table>,
+
+    pub durability: DurabilityState,
+    /// Pending table renames that have been committed but not yet made durable.
+    pub pending_renames: Vec<(String, String)>,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -759,6 +879,8 @@ impl SimulatorEnv {
             connection_tables: self.connection_tables.clone(),
             connection_last_query: self.connection_last_query,
             committed_tables: self.committed_tables.clone(),
+            durability: self.durability.clone(),
+            pending_renames: self.pending_renames.clone(),
         }
     }
 
@@ -768,12 +890,12 @@ impl SimulatorEnv {
         self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
 
         let latency_prof = &self.profile.io.latency;
-
+        let latency = latency_prof.latency_probability;
         let io: Arc<dyn SimIO> = match self.io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
                 self.opts.seed,
                 self.opts.page_size,
-                latency_prof.latency_probability,
+                latency,
                 latency_prof.min_tick,
                 latency_prof.max_tick,
             )),
@@ -781,7 +903,7 @@ impl SimulatorEnv {
                 SimulatorIO::new(
                     self.opts.seed,
                     self.opts.page_size,
-                    latency_prof.latency_probability,
+                    latency,
                     latency_prof.min_tick,
                     latency_prof.max_tick,
                     self.io_backend,
@@ -877,6 +999,7 @@ impl SimulatorEnv {
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
+            disable_crash_after_wal_sync: cli_opts.disable_crash_after_wal_sync,
             disable_faulty_query: cli_opts.disable_faulty_query,
             page_size: 4096, // TODO: randomize this too
             max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
@@ -925,13 +1048,13 @@ impl SimulatorEnv {
         profile.validate().unwrap();
 
         let latency_prof = &profile.io.latency;
-
         let io_backend = cli_opts.io_backend;
+        let latency = latency_prof.latency_probability;
         let io: Arc<dyn SimIO> = match io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
                 opts.seed,
                 opts.page_size,
-                latency_prof.latency_probability,
+                latency,
                 latency_prof.min_tick,
                 latency_prof.max_tick,
             )),
@@ -939,7 +1062,7 @@ impl SimulatorEnv {
                 SimulatorIO::new(
                     opts.seed,
                     opts.page_size,
-                    latency_prof.latency_probability,
+                    latency,
                     latency_prof.min_tick,
                     latency_prof.max_tick,
                     io_backend,
@@ -987,8 +1110,10 @@ impl SimulatorEnv {
             io_backend,
             profile: profile.clone(),
             committed_tables: Vec::new(),
+            durability: DurabilityState::default(),
             connection_tables: vec![None; profile.max_connections],
             connection_last_query: Bitmap::new(),
+            pending_renames: Vec::new(),
         }
     }
 
@@ -1025,11 +1150,26 @@ impl SimulatorEnv {
         };
     }
 
-    /// Clears the commited tables and the connection tables
+    /// Clears the committed tables, durability state, and connection tables
     pub fn clear_tables(&mut self) {
         self.committed_tables.clear();
+        self.durability.clear();
+        self.pending_renames.clear();
         self.connection_tables.iter_mut().for_each(|t| *t = None);
         self.connection_last_query = Bitmap::new();
+    }
+
+    pub fn update_durability(&mut self) {
+        for event in self.io.take_durable_events() {
+            let consumed = self.durability.process_event(
+                &event,
+                &self.committed_tables,
+                &self.pending_renames,
+            );
+            if consumed {
+                self.pending_renames.clear();
+            }
+        }
     }
 
     // TODO: does not yet create the appropriate context to avoid WriteWriteConflitcs
@@ -1095,7 +1235,168 @@ impl SimulatorEnv {
         ShadowTablesMut {
             transaction_tables: self.connection_tables.get_mut(conn_index).unwrap(),
             commited_tables: &mut self.committed_tables,
+            pending_renames: &mut self.pending_renames,
         }
+    }
+
+    /// Simulate power loss, reopen the database, and verify that all expected durable data
+    /// is still present.
+    pub fn power_loss_recover_and_verify(&mut self) -> Result<(), String> {
+        if self.io_backend != IoBackend::Memory {
+            return Err(
+                "power loss simulation is only supported with --io-backend=memory".to_string(),
+            );
+        }
+
+        self.update_durability();
+
+        let expected_tables = self.durability.expected_recoverable();
+        tracing::info!(
+            "POWER LOSS: committed={} wal_durable={} db_durable={} expected={}",
+            self.committed_tables.len(),
+            self.durability.wal_durable.len(),
+            self.durability.db_durable.len(),
+            expected_tables.len()
+        );
+
+        // close all connections and drop the database handle.
+        self.io.close_files();
+        for conn in &mut self.connections {
+            conn.disconnect();
+        }
+        self.db = None;
+
+        self.io.simulate_power_loss();
+
+        self.io
+            .persist_files()
+            .map_err(|e| format!("persist failed: {e}"))?;
+
+        let db_path = self.get_db_path();
+        let sqlite_conn =
+            rusqlite::Connection::open(&db_path).map_err(|e| format!("reopen failed: {e}"))?;
+        let integrity: String = sqlite_conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|e| format!("integrity_check failed: {e}"))?;
+        if integrity != "ok" {
+            return Err(format!("integrity_check: {integrity}"));
+        }
+        self.verify_committed_data(&sqlite_conn, &expected_tables)?;
+
+        // Reopen the database in the simulator so subsequent interactions observe the post-crash state.
+        self.reopen_database()?;
+
+        // Reset simulator model to match recovered durability.
+        self.clear_tables();
+        self.committed_tables = expected_tables;
+
+        let wal_header_size = turso_core::storage::sqlite3_ondisk::WAL_HEADER_SIZE as u64;
+        let wal_path = self.get_db_path().with_extension("db-wal");
+        let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        if wal_size > wal_header_size {
+            self.durability.wal_durable = self.committed_tables.clone();
+        } else {
+            self.durability.db_durable = self.committed_tables.clone();
+        }
+
+        Ok(())
+    }
+
+    fn reopen_database(&mut self) -> Result<(), String> {
+        self.connections
+            .iter_mut()
+            .for_each(|conn| *conn = SimConnection::Disconnected);
+
+        match self.type_ {
+            SimulationType::Differential => Ok(()),
+            SimulationType::Default | SimulationType::Doublecheck => {
+                let db_path = self.get_db_path();
+                let db = Database::open_file_with_flags(
+                    self.io.clone(),
+                    db_path.to_str().expect("db path should be valid UTF-8"),
+                    turso_core::OpenFlags::default(),
+                    turso_core::DatabaseOpts::new().with_autovacuum(true),
+                    None,
+                )
+                .map_err(|e| format!("Failed to reopen database: {e:?}"))?;
+
+                if self.profile.experimental_mvcc {
+                    let conn = db
+                        .connect()
+                        .map_err(|e| format!("connect failed during MVCC setup: {e:?}"))?;
+                    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+                        .map_err(|e| format!("enable mvcc failed: {e:?}"))?;
+                }
+
+                self.db = Some(db);
+                Ok(())
+            }
+        }
+    }
+
+    /// Verify that all committed data is present in the recovered database
+    pub fn verify_committed_data(
+        &self,
+        conn: &rusqlite::Connection,
+        committed_tables: &[Table],
+    ) -> Result<(), String> {
+        use sql_generation::model::table::SimValue;
+
+        for table in committed_tables {
+            let query = format!("SELECT * FROM \"{}\"", table.name);
+            let mut stmt = conn
+                .prepare(&query)
+                .map_err(|e| format!("table '{}': {e}", table.name))?;
+
+            let col_count = stmt.column_count();
+            let actual: Vec<Vec<SimValue>> = stmt
+                .query_map([], |row| {
+                    Ok((0..col_count)
+                        .map(|i| {
+                            Self::rusqlite_to_simvalue(
+                                row.get::<_, rusqlite::types::Value>(i).unwrap(),
+                            )
+                        })
+                        .collect())
+                })
+                .map_err(|e| format!("table '{}': {e}", table.name))?
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("table '{}': {e}", table.name))?;
+
+            if actual.len() != table.rows.len() {
+                return Err(format!(
+                    "table '{}': expected {} rows, got {}",
+                    table.name,
+                    table.rows.len(),
+                    actual.len()
+                ));
+            }
+
+            let mut expected = table.rows.clone();
+            let mut actual = actual;
+            expected.sort();
+            actual.sort();
+
+            if expected != actual {
+                return Err(format!("table '{}': data mismatch", table.name));
+            }
+        }
+        Ok(())
+    }
+
+    /// Convert rusqlite Value to SimValue
+    fn rusqlite_to_simvalue(value: rusqlite::types::Value) -> SimValue {
+        use rusqlite::types::Value as RValue;
+        use turso_core::types::Value as TValue;
+
+        let turso_value = match value {
+            RValue::Null => TValue::Null,
+            RValue::Integer(i) => TValue::Integer(i),
+            RValue::Real(f) => TValue::Float(f),
+            RValue::Text(s) => TValue::build_text(s),
+            RValue::Blob(b) => TValue::Blob(b),
+        };
+        SimValue(turso_value)
     }
 }
 
@@ -1158,6 +1459,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
     pub(crate) disable_fsync_no_wait: bool,
+    pub(crate) disable_crash_after_wal_sync: bool,
     pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,
     pub(crate) disable_integrity_check: bool,

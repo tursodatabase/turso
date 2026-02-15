@@ -200,6 +200,7 @@ fn run_simulator(
     };
     env.clear_poison();
     plan.clear_poison();
+
     let env = env.lock().unwrap();
     let plan = plan.lock().unwrap();
 
@@ -532,18 +533,24 @@ fn run_simulation_default(
 
     env.io.persist_files().unwrap();
 
-    if result.error.is_none() {
-        if env.opts.disable_integrity_check {
-            tracing::info!("skipping integrity check (disabled by configuration)");
-        } else {
-            let ic = integrity_check(&env.get_db_path());
-            if let Err(err) = ic {
+    if result.error.is_none() && !env.opts.disable_integrity_check {
+        match integrity_check(&env.get_db_path()) {
+            Ok(conn) => {
+                tracing::info!("integrity check passed");
+                // Verify committed data is actually present in the persisted database.
+                // This catches bugs where Turso claims "commit success" but never fsynced.
+                if let Err(err) = env.verify_committed_data(&conn, &env.committed_tables) {
+                    tracing::error!("committed data verification failed: {}", err);
+                    result.error = Some(turso_core::LimboError::InternalError(err));
+                }
+            }
+            Err(err) => {
                 tracing::error!("integrity check failed: {}", err);
                 result.error = Some(turso_core::LimboError::InternalError(err.to_string()));
-            } else {
-                tracing::info!("integrity check passed");
             }
         }
+    } else if env.opts.disable_integrity_check {
+        tracing::info!("skipping integrity check (disabled by configuration)");
     }
 
     result
@@ -608,23 +615,25 @@ const BANNER: &str = r#"
 
 "#;
 
-fn integrity_check(db_path: &Path) -> anyhow::Result<()> {
+fn integrity_check(db_path: &Path) -> anyhow::Result<rusqlite::Connection> {
     assert!(db_path.exists());
     let conn = rusqlite::Connection::open(db_path)?;
-    let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
-    let mut rows = stmt.query(())?;
-    let mut result: Vec<String> = Vec::new();
-
-    while let Some(row) = rows.next()? {
-        result.push(row.get(0)?);
-    }
+    let result: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
+        let mut rows = stmt.query(())?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            result.push(row.get(0)?);
+        }
+        result
+    };
     if result.is_empty() {
         anyhow::bail!("simulation failed: integrity_check should return `ok` or a list of problems")
     }
     if !result[0].eq_ignore_ascii_case("ok") {
         // Build a list of problems
-        result.iter_mut().for_each(|row| *row = format!("- {row}"));
-        anyhow::bail!("simulation failed: {}", result.join("\n"))
+        let problems: Vec<String> = result.iter().map(|row| format!("- {row}")).collect();
+        anyhow::bail!("simulation failed: {}", problems.join("\n"))
     }
-    Ok(())
+    Ok(conn)
 }
