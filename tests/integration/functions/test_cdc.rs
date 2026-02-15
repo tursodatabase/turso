@@ -933,6 +933,8 @@ fn test_cdc_schema_changes(db: TempDatabase) {
     conn.execute("DROP INDEX q_abc").unwrap();
     let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
 
+    // turso_cdc_version table + its auto-index add 2 entries to sqlite_schema,
+    // shifting rowids and rootpages by +2 compared to before version tracking
     assert_eq!(
         rows,
         vec![
@@ -941,13 +943,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
+                Value::Integer(5),
                 Value::Null,
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -959,13 +961,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(6),
+                Value::Integer(8),
                 Value::Null,
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("q".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(7),
+                    Value::Integer(9),
                     Value::Text("CREATE TABLE q (a, b, c)".to_string())
                 ])),
                 Value::Null,
@@ -975,13 +977,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(7),
+                Value::Integer(9),
                 Value::Null,
                 Value::Blob(record([
                     Value::Text("index".to_string()),
                     Value::Text("t_q".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(8),
+                    Value::Integer(10),
                     Value::Text("CREATE INDEX t_q ON t (q)".to_string())
                 ])),
                 Value::Null,
@@ -991,13 +993,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(8),
+                Value::Integer(10),
                 Value::Null,
                 Value::Blob(record([
                     Value::Text("index".to_string()),
                     Value::Text("q_abc".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(9),
+                    Value::Integer(11),
                     Value::Text("CREATE INDEX q_abc ON q (a, b, c)".to_string())
                 ])),
                 Value::Null,
@@ -1007,12 +1009,12 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(-1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
+                Value::Integer(5),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -1025,12 +1027,12 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(-1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(8),
+                Value::Integer(10),
                 Value::Blob(record([
                     Value::Text("index".to_string()),
                     Value::Text("q_abc".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(9),
+                    Value::Integer(11),
                     Value::Text("CREATE INDEX q_abc ON q (a, b, c)".to_string())
                 ])),
                 Value::Null,
@@ -1052,6 +1054,8 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
     conn.execute("ALTER TABLE t ADD COLUMN t").unwrap();
     let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
 
+    // turso_cdc_version table + its auto-index add 2 entries to sqlite_schema,
+    // shifting rowids and rootpages by +2 compared to before version tracking
     assert_eq!(
         rows,
         vec![
@@ -1060,13 +1064,13 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
+                Value::Integer(5),
                 Value::Null,
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -1078,12 +1082,12 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(0),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
+                Value::Integer(5),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -1092,7 +1096,7 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Value::Blob(record([
@@ -1113,19 +1117,19 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(0),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
+                Value::Integer(5),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, t, PRIMARY KEY (x, y))".to_string()
                     )
@@ -1144,5 +1148,73 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                 ])),
             ],
         ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_table_created(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT table_name, version FROM turso_cdc_version",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("turso_cdc".to_string()),
+            Value::Text("v1".to_string()),
+        ]]
+    );
+}
+
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_version_custom_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('id,my_cdc')")
+        .unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT table_name, version FROM turso_cdc_version",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("my_cdc".to_string()),
+            Value::Text("v1".to_string()),
+        ]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_not_created_when_exists(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    // First enable creates turso_cdc table and version entry
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+    // Disable CDC
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('off')")
+        .unwrap();
+    // Re-enable CDC — turso_cdc table already exists, so no duplicate version row
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT table_name, version FROM turso_cdc_version",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("turso_cdc".to_string()),
+            Value::Text("v1".to_string()),
+        ]]
     );
 }

@@ -1456,6 +1456,16 @@ pub enum Insn {
         /// Destination file path for the vacuumed database
         dest_path: String,
     },
+
+    /// Ensure turso_cdc_version table exists and insert/replace a version row,
+    /// then enable CDC on the connection. Runs nested SQL at VDBE execution time
+    /// (same pattern as ParseSchema). CDC is enabled after version table operations
+    /// so those operations are not captured.
+    InitCdcVersion {
+        cdc_table_name: String,
+        version: String,
+        cdc_mode: String,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -1648,6 +1658,7 @@ impl InsnVariants {
             InsnVariants::HashClose => execute::op_hash_close,
             InsnVariants::HashClear => execute::op_hash_clear,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
+            InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
     }
 }

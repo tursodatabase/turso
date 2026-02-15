@@ -349,8 +349,6 @@ fn update_pragma(
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
-            // todo(sivukhin): ideally, we should consistently update capture_data_changes connection flag only after successfull execution of schema change statement
-            // but for now, let's keep it as is...
             let opts = CaptureDataChangesMode::parse(&value)?;
             if let Some(table) = &opts.table() {
                 if resolver.schema.get_table(table).is_none() {
@@ -371,9 +369,21 @@ fn update_pragma(
                         program,
                         &connection,
                     )?;
+
+                    // InitCdcVersion creates the version table, records the version,
+                    // and enables CDC — done at execution time so version table
+                    // operations are not captured by CDC.
+                    program.emit_insn(Insn::InitCdcVersion {
+                        cdc_table_name: table.to_string(),
+                        version: TURSO_CDC_CURRENT_VERSION.to_string(),
+                        cdc_mode: value,
+                    });
+                } else {
+                    connection.set_capture_data_changes(opts);
                 }
+            } else {
+                connection.set_capture_data_changes(opts);
             }
-            connection.set_capture_data_changes(opts);
             Ok((program, TransactionMode::Write))
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
@@ -1313,6 +1323,9 @@ fn update_cache_size(
 }
 
 pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
+#[allow(dead_code)]
+pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
+pub const TURSO_CDC_CURRENT_VERSION: &str = "v1";
 fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
     vec![
         ast::ColumnDefinition {

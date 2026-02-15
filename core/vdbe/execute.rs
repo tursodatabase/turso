@@ -55,7 +55,10 @@ use crate::{
     stats::StatAccum,
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, IOExt, MvCursor};
+use crate::{
+    get_cursor, CaptureDataChangesMode, CheckpointMode, Completion, Connection, DatabaseStorage,
+    IOExt, MvCursor,
+};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
@@ -8297,6 +8300,62 @@ pub fn op_parse_schema(
     conn.auto_commit
         .store(previous_auto_commit, Ordering::SeqCst);
     maybe_nested_stmt_err?;
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_init_cdc_version(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        InitCdcVersion {
+            cdc_table_name,
+            version,
+            cdc_mode,
+        },
+        insn
+    );
+
+    let conn = program.connection.clone();
+
+    // Step 1: Create version table if needed
+    // Follow the FTS pattern: start_nested → prepare → disable subtransactions → run
+    {
+        conn.start_nested();
+        let mut stmt = conn.prepare(
+            "CREATE TABLE IF NOT EXISTS turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+        )?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        let res = stmt.run_ignore_rows();
+        conn.end_nested();
+        res?;
+    }
+
+    // Step 2: Insert or replace version row
+    {
+        conn.start_nested();
+        let mut stmt = conn.prepare(format!(
+            "INSERT OR REPLACE INTO turso_cdc_version (table_name, version) VALUES ('{cdc_table_name}', '{version}')",
+        ))?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        let res = stmt.run_ignore_rows();
+        conn.end_nested();
+        res?;
+    }
+
+    // Enable CDC after version table operations so they are not captured
+    let opts = CaptureDataChangesMode::parse(cdc_mode)?;
+    conn.set_capture_data_changes(opts);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
