@@ -472,7 +472,9 @@ impl Database {
             mv_store,
             path: path.into(),
             wal_path: wal_path.into(),
-            schema: Arc::new(Mutex::new(Arc::new(Schema::new()))),
+            schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
+                opts.enable_strict,
+            )))),
             _shared_page_cache: shared_page_cache,
             shared_wal,
             db_file,
@@ -904,11 +906,12 @@ impl Database {
                     }
 
                     // Load custom types from __turso_internal_types if the table
-                    // exists. The schema loaded by make_from_btree includes the
-                    // table definition but not its contents. We need to read the
-                    // stored type definitions so that DECODE/ENCODE and affinity
-                    // metadata are available to all subsequent connections.
-                    {
+                    // exists and strict mode is enabled. The schema loaded by
+                    // make_from_btree includes the table definition but not its
+                    // contents. We need to read the stored type definitions so
+                    // that DECODE/ENCODE and affinity metadata are available to
+                    // all subsequent connections.
+                    if opts.enable_strict {
                         let conn = state
                             .conn
                             .as_ref()

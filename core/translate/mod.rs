@@ -303,11 +303,25 @@ pub fn translate_inner(
             if_not_exists,
             type_name,
             body,
-        } => schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?,
+        } => {
+            if !connection.experimental_strict_enabled() {
+                bail_parse_error!(
+                    "Custom types require STRICT tables. Enable them with --experimental-strict flag"
+                );
+            }
+            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+        }
         ast::Stmt::DropType {
             if_exists,
             type_name,
-        } => schema::translate_drop_type(&type_name, if_exists, resolver, program)?,
+        } => {
+            if !connection.experimental_strict_enabled() {
+                bail_parse_error!(
+                    "Custom types require STRICT tables. Enable them with --experimental-strict flag"
+                );
+            }
+            schema::translate_drop_type(&type_name, if_exists, resolver, program)?
+        }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }

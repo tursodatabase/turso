@@ -418,7 +418,7 @@ impl Connection {
             .get();
 
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::new();
+        let mut fresh = Schema::with_options(self.experimental_strict_enabled());
         fresh.schema_version = cookie;
 
         // Preserve existing views to avoid expensive repopulation.
@@ -452,12 +452,13 @@ impl Connection {
             self.experimental_triggers_enabled(),
         )?;
 
-        // Load custom types from __turso_internal_types if the table exists.
-        // Type loading errors are non-fatal: we log warnings and continue with
-        // whatever types loaded successfully, ensuring the schema is always installed.
-        if fresh
-            .tables
-            .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+        // Load custom types from __turso_internal_types if the table exists
+        // and strict mode is enabled. Type loading errors are non-fatal: we log
+        // warnings and continue with whatever types loaded successfully.
+        if self.experimental_strict_enabled()
+            && fresh
+                .tables
+                .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
         {
             // Temporarily install the schema so we can prepare a query against it
             self.with_schema_mut(|schema| {

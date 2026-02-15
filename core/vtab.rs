@@ -79,7 +79,7 @@ impl VirtualTable {
         Arc::new(vtab)
     }
 
-    pub(crate) fn builtin_functions() -> Vec<Arc<VirtualTable>> {
+    pub(crate) fn builtin_functions(enable_strict: bool) -> Vec<Arc<VirtualTable>> {
         let mut vtables: Vec<Arc<VirtualTable>> = PragmaVirtualTable::functions()
             .into_iter()
             .map(|(tab, schema)| {
@@ -104,7 +104,9 @@ impl VirtualTable {
         #[cfg(feature = "cli_only")]
         vtables.push(Self::btree_dump_virtual_table());
 
-        vtables.push(Self::turso_types_virtual_table());
+        if enable_strict {
+            vtables.push(Self::turso_types_virtual_table());
+        }
 
         vtables
     }

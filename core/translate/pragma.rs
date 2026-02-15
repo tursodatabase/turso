@@ -1235,60 +1235,63 @@ fn query_pragma(
                 program.emit_result_row(base_reg, 6);
             }
 
-            // Custom types from the type registry (skip aliases where key != canonical name)
-            let mut type_names: Vec<_> = schema
-                .type_registry
-                .iter()
-                .filter(|(key, td)| *key == &td.name.to_lowercase())
-                .map(|(key, _)| key)
-                .collect();
-            type_names.sort();
-            for type_name in type_names {
-                let type_def = &schema.type_registry[type_name];
-                let display_name = if type_def.params.is_empty() {
-                    type_def.name.clone()
-                } else {
-                    let params: Vec<String> = type_def
-                        .params
-                        .iter()
-                        .map(|p| match &p.ty {
-                            Some(ty) => format!("{} {}", p.name, ty),
-                            None => p.name.clone(),
-                        })
-                        .collect();
-                    format!("{}({})", type_def.name, params.join(", "))
-                };
-                program.emit_string8(display_name, base_reg);
-                program.emit_string8(type_def.base.clone(), base_reg + 1);
-                if let Some(ref expr) = type_def.encode {
-                    program.emit_string8(expr.to_string(), base_reg + 2);
-                } else {
-                    program.emit_null(base_reg + 2, None);
+            // Custom types from the type registry are only shown when strict mode is enabled
+            if connection.experimental_strict_enabled() {
+                // Skip aliases where key != canonical name
+                let mut type_names: Vec<_> = schema
+                    .type_registry
+                    .iter()
+                    .filter(|(key, td)| *key == &td.name.to_lowercase())
+                    .map(|(key, _)| key)
+                    .collect();
+                type_names.sort();
+                for type_name in type_names {
+                    let type_def = &schema.type_registry[type_name];
+                    let display_name = if type_def.params.is_empty() {
+                        type_def.name.clone()
+                    } else {
+                        let params: Vec<String> = type_def
+                            .params
+                            .iter()
+                            .map(|p| match &p.ty {
+                                Some(ty) => format!("{} {}", p.name, ty),
+                                None => p.name.clone(),
+                            })
+                            .collect();
+                        format!("{}({})", type_def.name, params.join(", "))
+                    };
+                    program.emit_string8(display_name, base_reg);
+                    program.emit_string8(type_def.base.clone(), base_reg + 1);
+                    if let Some(ref expr) = type_def.encode {
+                        program.emit_string8(expr.to_string(), base_reg + 2);
+                    } else {
+                        program.emit_null(base_reg + 2, None);
+                    }
+                    if let Some(ref expr) = type_def.decode {
+                        program.emit_string8(expr.to_string(), base_reg + 3);
+                    } else {
+                        program.emit_null(base_reg + 3, None);
+                    }
+                    if let Some(ref expr) = type_def.default {
+                        program.emit_string8(expr.to_string(), base_reg + 4);
+                    } else {
+                        program.emit_null(base_reg + 4, None);
+                    }
+                    if type_def.operators.is_empty() {
+                        program.emit_null(base_reg + 5, None);
+                    } else {
+                        let ops: Vec<String> = type_def
+                            .operators
+                            .iter()
+                            .map(|op| match &op.func_name {
+                                Some(f) => format!("'{}' {}", op.op, f),
+                                None => format!("'{}'", op.op),
+                            })
+                            .collect();
+                        program.emit_string8(ops.join(", "), base_reg + 5);
+                    }
+                    program.emit_result_row(base_reg, 6);
                 }
-                if let Some(ref expr) = type_def.decode {
-                    program.emit_string8(expr.to_string(), base_reg + 3);
-                } else {
-                    program.emit_null(base_reg + 3, None);
-                }
-                if let Some(ref expr) = type_def.default {
-                    program.emit_string8(expr.to_string(), base_reg + 4);
-                } else {
-                    program.emit_null(base_reg + 4, None);
-                }
-                if type_def.operators.is_empty() {
-                    program.emit_null(base_reg + 5, None);
-                } else {
-                    let ops: Vec<String> = type_def
-                        .operators
-                        .iter()
-                        .map(|op| match &op.func_name {
-                            Some(f) => format!("'{}' {}", op.op, f),
-                            None => format!("'{}'", op.op),
-                        })
-                        .collect();
-                    program.emit_string8(ops.join(", "), base_reg + 5);
-                }
-                program.emit_result_row(base_reg, 6);
             }
 
             let pragma_meta = pragma_for(&pragma);
