@@ -161,3 +161,26 @@ fn test_create_table_without_rowid_composite_pk(tmp_db: TempDatabase) -> anyhow:
     );
     Ok(())
 }
+
+#[turso_macros::test]
+fn test_fail_not_null_in_upsert(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER NOT NULL, c TEXT NOT NULL);")?;
+    conn.execute("INSERT INTO t VALUES (1, 10, 'first');")?;
+
+    let res = conn.execute("INSERT INTO t VALUES (1, NULL, 'second') ON CONFLICT(a) DO UPDATE SET b = excluded.b, c = excluded.c;");
+    assert!(
+        res.is_err(), 
+        "Expected NOT NULL constraint error"
+    );
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("t.b"),
+        "Expected NOT NULL error message to contain 't.b'"
+    );
+    Ok(())
+}
+
