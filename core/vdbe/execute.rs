@@ -2569,7 +2569,7 @@ pub fn op_auto_commit(
                 .store(requested_autocommit, Ordering::SeqCst);
         }
     } else {
-        // No autocommit flip
+        // No autocommit flip.
         let mvcc_tx_active = conn.get_mv_tx().is_some();
         if !mvcc_tx_active {
             if !requested_autocommit {

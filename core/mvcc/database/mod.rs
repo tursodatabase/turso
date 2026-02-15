@@ -389,6 +389,7 @@ pub struct Savepoint {
 }
 
 impl Savepoint {
+    /// Creates an internal statement savepoint used for per-statement rollback.
     fn statement() -> Self {
         Self {
             kind: SavepointKind::Statement,
@@ -397,9 +398,11 @@ impl Savepoint {
             created_index_versions: Vec::new(),
             deleted_table_versions: Vec::new(),
             deleted_index_versions: Vec::new(),
+            newly_added_to_write_set: Vec::new(),
         }
     }
 
+    /// Creates a user-visible named savepoint snapshot.
     fn named(name: String, starts_transaction: bool, deferred_fk_violations: isize) -> Self {
         Self {
             kind: SavepointKind::Named {
@@ -411,9 +414,13 @@ impl Savepoint {
             created_index_versions: Vec::new(),
             deleted_table_versions: Vec::new(),
             deleted_index_versions: Vec::new(),
+            newly_added_to_write_set: Vec::new(),
         }
     }
 
+    /// Merges child savepoint deltas into this savepoint.
+    ///
+    /// Called when releasing nested savepoints so outer rollback still has a full undo set.
     fn merge_from(&mut self, mut other: Savepoint) {
         self.created_table_versions
             .append(&mut other.created_table_versions);
@@ -423,6 +430,8 @@ impl Savepoint {
             .append(&mut other.deleted_table_versions);
         self.deleted_index_versions
             .append(&mut other.deleted_index_versions);
+        self.newly_added_to_write_set
+            .append(&mut other.newly_added_to_write_set);
     }
 }
 
@@ -859,6 +868,14 @@ struct CommitCoordinator {
     pager_commit_lock: Arc<TursoRwLock>,
 }
 
+impl CommitCoordinator {
+    fn new() -> Self {
+        Self {
+            pager_commit_lock: Arc::new(TursoRwLock::new()),
+        }
+    }
+}
+
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState<Clock>,
     is_finalized: bool,
@@ -938,6 +955,10 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
     }
 
+    /// Validates commit-time write-write conflicts for one table row key.
+    ///
+    /// Returns [LimboError::WriteWriteConflict] when another transaction committed or is
+    /// preparing a conflicting version according to first-committer-wins.
     fn check_rowid_for_conflicts(
         &self,
         rowid: &RowID,
@@ -958,6 +979,10 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(())
     }
 
+    /// Validates commit-time write-write conflicts for one index key.
+    ///
+    /// Returns [LimboError::WriteWriteConflict] when another transaction committed or is
+    /// preparing a conflicting index version according to first-committer-wins.
     fn check_index_for_conflicts(
         &self,
         rowid: &RowID,
@@ -1015,6 +1040,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(())
     }
 
+    /// Validates a single version chain against the current transaction's commit timestamp.
+    ///
+    /// This enforces snapshot-isolation conflict checks for both:
+    /// 1. versions ended by concurrent commits (`end >= tx.begin_ts`), and
+    /// 2. live versions owned by concurrent transactions (state/ts tie-breaking).
     fn check_version_conflicts(
         &self,
         end_ts: u64,
@@ -1222,8 +1252,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
-                        self.commit_coordinator.pager_commit_lock.unlock();
                     }
+                    mvcc_store.unlock_commit_lock_if_held(tx);
                     mvcc_store.remove_tx(self.tx_id);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -1246,71 +1276,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let tx = tx.value();
 
                 for id in &self.write_set {
-                    // TODO: check for conflicts with indices, check for uniqueness too.
-                    if !id.row_id.is_int_key() {
-                        continue;
-                    }
-
-                    let row_versions = mvcc_store.rows.get(id);
-                    if row_versions.is_none() {
-                        continue;
-                    }
-
-                    let row_versions = row_versions.unwrap();
-                    let row_versions = row_versions.value();
-                    let row_versions = row_versions.read();
-
-                    // Check for conflicts - iterate in reverse for faster early termination
-                    for version in row_versions.iter().rev() {
-                        // Skip deleted versions
-                        if version.end.is_some() {
-                            continue;
-                        }
-
-                        match version.begin {
-                            Some(TxTimestampOrID::TxID(other_tx_id)) => {
-                                // Skip our own version
-                                if other_tx_id == self.tx_id {
-                                    continue;
-                                }
-                                // Another transaction's uncommitted version - check their state
-                                let other_tx = mvcc_store.txs.get(&other_tx_id);
-                                if let Some(other_tx) = other_tx {
-                                    let other_tx = other_tx.value();
-                                    match other_tx.state.load() {
-                                        // Other tx already committed = conflict
-                                        TransactionState::Committed(_) => {
-                                            return Err(LimboError::WriteWriteConflict);
-                                        }
-                                        // Both preparing - compare end_ts (lower wins)
-                                        TransactionState::Preparing(other_end_ts) => {
-                                            if other_end_ts < *end_ts {
-                                                // Other tx has lower end_ts, they win
-                                                return Err(LimboError::WriteWriteConflict);
-                                            }
-                                            // We have lower end_ts, we win - they'll abort when they validate
-                                        }
-                                        // Other tx still active - we're already Preparing so we're ahead
-                                        // They'll see us in Preparing/Committed when they try to commit
-                                        TransactionState::Active => {}
-                                        // Other tx aborted - no conflict
-                                        TransactionState::Aborted
-                                        | TransactionState::Terminated => {}
-                                    }
-                                }
-                            }
-                            Some(TxTimestampOrID::Timestamp(begin_ts)) => {
-                                // Committed version - check if it was inserted after we started
-                                if begin_ts >= tx.begin_ts {
-                                    // Duplicate! A version was committed after we started
-                                    return Err(LimboError::WriteWriteConflict);
-                                }
-                                turso_assert!(false, "there is another row insterted and not updated/deleted from before");
-                            }
-                            None => {
-                                // Invalid version
-                            }
-                        }
+                    if id.row_id.is_int_key() {
+                        self.check_rowid_for_conflicts(id, *end_ts, tx, mvcc_store)?;
+                    } else {
+                        self.check_index_for_conflicts(id, *end_ts, tx, mvcc_store)?;
                     }
                 }
 
@@ -1392,7 +1361,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if log_record.row_versions.is_empty() {
                     // Nothing to do, just end commit.
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                        self.commit_coordinator.pager_commit_lock.unlock();
+                        mvcc_store.unlock_commit_lock_if_held(tx);
                     }
                     self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 } else {
@@ -1923,9 +1892,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             clock,
             storage,
             exclusive_tx: AtomicU64::new(NO_EXCLUSIVE_TX),
-            commit_coordinator: Arc::new(CommitCoordinator {
-                pager_commit_lock: Arc::new(TursoRwLock::new()),
-            }),
+            commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             durable_txid_max: AtomicU64::new(0),
@@ -2873,11 +2840,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
     ) -> Result<TxID> {
-        if !self.blocking_checkpoint_lock.read() {
+        // Existing transactions already hold one blocking-checkpoint read guard
+        // from begin_tx(). When upgrading read->write, do not acquire another one.
+        let acquires_checkpoint_guard = maybe_existing_tx_id.is_none();
+        if acquires_checkpoint_guard && !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
         }
-        let unlock = || self.blocking_checkpoint_lock.unlock();
+        let unlock_checkpoint_guard = || {
+            if acquires_checkpoint_guard {
+                self.blocking_checkpoint_lock.unlock();
+            }
+        };
         let tx_id = maybe_existing_tx_id.unwrap_or_else(|| self.get_tx_id());
         let begin_ts = if let Some(tx_id) = maybe_existing_tx_id {
             self.txs
@@ -2889,18 +2863,29 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.get_timestamp()
         };
 
-        self.acquire_exclusive_tx(&tx_id)
-            .inspect_err(|_| unlock())?;
+        let already_exclusive = self.is_exclusive_tx(&tx_id);
+        if !already_exclusive {
+            self.acquire_exclusive_tx(&tx_id)
+                .inspect_err(|_| unlock_checkpoint_guard())?;
+        }
 
-        let locked = self.commit_coordinator.pager_commit_lock.write();
-        if !locked {
-            tracing::debug!(
-                "begin_exclusive_tx: tx_id={} failed with Busy on pager_commit_lock",
-                tx_id
-            );
-            self.release_exclusive_tx(&tx_id);
-            unlock();
-            return Err(LimboError::Busy);
+        let already_holds_commit_lock = maybe_existing_tx_id
+            .and_then(|existing_tx_id| self.txs.get(&existing_tx_id))
+            .is_some_and(|tx| tx.value().pager_commit_lock_held.load(Ordering::Acquire));
+
+        if !already_holds_commit_lock {
+            let locked = self.commit_coordinator.pager_commit_lock.write();
+            if !locked {
+                tracing::debug!(
+                    "begin_exclusive_tx: tx_id={} failed with Busy on pager_commit_lock",
+                    tx_id
+                );
+                if !already_exclusive {
+                    self.release_exclusive_tx(&tx_id);
+                }
+                unlock_checkpoint_guard();
+                return Err(LimboError::Busy);
+            }
         }
 
         let header = self.get_new_transaction_database_header(&pager);
@@ -2910,6 +2895,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .txs
                 .get(&existing_tx_id)
                 .ok_or_else(|| LimboError::NoSuchTransactionID(existing_tx_id.to_string()))?;
+            tx.value()
+                .pager_commit_lock_held
+                .store(true, Ordering::Release);
             *tx.value().header.write() = header;
             tracing::trace!(
                 "begin_exclusive_tx(tx_id={}) - upgraded existing transaction",
@@ -3257,19 +3245,28 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint) {
+        let Savepoint {
+            created_table_versions,
+            created_index_versions,
+            deleted_table_versions,
+            deleted_index_versions,
+            newly_added_to_write_set,
+            ..
+        } = savepoint;
+
         tracing::debug!(
             "rollback_savepoint(tx_id={}, created_table={}, created_index={}, deleted_table={}, deleted_index={})",
             tx_id,
-            savepoint.created_table_versions.len(),
-            savepoint.created_index_versions.len(),
-            savepoint.deleted_table_versions.len(),
-            savepoint.deleted_index_versions.len()
+            created_table_versions.len(),
+            created_index_versions.len(),
+            deleted_table_versions.len(),
+            deleted_index_versions.len()
         );
 
-        let mut touched_table_rowids = BTreeSet::new();
+        let mut touched_rowids = BTreeSet::new();
 
-        for (rowid, version_id) in savepoint.created_table_versions {
-            touched_table_rowids.insert(rowid.clone());
+        for (rowid, version_id) in created_table_versions {
+            touched_rowids.insert(rowid.clone());
             if let Some(entry) = self.rows.get(&rowid) {
                 let mut versions = entry.value().write();
                 versions.retain(|rv| rv.id != version_id);
@@ -3282,7 +3279,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        for ((table_id, key), version_id) in savepoint.created_index_versions {
+        for ((table_id, key), version_id) in created_index_versions {
             if let Some(index) = self.index_rows.get(&table_id) {
                 if let Some(entry) = index.value().get(&key) {
                     let mut versions = entry.value().write();
@@ -3296,8 +3293,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        for (rowid, version_id) in savepoint.deleted_table_versions {
-            touched_table_rowids.insert(rowid.clone());
+        for (rowid, version_id) in deleted_table_versions {
+            touched_rowids.insert(rowid.clone());
             if let Some(entry) = self.rows.get(&rowid) {
                 let mut versions = entry.value().write();
                 for rv in versions.iter_mut() {
@@ -3315,7 +3312,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        for ((table_id, key), version_id) in savepoint.deleted_index_versions {
+        for ((table_id, key), version_id) in deleted_index_versions {
             if let Some(index) = self.index_rows.get(&table_id) {
                 if let Some(entry) = index.value().get(&key) {
                     let mut versions = entry.value().write();
@@ -3334,16 +3331,34 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        self.remove_rolled_back_rows_from_write_set(tx_id, touched_table_rowids.clone());
+        touched_rowids.extend(newly_added_to_write_set);
+        self.remove_rolled_back_rows_from_write_set(tx_id, touched_rowids.clone());
         // A statement may reserve a rowid and then abort before a table-version is recorded
         // (e.g. uniqueness/FK failures). Invalidate all allocators so aborted reservations
         // never leak into future rowid choices.
         self.invalidate_all_rowid_allocators();
-        self.invalidate_rowid_allocators_for_rows(&touched_table_rowids);
+        self.invalidate_rowid_allocators_for_rows(&touched_rowids);
     }
 
     fn row_has_uncommitted_version_for_tx(&self, rowid: &RowID, tx_id: TxID) -> bool {
-        let Some(entry) = self.rows.get(rowid) else {
+        if rowid.row_id.is_int_key() {
+            let Some(entry) = self.rows.get(rowid) else {
+                return false;
+            };
+            let versions = entry.value().read();
+            return versions.iter().any(|rv| {
+                rv.begin == Some(TxTimestampOrID::TxID(tx_id))
+                    || rv.end == Some(TxTimestampOrID::TxID(tx_id))
+            });
+        }
+
+        let RowKey::Record(ref record) = rowid.row_id else {
+            return false;
+        };
+        let Some(index) = self.index_rows.get(&rowid.table_id) else {
+            return false;
+        };
+        let Some(entry) = index.value().get(record) else {
             return false;
         };
         let versions = entry.value().read();
@@ -3407,6 +3422,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
+        if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
+            // Re-entrant upgrade attempt for the same transaction.
+            return Ok(());
+        }
         if let Some(tx) = self.txs.get(tx_id) {
             let tx = tx.value();
             if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
@@ -3666,7 +3685,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 if versions[i].row.id == row_version.row.id
                     && matches!(
                         (&versions[i].begin, &row_version.begin),
-                        (Some(existing), Some(new)) if existing == new
+                        (
+                            Some(TxTimestampOrID::Timestamp(existing)),
+                            Some(TxTimestampOrID::Timestamp(new))
+                        ) if existing == new
                     )
                 {
                     versions[i] = row_version;
