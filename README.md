@@ -456,3 +456,5 @@ Thanks to all the contributors to Turso Database!
 <a href="https://github.com/tursodatabase/turso/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=tursodatabase/turso" />
 </a>
+
+Pedro Test Agent
