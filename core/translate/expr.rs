@@ -6501,6 +6501,56 @@ pub(crate) fn emit_user_facing_column_value(
     Ok(())
 }
 
+/// Walk an expression tree that has been rewritten to use `Expr::Register` for column
+/// references (e.g. by `rewrite_index_expr_for_insertion`). For each register that maps
+/// to a custom type column, emit decode bytecode into a fresh temporary register and
+/// rewrite the expression node to reference the decoded register.
+///
+/// This ensures expression indexes on custom type columns evaluate the expression on
+/// **decoded** (user-facing) values, matching what SELECT / CREATE INDEX see.
+pub(crate) fn decode_custom_type_registers_in_expr(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    expr: &mut turso_parser::ast::Expr,
+    columns: &[crate::schema::Column],
+    start_reg: usize,
+    key_reg: Option<usize>,
+    is_strict: bool,
+) -> Result<()> {
+    walk_expr_mut(expr, &mut |e| {
+        if let turso_parser::ast::Expr::Register(reg) = e {
+            let reg_val = *reg;
+            // Skip the rowid register — it's not a custom type column.
+            if key_reg == Some(reg_val) {
+                return Ok(WalkControl::Continue);
+            }
+            // Map register back to column index.
+            if reg_val >= start_reg {
+                let col_idx = reg_val - start_reg;
+                if let Some(column) = columns.get(col_idx) {
+                    if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str, is_strict)
+                    {
+                        if type_def.decode.is_some() {
+                            let decoded_reg = program.alloc_register();
+                            emit_user_facing_column_value(
+                                program,
+                                reg_val,
+                                decoded_reg,
+                                column,
+                                is_strict,
+                                resolver,
+                            )?;
+                            *e = turso_parser::ast::Expr::Register(decoded_reg);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
 /// Emit bytecode for a custom type encode/decode expression.
 /// Sets up `value` to reference `value_reg`, and type parameter overrides
 /// from `column.ty_params` matched against `type_def.params`.

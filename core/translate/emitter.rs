@@ -3428,6 +3428,7 @@ fn emit_update_insns<'a>(
                     rowid_reg,
                     col,
                     idx_start_reg + i,
+                    target_table.table.is_strict(),
                 )?;
             }
 
@@ -3828,6 +3829,7 @@ fn emit_update_insns<'a>(
                 rowid_reg,
                 col,
                 idx_start_reg + i,
+                target_table.table.is_strict(),
             )?;
         }
         // last register is the rowid
@@ -5130,6 +5132,7 @@ fn emit_index_column_value_old_image(
 
 /// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
 /// Handling expression indexes and regular columns
+#[allow(clippy::too_many_arguments)]
 fn emit_index_column_value_new_image(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -5138,6 +5141,7 @@ fn emit_index_column_value_new_image(
     rowid_reg: usize,
     idx_col: &IndexColumn,
     dest_reg: usize,
+    is_strict: bool,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
@@ -5146,6 +5150,18 @@ fn emit_index_column_value_new_image(
         // comparison instructions in the expression get the correct column
         // affinity even though column references have been rewritten to
         // Expr::Register.
+        // After rewrite, Expr::Register nodes reference encoded column registers.
+        // Decode custom type registers so the expression evaluates on user-facing
+        // values, matching what SELECT / CREATE INDEX see.
+        crate::translate::expr::decode_custom_type_registers_in_expr(
+            program,
+            resolver,
+            &mut expr,
+            columns,
+            columns_start_reg,
+            Some(rowid_reg),
+            is_strict,
+        )?;
         translate_expr_no_constant_opt(
             program,
             None,

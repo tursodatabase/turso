@@ -1029,6 +1029,7 @@ fn emit_commit_phase(
                 program,
                 resolver,
                 insertion,
+                ctx.table,
                 idx_col,
                 idx_start_reg + i,
             )?;
@@ -2313,6 +2314,7 @@ fn emit_index_uniqueness_check(
             program,
             resolver,
             insertion,
+            ctx.table,
             idx_col,
             idx_start_reg + i,
         )?;
@@ -2837,12 +2839,25 @@ fn emit_index_column_value_for_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     insertion: &Insertion,
+    table: &BTreeTable,
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
         rewrite_index_expr_for_insertion(&mut expr, insertion)?;
+        // After rewrite, Expr::Register nodes reference encoded column registers.
+        // Decode custom type registers so the expression evaluates on user-facing
+        // values, matching what SELECT / CREATE INDEX see.
+        crate::translate::expr::decode_custom_type_registers_in_expr(
+            program,
+            resolver,
+            &mut expr,
+            &table.columns,
+            insertion.first_col_register(),
+            Some(insertion.key_register()),
+            table.is_strict,
+        )?;
         translate_expr_no_constant_opt(
             program,
             Some(&TableReferences::new_empty()),
