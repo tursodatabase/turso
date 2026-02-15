@@ -1453,15 +1453,22 @@ fn bind_insert(
     let mut inserting_multiple_rows = false;
     match body {
         InsertBody::DefaultValues => {
-            // Generate default values for the table
+            // Generate default values for the table.
+            // Check column-level default first, then type-level default.
+            let is_strict = table.is_strict();
             values = table
                 .columns()
                 .iter()
                 .filter(|c| !c.hidden())
                 .map(|c| {
-                    c.default
-                        .clone()
-                        .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                    c.default.clone().unwrap_or_else(|| {
+                        if let Some(type_def) = resolver.schema.get_type_def(&c.ty_str, is_strict) {
+                            if let Some(ref default_expr) = type_def.default {
+                                return default_expr.clone();
+                            }
+                        }
+                        Box::new(ast::Expr::Literal(ast::Literal::Null))
+                    })
                 })
                 .collect();
         }
@@ -1793,10 +1800,16 @@ fn init_source_emission<'a>(
         }
         InsertBody::DefaultValues => {
             let num_values = table.columns().len();
+            let is_strict = table.is_strict();
             values.extend(table.columns().iter().map(|c| {
-                c.default
-                    .clone()
-                    .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                c.default.clone().unwrap_or_else(|| {
+                    if let Some(type_def) = resolver.schema.get_type_def(&c.ty_str, is_strict) {
+                        if let Some(ref default_expr) = type_def.default {
+                            return default_expr.clone();
+                        }
+                    }
+                    Box::new(ast::Expr::Literal(ast::Literal::Null))
+                })
             }));
             (
                 num_values,

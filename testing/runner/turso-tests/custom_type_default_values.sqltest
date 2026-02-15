@@ -1,7 +1,6 @@
 @database :memory:
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test default-values-uses-type-default {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 0;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents, label TEXT DEFAULT 'x') STRICT;
@@ -13,7 +12,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test default-values-column-default-overrides-type-default {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 0;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents DEFAULT 99, label TEXT DEFAULT 'y') STRICT;
@@ -25,7 +23,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test default-values-matches-column-list-insert {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 0;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents, label TEXT DEFAULT 'x') STRICT;
@@ -39,7 +36,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test default-values-no-type-default-gives-null {
     CREATE TYPE simple BASE integer ENCODE value DECODE value;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val simple, label TEXT DEFAULT 'x') STRICT;
