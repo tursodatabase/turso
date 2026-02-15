@@ -515,7 +515,12 @@ pub enum SubqueryType {
     },
     /// IN subquery; result is stored in an ephemeral index.
     /// Example: x <NOT> IN (SELECT ...)
-    In { cursor_id: usize },
+    In {
+        cursor_id: usize,
+        /// Affinity string for IN comparison (derived from LHS+RHS expression affinities).
+        /// Applied to both LHS values before probe and RHS values in the ephemeral index.
+        affinity_str: Option<String>,
+    },
 }
 
 impl Expr {

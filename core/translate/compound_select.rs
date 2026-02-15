@@ -264,6 +264,7 @@ fn emit_compound_select(
                     cursor_id: dedupe_index.0,
                     index: dedupe_index.1.clone(),
                     is_delete: false,
+                    affinity_str: None,
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
@@ -287,6 +288,7 @@ fn emit_compound_select(
                     cursor_id: dedupe_index.0,
                     index: dedupe_index.1.clone(),
                     is_delete: false,
+                    affinity_str: None,
                 };
 
                 emit_explain!(program, true, "UNION USING TEMP B-TREE".to_owned());
@@ -317,6 +319,7 @@ fn emit_compound_select(
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
                     is_delete: false,
+                    affinity_str: None,
                 };
 
                 let (right_cursor_id, right_index) =
@@ -325,6 +328,7 @@ fn emit_compound_select(
                     cursor_id: right_cursor_id,
                     index: right_index,
                     is_delete: false,
+                    affinity_str: None,
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
@@ -373,6 +377,7 @@ fn emit_compound_select(
                     cursor_id,
                     index: index.clone(),
                     is_delete: false,
+                    affinity_str: None,
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
@@ -395,6 +400,7 @@ fn emit_compound_select(
                     cursor_id,
                     index: index.clone(),
                     is_delete: true,
+                    affinity_str: None,
                 };
                 emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;

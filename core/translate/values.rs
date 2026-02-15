@@ -236,6 +236,7 @@ fn emit_values_to_index(
             cursor_id,
             index,
             is_delete,
+            ..
         } => (cursor_id, index, is_delete),
         _ => unreachable!(),
     };

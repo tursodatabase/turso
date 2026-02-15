@@ -337,6 +337,9 @@ pub enum QueryDestination {
         index: Arc<Index>,
         /// Whether this is a delete operation that will remove the index entries
         is_delete: bool,
+        /// Optional affinity string for IN subquery ephemeral indexes.
+        /// When set, applied to values via MakeRecord before insertion.
+        affinity_str: Option<String>,
     },
     /// The results of the query are stored in an ephemeral table,
     /// later used by the parent query.

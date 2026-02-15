@@ -318,6 +318,30 @@ text|1025.1655084066
 text| 
 }
 
+# ============================================
+# IN subquery: text literal compared against integer column values
+# should apply affinity coercion so text '1' matches integer 1
+# ============================================
+test affinity-in-subquery-text-vs-integer {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
+    SELECT '1' IN (SELECT id FROM t1);
+}
+expect {
+    1
+}
+
+test affinity-in-subquery-text-column-vs-integer-column {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, '1'), (2, '2'), (3, 'x');
+    SELECT val, val IN (SELECT id FROM t1) FROM t1 ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+    x|0
+}
+
 test affinity-ascii-whitespace-1_1 {
     CREATE TABLE nb1(i INTEGER);
     INSERT INTO nb1 VALUES ('12' || CHAR(160));

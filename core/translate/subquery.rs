@@ -10,7 +10,7 @@ use crate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
         emitter::emit_program_for_select,
-        expr::{unwrap_parens, walk_expr_mut, WalkControl},
+        expr::{compare_affinity, get_expr_affinity, unwrap_parens, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
             ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
@@ -18,6 +18,7 @@ use crate::{
         },
         select::prepare_select_plan,
     },
+    vdbe::affinity::Affinity,
     vdbe::{
         builder::{CursorType, MaterializedCteInfo, ProgramBuilder},
         insn::Insn,
@@ -513,17 +514,56 @@ fn get_subquery_parser<'a>(
                 let cursor_id =
                     program.alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index.clone()));
 
+                // Compute comparison affinity for each column position.
+                // This follows SQLite's exprINAffinity() which combines the LHS expression
+                // affinity with the RHS subquery column affinity using compareAffinity rules.
+                let lhs_columns = match unwrap_parens(lhs.as_ref())? {
+                    ast::Expr::Parenthesized(exprs) => {
+                        exprs.iter().map(|e| e.as_ref()).collect::<Vec<_>>()
+                    }
+                    expr => vec![expr],
+                };
+                let affinity_str: String = lhs_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, lhs_col)| {
+                        let lhs_aff = get_expr_affinity(lhs_col, Some(referenced_tables));
+                        let combined = compare_affinity(
+                            &plan.result_columns[i].expr,
+                            lhs_aff,
+                            Some(&plan.table_references),
+                        );
+                        if combined.has_affinity() {
+                            combined
+                        } else {
+                            Affinity::Blob
+                        }
+                    })
+                    .map(|a| a.aff_mask())
+                    .collect();
+                let has_meaningful_affinity =
+                    affinity_str.chars().any(|c| c != Affinity::Blob.aff_mask());
+                let affinity_str_opt = if has_meaningful_affinity {
+                    Some(affinity_str)
+                } else {
+                    None
+                };
+
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id,
                     index: ephemeral_index,
                     is_delete: false,
+                    affinity_str: affinity_str_opt.clone(),
                 };
 
                 *expr = ast::Expr::SubqueryResult {
                     subquery_id,
                     lhs: Some(lhs),
                     not_in: not,
-                    query_type: SubqueryType::In { cursor_id },
+                    query_type: SubqueryType::In {
+                        cursor_id,
+                        affinity_str: affinity_str_opt.clone(),
+                    },
                 };
 
                 let correlated = plan.is_correlated();
@@ -531,7 +571,10 @@ fn get_subquery_parser<'a>(
 
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
-                    query_type: SubqueryType::In { cursor_id },
+                    query_type: SubqueryType::In {
+                        cursor_id,
+                        affinity_str: affinity_str_opt,
+                    },
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(plan)),
                     },
@@ -1255,6 +1298,7 @@ fn emit_indexed_materialized_subquery(
             cursor_id: index_cursor_id,
             index: index.clone(),
             is_delete: false,
+            affinity_str: None,
         };
     }
 
@@ -1451,7 +1495,7 @@ pub fn emit_non_from_clause_subquery(
                 can_fallthrough: true,
             });
         }
-        SubqueryType::In { cursor_id } => {
+        SubqueryType::In { cursor_id, .. } => {
             program.emit_insn(Insn::OpenEphemeral {
                 cursor_id: *cursor_id,
                 is_table: false,

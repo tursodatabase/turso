@@ -140,6 +140,7 @@ pub fn emit_columns_to_destination(
             cursor_id: index_cursor_id,
             index: dedupe_index,
             is_delete,
+            affinity_str,
         } => {
             if *is_delete {
                 program.emit_insn(Insn::IdxDelete {
@@ -211,7 +212,7 @@ pub fn emit_columns_to_destination(
                     count: to_u16(record_count),
                     dest_reg: to_u16(record_reg),
                     index_name: Some(dedupe_index.name.clone()),
-                    affinity_str: None,
+                    affinity_str: affinity_str.clone(),
                 });
                 program.emit_insn(Insn::IdxInsert {
                     cursor_id: *index_cursor_id,
