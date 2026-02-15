@@ -866,8 +866,7 @@ fn test_too_many_columns_in_select(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
 
     // 2001 columns should exceed the SQLITE_MAX_COLUMN limit of 2000
-    let columns = std::iter::repeat("1")
-        .take(2001)
+    let columns = std::iter::repeat_n("1", 2001)
         .collect::<Vec<_>>()
         .join(",");
     let query = format!("SELECT {columns}");
@@ -883,8 +882,7 @@ fn test_too_many_columns_in_select(tmp_db: TempDatabase) {
     );
 
     // 2000 columns should be fine
-    let columns = std::iter::repeat("1")
-        .take(2000)
+    let columns = std::iter::repeat_n("1", 2000)
         .collect::<Vec<_>>()
         .join(",");
     let query = format!("SELECT {columns}");
@@ -892,8 +890,7 @@ fn test_too_many_columns_in_select(tmp_db: TempDatabase) {
     assert!(result.is_ok(), "SELECT with 2000 columns should succeed");
 
     // UNION with too many columns should also error
-    let columns = std::iter::repeat("1")
-        .take(2001)
+    let columns = std::iter::repeat_n("1", 2001)
         .collect::<Vec<_>>()
         .join(",");
     let query = format!("SELECT {columns} UNION SELECT {columns}");
