@@ -1,7 +1,6 @@
 @database :memory:
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test notnull-decode-rejects-ghost-null {
     -- ENCODE is identity, but DECODE maps 42 → NULL.
     -- A NOT NULL column must reject inserts that would decode to NULL.
@@ -15,7 +14,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test notnull-decode-ghost-null-rejected {
     CREATE TYPE tricky BASE integer
         ENCODE value
@@ -28,7 +26,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test notnull-decode-normal-values-ok {
     -- Non-NULL decoded values should pass.
     CREATE TYPE tricky BASE integer
@@ -45,7 +42,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test notnull-decode-actual-null-still-rejected {
     -- Actual NULL input should still be rejected by NOT NULL.
     CREATE TYPE tricky BASE integer
@@ -59,7 +55,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test notnull-decode-positive-only {
     -- Practical example: type that decodes non-positive values to NULL.
     CREATE TYPE positive_only BASE integer
@@ -74,7 +69,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test notnull-decode-positive-only-zero-rejected {
     CREATE TYPE positive_only BASE integer
         ENCODE value
@@ -87,7 +81,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test notnull-decode-positive-only-negative-rejected {
     CREATE TYPE positive_only BASE integer
         ENCODE value

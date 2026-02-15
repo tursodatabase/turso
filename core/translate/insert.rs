@@ -1349,15 +1349,41 @@ fn emit_notnulls(
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
         }
 
+        // Determine which register to check: for custom type columns with
+        // a DECODE expression, decode the encoded value into a temp register
+        // and check the *decoded* value. This prevents "ghost NULLs" where
+        // ENCODE produces a non-NULL value but DECODE returns NULL.
+        let check_reg = if let Some(type_def) = resolver
+            .schema
+            .get_type_def(&column_mapping.column.ty_str, ctx.table.is_strict)
+        {
+            if type_def.decode.is_some() {
+                let decoded_reg = program.alloc_register();
+                crate::translate::expr::emit_user_facing_column_value(
+                    program,
+                    column_mapping.register,
+                    decoded_reg,
+                    column_mapping.column,
+                    ctx.table.is_strict,
+                    resolver,
+                )?;
+                decoded_reg
+            } else {
+                column_mapping.register
+            }
+        } else {
+            column_mapping.register
+        };
+
         // For INSERT OR IGNORE, skip to the next row if NULL
         if on_ignore {
             program.emit_insn(Insn::IsNull {
-                reg: column_mapping.register,
+                reg: check_reg,
                 target_pc: ctx.loop_labels.row_done,
             });
         } else {
             program.emit_insn(Insn::HaltIfNull {
-                target_reg: column_mapping.register,
+                target_reg: check_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: {
                     let mut description = String::with_capacity(
