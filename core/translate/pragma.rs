@@ -370,18 +370,18 @@ fn update_pragma(
                         program,
                         &connection,
                     )?;
-
-                    // InitCdcVersion creates the version table, records the version,
-                    // and enables CDC — done at execution time so version table
-                    // operations are not captured by CDC.
-                    program.emit_insn(Insn::InitCdcVersion {
-                        cdc_table_name: info.table.to_string(),
-                        version: TURSO_CDC_CURRENT_VERSION.to_string(),
-                        cdc_mode: value,
-                    });
-                } else {
-                    connection.set_capture_data_changes_info(opts);
                 }
+                // InitCdcVersion creates the version table if needed, records the
+                // version (INSERT OR IGNORE), reads back the actual version, and
+                // enables CDC. Always deferred to execution time so:
+                // 1. Version table operations are not captured by CDC
+                // 2. If a version row already exists, we use that version (not the
+                //    current one), since the CDC table schema hasn't been migrated
+                program.emit_insn(Insn::InitCdcVersion {
+                    cdc_table_name: info.table.to_string(),
+                    version: TURSO_CDC_CURRENT_VERSION.to_string(),
+                    cdc_mode: value,
+                });
             } else {
                 connection.set_capture_data_changes_info(opts);
             }

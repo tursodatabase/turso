@@ -8338,11 +8338,13 @@ pub fn op_init_cdc_version(
         res?;
     }
 
-    // Step 2: Insert or replace version row
+    // Step 2: Insert version row only if one doesn't already exist.
+    // If the table was previously initialized with an older version, we must
+    // keep that version (the CDC table schema hasn't been migrated).
     {
         conn.start_nested();
         let mut stmt = conn.prepare(format!(
-            "INSERT OR REPLACE INTO turso_cdc_version (table_name, version) VALUES ('{cdc_table_name}', '{version}')",
+            "INSERT OR IGNORE INTO turso_cdc_version (table_name, version) VALUES ('{cdc_table_name}', '{version}')",
         ))?;
         stmt.program
             .prepared
@@ -8353,8 +8355,28 @@ pub fn op_init_cdc_version(
         res?;
     }
 
+    // Step 3: Read back the actual version from the table (may differ from
+    // `version` if the row already existed with an older version).
+    let actual_version = {
+        conn.start_nested();
+        let mut stmt = conn.prepare(format!(
+            "SELECT version FROM turso_cdc_version WHERE table_name = '{cdc_table_name}'",
+        ))?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        let rows = stmt.run_collect_rows();
+        conn.end_nested();
+        let rows = rows?;
+        match rows.first().and_then(|r| r.first()) {
+            Some(crate::Value::Text(text)) => text.to_string(),
+            _ => version.to_string(),
+        }
+    };
+
     // Enable CDC after version table operations so they are not captured
-    let opts = CaptureDataChangesInfo::parse(cdc_mode, Some(version.to_string()))?;
+    let opts = CaptureDataChangesInfo::parse(cdc_mode, Some(actual_version))?;
     conn.set_capture_data_changes_info(opts);
 
     state.pc += 1;
