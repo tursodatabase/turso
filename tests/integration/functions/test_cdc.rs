@@ -1670,3 +1670,34 @@ fn test_cdc_version_helper_defaults_to_v1(db: TempDatabase) {
     assert_eq!(parsed.version, None);
     assert_eq!(parsed.version(), TURSO_CDC_CURRENT_VERSION);
 }
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_drop_table_cleans_up_version(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Enable CDC — creates turso_cdc and turso_cdc_version tables
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // Verify version entry exists
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT table_name, version FROM turso_cdc_version",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![Value::Text("turso_cdc".into()), Value::Text("v1".into())]]
+    );
+
+    // Drop the CDC table
+    conn.execute("DROP TABLE turso_cdc").unwrap();
+
+    // Version entry should be cleaned up
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT COUNT(*) FROM turso_cdc_version",
+    );
+    assert_eq!(rows, vec![vec![Value::Integer(0)]]);
+}
