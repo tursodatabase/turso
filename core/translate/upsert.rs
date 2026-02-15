@@ -654,7 +654,9 @@ pub fn emit_upsert(
             .chain(std::iter::once(ctx.conflict_rowid_reg))
             .collect();
         if !relevant_before_update_triggers.is_empty() {
-            // NEW row values are in new_start registers
+            // NEW row values are in new_start registers. At this point they are
+            // encoded (post-encode for STRICT custom types). Mark new_encoded=true
+            // so fire_trigger's decode_trigger_registers will decode them.
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_registers: Vec<usize> = (0..num_cols)
                 .map(|i| new_start + i)
@@ -663,7 +665,8 @@ pub fn emit_upsert(
 
             // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
             // clauses should not suppress errors. Override conflict resolution to Abort.
-            let trigger_ctx = TriggerContext::new_with_override_conflict(
+            // Use new_after variant because NEW values are encoded at this point.
+            let trigger_ctx = TriggerContext::new_after_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers),
                 Some(old_registers.clone()),

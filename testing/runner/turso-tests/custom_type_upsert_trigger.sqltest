@@ -1,7 +1,6 @@
 @database :memory:
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 @requires trigger "uses triggers"
 test before-update-trigger-upsert-sees-decoded-new {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -18,7 +17,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 @requires trigger "uses triggers"
 test after-update-trigger-upsert-sees-decoded-new {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -35,7 +33,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 @requires trigger "uses triggers"
 test before-update-trigger-upsert-data-correct {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -51,7 +48,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 @requires trigger "uses triggers"
 test before-update-trigger-direct-update-still-works {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;

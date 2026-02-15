@@ -305,14 +305,14 @@ expect {
     bigint(value integer)|integer||||
     boolean(value any)|integer|boolean_to_int (value)|CASE WHEN value THEN 1 ELSE 0 END||
     bytea(value blob)|blob||||
-    date(value text)|text|date (value)|value||
+    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
     numeric(value any, precision integer, scale integer)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
     smallint(value integer)|integer|CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|value||
-    time(value text)|text|time (value)|value||
-    timestamp(value text)|text|datetime (value)|value||
+    time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE time (value) END|value||
+    timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE datetime (value) END|value||
     uuid(value text)|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|
     varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||
 }
@@ -335,15 +335,15 @@ expect {
     bigint(value integer)|integer||||
     boolean(value any)|integer|boolean_to_int (value)|CASE WHEN value THEN 1 ELSE 0 END||
     bytea(value blob)|blob||||
-    date(value text)|text|date (value)|value||
+    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
     numeric(value any, precision integer, scale integer)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
     smallint(value integer)|integer|CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|value||
     test_uint(value any)|text|test_uint_encode (value)|test_uint_decode (value)|0|'+' test_uint_add
-    time(value text)|text|time (value)|value||
-    timestamp(value text)|text|datetime (value)|value||
+    time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE time (value) END|value||
+    timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE datetime (value) END|value||
     uuid(value text)|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|
     varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||
 }
