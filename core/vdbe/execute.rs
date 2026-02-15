@@ -12290,7 +12290,22 @@ fn op_vacuum_into_inner(
                     unreachable!("sql column should be text (query has WHERE sql IS NOT NULL)");
                 };
                 let sql_str = sql.as_str();
-                let dest_stmt = dest_conn.prepare(sql_str)?;
+
+                // Internal tables (e.g. __turso_internal_types) have a reserved
+                // name prefix that translate_create_table rejects for user SQL.
+                // Temporarily mark the dest connection as nested during prepare()
+                // so the reserved-name check is bypassed at compile time. We must
+                // NOT keep it nested during step() because that would prevent
+                // sub-statements from upgrading to write transactions.
+                let is_internal = matches!(&row[1], Value::Text(n) if n.as_str().starts_with(crate::schema::TURSO_INTERNAL_PREFIX));
+                if is_internal {
+                    dest_conn.start_nested();
+                }
+                let dest_stmt = dest_conn.prepare(sql_str);
+                if is_internal {
+                    dest_conn.end_nested();
+                }
+                let dest_stmt = dest_stmt?;
                 vacuum_state.sub_state = OpVacuumIntoSubState::StepDestSchema {
                     dest_conn,
                     dest_schema_stmt: Box::new(dest_stmt),
@@ -12308,6 +12323,29 @@ fn op_vacuum_into_inner(
                     unreachable!("CREATE statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
+                    // After creating __turso_internal_types in the dest, load
+                    // custom type definitions from the source so that subsequent
+                    // CREATE TABLE statements for STRICT tables with custom type
+                    // columns can resolve those types.
+                    let row = &vacuum_state.schema_rows[idx];
+                    if matches!(&row[1], Value::Text(n) if n.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME)
+                    {
+                        let source_types: Vec<(String, std::sync::Arc<crate::schema::TypeDef>)> = {
+                            let source_schema = program.connection.schema.read();
+                            source_schema
+                                .type_registry
+                                .iter()
+                                .filter(|(_, td)| !td.is_builtin)
+                                .map(|(name, td)| (name.clone(), td.clone()))
+                                .collect()
+                        };
+                        dest_conn.with_schema_mut(|dest_schema| {
+                            for (name, td) in source_types {
+                                dest_schema.type_registry.insert(name, td);
+                            }
+                        });
+                    }
+
                     vacuum_state.sub_state = OpVacuumIntoSubState::PrepareDestSchema {
                         dest_conn,
                         idx: idx + 1,
@@ -12407,7 +12445,19 @@ fn op_vacuum_into_inner(
                         let insert_sql = format!(
                             "INSERT INTO \"{escaped_table_name}\" ({column_names}) VALUES ({placeholders})"
                         );
-                        let dest_insert_stmt = dest_conn.prepare(&insert_sql)?;
+
+                        // Internal tables need nested mode to bypass "may not
+                        // be modified" checks during prepare (compile time).
+                        let is_internal =
+                            table_name.starts_with(crate::schema::TURSO_INTERNAL_PREFIX);
+                        if is_internal {
+                            dest_conn.start_nested();
+                        }
+                        let dest_insert_stmt = dest_conn.prepare(&insert_sql);
+                        if is_internal {
+                            dest_conn.end_nested();
+                        }
+                        let dest_insert_stmt = dest_insert_stmt?;
 
                         vacuum_state.sub_state = OpVacuumIntoSubState::CopyRows {
                             dest_conn,

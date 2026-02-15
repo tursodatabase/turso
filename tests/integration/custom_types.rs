@@ -314,6 +314,59 @@ mod tests {
         );
     }
 
+    /// VACUUM INTO must work when custom types are defined. The destination
+    /// database must contain the __turso_internal_types table and its data,
+    /// and the vacuumed database must decode/encode correctly when reopened.
+    #[test]
+    fn test_vacuum_into_with_custom_types() {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("custom_types_vacuum_src.db");
+        let dest_path = path.with_file_name("custom_types_vacuum_dest.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_strict(true)
+            .with_encryption(true);
+
+        // Create source database with custom type and data
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+                .unwrap();
+            conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t1 VALUES (1, 42)").unwrap();
+            conn.execute("INSERT INTO t1 VALUES (2, 100)").unwrap();
+
+            // VACUUM INTO destination
+            conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        // Open the vacuumed database and verify
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+            let conn = db.connect_limbo();
+
+            // Data must be decoded correctly
+            let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM t1 ORDER BY id");
+            assert_eq!(
+                rows,
+                vec![(1, 42), (2, 100)],
+                "Vacuumed DB should return decoded values"
+            );
+
+            // Encoding must still work for new inserts
+            conn.execute("INSERT INTO t1 VALUES (3, 55)").unwrap();
+            let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM t1 WHERE id = 3");
+            assert_eq!(rows, vec![(3, 55)]);
+
+            conn.close().unwrap();
+        }
+    }
+
     /// Self-joins on custom type columns must return matching rows.
     ///
     /// The optimizer builds an ephemeral auto-index for the inner table.
