@@ -1232,7 +1232,7 @@ fn setup_backward_compat_v1(db: &TempDatabase, mode: &str) -> Arc<turso_core::Co
     conn.execute("INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v1')")
         .unwrap();
 
-    // Enable CDC — table already exists so InitCdcVersion opcode is NOT emitted
+    // Enable CDC — table already exists, InitCdcVersion reads version from table
     conn.execute(format!(
         "PRAGMA unstable_capture_data_changes_conn('{mode}')"
     ))
@@ -1503,6 +1503,52 @@ fn test_cdc_version_backward_compat_v1_full(db: TempDatabase) {
                 Value::Null,
             ]
         ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_preserves_old_version(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Simulate a database with a pre-existing CDC table at a fake old version
+    conn.execute(
+        "CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+    ).unwrap();
+    conn.execute(
+        "CREATE TABLE turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v0')",
+    ).unwrap();
+
+    // Enable CDC — should preserve the existing "v0" version, not overwrite with current
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // Version table should still have "v0"
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT table_name, version FROM turso_cdc_version",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("turso_cdc".to_string()),
+            Value::Text("v0".to_string()),
+        ]]
+    );
+
+    // PRAGMA GET should also report "v0"
+    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("full".to_string()),
+            Value::Text("turso_cdc".to_string()),
+            Value::Text("v0".to_string()),
+        ]]
     );
 }
 

@@ -1101,7 +1101,7 @@ mod tests {
                 let mut rows = Vec::new();
                 let mut stmt = conn3
                     .prepare(
-                        "SELECT * FROM sqlite_schema WHERE name != 'turso_cdc' AND type = 'table'",
+                        "SELECT * FROM sqlite_schema WHERE name NOT IN ('turso_cdc', 'turso_cdc_version') AND type = 'table'",
                     )
                     .unwrap();
                 while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
@@ -1127,7 +1127,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::from_i64(4),
+                            turso_core::Value::from_i64(6),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE t (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1136,7 +1136,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
-                            turso_core::Value::from_i64(6),
+                            turso_core::Value::from_i64(8),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE q (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1211,7 +1211,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::from_i64(4),
+                            turso_core::Value::from_i64(6),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE t (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1220,7 +1220,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("index")),
                             turso_core::Value::Text(turso_core::types::Text::new("t_idx")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::from_i64(6),
+                            turso_core::Value::from_i64(8),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE INDEX IF NOT EXISTS t_idx ON t (y)"
                             )),
@@ -1295,7 +1295,7 @@ mod tests {
                         turso_core::Value::Text(turso_core::types::Text::new("table")),
                         turso_core::Value::Text(turso_core::types::Text::new("t")),
                         turso_core::Value::Text(turso_core::types::Text::new("t")),
-                        turso_core::Value::from_i64(4),
+                        turso_core::Value::from_i64(6),
                         turso_core::Value::Text(turso_core::types::Text::new(
                             "CREATE TABLE t (x TEXT PRIMARY KEY, z)"
                         )),
@@ -1478,6 +1478,8 @@ mod tests {
                     vec![
                         "sqlite_sequence".to_string(),
                         "turso_cdc".to_string(),
+                        "turso_cdc_version".to_string(),
+                        "sqlite_autoindex_turso_cdc_version_1".to_string(),
                         "t".to_string(),
                         "sqlite_autoindex_t_1".to_string(),
                         "t_idx".to_string()
