@@ -15,6 +15,7 @@ use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
+use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
     ImmutableRecord, IndexInfo, SeekResult, Text,
@@ -55,7 +56,6 @@ use crate::{
     stats::StatAccum,
     translate::emitter::TransactionMode,
 };
-use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::{
     get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
     IOExt, MvCursor,
@@ -8347,8 +8347,7 @@ pub fn op_init_cdc_version(
     {
         let current = conn.get_capture_data_changes_info();
         if let Some(info) = current.as_ref() {
-            let opts =
-                CaptureDataChangesInfo::parse(cdc_mode, info.version.clone())?;
+            let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version.clone())?;
             state.pending_cdc_info = Some(opts);
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);

@@ -1151,11 +1151,9 @@ pub fn translate_drop_table(
         .get_table(crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME)
         .and_then(|t| t.btree())
     {
-        let ver_cursor_id =
-            program.alloc_cursor_id(CursorType::BTreeTable(version_table.clone()));
+        let ver_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(version_table.clone()));
         let ver_table_name_reg = program.alloc_register();
-        let dropped_name_reg =
-            program.emit_string8_new_reg(tbl_name.name.as_str().to_string());
+        let dropped_name_reg = program.emit_string8_new_reg(tbl_name.name.as_str().to_string());
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {

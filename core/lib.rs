@@ -1578,9 +1578,7 @@ impl CaptureDataChangesInfo {
     /// Returns the CDC schema version, defaulting to V1 for tables that
     /// predate version tracking (version field is None).
     pub fn version(&self) -> &str {
-        self.version
-            .as_deref()
-            .unwrap_or(TURSO_CDC_CURRENT_VERSION)
+        self.version.as_deref().unwrap_or(TURSO_CDC_CURRENT_VERSION)
     }
 }
 

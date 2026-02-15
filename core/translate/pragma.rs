@@ -4,8 +4,8 @@
 use crate::sync::Arc;
 use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, Expr, Literal};
 use turso_parser::ast::PragmaName;
+use turso_parser::ast::{self, Expr, Literal};
 
 use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
