@@ -1,11 +1,41 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
+
+/// Mutable lazy parameters that can be updated at runtime.
+/// These are stored separately from the immutable config to allow lazy initialization.
+/// This struct is shared between DatabaseSyncEngine and LazyDatabaseStorage.
+#[derive(Debug, Clone, Default)]
+pub struct LazyParams {
+    /// Remote URL for sync operations. Can be set lazily from None to Some.
+    pub remote_url: Option<String>,
+    /// Authorization token for HTTP requests. Can be changed at any time.
+    pub auth_token: Option<String>,
+    /// Encryption key for Turso Cloud (base64 encoded). Can be set lazily from None to Some.
+    pub remote_encryption_key: Option<String>,
+}
+
+impl LazyParams {
+    pub fn new(
+        remote_url: Option<String>,
+        auth_token: Option<String>,
+        remote_encryption_key: Option<String>,
+    ) -> Self {
+        Self {
+            remote_url,
+            auth_token,
+            remote_encryption_key,
+        }
+    }
+}
+
+/// Thread-safe wrapper for LazyParams that can be shared across components.
+pub type SharedLazyParams = Arc<RwLock<LazyParams>>;
 
 pub struct Coro<Ctx> {
     pub ctx: Mutex<Ctx>,

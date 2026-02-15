@@ -13,7 +13,7 @@ use crate::{
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::{pull_pages_v1, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE},
     errors,
-    types::{Coro, PartialSyncOpts},
+    types::{Coro, PartialSyncOpts, SharedLazyParams},
 };
 
 /// [PageStates] holds information about active operations with pages in the [LazyDatabaseStorage]
@@ -227,9 +227,11 @@ pub struct LazyDatabaseStorage<IO: SyncEngineIo> {
     server_revision: String,
     page_states: Arc<Mutex<PageStates>>,
     opts: PartialSyncOpts,
-    // optional remote_url from saved configuration section of metadata file
+    /// Shared lazy params containing remote_url and encryption_key that can be updated at runtime
+    lazy_params: Option<SharedLazyParams>,
+    /// Fallback remote_url from saved configuration section of metadata file (used if lazy_params is None)
     remote_url: Option<String>,
-    // optional encryption key (base64 encoded) for encrypted Turso Cloud databases
+    /// Fallback encryption key (base64 encoded) for encrypted Turso Cloud databases (used if lazy_params is None)
     remote_encryption_key: Option<String>,
 }
 
@@ -252,9 +254,54 @@ impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
             server_revision,
             opts,
             page_states: Arc::new(Mutex::new(PageStates::new())),
+            lazy_params: None,
             remote_url,
             remote_encryption_key,
         })
+    }
+
+    /// Create a new LazyDatabaseStorage with shared lazy params for runtime updates.
+    pub fn new_with_lazy_params(
+        clean_file: Arc<dyn File>,
+        dirty_file: Option<Arc<dyn File>>,
+        sync_engine_io: SyncEngineIoStats<IO>,
+        server_revision: String,
+        opts: PartialSyncOpts,
+        lazy_params: SharedLazyParams,
+    ) -> Result<Self, errors::Error> {
+        let clean_file_size = Arc::new(clean_file.size()?.into());
+        Ok(Self {
+            clean_file_size,
+            clean_file,
+            dirty_file,
+            sync_engine_io,
+            server_revision,
+            opts,
+            page_states: Arc::new(Mutex::new(PageStates::new())),
+            lazy_params: Some(lazy_params),
+            remote_url: None,
+            remote_encryption_key: None,
+        })
+    }
+
+    /// Get the current remote_url, preferring lazy_params if available.
+    #[allow(dead_code)]
+    fn get_remote_url(&self) -> Option<String> {
+        if let Some(lazy_params) = &self.lazy_params {
+            lazy_params.read().unwrap().remote_url.clone()
+        } else {
+            self.remote_url.clone()
+        }
+    }
+
+    /// Get the current encryption_key, preferring lazy_params if available.
+    #[allow(dead_code)]
+    fn get_encryption_key(&self) -> Option<String> {
+        if let Some(lazy_params) = &self.lazy_params {
+            lazy_params.read().unwrap().remote_encryption_key.clone()
+        } else {
+            self.remote_encryption_key.clone()
+        }
     }
 }
 
@@ -548,8 +595,9 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             is_hole
         );
         let mut generator = genawaiter::sync::Gen::new({
-            let remote_url = self.remote_url.clone();
-            let remote_encryption_key = self.remote_encryption_key.clone();
+            let lazy_params = self.lazy_params.clone();
+            let fallback_remote_url = self.remote_url.clone();
+            let fallback_encryption_key = self.remote_encryption_key.clone();
             let sync_engine_io = self.sync_engine_io.clone();
             let server_revision = self.server_revision.clone();
             let clean_file = self.clean_file.clone();
@@ -561,6 +609,16 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             move |coro| async move {
                 let coro = Coro::new((), coro);
                 let mut guard = PageStatesGuard::new(&page_states);
+                // Get current values from lazy_params or fallback
+                let (remote_url, remote_encryption_key) = if let Some(lazy_params) = &lazy_params {
+                    let params = lazy_params.read().unwrap();
+                    (
+                        params.remote_url.clone(),
+                        params.remote_encryption_key.clone(),
+                    )
+                } else {
+                    (fallback_remote_url, fallback_encryption_key)
+                };
                 let ctx = &SyncOperationCtx::new(
                     &coro,
                     &sync_engine_io,
