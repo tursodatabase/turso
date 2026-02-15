@@ -1601,3 +1601,72 @@ fn test_cdc_pragma_get_returns_version(db: TempDatabase) {
         ]]
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_pragma_idempotent(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Enable CDC
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // Insert a row — should produce CDC entries
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // Enable CDC again (idempotent — should not create extra CDC entries)
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // CDC count should not have changed (no self-capture)
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // Switch mode — should also be idempotent (no DDL, just mode change)
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // Verify mode actually changed
+    let info = conn.get_capture_data_changes_info();
+    let info = info.as_ref().expect("CDC should be enabled");
+    assert_eq!(info.mode, turso_core::CaptureDataChangesMode::Id);
+
+    // Insert another row — should still capture
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc");
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_helper_defaults_to_v1(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Simulate a pre-version-tracking database: CDC table exists but no version table
+    conn.execute(
+        "CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+    ).unwrap();
+
+    // Enable CDC — InitCdcVersion will create version table and insert current version
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // version() helper should return the current version
+    let info = conn.get_capture_data_changes_info();
+    let info = info.as_ref().expect("CDC should be enabled");
+    assert_eq!(info.version(), TURSO_CDC_CURRENT_VERSION);
+
+    // Now test with None version directly via parse (simulates old code path)
+    let parsed = turso_core::CaptureDataChangesInfo::parse("full", None)
+        .unwrap()
+        .unwrap();
+    // version field is None, but version() should return V1
+    assert_eq!(parsed.version, None);
+    assert_eq!(parsed.version(), TURSO_CDC_CURRENT_VERSION);
+}
