@@ -256,4 +256,37 @@ mod tests {
         println!("d1 vs d2: {d1} vs {d2}");
         (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-6
     }
+
+    /// Float8 optimized cosine distance matches dequantized Float32 cosine distance.
+    #[quickcheck]
+    fn prop_vector_distance_cos_f8_vs_dequantized(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
+        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
+        let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
+        let d_f8 = vector_distance_cos(&v1_f8, &v2_f8).unwrap();
+        let v1_deq = vector_convert(v1_f8, VectorType::Float32Dense).unwrap();
+        let v2_deq = vector_convert(v2_f8, VectorType::Float32Dense).unwrap();
+        let d_deq = vector_distance_cos(&v1_deq, &v2_deq).unwrap();
+        (d_f8.is_nan() && d_deq.is_nan()) || (d_f8 - d_deq).abs() < 1e-4
+    }
+
+    /// Float1Bit cosine distance (hamming) matches dot-product relationship:
+    /// hamming = (dims + dot_distance) / 2
+    #[quickcheck]
+    fn prop_vector_distance_cos_1bit_dot_relationship(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        use crate::vector::operations::distance_dot::vector_distance_dot;
+        let v1 = vector_convert(v1.into(), VectorType::Float1Bit).unwrap();
+        let v2 = vector_convert(v2.into(), VectorType::Float1Bit).unwrap();
+        let cos = vector_distance_cos(&v1, &v2).unwrap();
+        let dot = vector_distance_dot(&v1, &v2).unwrap();
+        // hamming = cos, dot = -(dims - 2*hamming), so cos = (dims + dot) / 2
+        (cos - (100.0 + dot) / 2.0).abs() < 1e-10
+    }
 }

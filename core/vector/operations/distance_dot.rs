@@ -224,4 +224,36 @@ mod tests {
         let d_simd = vector_f64_distance_dot_simsimd(v1.as_f64_slice(), v2.as_f64_slice());
         (d_rust.is_nan() && d_simd.is_nan()) || (d_rust - d_simd).abs() < 1e-6
     }
+
+    /// Float8 optimized dot distance matches dequantized Float32 dot distance.
+    #[quickcheck]
+    fn prop_vector_distance_dot_f8_vs_dequantized(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
+        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
+        let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
+        let d_f8 = vector_distance_dot(&v1_f8, &v2_f8).unwrap();
+        let v1_deq = vector_convert(v1_f8, VectorType::Float32Dense).unwrap();
+        let v2_deq = vector_convert(v2_f8, VectorType::Float32Dense).unwrap();
+        let d_deq = vector_distance_dot(&v1_deq, &v2_deq).unwrap();
+        (d_f8.is_nan() && d_deq.is_nan()) || (d_f8 - d_deq).abs() < 1e-3
+    }
+
+    /// Float1Bit dot distance matches dequantized ±1 Float32 dot distance.
+    #[quickcheck]
+    fn prop_vector_distance_dot_1bit_vs_dequantized(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        let v1 = vector_convert(v1.into(), VectorType::Float1Bit).unwrap();
+        let v2 = vector_convert(v2.into(), VectorType::Float1Bit).unwrap();
+        let d_1bit = vector_distance_dot(&v1, &v2).unwrap();
+        let v1_f32 = vector_convert(v1, VectorType::Float32Dense).unwrap();
+        let v2_f32 = vector_convert(v2, VectorType::Float32Dense).unwrap();
+        let d_f32 = vector_distance_dot(&v1_f32, &v2_f32).unwrap();
+        (d_1bit - d_f32).abs() < 1e-6
+    }
 }
