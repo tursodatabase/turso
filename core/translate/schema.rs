@@ -2,7 +2,7 @@ use crate::sync::Arc;
 
 use crate::ast;
 use crate::ext::VTabImpl;
-use crate::function::Func;
+use crate::function::{Deterministic, Func};
 use crate::schema::{
     create_table, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
     RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
@@ -1679,6 +1679,16 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Resu
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!(
                             "aggregate functions prohibited in {kind} expressions: {}",
+                            name.as_str()
+                        );
+                    }
+                    // Reject known non-deterministic built-in functions.
+                    // External functions are excluded from this check since
+                    // they default to non-deterministic but may actually be
+                    // deterministic (e.g. uuid_blob).
+                    if !matches!(func, Func::External(_)) && !func.is_deterministic() {
+                        bail_parse_error!(
+                            "non-deterministic functions prohibited in {kind} expressions: {}",
                             name.as_str()
                         );
                     }

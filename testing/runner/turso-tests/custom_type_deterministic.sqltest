@@ -1,7 +1,6 @@
 @database :memory:
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test reject-nondeterministic-encode-random {
     CREATE TYPE rand_salt BASE integer
         ENCODE value + abs(random() % 1000000)
@@ -12,7 +11,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test reject-nondeterministic-encode-changes {
     CREATE TYPE bad BASE integer
         ENCODE value + changes()
@@ -23,7 +21,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test reject-nondeterministic-decode {
     CREATE TYPE bad BASE integer
         ENCODE value
@@ -34,7 +31,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test accept-deterministic-encode {
     CREATE TYPE good BASE integer
         ENCODE value * 100 + abs(value)
@@ -48,7 +44,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test reject-nondeterministic-last-insert-rowid {
     CREATE TYPE bad BASE integer
         ENCODE value + last_insert_rowid()
