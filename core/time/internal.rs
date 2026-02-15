@@ -574,3 +574,86 @@ impl Deref for Duration {
         &self.inner
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for issue #5251: time_date() panics on large integer arguments
+    /// due to multiplication overflow in year-to-months conversion.
+    /// Should return CreationError instead of panicking.
+    #[test]
+    fn test_time_date_large_year_does_not_overflow() {
+        let offset = FixedOffset::east_opt(0).unwrap();
+
+        // i32::MAX year should fail gracefully (checked multiplication overflow)
+        let result = Time::time_date(i32::MAX, 1, 1, 0, 0, 0, 0, offset);
+        assert!(
+            result.is_err(),
+            "Expected error for i32::MAX year, got {:?}",
+            result
+        );
+
+        // i32::MIN year should fail gracefully (checked subtraction overflow)
+        let result = Time::time_date(i32::MIN, 1, 1, 0, 0, 0, 0, offset);
+        assert!(
+            result.is_err(),
+            "Expected error for i32::MIN year, got {:?}",
+            result
+        );
+
+        // Large but not extreme years that would overflow when multiplied by 12
+        // Year 200,000,000 * 12 = 2,400,000,000 which overflows u32::MAX (4,294,967,295)
+        let result = Time::time_date(200_000_000, 1, 1, 0, 0, 0, 0, offset);
+        assert!(
+            result.is_err(),
+            "Expected error for year 200,000,000, got {:?}",
+            result
+        );
+
+        // Negative large year
+        let result = Time::time_date(-200_000_000, 1, 1, 0, 0, 0, 0, offset);
+        assert!(
+            result.is_err(),
+            "Expected error for year -200,000,000, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_time_date_normal_years_work() {
+        let offset = FixedOffset::east_opt(0).unwrap();
+
+        // Normal years should still work
+        let result = Time::time_date(2024, 1, 15, 12, 30, 45, 0, offset);
+        assert!(
+            result.is_ok(),
+            "Expected success for year 2024, got {:?}",
+            result
+        );
+
+        // Year 0 should work
+        let result = Time::time_date(0, 1, 1, 0, 0, 0, 0, offset);
+        assert!(
+            result.is_ok(),
+            "Expected success for year 0, got {:?}",
+            result
+        );
+
+        // Small negative year should work
+        let result = Time::time_date(-1, 1, 1, 0, 0, 0, 0, offset);
+        assert!(
+            result.is_ok(),
+            "Expected success for year -1, got {:?}",
+            result
+        );
+
+        // Reasonably large year should work (within chrono's limits)
+        let result = Time::time_date(9999, 12, 31, 23, 59, 59, 0, offset);
+        assert!(
+            result.is_ok(),
+            "Expected success for year 9999, got {:?}",
+            result
+        );
+    }
+}
