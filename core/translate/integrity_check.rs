@@ -84,6 +84,19 @@ fn translate_integrity_check_impl(
                     if index.root_page > 0 {
                         root_pages.push(index.root_page);
 
+                        // Expression indexes (e.g., CREATE INDEX idx ON t(a + 1)) use
+                        // pos_in_table = usize::MAX as a sentinel to indicate they aren't
+                        // direct column references. Row-index consistency validation
+                        // requires direct column access, so we skip expression indexes.
+                        // Phase 1 (B-tree structure checks) still validates these indexes.
+                        // TODO: Evaluate expression index expressions to enable row-index
+                        // consistency checks for expression indexes as well.
+                        let has_expression_column =
+                            index.columns.iter().any(|c| c.pos_in_table == usize::MAX);
+                        if has_expression_column {
+                            continue;
+                        }
+
                         let column_positions: Vec<usize> =
                             index.columns.iter().map(|c| c.pos_in_table).collect();
 
