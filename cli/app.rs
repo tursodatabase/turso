@@ -1656,6 +1656,9 @@ impl Limbo {
         // FIXME: At this point, SQLite executes the following:
         // sqlite3_exec(p->db, "SAVEPOINT dump; PRAGMA writable_schema=ON", 0, 0, 0);
         // we don't have those yet, so don't.
+        // Emit CREATE TYPE statements from __turso_internal_types before table DDL,
+        // so that tables referencing custom types can be restored correctly.
+        Self::dump_custom_types(&conn, out)?;
         let q_tables = r#"
         SELECT name, sql
         FROM sqlite_schema
@@ -1665,8 +1668,8 @@ impl Limbo {
         if let Some(mut rows) = conn.query(q_tables)? {
             rows.run_with_row_callback(|row| {
                 let name: &str = row.get::<&str>(0)?;
-                // Skip sqlite_sequence table
-                if name == "sqlite_sequence" {
+                // Skip sqlite_sequence and internal types metadata table
+                if name == "sqlite_sequence" || name == turso_core::schema::TURSO_TYPES_TABLE_NAME {
                     return Ok(());
                 }
                 let ddl: &str = row.get::<&str>(1)?;
@@ -1734,6 +1737,36 @@ impl Limbo {
                     Self::write_sql_value_from_value(out, v).map_err(|e| io_error(e, "write"))?;
                 }
                 out.write_all(b");\n").map_err(|e| io_error(e, "write"))?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dump_custom_types<W: Write>(conn: &Arc<Connection>, out: &mut W) -> anyhow::Result<()> {
+        // Check if the internal types table exists before querying it.
+        let check = format!(
+            "SELECT 1 FROM sqlite_schema WHERE name='{}' AND type='table'",
+            turso_core::schema::TURSO_TYPES_TABLE_NAME
+        );
+        let mut has_types = false;
+        if let Some(mut rows) = conn.query(&check)? {
+            rows.run_with_row_callback(|_| {
+                has_types = true;
+                Ok(())
+            })?;
+        }
+        if !has_types {
+            return Ok(());
+        }
+        let q = format!(
+            "SELECT sql FROM {} ORDER BY rowid",
+            turso_core::schema::TURSO_TYPES_TABLE_NAME
+        );
+        if let Some(mut rows) = conn.query(&q)? {
+            rows.run_with_row_callback(|row| {
+                let sql: &str = row.get::<&str>(0)?;
+                writeln!(out, "{sql};")?;
                 Ok(())
             })?;
         }
