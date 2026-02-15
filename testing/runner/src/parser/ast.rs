@@ -115,8 +115,8 @@ pub struct TestFile {
     pub tests: Vec<TestCase>,
     /// Snapshot test cases (for EXPLAIN output)
     pub snapshots: Vec<SnapshotCase>,
-    /// Global skip directive that applies to all tests in the file
-    pub global_skip: Option<Skip>,
+    /// Global skip directives that apply to all tests in the file
+    pub global_skip: Vec<Skip>,
     /// Global capability requirements that apply to all tests in the file
     pub global_requires: Vec<Requirement>,
 }
@@ -136,7 +136,7 @@ pub struct CaseModifiers {
     /// Setup references with their spans
     pub setups: Vec<SetupRef>,
     /// If set, skip this case (unconditionally or conditionally)
-    pub skip: Option<Skip>,
+    pub skip: Vec<Skip>,
     /// If set, only run this case on the specified backend
     pub backend: Option<Backend>,
     /// Required capabilities for this case
