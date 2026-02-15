@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
 
@@ -1219,8 +1221,9 @@ fn test_cdc_version_not_created_when_exists(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
-fn test_cdc_version_backward_compat_v1(db: TempDatabase) {
+/// Helper: set up a database with pre-existing v1 CDC table and version table,
+/// then enable CDC with the given mode and perform insert/update/delete operations.
+fn setup_backward_compat_v1(db: &TempDatabase, mode: &str) -> Arc<turso_core::Connection> {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -1240,7 +1243,7 @@ fn test_cdc_version_backward_compat_v1(db: TempDatabase) {
     .unwrap();
 
     // Enable CDC — table already exists so InitCdcVersion opcode is NOT emitted
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute(format!("PRAGMA unstable_capture_data_changes_conn('{mode}')"))
         .unwrap();
 
     // Verify version table is unchanged
@@ -1256,12 +1259,19 @@ fn test_cdc_version_backward_compat_v1(db: TempDatabase) {
         ]]
     );
 
-    // Verify changes are captured correctly with insert, update, delete
-    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+    // Perform insert, update, delete
+    conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)")
         .unwrap();
-    conn.execute("UPDATE t SET y = 100 WHERE x = 1").unwrap();
-    conn.execute("DELETE FROM t WHERE x = 2").unwrap();
+    conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 3").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 1").unwrap();
 
+    conn
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_backward_compat_v1_id(db: TempDatabase) {
+    let conn = setup_backward_compat_v1(&db, "id");
     let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
     assert_eq!(
         rows,
@@ -1281,7 +1291,7 @@ fn test_cdc_version_backward_compat_v1(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("t".to_string()),
-                Value::Integer(2),
+                Value::Integer(3),
                 Value::Null,
                 Value::Null,
                 Value::Null,
@@ -1301,11 +1311,209 @@ fn test_cdc_version_backward_compat_v1(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(-1),
                 Value::Text("t".to_string()),
-                Value::Integer(2),
+                Value::Integer(3),
                 Value::Null,
                 Value::Null,
                 Value::Null,
             ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_backward_compat_v1_before(db: TempDatabase) {
+    let conn = setup_backward_compat_v1(&db, "before");
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
+                Value::Null,
+                Value::Null,
+            ]
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_backward_compat_v1_after(db: TempDatabase) {
+    let conn = setup_backward_compat_v1(&db, "after");
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_backward_compat_v1_full(db: TempDatabase) {
+    let conn = setup_backward_compat_v1(&db, "full");
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
+                Value::Blob(record([
+                    Value::Integer(0),
+                    Value::Integer(1),
+                    Value::Null,
+                    Value::Integer(3)
+                ])),
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
+                Value::Null,
+                Value::Null,
+            ]
         ]
     );
 }
