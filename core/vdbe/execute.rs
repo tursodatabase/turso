@@ -8324,7 +8324,7 @@ pub fn op_init_cdc_version(
 
     // "off" — just disable CDC, no version table operations needed
     if CaptureDataChangesInfo::parse(cdc_mode, None)?.is_none() {
-        conn.set_capture_data_changes_info(None);
+        state.pending_cdc_info = Some(None);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -8381,9 +8381,11 @@ pub fn op_init_cdc_version(
         }
     };
 
-    // Enable CDC after version table operations so they are not captured
+    // Defer enabling CDC until the program completes successfully (Halt).
+    // This ensures that if the transaction rolls back, the connection's
+    // CDC state remains unchanged.
     let opts = CaptureDataChangesInfo::parse(cdc_mode, Some(actual_version))?;
-    conn.set_capture_data_changes_info(opts);
+    state.pending_cdc_info = Some(opts);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

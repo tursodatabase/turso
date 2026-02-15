@@ -395,6 +395,10 @@ pub struct ProgramState {
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
     pub(crate) pending_fail_error: Option<LimboError>,
+    /// Pending CDC info to apply after the program completes successfully.
+    /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
+    /// transaction rolls back, the connection's CDC state remains unchanged.
+    pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
 }
 
 impl std::fmt::Debug for Program {
@@ -471,6 +475,7 @@ impl ProgramState {
             n_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
+            pending_cdc_info: None,
         }
     }
 
@@ -1200,6 +1205,11 @@ impl Program {
                     // Instruction completed execution
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                     state.auto_txn_cleanup = TxnCleanup::None;
+                    // Apply deferred connection state changes that should only
+                    // take effect after the transaction commits successfully.
+                    if let Some(cdc_info) = state.pending_cdc_info.take() {
+                        self.connection.set_capture_data_changes_info(cdc_info);
+                    }
                     return Ok(StepResult::Done);
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {

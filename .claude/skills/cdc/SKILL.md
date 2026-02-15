@@ -161,10 +161,13 @@ Used by `emit_cdc_insns()` to determine `change_type` value:
 ### 5. InitCdcVersion Opcode — `core/vdbe/execute.rs`
 
 Executed at runtime when CDC is enabled (always emitted by PRAGMA SET):
-1. Creates `turso_cdc_version` table if it doesn't exist
-2. `INSERT OR IGNORE` version row — preserves existing version, doesn't overwrite
-3. Reads back actual version from the table
-4. Calls `CaptureDataChangesInfo::parse(cdc_mode, Some(actual_version))` to enable CDC
+1. For "off": stores `None` in `state.pending_cdc_info`
+2. Creates `turso_cdc_version` table if it doesn't exist
+3. `INSERT OR IGNORE` version row — preserves existing version, doesn't overwrite
+4. Reads back actual version from the table
+5. Stores computed `CaptureDataChangesInfo` in `state.pending_cdc_info`
+
+The connection's CDC state is **not applied in the opcode**. Instead, `pending_cdc_info` is applied at Halt (in `normal_step`) only after the program completes successfully. This ensures atomicity: if the transaction rolls back (e.g. table creation fails), the connection's CDC state remains unchanged.
 
 A dedicated opcode is needed because the PRAGMA SET plan is compiled against the current schema, but creating `turso_cdc_version` is a schema change — you can't compile DML against a table that doesn't exist yet in the same plan.
 
@@ -276,3 +279,4 @@ Run: `cargo test -- test_cdc` (integration) or `cargo test -p turso_sync_engine 
 5. **Binary record format.** Before/after/updates columns use SQLite's MakeRecord format (same as B-tree payload).
 6. **Transaction-aware.** CDC writes happen within the same transaction as the DML, so rollback naturally discards CDC entries.
 7. **Version tracking.** CDC schema version is recorded in `turso_cdc_version` table and carried in `CaptureDataChangesInfo.version` for future schema evolution.
+8. **Atomic PRAGMA.** Connection CDC state is deferred via `pending_cdc_info` in `ProgramState` and applied only at Halt. If the PRAGMA's disk writes fail and the transaction rolls back, the connection state stays unchanged.
