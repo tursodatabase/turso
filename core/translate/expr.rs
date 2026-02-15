@@ -4279,10 +4279,17 @@ pub fn bind_and_rewrite_expr<'a>(
                     // User-defined columns take precedence over rowid aliases
                     // (oid, rowid, _rowid_). Only fall back to parse_row_id()
                     // when no matching user column exists.
+                    // Note: Only BTree tables have rowid; derived tables (FromClauseSubquery)
+                    // don't have a rowid.
                     let Some(col_idx) = col_idx else {
-                        if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
-                            *expr = row_id_expr;
-                            return Ok(WalkControl::Continue);
+                        let is_btree_table = matches!(tbl, Table::BTree(_));
+                        if is_btree_table {
+                            if let Some(row_id_expr) =
+                                parse_row_id(&normalized_id, tbl_id, || false)?
+                            {
+                                *expr = row_id_expr;
+                                return Ok(WalkControl::Continue);
+                            }
                         }
                         crate::bail_parse_error!("no such column: {}", normalized_id);
                     };
