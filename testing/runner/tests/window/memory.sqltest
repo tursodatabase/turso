@@ -28,3 +28,17 @@ expect {
     banana|3
 }
 
+test window-in-exists-subquery-referencing-outer-column {
+    CREATE TABLE t1 (a);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    SELECT * FROM (SELECT a FROM t1) as subq
+    WHERE EXISTS (
+      SELECT count(1) OVER (ORDER BY subq.a) FROM t1
+    );
+}
+expect {
+    1
+    2
+    3
+}
+
