@@ -1,0 +1,32 @@
+@database :memory:
+
+test limit-i64-min-no-panic {
+    SELECT 1 LIMIT -9223372036854775808;
+}
+expect {
+    1
+}
+
+test limit-negative-no-limit {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT x FROM t LIMIT -1;
+}
+expect {
+    1
+    2
+    3
+}
+
+test limit-zero {
+    SELECT 1 LIMIT 0;
+}
+expect {
+}
+
+test limit-one {
+    SELECT 1 UNION ALL SELECT 2 LIMIT 1;
+}
+expect {
+    1
+}
