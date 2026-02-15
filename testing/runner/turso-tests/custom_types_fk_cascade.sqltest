@@ -9,7 +9,6 @@
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cascade-update-basic {
     PRAGMA foreign_keys = ON;
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -28,7 +27,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cascade-update-multiple-children {
     PRAGMA foreign_keys = ON;
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -55,7 +53,6 @@ expect {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cascade-delete-basic {
     PRAGMA foreign_keys = ON;
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -74,7 +71,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cascade-delete-multiple-children {
     PRAGMA foreign_keys = ON;
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -98,7 +94,6 @@ expect {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test set-null-delete {
     PRAGMA foreign_keys = ON;
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -121,7 +116,6 @@ expect {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cascade-update-then-delete {
     PRAGMA foreign_keys = ON;
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -141,7 +135,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cascade-update-then-delete-part2 {
     PRAGMA foreign_keys = ON;
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -166,7 +159,6 @@ expect {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cascade-text-based-type {
     PRAGMA foreign_keys = ON;
     CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
