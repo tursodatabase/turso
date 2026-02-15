@@ -102,3 +102,12 @@ expect {
     1|null||
 }
 
+test case-when-aggregate-returns-column-value {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    INSERT INTO t1 VALUES (42, 'hello');
+    SELECT CASE WHEN SUM(1) THEN a ELSE b END FROM t1;
+}
+expect {
+    42
+}
+
