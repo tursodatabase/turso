@@ -139,6 +139,7 @@ pub fn emit_columns_to_destination(
         QueryDestination::EphemeralIndex {
             cursor_id: index_cursor_id,
             index: dedupe_index,
+            affinity_str,
             is_delete,
         } => {
             if *is_delete {
@@ -211,7 +212,7 @@ pub fn emit_columns_to_destination(
                     count: to_u16(record_count),
                     dest_reg: to_u16(record_reg),
                     index_name: Some(dedupe_index.name.clone()),
-                    affinity_str: None,
+                    affinity_str: affinity_str.as_ref().map(|s| (**s).clone()),
                 });
                 program.emit_insn(Insn::IdxInsert {
                     cursor_id: *index_cursor_id,
