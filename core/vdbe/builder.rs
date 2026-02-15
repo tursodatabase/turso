@@ -729,6 +729,7 @@ impl ProgramBuilder {
             } else {
                 String::new()
             },
+            on_error: None,
         });
     }
 
@@ -740,6 +741,7 @@ impl ProgramBuilder {
         self.emit_insn(Insn::Halt {
             err_code,
             description,
+            on_error: None,
         });
     }
 
@@ -1114,6 +1116,9 @@ impl ProgramBuilder {
                 Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
+                Insn::Program {
+                    ignore_jump_target, ..
+                } => resolve(ignore_jump_target, "Program")?,
                 _ => {}
             }
         }
@@ -1296,6 +1301,7 @@ impl ProgramBuilder {
             self.emit_insn(Insn::Halt {
                 err_code: 0,
                 description: description.to_string(),
+                on_error: None,
             });
             return;
         }

@@ -235,6 +235,7 @@ pub fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
     program.emit_insn(Insn::Halt {
         err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
         description: "FOREIGN KEY constraint failed".to_string(),
+        on_error: None,
     });
     Ok(())
 }
@@ -1268,10 +1269,15 @@ fn emit_fk_action_subprogram(
         connection.pager.load().clone(),
         QueryMode::Normal,
     );
+    // FK action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
+    // is a no-op that resolves to the next instruction (just falls through).
+    let ignore_jump_target = program.allocate_label();
     program.emit_insn(Insn::Program {
         params,
         program: Arc::new(RwLock::new(turso_stmt)),
+        ignore_jump_target,
     });
+    program.preassign_label_to_next_insn(ignore_jump_target);
 
     Ok(())
 }
