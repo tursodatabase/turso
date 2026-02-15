@@ -2020,13 +2020,24 @@ pub fn halt(
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         vtab_commit_all(&program.connection)?;
         index_method_pre_commit_all(state, pager)?;
-        program
+        let result = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
-            .map(Into::into)
+            .map(Into::into);
+        // Apply deferred CDC state after successful commit
+        if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+            if let Some(cdc_info) = state.pending_cdc_info.take() {
+                program.connection.set_capture_data_changes_info(cdc_info);
+            }
+        }
+        result
     } else {
         // Even if deferred violations are present, the statement subtransaction completes successfully when
         // it is part of an interactive transaction.
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+        // Apply deferred CDC state after successful statement completion
+        if let Some(cdc_info) = state.pending_cdc_info.take() {
+            program.connection.set_capture_data_changes_info(cdc_info);
+        }
         Ok(InsnFunctionStepResult::Done)
     }
 }
@@ -8329,7 +8340,22 @@ pub fn op_init_cdc_version(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    // Step 1: Create version table if needed
+    // Step 1: Create CDC table if needed
+    {
+        conn.start_nested();
+        let mut stmt = conn.prepare(format!(
+            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+        ))?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        let res = stmt.run_ignore_rows();
+        conn.end_nested();
+        res?;
+    }
+
+    // Step 2: Create version table if needed
     {
         conn.start_nested();
         let mut stmt = conn.prepare(
@@ -8344,7 +8370,7 @@ pub fn op_init_cdc_version(
         res?;
     }
 
-    // Step 2: Insert version row only if one doesn't already exist.
+    // Step 3: Insert version row only if one doesn't already exist.
     // If the table was previously initialized with an older version, we must
     // keep that version (the CDC table schema hasn't been migrated).
     {
@@ -8361,7 +8387,7 @@ pub fn op_init_cdc_version(
         res?;
     }
 
-    // Step 3: Read back the actual version from the table (may differ from
+    // Step 4: Read back the actual version from the table (may differ from
     // `version` if the row already existed with an older version).
     let actual_version = {
         conn.start_nested();

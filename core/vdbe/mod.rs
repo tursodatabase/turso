@@ -1205,11 +1205,6 @@ impl Program {
                     // Instruction completed execution
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                     state.auto_txn_cleanup = TxnCleanup::None;
-                    // Apply deferred connection state changes that should only
-                    // take effect after the transaction commits successfully.
-                    if let Some(cdc_info) = state.pending_cdc_info.take() {
-                        self.connection.set_capture_data_changes_info(cdc_info);
-                    }
                     return Ok(StepResult::Done);
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {

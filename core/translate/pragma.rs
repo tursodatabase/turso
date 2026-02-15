@@ -4,8 +4,8 @@
 use crate::sync::Arc;
 use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
-use turso_parser::ast::{PragmaName, QualifiedName};
+use turso_parser::ast::{self, Expr, Literal};
+use turso_parser::ast::PragmaName;
 
 use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
@@ -19,7 +19,6 @@ use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
-use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
@@ -351,31 +350,10 @@ fn update_pragma(
             let value = parse_string(&value)?;
             let opts =
                 CaptureDataChangesInfo::parse(&value, Some(TURSO_CDC_CURRENT_VERSION.to_string()))?;
-            if let Some(info) = &opts {
-                program = translate_create_table(
-                    QualifiedName {
-                        db_name: None,
-                        name: ast::Name::exact(info.table.to_string()),
-                        alias: None,
-                    },
-                    resolver,
-                    false,
-                    true, // if_not_exists
-                    ast::CreateTableBody::ColumnsAndConstraints {
-                        columns: turso_cdc_table_columns(),
-                        constraints: vec![],
-                        options: ast::TableOptions::empty(),
-                    },
-                    program,
-                    &connection,
-                )?;
-            }
-            // InitCdcVersion handles both enable and disable:
-            // - For enable: creates version table, records version (INSERT OR
-            //   IGNORE), reads back actual version, enables CDC
-            // - For disable ("off"): just sets CDC to None on connection
-            // Always deferred to execution time so version table operations
-            // are not captured by CDC.
+            // InitCdcVersion handles everything at execution time:
+            // - For enable: creates CDC table + version table, records version,
+            //   reads back actual version, defers CDC state to Halt
+            // - For disable ("off"): defers CDC=None to Halt
             let cdc_table_name = opts
                 .as_ref()
                 .map(|i| i.table.to_string())
@@ -1338,78 +1316,6 @@ pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
 #[allow(dead_code)]
 pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
 pub const TURSO_CDC_CURRENT_VERSION: &str = "v1";
-fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
-    vec![
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("change_id".to_string()),
-            col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-            }),
-            constraints: vec![ast::NamedColumnConstraint {
-                name: None,
-                constraint: ast::ColumnConstraint::PrimaryKey {
-                    order: None,
-                    conflict_clause: None,
-                    auto_increment: true,
-                },
-            }],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("change_time".to_string()),
-            col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("change_type".to_string()),
-            col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("table_name".to_string()),
-            col_type: Some(ast::Type {
-                name: "TEXT".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("id".to_string()),
-            col_type: None,
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("before".to_string()),
-            col_type: Some(ast::Type {
-                name: "BLOB".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("after".to_string()),
-            col_type: Some(ast::Type {
-                name: "BLOB".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("updates".to_string()),
-            col_type: Some(ast::Type {
-                name: "BLOB".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-    ]
-}
 
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
