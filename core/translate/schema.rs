@@ -1705,6 +1705,17 @@ pub fn translate_create_type(
 ) -> Result<ProgramBuilder> {
     let normalized_name = normalize_ident(type_name);
 
+    // Reject names that shadow SQLite base types — these are not in the
+    // type_registry but are handled by the column type system. Allowing
+    // them would create confusion and undropable types.
+    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+        _ => false,
+    });
+    if is_base_type {
+        bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
+    }
+
     // Check if type already exists
     if resolver
         .schema
