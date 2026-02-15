@@ -216,6 +216,38 @@ INSERT INTO t1 VALUES ('invalid-uuid', 'bad');
 -- Error: NOT NULL constraint failed (uuid_blob returned NULL)
 ```
 
+## CHECK Constraints
+
+In STRICT tables, CHECK constraint comparisons are type-checked at table creation time. A custom type column cannot be directly compared to a raw literal — the types must match. Use `CAST` to convert literals to the custom type:
+
+```sql
+-- ERROR: type mismatch in CHECK constraint (cents vs INTEGER)
+CREATE TABLE t1(amount cents CHECK(amount < 50)) STRICT;
+
+-- OK: CAST converts the literal to cents, both sides have the same type
+CREATE TABLE t1(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
+```
+
+This rule applies to all comparisons in STRICT tables, not just custom types:
+
+```sql
+-- ERROR: type mismatch (INTEGER vs TEXT)
+CREATE TABLE t1(age INTEGER CHECK(age < 'old')) STRICT;
+
+-- OK: same types
+CREATE TABLE t1(age INTEGER CHECK(age >= 18)) STRICT;
+```
+
+Function calls in CHECK expressions also require CAST, because the return type cannot be determined at table creation time:
+
+```sql
+-- ERROR: cannot determine return type of length()
+CREATE TABLE t1(name TEXT CHECK(length(name) < 10)) STRICT;
+
+-- OK: CAST makes the type explicit
+CREATE TABLE t1(name TEXT CHECK(CAST(length(name) AS INTEGER) < 10)) STRICT;
+```
+
 ## NULL Handling
 
 NULL values bypass encoding and decoding entirely:

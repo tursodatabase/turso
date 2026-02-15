@@ -109,6 +109,348 @@ pub(crate) fn validate_check_expr(
     Ok(())
 }
 
+/// Resolved type of an expression node for strict type checking of CHECK constraints.
+/// In STRICT tables, every comparison operand must have a determinable, compatible type.
+/// If a type cannot be determined (e.g. function calls), the user must use an explicit CAST.
+#[derive(Debug, Clone, PartialEq)]
+enum CheckExprType {
+    Integer,
+    Real,
+    Text,
+    Blob,
+    Any,
+    Null,
+    CustomType(String),
+}
+
+impl CheckExprType {
+    fn is_numeric(&self) -> bool {
+        matches!(self, Self::Integer | Self::Real)
+    }
+
+    fn is_compatible_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, _) | (_, Self::Null) => true,
+            (Self::Any, _) | (_, Self::Any) => true,
+            (a, b) if a == b => true,
+            (a, b) if a.is_numeric() && b.is_numeric() => true,
+            _ => false,
+        }
+    }
+
+    fn display_name(&self) -> &str {
+        match self {
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+            Self::Any => "ANY",
+            Self::Null => "NULL",
+            Self::CustomType(name) => name.as_str(),
+        }
+    }
+}
+
+/// Resolve the type of an expression node in a CHECK constraint.
+/// Returns an error if the type cannot be determined — the user must use CAST.
+fn resolve_check_expr_type(
+    expr: &ast::Expr,
+    columns: &[&ast::ColumnDefinition],
+    resolver: &Resolver,
+) -> Result<CheckExprType> {
+    use ast::{Literal, Operator, UnaryOperator};
+    match expr {
+        ast::Expr::Id(name) | ast::Expr::Name(name) => {
+            let n = normalize_ident(name.as_str());
+            // rowid/oid/_rowid_ are INTEGER
+            if ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&n)) {
+                return Ok(CheckExprType::Integer);
+            }
+            for col in columns {
+                if normalize_ident(col.col_name.as_str()) == n {
+                    return resolve_column_type(col, resolver);
+                }
+            }
+            bail_parse_error!("no such column: {}", name.as_str());
+        }
+        ast::Expr::Qualified(_tbl, col) => {
+            let cn = normalize_ident(col.as_str());
+            if ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&cn)) {
+                return Ok(CheckExprType::Integer);
+            }
+            for c in columns {
+                if normalize_ident(c.col_name.as_str()) == cn {
+                    return resolve_column_type(c, resolver);
+                }
+            }
+            bail_parse_error!("no such column: {}", col.as_str());
+        }
+        ast::Expr::Literal(lit) => match lit {
+            Literal::Numeric(s) => {
+                if s.contains('.') || s.contains('e') || s.contains('E') {
+                    Ok(CheckExprType::Real)
+                } else {
+                    Ok(CheckExprType::Integer)
+                }
+            }
+            Literal::String(_) => Ok(CheckExprType::Text),
+            Literal::Blob(_) => Ok(CheckExprType::Blob),
+            Literal::Null => Ok(CheckExprType::Null),
+            Literal::True | Literal::False => Ok(CheckExprType::Integer),
+            Literal::CurrentDate | Literal::CurrentTime | Literal::CurrentTimestamp => {
+                Ok(CheckExprType::Text)
+            }
+            Literal::Keyword(s) => {
+                bail_parse_error!(
+                    "cannot determine type of '{}' in CHECK constraint; use CAST",
+                    s
+                );
+            }
+        },
+        ast::Expr::Parenthesized(exprs) => {
+            if exprs.len() == 1 {
+                resolve_check_expr_type(&exprs[0], columns, resolver)
+            } else {
+                bail_parse_error!(
+                    "cannot determine type of expression in CHECK constraint; use CAST"
+                );
+            }
+        }
+        ast::Expr::Cast { type_name, .. } => {
+            if let Some(ref tn) = type_name {
+                resolve_type_name(&tn.name, resolver)
+            } else {
+                bail_parse_error!(
+                    "cannot determine type of CAST in CHECK constraint; use CAST with explicit type"
+                );
+            }
+        }
+        ast::Expr::Unary(op, inner) => match op {
+            UnaryOperator::Negative | UnaryOperator::Positive => {
+                let inner_ty = resolve_check_expr_type(inner, columns, resolver)?;
+                if !inner_ty.is_numeric() && inner_ty != CheckExprType::Null {
+                    bail_parse_error!(
+                        "unary minus/plus requires a numeric type, got {}",
+                        inner_ty.display_name()
+                    );
+                }
+                Ok(inner_ty)
+            }
+            UnaryOperator::BitwiseNot => Ok(CheckExprType::Integer),
+            UnaryOperator::Not => Ok(CheckExprType::Integer),
+        },
+        ast::Expr::Binary(lhs, op, rhs) => {
+            match op {
+                // Arithmetic: both must be numeric, result follows promotion rules
+                Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide => {
+                    let lty = resolve_check_expr_type(lhs, columns, resolver)?;
+                    let rty = resolve_check_expr_type(rhs, columns, resolver)?;
+                    if lty == CheckExprType::Null || rty == CheckExprType::Null {
+                        return Ok(CheckExprType::Null);
+                    }
+                    if !lty.is_numeric() || !rty.is_numeric() {
+                        bail_parse_error!(
+                            "arithmetic requires numeric types, got {} and {}",
+                            lty.display_name(),
+                            rty.display_name()
+                        );
+                    }
+                    if lty == CheckExprType::Real || rty == CheckExprType::Real {
+                        Ok(CheckExprType::Real)
+                    } else {
+                        Ok(CheckExprType::Integer)
+                    }
+                }
+                Operator::Modulus => Ok(CheckExprType::Integer),
+                Operator::Concat => Ok(CheckExprType::Text),
+                Operator::BitwiseAnd
+                | Operator::BitwiseOr
+                | Operator::LeftShift
+                | Operator::RightShift => Ok(CheckExprType::Integer),
+                // Logical: recurse to find nested comparisons
+                Operator::And | Operator::Or => {
+                    // The result of AND/OR is boolean (integer), but we need to
+                    // recurse to validate any comparisons inside.
+                    validate_check_types_in_expr(lhs, columns, resolver)?;
+                    validate_check_types_in_expr(rhs, columns, resolver)?;
+                    Ok(CheckExprType::Integer)
+                }
+                // Comparison operators: validate type compatibility and return Integer (boolean)
+                Operator::Equals
+                | Operator::NotEquals
+                | Operator::Less
+                | Operator::LessEquals
+                | Operator::Greater
+                | Operator::GreaterEquals => {
+                    let lty = resolve_check_expr_type(lhs, columns, resolver)?;
+                    let rty = resolve_check_expr_type(rhs, columns, resolver)?;
+                    if !lty.is_compatible_with(&rty) {
+                        bail_parse_error!(
+                            "type mismatch in CHECK constraint: cannot compare {} with {}",
+                            lty.display_name(),
+                            rty.display_name()
+                        );
+                    }
+                    Ok(CheckExprType::Integer)
+                }
+                // IS/IS NOT are NULL-checking operators, skip type validation
+                Operator::Is | Operator::IsNot => Ok(CheckExprType::Integer),
+                _ => {
+                    bail_parse_error!(
+                        "cannot determine type of expression in CHECK constraint; use CAST"
+                    );
+                }
+            }
+        }
+        ast::Expr::NotNull(_) | ast::Expr::IsNull(_) => Ok(CheckExprType::Integer),
+        ast::Expr::FunctionCall { name, .. } | ast::Expr::FunctionCallStar { name, .. } => {
+            bail_parse_error!(
+                "cannot determine return type of function {}() in CHECK constraint; \
+                 wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
+                name.as_str(),
+                name.as_str()
+            );
+        }
+        _ => {
+            bail_parse_error!("cannot determine type of expression in CHECK constraint; use CAST");
+        }
+    }
+}
+
+/// Resolve a column's type from its definition.
+fn resolve_column_type(col: &ast::ColumnDefinition, resolver: &Resolver) -> Result<CheckExprType> {
+    if let Some(ref col_type) = col.col_type {
+        resolve_type_name(&col_type.name, resolver)
+    } else {
+        // No type specified — in STRICT tables this would be caught elsewhere,
+        // but treat as ANY for CHECK validation purposes.
+        Ok(CheckExprType::Any)
+    }
+}
+
+/// Resolve a type name string to a CheckExprType.
+fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprType> {
+    let name_bytes = type_name.as_bytes();
+    let result = turso_macros::match_ignore_ascii_case!(match name_bytes {
+        b"INT" | b"INTEGER" => Some(CheckExprType::Integer),
+        b"REAL" | b"FLOAT" | b"DOUBLE" => Some(CheckExprType::Real),
+        b"TEXT" => Some(CheckExprType::Text),
+        b"BLOB" => Some(CheckExprType::Blob),
+        b"ANY" => Some(CheckExprType::Any),
+        _ => None,
+    });
+    if let Some(ty) = result {
+        return Ok(ty);
+    }
+    // Check if it's a known custom type
+    if resolver.schema.get_type_def_unchecked(type_name).is_some() {
+        return Ok(CheckExprType::CustomType(type_name.to_lowercase()));
+    }
+    bail_parse_error!("unknown type '{}' in CHECK constraint", type_name);
+}
+
+/// Walk a CHECK expression and validate that all comparisons have compatible types.
+/// Only called for STRICT tables.
+fn validate_check_types_in_expr(
+    expr: &ast::Expr,
+    columns: &[&ast::ColumnDefinition],
+    resolver: &Resolver,
+) -> Result<()> {
+    use ast::Operator;
+    match expr {
+        ast::Expr::Binary(lhs, op, rhs) => {
+            match op {
+                Operator::Equals
+                | Operator::NotEquals
+                | Operator::Less
+                | Operator::LessEquals
+                | Operator::Greater
+                | Operator::GreaterEquals => {
+                    let lty = resolve_check_expr_type(lhs, columns, resolver)?;
+                    let rty = resolve_check_expr_type(rhs, columns, resolver)?;
+                    if !lty.is_compatible_with(&rty) {
+                        bail_parse_error!(
+                            "type mismatch in CHECK constraint: cannot compare {} with {}",
+                            lty.display_name(),
+                            rty.display_name()
+                        );
+                    }
+                }
+                Operator::And | Operator::Or => {
+                    validate_check_types_in_expr(lhs, columns, resolver)?;
+                    validate_check_types_in_expr(rhs, columns, resolver)?;
+                }
+                // Arithmetic, concat, bitwise — recurse to find nested comparisons
+                _ => {
+                    validate_check_types_in_expr(lhs, columns, resolver)?;
+                    validate_check_types_in_expr(rhs, columns, resolver)?;
+                }
+            }
+        }
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            let lty = resolve_check_expr_type(lhs, columns, resolver)?;
+            let sty = resolve_check_expr_type(start, columns, resolver)?;
+            let ety = resolve_check_expr_type(end, columns, resolver)?;
+            if !lty.is_compatible_with(&sty) {
+                bail_parse_error!(
+                    "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
+                    lty.display_name(),
+                    sty.display_name()
+                );
+            }
+            if !lty.is_compatible_with(&ety) {
+                bail_parse_error!(
+                    "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
+                    lty.display_name(),
+                    ety.display_name()
+                );
+            }
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            let lty = resolve_check_expr_type(lhs, columns, resolver)?;
+            for item in rhs {
+                let ity = resolve_check_expr_type(item, columns, resolver)?;
+                if !lty.is_compatible_with(&ity) {
+                    bail_parse_error!(
+                        "type mismatch in CHECK IN list: cannot compare {} with {}",
+                        lty.display_name(),
+                        ity.display_name()
+                    );
+                }
+            }
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            for e in exprs {
+                validate_check_types_in_expr(e, columns, resolver)?;
+            }
+        }
+        ast::Expr::Unary(_, inner) => {
+            validate_check_types_in_expr(inner, columns, resolver)?;
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(op) = base {
+                validate_check_types_in_expr(op, columns, resolver)?;
+            }
+            for (when_expr, then_expr) in when_then_pairs {
+                validate_check_types_in_expr(when_expr, columns, resolver)?;
+                validate_check_types_in_expr(then_expr, columns, resolver)?;
+            }
+            if let Some(else_e) = else_expr {
+                validate_check_types_in_expr(else_e, columns, resolver)?;
+            }
+        }
+        // Leaf nodes and other expressions: no nested comparisons to validate
+        _ => {}
+    }
+    Ok(())
+}
+
 fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
@@ -215,6 +557,25 @@ fn validate(
                             Some(_) => {}
                         }
                     }
+                }
+            }
+        }
+
+        // In STRICT tables, validate that CHECK constraint comparisons have
+        // compatible types. This catches type mismatches at CREATE TABLE time
+        // rather than producing wrong results at INSERT/UPDATE time.
+        if is_strict {
+            let col_refs: Vec<&ast::ColumnDefinition> = columns.iter().collect();
+            for col in columns {
+                for constraint in &col.constraints {
+                    if let ast::ColumnConstraint::Check(expr) = &constraint.constraint {
+                        validate_check_types_in_expr(expr, &col_refs, resolver)?;
+                    }
+                }
+            }
+            for constraint in constraints {
+                if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
+                    validate_check_types_in_expr(expr, &col_refs, resolver)?;
                 }
             }
         }

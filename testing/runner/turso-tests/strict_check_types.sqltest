@@ -261,7 +261,6 @@ expect error {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-type-vs-integer-error {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(amount cents CHECK(amount < 50)) STRICT;
@@ -271,7 +270,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-type-vs-text-error {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(amount cents CHECK(amount = 'hello')) STRICT;
@@ -281,7 +279,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test different-custom-types-error {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TYPE score BASE integer ENCODE value * 10 DECODE value / 10;
@@ -296,7 +293,6 @@ expect error {
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-type-cast-valid-insert {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
@@ -308,7 +304,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-type-cast-check-violation {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
@@ -319,7 +314,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-type-cast-greater-than-zero {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(amount cents CHECK(amount > CAST(0 AS cents))) STRICT;
@@ -331,7 +325,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-type-cast-greater-than-zero-violation {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(amount cents CHECK(amount > CAST(0 AS cents))) STRICT;
@@ -342,7 +335,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-type-same-column-comparison {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(a cents, b cents, CHECK(a < b)) STRICT;
@@ -354,7 +346,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-type-between-cast {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(amount cents CHECK(amount BETWEEN CAST(0 AS cents) AND CAST(100 AS cents))) STRICT;
@@ -366,7 +357,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-type-in-list-cast {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(amount cents CHECK(amount IN (CAST(10 AS cents), CAST(20 AS cents), CAST(30 AS cents)))) STRICT;
