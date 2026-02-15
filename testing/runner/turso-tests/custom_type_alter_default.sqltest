@@ -1,7 +1,6 @@
 @database :memory:
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test alter-add-notnull-with-type-default {
     -- Type has DEFAULT 50, column has no explicit DEFAULT.
     -- ALTER TABLE ADD COLUMN NOT NULL should use the type-level default.
@@ -17,7 +16,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test alter-add-notnull-explicit-default-takes-precedence {
     -- Column-level DEFAULT should override type-level DEFAULT.
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50;
@@ -31,7 +29,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test alter-add-nullable-with-type-default {
     -- Nullable column with type default: existing rows get the type default.
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50;
@@ -45,7 +42,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test alter-add-notnull-no-default-rejects {
     -- No column or type default: should reject on non-empty table.
     CREATE TYPE simple BASE integer ENCODE value DECODE value;
@@ -58,7 +54,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test alter-add-notnull-type-default-empty-table {
     -- Empty table: should always succeed regardless of defaults.
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50;
