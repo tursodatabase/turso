@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
+use turso_core::TURSO_CDC_CURRENT_VERSION;
 
 use crate::common::{limbo_exec_rows, TempDatabase};
 
@@ -1165,7 +1166,7 @@ fn test_cdc_version_table_created(db: TempDatabase) {
         rows,
         vec![vec![
             Value::Text("turso_cdc".to_string()),
-            Value::Text("v1".to_string()),
+            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
         ]]
     );
 }
@@ -1183,7 +1184,7 @@ fn test_cdc_version_custom_table(db: TempDatabase) {
         rows,
         vec![vec![
             Value::Text("my_cdc".to_string()),
-            Value::Text("v1".to_string()),
+            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
         ]]
     );
 }
@@ -1207,7 +1208,7 @@ fn test_cdc_version_not_created_when_exists(db: TempDatabase) {
         rows,
         vec![vec![
             Value::Text("turso_cdc".to_string()),
-            Value::Text("v1".to_string()),
+            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
         ]]
     );
 }
@@ -1533,7 +1534,7 @@ fn test_cdc_pragma_get_returns_version(db: TempDatabase) {
         vec![vec![
             Value::Text("full".to_string()),
             Value::Text("turso_cdc".to_string()),
-            Value::Text("v1".to_string()),
+            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
         ]]
     );
 

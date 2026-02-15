@@ -72,6 +72,7 @@ use crate::sync::{
 };
 use crate::sync::{Mutex, RwLock};
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
+pub use crate::translate::pragma::TURSO_CDC_CURRENT_VERSION;
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
 use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
