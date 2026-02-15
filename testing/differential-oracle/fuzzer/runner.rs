@@ -21,7 +21,7 @@ use proptest::test_runner::TestRunner;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_gen_prop::{Schema, SqlStatement, StatementKind};
-use turso_core::Database;
+use turso_core::{Database, DatabaseOpts, OpenFlags};
 
 use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{OracleResult, check_differential};
@@ -181,7 +181,14 @@ impl Fuzzer {
 
         // Create Turso in-memory database using MemorySimIO
         let io = Arc::new(MemorySimIO::new(config.seed));
-        let turso_db = Database::open_file(io.clone(), out_dir.join("test.db").to_str().unwrap())?;
+        let opts = DatabaseOpts::new().with_strict(true);
+        let turso_db = Database::open_file_with_flags(
+            io.clone(),
+            out_dir.join("test.db").to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            None,
+        )?;
         let turso_conn = turso_db.connect()?;
 
         // Create SQLite in-memory database
@@ -364,13 +371,22 @@ impl Fuzzer {
             );
         }
 
-        // Verify each table's columns match
+        // Verify each table's columns and strict flags match
         for turso_table in turso_schema.tables.iter() {
             let sqlite_table = sqlite_schema
                 .tables
                 .iter()
                 .find(|t| t.name == turso_table.name)
                 .expect("Table should exist in SQLite schema");
+
+            if turso_table.strict != sqlite_table.strict {
+                bail!(
+                    "STRICT mismatch in table '{}': Turso strict={}, SQLite strict={}",
+                    turso_table.name,
+                    turso_table.strict,
+                    sqlite_table.strict
+                );
+            }
 
             let turso_cols: Vec<_> = turso_table.columns.iter().map(|c| &c.name).collect();
             let sqlite_cols: Vec<_> = sqlite_table.columns.iter().map(|c| &c.name).collect();

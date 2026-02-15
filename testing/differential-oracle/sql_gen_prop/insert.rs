@@ -85,6 +85,7 @@ pub fn insert_for_table(
 ) -> BoxedStrategy<InsertStatement> {
     let table_name = table.name.clone();
     let columns = table.columns.clone();
+    let is_strict = table.strict;
     let functions = builtin_functions();
 
     // Extract profile values from the InsertProfile
@@ -101,9 +102,20 @@ pub fn insert_for_table(
         .with_aggregates(allow_aggregates)
         .with_profile(expr_profile);
 
+    let profile_clone = profile.clone();
     let value_strategies: Vec<BoxedStrategy<Expression>> = columns
         .iter()
-        .map(|c| crate::expression::expression_for_type(Some(&c.data_type), &ctx))
+        .map(|c| {
+            if is_strict {
+                // For STRICT tables, use only literal values to avoid type mismatches
+                // that STRICT rejects (e.g., CAST expressions, cross-type binary ops)
+                crate::value::value_for_type(&c.data_type, c.nullable, &profile_clone)
+                    .prop_map(Expression::Value)
+                    .boxed()
+            } else {
+                crate::expression::expression_for_type(Some(&c.data_type), &ctx)
+            }
+        })
         .collect();
 
     value_strategies
