@@ -52,6 +52,19 @@ impl VirtualTable {
         Arc::new(dbpage_vtab)
     }
 
+    fn btree_dump_virtual_table() -> Arc<VirtualTable> {
+        let btree_dump_table = crate::btree_dump::BtreeDumpTable::new();
+        let vtab = VirtualTable {
+            name: btree_dump_table.name(),
+            columns: Self::resolve_columns(btree_dump_table.sql())
+                .expect("btree_dump schema resolution should not fail"),
+            kind: VTabKind::TableValuedFunction,
+            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(btree_dump_table))),
+            vtab_id: 0,
+        };
+        Arc::new(vtab)
+    }
+
     pub(crate) fn builtin_functions() -> Vec<Arc<VirtualTable>> {
         let mut vtables: Vec<Arc<VirtualTable>> = PragmaVirtualTable::functions()
             .into_iter()
@@ -73,6 +86,8 @@ impl VirtualTable {
 
         #[cfg(feature = "cli_only")]
         vtables.push(Self::dbpage_virtual_table());
+
+        vtables.push(Self::btree_dump_virtual_table());
 
         vtables
     }

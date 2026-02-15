@@ -1,0 +1,54 @@
+@database :memory:
+
+# Dump an index with data
+test btree-dump-index {
+    CREATE TABLE t1 (a INTEGER, b TEXT);
+    INSERT INTO t1 VALUES (1, 'hello');
+    INSERT INTO t1 VALUES (2, 'world');
+    INSERT INTO t1 VALUES (3, 'foo');
+    CREATE INDEX idx1 ON t1(b);
+    SELECT count(*) FROM btree_dump('idx1');
+}
+expect {
+    3
+}
+
+# Dump an empty index
+test btree-dump-empty-index {
+    CREATE TABLE t2 (a INTEGER, b TEXT);
+    CREATE INDEX idx2 ON t2(b);
+    SELECT count(*) FROM btree_dump('idx2');
+}
+expect {
+    0
+}
+
+# Dump a nonexistent name returns no rows
+test btree-dump-nonexistent {
+    SELECT count(*) FROM btree_dump('nonexistent');
+}
+expect {
+    0
+}
+
+# Dump a table
+test btree-dump-table {
+    CREATE TABLE t3 (a INTEGER, b TEXT);
+    INSERT INTO t3 VALUES (10, 'alpha');
+    INSERT INTO t3 VALUES (20, 'beta');
+    SELECT count(*) FROM btree_dump('t3');
+}
+expect {
+    2
+}
+
+# Record column returns a blob (non-null)
+test btree-dump-record-not-null {
+    CREATE TABLE t4 (x INTEGER);
+    INSERT INTO t4 VALUES (42);
+    CREATE INDEX idx4 ON t4(x);
+    SELECT typeof(record) FROM btree_dump('idx4');
+}
+expect {
+    blob
+}

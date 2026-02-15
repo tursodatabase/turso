@@ -143,6 +143,8 @@ pub use vdbe::{
     FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
 
+pub(crate) mod btree_dump;
+
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
 
