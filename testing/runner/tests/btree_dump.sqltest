@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if mvcc "btree_dump reads physical btree pages, not available for uncheckpointed MVCC data"
 
 # Dump an index with data
 test btree-dump-index {
@@ -23,12 +24,12 @@ expect {
     0
 }
 
-# Dump a nonexistent name returns no rows
+# Dump a nonexistent name returns an error
 test btree-dump-nonexistent {
     SELECT count(*) FROM btree_dump('nonexistent');
 }
-expect {
-    0
+expect error {
+    btree_dump: no such table or index: 'nonexistent'
 }
 
 # Dump a table

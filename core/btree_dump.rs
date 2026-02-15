@@ -145,10 +145,6 @@ impl BtreeDumpCursor {
     }
 }
 
-// SAFETY: BTreeCursor is Send + Sync, and all other fields are Send + Sync
-unsafe impl Send for BtreeDumpCursor {}
-unsafe impl Sync for BtreeDumpCursor {}
-
 impl InternalVirtualTableCursor for BtreeDumpCursor {
     fn filter(&mut self, args: &[Value], _idx_str: Option<String>, idx_num: i32) -> Result<bool> {
         self.cursor = None;
@@ -166,8 +162,17 @@ impl InternalVirtualTableCursor for BtreeDumpCursor {
         };
 
         let root_page = match self.find_root_page(name) {
-            Some(rp) => rp,
-            None => return Ok(false),
+            Some(rp) if rp > 0 => rp,
+            Some(_) => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "btree_dump: '{name}' has no physical btree (MVCC non-checkpointed)",
+                )));
+            }
+            None => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "btree_dump: no such table or index: '{name}'",
+                )));
+            }
         };
 
         let mut btree_cursor = BTreeCursor::new(self.pager.clone(), root_page, 0);
