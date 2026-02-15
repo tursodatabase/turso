@@ -119,68 +119,13 @@ impl TrivialExpression {
                 let left_val = left.evaluate(values);
                 let right_val = right.evaluate(values);
 
-                // Perform operations with type promotion when needed
+                // Use Value's exec_* methods which handle all type coercion
+                // (including Text → Numeric) consistently with SQLite semantics
                 match op {
-                    Operator::Add => match (&left_val, &right_val) {
-                        (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Integer(b))) => Value::from_i64(a + b),
-                        (Value::Numeric(Numeric::Float(a)), Value::Numeric(Numeric::Float(b))) => Value::from_f64(f64::from(*a) + f64::from(*b)),
-                        // Mixed integer/float - promote integer to float
-                        (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Float(b))) => Value::from_f64(*a as f64 + f64::from(*b)),
-                        (Value::Numeric(Numeric::Float(a)), Value::Numeric(Numeric::Integer(b))) => Value::from_f64(f64::from(*a) + *b as f64),
-                        (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        _ => panic!("Type mismatch in trivial expression: {left_val:?} + {right_val:?}. This is a bug in trivial expression validation."),
-                    },
-                    Operator::Subtract => match (&left_val, &right_val) {
-                        (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Integer(b))) => Value::from_i64(a - b),
-                        (Value::Numeric(Numeric::Float(a)), Value::Numeric(Numeric::Float(b))) => Value::from_f64(f64::from(*a) - f64::from(*b)),
-                        // Mixed integer/float - promote integer to float
-                        (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Float(b))) => Value::from_f64(*a as f64 - f64::from(*b)),
-                        (Value::Numeric(Numeric::Float(a)), Value::Numeric(Numeric::Integer(b))) => Value::from_f64(f64::from(*a) - *b as f64),
-                        (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        _ => panic!("Type mismatch in trivial expression: {left_val:?} - {right_val:?}. This is a bug in trivial expression validation."),
-                    },
-                    Operator::Multiply => match (&left_val, &right_val) {
-                        (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Integer(b))) => Value::from_i64(a * b),
-                        (Value::Numeric(Numeric::Float(a)), Value::Numeric(Numeric::Float(b))) => Value::from_f64(f64::from(*a) * f64::from(*b)),
-                        // Mixed integer/float - promote integer to float
-                        (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Float(b))) => Value::from_f64(*a as f64 * f64::from(*b)),
-                        (Value::Numeric(Numeric::Float(a)), Value::Numeric(Numeric::Integer(b))) => Value::from_f64(f64::from(*a) * *b as f64),
-                        (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        _ => panic!("Type mismatch in trivial expression: {left_val:?} * {right_val:?}. This is a bug in trivial expression validation."),
-                    },
-                    Operator::Divide => match (&left_val, &right_val) {
-                        (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Integer(b))) => {
-                            if *b != 0 {
-                                Value::from_i64(a / b)
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (Value::Numeric(Numeric::Float(a)), Value::Numeric(Numeric::Float(b))) => {
-                            if f64::from(*b) != 0.0 {
-                                Value::from_f64(f64::from(*a) / f64::from(*b))
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        // Mixed integer/float - promote integer to float
-                        (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Float(b))) => {
-                            if f64::from(*b) != 0.0 {
-                                Value::from_f64(*a as f64 / f64::from(*b))
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (Value::Numeric(Numeric::Float(a)), Value::Numeric(Numeric::Integer(b))) => {
-                            if *b != 0 {
-                                Value::from_f64(f64::from(*a) / *b as f64)
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        _ => panic!("Type mismatch in trivial expression: {left_val:?} / {right_val:?}. This is a bug in trivial expression validation."),
-                    },
+                    Operator::Add => left_val.exec_add(&right_val),
+                    Operator::Subtract => left_val.exec_subtract(&right_val),
+                    Operator::Multiply => left_val.exec_multiply(&right_val),
+                    Operator::Divide => left_val.exec_divide(&right_val),
                     _ => panic!("Unsupported operator in trivial expression: {op:?}"),
                 }
             }
@@ -546,5 +491,52 @@ mod tests {
         };
         let result = nested_expr.evaluate(&[]);
         assert_eq!(result, Value::from_f64(96.0));
+    }
+
+    #[test]
+    fn test_text_to_numeric_coercion_in_arithmetic() {
+        // Non-numeric text should coerce to 0 (SQLite behavior)
+        let values = vec![Value::Text(Text::new("hello".to_string()))];
+
+        // text - 1 => 0 - 1 = -1
+        let expr = TrivialExpression::Binary {
+            left: Box::new(TrivialExpression::Column(0)),
+            op: Operator::Subtract,
+            right: Box::new(TrivialExpression::Immediate(Value::from_i64(1))),
+        };
+        assert_eq!(expr.evaluate(&values), Value::from_i64(-1));
+
+        // text + 1 => 0 + 1 = 1
+        let expr = TrivialExpression::Binary {
+            left: Box::new(TrivialExpression::Column(0)),
+            op: Operator::Add,
+            right: Box::new(TrivialExpression::Immediate(Value::from_i64(1))),
+        };
+        assert_eq!(expr.evaluate(&values), Value::from_i64(1));
+
+        // text * 2 => 0 * 2 = 0
+        let expr = TrivialExpression::Binary {
+            left: Box::new(TrivialExpression::Column(0)),
+            op: Operator::Multiply,
+            right: Box::new(TrivialExpression::Immediate(Value::from_i64(2))),
+        };
+        assert_eq!(expr.evaluate(&values), Value::from_i64(0));
+
+        // text / 2 => 0 / 2 = 0
+        let expr = TrivialExpression::Binary {
+            left: Box::new(TrivialExpression::Column(0)),
+            op: Operator::Divide,
+            right: Box::new(TrivialExpression::Immediate(Value::from_i64(2))),
+        };
+        assert_eq!(expr.evaluate(&values), Value::from_i64(0));
+
+        // Numeric text "42" - 1 => 41
+        let numeric_text_values = vec![Value::Text(Text::new("42".to_string()))];
+        let expr = TrivialExpression::Binary {
+            left: Box::new(TrivialExpression::Column(0)),
+            op: Operator::Subtract,
+            right: Box::new(TrivialExpression::Immediate(Value::from_i64(1))),
+        };
+        assert_eq!(expr.evaluate(&numeric_text_values), Value::from_i64(41));
     }
 }
