@@ -75,10 +75,13 @@ pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
     let text = &text[1..text.len() - 1];
     if text.trim().is_empty() {
         return Ok(match vector_type {
-            VectorType::Float1Bit | VectorType::Float8 => {
+            VectorType::Float1Bit => {
                 return Err(LimboError::ConversionError(
                     "empty vector not supported for this type".to_string(),
                 ));
+            }
+            VectorType::Float8 => {
+                return Ok(Vector::from_f8(0, Vec::new(), 0.0, 0.0));
             }
             _ => Vector {
                 vector_type,

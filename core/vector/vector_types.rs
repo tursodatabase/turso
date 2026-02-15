@@ -731,6 +731,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn parse_string_vector_f8_zero_length() {
+        let vector = operations::text::vector_from_text(VectorType::Float8, "[]").unwrap();
+        assert_eq!(vector.dims, 0);
+        assert_eq!(vector.vector_type, VectorType::Float8);
+        let (quantized, alpha, shift) = vector.as_f8_data();
+        assert!(quantized.is_empty());
+        assert_eq!(alpha, 0.0);
+        assert_eq!(shift, 0.0);
+    }
+
+    #[test]
     fn test_parse_string_vector_valid_whitespace() {
         let vector = operations::text::vector_from_text(
             VectorType::Float32Dense,

@@ -151,6 +151,9 @@ fn convert_floats_to_f8(
     values: impl Iterator<Item = f32> + Clone,
     dims: usize,
 ) -> Result<Vector<'static>> {
+    if dims == 0 {
+        return Ok(Vector::from_f8(0, Vec::new(), 0.0, 0.0));
+    }
     let mut min_val = f32::INFINITY;
     let mut max_val = f32::NEG_INFINITY;
     for val in values.clone() {
@@ -363,5 +366,25 @@ mod tests {
             }
         }
         true
+    }
+
+    #[test]
+    fn test_vector_convert_empty_to_f8() {
+        let empty_f32 = Vector::from_f32(vec![]);
+        let f8 = vector_convert(empty_f32, VectorType::Float8).unwrap();
+        assert_eq!(f8.dims, 0);
+        assert_eq!(f8.vector_type, VectorType::Float8);
+        let (quantized, alpha, shift) = f8.as_f8_data();
+        assert!(quantized.is_empty());
+        assert_eq!(alpha, 0.0);
+        assert_eq!(shift, 0.0);
+    }
+
+    #[test]
+    fn test_vector_convert_empty_f8_to_f32() {
+        let empty_f8 = Vector::from_f8(0, Vec::new(), 0.0, 0.0);
+        let f32_vec = vector_convert(empty_f8, VectorType::Float32Dense).unwrap();
+        assert_eq!(f32_vec.dims, 0);
+        assert!(f32_vec.as_f32_slice().is_empty());
     }
 }
