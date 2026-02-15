@@ -148,7 +148,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         ),
         UnstableCaptureDataChangesConn => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
-            &["mode", "table"],
+            &["mode", "table", "version"],
         ),
         QueryOnly => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,

@@ -1517,3 +1517,49 @@ fn test_cdc_version_backward_compat_v1_full(db: TempDatabase) {
         ]
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_pragma_get_returns_version(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Before enabling CDC, PRAGMA GET should return "off" with null table and version
+    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("off".to_string()),
+            Value::Null,
+            Value::Null,
+        ]]
+    );
+
+    // Enable CDC
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // PRAGMA GET should return mode, table, and version
+    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("full".to_string()),
+            Value::Text("turso_cdc".to_string()),
+            Value::Text("v1".to_string()),
+        ]]
+    );
+
+    // Disable CDC and verify it goes back to "off"
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('off')")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("off".to_string()),
+            Value::Null,
+            Value::Null,
+        ]]
+    );
+}

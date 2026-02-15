@@ -67,7 +67,7 @@ use crate::vdbe::insn::{
 };
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, emit_explain, Result, SymbolTable};
-use crate::{turso_assert, Connection, QueryMode};
+use crate::{turso_assert, CaptureDataChangesExt, Connection, QueryMode};
 
 /// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
 /// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).
@@ -1954,7 +1954,7 @@ fn emit_delete_row_common(
 
         // Emit update in the CDC table if necessary (before DELETE updated the table)
         if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-            let cdc_has_before = program.capture_data_changes_mode().has_before();
+            let cdc_has_before = program.capture_data_changes_info().has_before();
             let before_record_reg = if cdc_has_before {
                 Some(emit_cdc_full_record(
                     program,
@@ -2809,7 +2809,7 @@ fn emit_update_insns<'a>(
 
     // we allocate 2C registers for "updates" as the structure of this column for CDC table is following:
     // [C boolean values where true set for changed columns] [C values with updates where NULL is set for not-changed columns]
-    let cdc_updates_register = if program.capture_data_changes_mode().has_updates() {
+    let cdc_updates_register = if program.capture_data_changes_info().has_updates() {
         Some(program.alloc_registers(2 * col_len))
     } else {
         None
@@ -3767,7 +3767,7 @@ fn emit_update_insns<'a>(
         };
 
         // create full CDC record before update if necessary
-        let cdc_before_reg = if program.capture_data_changes_mode().has_before() {
+        let cdc_before_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
                 target_table.table.columns(),
@@ -3896,7 +3896,7 @@ fn emit_update_insns<'a>(
         }
 
         // create full CDC record after update if necessary
-        let cdc_after_reg = if program.capture_data_changes_mode().has_after() {
+        let cdc_after_reg = if program.capture_data_changes_info().has_after() {
             Some(emit_cdc_patch_record(
                 program,
                 &target_table.table,
@@ -4000,7 +4000,7 @@ pub fn prepare_cdc_if_necessary(
     schema: &Schema,
     changed_table_name: &str,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
-    let mode = program.capture_data_changes_mode();
+    let mode = program.capture_data_changes_info();
     let cdc_table = mode.table();
     let Some(cdc_table) = cdc_table else {
         return Ok(None);

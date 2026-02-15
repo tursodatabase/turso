@@ -23,7 +23,7 @@ use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Numeric, Value};
+use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -349,13 +349,13 @@ fn update_pragma(
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
-            let opts = CaptureDataChangesMode::parse(&value)?;
-            if let Some(table) = &opts.table() {
-                if resolver.schema.get_table(table).is_none() {
+            let opts = CaptureDataChangesInfo::parse(&value, Some(TURSO_CDC_CURRENT_VERSION.to_string()))?;
+            if let Some(info) = &opts {
+                if resolver.schema.get_table(&info.table).is_none() {
                     program = translate_create_table(
                         QualifiedName {
                             db_name: None,
-                            name: ast::Name::exact(table.to_string()),
+                            name: ast::Name::exact(info.table.to_string()),
                             alias: None,
                         },
                         resolver,
@@ -374,15 +374,15 @@ fn update_pragma(
                     // and enables CDC — done at execution time so version table
                     // operations are not captured by CDC.
                     program.emit_insn(Insn::InitCdcVersion {
-                        cdc_table_name: table.to_string(),
+                        cdc_table_name: info.table.to_string(),
                         version: TURSO_CDC_CURRENT_VERSION.to_string(),
                         cdc_mode: value,
                     });
                 } else {
-                    connection.set_capture_data_changes(opts);
+                    connection.set_capture_data_changes_info(opts);
                 }
             } else {
-                connection.set_capture_data_changes(opts);
+                connection.set_capture_data_changes_info(opts);
             }
             Ok((program, TransactionMode::Write))
         }
@@ -1054,16 +1054,27 @@ fn query_pragma(
         PragmaName::UnstableCaptureDataChangesConn => {
             let pragma = pragma_for(&pragma);
             let second_column = program.alloc_register();
-            let opts = connection.get_capture_data_changes();
-            program.emit_string8(opts.mode_name().to_string(), register);
-            if let Some(table) = &opts.table() {
-                program.emit_string8(table.to_string(), second_column);
-            } else {
-                program.emit_null(second_column, None);
+            let third_column = program.alloc_register();
+            let opts = connection.get_capture_data_changes_info();
+            match opts.as_ref() {
+                Some(info) => {
+                    program.emit_string8(info.mode_name().to_string(), register);
+                    program.emit_string8(info.table.clone(), second_column);
+                    match &info.version {
+                        Some(v) => program.emit_string8(v.clone(), third_column),
+                        None => program.emit_null(third_column, None),
+                    }
+                }
+                None => {
+                    program.emit_string8("off".to_string(), register);
+                    program.emit_null(second_column, None);
+                    program.emit_null(third_column, None);
+                }
             }
-            program.emit_result_row(register, 2);
+            program.emit_result_row(register, 3);
             program.add_pragma_result_column(pragma.columns[0].to_string());
             program.add_pragma_result_column(pragma.columns[1].to_string());
+            program.add_pragma_result_column(pragma.columns[2].to_string());
             Ok((program, TransactionMode::Read))
         }
         PragmaName::QueryOnly => {

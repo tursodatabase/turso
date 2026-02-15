@@ -16,7 +16,7 @@ use crate::{
     match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
-    AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesMode,
+    AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesInfo,
     CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
     DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
     LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
@@ -77,7 +77,7 @@ pub struct Connection {
     /// Disable automatic checkpoint behaviour when DB is shutted down or WAL reach certain size
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
     pub(super) wal_auto_checkpoint_disabled: AtomicBool,
-    pub(super) capture_data_changes: RwLock<CaptureDataChangesMode>,
+    pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
     pub(super) closed: AtomicBool,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
@@ -984,12 +984,12 @@ impl Connection {
         self.cache_size.store(size, Ordering::SeqCst);
     }
 
-    pub fn get_capture_data_changes(
+    pub fn get_capture_data_changes_info(
         &self,
-    ) -> crate::sync::RwLockReadGuard<'_, CaptureDataChangesMode> {
+    ) -> crate::sync::RwLockReadGuard<'_, Option<CaptureDataChangesInfo>> {
         self.capture_data_changes.read()
     }
-    pub fn set_capture_data_changes(&self, opts: CaptureDataChangesMode) {
+    pub fn set_capture_data_changes_info(&self, opts: Option<CaptureDataChangesInfo>) {
         *self.capture_data_changes.write() = opts;
     }
     pub fn get_page_size(&self) -> PageSize {

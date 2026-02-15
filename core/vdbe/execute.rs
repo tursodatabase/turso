@@ -56,7 +56,7 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{
-    get_cursor, CaptureDataChangesMode, CheckpointMode, Completion, Connection, DatabaseStorage,
+    get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
     IOExt, MvCursor,
 };
 use either::Either;
@@ -8354,8 +8354,8 @@ pub fn op_init_cdc_version(
     }
 
     // Enable CDC after version table operations so they are not captured
-    let opts = CaptureDataChangesMode::parse(cdc_mode)?;
-    conn.set_capture_data_changes(opts);
+    let opts = CaptureDataChangesInfo::parse(cdc_mode, Some(version.to_string()))?;
+    conn.set_capture_data_changes_info(opts);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

@@ -45,7 +45,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
     },
-    Connection, LimboError, Result, VirtualTable,
+    CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
 };
 use std::num::NonZeroUsize;
 use turso_parser::ast::{
@@ -722,7 +722,7 @@ pub fn translate_insert(
 
     // Emit update in the CDC table if necessary (after the INSERT updated the table)
     if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
-        let cdc_has_after = program.capture_data_changes_mode().has_after();
+        let cdc_has_after = program.capture_data_changes_info().has_after();
         let after_record_reg = if cdc_has_after {
             Some(emit_cdc_patch_record(
                 &mut program,
@@ -2940,7 +2940,7 @@ fn emit_replace_delete_conflicting_row(
 
     // CDC BEFORE, using rowid_reg
     if let Some(cdc_cursor_id) = ctx.cdc_table.as_ref().map(|(id, _tbl)| *id) {
-        let cdc_has_before = program.capture_data_changes_mode().has_before();
+        let cdc_has_before = program.capture_data_changes_info().has_before();
         let before_record_reg = if cdc_has_before {
             Some(emit_cdc_full_record(
                 program,

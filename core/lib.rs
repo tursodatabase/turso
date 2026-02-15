@@ -1213,7 +1213,7 @@ impl Database {
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_checkpoint_disabled: AtomicBool::new(false),
-            capture_data_changes: RwLock::new(CaptureDataChangesMode::Off),
+            capture_data_changes: RwLock::new(None),
             closed: AtomicBool::new(false),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
@@ -1522,61 +1522,80 @@ impl Database {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CaptureDataChangesMode {
-    Off,
-    Id { table: String },
-    Before { table: String },
-    After { table: String },
-    Full { table: String },
+    Id,
+    Before,
+    After,
+    Full,
 }
 
-impl CaptureDataChangesMode {
-    pub fn parse(value: &str) -> Result<CaptureDataChangesMode> {
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CaptureDataChangesInfo {
+    pub mode: CaptureDataChangesMode,
+    pub table: String,
+    pub version: Option<String>,
+}
+
+impl CaptureDataChangesInfo {
+    pub fn parse(value: &str, version: Option<String>) -> Result<Option<CaptureDataChangesInfo>> {
         let (mode, table) = value
             .split_once(",")
             .unwrap_or((value, TURSO_CDC_DEFAULT_TABLE_NAME));
         match mode {
-            "off" => Ok(CaptureDataChangesMode::Off),
-            "id" => Ok(CaptureDataChangesMode::Id { table: table.to_string() }),
-            "before" => Ok(CaptureDataChangesMode::Before { table: table.to_string() }),
-            "after" => Ok(CaptureDataChangesMode::After { table: table.to_string() }),
-            "full" => Ok(CaptureDataChangesMode::Full { table: table.to_string() }),
+            "off" => Ok(None),
+            "id" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::Id, table: table.to_string(), version })),
+            "before" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::Before, table: table.to_string(), version })),
+            "after" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::After, table: table.to_string(), version })),
+            "full" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::Full, table: table.to_string(), version })),
             _ => Err(LimboError::InvalidArgument(
                 "unexpected pragma value: expected '<mode>' or '<mode>,<cdc-table-name>' parameter where mode is one of off|id|before|after|full".to_string(),
             ))
         }
     }
     pub fn has_updates(&self) -> bool {
-        matches!(self, CaptureDataChangesMode::Full { .. })
+        self.mode == CaptureDataChangesMode::Full
     }
     pub fn has_after(&self) -> bool {
         matches!(
-            self,
-            CaptureDataChangesMode::After { .. } | CaptureDataChangesMode::Full { .. }
+            self.mode,
+            CaptureDataChangesMode::After | CaptureDataChangesMode::Full
         )
     }
     pub fn has_before(&self) -> bool {
         matches!(
-            self,
-            CaptureDataChangesMode::Before { .. } | CaptureDataChangesMode::Full { .. }
+            self.mode,
+            CaptureDataChangesMode::Before | CaptureDataChangesMode::Full
         )
     }
     pub fn mode_name(&self) -> &str {
-        match self {
-            CaptureDataChangesMode::Off => "off",
-            CaptureDataChangesMode::Id { .. } => "id",
-            CaptureDataChangesMode::Before { .. } => "before",
-            CaptureDataChangesMode::After { .. } => "after",
-            CaptureDataChangesMode::Full { .. } => "full",
+        match self.mode {
+            CaptureDataChangesMode::Id => "id",
+            CaptureDataChangesMode::Before => "before",
+            CaptureDataChangesMode::After => "after",
+            CaptureDataChangesMode::Full => "full",
         }
     }
-    pub fn table(&self) -> Option<&str> {
-        match self {
-            CaptureDataChangesMode::Off => None,
-            CaptureDataChangesMode::Id { table }
-            | CaptureDataChangesMode::Before { table }
-            | CaptureDataChangesMode::After { table }
-            | CaptureDataChangesMode::Full { table } => Some(table.as_str()),
-        }
+}
+
+/// Convenience methods for `Option<CaptureDataChangesInfo>` to keep call sites simple.
+pub trait CaptureDataChangesExt {
+    fn has_updates(&self) -> bool;
+    fn has_after(&self) -> bool;
+    fn has_before(&self) -> bool;
+    fn table(&self) -> Option<&str>;
+}
+
+impl CaptureDataChangesExt for Option<CaptureDataChangesInfo> {
+    fn has_updates(&self) -> bool {
+        self.as_ref().is_some_and(|i| i.has_updates())
+    }
+    fn has_after(&self) -> bool {
+        self.as_ref().is_some_and(|i| i.has_after())
+    }
+    fn has_before(&self) -> bool {
+        self.as_ref().is_some_and(|i| i.has_before())
+    }
+    fn table(&self) -> Option<&str> {
+        self.as_ref().map(|i| i.table.as_str())
     }
 }
 

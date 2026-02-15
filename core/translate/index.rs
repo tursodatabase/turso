@@ -21,7 +21,7 @@ use crate::translate::plan::{
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
 use crate::vdbe::BranchOffset;
-use crate::{bail_parse_error, LimboError};
+use crate::{bail_parse_error, CaptureDataChangesExt, LimboError};
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
@@ -865,7 +865,7 @@ pub fn translate_drop_index(
     program.resolve_label(label_once_end, program.offset());
 
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        let before_record_reg = if program.capture_data_changes_mode().has_before() {
+        let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 &mut program,
                 &sqlite_table.columns,

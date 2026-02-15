@@ -13,7 +13,7 @@ use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::{Program, ProgramState, Register};
 use crate::SymbolTable;
-use crate::{CaptureDataChangesMode, Connection, QueryMode, Result, Value};
+use crate::{Connection, QueryMode, Result, Value};
 use turso_parser::ast::{Expr, Literal, Operator};
 
 // Transform an expression to replace column references with Register expressions Why do we want to
@@ -357,7 +357,7 @@ impl CompiledExpression {
         // Create a minimal program builder for expression compilation
         let mut builder = ProgramBuilder::new(
             QueryMode::Normal,
-            CaptureDataChangesMode::Off,
+            None,
             ProgramBuilderOpts {
                 num_cursors: 0,
                 approx_num_insns: 5,  // Most expressions are simple

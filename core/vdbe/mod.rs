@@ -68,7 +68,7 @@ use crate::connection::AttachedDatabasesFingerprint;
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
 use crate::{
-    AtomicBool, CaptureDataChangesMode, Connection, MvStore, Result, SyncMode, TransactionState,
+    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, SyncMode, TransactionState,
 };
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
@@ -834,7 +834,7 @@ pub struct PrepareContext {
     database_ptr: usize,
     foreign_keys: bool,
     query_only: bool,
-    capture_data_changes: CaptureDataChangesMode,
+    capture_data_changes: Option<CaptureDataChangesInfo>,
     syms_generation: u64,
     attached_databases_fingerprint: AttachedDatabasesFingerprint,
     busy_timeout_ms: u64,
@@ -855,7 +855,7 @@ impl PrepareContext {
             database_ptr: connection.database_ptr(),
             foreign_keys: connection.foreign_keys_enabled(),
             query_only: connection.get_query_only(),
-            capture_data_changes: connection.get_capture_data_changes().clone(),
+            capture_data_changes: connection.get_capture_data_changes_info().clone(),
             syms_generation: connection.syms_generation(),
             attached_databases_fingerprint: connection.attached_databases_fingerprint(),
             busy_timeout_ms: connection.get_busy_timeout().as_millis() as u64,
