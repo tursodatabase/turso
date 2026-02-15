@@ -4005,7 +4005,9 @@ pub fn prepare_cdc_if_necessary(
     let Some(cdc_table) = cdc_table else {
         return Ok(None);
     };
-    if changed_table_name == cdc_table {
+    if changed_table_name == cdc_table
+        || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+    {
         return Ok(None);
     }
     let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
