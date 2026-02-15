@@ -2447,3 +2447,11 @@ test strftime-format-bool-false {
 expect {
     0
 }
+
+# Regression test for issue #5251: time_date() panics on large integer arguments
+# due to multiplication overflow. Should return NULL, not panic.
+test time-date-large-integer-overflow {
+    SELECT time_date(2147483647, 2147483647, 2147483647);
+}
+expect {
+}

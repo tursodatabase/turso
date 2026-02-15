@@ -191,7 +191,7 @@ fn time_date_internal(args: &[Value]) -> Value {
         seconds -= offset_sec as i64;
     }
 
-    let t = Time::time_date(
+    let t = match Time::time_date(
         year as i32,
         month as i32,
         day,
@@ -200,9 +200,10 @@ fn time_date_internal(args: &[Value]) -> Value {
         seconds,
         nano_secs,
         FixedOffset::east_opt(0).unwrap(),
-    );
-
-    let t = tri!(t);
+    ) {
+        Ok(t) => t,
+        Err(_) => return Value::null(),
+    };
 
     t.into_blob()
 }

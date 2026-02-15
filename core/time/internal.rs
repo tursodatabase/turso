@@ -206,13 +206,23 @@ impl Time {
 
         match year.cmp(&0) {
             std::cmp::Ordering::Greater => {
+                let months = (year - 1)
+                    .unsigned_abs()
+                    .checked_mul(12)
+                    .ok_or(TimeError::CreationError)?;
                 dt = dt
-                    .checked_add_months(chrono::Months::new((year - 1).unsigned_abs() * 12))
+                    .checked_add_months(chrono::Months::new(months))
                     .ok_or(TimeError::CreationError)?
             }
             std::cmp::Ordering::Less => {
+                let months = year
+                    .checked_sub(1)
+                    .ok_or(TimeError::CreationError)?
+                    .unsigned_abs()
+                    .checked_mul(12)
+                    .ok_or(TimeError::CreationError)?;
                 dt = dt
-                    .checked_sub_months(chrono::Months::new((year - 1).unsigned_abs() * 12))
+                    .checked_sub_months(chrono::Months::new(months))
                     .ok_or(TimeError::CreationError)?
             }
             std::cmp::Ordering::Equal => (),
