@@ -303,7 +303,7 @@ expect {
     BLOB|||||
     ANY|||||
     bigint|integer||||
-    boolean|integer|boolean_to_int (value)|int_to_boolean (value)||
+    boolean|integer|boolean_to_int (value)|CASE WHEN value THEN 1 ELSE 0 END||
     bytea|blob||||
     date|text|date (value)|value||
     inet|text|validate_ipaddr (value)|value||
@@ -333,7 +333,7 @@ expect {
     BLOB|||||
     ANY|||||
     bigint|integer||||
-    boolean|integer|boolean_to_int (value)|int_to_boolean (value)||
+    boolean|integer|boolean_to_int (value)|CASE WHEN value THEN 1 ELSE 0 END||
     bytea|blob||||
     date|text|date (value)|value||
     inet|text|validate_ipaddr (value)|value||

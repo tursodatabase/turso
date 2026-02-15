@@ -12,12 +12,12 @@ test boolean-insert-text {
     SELECT id, val FROM t1;
 }
 expect {
-    1|true
-    2|false
-    3|true
-    4|false
-    5|true
-    6|false
+    1|1
+    2|0
+    3|1
+    4|0
+    5|1
+    6|0
 }
 
 @requires strict "uses STRICT tables"
@@ -28,8 +28,8 @@ test boolean-insert-int {
     SELECT id, val FROM t1;
 }
 expect {
-    1|true
-    2|false
+    1|1
+    2|0
 }
 
 @requires strict "uses STRICT tables"
@@ -40,8 +40,8 @@ test boolean-alias-bool {
     SELECT id, val FROM t1;
 }
 expect {
-    1|true
-    2|false
+    1|1
+    2|0
 }
 
 @requires strict "uses STRICT tables"

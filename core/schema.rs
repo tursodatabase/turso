@@ -386,7 +386,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
     let type_sqls: &[&str] = &[
         #[cfg(feature = "uuid")]
         "CREATE TYPE uuid BASE blob ENCODE uuid_blob(value) DECODE uuid_str(value) DEFAULT uuid4_str()",
-        "CREATE TYPE boolean BASE integer ENCODE boolean_to_int(value) DECODE int_to_boolean(value)",
+        "CREATE TYPE boolean BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END",
         #[cfg(feature = "json")]
         "CREATE TYPE json BASE text ENCODE json(value) DECODE value",
         #[cfg(feature = "json")]

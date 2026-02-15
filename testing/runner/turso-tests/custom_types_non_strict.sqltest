@@ -110,7 +110,7 @@ test non-strict-cast-explicit {
     SELECT CAST(1 AS boolean);
 }
 expect {
-    true
+    1
 }
 
 # CAST(x AS numeric) without params falls through to standard SQLite CAST
