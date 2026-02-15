@@ -546,6 +546,8 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         &mut plan.offset,
     )?;
 
+    downgrade_multi_index_scans(&mut plan.table_references, &mut plan.where_clause);
+
     Ok(())
 }
 
@@ -575,6 +577,8 @@ fn optimize_update_plan(
         &mut plan.limit,
         &mut plan.offset,
     )?;
+
+    downgrade_multi_index_scans(&mut plan.table_references, &mut plan.where_clause);
 
     let table_ref = &mut plan.table_references.joined_tables_mut()[0];
 
@@ -2561,6 +2565,25 @@ pub trait TakeOwnership {
 impl TakeOwnership for ast::Expr {
     fn take_ownership(&mut self) -> Self {
         std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
+    }
+}
+
+/// Multi-index scans (OR-by-union, AND-by-intersection) are only supported for
+/// SELECT operations. When the optimizer picks one for DELETE or UPDATE, revert
+/// to a full table scan and un-consume the WHERE terms so they are evaluated as
+/// regular filters.
+fn downgrade_multi_index_scans(
+    table_references: &mut TableReferences,
+    where_clause: &mut [WhereTerm],
+) {
+    for table in table_references.joined_tables_mut() {
+        if let Operation::MultiIndexScan(ref op) = table.op {
+            where_clause[op.where_term_idx].consumed = false;
+            for &idx in &op.additional_consumed_terms {
+                where_clause[idx].consumed = false;
+            }
+            table.op = Operation::default_scan_for(&table.table);
+        }
     }
 }
 

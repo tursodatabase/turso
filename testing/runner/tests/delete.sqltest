@@ -274,3 +274,20 @@ expect {
     2|b
     3|c
 }
+
+# DELETE with OR on two indexed columns. The optimizer may consider a
+# multi-index scan, which is only implemented for SELECT. The query must
+# still work by falling back to a regular scan.
+test delete-or-indexed-columns {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT, d INTEGER);
+    CREATE INDEX idx_t1_b ON t1(b);
+    CREATE INDEX idx_t1_d ON t1(d);
+    INSERT INTO t1 VALUES (1, 'hello', 10);
+    INSERT INTO t1 VALUES (2, 'world', 20);
+    INSERT INTO t1 VALUES (3, 'foo', 30);
+    DELETE FROM t1 WHERE b = 'hello' OR d = 20;
+    SELECT * FROM t1;
+}
+expect {
+    3|foo|30
+}
