@@ -1313,7 +1313,6 @@ fn update_cache_size(
 }
 
 pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
-#[allow(dead_code)]
 pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
 pub const TURSO_CDC_CURRENT_VERSION: &str = "v1";
 

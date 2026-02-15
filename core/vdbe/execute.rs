@@ -55,6 +55,7 @@ use crate::{
     stats::StatAccum,
     translate::emitter::TransactionMode,
 };
+use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::{
     get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
     IOExt, MvCursor,
@@ -8333,11 +8334,25 @@ pub fn op_init_cdc_version(
 
     let conn = program.connection.clone();
 
-    // "off" — just disable CDC, no version table operations needed
+    // "off" — disable CDC (table and version entry are preserved)
     if CaptureDataChangesInfo::parse(cdc_mode, None)?.is_none() {
         state.pending_cdc_info = Some(None);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // If CDC is already enabled, re-parse with current version and exit early.
+    // This makes the operation idempotent and avoids CDC capturing its own
+    // table creation when the pragma is called multiple times.
+    {
+        let current = conn.get_capture_data_changes_info();
+        if let Some(info) = current.as_ref() {
+            let opts =
+                CaptureDataChangesInfo::parse(cdc_mode, info.version.clone())?;
+            state.pending_cdc_info = Some(opts);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
 
     // Step 1: Create CDC table if needed
@@ -8358,9 +8373,9 @@ pub fn op_init_cdc_version(
     // Step 2: Create version table if needed
     {
         conn.start_nested();
-        let mut stmt = conn.prepare(
-            "CREATE TABLE IF NOT EXISTS turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
-        )?;
+        let mut stmt = conn.prepare(format!(
+            "CREATE TABLE IF NOT EXISTS {TURSO_CDC_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+        ))?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
@@ -8376,7 +8391,7 @@ pub fn op_init_cdc_version(
     {
         conn.start_nested();
         let mut stmt = conn.prepare(format!(
-            "INSERT OR IGNORE INTO turso_cdc_version (table_name, version) VALUES ('{cdc_table_name}', '{version}')",
+            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{cdc_table_name}', '{version}')",
         ))?;
         stmt.program
             .prepared
@@ -8392,7 +8407,7 @@ pub fn op_init_cdc_version(
     let actual_version = {
         conn.start_nested();
         let mut stmt = conn.prepare(format!(
-            "SELECT version FROM turso_cdc_version WHERE table_name = '{cdc_table_name}'",
+            "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{cdc_table_name}'",
         ))?;
         stmt.program
             .prepared

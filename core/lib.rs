@@ -1575,6 +1575,13 @@ impl CaptureDataChangesInfo {
             CaptureDataChangesMode::Full => "full",
         }
     }
+    /// Returns the CDC schema version, defaulting to V1 for tables that
+    /// predate version tracking (version field is None).
+    pub fn version(&self) -> &str {
+        self.version
+            .as_deref()
+            .unwrap_or(TURSO_CDC_CURRENT_VERSION)
+    }
 }
 
 /// Convenience methods for `Option<CaptureDataChangesInfo>` to keep call sites simple.
