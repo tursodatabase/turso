@@ -1,7 +1,7 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, RowID, RowKey, RowVersion, TxTimestampOrID,
-    WriteRowStateMachine, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    DeleteRowStateMachine, MVTableId, MvStore, RowID, RowKey, RowVersion, WriteRowStateMachine,
+    SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::schema::Index;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
@@ -218,7 +218,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
+            if let Some(b) = version.begin.as_timestamp() {
                 begin_ts = Some(b);
                 // A row exists in the DB file if:
                 // 1. It was checkpointed in a previous checkpoint (begin_ts <= checkpointed_txid_max_old), OR
@@ -236,7 +236,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
             }
             let mut end_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
+            if let Some(e) = version.end.as_timestamp() {
                 end_ts = Some(e);
                 if self
                     .checkpointed_txid_max_old
@@ -307,11 +307,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let row_versions = entry.value().read();
 
             for version in row_versions.iter() {
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
-                    max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
+                if let Some(b) = version.begin.as_timestamp() {
+                    max_timestamp = max_timestamp.max(NonZeroU64::new(b));
                 }
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
-                    max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
+                if let Some(e) = version.end.as_timestamp() {
+                    max_timestamp = max_timestamp.max(NonZeroU64::new(e));
                 }
             }
 
@@ -478,10 +478,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let versions = entry.value().read();
 
                 for version in versions.iter() {
-                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
+                    if let Some(ts) = version.begin.as_timestamp() {
                         max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                     }
-                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
+                    if let Some(ts) = version.end.as_timestamp() {
                         max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                     }
                 }
