@@ -1518,20 +1518,17 @@ fn test_cdc_version_preserves_old_version(db: TempDatabase) {
     ).unwrap();
     conn.execute(
         "CREATE TABLE turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
-    ).unwrap();
-    conn.execute(
-        "INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v0')",
-    ).unwrap();
+    )
+    .unwrap();
+    conn.execute("INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v0')")
+        .unwrap();
 
     // Enable CDC — should preserve the existing "v0" version, not overwrite with current
     conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         .unwrap();
 
     // Version table should still have "v0"
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT table_name, version FROM turso_cdc_version",
-    );
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
     assert_eq!(
         rows,
         vec![vec![
