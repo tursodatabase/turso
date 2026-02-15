@@ -9,9 +9,7 @@ description: Change Data Capture - architecture, entrypoints, bytecode emission,
 CDC tracks INSERT/UPDATE/DELETE changes on database tables by writing change records into a
 dedicated CDC table (`turso_cdc` by default). It is per-connection, enabled via PRAGMA, and
 operates at the bytecode generation (translate) layer. The sync engine consumes CDC records
-to replicate changes across nodes.
-
-**Status:** Unstable (PRAGMA name prefixed with `unstable_`).
+to push local changes to the remote.
 
 ## Architecture Diagram
 
@@ -43,7 +41,7 @@ User SQL (INSERT/UPDATE/DELETE/DDL)
   ┌─────────────────────────────────────────────────┐
   │  Sync engine (sync/engine/)                     │
   │  DatabaseTape reads CDC table → DatabaseChange  │
-  │  → apply/revert → replicate to remote           │
+  │  → apply/revert → push to remote                 │
   └─────────────────────────────────────────────────┘
 ```
 
@@ -79,7 +77,7 @@ Convenience trait `CaptureDataChangesExt` on `Option<CaptureDataChangesInfo>` pr
 - `has_before()` / `has_after()` / `has_updates()` — delegates to inner, returns false for None
 - `table()` — returns `Option<&str>`, None when CDC is off
 
-### CDC Table Schema — `core/translate/pragma.rs`
+### CDC Table Schema v1 (current)
 
 Default table name: `turso_cdc` (constant `TURSO_CDC_DEFAULT_TABLE_NAME`)
 
@@ -273,7 +271,7 @@ Run: `cargo test -- test_cdc` (integration) or `cargo test -p turso_sync_engine 
 
 1. **Per-connection, not per-database.** Each connection has its own CDC mode and can target different tables.
 2. **Bytecode-level implementation.** CDC instructions are emitted alongside the actual DML bytecode during translation — no runtime hooks or triggers.
-3. **Self-exclusion.** Changes to the CDC table itself are never re-captured (checked in `prepare_cdc_if_necessary`).
+3. **Self-exclusion.** Changes to the CDC table and `turso_cdc_version` table are never captured (checked in `prepare_cdc_if_necessary`).
 4. **Schema changes tracked.** DDL operations are recorded as changes to `sqlite_schema` table.
 5. **Binary record format.** Before/after/updates columns use SQLite's MakeRecord format (same as B-tree payload).
 6. **Transaction-aware.** CDC writes happen within the same transaction as the DML, so rollback naturally discards CDC entries.
