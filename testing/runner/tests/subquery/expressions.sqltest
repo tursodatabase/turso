@@ -698,3 +698,15 @@ test subquery-is-distinct-from {
 expect {
     1|1|1
 }
+
+# =============================================================================
+# Scalar subquery referencing rowid of derived table (#5249)
+# Derived tables (FROM-clause subqueries) don't have a rowid, so this should
+# return an error "no such column: rowid"
+# =============================================================================
+
+test scalar-subquery-rowid-derived-table {
+    SELECT (SELECT t.rowid) FROM (SELECT 1) t;
+}
+expect error {
+}
