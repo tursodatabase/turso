@@ -30,7 +30,7 @@ use super::{
 /// produce wrong ORDER BY results, so they should be treated as if the
 /// type has no `<` operator (sort on encoded blobs instead).
 fn has_known_sort_comparator(func_name: &str) -> bool {
-    matches!(func_name, "numeric_lt" | "test_uint_lt")
+    matches!(func_name, "numeric_lt" | "test_uint_lt" | "string_reverse")
 }
 
 /// For an ORDER BY expression that is a column reference to a custom type,
@@ -55,8 +55,9 @@ pub(crate) fn custom_type_lt_func(
             .operators
             .iter()
             .find(|op| op.op == "<")
-            .filter(|op| has_known_sort_comparator(&op.func_name))
-            .map(|op| op.func_name.clone())
+            .and_then(|op| op.func_name.as_ref())
+            .filter(|func_name| has_known_sort_comparator(func_name))
+            .cloned()
     } else {
         None
     }
@@ -106,11 +107,8 @@ fn is_custom_type_without_lt(
             if let Some(col) = table.get_column_at(*column) {
                 if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict()) {
                     if type_def.decode.is_some() {
-                        // No `<` operator, or `<` operator with unknown comparator
-                        return !type_def
-                            .operators
-                            .iter()
-                            .any(|op| op.op == "<" && has_known_sort_comparator(&op.func_name));
+                        // No `<` operator at all (naked or with function)
+                        return !type_def.operators.iter().any(|op| op.op == "<");
                     }
                 }
             }
@@ -151,6 +149,25 @@ pub fn init_order_by(
     has_distinct: bool,
     aggregates: &[Aggregate],
 ) -> Result<()> {
+    // Block ORDER BY on custom type columns without OPERATOR '<'
+    for (expr, _) in order_by.iter() {
+        if is_custom_type_without_lt(expr, referenced_tables, t_ctx.resolver.schema) {
+            if let Some((col, type_def)) =
+                result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema)
+            {
+                let col_name = col.name.as_deref().unwrap_or("?");
+                crate::bail_parse_error!(
+                    "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
+                    col_name,
+                    type_def.name
+                );
+            }
+            crate::bail_parse_error!(
+                "cannot ORDER BY a custom type column that does not declare OPERATOR '<'"
+            );
+        }
+    }
+
     let only_aggs = order_by
         .iter()
         .all(|(e, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
@@ -345,32 +362,31 @@ pub fn emit_order_by(
         let column_idx = remapping.orderby_sorter_idx;
         program.emit_column_or_rowid(cursor_id, column_idx, reg);
 
-        // For deduplicated columns that were stored encoded (because decode was suppressed
-        // for the sort key), we need to decode the value for display.
+        // Deduplicated columns share a sort key slot, which stores the encoded
+        // (on-disk) value (decode was suppressed during sorter insert). Apply
+        // DECODE now so the result set contains human-readable values.
         if remapping.deduplicated {
             if let Some((col, type_def)) = result_column_custom_type_info(
                 &rc.expr,
                 &plan.table_references,
                 t_ctx.resolver.schema,
             ) {
-                if type_def.decode.is_some() && !type_def.operators.iter().any(|op| op.op == "<") {
-                    if let Some(ref decode_expr) = type_def.decode {
-                        let skip_label = program.allocate_label();
-                        program.emit_insn(Insn::IsNull {
-                            reg,
-                            target_pc: skip_label,
-                        });
-                        super::expr::emit_type_expr(
-                            program,
-                            decode_expr,
-                            reg,
-                            reg,
-                            col,
-                            &type_def,
-                            &t_ctx.resolver,
-                        )?;
-                        program.resolve_label(skip_label, program.offset());
-                    }
+                if let Some(ref decode_expr) = type_def.decode {
+                    let skip_label = program.allocate_label();
+                    program.emit_insn(Insn::IsNull {
+                        reg,
+                        target_pc: skip_label,
+                    });
+                    super::expr::emit_type_expr(
+                        program,
+                        decode_expr,
+                        reg,
+                        reg,
+                        col,
+                        &type_def,
+                        &t_ctx.resolver,
+                    )?;
+                    program.resolve_label(skip_label, program.offset());
                 }
             }
         }
@@ -448,11 +464,13 @@ pub fn order_by_sorter_insert(
                 extra_amount: 0,
             });
         } else {
-            // For custom type columns without a `<` operator, suppress decode so the
-            // sorter sorts on the encoded (on-disk) values. Types WITH a `<` operator
-            // are decoded normally and use a custom comparator in the sorter.
-            let suppress = is_custom_type_without_lt(expr, &plan.table_references, resolver.schema);
-            if suppress {
+            // Sort keys must be encoded (on-disk) values. Suppress decode so the
+            // sorter compares encoded representations, using either the base type's
+            // built-in comparison (naked OPERATOR '<') or a custom comparator function.
+            let is_custom =
+                result_column_custom_type_info(expr, &plan.table_references, resolver.schema)
+                    .is_some_and(|(_, td)| td.decode.is_some());
+            if is_custom {
                 program.suppress_custom_type_decode = true;
             }
             let result = translate_expr(
@@ -462,7 +480,7 @@ pub fn order_by_sorter_insert(
                 key_reg,
                 resolver,
             );
-            if suppress {
+            if is_custom {
                 program.suppress_custom_type_decode = false;
             }
             result?;

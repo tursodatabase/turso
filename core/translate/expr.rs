@@ -2465,8 +2465,7 @@ pub fn translate_expr(
                         | ScalarFunc::TestUintDiv
                         | ScalarFunc::TestUintLt
                         | ScalarFunc::TestUintEq
-                        | ScalarFunc::TestReverseEncode
-                        | ScalarFunc::TestReverseDecode
+                        | ScalarFunc::StringReverse
                         | ScalarFunc::BooleanToInt
                         | ScalarFunc::IntToBoolean
                         | ScalarFunc::ValidateIpAddr
@@ -6368,7 +6367,9 @@ fn find_custom_type_operator(
         // Direct match: just check op symbol (no right_type constraint)
         for op_def in &type_def.operators {
             if op_def.op == op_str {
-                return Some((op_def.func_name.clone(), false, false));
+                // Naked operator (func_name = None): fall through to standard comparison
+                let func_name = op_def.func_name.as_ref()?;
+                return Some((func_name.clone(), false, false));
             }
         }
 
@@ -6378,7 +6379,7 @@ fn find_custom_type_operator(
                 .operators
                 .iter()
                 .find(|o| o.op == sym)
-                .map(|o| o.func_name.clone())
+                .and_then(|o| o.func_name.clone())
         };
 
         match *op {

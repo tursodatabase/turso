@@ -175,8 +175,8 @@ pub struct ProgramBuilder {
     /// and type parameter names resolve to registers holding their concrete values.
     pub id_register_overrides: HashMap<String, usize>,
     /// When set, translate_expr will skip custom type decode for Expr::Column.
-    /// This is used when building ORDER BY sort keys for custom types without a `<` operator,
-    /// so the sorter sorts on the encoded (on-disk) values.
+    /// This is used when building ORDER BY sort keys so the sorter compares
+    /// encoded (on-disk) values. Decode is presentation-only.
     pub suppress_custom_type_decode: bool,
     /// When true, the next `emit_column` call will not bake the default value
     /// into the Column instruction. Used for custom type columns where the default

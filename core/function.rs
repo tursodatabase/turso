@@ -476,8 +476,7 @@ pub enum ScalarFunc {
     TestUintDiv,
     TestUintLt,
     TestUintEq,
-    TestReverseEncode,
-    TestReverseDecode,
+    StringReverse,
     // Built-in type support functions
     BooleanToInt,
     IntToBoolean,
@@ -568,8 +567,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::TestUintDiv
             | ScalarFunc::TestUintLt
             | ScalarFunc::TestUintEq
-            | ScalarFunc::TestReverseEncode
-            | ScalarFunc::TestReverseDecode => true,
+            | ScalarFunc::StringReverse => true,
             ScalarFunc::BooleanToInt
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
@@ -660,8 +658,7 @@ impl Display for ScalarFunc {
             Self::TestUintDiv => "test_uint_div",
             Self::TestUintLt => "test_uint_lt",
             Self::TestUintEq => "test_uint_eq",
-            Self::TestReverseEncode => "test_reverse_encode",
-            Self::TestReverseDecode => "test_reverse_decode",
+            Self::StringReverse => "string_reverse",
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
@@ -767,10 +764,7 @@ impl ScalarFunc {
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
             // Test functions for custom types (1-arg encode/decode, 2-arg operators)
-            Self::TestUintEncode
-            | Self::TestUintDecode
-            | Self::TestReverseEncode
-            | Self::TestReverseDecode => &[1],
+            Self::TestUintEncode | Self::TestUintDecode | Self::StringReverse => &[1],
             Self::TestUintAdd
             | Self::TestUintSub
             | Self::TestUintMul
@@ -1284,8 +1278,7 @@ impl Func {
             "test_uint_div" => Ok(Self::Scalar(ScalarFunc::TestUintDiv)),
             "test_uint_lt" => Ok(Self::Scalar(ScalarFunc::TestUintLt)),
             "test_uint_eq" => Ok(Self::Scalar(ScalarFunc::TestUintEq)),
-            "test_reverse_encode" => Ok(Self::Scalar(ScalarFunc::TestReverseEncode)),
-            "test_reverse_decode" => Ok(Self::Scalar(ScalarFunc::TestReverseDecode)),
+            "string_reverse" => Ok(Self::Scalar(ScalarFunc::StringReverse)),
             // Built-in type support functions
             "boolean_to_int" => Ok(Self::Scalar(ScalarFunc::BooleanToInt)),
             "int_to_boolean" => Ok(Self::Scalar(ScalarFunc::IntToBoolean)),

@@ -752,7 +752,9 @@ impl ToTokens for Stmt {
                 for op in &body.operators {
                     s.append(TK_ID, Some("OPERATOR"))?;
                     s.append(TK_STRING, Some(&format!("'{}'", op.op)))?;
-                    s.append(TK_ID, Some(&op.func_name))?;
+                    if let Some(ref func_name) = op.func_name {
+                        s.append(TK_ID, Some(func_name))?;
+                    }
                 }
                 Ok(())
             }

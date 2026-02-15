@@ -16,14 +16,14 @@ Custom types work only with **STRICT** tables.
 CREATE TYPE type_name BASE base_type
     ENCODE encode_expr
     DECODE decode_expr
-    [OPERATOR 'op' (operand_type) -> function_name ...]
+    [OPERATOR 'op' [function_name] ...]
     [DEFAULT default_expr];
 ```
 
 - **BASE** — The underlying SQLite storage type (`text`, `integer`, `real`, `blob`).
 - **ENCODE** — Expression applied to `value` before writing to disk.
 - **DECODE** — Expression applied to `value` when reading from disk.
-- **OPERATOR** — (Optional) Custom operator overloads for the type.
+- **OPERATOR** — (Optional) Custom operator overloads for the type. If `function_name` is omitted, the base type's built-in comparison is used (see [Ordering](#ordering) below).
 - **DEFAULT** — (Optional) Default value for columns of this type when no value is supplied.
 
 The special identifier `value` refers to the input being encoded or decoded.
@@ -57,8 +57,8 @@ Encode reverses the string for storage; decode reverses it back:
 
 ```sql
 CREATE TYPE reversed BASE text
-    ENCODE test_reverse_encode(value)
-    DECODE test_reverse_decode(value);
+    ENCODE string_reverse(value)
+    DECODE string_reverse(value);
 CREATE TABLE t1(val reversed) STRICT;
 INSERT INTO t1 VALUES ('hello');
 SELECT val FROM t1;
@@ -112,6 +112,109 @@ SELECT val FROM t1 WHERE val < 25;
 -- 20
 ```
 
+## Ordering
+
+Sorting and indexing always operate on **encoded (on-disk) values**, not decoded values. DECODE is purely a presentation layer — it controls how values appear in query results, but has no effect on sort order or index structure.
+
+Custom types that support ordering must declare `OPERATOR '<'`. Without it, `ORDER BY` and `CREATE INDEX` on columns of that type are **forbidden** — attempting either produces a clear error.
+
+### Naked `OPERATOR '<'` (Base Type Comparison)
+
+A naked `OPERATOR '<'` (no function name) tells Turso to compare encoded values using the base type's built-in comparison. This works correctly when the encoding preserves the desired sort order:
+
+```sql
+-- ENCODE value * 100 is monotonic: 10→100, 20→200, 30→300.
+-- Sorting encoded integers preserves numeric order.
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100
+    OPERATOR '<';
+
+CREATE TABLE prices(id INTEGER PRIMARY KEY, amount cents) STRICT;
+INSERT INTO prices VALUES (1, 30), (2, 10), (3, 20);
+SELECT amount FROM prices ORDER BY amount;
+-- 10
+-- 20
+-- 30
+```
+
+If the encoding does **not** preserve order, the sort will reflect the encoded representation:
+
+```sql
+-- string_reverse is NOT monotonic: encoded text sorts differently than decoded.
+-- Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
+-- Encoded text sort: ananab < elppa < yrrehc → display: banana, apple, cherry.
+CREATE TYPE reversed BASE text
+    ENCODE string_reverse(value)
+    DECODE string_reverse(value)
+    OPERATOR '<';
+
+CREATE TABLE t(id INTEGER PRIMARY KEY, val reversed) STRICT;
+INSERT INTO t VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry');
+SELECT val FROM t ORDER BY val;
+-- banana
+-- apple
+-- cherry
+```
+
+### `OPERATOR '<'` with a Function (Custom Comparator)
+
+For types where the base type comparison on encoded values is not suitable, provide a custom comparator function. The comparator transforms encoded values before comparing:
+
+```sql
+-- numeric stores values as blobs; standard blob comparison is wrong.
+-- numeric_lt knows how to compare encoded blobs numerically.
+CREATE TYPE numeric(precision, scale) BASE blob
+    ENCODE numeric_encode(value, precision, scale)
+    DECODE numeric_decode(value)
+    OPERATOR '<' numeric_lt;
+```
+
+A comparator can also recover a desired sort order from a non-order-preserving encoding:
+
+```sql
+-- Same encoding as above, but the comparator reverses encoded values
+-- before comparing, recovering alphabetical order.
+CREATE TYPE reversed_alpha BASE text
+    ENCODE string_reverse(value)
+    DECODE string_reverse(value)
+    OPERATOR '<' string_reverse;
+
+CREATE TABLE t(id INTEGER PRIMARY KEY, val reversed_alpha) STRICT;
+INSERT INTO t VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry');
+SELECT val FROM t ORDER BY val;
+-- apple
+-- banana
+-- cherry
+```
+
+### Non-Orderable Types
+
+Types without `OPERATOR '<'` cannot be used in `ORDER BY` or `CREATE INDEX`:
+
+```sql
+CREATE TYPE mytype BASE text ENCODE value DECODE value;
+CREATE TABLE t(val mytype) STRICT;
+
+SELECT val FROM t ORDER BY val;
+-- Error: cannot ORDER BY column 'val' of type 'mytype': type does not declare OPERATOR '<'
+
+CREATE INDEX idx ON t(val);
+-- Error: cannot create index on column 'val' of type 'mytype': type does not declare OPERATOR '<'
+```
+
+Expression indexes that compute a regular value from a non-orderable column are still allowed:
+
+```sql
+CREATE INDEX idx ON t(length(val));  -- OK: length() returns an integer
+```
+
+### Built-In Types with Ordering
+
+The following built-in types declare `OPERATOR '<'` and support `ORDER BY` and indexing: `date`, `time`, `timestamp`, `varchar`, `smallint`, `boolean`, `uuid`, `bytea`, `numeric`.
+
+Types without ordering support: `json`, `jsonb`, `inet`.
+
 ## Defaults
 
 ### Type-Level Default
@@ -147,9 +250,9 @@ The default can be an expression or function call:
 
 ```sql
 CREATE TYPE reversed BASE text
-    ENCODE test_reverse_encode(value)
-    DECODE test_reverse_decode(value)
-    DEFAULT test_reverse_encode('auto');
+    ENCODE string_reverse(value)
+    DECODE string_reverse(value)
+    DEFAULT string_reverse('auto');
 
 CREATE TABLE t1(id INTEGER PRIMARY KEY, val reversed) STRICT;
 INSERT INTO t1(id) VALUES (1);
@@ -268,8 +371,8 @@ You can cast values to a custom type, which applies the encode function:
 
 ```sql
 CREATE TYPE reversed BASE text
-    ENCODE test_reverse_encode(value)
-    DECODE test_reverse_decode(value);
+    ENCODE string_reverse(value)
+    DECODE string_reverse(value);
 SELECT CAST('hello' AS reversed);
 -- olleh
 ```

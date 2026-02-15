@@ -3,7 +3,6 @@
 # --- ERROR TESTS: types without OPERATOR '<' cannot be sorted or indexed ---
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test order-by-blocked-for-non-orderable-type {
     CREATE TYPE noorder BASE text ENCODE value DECODE value;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val noorder) STRICT;
@@ -15,7 +14,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test create-index-blocked-for-non-orderable-type {
     CREATE TYPE noorder2 BASE text ENCODE value DECODE value;
     CREATE TABLE t2(id INTEGER PRIMARY KEY, val noorder2) STRICT;
@@ -26,8 +24,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 test expression-index-on-non-orderable-type-allowed {
     CREATE TYPE noorder3 BASE text ENCODE upper(value) DECODE value;
     CREATE TABLE t14(id INTEGER PRIMARY KEY, val noorder3) STRICT;
@@ -43,7 +39,6 @@ expect {
 
 # Identity encode/decode: encoded = decoded, so sort order matches alphabetical.
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-identity-encoding {
     CREATE TYPE orderable BASE text ENCODE value DECODE value OPERATOR '<';
     CREATE TABLE t3(id INTEGER PRIMARY KEY, val orderable) STRICT;
@@ -60,7 +55,6 @@ expect {
 
 # Same query with an index — must produce identical results.
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-identity-encoding-with-index {
     CREATE TYPE orderable2 BASE text ENCODE value DECODE value OPERATOR '<';
     CREATE TABLE t4(id INTEGER PRIMARY KEY, val orderable2) STRICT;
@@ -79,7 +73,6 @@ expect {
 # ENCODE value * 10 is a monotonic transform: 10→100, 20→200, 30→300.
 # Sorting encoded integers preserves numeric order.
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-monotonic-integer {
     CREATE TYPE myint BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
     CREATE TABLE t5(id INTEGER PRIMARY KEY, val myint) STRICT;
@@ -95,7 +88,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-monotonic-integer-with-index {
     CREATE TYPE myint1b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
     CREATE TABLE t5b(id INTEGER PRIMARY KEY, val myint1b) STRICT;
@@ -112,7 +104,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-desc-order {
     CREATE TYPE myint2 BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
     CREATE TABLE t6(id INTEGER PRIMARY KEY, val myint2) STRICT;
@@ -128,7 +119,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-desc-order-with-index {
     CREATE TYPE myint2b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
     CREATE TABLE t6b(id INTEGER PRIMARY KEY, val myint2b) STRICT;
@@ -149,7 +139,6 @@ expect {
 # Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
 # Naked '<' sorts encoded text: ananab < elppa < yrrehc → display: banana, apple, cherry.
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-non-monotonic-encoding {
     CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
     CREATE TABLE t_rev(id INTEGER PRIMARY KEY, val rev) STRICT;
@@ -166,7 +155,6 @@ expect {
 
 # Same query with an index — must produce identical results.
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-non-monotonic-encoding-with-index {
     CREATE TYPE rev2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
     CREATE TABLE t_rev2(id INTEGER PRIMARY KEY, val rev2) STRICT;
@@ -185,7 +173,6 @@ expect {
 # DESC with non-monotonic encoding.
 # DESC encoded: yrrehc > elppa > ananab → display: cherry, apple, banana.
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-non-monotonic-desc {
     CREATE TYPE rev3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
     CREATE TABLE t_rev3(id INTEGER PRIMARY KEY, val rev3) STRICT;
@@ -201,7 +188,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-non-monotonic-desc-with-index {
     CREATE TYPE rev4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
     CREATE TABLE t_rev4(id INTEGER PRIMARY KEY, val rev4) STRICT;
@@ -225,7 +211,6 @@ expect {
 # Sort: apple < banana < cherry → display: apple, banana, cherry.
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-comparator-recovers-alphabetical {
     CREATE TYPE rev_cmp BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
     CREATE TABLE t_cmp(id INTEGER PRIMARY KEY, val rev_cmp) STRICT;
@@ -241,7 +226,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-comparator-recovers-alphabetical-with-index {
     CREATE TYPE rev_cmp2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
     CREATE TABLE t_cmp2(id INTEGER PRIMARY KEY, val rev_cmp2) STRICT;
@@ -258,7 +242,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-comparator-desc {
     CREATE TYPE rev_cmp3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
     CREATE TABLE t_cmp3(id INTEGER PRIMARY KEY, val rev_cmp3) STRICT;
@@ -274,7 +257,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-comparator-desc-with-index {
     CREATE TYPE rev_cmp4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
     CREATE TABLE t_cmp4(id INTEGER PRIMARY KEY, val rev_cmp4) STRICT;
@@ -293,7 +275,6 @@ expect {
 # --- BUILT-IN TYPES: all have OPERATOR '<' and sort correctly ---
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test builtin-date-order-by {
     CREATE TABLE t7(id INTEGER PRIMARY KEY, d date) STRICT;
     INSERT INTO t7 VALUES (1, '2024-03-15');
@@ -308,7 +289,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test builtin-date-with-index {
     CREATE TABLE t7b(id INTEGER PRIMARY KEY, d date) STRICT;
     CREATE INDEX idx7b ON t7b(d);
@@ -324,7 +304,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test builtin-time-order-by {
     CREATE TABLE t8(id INTEGER PRIMARY KEY, t time) STRICT;
     INSERT INTO t8 VALUES (1, '14:30:00');
@@ -339,7 +318,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test builtin-timestamp-order-by {
     CREATE TABLE t9(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
     INSERT INTO t9 VALUES (1, '2024-03-15 14:30:00');
@@ -354,7 +332,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test builtin-varchar-order-by {
     CREATE TABLE t10(id INTEGER PRIMARY KEY, name varchar(50)) STRICT;
     INSERT INTO t10 VALUES (1, 'Charlie');
@@ -369,7 +346,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test builtin-smallint-order-by {
     CREATE TABLE t11(id INTEGER PRIMARY KEY, val smallint) STRICT;
     INSERT INTO t11 VALUES (1, 300);
@@ -384,7 +360,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test builtin-boolean-order-by {
     CREATE TABLE t12(id INTEGER PRIMARY KEY, flag boolean) STRICT;
     INSERT INTO t12 VALUES (1, true);
@@ -401,7 +376,6 @@ expect {
 # --- MISC ---
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-with-other-operators {
     CREATE TYPE mytype BASE text ENCODE value DECODE value OPERATOR '<' OPERATOR '=' DECODE value;
     CREATE TABLE t15(id INTEGER PRIMARY KEY, val mytype) STRICT;
@@ -417,7 +391,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test naked-lt-roundtrips-through-sql {
     CREATE TYPE rt_type BASE text ENCODE value DECODE value OPERATOR '<';
     SELECT sql FROM sqlite_turso_types WHERE name = 'rt_type';
@@ -427,7 +400,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test custom-comparator-roundtrips-through-sql {
     CREATE TYPE rt_type2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
     SELECT sql FROM sqlite_turso_types WHERE name = 'rt_type2';

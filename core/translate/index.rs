@@ -124,6 +124,28 @@ pub fn translate_create_index(
     if connection.mvcc_enabled() && columns.iter().any(|c| c.expr.is_some()) {
         bail_parse_error!("Expression indexes are not supported in MVCC mode");
     }
+
+    // Block CREATE INDEX on non-orderable custom type columns
+    for col in &columns {
+        if col.expr.is_none() {
+            // Simple column reference (not expression index)
+            if let Some(column) = tbl.columns.get(col.pos_in_table) {
+                if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str, tbl.is_strict)
+                {
+                    if type_def.decode.is_some()
+                        && !type_def.operators.iter().any(|op| op.op == "<")
+                    {
+                        bail_parse_error!(
+                            "cannot create index on column '{}' of type '{}': type does not declare OPERATOR '<'",
+                            col.name,
+                            type_def.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     if !with_clause.is_empty() && using.is_none() {
         crate::bail_parse_error!(
             "Error: additional parameters are allowed only for custom module indices: '{idx_name}' is not custom module index"

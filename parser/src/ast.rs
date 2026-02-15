@@ -1177,8 +1177,8 @@ pub enum AlterTableBody {
 pub struct TypeOperator {
     /// operator symbol: "+", "-", "*", "/", "<", "=", etc.
     pub op: String,
-    /// function name to call
-    pub func_name: String,
+    /// function name to call, or None for naked operators (use base type comparison)
+    pub func_name: Option<String>,
 }
 
 /// A parameter in a `CREATE TYPE` definition, with an optional type annotation.

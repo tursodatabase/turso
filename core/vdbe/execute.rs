@@ -198,6 +198,22 @@ fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComp
                 }
             },
         )),
+        "string_reverse" => Some(std::sync::Arc::new(
+            |a: &ValueRef, b: &ValueRef| -> Ordering {
+                fn reverse_str(v: &ValueRef) -> String {
+                    match v {
+                        ValueRef::Text(t) => t.to_string().chars().rev().collect(),
+                        _ => String::new(),
+                    }
+                }
+                match (a, b) {
+                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
+                    (ValueRef::Null, _) => Ordering::Less,
+                    (_, ValueRef::Null) => Ordering::Greater,
+                    _ => reverse_str(a).cmp(&reverse_str(b)),
+                }
+            },
+        )),
         "test_uint_lt" => Some(std::sync::Arc::new(
             |a: &ValueRef, b: &ValueRef| -> Ordering {
                 fn to_u64(v: &ValueRef) -> Option<u64> {
@@ -6148,7 +6164,7 @@ pub fn op_function(
                 };
                 state.registers[*dest] = Register::Value(result);
             }
-            ScalarFunc::TestReverseEncode | ScalarFunc::TestReverseDecode => {
+            ScalarFunc::StringReverse => {
                 check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
