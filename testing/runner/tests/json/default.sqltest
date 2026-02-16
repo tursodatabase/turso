@@ -274,6 +274,20 @@ expect raw {
 # } {{{
 #   "x": 1
 # }}}
+test json_array_postive-expo {
+    SELECT json_array(-1e99, +2e100);
+}
+expect {
+    [-1.0e+99,2.0e+100]
+}
+
+test json_array_negative-expo {
+    SELECT json_array(-1e-99, +2e-100);
+}
+expect {
+    [-1.0e-99,2.0e-100]
+}
+
 test json_array_str {
     SELECT json_array('a')
 }
@@ -1529,6 +1543,20 @@ expect {
     {"user":{"profile":{"name":"Alice","age":25}}}
 }
 
+test json_set_postive-expo {
+    SELECT json_set(-1e99)
+}
+expect {
+    -1.0e+99
+}
+
+test json_set_negative-expo {
+    SELECT json_set(-1e-99)
+}
+expect {
+    -1.0e-99
+}
+
 test json_set_blob_value {
     SELECT json_set(3906369340027029955, '$.' || char(8) || '' || CAST(zeroblob(27) AS TEXT) || '5!""!!!$.' || char(6) || '62=!""%!!!!!!QQQQQQQQQQ' || char(13) || CAST(zeroblob(3) AS TEXT), x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00');
 }
@@ -1635,6 +1663,20 @@ expect {
 }
 
 # Tests for json_insert() function
+test json_insert_postive-expo {
+    SELECT json_insert(-1e99);
+}
+expect {
+    -1.0e+99
+}
+
+test json_insert_negative-expo {
+    SELECT json_insert(-1e-99);
+}
+expect {
+    -1.0e-99
+}
+
 test json_insert_new_key_in_nested_object {
     SELECT json_insert('{"a": {"b": {"c": 5}}}', '$.a.b.d', 10);
 }
