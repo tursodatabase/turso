@@ -3136,6 +3136,332 @@ fn test_commit_dependency_multiple_reads() {
     assert_eq!(dep_set.value().commit_dep_set.lock().len(), 3);
 }
 
+/// Hekaton §2.7 cascade abort with real connections and threads.
+///
+/// A Preparing writer is speculatively read by a reader on another thread.
+/// When the writer aborts, the reader's COMMIT must fail with
+/// CommitDependencyAborted (cascade abort via AbortNow).
+///
+/// Sequence:
+///   1. Writer: BEGIN CONCURRENT → UPDATE (real SQL)
+///   2. Writer state manually set to Preparing(end_ts)
+///   3. Reader thread: BEGIN → SELECT (speculative read → dependency) → INSERT
+///   4. Main thread: rollback writer → cascade abort via AbortNow
+///   5. Reader COMMIT → CommitDependencyAborted
+#[test]
+fn test_commit_dep_threaded_abort_cascades() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let mvcc_store = db.get_mvcc_store();
+
+    // Writer: real SQL operations
+    let writer_conn = db.connect();
+    writer_conn.execute("BEGIN CONCURRENT").unwrap();
+    writer_conn
+        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
+        .unwrap();
+    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
+
+    // Simulate mid-commit: transition writer to Preparing.
+    // end_ts comes from the global clock so the reader's begin_ts will be >=
+    // end_ts, satisfying the speculative read condition (Hekaton Table 1).
+    let end_ts = mvcc_store.clock.get_timestamp();
+    mvcc_store
+        .txs
+        .get(&writer_tx_id)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Preparing(end_ts));
+
+    // Reader signals after speculative read so main thread can abort writer.
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+
+    let db_arc = db.get_db();
+    let reader_handle = std::thread::spawn(move || {
+        let reader_conn = db_arc.connect().unwrap();
+        reader_conn.execute("BEGIN CONCURRENT").unwrap();
+
+        // SELECT triggers speculative read: reader.begin_ts >= writer.end_ts
+        // → Hekaton Table 1: visible, register commit dependency
+        let mut stmt = reader_conn
+            .prepare("SELECT value FROM t WHERE id = 1")
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+
+        // Write so COMMIT exercises the full commit state machine path.
+        reader_conn
+            .execute("INSERT INTO t VALUES (2, 'reader_data')")
+            .unwrap();
+
+        // Signal: speculative read done, dependency registered
+        signal_tx.send(()).unwrap();
+
+        // COMMIT blocks in WaitForDependencies until the writer resolves.
+        // Writer will abort → AbortNow set → CommitDependencyAborted.
+        let commit_result = reader_conn.execute("COMMIT");
+        let _ = reader_conn.close(); // cleanup (rolls back if still active)
+        (rows, commit_result)
+    });
+
+    // Wait for reader to complete speculative read
+    signal_rx.recv().unwrap();
+
+    // Abort writer → cascade: sets AbortNow on reader, decrements counter
+    mvcc_store.rollback_tx(writer_tx_id, writer_conn.pager.load().clone(), &writer_conn);
+
+    let (rows, commit_result) = reader_handle.join().unwrap();
+
+    // Reader saw the writer's modified value via speculative read
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0].to_text().unwrap(),
+        "modified",
+        "reader should have speculatively read the Preparing writer's value"
+    );
+
+    // Reader's COMMIT must fail: depended-on writer aborted
+    assert!(
+        matches!(commit_result, Err(LimboError::CommitDependencyAborted)),
+        "expected CommitDependencyAborted, got: {:?}",
+        commit_result
+    );
+
+    // Verify database consistency
+    {
+        let conn = db.connect();
+
+        // Only the initial value should remain
+        let mut stmt = conn.prepare("SELECT value FROM t WHERE id = 1").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].to_text().unwrap(), "initial");
+
+        // Reader's INSERT must not be visible (cascade-aborted)
+        let mut stmt = conn.prepare("SELECT * FROM t WHERE id = 2").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert!(
+            rows.is_empty(),
+            "reader's write should not be visible after cascade abort"
+        );
+    }
+}
+
+/// Hekaton §2.7: multiple readers depending on the same Preparing writer
+/// all cascade-abort when the writer aborts.
+#[test]
+fn test_commit_dep_threaded_multiple_dependents_abort() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let mvcc_store = db.get_mvcc_store();
+
+    // Writer
+    let writer_conn = db.connect();
+    writer_conn.execute("BEGIN CONCURRENT").unwrap();
+    writer_conn
+        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
+        .unwrap();
+    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
+
+    let end_ts = mvcc_store.clock.get_timestamp();
+    mvcc_store
+        .txs
+        .get(&writer_tx_id)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Preparing(end_ts));
+
+    let num_readers = 4;
+    // Barrier: all readers + main thread synchronize after speculative reads
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(num_readers + 1));
+
+    let mut handles = Vec::new();
+    for i in 0..num_readers {
+        let db_arc = db.get_db();
+        let barrier_clone = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let conn = db_arc.connect().unwrap();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+
+            // Speculative read from Preparing writer
+            let mut stmt = conn.prepare("SELECT value FROM t WHERE id = 1").unwrap();
+            let rows = stmt.run_collect_rows().unwrap();
+
+            // Each reader writes to a unique row (no conflicts)
+            conn.execute(&format!(
+                "INSERT INTO t VALUES ({}, 'reader_{}')",
+                i + 10,
+                i
+            ))
+            .unwrap();
+
+            // Signal: all readers done with speculative reads
+            barrier_clone.wait();
+
+            let commit_result = conn.execute("COMMIT");
+            let _ = conn.close();
+            (rows, commit_result)
+        }));
+    }
+
+    // Wait for all readers to complete speculative reads
+    barrier.wait();
+
+    // Abort writer → cascade to ALL readers
+    mvcc_store.rollback_tx(writer_tx_id, writer_conn.pager.load().clone(), &writer_conn);
+
+    for handle in handles {
+        let (rows, commit_result) = handle.join().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].to_text().unwrap(), "modified");
+        assert!(
+            matches!(commit_result, Err(LimboError::CommitDependencyAborted)),
+            "expected CommitDependencyAborted, got: {:?}",
+            commit_result
+        );
+    }
+
+    // All reader writes should be invisible — only the initial row remains
+    {
+        let conn = db.connect();
+        let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    }
+}
+
+/// Hekaton §2.7 happy path: when a Preparing writer commits, the dependent
+/// reader's CommitDepCounter is decremented and the reader can proceed.
+#[test]
+fn test_commit_dep_threaded_commit_resolves() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let mvcc_store = db.get_mvcc_store();
+
+    // Writer: UPDATE via real connection, then set to Preparing
+    let writer_conn = db.connect();
+    writer_conn.execute("BEGIN CONCURRENT").unwrap();
+    writer_conn
+        .execute("UPDATE t SET value = 'committed' WHERE id = 1")
+        .unwrap();
+    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
+
+    let end_ts = mvcc_store.clock.get_timestamp();
+    mvcc_store
+        .txs
+        .get(&writer_tx_id)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Preparing(end_ts));
+
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+
+    let db_arc = db.get_db();
+    let reader_handle = std::thread::spawn(move || {
+        let reader_conn = db_arc.connect().unwrap();
+        reader_conn.execute("BEGIN CONCURRENT").unwrap();
+
+        let mut stmt = reader_conn
+            .prepare("SELECT value FROM t WHERE id = 1")
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+
+        reader_conn
+            .execute("INSERT INTO t VALUES (2, 'reader_data')")
+            .unwrap();
+
+        signal_tx.send(()).unwrap();
+
+        // COMMIT blocks in WaitForDependencies. Writer will commit →
+        // counter decremented → reader proceeds.
+        let commit_result = reader_conn.execute("COMMIT");
+        let _ = reader_conn.close();
+        (rows, commit_result)
+    });
+
+    signal_rx.recv().unwrap();
+
+    // Complete the writer's commit manually (postprocessing):
+    // 1. Convert TxID → Timestamp in row versions
+    // 2. Set state to Committed
+    // 3. Drain CommitDepSet, decrement dependents' counters
+    {
+        let writer_tx = mvcc_store.txs.get(&writer_tx_id).unwrap();
+        let writer_tx = writer_tx.value();
+
+        // Convert TxID→Timestamp in row versions (Hekaton §3.3 postprocessing)
+        for entry in mvcc_store.rows.iter() {
+            let mut rvs = entry.value().write();
+            for rv in rvs.iter_mut() {
+                if rv.begin == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                }
+                if rv.end == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                }
+            }
+        }
+
+        // Committed state + notify dependents
+        writer_tx.state.store(TransactionState::Committed(end_ts));
+        let dependents = std::mem::take(&mut *writer_tx.commit_dep_set.lock());
+        for dep_tx_id in dependents {
+            if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
+                dep_tx_entry
+                    .value()
+                    .commit_dep_counter
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    let (rows, commit_result) = reader_handle.join().unwrap();
+
+    // Reader speculatively read the writer's value
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_text().unwrap(), "committed");
+
+    // Reader's COMMIT succeeds: dependency resolved by writer's commit
+    assert!(
+        commit_result.is_ok(),
+        "expected reader COMMIT to succeed, got: {:?}",
+        commit_result
+    );
+
+    // Both writes are visible
+    {
+        let conn = db.connect();
+        let mut stmt = conn.prepare("SELECT value FROM t ORDER BY id").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].to_text().unwrap(), "committed");
+        assert_eq!(rows[1][0].to_text().unwrap(), "reader_data");
+    }
+}
+
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
