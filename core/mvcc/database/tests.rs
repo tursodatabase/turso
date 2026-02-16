@@ -3229,8 +3229,7 @@ fn test_commit_dep_threaded_abort_cascades() {
     // Reader's COMMIT must fail: depended-on writer aborted
     assert!(
         matches!(commit_result, Err(LimboError::CommitDependencyAborted)),
-        "expected CommitDependencyAborted, got: {:?}",
-        commit_result
+        "expected CommitDependencyAborted, got: {commit_result:?}",
     );
 
     // Verify database consistency
@@ -3302,10 +3301,9 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
             let rows = stmt.run_collect_rows().unwrap();
 
             // Each reader writes to a unique row (no conflicts)
-            conn.execute(&format!(
-                "INSERT INTO t VALUES ({}, 'reader_{}')",
+            conn.execute(format!(
+                "INSERT INTO t VALUES ({}, 'reader_{i}')",
                 i + 10,
-                i
             ))
             .unwrap();
 
@@ -3330,8 +3328,7 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
         assert_eq!(rows[0][0].to_text().unwrap(), "modified");
         assert!(
             matches!(commit_result, Err(LimboError::CommitDependencyAborted)),
-            "expected CommitDependencyAborted, got: {:?}",
-            commit_result
+            "expected CommitDependencyAborted, got: {commit_result:?}",
         );
     }
 
@@ -3445,8 +3442,7 @@ fn test_commit_dep_threaded_commit_resolves() {
     // Reader's COMMIT succeeds: dependency resolved by writer's commit
     assert!(
         commit_result.is_ok(),
-        "expected reader COMMIT to succeed, got: {:?}",
-        commit_result
+        "expected reader COMMIT to succeed, got: {commit_result:?}",
     );
 
     // Both writes are visible
@@ -3528,8 +3524,7 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
     // Read-only tx must still fail when its dependency aborts
     assert!(
         matches!(commit_result, Err(LimboError::CommitDependencyAborted)),
-        "read-only tx should fail with CommitDependencyAborted, got: {:?}",
-        commit_result
+        "read-only tx should fail with CommitDependencyAborted, got: {commit_result:?}",
     );
 }
 
@@ -6424,8 +6419,7 @@ fn test_partial_commit_visibility_bug() {
                     // This simulates a multi-row operation like a bank transfer
                     for row_num in 0..ROWS_PER_BATCH {
                         conn.execute(format!(
-                            "INSERT INTO consistency_test VALUES ({}, {})",
-                            batch_id, row_num
+                            "INSERT INTO consistency_test VALUES ({batch_id}, {row_num})",
                         ))
                         .unwrap();
                     }
@@ -6479,7 +6473,7 @@ fn test_partial_commit_visibility_bug() {
                         let row_num = row[1].as_int().unwrap();
                         batches
                             .entry(batch_id)
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(row_num);
                     }
 
@@ -6499,19 +6493,16 @@ fn test_partial_commit_visibility_bug() {
                         // This is a SNAPSHOT ISOLATION VIOLATION.
                         if count != 0 && count != ROWS_PER_BATCH {
                             eprintln!(
-                                "[Reader {}] VIOLATION DETECTED at iteration {}!",
-                                reader_id, iteration
+                                "[Reader {reader_id}] VIOLATION DETECTED at iteration {iteration}!",
                             );
                             eprintln!(
-                                "  Batch {} has {} rows (expected {} or 0)",
-                                batch_id, count, ROWS_PER_BATCH
+                                "  Batch {batch_id} has {count} rows (expected {ROWS_PER_BATCH} or 0)",
                             );
-                            eprintln!("  Visible row_nums: {:?}", row_nums);
+                            eprintln!("  Visible row_nums: {row_nums:?}");
                             eprintln!();
                             eprintln!("  EXPLANATION:");
                             eprintln!(
-                                "  - This reader started a snapshot during batch {}'s commit",
-                                batch_id
+                                "  - This reader started a snapshot during batch {batch_id}'s commit",
                             );
                             eprintln!(
                                 "  - The commit loop (mod.rs:912-984) was updating timestamps"
@@ -6558,7 +6549,7 @@ fn test_partial_commit_visibility_bug() {
                     thread::sleep(Duration::from_micros(50));
                 }
 
-                eprintln!("[Reader {}] Completed {} iterations", reader_id, iteration);
+                eprintln!("[Reader {reader_id}] Completed {iteration} iterations");
             });
 
             reader_handles.push(handle);
