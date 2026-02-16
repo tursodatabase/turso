@@ -23,7 +23,7 @@ use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn},
 };
 use crate::Connection;
-use crate::{bail_parse_error, Result};
+use crate::{bail_parse_error, CaptureDataChangesExt, Result};
 
 use turso_ext::VTabKind;
 
@@ -500,7 +500,7 @@ pub fn emit_schema_entry(
     });
 
     if let Some(cdc_table_cursor_id) = cdc_table_cursor_id {
-        let after_record_reg = if program.capture_data_changes_mode().has_after() {
+        let after_record_reg = if program.capture_data_changes_info().has_after() {
             Some(record_reg)
         } else {
             None
@@ -841,7 +841,7 @@ pub fn translate_drop_table(
             flags: CmpInsFlags::default(),
             collation: None,
         });
-        let before_record_reg = if program.capture_data_changes_mode().has_before() {
+        let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 &mut program,
                 &schema_table.columns,
@@ -1143,6 +1143,59 @@ pub fn translate_drop_table(
         });
 
         program.preassign_label_to_next_insn(end_loop_label);
+    }
+
+    // Clean up turso_cdc_version entry for the dropped table (if version table exists)
+    if let Some(version_table) = resolver
+        .schema
+        .get_table(crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME)
+        .and_then(|t| t.btree())
+    {
+        let ver_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(version_table.clone()));
+        let ver_table_name_reg = program.alloc_register();
+        let dropped_name_reg = program.emit_string8_new_reg(tbl_name.name.as_str().to_string());
+        program.mark_last_insn_constant();
+
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: ver_cursor_id,
+            root_page: version_table.root_page.into(),
+            db: 0,
+        });
+
+        let end_ver_loop_label = program.allocate_label();
+        let ver_loop_start_label = program.allocate_label();
+
+        program.emit_insn(Insn::Rewind {
+            cursor_id: ver_cursor_id,
+            pc_if_empty: end_ver_loop_label,
+        });
+
+        program.preassign_label_to_next_insn(ver_loop_start_label);
+
+        program.emit_column_or_rowid(ver_cursor_id, 0, ver_table_name_reg);
+
+        let continue_ver_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: ver_table_name_reg,
+            rhs: dropped_name_reg,
+            target_pc: continue_ver_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+
+        program.emit_insn(Insn::Delete {
+            cursor_id: ver_cursor_id,
+            table_name: crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME.to_string(),
+            is_part_of_update: false,
+        });
+
+        program.resolve_label(continue_ver_label, program.offset());
+        program.emit_insn(Insn::Next {
+            cursor_id: ver_cursor_id,
+            pc_if_next: ver_loop_start_label,
+        });
+
+        program.preassign_label_to_next_insn(end_ver_loop_label);
     }
 
     // Drop the in-memory structures for the table

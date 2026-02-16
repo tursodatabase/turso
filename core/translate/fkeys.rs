@@ -1237,7 +1237,7 @@ fn emit_fk_action_subprogram(
 ) -> Result<()> {
     let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
         QueryMode::Normal,
-        program.capture_data_changes_mode().clone(),
+        program.capture_data_changes_info().clone(),
         FK_SUBPROGRAM_OPTS,
     );
     subprogram_builder.prologue();

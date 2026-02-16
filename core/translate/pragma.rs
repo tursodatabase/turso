@@ -4,8 +4,8 @@
 use crate::sync::Arc;
 use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
-use turso_parser::ast::{PragmaName, QualifiedName};
+use turso_parser::ast::PragmaName;
+use turso_parser::ast::{self, Expr, Literal};
 
 use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
@@ -19,11 +19,10 @@ use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
-use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Numeric, Value};
+use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -349,31 +348,21 @@ fn update_pragma(
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
-            // todo(sivukhin): ideally, we should consistently update capture_data_changes connection flag only after successfull execution of schema change statement
-            // but for now, let's keep it as is...
-            let opts = CaptureDataChangesMode::parse(&value)?;
-            if let Some(table) = &opts.table() {
-                if resolver.schema.get_table(table).is_none() {
-                    program = translate_create_table(
-                        QualifiedName {
-                            db_name: None,
-                            name: ast::Name::exact(table.to_string()),
-                            alias: None,
-                        },
-                        resolver,
-                        false,
-                        true, // if_not_exists
-                        ast::CreateTableBody::ColumnsAndConstraints {
-                            columns: turso_cdc_table_columns(),
-                            constraints: vec![],
-                            options: ast::TableOptions::empty(),
-                        },
-                        program,
-                        &connection,
-                    )?;
-                }
-            }
-            connection.set_capture_data_changes(opts);
+            let opts =
+                CaptureDataChangesInfo::parse(&value, Some(TURSO_CDC_CURRENT_VERSION.to_string()))?;
+            // InitCdcVersion handles everything at execution time:
+            // - For enable: creates CDC table + version table, records version,
+            //   reads back actual version, defers CDC state to Halt
+            // - For disable ("off"): defers CDC=None to Halt
+            let cdc_table_name = opts
+                .as_ref()
+                .map(|i| i.table.to_string())
+                .unwrap_or_default();
+            program.emit_insn(Insn::InitCdcVersion {
+                cdc_table_name,
+                version: TURSO_CDC_CURRENT_VERSION.to_string(),
+                cdc_mode: value,
+            });
             Ok((program, TransactionMode::Write))
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
@@ -1044,16 +1033,27 @@ fn query_pragma(
         PragmaName::UnstableCaptureDataChangesConn => {
             let pragma = pragma_for(&pragma);
             let second_column = program.alloc_register();
-            let opts = connection.get_capture_data_changes();
-            program.emit_string8(opts.mode_name().to_string(), register);
-            if let Some(table) = &opts.table() {
-                program.emit_string8(table.to_string(), second_column);
-            } else {
-                program.emit_null(second_column, None);
+            let third_column = program.alloc_register();
+            let opts = connection.get_capture_data_changes_info();
+            match opts.as_ref() {
+                Some(info) => {
+                    program.emit_string8(info.mode_name().to_string(), register);
+                    program.emit_string8(info.table.clone(), second_column);
+                    match &info.version {
+                        Some(v) => program.emit_string8(v.clone(), third_column),
+                        None => program.emit_null(third_column, None),
+                    }
+                }
+                None => {
+                    program.emit_string8("off".to_string(), register);
+                    program.emit_null(second_column, None);
+                    program.emit_null(third_column, None);
+                }
             }
-            program.emit_result_row(register, 2);
+            program.emit_result_row(register, 3);
             program.add_pragma_result_column(pragma.columns[0].to_string());
             program.add_pragma_result_column(pragma.columns[1].to_string());
+            program.add_pragma_result_column(pragma.columns[2].to_string());
             Ok((program, TransactionMode::Read))
         }
         PragmaName::QueryOnly => {
@@ -1313,78 +1313,8 @@ fn update_cache_size(
 }
 
 pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
-fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
-    vec![
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("change_id".to_string()),
-            col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-            }),
-            constraints: vec![ast::NamedColumnConstraint {
-                name: None,
-                constraint: ast::ColumnConstraint::PrimaryKey {
-                    order: None,
-                    conflict_clause: None,
-                    auto_increment: true,
-                },
-            }],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("change_time".to_string()),
-            col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("change_type".to_string()),
-            col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("table_name".to_string()),
-            col_type: Some(ast::Type {
-                name: "TEXT".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("id".to_string()),
-            col_type: None,
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("before".to_string()),
-            col_type: Some(ast::Type {
-                name: "BLOB".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("after".to_string()),
-            col_type: Some(ast::Type {
-                name: "BLOB".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("updates".to_string()),
-            col_type: Some(ast::Type {
-                name: "BLOB".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-    ]
-}
+pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
+pub const TURSO_CDC_CURRENT_VERSION: &str = "v1";
 
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;

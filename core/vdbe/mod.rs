@@ -68,7 +68,7 @@ use crate::connection::AttachedDatabasesFingerprint;
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
 use crate::{
-    AtomicBool, CaptureDataChangesMode, Connection, MvStore, Result, SyncMode, TransactionState,
+    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, SyncMode, TransactionState,
 };
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
@@ -395,6 +395,13 @@ pub struct ProgramState {
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
     pub(crate) pending_fail_error: Option<LimboError>,
+    /// Pending CDC info to apply after the program completes successfully.
+    /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
+    /// transaction rolls back, the connection's CDC state remains unchanged.
+    ///
+    /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
+    /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
+    pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
 }
 
 impl std::fmt::Debug for Program {
@@ -471,6 +478,7 @@ impl ProgramState {
             n_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
+            pending_cdc_info: None,
         }
     }
 
@@ -834,7 +842,7 @@ pub struct PrepareContext {
     database_ptr: usize,
     foreign_keys: bool,
     query_only: bool,
-    capture_data_changes: CaptureDataChangesMode,
+    capture_data_changes: Option<CaptureDataChangesInfo>,
     syms_generation: u64,
     attached_databases_fingerprint: AttachedDatabasesFingerprint,
     busy_timeout_ms: u64,
@@ -855,7 +863,7 @@ impl PrepareContext {
             database_ptr: connection.database_ptr(),
             foreign_keys: connection.foreign_keys_enabled(),
             query_only: connection.get_query_only(),
-            capture_data_changes: connection.get_capture_data_changes().clone(),
+            capture_data_changes: connection.get_capture_data_changes_info().clone(),
             syms_generation: connection.syms_generation(),
             attached_databases_fingerprint: connection.attached_databases_fingerprint(),
             busy_timeout_ms: connection.get_busy_timeout().as_millis() as u64,

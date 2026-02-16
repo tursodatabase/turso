@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
+use turso_core::TURSO_CDC_CURRENT_VERSION;
 
 use crate::common::{limbo_exec_rows, TempDatabase};
 
@@ -933,6 +936,8 @@ fn test_cdc_schema_changes(db: TempDatabase) {
     conn.execute("DROP INDEX q_abc").unwrap();
     let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
 
+    // turso_cdc_version table + its auto-index add 2 entries to sqlite_schema,
+    // shifting rowids and rootpages by +2 compared to before version tracking
     assert_eq!(
         rows,
         vec![
@@ -941,13 +946,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
+                Value::Integer(5),
                 Value::Null,
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -959,13 +964,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(6),
+                Value::Integer(8),
                 Value::Null,
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("q".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(7),
+                    Value::Integer(9),
                     Value::Text("CREATE TABLE q (a, b, c)".to_string())
                 ])),
                 Value::Null,
@@ -975,13 +980,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(7),
+                Value::Integer(9),
                 Value::Null,
                 Value::Blob(record([
                     Value::Text("index".to_string()),
                     Value::Text("t_q".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(8),
+                    Value::Integer(10),
                     Value::Text("CREATE INDEX t_q ON t (q)".to_string())
                 ])),
                 Value::Null,
@@ -991,13 +996,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(8),
+                Value::Integer(10),
                 Value::Null,
                 Value::Blob(record([
                     Value::Text("index".to_string()),
                     Value::Text("q_abc".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(9),
+                    Value::Integer(11),
                     Value::Text("CREATE INDEX q_abc ON q (a, b, c)".to_string())
                 ])),
                 Value::Null,
@@ -1007,12 +1012,12 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(-1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
+                Value::Integer(5),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -1025,12 +1030,12 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(-1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(8),
+                Value::Integer(10),
                 Value::Blob(record([
                     Value::Text("index".to_string()),
                     Value::Text("q_abc".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(9),
+                    Value::Integer(11),
                     Value::Text("CREATE INDEX q_abc ON q (a, b, c)".to_string())
                 ])),
                 Value::Null,
@@ -1052,6 +1057,8 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
     conn.execute("ALTER TABLE t ADD COLUMN t").unwrap();
     let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
 
+    // turso_cdc_version table + its auto-index add 2 entries to sqlite_schema,
+    // shifting rowids and rootpages by +2 compared to before version tracking
     assert_eq!(
         rows,
         vec![
@@ -1060,13 +1067,13 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(1),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
+                Value::Integer(5),
                 Value::Null,
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -1078,12 +1085,12 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(0),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
+                Value::Integer(5),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -1092,7 +1099,7 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Value::Blob(record([
@@ -1113,19 +1120,19 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                 Value::Null,
                 Value::Integer(0),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
+                Value::Integer(5),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(4),
+                    Value::Integer(6),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, t, PRIMARY KEY (x, y))".to_string()
                     )
@@ -1145,4 +1152,549 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
             ],
         ]
     );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_table_created(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("turso_cdc".to_string()),
+            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
+        ]]
+    );
+}
+
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_version_custom_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('id,my_cdc')")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("my_cdc".to_string()),
+            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
+        ]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_not_created_when_exists(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    // First enable creates turso_cdc table and version entry
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+    // Disable CDC
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('off')")
+        .unwrap();
+    // Re-enable CDC — turso_cdc table already exists, so no duplicate version row
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("turso_cdc".to_string()),
+            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
+        ]]
+    );
+}
+
+/// Helper: set up a database with pre-existing v1 CDC table and version table,
+/// then enable CDC with the given mode and perform insert/update/delete operations.
+fn setup_backward_compat_v1(db: &TempDatabase, mode: &str) -> Arc<turso_core::Connection> {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Simulate a database that already has the v1 CDC table and version table
+    // (as if created by a previous version of the code)
+    conn.execute(
+        "CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+    ).unwrap();
+    conn.execute(
+        "CREATE TABLE turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v1')")
+        .unwrap();
+
+    // Enable CDC — table already exists, InitCdcVersion reads version from table
+    conn.execute(format!(
+        "PRAGMA unstable_capture_data_changes_conn('{mode}')"
+    ))
+    .unwrap();
+
+    // Verify version table is unchanged
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("turso_cdc".to_string()),
+            Value::Text("v1".to_string()),
+        ]]
+    );
+
+    // Perform insert, update, delete
+    conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
+    conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 3").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 1").unwrap();
+
+    conn
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_backward_compat_v1_id(db: TempDatabase) {
+    let conn = setup_backward_compat_v1(&db, "id");
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_backward_compat_v1_before(db: TempDatabase) {
+    let conn = setup_backward_compat_v1(&db, "before");
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
+                Value::Null,
+                Value::Null,
+            ]
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_backward_compat_v1_after(db: TempDatabase) {
+    let conn = setup_backward_compat_v1(&db, "after");
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_backward_compat_v1_full(db: TempDatabase) {
+    let conn = setup_backward_compat_v1(&db, "full");
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
+                Value::Blob(record([
+                    Value::Integer(0),
+                    Value::Integer(1),
+                    Value::Null,
+                    Value::Integer(3)
+                ])),
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(5),
+                Value::Null,
+                Value::Integer(-1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
+                Value::Null,
+                Value::Null,
+            ]
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_preserves_old_version(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Simulate a database with a pre-existing CDC table at a fake old version
+    conn.execute(
+        "CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+    ).unwrap();
+    conn.execute(
+        "CREATE TABLE turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v0')")
+        .unwrap();
+
+    // Enable CDC — should preserve the existing "v0" version, not overwrite with current
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // Version table should still have "v0"
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("turso_cdc".to_string()),
+            Value::Text("v0".to_string()),
+        ]]
+    );
+
+    // PRAGMA GET should also report "v0"
+    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("full".to_string()),
+            Value::Text("turso_cdc".to_string()),
+            Value::Text("v0".to_string()),
+        ]]
+    );
+
+    // Connection state should carry "v0" version
+    let info = conn.get_capture_data_changes_info();
+    let info = info.as_ref().expect("CDC should be enabled");
+    assert_eq!(info.mode, turso_core::CaptureDataChangesMode::Full);
+    assert_eq!(info.table, "turso_cdc");
+    assert_eq!(info.version, Some("v0".to_string()));
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_pragma_get_returns_version(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Before enabling CDC, PRAGMA GET should return "off" with null table and version
+    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("off".to_string()),
+            Value::Null,
+            Value::Null,
+        ]]
+    );
+
+    // Enable CDC
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // PRAGMA GET should return mode, table, and version
+    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("full".to_string()),
+            Value::Text("turso_cdc".to_string()),
+            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
+        ]]
+    );
+
+    // Disable CDC and verify it goes back to "off"
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('off')")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("off".to_string()),
+            Value::Null,
+            Value::Null,
+        ]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_pragma_idempotent(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Enable CDC
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // Insert a row — should produce CDC entries
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // Enable CDC again (idempotent — should not create extra CDC entries)
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // CDC count should not have changed (no self-capture)
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // Switch mode — should also be idempotent (no DDL, just mode change)
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // Verify mode actually changed
+    let info = conn.get_capture_data_changes_info();
+    let info = info.as_ref().expect("CDC should be enabled");
+    assert_eq!(info.mode, turso_core::CaptureDataChangesMode::Id);
+
+    // Insert another row — should still capture
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc");
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_version_helper_defaults_to_v1(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Simulate a pre-version-tracking database: CDC table exists but no version table
+    conn.execute(
+        "CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+    ).unwrap();
+
+    // Enable CDC — InitCdcVersion will create version table and insert current version
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // version() helper should return the current version
+    let info = conn.get_capture_data_changes_info();
+    let info = info.as_ref().expect("CDC should be enabled");
+    assert_eq!(info.version(), TURSO_CDC_CURRENT_VERSION);
+
+    // Now test with None version directly via parse (simulates old code path)
+    let parsed = turso_core::CaptureDataChangesInfo::parse("full", None)
+        .unwrap()
+        .unwrap();
+    // version field is None, but version() should return V1
+    assert_eq!(parsed.version, None);
+    assert_eq!(parsed.version(), TURSO_CDC_CURRENT_VERSION);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_drop_table_cleans_up_version(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Enable CDC — creates turso_cdc and turso_cdc_version tables
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+
+    // Verify version entry exists
+    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("turso_cdc".into()),
+            Value::Text("v1".into())
+        ]]
+    );
+
+    // Drop the CDC table
+    conn.execute("DROP TABLE turso_cdc").unwrap();
+
+    // Version entry should be cleaned up
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc_version");
+    assert_eq!(rows, vec![vec![Value::Integer(0)]]);
 }

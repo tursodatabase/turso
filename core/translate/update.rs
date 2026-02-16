@@ -11,7 +11,7 @@ use crate::{
     schema::{Schema, Table},
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
-    Connection,
+    CaptureDataChangesExt, Connection,
 };
 use turso_parser::ast::{self, Expr, Indexed, SortOrder};
 
@@ -103,7 +103,7 @@ pub fn translate_update_for_schema_change(
     let mut plan = prepare_update_plan(&mut program, resolver, body, connection, true)?;
 
     if let Plan::Update(update_plan) = &mut plan {
-        if program.capture_data_changes_mode().has_updates() {
+        if program.capture_data_changes_info().has_updates() {
             update_plan.cdc_update_alter_statement = Some(ddl_query.to_string());
         }
 

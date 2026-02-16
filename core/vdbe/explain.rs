@@ -2066,6 +2066,15 @@ pub fn insn_to_row(
             0,
             format!("dest={dest_path}"),
         ),
+        Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
+            "InitCdcVersion",
+            0,
+            0,
+            0,
+            Value::build_text(format!("{cdc_table_name}={version}")),
+            0,
+            format!("ensure turso_cdc_version({cdc_table_name}, {version}); set cdc={cdc_mode}"),
+        ),
     }
 }
 

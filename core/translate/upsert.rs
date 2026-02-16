@@ -17,7 +17,6 @@ use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
 };
 use crate::vdbe::insn::{to_u16, CmpInsFlags};
-use crate::Connection;
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -40,6 +39,7 @@ use crate::{
         insn::{IdxInsertFlags, InsertFlags, Insn},
     },
 };
+use crate::{CaptureDataChangesExt, Connection};
 
 // The following comment is copied directly from SQLite source and should be used as a guiding light
 // whenever we encounter compatibility bugs related to conflict clause handling:
@@ -971,7 +971,7 @@ pub fn emit_upsert(
         let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         if new_rowid_reg.is_some() {
             // DELETE (before)
-            let before_rec = if program.capture_data_changes_mode().has_before() {
+            let before_rec = if program.capture_data_changes_info().has_before() {
                 Some(emit_cdc_full_record(
                     program,
                     table.columns(),
@@ -994,7 +994,7 @@ pub fn emit_upsert(
             )?;
 
             // INSERT (after)
-            let after_rec = if program.capture_data_changes_mode().has_after() {
+            let after_rec = if program.capture_data_changes_info().has_after() {
                 Some(emit_cdc_patch_record(
                     program, table, new_start, rec, new_rowid,
                 ))
@@ -1013,7 +1013,7 @@ pub fn emit_upsert(
                 table.get_name(),
             )?;
         } else {
-            let after_rec = if program.capture_data_changes_mode().has_after() {
+            let after_rec = if program.capture_data_changes_info().has_after() {
                 Some(emit_cdc_patch_record(
                     program,
                     table,
@@ -1024,7 +1024,7 @@ pub fn emit_upsert(
             } else {
                 None
             };
-            let before_rec = if program.capture_data_changes_mode().has_before() {
+            let before_rec = if program.capture_data_changes_info().has_before() {
                 Some(emit_cdc_full_record(
                     program,
                     table.columns(),

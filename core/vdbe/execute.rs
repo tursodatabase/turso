@@ -15,6 +15,7 @@ use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
+use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
     ImmutableRecord, IndexInfo, SeekResult, Text,
@@ -55,7 +56,10 @@ use crate::{
     stats::StatAccum,
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, IOExt, MvCursor};
+use crate::{
+    get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
+    IOExt, MvCursor,
+};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
@@ -2017,13 +2021,24 @@ pub fn halt(
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         vtab_commit_all(&program.connection)?;
         index_method_pre_commit_all(state, pager)?;
-        program
+        let result = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
-            .map(Into::into)
+            .map(Into::into);
+        // Apply deferred CDC state after successful commit
+        if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+            if let Some(cdc_info) = state.pending_cdc_info.take() {
+                program.connection.set_capture_data_changes_info(cdc_info);
+            }
+        }
+        result
     } else {
         // Even if deferred violations are present, the statement subtransaction completes successfully when
         // it is part of an interactive transaction.
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+        // Apply deferred CDC state after successful statement completion
+        if let Some(cdc_info) = state.pending_cdc_info.take() {
+            program.connection.set_capture_data_changes_info(cdc_info);
+        }
         Ok(InsnFunctionStepResult::Done)
     }
 }
@@ -8305,6 +8320,120 @@ pub fn op_parse_schema(
     conn.auto_commit
         .store(previous_auto_commit, Ordering::SeqCst);
     maybe_nested_stmt_err?;
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_init_cdc_version(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        InitCdcVersion {
+            cdc_table_name,
+            version,
+            cdc_mode,
+        },
+        insn
+    );
+
+    let conn = program.connection.clone();
+
+    // "off" — disable CDC (table and version entry are preserved)
+    if CaptureDataChangesInfo::parse(cdc_mode, None)?.is_none() {
+        state.pending_cdc_info = Some(None);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // If CDC is already enabled, re-parse with current version and exit early.
+    // This makes the operation idempotent and avoids CDC capturing its own
+    // table creation when the pragma is called multiple times.
+    {
+        let current = conn.get_capture_data_changes_info();
+        if let Some(info) = current.as_ref() {
+            let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version.clone())?;
+            state.pending_cdc_info = Some(opts);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
+
+    // Step 1: Create CDC table if needed
+    {
+        conn.start_nested();
+        let mut stmt = conn.prepare(format!(
+            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+        ))?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        let res = stmt.run_ignore_rows();
+        conn.end_nested();
+        res?;
+    }
+
+    // Step 2: Create version table if needed
+    {
+        conn.start_nested();
+        let mut stmt = conn.prepare(format!(
+            "CREATE TABLE IF NOT EXISTS {TURSO_CDC_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+        ))?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        let res = stmt.run_ignore_rows();
+        conn.end_nested();
+        res?;
+    }
+
+    // Step 3: Insert version row only if one doesn't already exist.
+    // If the table was previously initialized with an older version, we must
+    // keep that version (the CDC table schema hasn't been migrated).
+    {
+        conn.start_nested();
+        let mut stmt = conn.prepare(format!(
+            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{cdc_table_name}', '{version}')",
+        ))?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        let res = stmt.run_ignore_rows();
+        conn.end_nested();
+        res?;
+    }
+
+    // Step 4: Read back the actual version from the table (may differ from
+    // `version` if the row already existed with an older version).
+    let actual_version = {
+        conn.start_nested();
+        let mut stmt = conn.prepare(format!(
+            "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{cdc_table_name}'",
+        ))?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        let rows = stmt.run_collect_rows();
+        conn.end_nested();
+        let rows = rows?;
+        match rows.first().and_then(|r| r.first()) {
+            Some(crate::Value::Text(text)) => text.to_string(),
+            _ => version.to_string(),
+        }
+    };
+
+    // Defer enabling CDC until the program completes successfully (Halt).
+    // This ensures that if the transaction rolls back, the connection's
+    // CDC state remains unchanged.
+    let opts = CaptureDataChangesInfo::parse(cdc_mode, Some(actual_version))?;
+    state.pending_cdc_info = Some(opts);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
