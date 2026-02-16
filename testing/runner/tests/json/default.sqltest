@@ -1272,6 +1272,12 @@ expect {
     0
 }
 
+test json_valid_no_args {
+    SELECT json_valid();
+}
+expect error {
+}
+
 test json-patch-basic-1 {
     select json_patch('{"a":1}', '{"b":2}');
 }

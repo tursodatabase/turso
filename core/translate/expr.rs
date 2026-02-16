@@ -1217,14 +1217,17 @@ pub fn translate_expr(
                             func_ctx,
                         )
                     }
-                    JsonFunc::JsonValid => translate_function(
-                        program,
-                        args,
-                        referenced_tables,
-                        resolver,
-                        target_register,
-                        func_ctx,
-                    ),
+                    JsonFunc::JsonValid => {
+                        let args = expect_arguments_exact!(args, 1, j);
+                        translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        )
+                    }
                     JsonFunc::JsonPatch | JsonFunc::JsonbPatch => {
                         let args = expect_arguments_exact!(args, 2, j);
                         translate_function(
