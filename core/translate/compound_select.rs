@@ -263,6 +263,7 @@ fn emit_compound_select(
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: dedupe_index.0,
                     index: dedupe_index.1.clone(),
+                    affinity_str: None,
                     is_delete: false,
                 };
                 let compound_select = Plan::CompoundSelect {
@@ -286,6 +287,7 @@ fn emit_compound_select(
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: dedupe_index.0,
                     index: dedupe_index.1.clone(),
+                    affinity_str: None,
                     is_delete: false,
                 };
 
@@ -316,6 +318,7 @@ fn emit_compound_select(
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
+                    affinity_str: None,
                     is_delete: false,
                 };
 
@@ -324,6 +327,7 @@ fn emit_compound_select(
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: right_cursor_id,
                     index: right_index,
+                    affinity_str: None,
                     is_delete: false,
                 };
                 let compound_select = Plan::CompoundSelect {
@@ -372,6 +376,7 @@ fn emit_compound_select(
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id,
                     index: index.clone(),
+                    affinity_str: None,
                     is_delete: false,
                 };
                 let compound_select = Plan::CompoundSelect {
@@ -394,6 +399,7 @@ fn emit_compound_select(
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id,
                     index: index.clone(),
+                    affinity_str: None,
                     is_delete: true,
                 };
                 emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());

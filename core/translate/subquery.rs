@@ -10,7 +10,7 @@ use crate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
         emitter::emit_program_for_select,
-        expr::{unwrap_parens, walk_expr_mut, WalkControl},
+        expr::{compare_affinity, get_expr_affinity, unwrap_parens, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
             ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
@@ -466,16 +466,33 @@ fn get_subquery_parser<'a>(
                 optimize_select_plan(&mut plan, resolver.schema)?;
                 // e.g. (x,y) IN (SELECT ...)
                 // or x IN (SELECT ...)
-                let lhs_column_count = match unwrap_parens(lhs.as_ref())? {
-                    ast::Expr::Parenthesized(exprs) => exprs.len(),
-                    _ => 1,
+                let lhs_columns = match unwrap_parens(lhs.as_ref())? {
+                    ast::Expr::Parenthesized(exprs) => {
+                        either::Left(exprs.iter().map(|e| e.as_ref()))
+                    }
+                    expr => either::Right(core::iter::once(expr)),
                 };
+                let lhs_column_count = lhs_columns.len();
                 if lhs_column_count != plan.result_columns.len() {
                     crate::bail_parse_error!(
                         "sub-select returns {} columns - expected {lhs_column_count}",
                         plan.result_columns.len()
                     );
                 }
+                let in_affinity_str: Arc<String> = Arc::new(
+                    lhs_columns
+                        .enumerate()
+                        .map(|(i, lhs_expr)| {
+                            let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables));
+                            compare_affinity(
+                                &plan.result_columns[i].expr,
+                                lhs_affinity,
+                                Some(&plan.table_references),
+                            )
+                            .aff_mask()
+                        })
+                        .collect(),
+                );
 
                 let mut columns = plan
                     .result_columns
@@ -516,6 +533,7 @@ fn get_subquery_parser<'a>(
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id,
                     index: ephemeral_index,
+                    affinity_str: Some(in_affinity_str.clone()),
                     is_delete: false,
                 };
 
@@ -523,7 +541,10 @@ fn get_subquery_parser<'a>(
                     subquery_id,
                     lhs: Some(lhs),
                     not_in: not,
-                    query_type: SubqueryType::In { cursor_id },
+                    query_type: SubqueryType::In {
+                        cursor_id,
+                        affinity_str: in_affinity_str.clone(),
+                    },
                 };
 
                 let correlated = plan.is_correlated();
@@ -531,7 +552,10 @@ fn get_subquery_parser<'a>(
 
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
-                    query_type: SubqueryType::In { cursor_id },
+                    query_type: SubqueryType::In {
+                        cursor_id,
+                        affinity_str: in_affinity_str,
+                    },
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(plan)),
                     },
@@ -1254,6 +1278,7 @@ fn emit_indexed_materialized_subquery(
         *dest = QueryDestination::EphemeralIndex {
             cursor_id: index_cursor_id,
             index: index.clone(),
+            affinity_str: None,
             is_delete: false,
         };
     }
@@ -1451,7 +1476,7 @@ pub fn emit_non_from_clause_subquery(
                 can_fallthrough: true,
             });
         }
-        SubqueryType::In { cursor_id } => {
+        SubqueryType::In { cursor_id, .. } => {
             program.emit_insn(Insn::OpenEphemeral {
                 cursor_id: *cursor_id,
                 is_table: false,

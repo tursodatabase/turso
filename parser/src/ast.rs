@@ -1,6 +1,8 @@
 pub mod check;
 pub mod fmt;
 
+use std::sync::Arc;
+
 use crate::lexer::is_keyword;
 use strum_macros::{EnumIter, EnumString};
 
@@ -515,7 +517,12 @@ pub enum SubqueryType {
     },
     /// IN subquery; result is stored in an ephemeral index.
     /// Example: x <NOT> IN (SELECT ...)
-    In { cursor_id: usize },
+    In {
+        cursor_id: usize,
+        /// Affinity string used by the IN operator probe and ephemeral materialization.
+        /// Mirrors SQLite's exprINAffinity behavior.
+        affinity_str: Arc<String>,
+    },
 }
 
 impl Expr {

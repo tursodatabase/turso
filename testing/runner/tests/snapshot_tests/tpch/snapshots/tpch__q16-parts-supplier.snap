@@ -88,7 +88,7 @@ addr  opcode                            p1   p2  p3  p4                         
   37              IdxGT                  5   61  42                                 0  key=[42..42]
   38              Integer                0   43   0                                 0  r[43]=0
   39              Column                 5    1  44                                 0  r[44]=sqlite_autoindex_partsupp_1.ps_suppkey
-  40              Affinity              44    1   0                                 0  r[44..45] = D
+  40              Affinity              44    1   0                                 0  r[44..45] = C
   41              Found                  0   50  44                                 0  if found goto 50
   42              Rewind                 0   48   0                                 0  Rewind  ephemeral_index_where_sub_t3
   43                Column               0    0  45                                 0  r[45]=ephemeral_index_where_sub_t3.s_suppkey

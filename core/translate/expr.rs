@@ -757,7 +757,10 @@ pub fn translate_expr(
                     });
                     Ok(target_register)
                 }
-                SubqueryType::In { cursor_id } => {
+                SubqueryType::In {
+                    cursor_id,
+                    affinity_str,
+                } => {
                     // jump here when we can definitely skip the row (result = 0/false)
                     let label_skip_row = program.allocate_label();
                     // jump here when we can definitely include the row (result = 1/true)
@@ -800,22 +803,18 @@ pub fn translate_expr(
                         }
                     }
 
-                    // Compute and apply affinity for the LHS columns before the index probe.
-                    // This follows SQLite's approach where OP_Affinity is emitted before
-                    // Found/NotFound operations on ephemeral indices for IN subqueries.
-
-                    let affinity = lhs_columns
-                        .iter()
-                        .map(|col| get_expr_affinity(col, referenced_tables));
-
                     // Only emit Affinity instruction if there's meaningful affinity to apply
                     // (i.e., not all BLOB/NONE affinity)
-                    if affinity.clone().any(|a| a != Affinity::Blob) {
+                    if affinity_str
+                        .chars()
+                        .map(Affinity::from_char)
+                        .any(|a| a != Affinity::Blob)
+                    {
                         if let Ok(count) = std::num::NonZeroUsize::try_from(lhs_column_count) {
                             program.emit_insn(Insn::Affinity {
                                 start_reg: lhs_column_regs_start,
                                 count,
-                                affinities: affinity.clone().map(|a| a.aff_mask()).collect(),
+                                affinities: affinity_str.as_ref().clone(),
                             });
                         }
                     }
@@ -858,7 +857,7 @@ pub fn translate_expr(
                     });
                     program.preassign_label_to_next_insn(label_null_checks_loop_start);
                     let column_check_reg = program.alloc_register();
-                    for (i, affinity) in affinity.enumerate().take(lhs_column_count) {
+                    for (i, affinity) in affinity_str.chars().map(Affinity::from_char).enumerate() {
                         program.emit_insn(Insn::Column {
                             cursor_id: *cursor_id,
                             column: i,

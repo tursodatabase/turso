@@ -1,14 +1,22 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT c.id, c.name\n    FROM customers c\n    WHERE c.id IN (\n        SELECT o.customer_id\n        FROM orders o\n        GROUP BY o.customer_id\n        HAVING sum(o.total_amount) > 1000\n    );"
+expression: |-
+  SELECT c.id, c.name
+      FROM customers c
+      WHERE c.id IN (
+          SELECT o.customer_id
+          FROM orders o
+          GROUP BY o.customer_id
+          HAVING sum(o.total_amount) > 1000
+      );
 info:
   statement_type: SELECT
   tables:
-    - customers
-    - orders
+  - customers
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN orders AS o USING INDEX idx_orders_customer
@@ -61,7 +69,7 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   42  Rewind                     3  64   0                 0  Rewind table customers
   43    Integer                  0  18   0                 0  r[18]=0
   44    RowId                    3  19   0                 0  r[19]=customers.rowid
-  45    Affinity                19   1   0                 0  r[19..20] = D
+  45    Affinity                19   1   0                 0  r[19..20] = C
   46    NotFound                 0  48  19                 0  if not found goto 48
   47    Goto                     0  54   0                 0
   48    Rewind                   0  56   0                 0  Rewind  ephemeral_index_where_sub_t2

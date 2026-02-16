@@ -231,12 +231,13 @@ fn emit_values_to_index(
     start_reg: usize,
     row_len: usize,
 ) -> Result<()> {
-    let (cursor_id, index, is_delete) = match &plan.query_destination {
+    let (cursor_id, index, affinity_str, is_delete) = match &plan.query_destination {
         QueryDestination::EphemeralIndex {
             cursor_id,
             index,
+            affinity_str,
             is_delete,
-        } => (cursor_id, index, is_delete),
+        } => (cursor_id, index, affinity_str, is_delete),
         _ => unreachable!(),
     };
 
@@ -287,7 +288,7 @@ fn emit_values_to_index(
             count: to_u16(record_count),
             dest_reg: to_u16(record_reg),
             index_name: Some(index.name.clone()),
-            affinity_str: None,
+            affinity_str: affinity_str.as_ref().map(|s| (**s).clone()),
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: *cursor_id,

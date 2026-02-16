@@ -335,6 +335,9 @@ pub enum QueryDestination {
         cursor_id: CursorID,
         /// The index that will be used to store the results.
         index: Arc<Index>,
+        /// Optional MakeRecord affinity string to apply before inserting keys.
+        /// For `IN (SELECT ...)` this must match the left-hand side expression affinity.
+        affinity_str: Option<Arc<String>>,
         /// Whether this is a delete operation that will remove the index entries
         is_delete: bool,
     },

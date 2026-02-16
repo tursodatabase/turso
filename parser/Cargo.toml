@@ -21,7 +21,7 @@ bitflags = { workspace = true }
 miette = { workspace = true }
 strum = { workspace = true }
 strum_macros = {workspace = true }
-serde = { workspace = true , optional = true, features = ["derive"] }
+serde = { workspace = true , optional = true, features = ["derive", "rc"] }
 thiserror = { workspace = true }
 turso_macros = { workspace = true }
 memchr = "2.7.6"
