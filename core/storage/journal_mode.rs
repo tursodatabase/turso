@@ -61,8 +61,8 @@ pub fn logical_log_exists(db_path: impl AsRef<std::path::Path>) -> bool {
     std::path::Path::exists(log_path.as_path()) && log_path.as_path().metadata().unwrap().len() > 0
 }
 
-pub fn open_mv_store<I: IO + ?Sized>(
-    io: &I,
+pub fn open_mv_store(
+    io: Arc<dyn IO>,
     db_path: impl AsRef<std::path::Path>,
     flags: OpenFlags,
 ) -> Result<Arc<MvStore>> {
@@ -73,7 +73,7 @@ pub fn open_mv_store<I: IO + ?Sized>(
         .to_str()
         .expect("path should be valid string");
     let file = io.open_file(string_path, flags, false)?;
-    let storage = mvcc::persistent_storage::Storage::new(file);
+    let storage = mvcc::persistent_storage::Storage::new(file, io);
     let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
     let mv_store = Arc::new(mv_store);
     Ok(mv_store)

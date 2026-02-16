@@ -75,7 +75,7 @@ pub struct LockStates {
 /// 5. Commits the pager transaction, effectively flushing to the WAL
 /// 6. Immediately does a TRUNCATE checkpoint from the WAL to the DB
 /// 7. Fsync the DB file
-/// 8. Truncate logical log, fsync logical log, then truncate WAL
+/// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
 /// 9. Releases the blocking_checkpoint_lock
 pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// The current state of the state machine

@@ -6,9 +6,7 @@ use std::fmt::Debug;
 
 pub mod logical_log;
 use crate::mvcc::database::LogRecord;
-use crate::mvcc::persistent_storage::logical_log::{
-    LogicalLog, DEFAULT_LOG_CHECKPOINT_THRESHOLD, LOG_HDR_SIZE,
-};
+use crate::mvcc::persistent_storage::logical_log::{LogicalLog, DEFAULT_LOG_CHECKPOINT_THRESHOLD};
 use crate::{Completion, File, Result};
 
 pub struct Storage {
@@ -19,9 +17,9 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new(file: Arc<dyn File>) -> Self {
+    pub fn new(file: Arc<dyn File>, io: Arc<dyn crate::IO>) -> Self {
         Self {
-            logical_log: RwLock::new(LogicalLog::new(file)),
+            logical_log: RwLock::new(LogicalLog::new(file, io)),
             log_offset: AtomicU64::new(0),
             checkpoint_threshold: AtomicI64::new(DEFAULT_LOG_CHECKPOINT_THRESHOLD),
         }
@@ -59,7 +57,7 @@ impl Storage {
 
     pub fn truncate(&self) -> Result<Completion> {
         let c = self.logical_log.write().truncate()?;
-        self.shadow_offset_store(LOG_HDR_SIZE as u64);
+        self.shadow_offset_store(0);
         Ok(c)
     }
 

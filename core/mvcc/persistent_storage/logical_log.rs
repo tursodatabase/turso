@@ -7,7 +7,7 @@
 //!
 //! In normal operation:
 //! - commits append transaction frames to `.db-log`;
-//! - checkpoint copies data into the DB file, then shrinks `.db-log` back to its header.
+//! - checkpoint copies data into the DB file, then truncates `.db-log` to 0.
 //!
 //! ## File layout
 //!
@@ -20,7 +20,8 @@
 //! - `version: u8` (`LOG_VERSION`)
 //! - `flags: u8` (bits 1..7 must be zero; bit 0 is currently reserved/ignored)
 //! - `hdr_len: u16` (`>= 56`)
-//! - `reserved: [u8; 44]` (must be zero for current format)
+//! - `salt: u64` (random salt, regenerated on each log truncation)
+//! - `reserved: [u8; 36]` (must be zero for current format)
 //! - `hdr_crc32c: u32` (CRC32C of the header with this field zeroed)
 //!
 //! ### Transaction frame
@@ -40,7 +41,8 @@
 //!
 //! Trailer (`TX_TRAILER_SIZE = 12`):
 //! - `payload_size: u32` (total bytes of all op entries)
-//! - `crc32c: u32` (CRC32C over `tx_header || payload`)
+//! - `crc32c: u32` (chained CRC32C: `crc32c_append(prev_frame_crc, tx_header || payload)`;
+//!   the first frame uses `crc32c(salt.to_le_bytes())` as its seed)
 //! - `end_magic: u32` (`END_MAGIC`)
 //!
 //! ## Operation encoding
@@ -55,13 +57,10 @@
 //!
 //! ## Validation behavior
 //!
-//! There are two read paths:
-//! - Full replay (`parse_next_transaction`): strict structural validation (header/trailer fields,
-//!   reserved bits, table-id sign, op payload shape) plus CRC verification.
-//! - Max-timestamp scan (`scan_max_commit_ts`): parses frame boundaries and verifies CRC/trailer,
-//!   but intentionally does not fully decode op payloads.
+//! The read path (`parse_next_transaction`) performs strict structural validation (header/trailer
+//! fields, reserved bits, table-id sign, op payload shape) plus chained CRC verification.
 //!
-//! Both paths are availability-focused, mirroring SQLite WAL prefix semantics:
+//! Validation is availability-focused, mirroring SQLite WAL prefix semantics:
 //! - torn/incomplete tail at end-of-file is accepted as EOF (previous validated frames remain);
 //! - first invalid frame encountered during forward scan is treated as an invalid tail and ignored;
 //! - only header corruption fails closed.
@@ -69,7 +68,7 @@
 //! ## Recovery behavior
 //!
 //! Recovery (reader + MVCC replay) does this:
-//! - validates header first;
+//! - validates header first (empty/0-byte file treated as no log);
 //! - accepts a valid header with no frames (size `<= LOG_HDR_SIZE`);
 //! - reads `persistent_tx_ts_max` from `__turso_internal_mvcc_meta` (the durable replay boundary);
 //! - streams frames in commit order until first torn tail;
@@ -88,7 +87,7 @@
 //! 2. commit pager transaction (data + metadata row in same WAL txn);
 //! 3. checkpoint WAL pages into DB file;
 //! 4. fsync DB file (unless `SyncMode::Off`);
-//! 5. truncate logical log to `LOG_HDR_SIZE`;
+//! 5. truncate logical log to 0 (regenerates salt in memory; header written with next frame);
 //! 6. fsync logical log (unless `SyncMode::Off`);
 //! 7. truncate WAL last.
 //!
@@ -120,9 +119,11 @@ pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION: u8 = 2;
 pub const LOG_HDR_SIZE: usize = 56;
-const LOG_HDR_RESERVED_START: usize = 8;
+const LOG_HDR_SALT_START: usize = 8;
+const LOG_HDR_SALT_SIZE: usize = 8;
+const LOG_HDR_RESERVED_START: usize = LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE; // 16
 const LOG_HDR_CRC_START: usize = 52;
-const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START;
+const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START; // 36
 const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
 
@@ -143,16 +144,18 @@ pub(crate) struct LogHeader {
     version: u8,
     flags: u8,
     hdr_len: u16,
+    pub(crate) salt: u64,
     hdr_crc32c: u32,
     reserved: [u8; LOG_HDR_RESERVED_SIZE],
 }
 
 impl LogHeader {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(io: &Arc<dyn crate::IO>) -> Self {
         Self {
             version: LOG_VERSION,
             flags: 0,
             hdr_len: LOG_HDR_SIZE as u16,
+            salt: io.generate_random_number() as u64,
             hdr_crc32c: 0,
             reserved: [0; LOG_HDR_RESERVED_SIZE],
         }
@@ -164,6 +167,8 @@ impl LogHeader {
         buf[4] = self.version;
         buf[5] = self.flags;
         buf[6..8].copy_from_slice(&self.hdr_len.to_le_bytes());
+        buf[LOG_HDR_SALT_START..LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE]
+            .copy_from_slice(&self.salt.to_le_bytes());
         buf[LOG_HDR_RESERVED_START..LOG_HDR_CRC_START].copy_from_slice(&self.reserved);
 
         let crc = crc32c::crc32c(&buf);
@@ -220,6 +225,17 @@ impl LogHeader {
             ));
         }
 
+        let salt = u64::from_le_bytes([
+            buf[LOG_HDR_SALT_START],
+            buf[LOG_HDR_SALT_START + 1],
+            buf[LOG_HDR_SALT_START + 2],
+            buf[LOG_HDR_SALT_START + 3],
+            buf[LOG_HDR_SALT_START + 4],
+            buf[LOG_HDR_SALT_START + 5],
+            buf[LOG_HDR_SALT_START + 6],
+            buf[LOG_HDR_SALT_START + 7],
+        ]);
+
         let mut reserved = [0u8; LOG_HDR_RESERVED_SIZE];
         reserved.copy_from_slice(&buf[LOG_HDR_RESERVED_START..LOG_HDR_CRC_START]);
         if reserved.iter().any(|b| *b != 0) {
@@ -232,30 +248,50 @@ impl LogHeader {
             version,
             flags,
             hdr_len,
+            salt,
             hdr_crc32c,
             reserved,
         })
     }
 }
 
+/// Derives the initial CRC seed from the header salt.
+/// The salt is mixed into a 32-bit CRC state that seeds the first frame's checksum.
+fn derive_initial_crc(salt: u64) -> u32 {
+    crc32c::crc32c(&salt.to_le_bytes())
+}
+
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
+    io: Arc<dyn crate::IO>,
     pub offset: u64,
     write_buf: Vec<u8>,
     header: Option<LogHeader>,
+    /// Running CRC state for chained checksums. Seeded from the header salt;
+    /// updated after each committed frame. The next frame's CRC is computed as
+    /// `crc32c_append(running_crc, frame_bytes)`.
+    pub running_crc: u32,
+    /// Pending CRC from a deferred-offset write. Applied by
+    /// `advance_offset_after_success` so that an abandoned write
+    /// doesn't corrupt the chain.
+    pending_running_crc: Option<u32>,
 }
 
 impl LogicalLog {
-    pub fn new(file: Arc<dyn File>) -> Self {
+    pub fn new(file: Arc<dyn File>, io: Arc<dyn crate::IO>) -> Self {
         Self {
             file,
+            io,
             offset: 0,
             write_buf: Vec::new(),
             header: None,
+            running_crc: 0,
+            pending_running_crc: None,
         }
     }
 
     pub(crate) fn set_header(&mut self, header: LogHeader) {
+        self.running_crc = derive_initial_crc(header.salt);
         self.header = Some(header);
     }
 
@@ -279,8 +315,12 @@ impl LogicalLog {
         // 1. Serialize log header if it's first write
         let is_first_write = self.offset == 0;
         if is_first_write {
-            let header = self.header.get_or_insert_with(LogHeader::new);
-            let header_bytes = header.encode();
+            if self.header.is_none() {
+                let header = LogHeader::new(&self.io);
+                self.running_crc = derive_initial_crc(header.salt);
+                self.header = Some(header);
+            }
+            let header_bytes = self.header.as_ref().unwrap().encode();
             self.write_buf.extend_from_slice(&header_bytes);
         }
 
@@ -305,7 +345,11 @@ impl LogicalLog {
         let payload_size = u32::try_from(payload_end - payload_start).map_err(|_| {
             LimboError::InternalError("Logical log payload_size exceeds u32".to_string())
         })?;
-        let crc = crc32c::crc32c(&self.write_buf[tx_header_start..payload_end]);
+        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
+        let crc = crc32c::crc32c_append(
+            self.running_crc,
+            &self.write_buf[tx_header_start..payload_end],
+        );
 
         // 4. Serialize trailer
         self.write_buf
@@ -332,6 +376,9 @@ impl LogicalLog {
         let c = self.file.pwrite(self.offset, buffer, c)?;
         if advance_offset_immediately {
             self.offset += buffer_len as u64;
+            self.running_crc = crc;
+        } else {
+            self.pending_running_crc = Some(crc);
         }
         Ok((c, buffer_len as u64))
     }
@@ -357,6 +404,10 @@ impl LogicalLog {
             .offset
             .checked_add(bytes)
             .expect("logical log offset overflow");
+        self.running_crc = self
+            .pending_running_crc
+            .take()
+            .expect("advance_offset_after_success called without pending deferred write");
     }
 
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
@@ -373,7 +424,7 @@ impl LogicalLog {
         }
         if self.offset == 0 {
             // Valid path: checkpoint can run before the first logical-log append.
-            return Ok(LogHeader::new());
+            return Ok(LogHeader::new(&self.io));
         }
         Err(LimboError::InternalError(
             "Logical log header not initialized".to_string(),
@@ -412,13 +463,21 @@ impl LogicalLog {
     }
 
     pub fn truncate(&mut self) -> Result<Completion> {
+        // Regenerate salt so stale frames (from before truncation) cannot validate
+        // against the new CRC chain.
+        let mut header = self.current_or_new_header()?;
+        header.salt = self.io.generate_random_number() as u64;
+        self.running_crc = derive_initial_crc(header.salt);
+        self.pending_running_crc = None;
+        self.header = Some(header);
+
         let completion = Completion::new_trunc(move |result| {
             if let Err(err) = result {
                 tracing::error!("logical_log_truncate failed: {}", err);
             }
         });
-        let c = self.file.truncate(LOG_HDR_SIZE as u64, completion)?;
-        self.offset = LOG_HDR_SIZE as u64;
+        let c = self.file.truncate(0, completion)?;
+        self.offset = 0;
         Ok(c)
     }
 }
@@ -551,6 +610,9 @@ pub struct StreamingLogicalLogReader {
     /// Byte offset of the end of the last fully validated transaction frame. Used during
     /// recovery to set the writer offset so that torn-tail bytes are overwritten on next append.
     last_valid_offset: usize,
+    /// Running CRC state for chained checksum validation. Seeded from the header salt;
+    /// updated after each successfully validated frame.
+    running_crc: u32,
 }
 
 impl StreamingLogicalLogReader {
@@ -566,6 +628,7 @@ impl StreamingLogicalLogReader {
             state: StreamingState::NeedTransactionStart,
             pending_ops: std::collections::VecDeque::new(),
             last_valid_offset: 0,
+            running_crc: 0,
         }
     }
 
@@ -578,6 +641,12 @@ impl StreamingLogicalLogReader {
     /// bytes beyond it are overwritten by the next append.
     pub fn last_valid_offset(&self) -> usize {
         self.last_valid_offset
+    }
+
+    /// Returns the running CRC state after all validated frames. Used during recovery
+    /// to hand off the chain state to the writer so it can continue appending.
+    pub fn running_crc(&self) -> u32 {
+        self.running_crc
     }
 
     pub fn read_header(&mut self, io: &Arc<dyn crate::IO>) -> Result<()> {
@@ -615,6 +684,7 @@ impl StreamingLogicalLogReader {
 
         match LogHeader::decode(&header_bytes) {
             Ok(header) => {
+                self.running_crc = derive_initial_crc(header.salt);
                 self.header = Some(header.clone());
                 self.offset = hdr_len;
                 self.buffer.write().clear();
@@ -628,162 +698,6 @@ impl StreamingLogicalLogReader {
             }
             Err(err) => Err(err),
         }
-    }
-
-    /// Scans all valid transaction frames without fully decoding op payloads.
-    /// Returns the maximum `commit_ts` among all validated frames. Used during recovery
-    /// to reseed the MVCC logical clock to `max(persistent_tx_ts_max, scan_result) + 1`.
-    pub fn scan_max_commit_ts(&mut self, io: &Arc<dyn crate::IO>) -> Result<u64> {
-        let mut max_ts = 0u64;
-
-        loop {
-            if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
-                return Ok(max_ts);
-            }
-            let frame_start = self.offset.saturating_sub(self.bytes_can_read());
-
-            let header_bytes = match self.try_consume_fixed::<TX_HEADER_SIZE>(io)? {
-                Some(bytes) => bytes,
-                None => return Ok(max_ts),
-            };
-
-            let frame_magic = u32::from_le_bytes([
-                header_bytes[0],
-                header_bytes[1],
-                header_bytes[2],
-                header_bytes[3],
-            ]);
-            if frame_magic != FRAME_MAGIC {
-                self.last_valid_offset = frame_start;
-                return Ok(max_ts);
-            }
-            let op_count = u16::from_le_bytes([header_bytes[4], header_bytes[5]]);
-            let commit_ts = u64::from_le_bytes([
-                header_bytes[6],
-                header_bytes[7],
-                header_bytes[8],
-                header_bytes[9],
-                header_bytes[10],
-                header_bytes[11],
-                header_bytes[12],
-                header_bytes[13],
-            ]);
-
-            let mut running_crc = crc32c::crc32c(&header_bytes);
-            let mut payload_bytes_read: u32 = 0;
-
-            for _ in 0..op_count {
-                let op_bytes = match self.try_consume_fixed::<6>(io)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(max_ts),
-                };
-                running_crc = crc32c::crc32c_append(running_crc, &op_bytes);
-
-                let (payload_len_u64, payload_len_bytes, payload_len_bytes_len) =
-                    match self.consume_varint_bytes(io)? {
-                        Some((value, bytes, len)) => (value, bytes, len),
-                        None => return Ok(max_ts),
-                    };
-                running_crc =
-                    crc32c::crc32c_append(running_crc, &payload_len_bytes[..payload_len_bytes_len]);
-                let payload_len = match usize::try_from(payload_len_u64) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        self.last_valid_offset = frame_start;
-                        return Ok(max_ts);
-                    }
-                };
-                if !self.try_skip_bytes_with_crc(io, payload_len, &mut running_crc)? {
-                    return Ok(max_ts);
-                }
-
-                let op_total_bytes = 6 + payload_len_bytes_len + payload_len;
-                payload_bytes_read = match u32::try_from(op_total_bytes)
-                    .ok()
-                    .and_then(|op_size| payload_bytes_read.checked_add(op_size))
-                {
-                    Some(v) => v,
-                    None => {
-                        self.last_valid_offset = frame_start;
-                        return Ok(max_ts);
-                    }
-                };
-            }
-
-            let trailer_bytes = match self.try_consume_fixed::<TX_TRAILER_SIZE>(io)? {
-                Some(bytes) => bytes,
-                None => return Ok(max_ts),
-            };
-
-            let payload_size = u32::from_le_bytes([
-                trailer_bytes[0],
-                trailer_bytes[1],
-                trailer_bytes[2],
-                trailer_bytes[3],
-            ]);
-            let crc32c_expected = u32::from_le_bytes([
-                trailer_bytes[4],
-                trailer_bytes[5],
-                trailer_bytes[6],
-                trailer_bytes[7],
-            ]);
-            let end_magic = u32::from_le_bytes([
-                trailer_bytes[8],
-                trailer_bytes[9],
-                trailer_bytes[10],
-                trailer_bytes[11],
-            ]);
-
-            if payload_size != payload_bytes_read {
-                self.last_valid_offset = frame_start;
-                return Ok(max_ts);
-            }
-            if crc32c_expected != running_crc {
-                self.last_valid_offset = frame_start;
-                return Ok(max_ts);
-            }
-            if end_magic != END_MAGIC {
-                self.last_valid_offset = frame_start;
-                return Ok(max_ts);
-            }
-
-            max_ts = max_ts.max(commit_ts);
-            self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
-        }
-    }
-
-    /// Advances the read position by `amount` bytes without returning them, while
-    /// feeding each byte into `running_crc`. Returns false if there are not enough
-    /// remaining bytes (EOF). Used by `scan_max_commit_ts` to skip over op payloads
-    /// while still computing CRC for frame validation.
-    fn try_skip_bytes_with_crc(
-        &mut self,
-        io: &Arc<dyn crate::IO>,
-        amount: usize,
-        running_crc: &mut u32,
-    ) -> Result<bool> {
-        if self.remaining_bytes() < amount {
-            return Ok(false);
-        }
-
-        let mut remaining = amount;
-        while remaining > 0 {
-            if self.bytes_can_read() == 0 {
-                self.read_more_data(io, 1)?;
-            }
-
-            let available = self.bytes_can_read().min(remaining);
-            let start = self.buffer_offset;
-            let end = start + available;
-            {
-                let buffer = self.buffer.read();
-                *running_crc = crc32c::crc32c_append(*running_crc, &buffer[start..end]);
-            }
-            self.buffer_offset = end;
-            remaining -= available;
-        }
-
-        Ok(true)
     }
 
     fn set_invalid_header_state(&mut self) {
@@ -869,7 +783,8 @@ impl StreamingLogicalLogReader {
             header_bytes[13],
         ]);
 
-        let mut running_crc = crc32c::crc32c(&header_bytes);
+        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
+        let mut running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
         let mut payload_bytes_read: u32 = 0;
         let mut parsed_ops = Vec::with_capacity(op_count as usize);
 
@@ -1031,6 +946,8 @@ impl StreamingLogicalLogReader {
         }
 
         self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
+        // Advance the chain: this frame's CRC becomes the seed for the next frame.
+        self.running_crc = running_crc;
         Ok(ParseResult::Ops(parsed_ops))
     }
 
@@ -1319,6 +1236,7 @@ impl StreamingLogicalLogReader {
     }
 }
 
+#[cfg_attr(test, derive(Debug))]
 enum ParseResult {
     /// A fully validated transaction frame was parsed.
     Ops(Vec<ParsedOp>),
@@ -1331,6 +1249,7 @@ enum ParseResult {
     InvalidFrame,
 }
 
+#[cfg_attr(test, derive(Debug))]
 enum ParsedOp {
     UpsertTable {
         table_id: MVTableId,
@@ -1387,7 +1306,7 @@ mod tests {
         HeaderReadResult, LogHeader, LogicalLog, LOG_HDR_CRC_START, LOG_HDR_SIZE, TX_HEADER_SIZE,
         TX_TRAILER_SIZE,
     };
-    use super::{StreamingLogicalLogReader, StreamingResult};
+    use super::{ParseResult, StreamingLogicalLogReader, StreamingResult};
     use crate::OpenFlags;
     use tracing_subscriber::EnvFilter;
 
@@ -1406,7 +1325,7 @@ mod tests {
         commit_ts: u64,
     ) -> (Arc<dyn crate::File>, usize) {
         let file = io.open_file(file_name, OpenFlags::Create, false).unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: commit_ts,
@@ -1930,7 +1849,7 @@ mod tests {
         let file = io
             .open_file("test.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let rowid_len = varint_len(1);
@@ -2007,7 +1926,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 1, false, false, "a");
         append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 2, false, false, "b");
@@ -2057,7 +1976,7 @@ mod tests {
         let file = io
             .open_file("logical_log_i32_min_table_id", OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
         let table_id = crate::mvcc::database::MVTableId::from(i32::MIN as i64);
 
         append_single_table_op_tx(&mut log, &io, table_id, 7, 11, false, false, "min");
@@ -2091,7 +2010,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), -1, 1, false, false, "neg");
         append_single_table_op_tx(&mut log, &io, (-2).into(), -1, 2, true, false, "neg");
@@ -2117,7 +2036,7 @@ mod tests {
         let file = io
             .open_file("corrupt.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 123,
@@ -2263,7 +2182,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
         let after_first = log.offset as usize;
@@ -2304,7 +2223,7 @@ mod tests {
         let file = io
             .open_file("header-corrupt.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
         let tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 77,
             row_versions: vec![],
@@ -2429,7 +2348,7 @@ mod tests {
         let file = io
             .open_file("empty-tx.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         let tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 200,
@@ -2457,7 +2376,7 @@ mod tests {
         let file = io
             .open_file("bitflip.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 300,
             row_versions: Vec::new(),
@@ -2528,7 +2447,7 @@ mod tests {
         let file = io
             .open_file("roundtrip-rand.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         let mut expected = Vec::new();
         for tx_i in 0..128u64 {
@@ -2601,7 +2520,7 @@ mod tests {
             Ok(f) => f,
             Err(_) => return false,
         };
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
         let mut expected = Vec::new();
 
         for (idx, (is_delete, rowid, btree_resident)) in events.into_iter().take(64).enumerate() {
@@ -2646,56 +2565,10 @@ mod tests {
         }
 
         if expected.is_empty() {
-            return file.size().map(|size| size == 0).unwrap_or(false);
+            return file.size().expect("file.size() failed") == 0;
         }
 
         read_table_ops(file, &io) == expected
-    }
-
-    /// What this property checks: Timestamp scanning returns exactly the maximum commit timestamp among valid written frames.
-    /// Why this matters: Clock reseeding and replay cutoff decisions depend on this value being exact.
-    #[quickcheck]
-    fn prop_scan_max_commit_ts_matches_written_commits(commit_ts: Vec<u16>) -> bool {
-        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let file = match io.open_file(
-            "logical_log_prop_scan_max_commit_ts",
-            OpenFlags::Create,
-            false,
-        ) {
-            Ok(f) => f,
-            Err(_) => return false,
-        };
-        let mut log = LogicalLog::new(file.clone());
-        let mut expected_max = 0u64;
-
-        for (idx, ts) in commit_ts.into_iter().take(64).enumerate() {
-            let commit_ts = (ts as u64).max(1) + idx as u64;
-            expected_max = expected_max.max(commit_ts);
-            append_single_table_op_tx(
-                &mut log,
-                &io,
-                (-2).into(),
-                idx as i64 + 1,
-                commit_ts,
-                false,
-                false,
-                "v",
-            );
-        }
-
-        let mut reader = StreamingLogicalLogReader::new(file);
-        let header = match reader.try_read_header(&io) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        match header {
-            HeaderReadResult::NoLog => expected_max == 0,
-            HeaderReadResult::Invalid => false,
-            HeaderReadResult::Valid(_) => match reader.scan_max_commit_ts(&io) {
-                Ok(found_max) => found_max == expected_max,
-                Err(_) => false,
-            },
-        }
     }
 
     /// What this property checks: Streaming varint decode returns the original value for encoded inputs.
@@ -2756,7 +2629,7 @@ mod tests {
         let file = io
             .open_file("btree.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 55,
@@ -2799,7 +2672,7 @@ mod tests {
         let file = io
             .open_file("header.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 10,
@@ -2834,12 +2707,14 @@ mod tests {
         assert_eq!(header.hdr_crc32c, expected_crc);
     }
 
-    /// What this test checks: Header encode/decode with CRC validation round-trips cleanly.
+    /// What this test checks: Header encode/decode with CRC validation round-trips cleanly, including salt.
     /// Why this matters: Header integrity verification must be deterministic across writes/restarts.
     #[test]
     fn test_logical_log_header_crc_roundtrip() {
         init_tracing();
-        let header = LogHeader::new();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let header = LogHeader::new(&io);
+        assert_ne!(header.salt, 0, "salt should be non-zero from IO RNG");
         let bytes = header.encode();
         // Verify CRC: zero out the CRC field and recompute
         let mut check_buf = bytes;
@@ -2847,6 +2722,7 @@ mod tests {
         let expected_crc = crc32c::crc32c(&check_buf);
         let decoded = LogHeader::decode(&bytes).unwrap();
         assert_eq!(decoded.version, header.version);
+        assert_eq!(decoded.salt, header.salt);
         assert_eq!(decoded.hdr_crc32c, expected_crc);
     }
 
@@ -2863,7 +2739,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 11, false, false, "foo");
         let c = file
@@ -2880,77 +2756,194 @@ mod tests {
         assert!(matches!(result, HeaderReadResult::Invalid));
     }
 
-    /// What this test checks: Timestamp scanning treats both torn EOF and invalid newest frames as stop-but-keep-prefix.
-    /// Why this matters: Recovery is availability-focused and should preserve the committed prefix.
+    /// What this test checks: Truncation regenerates the salt and old frames can't validate with the new salt.
+    /// Why this matters: Salt rotation on truncation ensures stale data from a previous log epoch
+    /// cannot accidentally validate against the new CRC chain.
     #[test]
-    fn test_scan_max_commit_ts_torn_tail_and_corruption_semantics() {
+    fn test_truncation_regenerates_salt() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file("scan-max-ts.db-log", crate::OpenFlags::Create, false)
+            .open_file("salt-regen.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone());
 
+        // Write a frame and capture the salt
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
-        let after_first = log.offset as usize;
+        let salt_before = log.header.as_ref().unwrap().salt;
+
+        // Truncate to 0 (simulates checkpoint truncation); header with new salt
+        // will be written together with the next frame.
+        let c = log.truncate().unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let salt_after = log.header.as_ref().unwrap().salt;
+        assert_ne!(salt_before, salt_after, "salt must change on truncation");
+        assert_eq!(log.offset, 0, "offset must be 0 after truncation");
+
+        // Write a new frame — this also writes the header with the new salt
         append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
-        let after_second = log.offset as usize;
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
-        assert!(matches!(
-            reader.try_read_header(&io).unwrap(),
-            HeaderReadResult::Valid(_)
-        ));
-        let max_ts = reader.scan_max_commit_ts(&io).unwrap();
-        assert_eq!(max_ts, 20);
-
-        let second_frame_len = after_second - after_first;
-        let partial_second_frame_len = second_frame_len / 2;
-        let c = file
-            .truncate(
-                (after_first + partial_second_frame_len) as u64,
-                Completion::new_trunc(|_| {}),
-            )
-            .unwrap();
-        io.wait_for_completion(c).unwrap();
-
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
-        assert!(matches!(
-            reader.try_read_header(&io).unwrap(),
-            HeaderReadResult::Valid(_)
-        ));
-        let max_ts = reader.scan_max_commit_ts(&io).unwrap();
-        assert_eq!(max_ts, 10);
-
-        let file = io
-            .open_file(
-                "scan-max-ts-corrupt.db-log",
-                crate::OpenFlags::Create,
-                false,
-            )
-            .unwrap();
-        let mut log = LogicalLog::new(file.clone());
-        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 30, false, false, "a");
-        let after_first = log.offset as usize;
-        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 40, false, false, "b");
-        let after_second = log.offset as usize;
-        let second_frame_len = after_second - after_first;
-        let second_trailer_crc_offset = after_first + second_frame_len - TX_TRAILER_SIZE + 4;
-        let c = file
-            .pwrite(
-                second_trailer_crc_offset as u64,
-                Arc::new(Buffer::new(vec![0xDE, 0xAD, 0xBE, 0xEF])),
-                Completion::new_write(|_| {}),
-            )
-            .unwrap();
-        io.wait_for_completion(c).unwrap();
-
+        // Reader should see only the new frame (old data was truncated)
         let mut reader = StreamingLogicalLogReader::new(file);
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
         ));
-        let max_ts = reader.scan_max_commit_ts(&io).unwrap();
-        assert_eq!(max_ts, 30);
+        let header = reader.header().unwrap();
+        assert_eq!(header.salt, salt_after);
+
+        match reader.parse_next_transaction(&io) {
+            Ok(ParseResult::Ops(ops)) => {
+                assert!(!ops.is_empty(), "expected at least one op");
+            }
+            Ok(ParseResult::Eof) => panic!("expected ops, got EOF"),
+            Ok(ParseResult::InvalidFrame) => panic!("expected ops, got InvalidFrame"),
+            Err(e) => panic!("expected ops, got error: {e:?}"),
+        }
+        assert!(matches!(
+            reader.parse_next_transaction(&io),
+            Ok(ParseResult::Eof)
+        ));
+    }
+
+    /// What this test checks: Corrupting frame 1 in a multi-frame log invalidates frame 2 even
+    /// though frame 2's bytes are intact, because the CRC chain is broken.
+    /// Why this matters: Chained CRC guarantees prefix integrity — any corruption stops the entire
+    /// suffix from validating, not just the corrupted frame.
+    #[test]
+    fn test_crc_chain_invalidates_suffix_on_corruption() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("crc-chain.db-log", crate::OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone());
+
+        // Write 3 frames
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "aaa");
+        let after_first = log.offset as usize;
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "bbb");
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 3, 30, false, false, "ccc");
+
+        // Without corruption, all 3 frames should read back
+        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        assert!(matches!(
+            reader.try_read_header(&io).unwrap(),
+            HeaderReadResult::Valid(_)
+        ));
+        let mut count = 0;
+        while let Ok(ParseResult::Ops(_)) = reader.parse_next_transaction(&io) {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+
+        // Corrupt one byte in frame 1's payload (not the CRC field itself)
+        let corrupt_offset = LOG_HDR_SIZE + TX_HEADER_SIZE + 1; // inside frame 1 payload
+        let c = file
+            .pwrite(
+                corrupt_offset as u64,
+                Arc::new(Buffer::new(vec![0xFF])),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        // Now frame 1 should fail CRC, and frames 2+3 should NOT be returned
+        // (chained CRC means the reader stops at the first invalid frame)
+        let mut reader = StreamingLogicalLogReader::new(file);
+        assert!(matches!(
+            reader.try_read_header(&io).unwrap(),
+            HeaderReadResult::Valid(_)
+        ));
+        // Frame 1 is corrupted — CRC mismatch on structurally complete frame
+        match reader.parse_next_transaction(&io) {
+            Ok(ParseResult::InvalidFrame) => {}
+            other => panic!("expected InvalidFrame after corrupted frame 1, got {other:?}"),
+        }
+        // Verify we didn't somehow get frame 2 or 3
+        let valid_offset = reader.last_valid_offset();
+        assert!(
+            valid_offset <= after_first,
+            "valid offset {valid_offset} should be <= first frame end {after_first}",
+        );
+    }
+
+    /// What this test checks: A structurally valid tx frame from one log cannot be spliced
+    /// into another log and pass CRC validation, because the two logs have different salts
+    /// and therefore different CRC chains.
+    /// Why this matters: Salt-seeded chained CRC prevents cross-log frame replay attacks —
+    /// an adversary cannot copy frames between logs to forge commit history.
+    #[test]
+    fn test_splice_frame_from_different_log_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+
+        // --- Log A: write one frame ---
+        let file_a = io
+            .open_file("splice-a.db-log", crate::OpenFlags::Create, false)
+            .unwrap();
+        let mut log_a = LogicalLog::new(file_a.clone(), io.clone());
+        append_single_table_op_tx(&mut log_a, &io, (-2).into(), 1, 10, false, false, "aaa");
+        let log_a_end = log_a.offset as usize;
+
+        // --- Log B: write one frame (different salt → different CRC chain) ---
+        let file_b = io
+            .open_file("splice-b.db-log", crate::OpenFlags::Create, false)
+            .unwrap();
+        let mut log_b = LogicalLog::new(file_b.clone(), io.clone());
+        append_single_table_op_tx(&mut log_b, &io, (-2).into(), 2, 20, false, false, "bbb");
+        let log_b_end = log_b.offset as usize;
+
+        // Verify the two logs have different salts
+        let salt_a = log_a.header.as_ref().unwrap().salt;
+        let salt_b = log_b.header.as_ref().unwrap().salt;
+        assert_ne!(
+            salt_a, salt_b,
+            "two independent logs should have different salts"
+        );
+
+        // Read raw frame bytes from log B (everything after the header)
+        let frame_b_len = log_b_end - LOG_HDR_SIZE;
+        let read_buf = Arc::new(Buffer::new_temporary(frame_b_len));
+        let c = file_b
+            .pread(
+                LOG_HDR_SIZE as u64,
+                Completion::new_read(read_buf.clone(), |_| None),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        let frame_b_bytes: Vec<u8> = read_buf.as_slice()[..frame_b_len].to_vec();
+
+        // Splice log B's frame onto the end of log A
+        let c = file_a
+            .pwrite(
+                log_a_end as u64,
+                Arc::new(Buffer::new(frame_b_bytes)),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        // Read log A — should get 1 valid frame (A's own), then reject the spliced frame
+        let mut reader = StreamingLogicalLogReader::new(file_a);
+        assert!(matches!(
+            reader.try_read_header(&io).unwrap(),
+            HeaderReadResult::Valid(_)
+        ));
+
+        // Frame 1 from log A should validate fine
+        match reader.parse_next_transaction(&io) {
+            Ok(ParseResult::Ops(ops)) => assert!(!ops.is_empty()),
+            other => panic!("expected log A's frame to parse, got {other:?}"),
+        }
+
+        // The spliced frame from log B should fail CRC validation
+        match reader.parse_next_transaction(&io) {
+            Ok(ParseResult::InvalidFrame) => {}
+            other => {
+                panic!("spliced frame from a different log should NOT validate, got {other:?}")
+            }
+        }
     }
 }

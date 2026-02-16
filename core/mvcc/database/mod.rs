@@ -3545,8 +3545,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Self::capture_table_valued_functions(&connection.schema.read());
 
         let header = match reader.try_read_header(&pager.io)? {
-            HeaderReadResult::Valid(header) => header,
-            HeaderReadResult::NoLog => return Ok(false),
+            HeaderReadResult::Valid(header) => Some(header),
+            HeaderReadResult::NoLog => None,
             HeaderReadResult::Invalid => {
                 return Err(LimboError::Corrupt(
                     "Logical log header corrupt and no WAL recovery available".to_string(),
@@ -3554,11 +3554,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         };
 
-        self.storage.logical_log.write().set_header(header);
+        if let Some(header) = &header {
+            self.storage.logical_log.write().set_header(header.clone());
+        }
         let persistent_tx_ts_max = if self.uses_durable_mvcc_metadata(&connection) {
             match self.try_read_persistent_tx_ts_max(&connection)? {
                 Some(ts) => ts,
                 None if pager.is_encryption_enabled() => 0,
+                None if header.is_none() => 0,
                 None => {
                     return Err(LimboError::Corrupt(
                         "Missing MVCC metadata table".to_string(),
@@ -3572,7 +3575,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .store(persistent_tx_ts_max, Ordering::SeqCst);
         self.clock.reset(persistent_tx_ts_max + 1);
 
-        if file.size()? <= LOG_HDR_SIZE as u64 {
+        if header.is_none() || file.size()? <= LOG_HDR_SIZE as u64 {
             return Ok(false);
         }
 
@@ -3917,7 +3920,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     self.insert_index_version(rowid.table_id, sortable_key, row_version);
                 }
                 StreamingResult::Eof => {
-                    self.storage.logical_log.write().offset = reader.last_valid_offset() as u64;
+                    let mut log = self.storage.logical_log.write();
+                    log.offset = reader.last_valid_offset() as u64;
+                    log.running_crc = reader.running_crc();
                     break;
                 }
             }

@@ -4,7 +4,7 @@ use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::LocalClock;
 use crate::mvcc::cursor::MvccCursorType;
-use crate::mvcc::persistent_storage::logical_log::{StreamingLogicalLogReader, LOG_HDR_SIZE};
+use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
@@ -924,7 +924,7 @@ fn test_bootstrap_completes_interrupted_checkpoint_with_committed_wal() {
     let log_size = db.get_mvcc_store().get_logical_log_file().size().unwrap();
     assert!(
         log_size >= LOG_HDR_SIZE as u64,
-        "logical log must remain at least header-sized after interrupted-checkpoint reconciliation"
+        "logical log must be at least {LOG_HDR_SIZE} bytes after interrupted-checkpoint reconciliation"
     );
     let wal_path = wal_path_for_db(&db_path);
     let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -972,7 +972,8 @@ fn test_checkpoint_truncates_wal_last() {
             );
             assert_eq!(
                 mvcc_store.get_logical_log_file().size().unwrap(),
-                LOG_HDR_SIZE as u64
+                0,
+                "logical log should be truncated to 0"
             );
         }
 
@@ -993,7 +994,8 @@ fn test_checkpoint_truncates_wal_last() {
     assert_eq!(final_wal_len, 0);
     assert_eq!(
         mvcc_store.get_logical_log_file().size().unwrap(),
-        LOG_HDR_SIZE as u64
+        0,
+        "logical log should be truncated to 0 after checkpoint"
     );
 }
 
@@ -1133,7 +1135,7 @@ fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
-fn test_bootstrap_handles_committed_wal_when_log_already_header_only() {
+fn test_bootstrap_handles_committed_wal_when_log_truncated() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     {
@@ -1199,10 +1201,10 @@ fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
     assert_eq!(rows[0][1].to_string(), "x");
 }
 
-/// What this test checks: Header-only recovery seeds new tx timestamps above durable metadata boundary.
+/// What this test checks: Recovery after checkpoint (empty log) seeds new tx timestamps above durable metadata boundary.
 /// Why this matters: Timestamp rewind below checkpointed boundary would break MVCC ordering.
 #[test]
-fn test_header_only_log_recovery_loads_checkpoint_watermark() {
+fn test_empty_log_recovery_loads_checkpoint_watermark() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let persistent_tx_ts_max = {
         let conn = db.connect();
@@ -1212,11 +1214,10 @@ fn test_header_only_log_recovery_loads_checkpoint_watermark() {
         conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
         let mvcc_store = db.get_mvcc_store();
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        let mut reader = StreamingLogicalLogReader::new(mvcc_store.get_logical_log_file());
-        reader.read_header(&conn.db.io).unwrap();
         assert_eq!(
             mvcc_store.get_logical_log_file().size().unwrap(),
-            LOG_HDR_SIZE as u64
+            0,
+            "logical log should be truncated to 0 after checkpoint"
         );
         let meta = get_rows(
             &conn,
@@ -1300,7 +1301,7 @@ fn test_meta_recovery_case_1_no_wal_no_log_metadata_present_clean_boot() {
     let log_len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
     assert_eq!(
         log_len, LOG_HDR_SIZE as u64,
-        "expected header-only logical log on clean boot"
+        "expected logical log to be {LOG_HDR_SIZE} bytes (bootstrap header) on clean boot"
     );
 }
 

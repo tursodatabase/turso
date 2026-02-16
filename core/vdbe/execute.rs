@@ -11705,7 +11705,7 @@ fn op_journal_mode_inner(
                 if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc) {
                     let db_path = program.connection.get_database_canonical_path();
                     let mv_store = journal_mode::open_mv_store(
-                        pager.io.as_ref(),
+                        pager.io.clone(),
                         &db_path,
                         program.connection.db.open_flags,
                     )?;

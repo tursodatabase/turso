@@ -13,8 +13,10 @@ Startup decisions use four durable artifacts:
 - MVCC logical log (`.db-log`)
 - MVCC metadata table row: `__turso_internal_mvcc_meta(k='persistent_tx_ts_max')`
 
-The logical-log header (56 bytes) contains only format metadata:
-magic, version, flags, hdr_len, reserved, hdr_crc32c.
+The logical-log header (56 bytes) contains format metadata and a CRC chain seed:
+magic, version, flags, hdr_len, salt (u64), reserved, hdr_crc32c.
+The salt is regenerated on each log truncation; frame CRCs are chained
+(`crc32c_append(prev_frame_crc, data)`) with the initial seed derived from the salt.
 
 `persistent_tx_ts_max` in `__turso_internal_mvcc_meta`is the durable replay boundary, stored inside the main database file/WAL.
 Recovery replays logical-log frames only when `commit_ts > persistent_tx_ts_max`.
@@ -34,22 +36,22 @@ The replay boundary comes from the metadata row.
 
 ## Startup Case Classification
 
-Recovery classifies startup state using:
-- `wal_has_frames`: `wal.get_max_frame_in_wal() > 0` (WAL has committed/visible frames)
-- `log_header_state`: `Valid`, `Invalid`, or `NoLog` from `try_read_header()`
-- `log_has_frames`: logical log size `> LOG_HDR_SIZE`
+Recovery classifies startup state using two checks:
+- Does the WAL have committed frames? (`wal.get_max_frame_in_wal() > 0`)
+- What does `try_read_header()` return? (`Valid`, `Invalid`, or `NoLog`)
 
 | Case | Startup artifacts | Recovery behavior |
 |---|---|---|
 | 1 | WAL has committed frames + log header valid | Complete interrupted checkpoint: backfill WAL into DB, sync DB, truncate WAL. Then run logical-log recovery with metadata cutoff. |
 | 2 | WAL has committed frames + log header missing (`NoLog`) | Fail closed with `Corrupt`. |
 | 3 | WAL has committed frames + log header invalid/torn | Fail closed with `Corrupt`. |
-| 4 | WAL has no committed frames (`get_max_frame_in_wal() == 0`) | Truncate/discard WAL tail bytes and continue logical-log recovery. |
-| 5 | No WAL committed frames + log header invalid/torn | Fail closed with `Corrupt`. |
-| 6 | No WAL committed frames + valid header, header-only log | No replay needed; timestamp state comes from metadata row. |
-| 7 | No WAL committed frames + no logical log (`NoLog`) | No-op startup. |
+| 4 | WAL has no committed frames | Truncate/discard WAL tail bytes and continue logical-log recovery. |
+| 5 | No WAL + log header invalid/torn | Fail closed with `Corrupt`. |
+| 6 | No WAL + valid header, no frames (size <= `LOG_HDR_SIZE`) | No replay needed; timestamp state comes from metadata row. |
+| 7 | No WAL + empty log (0 bytes / `NoLog`) | Timestamp state loaded from metadata row if present; no replay. |
 
 Notes:
+- After checkpoint, the log is truncated to 0 bytes. On restart this is case 7.
 - Torn tail in log body is treated as EOF (prefix frames remain valid).
 - First invalid frame during forward scan terminates the scan (prefix preserved), matching SQLite WAL availability semantics.
 - Missing or corrupt metadata row is treated as corruption when the metadata table is expected to exist.
@@ -63,7 +65,7 @@ Notes:
 5. Commit pager transaction. WAL now contains committed frames for both data and the metadata row. In-memory `durable_txid_max` advances on this transition.
 6. Checkpoint WAL (backfill WAL frames into DB file).
 7. Fsync DB file (unless `SyncMode::Off`).
-8. Truncate logical log to header size (`LOG_HDR_SIZE`).
+8. Truncate logical log to 0 (salt regenerated in memory; header written with next frame).
 9. Fsync logical log (unless `SyncMode::Off`).
 10. Truncate WAL.
 11. Finalize: GC checkpointed versions, release lock.
@@ -94,10 +96,10 @@ Key tests in `core/mvcc/database/tests.rs`:
 - `test_bootstrap_completes_interrupted_checkpoint_with_committed_wal`
 - `test_bootstrap_rejects_committed_wal_without_log_file`
 - `test_bootstrap_rejects_torn_log_header_with_committed_wal`
-- `test_bootstrap_handles_committed_wal_when_log_already_header_only`
+- `test_bootstrap_handles_committed_wal_when_log_truncated`
 - `test_bootstrap_ignores_wal_frames_without_commit_marker`
 - `test_bootstrap_rejects_corrupt_log_header_without_wal`
-- `test_header_only_log_recovery_loads_checkpoint_watermark`
+- `test_empty_log_recovery_loads_checkpoint_watermark`
 - `test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit`
 - `test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_recoverable`
 

@@ -1136,7 +1136,7 @@ impl Database {
 
         if open_mv_store {
             let mv_store =
-                journal_mode::open_mv_store(self.io.as_ref(), &self.path, self.open_flags)?;
+                journal_mode::open_mv_store(self.io.clone(), &self.path, self.open_flags)?;
             self.mv_store.store(Some(mv_store));
         }
 
