@@ -1,0 +1,66 @@
+@database :memory:
+
+# Multi-column subquery in comparison expressions should work
+# Regression test for https://github.com/tursodatabase/turso/issues/5231
+
+test multi-column-subquery-eq {
+    SELECT (SELECT 1, 2) = (SELECT 1, 2);
+}
+expect {
+    1
+}
+
+test multi-column-subquery-ne {
+    SELECT (SELECT 1, 2) != (SELECT 3, 4);
+}
+expect {
+    1
+}
+
+test multi-column-subquery-lt {
+    SELECT (SELECT 1, 2) < (SELECT 3, 4);
+}
+expect {
+    1
+}
+
+test multi-column-subquery-addition {
+    SELECT (SELECT 1, 2) + (SELECT 3, 4);
+}
+expect error {
+}
+
+# Single-column subquery comparison should still work
+test single-column-subquery-eq {
+    SELECT (SELECT 1) = (SELECT 1);
+}
+expect {
+    1
+}
+
+test single-column-subquery-ne {
+    SELECT (SELECT 1) = (SELECT 2);
+}
+expect {
+    0
+}
+
+test single-column-subquery-arithmetic {
+    SELECT (SELECT 1) + (SELECT 2);
+}
+expect {
+    3
+}
+
+test mixed-row-literal-and-subquery {
+    SELECT (1,2)=(SELECT 1,2), (SELECT 1,2)!=(1,3), (1,2)<(SELECT 2,0), (SELECT 2,0)>(1,2);
+}
+expect {
+    1|1|1|1
+}
+
+test row-value-arity-mismatch-lt {
+    SELECT (SELECT 1,2) < (SELECT 1);
+}
+expect error {
+}
