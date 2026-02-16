@@ -418,7 +418,14 @@ fn emit_program_for_select_with_inputs(
     t_ctx.materialized_build_inputs = materialized_build_inputs;
 
     // Emit main parts of query
-    emit_query(program, &mut plan, &mut t_ctx)?;
+    let result_cols_start = emit_query(program, &mut plan, &mut t_ctx)?;
+    // TODO: This solution works but it's just a hack/quick fix.
+    // Ideally we should do some refactor on how we scope queries, subqueries, and registers so that we don't have to do these ad-hoc/unintuitive adjustments.
+
+    // Restore reg_result_cols_start after emit_query, because nested subqueries
+    // (e.g. correlated scalar subqueries in WHERE) can overwrite
+    // program.reg_result_cols_start with their own result column registers.
+    program.reg_result_cols_start = Some(result_cols_start);
 
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);

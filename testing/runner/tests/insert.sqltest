@@ -1851,3 +1851,20 @@ test insert-select-nonexistent-column {
 expect error {
 }
 
+# https://github.com/tursodatabase/turso/issues/5278
+test insert-select-correlated-subquery-not-in {
+    CREATE TABLE products(id INTEGER PRIMARY KEY, price INTEGER, category TEXT);
+    CREATE TABLE expensive(id INTEGER PRIMARY KEY, price INTEGER, category TEXT);
+    INSERT INTO products VALUES (1, 10, 'A'), (2, 50, 'B'), (3, 200, 'A'), (4, 75, 'B'), (5, 30, 'A');
+    INSERT INTO expensive SELECT * FROM products WHERE price > 40 AND category = 'B';
+    INSERT INTO expensive SELECT * FROM products p
+      WHERE price > (SELECT AVG(price) FROM products WHERE category = p.category)
+      AND id NOT IN (SELECT id FROM expensive);
+    SELECT * FROM expensive ORDER BY id;
+}
+expect {
+    2|50|B
+    3|200|A
+    4|75|B
+}
+
