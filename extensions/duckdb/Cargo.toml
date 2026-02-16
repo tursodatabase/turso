@@ -1,0 +1,25 @@
+[package]
+name = "limbo_duckdb"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Turso DuckDB foreign data wrapper extension"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+static = ["turso_ext/static"]
+
+[dependencies]
+turso_ext = { workspace = true, features = ["static"] }
+duckdb = { version = "1.1", features = ["bundled"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
