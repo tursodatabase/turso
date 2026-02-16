@@ -5544,3 +5544,59 @@ fn test_mvcc_unique_constraint() {
         .execute("COMMIT")
         .expect_err("duplicate unique - first committer wins");
 }
+
+/// Regression test for MVCC concurrent commit yield-spin deadlock.
+///
+/// When the VDBE encounters a yield completion (pager_commit_lock contention),
+/// it must return StepResult::IO to yield control. Previously, it checked
+/// `finished()` which is always true for yield completions, causing an infinite
+/// spin inside a single step() call — deadlocking cooperative schedulers.
+///
+/// We simulate lock contention by pre-acquiring pager_commit_lock before
+/// calling COMMIT, then verify step() returns IO instead of hanging.
+#[test]
+fn test_concurrent_commit_yield_spin() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    // Pre-acquire the pager_commit_lock to simulate another connection
+    // holding it mid-commit.
+    let mv_store = db.get_mvcc_store();
+    let lock = &mv_store.commit_coordinator.pager_commit_lock;
+    assert!(lock.write(), "should acquire lock");
+
+    // Prepare COMMIT — step() should yield (return IO), not spin forever.
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    let mut returned_io = false;
+    for _ in 0..100 {
+        match stmt.step().unwrap() {
+            crate::StepResult::IO => {
+                returned_io = true;
+                break;
+            }
+            crate::StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(returned_io, "step() should return IO when pager_commit_lock is contended");
+
+    // Release the lock and let the commit finish
+    lock.unlock();
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::Done => break,
+            crate::StepResult::IO => {}
+            _ => {}
+        }
+    }
+
+    // Verify the insert is visible
+    let rows = get_rows(&conn, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+}
