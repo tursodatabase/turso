@@ -921,6 +921,42 @@ impl TableReferences {
             .find(|t| t.identifier == identifier)
     }
 
+    /// Updates the internal_id of an [OuterQueryReference] identified by its old internal_id.
+    /// This is needed when a CTE from outer_query_refs is re-planned and added to joined_tables
+    /// with a new internal_id. Without this update, scalar subqueries that reference the CTE by
+    /// its original name would resolve to the stale internal_id.
+    pub fn update_outer_query_ref_internal_id(
+        &mut self,
+        old_id: TableInternalId,
+        new_id: TableInternalId,
+    ) {
+        if let Some(outer_ref) = self
+            .outer_query_refs
+            .iter_mut()
+            .find(|t| t.internal_id == old_id)
+        {
+            outer_ref.internal_id = new_id;
+        }
+    }
+
+    /// Updates the internal_id of an [OuterQueryReference] identified by its name.
+    /// This is needed when a CTE is planned fresh from cte_definitions and added to joined_tables.
+    /// If the CTE was also pre-planned into outer_query_refs (for scalar subquery visibility),
+    /// the outer_query_ref's internal_id must be updated to match the fresh plan's internal_id.
+    pub fn update_outer_query_ref_internal_id_by_name(
+        &mut self,
+        name: &str,
+        new_id: TableInternalId,
+    ) {
+        if let Some(outer_ref) = self
+            .outer_query_refs
+            .iter_mut()
+            .find(|t| t.identifier == name)
+        {
+            outer_ref.internal_id = new_id;
+        }
+    }
+
     /// Returns the internal ID and immutable reference to the [Table] with the given identifier,
     pub fn find_table_and_internal_id_by_identifier(
         &self,

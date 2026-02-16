@@ -796,6 +796,16 @@ fn parse_table(
             cte_table.identifier = normalize_ident(alias.as_str());
         }
 
+        // If this CTE was pre-planned into outer_query_refs (for scalar subquery visibility),
+        // update the outer_query_ref's internal_id to match this fresh plan's internal_id.
+        // Without this, scalar subqueries referencing the CTE by its original name
+        // (e.g. `SELECT c.x` when using `FROM c t`) would resolve to the stale
+        // pre-planned internal_id that the emitter never registers.
+        table_references.update_outer_query_ref_internal_id_by_name(
+            &normalized_qualified_name,
+            cte_table.internal_id,
+        );
+
         table_references.add_joined_table(cte_table);
         return Ok(());
     }
@@ -822,6 +832,7 @@ fn parse_table(
         let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
         let cte_id = outer_ref.cte_id;
         let outer_table = outer_ref.table.clone();
+        let old_outer_ref_internal_id = outer_ref.internal_id;
         let materialize_hint = match &outer_table {
             Table::FromClauseSubquery(subquery) => subquery.materialize_hint,
             _ => false,
@@ -858,8 +869,15 @@ fn parse_table(
             if let Some(alias) = alias {
                 jt.identifier = alias;
             }
+            let new_internal_id = jt.internal_id;
             jt.database_id = database_id;
             table_references.add_joined_table(jt);
+            // Update the outer_query_ref's internal_id to match the new JoinedTable.
+            // This ensures that scalar subqueries referencing the CTE by its original
+            // name (e.g. `SELECT c.x` when using `FROM c t`) resolve to the correct
+            // internal_id that the emitter registers.
+            table_references
+                .update_outer_query_ref_internal_id(old_outer_ref_internal_id, new_internal_id);
         } else {
             let internal_id = program.table_reference_counter.next();
             table_references.add_joined_table(JoinedTable {
@@ -873,6 +891,9 @@ fn parse_table(
                 expression_index_usages: Vec::new(),
                 database_id,
             });
+            // Update the outer_query_ref's internal_id to match the new JoinedTable.
+            table_references
+                .update_outer_query_ref_internal_id(old_outer_ref_internal_id, internal_id);
         }
         return Ok(());
     }
