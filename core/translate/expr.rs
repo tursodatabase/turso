@@ -2938,7 +2938,7 @@ pub fn translate_expr(
             unreachable!("Qualified should be resolved to a Column before translation")
         }
         ast::Expr::Raise(resolve_type, msg_expr) => {
-            let in_trigger = program.trigger.is_some() || program.is_subprogram;
+            let in_trigger = program.trigger.is_some();
             match resolve_type {
                 ResolveType::Ignore => {
                     if !in_trigger {
