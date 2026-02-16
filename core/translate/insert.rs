@@ -1475,16 +1475,15 @@ fn init_source_emission<'a>(
                     yield_reg,
                     coroutine_implementation_start: ctx.halt_label,
                 };
-                program.incr_nesting();
-                let num_result_cols =
-                    translate_select(select, resolver, program, query_destination, connection)?;
+                let num_result_cols = program.nested(|program| {
+                    translate_select(select, resolver, program, query_destination, connection)
+                })?;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(
                         "{} values for {required_column_count} columns",
                         num_result_cols,
                     );
                 }
-                program.decr_nesting();
 
                 program.emit_insn(Insn::EndCoroutine { yield_reg });
                 program.preassign_label_to_next_insn(jump_on_definition_label);

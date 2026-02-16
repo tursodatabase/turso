@@ -624,16 +624,17 @@ fn emit_materialized_build_inputs(
             cursor_id,
             is_table: true,
         });
-        program.incr_nesting();
-        program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
-        emit_program_for_select_with_inputs(
-            program,
-            resolver,
-            materialize_plan,
-            build_inputs.clone(),
-        )?;
-        program.clear_hash_tables_to_keep_open();
-        program.decr_nesting();
+        program.nested(|program| -> Result<()> {
+            program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
+            emit_program_for_select_with_inputs(
+                program,
+                resolver,
+                materialize_plan,
+                build_inputs.clone(),
+            )?;
+            program.clear_hash_tables_to_keep_open();
+            Ok(())
+        })?;
         program.pop_current_parent_explain();
 
         build_inputs.insert(
@@ -1418,9 +1419,7 @@ fn emit_program_for_delete(
         });
 
         // Execute the rowset SELECT plan to populate the rowset.
-        program.incr_nesting();
-        emit_program_for_select(program, resolver, rowset_plan)?;
-        program.decr_nesting();
+        program.nested(|program| emit_program_for_select(program, resolver, rowset_plan))?;
 
         // Close the read cursor(s) opened by the rowset plan before opening for writing
         let table_ref = plan.table_references.joined_tables().first().unwrap();
@@ -2224,9 +2223,7 @@ fn emit_program_for_update(
             cursor_id: temp_cursor_id.unwrap(),
             is_table: true,
         });
-        program.incr_nesting();
-        emit_program_for_select(program, resolver, ephemeral_plan)?;
-        program.decr_nesting();
+        program.nested(|program| emit_program_for_select(program, resolver, ephemeral_plan))?;
         Arc::new(table)
     } else {
         Arc::new(
