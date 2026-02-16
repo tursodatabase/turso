@@ -212,6 +212,35 @@ fn rewrite_trigger_expr_for_subprogram(
     Ok(())
 }
 
+/// Rewrite NEW/OLD references in all expressions within an Upsert clause for subprogram
+fn rewrite_upsert_exprs_for_subprogram(
+    upsert: &mut Option<Box<ast::Upsert>>,
+    ctx: &TriggerSubprogramContext,
+) -> Result<()> {
+    let mut current = upsert.as_mut();
+    while let Some(u) = current {
+        if let ast::UpsertDo::Set {
+            ref mut sets,
+            ref mut where_clause,
+        } = u.do_clause
+        {
+            for set in sets.iter_mut() {
+                rewrite_trigger_expr_for_subprogram(&mut set.expr, &ctx.table, ctx)?;
+            }
+            if let Some(ref mut wc) = where_clause {
+                rewrite_trigger_expr_for_subprogram(wc, &ctx.table, ctx)?;
+            }
+        }
+        if let Some(ref mut idx) = u.index {
+            if let Some(ref mut wc) = idx.where_clause {
+                rewrite_trigger_expr_for_subprogram(wc, &ctx.table, ctx)?;
+            }
+        }
+        current = u.next.as_mut();
+    }
+    Ok(())
+}
+
 /// Convert TriggerCmd to Stmt, rewriting NEW/OLD to Variable expressions (for subprogram compilation)
 fn trigger_cmd_to_stmt_for_subprogram(
     cmd: &ast::TriggerCmd,
@@ -232,7 +261,11 @@ fn trigger_cmd_to_stmt_for_subprogram(
             let mut select_clone = select.clone();
             rewrite_expressions_in_select_for_subprogram(&mut select_clone, subprogram_ctx)?;
 
-            let body = InsertBody::Select(select_clone, upsert.clone());
+            // Rewrite NEW/OLD references in the UPSERT clause (if present)
+            let mut upsert_clone = upsert.clone();
+            rewrite_upsert_exprs_for_subprogram(&mut upsert_clone, subprogram_ctx)?;
+
+            let body = InsertBody::Select(select_clone, upsert_clone);
             // If override_conflict is set (e.g., in UPSERT DO UPDATE context),
             // use it instead of the command's or_conflict to ensure errors propagate.
             let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);

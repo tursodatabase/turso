@@ -1238,7 +1238,16 @@ fn rewrite_expr_to_registers(
                             if let Some(r) = col_reg_from_row_image(&c) {
                                 *expr = Expr::Register(r);
                             }
+                            return Ok(WalkControl::Continue);
                         }
+                    }
+
+                    // In UPSERT DO UPDATE context (allow_excluded=true), a qualified
+                    // reference that doesn't match the target table or EXCLUDED is
+                    // invalid. Return a graceful error instead of leaving it
+                    // unresolved (which would panic later in translate_expr).
+                    if allow_excluded {
+                        bail_parse_error!("no such column: {}.{}", ns, c);
                     }
                 }
                 // Unqualified id -> row image (CURRENT/NEW depending on caller)
