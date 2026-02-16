@@ -6732,7 +6732,9 @@ pub fn op_insert(
                     return_if_io!(cursor.rowid())
                 };
                 if let Some(rowid) = maybe_rowid {
-                    program.connection.update_last_rowid(rowid);
+                    if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
+                        program.connection.update_last_rowid(rowid);
+                    }
                     state
                         .n_change
                         .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);

@@ -45,7 +45,7 @@ addr  opcode            p1  p2  p3  p4              p5  comment
   25    Column           0   1   4                   0  r[4]=products.name
   26    Column           1   0   7                   0  r[7]=idx_products_category.category
   27    MakeRecord       3   5  17                   0  r[17]=mkrec(r[3..7])
-  28    Insert           0  17   2  products         0  intkey=r[2] data=r[17]
+  28    Insert           0  17   2  products         8  intkey=r[2] data=r[17]
   29  Next               1   5   0                   0
   30  Halt               0   0   0                   0
   31  Transaction        0   2  10                   0  iDb=0 tx_mode=Write
