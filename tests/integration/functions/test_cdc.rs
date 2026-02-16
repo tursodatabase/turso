@@ -1658,3 +1658,103 @@ fn test_cdc_v2_schema_has_9_columns(db: TempDatabase) {
         )]]
     );
 }
+
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_no_internal_table_changes(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE INDEX t_idx ON t(x)").unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    // Only user DDL should appear — no records for turso_cdc, turso_cdc_version,
+    // sqlite_sequence, or their auto-indexes. Those are created before CDC is active.
+    assert_eq!(
+        rows,
+        vec![
+            // CREATE TABLE t
+            v2_row(
+                1,
+                "sqlite_schema",
+                5,
+                None,
+                Some(record([
+                    Value::Text("table".to_string()),
+                    Value::Text("t".to_string()),
+                    Value::Text("t".to_string()),
+                    Value::Integer(6),
+                    Value::Text("CREATE TABLE t (x)".to_string())
+                ])),
+                None,
+            ),
+            v2_commit(),
+            // CREATE INDEX t_idx ON t(x)
+            v2_row(
+                1,
+                "sqlite_schema",
+                6,
+                None,
+                Some(record([
+                    Value::Text("index".to_string()),
+                    Value::Text("t_idx".to_string()),
+                    Value::Text("t".to_string()),
+                    Value::Integer(7),
+                    Value::Text("CREATE INDEX t_idx ON t (x)".to_string())
+                ])),
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_drop_turso_cdc(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    // Verify CDC records exist (INSERT + COMMIT)
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc");
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+
+    // Drop the CDC table — should succeed
+    conn.execute("DROP TABLE turso_cdc").unwrap();
+
+    // Verify turso_cdc is gone from sqlite_schema
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'turso_cdc'",
+    );
+    assert_eq!(rows, vec![vec![Value::Integer(0)]]);
+}
+
+#[turso_macros::test]
+fn test_cdc_drop_turso_cdc_version(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+
+    // Verify turso_cdc_version exists
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'turso_cdc_version'",
+    );
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // Drop turso_cdc_version — should succeed
+    conn.execute("DROP TABLE turso_cdc_version").unwrap();
+
+    // Verify it's gone from sqlite_schema
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'turso_cdc_version'",
+    );
+    assert_eq!(rows, vec![vec![Value::Integer(0)]]);
+}
