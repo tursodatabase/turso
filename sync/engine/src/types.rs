@@ -429,15 +429,12 @@ impl DatabaseChange {
 
     /// Parse a CDC row based on the CDC version string.
     pub fn from_row(row: &turso_core::Row, cdc_version: &str) -> Result<Self> {
-        if cdc_version == "v2" {
-            Self::from_row_v2(row)
-        } else if cdc_version == "v1" {
-            Self::from_row_v1(row)
-        } else {
-            Err(Error::DatabaseTapeError(format!(
-                "unexpected CDC version: {}",
-                cdc_version
-            )))
+        match cdc_version {
+            turso_core::TURSO_CDC_VERSION_V2 => Self::from_row_v2(row),
+            turso_core::TURSO_CDC_VERSION_V1 => Self::from_row_v1(row),
+            _ => Err(Error::DatabaseTapeError(format!(
+                "unexpected CDC version: {cdc_version}"
+            ))),
         }
     }
 }

@@ -1314,7 +1314,18 @@ fn update_cache_size(
 
 pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
 pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
-pub const TURSO_CDC_CURRENT_VERSION: &str = "v2";
+
+/// CDC v1 schema (8 columns):
+/// (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER,
+///  change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)
+pub const TURSO_CDC_VERSION_V1: &str = "v1";
+
+/// CDC v2 schema (9 columns) — adds `change_txn_id` column and COMMIT records (change_type=2):
+/// (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER,
+///  change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)
+pub const TURSO_CDC_VERSION_V2: &str = "v2";
+
+pub const TURSO_CDC_CURRENT_VERSION: &str = TURSO_CDC_VERSION_V2;
 
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;

@@ -4108,7 +4108,7 @@ pub fn emit_cdc_insns(
     let is_v2 = program
         .capture_data_changes_info()
         .as_ref()
-        .is_some_and(|info| info.version() == "v2");
+        .is_some_and(|info| info.has_txn_id());
 
     if is_v2 {
         emit_cdc_insns_v2(
@@ -4502,7 +4502,7 @@ pub fn emit_cdc_with_autocommit_check(
     let is_v2 = program
         .capture_data_changes_info()
         .as_ref()
-        .is_some_and(|info| info.version() == "v2");
+        .is_some_and(|info| info.has_txn_id());
 
     if is_v2 {
         // Check if we're in autocommit mode; if so, emit a COMMIT record.

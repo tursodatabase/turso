@@ -73,6 +73,8 @@ use crate::sync::{
 use crate::sync::{Mutex, RwLock};
 pub use crate::translate::pragma::TURSO_CDC_CURRENT_VERSION;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
+pub use crate::translate::pragma::TURSO_CDC_VERSION_V1;
+pub use crate::translate::pragma::TURSO_CDC_VERSION_V2;
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
 use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
@@ -1584,6 +1586,15 @@ impl CaptureDataChangesInfo {
     pub fn version(&self) -> &str {
         self.version.as_deref().unwrap_or(TURSO_CDC_CURRENT_VERSION)
     }
+    /// Whether this CDC version includes the `change_txn_id` column and COMMIT records.
+    pub fn has_txn_id(&self) -> bool {
+        cdc_version_has_txn_id(self.version())
+    }
+}
+
+/// Whether the given CDC version string includes the `change_txn_id` column and COMMIT records.
+pub fn cdc_version_has_txn_id(version: &str) -> bool {
+    version == TURSO_CDC_VERSION_V2
 }
 
 /// Convenience methods for `Option<CaptureDataChangesInfo>` to keep call sites simple.

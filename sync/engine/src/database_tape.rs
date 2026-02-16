@@ -156,7 +156,7 @@ impl DatabaseTape {
         let mut stmt = match connection.prepare(&query) {
             Ok(stmt) => stmt,
             Err(turso_core::LimboError::ParseError(err)) if err.contains("no such table") => {
-                return Ok("v1".to_string())
+                return Ok(turso_core::TURSO_CDC_VERSION_V1.to_string())
             }
             Err(err) => return Err(err.into()),
         };
@@ -165,10 +165,10 @@ impl DatabaseTape {
                 if let turso_core::Value::Text(text) = &row[0] {
                     Ok(text.to_string())
                 } else {
-                    Ok("v1".to_string())
+                    Ok(turso_core::TURSO_CDC_VERSION_V1.to_string())
                 }
             }
-            _ => Ok("v1".to_string()),
+            _ => Ok(turso_core::TURSO_CDC_VERSION_V1.to_string()),
         }
     }
 

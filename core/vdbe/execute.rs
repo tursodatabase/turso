@@ -1,3 +1,4 @@
+use crate::cdc_version_has_txn_id;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
@@ -8398,7 +8399,7 @@ pub fn op_init_cdc_version(
     // Step 1: Create CDC table if needed
     {
         conn.start_nested();
-        let create_sql = if version == "v2" {
+        let create_sql = if cdc_version_has_txn_id(version) {
             format!(
                 "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
             )

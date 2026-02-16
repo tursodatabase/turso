@@ -70,7 +70,7 @@ pub fn translate_tx_commit(
     let is_v2 = program
         .capture_data_changes_info()
         .as_ref()
-        .is_some_and(|info| info.version() == "v2");
+        .is_some_and(|info| info.has_txn_id());
     if is_v2 {
         // Use a dummy table name for prepare_cdc_if_necessary — any name that isn't the
         // CDC table itself will work.
