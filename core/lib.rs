@@ -1586,15 +1586,19 @@ impl CaptureDataChangesInfo {
     pub fn version(&self) -> &str {
         self.version.as_deref().unwrap_or(TURSO_CDC_CURRENT_VERSION)
     }
-    /// Whether this CDC version includes the `change_txn_id` column and COMMIT records.
-    pub fn has_txn_id(&self) -> bool {
-        cdc_version_has_txn_id(self.version())
-    }
-}
 
-/// Whether the given CDC version string includes the `change_txn_id` column and COMMIT records.
-pub fn cdc_version_has_txn_id(version: &str) -> bool {
-    version == TURSO_CDC_VERSION_V2
+    /// Whether this CDC version has the `COMMIT` record type
+    pub fn has_commit_record_type(&self) -> bool {
+        self.version() == TURSO_CDC_VERSION_V2
+    }
+
+    pub fn is_v1(&self) -> bool {
+        self.version() == TURSO_CDC_VERSION_V1
+    }
+
+    pub fn is_v2(&self) -> bool {
+        self.version() == TURSO_CDC_VERSION_V2
+    }
 }
 
 /// Convenience methods for `Option<CaptureDataChangesInfo>` to keep call sites simple.

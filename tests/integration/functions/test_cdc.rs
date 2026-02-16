@@ -67,7 +67,7 @@ fn v2_row(
     ]
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_simple_id(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -111,7 +111,7 @@ fn record<const N: usize>(values: [Value; N]) -> Vec<u8> {
         .to_vec()
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_simple_before(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -161,7 +161,7 @@ fn test_cdc_simple_before(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_simple_after(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -211,7 +211,7 @@ fn test_cdc_simple_after(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_simple_full(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -280,7 +280,7 @@ fn test_cdc_simple_full(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_crud(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -680,7 +680,7 @@ fn test_cdc_table_columns(db: TempDatabase) {
     assert_eq!(rows, vec![vec![Value::Text(r#"["a","c"]"#.to_string())]]);
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_bin_record(db: TempDatabase) {
     let conn = db.connect_limbo();
     let record = record([
@@ -940,7 +940,7 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_version_table_created(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -975,7 +975,7 @@ fn test_cdc_version_custom_table(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_version_not_created_when_exists(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1043,7 +1043,7 @@ fn setup_backward_compat_v1(db: &TempDatabase, mode: &str) -> Arc<turso_core::Co
     conn
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_version_backward_compat_v1_id(db: TempDatabase) {
     let conn = setup_backward_compat_v1(&db, "id");
     let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
@@ -1104,7 +1104,7 @@ fn test_cdc_version_backward_compat_v1_id(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_version_backward_compat_v1_before(db: TempDatabase) {
     let conn = setup_backward_compat_v1(&db, "before");
     let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
@@ -1165,7 +1165,7 @@ fn test_cdc_version_backward_compat_v1_before(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_version_backward_compat_v1_after(db: TempDatabase) {
     let conn = setup_backward_compat_v1(&db, "after");
     let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
@@ -1226,7 +1226,7 @@ fn test_cdc_version_backward_compat_v1_after(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_version_backward_compat_v1_full(db: TempDatabase) {
     let conn = setup_backward_compat_v1(&db, "full");
     let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
@@ -1292,7 +1292,7 @@ fn test_cdc_version_backward_compat_v1_full(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_version_preserves_old_version(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1342,7 +1342,7 @@ fn test_cdc_version_preserves_old_version(db: TempDatabase) {
     assert_eq!(info.version, Some("v0".to_string()));
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_pragma_get_returns_version(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1388,7 +1388,7 @@ fn test_cdc_pragma_get_returns_version(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_pragma_idempotent(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1428,7 +1428,7 @@ fn test_cdc_pragma_idempotent(db: TempDatabase) {
     assert_eq!(rows, vec![vec![Value::Integer(4)]]);
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_version_helper_defaults_to_v1(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1457,7 +1457,7 @@ fn test_cdc_version_helper_defaults_to_v1(db: TempDatabase) {
     assert_eq!(parsed.version(), TURSO_CDC_CURRENT_VERSION);
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_preexisting_v1_table_writes_v1_format(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1522,7 +1522,7 @@ fn test_cdc_preexisting_v1_table_writes_v1_format(db: TempDatabase) {
     );
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_drop_table_cleans_up_version(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1554,7 +1554,7 @@ fn test_cdc_drop_table_cleans_up_version(db: TempDatabase) {
 // CDC v2 specific tests
 // ============================================================================
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_v2_txn_id_autocommit(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1579,7 +1579,7 @@ fn test_cdc_v2_txn_id_autocommit(db: TempDatabase) {
     assert_ne!(rows[0][0], rows[2][0]);
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_v2_txn_id_explicit_transaction(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1606,7 +1606,7 @@ fn test_cdc_v2_txn_id_explicit_transaction(db: TempDatabase) {
     assert_eq!(rows[3][1], Value::Integer(2)); // COMMIT
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_v2_commit_record_fields(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1638,7 +1638,7 @@ fn test_cdc_v2_commit_record_fields(db: TempDatabase) {
 // Note: is_autocommit() and conn_txn_id() are internal functions and cannot be
 // called from user SQL. They are tested indirectly through the CDC record tests.
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_v2_txn_id_reset_after_commit(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1660,7 +1660,7 @@ fn test_cdc_v2_txn_id_reset_after_commit(db: TempDatabase) {
     assert_ne!(rows[0][0], rows[1][0]);
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_cdc_v2_schema_has_9_columns(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")

@@ -350,6 +350,9 @@ fn update_pragma(
             let value = parse_string(&value)?;
             let opts =
                 CaptureDataChangesInfo::parse(&value, Some(TURSO_CDC_CURRENT_VERSION.to_string()))?;
+            if opts.is_some() && connection.mvcc_enabled() {
+                bail_parse_error!("CDC is not supported in MVCC mode");
+            }
             // InitCdcVersion handles everything at execution time:
             // - For enable: creates CDC table + version table, records version,
             //   reads back actual version, defers CDC state to Halt

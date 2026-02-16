@@ -40,7 +40,6 @@ use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
     vector_distance_dot, vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
-use crate::{cdc_version_has_txn_id, TURSO_CDC_VERSION_V1};
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
@@ -61,6 +60,7 @@ use crate::{
     get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
     IOExt, MvCursor,
 };
+use crate::{TURSO_CDC_VERSION_V1, TURSO_CDC_VERSION_V2};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
@@ -8415,14 +8415,18 @@ pub fn op_init_cdc_version(
     // Step 1: Create CDC table if needed
     {
         conn.start_nested();
-        let create_sql = if cdc_version_has_txn_id(version) {
+        let create_sql = if version == TURSO_CDC_VERSION_V1 {
+            format!(
+                "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+            )
+        } else if version == TURSO_CDC_VERSION_V2 {
             format!(
                 "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
             )
         } else {
-            format!(
-                "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
-            )
+            return Err(LimboError::InternalError(format!(
+                "unexpected cdc version: {version}"
+            )));
         };
         let mut stmt = conn.prepare(create_sql)?;
         stmt.program
@@ -11765,6 +11769,12 @@ fn op_journal_mode_inner(
 
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc) {
+                    let cdc_info = program.connection.get_capture_data_changes_info();
+                    if cdc_info.is_some() {
+                        return Err(LimboError::InternalError(
+                            "cannot enable MVCC while CDC is active".to_string(),
+                        ));
+                    }
                     let db_path = program.connection.get_database_canonical_path();
                     let mv_store = journal_mode::open_mv_store(
                         pager.io.as_ref(),
