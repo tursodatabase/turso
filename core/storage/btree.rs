@@ -6955,8 +6955,8 @@ fn page_free_array(
     let buf_range = buf.as_ptr_range();
     let mut number_of_cells_removed = 0;
     let mut number_of_cells_buffered = 0;
-    let mut buffered_cells_offsets: [u16; 10] = [0; 10];
-    let mut buffered_cells_ends: [u16; 10] = [0; 10];
+    let mut buffered_cells_offsets: [usize; 10] = [0; 10];
+    let mut buffered_cells_ends: [usize; 10] = [0; 10];
     for i in first..first + count {
         let cell = &cell_array.cell_payloads[i];
         let cell_pointer = cell.as_ptr_range();
@@ -6967,8 +6967,8 @@ fn page_free_array(
                 "whole cell should be inside the page"
             );
             // TODO: remove pointer too
-            let offset = (cell_pointer.start as usize - buf_range.start as usize) as u16;
-            let len = (cell_pointer.end as usize - cell_pointer.start as usize) as u16;
+            let offset = cell_pointer.start as usize - buf_range.start as usize;
+            let len = cell_pointer.end as usize - cell_pointer.start as usize;
             assert!(len > 0, "cell size should be greater than 0");
             let end = offset + len;
 
@@ -6997,8 +6997,8 @@ fn page_free_array(
                     for j in 0..number_of_cells_buffered {
                         free_cell_range(
                             page,
-                            buffered_cells_offsets[j] as usize,
-                            buffered_cells_ends[j] as usize - buffered_cells_offsets[j] as usize,
+                            buffered_cells_offsets[j],
+                            buffered_cells_ends[j] - buffered_cells_offsets[j],
                             usable_space,
                         )?;
                     }
@@ -7015,8 +7015,8 @@ fn page_free_array(
     for j in 0..number_of_cells_buffered {
         free_cell_range(
             page,
-            buffered_cells_offsets[j] as usize,
-            buffered_cells_ends[j] as usize - buffered_cells_offsets[j] as usize,
+            buffered_cells_offsets[j],
+            buffered_cells_ends[j] - buffered_cells_offsets[j],
             usable_space,
         )?;
     }
