@@ -143,6 +143,52 @@ impl SortableIndexKey {
 
         Ok(std::cmp::Ordering::Equal)
     }
+
+    /// Check if the index key contains any NULL values (excluding the rowid column).
+    /// In SQLite, NULLs don't violate UNIQUE constraints, so we skip conflict checks for NULL keys.
+    pub fn contains_null(&self, num_indexed_cols: usize) -> Result<bool> {
+        let mut iter = self.key.iter()?;
+        // Only check the indexed columns, not the rowid at the end
+        for _ in 0..num_indexed_cols {
+            if let Some(value) = iter.next() {
+                if matches!(value?, crate::types::ValueRef::Null) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Check if the first `num_cols` columns of this key match another key.
+    /// Used for UNIQUE index conflict detection where we need to compare only
+    /// the indexed columns, not the rowid suffix.
+    pub fn matches_prefix(&self, other: &Self, num_cols: usize) -> Result<bool> {
+        let mut lhs = self.key.iter()?;
+        let mut rhs = other.key.iter()?;
+
+        for i in 0..num_cols {
+            let lhs_value = match lhs.next() {
+                Some(v) => v?,
+                None => return Ok(false),
+            };
+            let rhs_value = match rhs.next() {
+                Some(v) => v?,
+                None => return Ok(false),
+            };
+
+            let cmp = compare_immutable(
+                std::iter::once(&lhs_value),
+                std::iter::once(&rhs_value),
+                &self.metadata.key_info[i..i + 1],
+            );
+
+            if cmp != std::cmp::Ordering::Equal {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
 }
 
 impl PartialEq for SortableIndexKey {
@@ -317,6 +363,9 @@ pub struct Savepoint {
     /// On rollback: clear end timestamp to restore visibility.
     deleted_table_versions: Vec<(RowID, u64)>,
     deleted_index_versions: Vec<((MVTableId, Arc<SortableIndexKey>), u64)>,
+    /// RowIDs that were NEWLY added to write_set by this savepoint.
+    /// On rollback: only these should be removed from write_set.
+    newly_added_to_write_set: Vec<RowID>,
 }
 
 /// Transaction
@@ -357,7 +406,15 @@ impl Transaction {
     }
 
     fn insert_to_write_set(&self, id: RowID) {
-        self.write_set.insert(id);
+        // Check if this is a new addition to write_set
+        let is_new = !self.write_set.contains(&id);
+        self.write_set.insert(id.clone());
+        // If new, record in the current savepoint so we can remove on rollback
+        if is_new {
+            if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+                savepoint.newly_added_to_write_set.push(id);
+            }
+        }
     }
 
     /// Begin a new savepoint for statement-level tracking.
@@ -684,6 +741,147 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             _phantom: PhantomData,
         }
     }
+
+    fn check_rowid_for_conflicts(
+        &self,
+        rowid: &RowID,
+        end_ts: u64,
+        tx: &Transaction,
+        mvcc_store: &Arc<MvStore<Clock>>,
+    ) -> Result<()> {
+        let row_versions = mvcc_store.rows.get(rowid);
+        if row_versions.is_none() {
+            return Ok(());
+        }
+
+        let row_versions = row_versions.unwrap();
+        let row_versions = row_versions.value();
+        let row_versions = row_versions.read();
+
+        self.check_version_conflicts(end_ts, tx, mvcc_store, &row_versions)?;
+        Ok(())
+    }
+
+    fn check_index_for_conflicts(
+        &self,
+        rowid: &RowID,
+        end_ts: u64,
+        tx: &Transaction,
+        mvcc_store: &Arc<MvStore<Clock>>,
+    ) -> Result<()> {
+        let RowKey::Record(record) = &rowid.row_id else {
+            panic!("invalid index row_id type, should be Record")
+        };
+        if !record.metadata.is_unique {
+            // Skip indexes which are not unique or not primary key
+            return Ok(());
+        }
+        // In SQLite, NULLs don't violate UNIQUE constraints - skip conflict check for keys containing NULL
+        let num_indexed_cols = record.metadata.num_cols.saturating_sub(1); // exclude rowid column
+        if record.contains_null(num_indexed_cols)? {
+            return Ok(());
+        }
+
+        // Create a prefix key with num_cols - 1 for range lookup.
+        // Due to SortableIndexKey's Ord using min(num_cols), this key compares Equal
+        // to all entries with the same indexed columns (regardless of rowid).
+        let prefix_key = {
+            let mut index_info = record.metadata.as_ref().clone();
+            turso_assert!(index_info.has_rowid, "not supported yet without rowid");
+            index_info.num_cols -= 1;
+            SortableIndexKey {
+                key: record.key.clone(),
+                metadata: Arc::new(index_info),
+            }
+        };
+
+        let table_id = rowid.table_id;
+        let index_rows = mvcc_store
+            .index_rows
+            .get(&table_id)
+            .unwrap_or_else(|| panic!("expected index {table_id:?}"));
+        let index_rows = index_rows.value();
+
+        // Use range to efficiently find all entries that match the prefix.
+        // Since entries are ordered by Ord, all entries with the same indexed columns
+        // are contiguous. We start from the prefix_key and stop when prefix no longer matches.
+        for entry in index_rows.range::<SortableIndexKey, _>(&prefix_key..) {
+            let other_key = entry.key();
+            // Check if prefix still matches - if not, we've passed all matching entries
+            if !record.matches_prefix(other_key, num_indexed_cols)? {
+                break;
+            }
+            let row_versions = entry.value();
+            let row_versions = row_versions.read();
+            self.check_version_conflicts(end_ts, tx, mvcc_store, &row_versions)?;
+        }
+
+        Ok(())
+    }
+
+    fn check_version_conflicts(
+        &self,
+        end_ts: u64,
+        tx: &Transaction,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        row_versions: &[RowVersion],
+    ) -> Result<()> {
+        // Check for conflicts - iterate in reverse for faster early termination
+        for version in row_versions.iter().rev() {
+            // Skip deleted versions
+            if version.end.is_some() {
+                continue;
+            }
+
+            match version.begin {
+                Some(TxTimestampOrID::TxID(other_tx_id)) => {
+                    // Skip our own version
+                    if other_tx_id == self.tx_id {
+                        continue;
+                    }
+                    // Another transaction's uncommitted version - check their state
+                    let other_tx = mvcc_store.txs.get(&other_tx_id);
+                    if let Some(other_tx) = other_tx {
+                        let other_tx = other_tx.value();
+                        match other_tx.state.load() {
+                            // Other tx already committed = conflict
+                            TransactionState::Committed(_) => {
+                                return Err(LimboError::WriteWriteConflict);
+                            }
+                            // Both preparing - compare end_ts (lower wins)
+                            TransactionState::Preparing(other_end_ts) => {
+                                if other_end_ts < end_ts {
+                                    // Other tx has lower end_ts, they win
+                                    return Err(LimboError::WriteWriteConflict);
+                                }
+                                // We have lower end_ts, we win - they'll abort when they validate
+                            }
+                            // Other tx still active - we're already Preparing so we're ahead
+                            // They'll see us in Preparing/Committed when they try to commit
+                            TransactionState::Active => {}
+                            // Other tx aborted - no conflict
+                            TransactionState::Aborted | TransactionState::Terminated => {}
+                        }
+                    }
+                }
+                Some(TxTimestampOrID::Timestamp(begin_ts)) => {
+                    // Committed version - check if it was inserted after we started
+                    if begin_ts >= tx.begin_ts {
+                        // Duplicate! A version was committed after we started
+                        return Err(LimboError::WriteWriteConflict);
+                    }
+                    turso_assert!(
+                        false,
+                        "there is another row insterted and not updated/deleted from before"
+                    );
+                }
+                None => {
+                    // Invalid version
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WriteRowStateMachine {
@@ -844,71 +1042,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let tx = tx.value();
 
                 for id in &self.write_set {
-                    // TODO: check for conflicts with indices, check for uniqueness too.
-                    if !id.row_id.is_int_key() {
-                        continue;
-                    }
-
-                    let row_versions = mvcc_store.rows.get(id);
-                    if row_versions.is_none() {
-                        continue;
-                    }
-
-                    let row_versions = row_versions.unwrap();
-                    let row_versions = row_versions.value();
-                    let row_versions = row_versions.read();
-
-                    // Check for conflicts - iterate in reverse for faster early termination
-                    for version in row_versions.iter().rev() {
-                        // Skip deleted versions
-                        if version.end.is_some() {
-                            continue;
-                        }
-
-                        match version.begin {
-                            Some(TxTimestampOrID::TxID(other_tx_id)) => {
-                                // Skip our own version
-                                if other_tx_id == self.tx_id {
-                                    continue;
-                                }
-                                // Another transaction's uncommitted version - check their state
-                                let other_tx = mvcc_store.txs.get(&other_tx_id);
-                                if let Some(other_tx) = other_tx {
-                                    let other_tx = other_tx.value();
-                                    match other_tx.state.load() {
-                                        // Other tx already committed = conflict
-                                        TransactionState::Committed(_) => {
-                                            return Err(LimboError::WriteWriteConflict);
-                                        }
-                                        // Both preparing - compare end_ts (lower wins)
-                                        TransactionState::Preparing(other_end_ts) => {
-                                            if other_end_ts < *end_ts {
-                                                // Other tx has lower end_ts, they win
-                                                return Err(LimboError::WriteWriteConflict);
-                                            }
-                                            // We have lower end_ts, we win - they'll abort when they validate
-                                        }
-                                        // Other tx still active - we're already Preparing so we're ahead
-                                        // They'll see us in Preparing/Committed when they try to commit
-                                        TransactionState::Active => {}
-                                        // Other tx aborted - no conflict
-                                        TransactionState::Aborted
-                                        | TransactionState::Terminated => {}
-                                    }
-                                }
-                            }
-                            Some(TxTimestampOrID::Timestamp(begin_ts)) => {
-                                // Committed version - check if it was inserted after we started
-                                if begin_ts >= tx.begin_ts {
-                                    // Duplicate! A version was committed after we started
-                                    return Err(LimboError::WriteWriteConflict);
-                                }
-                                turso_assert!(false, "there is another row insterted and not updated/deleted from before");
-                            }
-                            None => {
-                                // Invalid version
-                            }
-                        }
+                    if id.row_id.is_int_key() {
+                        self.check_rowid_for_conflicts(id, *end_ts, tx, mvcc_store)?;
+                    } else {
+                        self.check_index_for_conflicts(id, *end_ts, tx, mvcc_store)?;
                     }
                 }
 
@@ -2648,22 +2785,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let mut affected_table_rowids: BTreeSet<RowID> = BTreeSet::new();
 
             // Remove created table versions
-            for (rowid, version_id) in savepoint.created_table_versions {
-                if let Some(entry) = self.rows.get(&rowid) {
+            for (rowid, version_id) in &savepoint.created_table_versions {
+                if let Some(entry) = self.rows.get(rowid) {
                     let mut versions = entry.value().write();
-                    versions.retain(|rv| rv.id != version_id);
+                    versions.retain(|rv| rv.id != *version_id);
                     tracing::debug!("rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
                         rowid.table_id, rowid.row_id, version_id);
                 }
-                affected_table_rowids.insert(rowid);
+                affected_table_rowids.insert(rowid.clone());
             }
 
             // Remove created index versions
-            for ((table_id, key), version_id) in savepoint.created_index_versions {
-                if let Some(index) = self.index_rows.get(&table_id) {
-                    if let Some(entry) = index.value().get(&key) {
+            for ((table_id, key), version_id) in &savepoint.created_index_versions {
+                if let Some(index) = self.index_rows.get(table_id) {
+                    if let Some(entry) = index.value().get(key) {
                         let mut versions = entry.value().write();
-                        versions.retain(|rv| rv.id != version_id);
+                        versions.retain(|rv| rv.id != *version_id);
                         tracing::debug!(
                             "rollback_savepoint: removed index version(table_id={}, version_id={})",
                             table_id,
@@ -2674,11 +2811,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
 
             // Restore deleted table versions (clear end timestamp)
-            for (rowid, version_id) in savepoint.deleted_table_versions {
-                if let Some(entry) = self.rows.get(&rowid) {
+            for (rowid, version_id) in &savepoint.deleted_table_versions {
+                if let Some(entry) = self.rows.get(rowid) {
                     let mut versions = entry.value().write();
                     for rv in versions.iter_mut() {
-                        if rv.id == version_id {
+                        if rv.id == *version_id {
                             rv.end = None;
                             tracing::debug!("rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
                                 rowid.table_id, rowid.row_id, version_id);
@@ -2686,16 +2823,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
                     }
                 }
-                affected_table_rowids.insert(rowid);
+                affected_table_rowids.insert(rowid.clone());
             }
 
             // Restore deleted index versions
-            for ((table_id, key), version_id) in savepoint.deleted_index_versions {
-                if let Some(index) = self.index_rows.get(&table_id) {
-                    if let Some(entry) = index.value().get(&key) {
+            for ((table_id, key), version_id) in &savepoint.deleted_index_versions {
+                if let Some(index) = self.index_rows.get(table_id) {
+                    if let Some(entry) = index.value().get(key) {
                         let mut versions = entry.value().write();
                         for rv in versions.iter_mut() {
-                            if rv.id == version_id {
+                            if rv.id == *version_id {
                                 rv.end = None;
                                 tracing::debug!("rollback_savepoint: restored index version(table_id={}, version_id={})",
                                     table_id, version_id);
@@ -2706,7 +2843,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
 
-            // Clean up write set: remove table rowids that no longer have any
+            // Clean up write set: remove rowids that no longer have any
             // version belonging to this transaction. Without this, commit
             // validation would find stale write set entries pointing to
             // pre-existing committed versions and panic.
@@ -2717,6 +2854,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         matches!(rv.begin, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
                             || matches!(rv.end, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
                     })
+                } else {
+                    false
+                };
+                if !has_tx_version {
+                    tx.write_set.remove(rowid);
+                }
+            }
+
+            // Same cleanup for index rowids that were newly added by this savepoint.
+            for rowid in &savepoint.newly_added_to_write_set {
+                if rowid.row_id.is_int_key() {
+                    // Table rowids are already handled above via affected_table_rowids.
+                    continue;
+                }
+                let RowKey::Record(ref record) = rowid.row_id else {
+                    unreachable!()
+                };
+                let has_tx_version = if let Some(index) = self.index_rows.get(&rowid.table_id) {
+                    if let Some(entry) = index.value().get(record) {
+                        let versions = entry.value().read();
+                        versions.iter().any(|rv| {
+                            matches!(rv.begin, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
+                                || matches!(rv.end, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
+                        })
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 };

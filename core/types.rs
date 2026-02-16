@@ -1788,6 +1788,8 @@ pub struct IndexInfo {
     pub has_rowid: bool,
     /// The total number of columns in the index, including the row ID column if present.
     pub num_cols: usize,
+    /// Indicates whether index rows should be unique.
+    pub is_unique: bool,
 }
 
 impl Default for IndexInfo {
@@ -1796,6 +1798,7 @@ impl Default for IndexInfo {
             key_info: vec![],
             has_rowid: true,
             num_cols: 1,
+            is_unique: false,
         }
     }
 }
@@ -1822,6 +1825,7 @@ impl IndexInfo {
             },
             has_rowid: index.has_rowid,
             num_cols: index.columns.len() + (index.has_rowid as usize),
+            is_unique: index.unique,
         }
     }
 }
@@ -3057,6 +3061,7 @@ mod tests {
                 .collect(),
             has_rowid: false,
             num_cols,
+            is_unique: false,
         }
     }
 

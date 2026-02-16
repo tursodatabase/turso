@@ -3783,3 +3783,24 @@ fn test_gc_e2e_multiple_checkpoint_gc_cycles() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+#[test]
+fn test_mvcc_unique_constraint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id UNIQUE)").unwrap();
+    let conn2 = db.connect();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (666)").unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (666)").unwrap();
+
+    conn.execute("COMMIT").unwrap();
+    // conn2 should see conflict with conn1's row where first conneciton changed `begin` to a Timestamp that is < than conn2's end_ts
+    conn2
+        .execute("COMMIT")
+        .expect_err("duplicate unique - first committer wins");
+}

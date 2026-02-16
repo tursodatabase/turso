@@ -185,6 +185,7 @@ pub(crate) fn open_index_cursor(
         has_rowid: false,
         num_cols: keys.len(),
         key_info: keys,
+        is_unique: scratch.unique,
     }));
     Ok(cursor)
 }
