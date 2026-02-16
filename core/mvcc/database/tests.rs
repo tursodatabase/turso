@@ -3034,8 +3034,7 @@ fn test_commit_dependency_cascade_abort() {
     // Add reader to txs so cascade can find it
     txs.insert(2, reader);
 
-    let dependents = std::mem::take(&mut *tx1.commit_dep_set.lock());
-    for dep_tx_id in dependents {
+    for dep_tx_id in tx1.commit_dep_set.lock().drain(..) {
         if let Some(dep_tx_entry) = txs.get(&dep_tx_id) {
             let dep_tx = dep_tx_entry.value();
             dep_tx.abort_now.store(true, Ordering::Release);
@@ -3427,8 +3426,7 @@ fn test_commit_dep_threaded_commit_resolves() {
 
         // Committed state + notify dependents
         writer_tx.state.store(TransactionState::Committed(end_ts));
-        let dependents = std::mem::take(&mut *writer_tx.commit_dep_set.lock());
-        for dep_tx_id in dependents {
+        for dep_tx_id in writer_tx.commit_dep_set.lock().drain(..) {
             if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
                 dep_tx_entry
                     .value()
