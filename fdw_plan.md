@@ -1,0 +1,1943 @@
+# Foreign Data Wrapper Implementation Plan for Turso
+
+## 1. Context
+
+Turso (Limbo) already has a **production-grade virtual table system** that closely mirrors
+SQLite's vtab interface. This is the natural foundation for FDW support. Unlike PostgreSQL
+which has a separate FDW abstraction, we build FDWs as virtual table extensions
+using the existing `VTabModule` / `VTable` / `VTabCursor` traits.
+
+### What Turso Already Has
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `CREATE VIRTUAL TABLE` parsing | Done | `parser/src/parser.rs:840` |
+| Virtual table bytecode (VFilter/VColumn/VNext) | Done | `core/vdbe/insn.rs:477-506` |
+| `best_index` cost-based optimization | Done | `core/translate/optimizer/access_method.rs:386-424` |
+| Extension loading (`VTabModule` trait) | Done | `extensions/core/src/vtabs.rs:135-226` |
+| Constraint pushdown to vtab | Done | `ConstraintInfo`, `ConstraintUsage` types |
+| INSERT/UPDATE/DELETE on vtab | Done | `core/vdbe/execute.rs:1135`, derive dispatch at `macros/src/ext/vtab_derive.rs:140-190` |
+| Transaction support (begin/commit/rollback) | Done | vtab trait methods, derive wrappers |
+| CSV extension as reference impl | Done | `extensions/csv/src/lib.rs` |
+| Connection proxy for extensions | Done | `turso_ext::Connection` in `extensions/core/src/vtabs.rs:522-546` |
+| HIDDEN columns | Done | `core/schema.rs:2786` - type string containing "HIDDEN" sets the flag |
+| Dynamic extension loading | Done | `core/ext/dynamic.rs:38` - `load_extension()` via `libloading` |
+| Derive macros for FFI bridge | Done | `macros/src/ext/vtab_derive.rs` - generates all extern "C" wrappers |
+
+### What We Need to Build
+
+1. **`http` extension** - Query HTTP/REST APIs and MCP servers as tables
+2. **`duckdb` extension** - Query DuckDB databases for analytical workloads
+
+Both are implemented as Turso extensions using the virtual table interface. No changes to
+the core engine are required for v1.
+
+### Critical Design Constraints Discovered
+
+These are real constraints from reading the code that shape the implementation:
+
+**1. `best_index()` is a static method - no access to table instance.**
+
+The `VTable::best_index()` trait method signature (`extensions/core/src/vtabs.rs:195`):
+```rust
+fn best_index(
+    _constraints: &[ConstraintInfo],
+    _order_by: &[OrderByInfo],
+) -> Result<IndexInfo, ResultCode>
+```
+No `&self` parameter. The derive macro (`macros/src/ext/vtab_derive.rs:220-232`) calls it
+without a table pointer. This means `best_index` cannot inspect per-table-instance config
+(like which columns are HTTP parameters vs. result columns).
+
+**Consequence**: Constraint pushdown must be designed around this. Two approaches:
+- (a) `best_index` accepts ALL equality constraints generically, encodes column indices
+  in `idx_str`, and the cursor's `filter()` (which has `&mut self` and knows the config)
+  decides what to do with them.
+- (b) For HTTP FDW: use HIDDEN columns as parameters. `best_index` accepts all usable
+  constraints. `filter()` inspects which args correspond to HIDDEN columns and substitutes
+  them into the URL template.
+
+**2. The optimizer ignores vtab `estimated_cost` / `estimated_rows`.**
+
+At `core/translate/optimizer/access_method.rs:403`:
+```rust
+// TODO: Base cost on `IndexInfo::estimated_cost` and output cardinality on `IndexInfo::estimated_rows`
+cost: estimate_cost_for_scan_or_seek(None, &[], &[], ...)
+```
+The vtab's cost estimates are not used. The optimizer falls back to a generic cost model.
+This doesn't block us but means cost hints from `best_index` have no effect currently.
+
+**3. `VTabCursor::filter()` receives args but NOT constraint metadata.**
+
+Signature (`extensions/core/src/vtabs.rs:218`):
+```rust
+fn filter(&mut self, args: &[Value], idx_info: Option<(&str, i32)>) -> ResultCode;
+```
+The cursor receives:
+- `args`: constraint values (ordered by `argv_index` from `best_index`)
+- `idx_info`: `Some((idx_str, idx_num))` or `None`
+
+It does NOT receive which columns or operators the args correspond to. This metadata
+must be encoded in `idx_str` by `best_index` and decoded by `filter`.
+
+**4. The derive macro dispatches INSERT/UPDATE/DELETE from a single `xUpdate` call.**
+
+At `macros/src/ext/vtab_derive.rs:140-190`:
+- `args[0]` is NULL → INSERT (calls `VTable::insert(&columns)`)
+- `args[0]` is integer, `args[1]` is NULL → DELETE (calls `VTable::delete(rowid)`)
+- `args[0]` is integer, `args[1]` is integer → UPDATE (calls `VTable::update(rowid, &columns)`)
+
+The `columns` slice is `&args[2..]`, matching SQLite's xUpdate convention.
+
+**5. `VTabCursor::filter()` return convention.**
+
+`ResultCode::OK` → rows exist (cursor on first row)
+`ResultCode::EOF` → no rows
+Any other code → error
+
+This is checked in `core/vtab.rs:596-600` which maps to `Ok(true)` / `Ok(false)` / `Err`.
+
+**6. `VTable::open()` receives `Option<Arc<Connection>>`.**
+
+The `Connection` object lets extensions query other tables in the same database.
+Generated by the derive: `macros/src/ext/vtab_derive.rs:56-68`. The `Conn` pointer is
+constructed in `core/vtab.rs:440-444` with a `Weak<Connection>` and FFI function pointers
+for `prepare_stmt` and `execute`.
+
+**7. Extension crate structure.**
+
+From `extensions/csv/Cargo.toml`:
+```toml
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+static = ["turso_ext/static"]
+
+[dependencies]
+turso_ext = { workspace = true, features = ["static"] }
+```
+- `cdylib` for dynamic loading (`.so`/`.dylib`)
+- `lib` for static linking
+- Non-wasm builds require `mimalloc` as global allocator (injected by `register_extension!` macro)
+
+**8. `register_extension!` macro generates two entry points.**
+
+From `macros/src/ext/mod.rs:88-121`:
+- `register_extension` (`#[no_mangle]`, for dynamic loading) - receives `&ExtensionApi`
+- `register_extension_static` (feature-gated, for static linking) - receives `&mut ExtensionApi`
+
+**9. Only 6 constraint operators are passed to vtabs.**
+
+The optimizer's `to_ext_constraint_op()` at `core/translate/optimizer/constraints.rs:1362-1375`
+only converts these `ast::Operator` variants to `ConstraintOp`:
+- `Equals` → `ConstraintOp::Eq`
+- `Less` → `ConstraintOp::Lt`
+- `LessEquals` → `ConstraintOp::Le`
+- `Greater` → `ConstraintOp::Gt`
+- `GreaterEquals` → `ConstraintOp::Ge`
+- `NotEquals` → `ConstraintOp::Ne`
+
+**The `Like`, `Glob`, `Match`, `Regexp`, `In`, `Is`, `IsNot` operators are NOT converted.**
+The optimizer's `ConstraintOperator::Like` is a separate enum variant (not `AstNativeOperator`)
+and is filtered out by `to_ext_constraint_op`. This means `best_index` will never see
+`ConstraintOp::Like`, so our DuckDB extension should NOT list it as a supported operator.
+
+**10. `turso_ext::Value` is NOT Clone and has no Display impl.**
+
+The FFI `Value` type (`extensions/core/src/types.rs:112`) is `#[repr(C)]` with a union and
+does not implement `Clone` or `Display`. This means:
+- **Cursors cannot store `Vec<Vec<Value>>`** — you can't clone Values from the cache
+- **`arg.to_string()` won't compile** on `turso_ext::Value`
+
+Instead, cursors should store parsed data in Rust-native types (e.g., `serde_json::Value`
+or a custom `CellValue` enum) and construct fresh `turso_ext::Value` on each `column()` call
+using `Value::from_text()`, `Value::from_integer()`, etc. (same pattern as CSV extension).
+
+To extract string representations from constraint args, use `arg.to_text()` (returns
+`Option<&str>`), `arg.to_integer()` (returns `Option<i64>`), `arg.to_float()` (returns
+`Option<f64>`) rather than `.to_string()`.
+
+**11. Constraint-to-expression mapping in the optimizer.**
+
+At `core/translate/optimizer/mod.rs:1781-1851`, the optimizer maps `ConstraintUsage.argv_index`
+values to WHERE clause expressions. Each constraint with a non-None `argv_index` gets its
+constraining expression extracted from the WHERE clause and placed at position
+`argv_index - 1` in a `Vec<Expr>`. The final `Scan::VirtualTable.constraints` field
+(`core/translate/plan.rs:1884`) is `Vec<Expr>` — these are the expressions that get
+evaluated and passed as `args` to `filter()` via the VFilter bytecode instruction.
+
+The `argv_index` values MUST form a contiguous sequence starting from 1 (enforced at
+`core/translate/optimizer/mod.rs:1832-1844`). Gaps cause an error.
+
+**12. Virtual table cursor `rowid()` is used by the engine for UPDATE/DELETE.**
+
+The `RowId` instruction (`execute.rs:2922`) calls `virtual_cursor.rowid()` and stores
+the result in a register. For DELETE, the emitter puts this value in `VUpdate.start_reg[0]`
+(old_rowid). For UPDATE, it copies it to both `start_reg[0]` (old_rowid) and `start_reg[1]`
+(new_rowid) at `emitter.rs:2790-2796`. The derive macro then dispatches:
+- `(Some(old), None)` → `delete(table, old)`
+- `(Some(old), Some(new))` → `update(table, old, &columns)`
+
+**If your cursor's `rowid()` returns a sequential index instead of the actual row identifier
+from the backing store, UPDATE/DELETE will target the wrong rows.**
+
+**13. `duckdb-rs` crate does NOT have `Connection::last_insert_rowid()`.**
+
+Unlike `rusqlite`, the `duckdb-rs` crate does not provide `last_insert_rowid()`.
+Use `INSERT INTO table VALUES (...) RETURNING rowid` with `stmt.query_row()` instead.
+
+**14. `INSERT...SELECT` is NOT supported for virtual tables.**
+
+The translator at `core/translate/insert.rs:2407` only supports `INSERT INTO vtab VALUES (...)`.
+Attempting `INSERT INTO vtab SELECT ...` will fail. This is a known limitation.
+
+**15. Args to `VTabModule::create()` do NOT include module_name or table_name.**
+
+Unlike SQLite's `xCreate(db, pAux, argc, argv)` where `argv[0]` is module name and `argv[1]`
+is database name, Turso passes ONLY user-specified arguments. The `module_args_from_sql()`
+function at `core/util.rs:237` extracts only the content inside parentheses. VCreate at
+`execute.rs:1043-1044` stores module_name and table_name in separate registers. Follow the
+CSV extension pattern: iterate ALL args, split on first `=` to get `(key, value)` pairs.
+
+**16. `jsonpath_rust::JsonPath::parse()` does NOT exist.**
+
+The `jsonpath-rust` crate (0.7.x) provides `JsonPath` as an enum, not a struct. Construct via
+`JsonPath::from_str()` (implements `std::str::FromStr`). The `find()` method returns a
+`serde_json::Value` (a JSON array of matched items), not an iterator. Pin version to `0.7`
+since `1.0` is a breaking rewrite.
+
+**17. All config structs and enums MUST derive `Clone`.**
+
+`HttpConfig`, `DuckDbConfig`, `ColumnDef`, `ResponseFormat`, `DuckDbMode` all need `#[derive(Clone)]`.
+Cursors store a copy of the config (created in `VTable::open()`). `DuckDbMode` also needs
+`PartialEq` for the `!= DuckDbMode::Table` check in write methods.
+
+## 2. Architecture
+
+```
+                    SQL Query
+                       |
+                   [Parser]
+                       |
+            CREATE VIRTUAL TABLE ... USING http(...)
+            CREATE VIRTUAL TABLE ... USING duckdb(...)
+                       |
+                [Query Planner]
+                       |
+              best_index(constraints) -> IndexInfo { idx_str, idx_num, constraint_usages }
+                       |                     ^-- static method, no table instance
+                  [VDBE Executor]
+                       |
+        VFilter(args, idx_str, idx_num) -> VColumn -> VNext -> ...
+            |                                   |
+      [Extension cursor]                  [Extension cursor]
+            |  (has &mut self,                  |
+            |   knows config)                   |
+    HTTP request / DuckDB query           return rows
+```
+
+### Extension Crate Layout
+
+```
+extensions/
+  http/
+    Cargo.toml          # deps: turso_ext, ureq, serde_json, jsonpath-rust
+    src/
+      lib.rs            # register_extension! { vtabs: { HttpVTabModule } }
+      config.rs         # HttpConfig parsing from CREATE VIRTUAL TABLE args
+      table.rs          # HttpTable (VTable impl), best_index, open
+      cursor.rs         # HttpCursor (VTabCursor impl), filter/column/next
+      mcp.rs            # MCP JSON-RPC protocol helpers
+      response.rs       # JSON/CSV response parsing into Vec<Vec<Value>>
+  duckdb/
+    Cargo.toml          # deps: turso_ext, duckdb (bundled)
+    src/
+      lib.rs            # register_extension! { vtabs: { DuckDbVTabModule } }
+      config.rs         # DuckDbConfig parsing
+      table.rs          # DuckDbTable, best_index, open, insert/update/delete
+      cursor.rs         # DuckDbCursor, filter with SQL generation
+      type_map.rs       # DuckDB <-> Turso Value conversion
+```
+
+## 3. HTTP FDW (`http` extension)
+
+### 3.1 User-Facing SQL API
+
+```sql
+-- Basic REST API endpoint
+CREATE VIRTUAL TABLE github_repos USING http(
+    url='https://api.github.com/users/tursodatabase/repos',
+    format='json',
+    json_path='$',
+    columns='id INTEGER, name TEXT, full_name TEXT, stargazers_count INTEGER, language TEXT'
+);
+
+SELECT name, stargazers_count FROM github_repos
+  WHERE language = 'Rust'
+  ORDER BY stargazers_count DESC;
+```
+
+```sql
+-- API with query parameters via HIDDEN columns
+-- HIDDEN columns are NOT returned by SELECT * but CAN be constrained in WHERE
+CREATE VIRTUAL TABLE weather USING http(
+    url='https://api.openweathermap.org/data/2.5/weather',
+    format='json',
+    headers='Authorization: Bearer ${API_KEY}',
+    json_path='$.main',
+    columns='city TEXT HIDDEN, temp REAL, humidity INTEGER, pressure INTEGER'
+);
+
+-- The HIDDEN column 'city' is passed as URL param: ?city=London
+SELECT temp, humidity FROM weather WHERE city = 'London';
+```
+
+```sql
+-- POST endpoint (webhooks, GraphQL, etc.)
+CREATE VIRTUAL TABLE graphql_users USING http(
+    url='https://api.example.com/graphql',
+    method='POST',
+    content_type='application/json',
+    body='{"query": "{ users { id name email } }"}',
+    format='json',
+    json_path='$.data.users',
+    columns='id INTEGER, name TEXT, email TEXT'
+);
+```
+
+```sql
+-- CSV endpoint
+CREATE VIRTUAL TABLE remote_csv USING http(
+    url='https://data.example.com/export.csv',
+    format='csv',
+    header='yes',
+    columns='date TEXT, value REAL, category TEXT'
+);
+```
+
+#### MCP Server Integration
+
+```sql
+-- Connect to an MCP server tool
+CREATE VIRTUAL TABLE mcp_search USING http(
+    url='http://localhost:3000/mcp',
+    format='mcp',
+    tool='search_documents',
+    columns='query TEXT HIDDEN, id INTEGER, title TEXT, content TEXT, score REAL'
+);
+
+-- HIDDEN column 'query' becomes MCP tool argument
+SELECT title, score FROM mcp_search WHERE query = 'database performance' LIMIT 10;
+```
+
+### 3.2 Parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `url` | Yes | - | HTTP endpoint URL |
+| `method` | No | `GET` | HTTP method (GET, POST, PUT) |
+| `format` | No | `json` | Response format: `json`, `csv`, `mcp` |
+| `columns` | Yes | - | Column definitions (name TYPE [HIDDEN]) |
+| `json_path` | No | `$` | JSONPath to extract array of results |
+| `headers` | No | - | Custom headers (newline-separated key:value) |
+| `body` | No | - | Request body (for POST) |
+| `content_type` | No | `application/json` | Content-Type header |
+| `timeout` | No | `30` | Request timeout in seconds |
+| `cache_ttl` | No | `0` | Cache responses for N seconds |
+| `tool` | No | - | MCP tool name (format=mcp only) |
+| `resource` | No | - | MCP resource URI (format=mcp only) |
+
+### 3.3 Implementation Details
+
+**Required imports** (at top of `extensions/http/src/lib.rs`):
+```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+use turso_ext::*;
+```
+
+#### `HttpConfig` - Configuration parsed from CREATE VIRTUAL TABLE args
+
+```rust
+// MUST derive Clone + PartialEq — used in match and comparisons
+#[derive(Clone, PartialEq)]
+enum ResponseFormat {
+    Json,
+    Csv,
+    Mcp,
+}
+
+// MUST derive Clone — cursor stores a copy (created in open())
+#[derive(Clone)]
+struct HttpConfig {
+    url: String,
+    method: String,                  // GET, POST, PUT
+    format: ResponseFormat,          // Json, Csv, Mcp
+    json_path: String,               // JSONPath expression
+    headers: Vec<(String, String)>,  // custom headers
+    body: Option<String>,            // POST body
+    content_type: String,
+    timeout_secs: u64,
+    cache_ttl_secs: u64,
+    mcp_tool: Option<String>,
+    mcp_resource: Option<String>,
+    // Parsed from the columns= parameter
+    column_defs: Vec<ColumnDef>,     // name, type, is_hidden
+}
+
+// MUST derive Clone — used in HttpConfig and DuckDbConfig (both Clone)
+#[derive(Clone)]
+struct ColumnDef {
+    name: String,
+    ty: String,       // INTEGER, TEXT, REAL, BLOB
+    hidden: bool,
+}
+```
+
+Parsing follows the same `key=value` pattern as CSV extension (`extensions/csv/src/lib.rs:39-50`).
+Args arrive as `Value::from_text("key=value")` with single quotes already stripped by
+`module_args_from_sql()` at `core/util.rs:237`. Split on first `=` with `splitn(2, '=')`.
+The `columns` parameter is parsed to extract HIDDEN markers.
+
+**Shared helper** — generates the `CREATE TABLE x (...)` schema string required by the core:
+```rust
+fn column_defs_to_create_table_sql(column_defs: &[ColumnDef]) -> String {
+    let cols: Vec<String> = column_defs.iter()
+        .map(|c| {
+            if c.hidden {
+                format!("{} {} HIDDEN", c.name, c.ty)
+            } else {
+                format!("{} {}", c.name, c.ty)
+            }
+        })
+        .collect();
+    format!("CREATE TABLE x ({})", cols.join(", "))
+}
+```
+
+Both `HttpConfig` and `DuckDbConfig` delegate `to_create_table_sql()` to this helper.
+
+**Config parsing** (follows CSV extension pattern at `extensions/csv/src/lib.rs:39-50`):
+```rust
+impl HttpConfig {
+    fn parse(args: &[Value]) -> Result<Self, ResultCode> {
+        let mut url = None;
+        let mut method = "GET".to_string();
+        let mut format = ResponseFormat::Json;
+        let mut json_path = "$".to_string();
+        let mut headers = Vec::new();
+        let mut body = None;
+        let mut content_type = "application/json".to_string();
+        let mut timeout_secs = 30u64;
+        let mut cache_ttl_secs = 0u64;
+        let mut mcp_tool = None;
+        let mut mcp_resource = None;
+        let mut columns_str = None;
+
+        for arg in args {
+            let text = arg.to_text().ok_or(ResultCode::InvalidArgs)?;
+            let parts: Vec<&str> = text.splitn(2, '=').collect();
+            if parts.len() != 2 { return Err(ResultCode::InvalidArgs); }
+            let (key, value) = (parts[0], parts[1]);
+            match key.trim() {
+                "url" => url = Some(value.trim().to_string()),
+                "method" => method = value.trim().to_uppercase(),
+                "format" => format = match value.trim() {
+                    "csv" => ResponseFormat::Csv,
+                    "mcp" => ResponseFormat::Mcp,
+                    _ => ResponseFormat::Json,
+                },
+                "json_path" => json_path = value.trim().to_string(),
+                "headers" => {
+                    // Parse "Key: Value\nKey2: Value2"
+                    for line in value.split('\n') {
+                        if let Some((k, v)) = line.split_once(':') {
+                            headers.push((k.trim().to_string(), v.trim().to_string()));
+                        }
+                    }
+                }
+                "body" => body = Some(value.to_string()),
+                "content_type" => content_type = value.trim().to_string(),
+                "timeout" => timeout_secs = value.trim().parse().unwrap_or(30),
+                "cache_ttl" => cache_ttl_secs = value.trim().parse().unwrap_or(0),
+                "mcp_tool" => mcp_tool = Some(value.trim().to_string()),
+                "mcp_resource" => mcp_resource = Some(value.trim().to_string()),
+                "columns" => columns_str = Some(value.to_string()),
+                _ => return Err(ResultCode::InvalidArgs),
+            }
+        }
+
+        let url = url.ok_or(ResultCode::InvalidArgs)?;
+        let column_defs = parse_column_defs(columns_str.as_deref().unwrap_or(""))?;
+        if column_defs.is_empty() {
+            return Err(ResultCode::InvalidArgs); // columns required for HTTP
+        }
+
+        // Auto-set MCP defaults
+        if mcp_tool.is_some() || mcp_resource.is_some() {
+            format = ResponseFormat::Mcp;
+            method = "POST".to_string();
+        }
+
+        Ok(HttpConfig {
+            url, method, format, json_path, headers, body,
+            content_type, timeout_secs, cache_ttl_secs,
+            mcp_tool, mcp_resource, column_defs,
+        })
+    }
+
+    fn to_create_table_sql(&self) -> String {
+        column_defs_to_create_table_sql(&self.column_defs)
+    }
+}
+
+/// Parse "id INTEGER, name TEXT, city TEXT HIDDEN" into Vec<ColumnDef>
+fn parse_column_defs(s: &str) -> Result<Vec<ColumnDef>, ResultCode> {
+    if s.trim().is_empty() { return Ok(Vec::new()); }
+    let mut defs = Vec::new();
+    for part in s.split(',') {
+        let tokens: Vec<&str> = part.trim().split_whitespace().collect();
+        if tokens.len() < 2 { return Err(ResultCode::InvalidArgs); }
+        let name = tokens[0].to_string();
+        let ty = tokens[1].to_uppercase();
+        let hidden = tokens.len() > 2 && tokens[2].eq_ignore_ascii_case("HIDDEN");
+        defs.push(ColumnDef { name, ty, hidden });
+    }
+    Ok(defs)
+}
+
+impl DuckDbConfig {
+    fn parse(args: &[Value]) -> Result<Self, ResultCode> {
+        let mut database = None;
+        let mut table = None;
+        let mut query = None;
+        let mut schema_name = "main".to_string();
+        let mut columns_str = None;
+
+        for arg in args {
+            let text = arg.to_text().ok_or(ResultCode::InvalidArgs)?;
+            let parts: Vec<&str> = text.splitn(2, '=').collect();
+            if parts.len() != 2 { return Err(ResultCode::InvalidArgs); }
+            let (key, value) = (parts[0].trim(), parts[1].trim());
+            match key {
+                "database" => database = Some(value.to_string()),
+                "table" => table = Some(value.to_string()),
+                "query" => query = Some(value.to_string()),
+                "schema" => schema_name = value.to_string(),
+                "columns" => columns_str = Some(value.to_string()),
+                _ => return Err(ResultCode::InvalidArgs),
+            }
+        }
+
+        let database = database.ok_or(ResultCode::InvalidArgs)?;
+        if table.is_none() && query.is_none() {
+            return Err(ResultCode::InvalidArgs); // one of table/query required
+        }
+
+        let mode = if table.is_some() { DuckDbMode::Table } else { DuckDbMode::Query };
+        let column_defs = parse_column_defs(columns_str.as_deref().unwrap_or(""))?;
+        // column_defs can be empty — auto-detection happens in create() for table mode
+
+        Ok(DuckDbConfig { database, table, query, schema_name, column_defs, mode })
+    }
+
+    fn to_create_table_sql(&self) -> String {
+        column_defs_to_create_table_sql(&self.column_defs)
+    }
+}
+```
+
+#### `HttpVTabModule` (implements `VTabModule`)
+
+```rust
+#[derive(Debug, VTabModuleDerive, Default)]
+struct HttpVTabModule;
+
+impl VTabModule for HttpVTabModule {
+    type Table = HttpTable;
+    const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+    const NAME: &'static str = "http";
+    const READONLY: bool = true;
+
+    fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        let config = HttpConfig::parse(args)?;
+        // Generate schema like: CREATE TABLE x (city TEXT HIDDEN, temp REAL, humidity INTEGER)
+        // The HIDDEN keyword in the type string is detected by core/schema.rs:2786
+        let schema = config.to_create_table_sql();
+        Ok((schema, HttpTable { config }))
+    }
+}
+```
+
+**Schema generation**: The schema string MUST be a `CREATE TABLE x (...)` statement.
+The core parses it at `core/vtab.rs:169-183` via `Parser::new(schema.as_bytes())` and
+extracts column definitions. HIDDEN columns are detected by `ty_str.contains("HIDDEN")`
+at `core/schema.rs:2786`, so the schema must include HIDDEN in the type:
+```
+CREATE TABLE x (city TEXT HIDDEN, temp REAL, humidity INTEGER)
+```
+
+#### `HttpTable` (implements `VTable`)
+
+```rust
+struct HttpTable {
+    config: HttpConfig,
+}
+
+impl VTable for HttpTable {
+    type Cursor = HttpCursor;
+    type Error = ResultCode;
+
+    fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+        Ok(HttpCursor {
+            config: self.config.clone(),
+            rows: Vec::new(),
+            current_row: 0,
+        })
+    }
+
+    // best_index is static - cannot access self.config
+    // Strategy: accept ALL usable equality constraints, encode their column indices in idx_str
+    fn best_index(
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let mut usages = Vec::with_capacity(constraints.len());
+        let mut consumed_columns = Vec::new(); // column indices we'll consume
+        let mut next_argv = 1u32;
+
+        for c in constraints {
+            if c.usable && c.op == ConstraintOp::Eq {
+                // Accept all usable equality constraints
+                usages.push(ConstraintUsage {
+                    argv_index: Some(next_argv),
+                    omit: true, // we handle this constraint fully
+                });
+                consumed_columns.push(c.column_index);
+                next_argv += 1;
+            } else {
+                usages.push(ConstraintUsage {
+                    argv_index: None,
+                    omit: false,
+                });
+            }
+        }
+
+        // Encode consumed column indices in idx_str so filter() knows what each arg means
+        // Format: "0,3,7" = column indices in argv order
+        let idx_str = if consumed_columns.is_empty() {
+            None
+        } else {
+            Some(
+                consumed_columns
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        };
+
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str,
+            order_by_consumed: false,
+            estimated_cost: if consumed_columns.is_empty() { 1_000_000.0 } else { 1000.0 },
+            estimated_rows: if consumed_columns.is_empty() { u32::MAX } else { 100 },
+            constraint_usages: usages,
+        })
+    }
+}
+```
+
+#### `HttpCursor` (implements `VTabCursor`)
+
+**Important**: `turso_ext::Value` is NOT Clone and has no Display impl (constraint #10).
+Store rows as `serde_json::Value` and construct `turso_ext::Value` on each `column()` call.
+Use `arg.to_text()` / `arg.to_integer()` / `arg.to_float()` to extract constraint values.
+
+```rust
+struct HttpCursor {
+    config: HttpConfig,
+    rows: Vec<Vec<serde_json::Value>>,  // parsed response rows (NOT turso_ext::Value)
+    current_row: usize,
+}
+
+impl VTabCursor for HttpCursor {
+    type Error = ResultCode;
+
+    fn filter(&mut self, args: &[Value], idx_info: Option<(&str, i32)>) -> ResultCode {
+        // Decode idx_str to know which column each arg corresponds to
+        let consumed_columns: Vec<usize> = match idx_info {
+            Some((idx_str, _)) => idx_str
+                .split(',')
+                .filter_map(|s| s.parse::<usize>().ok())
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // Map args to column names using self.config (cursor HAS instance access)
+        // NOTE: Value has no Display impl. Use to_text()/to_integer()/to_float().
+        let mut params: HashMap<String, String> = HashMap::new();
+        for (i, col_idx) in consumed_columns.iter().enumerate() {
+            if let Some(arg) = args.get(i) {
+                let col = &self.config.column_defs[*col_idx];
+                let val_str = if let Some(s) = arg.to_text() {
+                    s.to_owned()
+                } else if let Some(n) = arg.to_integer() {
+                    n.to_string()
+                } else if let Some(f) = arg.to_float() {
+                    f.to_string()
+                } else {
+                    String::new() // null
+                };
+                params.insert(col.name.clone(), val_str);
+            }
+        }
+
+        // Build HTTP request
+        let mut url = self.config.url.clone();
+        if !params.is_empty() && self.config.method == "GET" {
+            // Append HIDDEN column values as query params
+            let query: String = params.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&");
+            url = format!("{url}?{query}");
+        }
+
+        // Execute HTTP request (blocking in v1)
+        let response = match self.execute_request(&url, &params) {
+            Ok(r) => r,
+            Err(_) => { self.rows.clear(); return ResultCode::EOF; }
+        };
+
+        // Parse response based on format -> Vec<Vec<serde_json::Value>>
+        self.rows = match self.config.format {
+            ResponseFormat::Json => parse_json_response(&response, &self.config),
+            ResponseFormat::Csv => parse_csv_response(&response, &self.config),
+            ResponseFormat::Mcp => parse_mcp_response(&response, &self.config, &params),
+        };
+        self.current_row = 0;
+
+        if self.rows.is_empty() { ResultCode::EOF } else { ResultCode::OK }
+    }
+
+    fn column(&self, idx: u32) -> Result<Value, Self::Error> {
+        // Construct fresh turso_ext::Value each call (Value is NOT Clone)
+        let cell = self.rows.get(self.current_row)
+            .and_then(|row| row.get(idx as usize));
+        match cell {
+            Some(serde_json::Value::Number(n)) if n.is_i64() =>
+                Ok(Value::from_integer(n.as_i64().unwrap())),
+            Some(serde_json::Value::Number(n)) =>
+                Ok(Value::from_float(n.as_f64().unwrap())),
+            Some(serde_json::Value::String(s)) =>
+                Ok(Value::from_text(s.clone())),
+            Some(serde_json::Value::Bool(b)) =>
+                Ok(Value::from_integer(*b as i64)),
+            Some(serde_json::Value::Null) | None =>
+                Ok(Value::null()),
+            Some(other) =>
+                Ok(Value::from_text(serde_json::to_string(other).unwrap_or_default())),
+        }
+    }
+
+    fn eof(&self) -> bool {
+        self.current_row >= self.rows.len()
+    }
+
+    fn next(&mut self) -> ResultCode {
+        self.current_row += 1;
+        if self.current_row >= self.rows.len() { ResultCode::EOF } else { ResultCode::OK }
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+}
+
+impl HttpCursor {
+    fn execute_request(
+        &self, url: &str, params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        let timeout = std::time::Duration::from_secs(self.config.timeout_secs.max(1));
+        let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+
+        let mut req = match self.config.method.as_str() {
+            "POST" | "PUT" => agent.request(&self.config.method, url),
+            _ => agent.get(url),  // default GET
+        };
+
+        // Apply custom headers
+        for (key, value) in &self.config.headers {
+            req = req.set(key, value);
+        }
+
+        let response = if self.config.method == "POST" || self.config.method == "PUT" {
+            let body = if self.config.format == ResponseFormat::Mcp {
+                // MCP: build JSON-RPC body from params
+                build_mcp_request_body(&self.config, params)
+            } else {
+                self.config.body.clone().unwrap_or_default()
+            };
+            req.set("Content-Type", &self.config.content_type)
+                .send_string(&body)
+                .map_err(|e| format!("HTTP request failed: {e}"))?
+        } else {
+            req.call().map_err(|e| format!("HTTP request failed: {e}"))?
+        };
+
+        response.into_string()
+            .map_err(|e| format!("Failed to read response body: {e}"))
+    }
+}
+```
+
+#### HTTP Client
+
+Use `ureq` (blocking) for v1. Pure Rust, no system dependencies.
+Crate name follows `limbo_*` convention (see `extensions/csv/Cargo.toml`).
+
+```toml
+# extensions/http/Cargo.toml
+[package]
+name = "limbo_http"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Turso HTTP/MCP foreign data wrapper extension"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+static = ["turso_ext/static"]
+
+[dependencies]
+turso_ext = { workspace = true, features = ["static"] }
+ureq = "2"
+serde_json = "1"
+jsonpath-rust = "0.7"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+```
+
+`ureq` is blocking. This means `filter()` blocks the VDBE until the HTTP response
+arrives. For v1 this is acceptable. For v2, see section 5.2 on async.
+
+**ureq v2 API:**
+```rust
+// GET
+let body: String = ureq::get(&url)
+    .set("Authorization", "Bearer token")
+    .call()                    // -> Result<Response, ureq::Error>
+    .map_err(|e| ...)?
+    .into_string()             // -> Result<String, std::io::Error>
+    .map_err(|e| ...)?;
+
+// POST
+let body: String = ureq::post(&url)
+    .set("Content-Type", &self.config.content_type)
+    .send_string(&post_body)?  // -> Result<Response, ureq::Error>
+    .into_string()?;
+```
+
+**Error handling:** `ureq::Error::Status(code, response)` for HTTP 4xx/5xx. Transport errors for
+connection/DNS failures. Pin to ureq v2 — v3 has breaking API changes.
+
+#### MCP Protocol
+
+For MCP support, `filter()` sends JSON-RPC over HTTP:
+
+```json
+{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+ "params": {"name": "search_documents", "arguments": {"query": "..."}}}
+```
+
+The response `result.content[]` array is parsed. Each content item with
+`type: "text"` has its text parsed as JSON to extract column values.
+
+```rust
+fn build_mcp_request_body(
+    config: &HttpConfig, params: &HashMap<String, String>,
+) -> String {
+    let arguments: serde_json::Value = params.iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into();
+
+    if let Some(tool) = &config.mcp_tool {
+        // tools/call
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        }).to_string()
+    } else if let Some(resource) = &config.mcp_resource {
+        // resources/read
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "resources/read",
+            "params": { "uri": resource }
+        }).to_string()
+    } else {
+        "{}".to_string()
+    }
+}
+
+fn parse_mcp_response(
+    body: &str, config: &HttpConfig, _params: &HashMap<String, String>,
+) -> Vec<Vec<serde_json::Value>> {
+    let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    // MCP response: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"..."}]}}
+    let content = json.pointer("/result/content").and_then(|v| v.as_array());
+    let Some(items) = content else { return Vec::new(); };
+
+    let mut rows = Vec::new();
+    for item in items {
+        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                // Try to parse text as JSON object, then extract column values
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(text) {
+                    let row: Vec<serde_json::Value> = config.column_defs.iter()
+                        .filter(|c| !c.hidden)
+                        .map(|col| obj.get(&col.name).cloned().unwrap_or(serde_json::Value::Null))
+                        .collect();
+                    rows.push(row);
+                }
+            }
+        }
+    }
+    rows
+}
+```
+
+#### JSON Response Parsing
+
+Returns `Vec<Vec<serde_json::Value>>` (NOT `turso_ext::Value`). Conversion to
+`turso_ext::Value` happens in `column()` (see constraint #10 above).
+
+```rust
+fn parse_json_response(body: &str, config: &HttpConfig) -> Vec<Vec<serde_json::Value>> {
+    let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+
+    // Apply JSONPath to extract array
+    // NOTE: JsonPath::parse() does NOT exist. Use FromStr trait.
+    // find() returns a serde_json::Value (JSON array of matched items), NOT an iterator.
+    use std::str::FromStr;
+    let found = match jsonpath_rust::JsonPath::from_str(&config.json_path) {
+        Ok(path) => path.find(&json),
+        Err(_) => return Vec::new(),
+    };
+
+    // find() returns a JSON array of matched items
+    let items = match found.as_array() {
+        Some(arr) => arr.clone(),
+        None => vec![found],  // single match, wrap in array
+    };
+
+    // Non-hidden column names (what SELECT * returns)
+    let visible_cols: Vec<&ColumnDef> = config.column_defs.iter()
+        .filter(|c| !c.hidden)
+        .collect();
+
+    let mut rows = Vec::new();
+    for item in &items {
+        match item {
+            serde_json::Value::Object(obj) => {
+                // Extract column values by name
+                let row: Vec<serde_json::Value> = visible_cols.iter()
+                    .map(|col| obj.get(&col.name).cloned().unwrap_or(serde_json::Value::Null))
+                    .collect();
+                rows.push(row);
+            }
+            serde_json::Value::Array(arr) => {
+                // Positional extraction for array items
+                let row: Vec<serde_json::Value> = visible_cols.iter().enumerate()
+                    .map(|(i, _)| arr.get(i).cloned().unwrap_or(serde_json::Value::Null))
+                    .collect();
+                rows.push(row);
+            }
+            scalar => {
+                // Single scalar value → single-column row
+                rows.push(vec![scalar.clone()]);
+            }
+        }
+    }
+    rows
+    // NOTE: turso_ext::Value conversion happens lazily in column():
+    //   serde_json::Value::Number(n) if n.is_i64() -> Value::from_integer(n.as_i64())
+    //   serde_json::Value::Number(n)               -> Value::from_float(n.as_f64())
+    //   serde_json::Value::String(s)               -> Value::from_text(s)
+    //   serde_json::Value::Bool(b)                 -> Value::from_integer(b as i64)
+    //   serde_json::Value::Null                    -> Value::null()
+    //   serde_json::Value::Array/Object            -> Value::from_text(serde_json::to_string())
+}
+```
+
+#### CSV Response Parsing
+
+```rust
+fn parse_csv_response(body: &str, config: &HttpConfig) -> Vec<Vec<serde_json::Value>> {
+    let visible_cols: Vec<&ColumnDef> = config.column_defs.iter()
+        .filter(|c| !c.hidden)
+        .collect();
+
+    let mut rows = Vec::new();
+    let mut lines = body.lines();
+
+    // Skip header row if present (first line)
+    let _header = lines.next();
+
+    for line in lines {
+        if line.trim().is_empty() { continue; }
+        let fields: Vec<&str> = line.split(',').collect();
+        let row: Vec<serde_json::Value> = visible_cols.iter().enumerate()
+            .map(|(i, col)| {
+                let field = fields.get(i).map(|s| s.trim()).unwrap_or("");
+                // Try to parse as the declared type
+                match col.ty.to_uppercase().as_str() {
+                    "INTEGER" | "INT" => field.parse::<i64>()
+                        .map(|n| serde_json::Value::Number(n.into()))
+                        .unwrap_or(serde_json::Value::Null),
+                    "REAL" | "FLOAT" | "DOUBLE" => field.parse::<f64>()
+                        .ok()
+                        .and_then(|f| serde_json::Number::from_f64(f))
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null),
+                    _ => serde_json::Value::String(field.to_string()),
+                }
+            })
+            .collect();
+        rows.push(row);
+    }
+    rows
+}
+```
+
+**Note:** This CSV parser is simplistic (splits on `,`, no quoted field support). For v2,
+consider using the `csv` crate for proper RFC 4180 parsing. Sufficient for v1 since most
+HTTP APIs return JSON, not CSV.
+
+### 3.4 Constraint Pushdown Strategy (Revised)
+
+Since `best_index` is static, the strategy is:
+
+1. **`best_index`**: Accept ALL usable `Eq` constraints. Encode their `column_index`
+   values in `idx_str` as comma-separated integers (e.g., `"0,3"`). Set `argv_index`
+   for each consumed constraint. Set `omit: true` so the VDBE doesn't re-check them.
+
+2. **`filter`**: Decode `idx_str` to get column indices. Map each arg to its column name
+   using `self.config.column_defs[col_idx]`. For HIDDEN columns, use as HTTP parameters.
+   For non-HIDDEN columns, treat as post-fetch filters (but since we set `omit: true`,
+   the VDBE already trusts us).
+
+3. **HIDDEN columns** behave as parameters: `city TEXT HIDDEN` means `city` is a query
+   parameter that doesn't appear in `SELECT *` but can be used in `WHERE city = 'London'`.
+   The core already handles HIDDEN correctly (`core/schema.rs:2786`).
+
+## 4. DuckDB FDW (`duckdb` extension)
+
+### 4.1 User-Facing SQL API
+
+```sql
+-- Attach a DuckDB database file
+CREATE VIRTUAL TABLE sales USING duckdb(
+    database='/path/to/analytics.duckdb',
+    table='sales',
+    columns='id INTEGER, product TEXT, amount REAL, sale_date TEXT, region TEXT'
+);
+
+-- Or with auto-detected schema (no columns= needed)
+CREATE VIRTUAL TABLE sales USING duckdb(
+    database='/path/to/analytics.duckdb',
+    table='sales'
+);
+
+-- WHERE is pushed down to DuckDB
+SELECT product, SUM(amount)
+  FROM sales
+  WHERE region = 'US' AND sale_date > '2025-01-01'
+  GROUP BY product;
+
+-- Join Turso local table with DuckDB analytical table
+SELECT u.name, s.product, s.amount
+  FROM users u
+  JOIN sales s ON u.id = s.customer_id
+  WHERE s.amount > 100;
+```
+
+```sql
+-- Raw DuckDB SQL (query mode - no pushdown, fixed query)
+CREATE VIRTUAL TABLE monthly_sales USING duckdb(
+    database='/path/to/analytics.duckdb',
+    query='SELECT date_trunc(''month'', sale_date) as month, SUM(amount) as total FROM sales GROUP BY 1',
+    columns='month TEXT, total REAL'
+);
+
+-- Query Parquet files through DuckDB
+CREATE VIRTUAL TABLE parquet_data USING duckdb(
+    database=':memory:',
+    query='SELECT * FROM read_parquet(''/data/events.parquet'')',
+    columns='event_id INTEGER, event_type TEXT, timestamp TEXT, payload TEXT'
+);
+```
+
+### 4.2 Parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `database` | Yes | - | Path to DuckDB file, or `:memory:` |
+| `table` | No* | - | DuckDB table name to query |
+| `query` | No* | - | Raw DuckDB SQL (no pushdown) |
+| `columns` | No | auto | Column definitions (auto-detected if `table` given) |
+| `schema` | No | `main` | DuckDB schema name |
+
+*One of `table` or `query` must be specified.
+
+### 4.3 Implementation Details
+
+#### `DuckDbConfig`
+
+```rust
+// MUST derive Clone — cursor stores a copy (created in open())
+#[derive(Clone)]
+struct DuckDbConfig {
+    database: String,
+    table: Option<String>,         // table mode
+    query: Option<String>,         // query mode
+    schema_name: String,           // default "main"
+    column_defs: Vec<ColumnDef>,   // parsed or auto-detected (ColumnDef is Clone)
+    mode: DuckDbMode,
+}
+
+// MUST derive Clone + PartialEq — used in matches!() and != comparisons
+#[derive(Clone, PartialEq)]
+enum DuckDbMode {
+    Table,   // SELECT with pushdown
+    Query,   // fixed SQL, no pushdown
+}
+```
+
+#### `DuckDbVTabModule` (implements `VTabModule`)
+
+```rust
+#[derive(Debug, VTabModuleDerive, Default)]
+struct DuckDbVTabModule;
+
+impl VTabModule for DuckDbVTabModule {
+    type Table = DuckDbTable;
+    const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+    const NAME: &'static str = "duckdb";
+    const READONLY: bool = false;
+
+    fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        let config = DuckDbConfig::parse(args)?;
+        let conn = duckdb::Connection::open(&config.database)
+            .map_err(|_| ResultCode::Error)?;
+
+        // Auto-detect schema if columns not specified and table mode
+        let (schema_sql, column_defs) = if config.column_defs.is_empty() {
+            introspect_duckdb_schema(&conn, &config)?
+        } else {
+            (config.to_create_table_sql(), config.column_defs.clone())
+        };
+
+        let mut final_config = config;
+        final_config.column_defs = column_defs;
+
+        Ok((schema_sql, DuckDbTable { config: final_config, conn }))
+    }
+}
+```
+
+**Auto schema detection** queries DuckDB's `information_schema`:
+```rust
+fn introspect_duckdb_schema(
+    conn: &duckdb::Connection, config: &DuckDbConfig,
+) -> Result<(String, Vec<ColumnDef>), ResultCode> {
+    let table_name = config.table.as_ref().ok_or(ResultCode::Error)?;
+    let mut stmt = conn.prepare(
+        "SELECT column_name, data_type FROM information_schema.columns \
+         WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position"
+    ).map_err(|_| ResultCode::Error)?;
+
+    let rows = stmt.query_map(
+        [&config.schema_name, table_name.as_str()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    ).map_err(|_| ResultCode::Error)?;
+
+    let mut column_defs = Vec::new();
+    for row in rows {
+        let (col_name, duckdb_type) = row.map_err(|_| ResultCode::Error)?;
+        // Map DuckDB type names to Turso types (see 4.4 Type Mapping)
+        let turso_type = match duckdb_type.to_uppercase().as_str() {
+            "BIGINT" | "INTEGER" | "SMALLINT" | "TINYINT" | "BOOLEAN" => "INTEGER",
+            "DOUBLE" | "FLOAT" | "DECIMAL" | "REAL" => "REAL",
+            "BLOB" => "BLOB",
+            _ => "TEXT",  // VARCHAR, DATE, TIMESTAMP, LIST, STRUCT, MAP, etc.
+        };
+        column_defs.push(ColumnDef {
+            name: col_name, ty: turso_type.to_string(), hidden: false,
+        });
+    }
+
+    if column_defs.is_empty() {
+        return Err(ResultCode::Error); // table not found or no columns
+    }
+
+    // Generate CREATE TABLE schema string
+    let cols_sql: Vec<String> = column_defs.iter()
+        .map(|c| format!("{} {}", c.name, c.ty))
+        .collect();
+    let schema = format!("CREATE TABLE x ({})", cols_sql.join(", "));
+    Ok((schema, column_defs))
+}
+```
+
+**Known limitation:** SQL identifiers (column names, table names) are not quoted in generated
+SQL. Column names like "group" (reserved word) or "full name" (space) will cause DuckDB SQL
+errors. For v1, assume clean ASCII identifiers. For v2, wrap in double-quotes:
+`format!("\"{}\"", name.replace('"', "\"\""))`.
+
+#### `DuckDbTable` (implements `VTable`)
+
+```rust
+struct DuckDbTable {
+    config: DuckDbConfig,
+    conn: duckdb::Connection,  // kept open for table lifetime
+}
+
+impl VTable for DuckDbTable {
+    type Cursor = DuckDbCursor;
+    type Error = String;
+
+    fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+        Ok(DuckDbCursor {
+            config: self.config.clone(),
+            // Share connection via raw pointer (DuckDB Connection is not Clone)
+            // Safe: cursor lifetime <= table lifetime
+            conn_ptr: &self.conn as *const duckdb::Connection,
+            rows: Vec::new(),
+            row_ids: Vec::new(),
+            current_row: 0,
+        })
+    }
+
+    // Static method - same pattern as HTTP FDW
+    fn best_index(
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        // Accept equality AND comparison constraints for pushdown.
+        // NOTE: Only Eq, Lt, Le, Gt, Ge, Ne are passed by the optimizer (constraint #9).
+        // Like/Glob/Match/Regexp are NOT converted by to_ext_constraint_op().
+        let mut usages = Vec::with_capacity(constraints.len());
+        let mut consumed = Vec::new(); // (column_index, op) pairs
+        let mut next_argv = 1u32;
+
+        for c in constraints {
+            if c.usable && matches!(c.op,
+                ConstraintOp::Eq | ConstraintOp::Lt | ConstraintOp::Le |
+                ConstraintOp::Gt | ConstraintOp::Ge | ConstraintOp::Ne
+            ) {
+                usages.push(ConstraintUsage {
+                    argv_index: Some(next_argv),
+                    omit: true,
+                });
+                consumed.push((c.column_index, c.op as u8));
+                next_argv += 1;
+            } else {
+                usages.push(ConstraintUsage { argv_index: None, omit: false });
+            }
+        }
+
+        // Encode column_index:op pairs in idx_str
+        // Format: "0:2,3:16" = column 0 with Eq(2), column 3 with Gt(16)
+        let idx_str = if consumed.is_empty() {
+            None
+        } else {
+            Some(
+                consumed.iter()
+                    .map(|(col, op)| format!("{col}:{op}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        };
+
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str,
+            order_by_consumed: false,
+            estimated_cost: if consumed.is_empty() { 1_000_000.0 } else { 1000.0 },
+            estimated_rows: if consumed.is_empty() { u32::MAX } else { 1000 },
+            constraint_usages: usages,
+        })
+    }
+
+    fn insert(&mut self, args: &[Value]) -> Result<i64, Self::Error> {
+        if self.config.mode != DuckDbMode::Table {
+            return Err("INSERT not supported in query mode".into());
+        }
+        // Build: INSERT INTO <table> VALUES (?, ?, ...) RETURNING rowid
+        // NOTE: duckdb-rs does NOT have conn.last_insert_rowid() like rusqlite.
+        // Use INSERT ... RETURNING rowid to get the inserted row's rowid.
+        let placeholders = (0..args.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "INSERT INTO {} VALUES ({}) RETURNING rowid",
+            self.config.table.as_ref().unwrap(), placeholders
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        for (i, arg) in args.iter().enumerate() {
+            bind_turso_value_to_duckdb(&mut stmt, i + 1, arg)?;
+        }
+        // Must use raw_query() since we used raw_bind_parameter() above.
+        // query_row() would pass its own params, overriding our bindings.
+        let mut rows = stmt.raw_query();
+        let row = rows.next().map_err(|e| e.to_string())?
+            .ok_or_else(|| "INSERT RETURNING returned no rows".to_string())?;
+        let rowid: i64 = row.get(0).map_err(|e| e.to_string())?;
+        Ok(rowid)
+    }
+
+    fn delete(&mut self, rowid: i64) -> Result<(), Self::Error> {
+        if self.config.mode != DuckDbMode::Table {
+            return Err("DELETE not supported in query mode".into());
+        }
+        let sql = format!(
+            "DELETE FROM {} WHERE rowid = ?",
+            self.config.table.as_ref().unwrap()
+        );
+        self.conn.execute(&sql, [rowid]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn update(&mut self, rowid: i64, args: &[Value]) -> Result<(), Self::Error> {
+        if self.config.mode != DuckDbMode::Table {
+            return Err("UPDATE not supported in query mode".into());
+        }
+        // Build: UPDATE <table> SET col0=?, col1=?, ... WHERE rowid = ?
+        // The rowid parameter is bound AFTER all column values.
+        let sets: Vec<String> = self.config.column_defs.iter().enumerate()
+            .map(|(i, col)| format!("{} = ?{}", col.name, i + 1))
+            .collect();
+        let rowid_param_idx = args.len() + 1;
+        let sql = format!(
+            "UPDATE {} SET {} WHERE rowid = ?{}",
+            self.config.table.as_ref().unwrap(),
+            sets.join(", "),
+            rowid_param_idx,
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        // Bind column values
+        for (i, arg) in args.iter().enumerate() {
+            bind_turso_value_to_duckdb(&mut stmt, i + 1, arg)?;
+        }
+        // Bind rowid to the WHERE clause (Bug fix: this was missing!)
+        stmt.raw_bind_parameter(rowid_param_idx, rowid)
+            .map_err(|e| e.to_string())?;
+        stmt.raw_execute().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    // begin/commit/rollback: default no-ops from VTable trait are fine.
+    // DuckDB auto-commits each statement. If batched transaction performance
+    // becomes important, implement these to call conn.execute("BEGIN"/"COMMIT"/"ROLLBACK").
+}
+```
+
+#### `DuckDbCursor` (implements `VTabCursor`)
+
+**Important**: `turso_ext::Value` is NOT Clone (constraint #10). Store rows as a custom
+enum and construct `turso_ext::Value` on each `column()` call.
+
+```rust
+/// Owned cell value for caching DuckDB results (turso_ext::Value is NOT Clone)
+#[derive(Clone)]
+enum CellValue {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl CellValue {
+    fn to_ext_value(&self) -> Value {
+        match self {
+            CellValue::Null => Value::null(),
+            CellValue::Integer(i) => Value::from_integer(*i),
+            CellValue::Float(f) => Value::from_float(*f),
+            CellValue::Text(s) => Value::from_text(s.clone()),
+            CellValue::Blob(b) => Value::from_blob(b.clone()),
+        }
+    }
+}
+
+struct DuckDbCursor {
+    config: DuckDbConfig,
+    conn_ptr: *const duckdb::Connection,
+    rows: Vec<Vec<CellValue>>,  // NOT turso_ext::Value (see constraint #10)
+    row_ids: Vec<i64>,          // DuckDB rowid for each row (for UPDATE/DELETE support)
+    current_row: usize,
+}
+
+// SAFETY: DuckDB connection is thread-safe
+unsafe impl Send for DuckDbCursor {}
+unsafe impl Sync for DuckDbCursor {}
+
+impl VTabCursor for DuckDbCursor {
+    type Error = String;
+
+    fn filter(&mut self, args: &[Value], idx_info: Option<(&str, i32)>) -> ResultCode {
+        let conn = unsafe { &*self.conn_ptr };
+
+        let sql = match self.config.mode {
+            DuckDbMode::Query => {
+                // Fixed query mode - no pushdown
+                self.config.query.clone().unwrap()
+            }
+            DuckDbMode::Table => {
+                // Build SELECT with WHERE from pushed constraints
+                // Include rowid for UPDATE/DELETE support (DuckDB pseudocolumn)
+                let cols = self.config.column_defs.iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let table = self.config.table.as_ref().unwrap();
+                let mut sql = format!("SELECT rowid, {cols} FROM {table}");
+
+                // Decode idx_str: "0:2,3:16" -> [(col0, Eq), (col3, Gt)]
+                if let Some((idx_str, _)) = idx_info {
+                    let clauses: Vec<String> = idx_str.split(',').enumerate()
+                        .filter_map(|(i, part)| {
+                            let parts: Vec<&str> = part.split(':').collect();
+                            if parts.len() != 2 { return None; }
+                            let col_idx: usize = parts[0].parse().ok()?;
+                            let op: u8 = parts[1].parse().ok()?;
+                            let col_name = &self.config.column_defs[col_idx].name;
+                            // ConstraintOp repr(u8) values from extensions/core/src/vtabs.rs
+                            // Only these 6 operators are passed by the optimizer (constraint #9)
+                            let op_str = match op {
+                                2 => "=", 4 => "<", 8 => "<=",
+                                16 => ">", 32 => ">=", 68 => "!=",
+                                _ => return None,
+                            };
+                            Some(format!("{col_name} {op_str} ?{}", i + 1))
+                        })
+                        .collect();
+                    if !clauses.is_empty() {
+                        sql.push_str(" WHERE ");
+                        sql.push_str(&clauses.join(" AND "));
+                    }
+                }
+                sql
+            }
+        };
+
+        // Execute DuckDB query with bound parameters
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => { self.rows.clear(); return ResultCode::EOF; }
+        };
+
+        // Bind args (only in table mode with constraints)
+        // NOTE: Value has no Display impl. Use to_text()/to_integer()/to_float().
+        for (i, arg) in args.iter().enumerate() {
+            if bind_turso_value_to_duckdb(&mut stmt, i + 1, arg).is_err() {
+                self.rows.clear();
+                return ResultCode::EOF;
+            }
+        }
+
+        // Fetch all rows into Vec<Vec<CellValue>> (NOT turso_ext::Value)
+        // In table mode, column 0 in result set is rowid (not exposed to user)
+        let has_rowid = matches!(self.config.mode, DuckDbMode::Table);
+        let (rows, row_ids) = fetch_duckdb_rows(&mut stmt, &self.config.column_defs, has_rowid);
+        self.rows = rows;
+        self.row_ids = row_ids;
+        self.current_row = 0;
+
+        if self.rows.is_empty() { ResultCode::EOF } else { ResultCode::OK }
+    }
+
+    fn column(&self, idx: u32) -> Result<Value, Self::Error> {
+        // Construct fresh turso_ext::Value each call (Value is NOT Clone)
+        self.rows.get(self.current_row)
+            .and_then(|row| row.get(idx as usize))
+            .map(|cell| cell.to_ext_value())
+            .ok_or_else(|| "column out of bounds".to_string())
+    }
+
+    fn eof(&self) -> bool {
+        self.current_row >= self.rows.len()
+    }
+
+    fn next(&mut self) -> ResultCode {
+        self.current_row += 1;
+        if self.current_row >= self.rows.len() { ResultCode::EOF } else { ResultCode::OK }
+    }
+
+    fn rowid(&self) -> i64 {
+        // Return actual DuckDB rowid (NOT sequential index!)
+        // This value is used by the engine for UPDATE/DELETE VUpdate dispatch.
+        // The RowId instruction at execute.rs:2922 calls cursor.rowid() and puts
+        // it in a register. For UPDATE, emitter.rs:2790-2796 copies it to argv[0]
+        // and argv[1]. For DELETE, it goes to argv[0].
+        self.row_ids.get(self.current_row).copied().unwrap_or(self.current_row as i64)
+    }
+}
+```
+
+#### DuckDB Dependency
+
+Crate name follows `limbo_*` convention.
+
+```toml
+# extensions/duckdb/Cargo.toml
+[package]
+name = "limbo_duckdb"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Turso DuckDB foreign data wrapper extension"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+static = ["turso_ext/static"]
+
+[dependencies]
+turso_ext = { workspace = true, features = ["static"] }
+duckdb = { version = "1.1", features = ["bundled"] }
+serde_json = "1"  # for LIST/STRUCT/MAP serialization
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+```
+
+The `bundled` feature compiles DuckDB from C++ source (~20MB binary increase).
+This is a large dependency. Alternative: link against system `libduckdb` without `bundled`.
+
+#### Constraint Pushdown (Revised for static `best_index`)
+
+1. `best_index` (static): Accepts usable comparison constraints (Eq, Lt, Le, Gt, Ge, Ne).
+   **NOT Like** — the optimizer does not convert Like to ConstraintOp (see constraint #9).
+   Encodes each as `column_index:op_byte` in `idx_str`. The ConstraintOp enum values
+   match the `#[repr(u8)]` values defined in `extensions/core/src/vtabs.rs:228-245`.
+
+2. `filter` (has `&mut self`): Parses `idx_str`, maps column indices to column names
+   via `self.config.column_defs`, builds DuckDB SQL with parameterized WHERE, binds args.
+
+3. In `query` mode: `best_index` returns empty constraint usages (no pushdown).
+   `filter` runs the fixed query.
+
+### 4.4 Type Mapping
+
+Rows are fetched into `CellValue` (not `turso_ext::Value`) since Value is not Clone (constraint #10).
+Conversion to `turso_ext::Value` happens lazily in `column()` via `CellValue::to_ext_value()`.
+
+| Turso Type | DuckDB Type | Fetch as `CellValue` |
+|------------|-------------|----------------------|
+| `INTEGER` | `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT` | `CellValue::Integer(row.get::<_, i64>(i))` |
+| `INTEGER` | `BOOLEAN` | `CellValue::Integer(row.get::<_, bool>(i) as i64)` — MUST fetch as bool, NOT i64 |
+| `REAL` | `DOUBLE`, `FLOAT` | `CellValue::Float(row.get::<_, f64>(i))` |
+| `REAL` | `DECIMAL` | `CellValue::Float(row.get::<_, f64>(i))` |
+| `TEXT` | `VARCHAR` | `CellValue::Text(row.get::<_, String>(i))` |
+| `TEXT` | `DATE`, `TIMESTAMP` | `CellValue::Text(row.get::<_, String>(i))` |
+| `BLOB` | `BLOB` | `CellValue::Blob(row.get::<_, Vec<u8>>(i))` |
+| `NULL` | any NULL | `CellValue::Null` |
+| `TEXT` | `LIST`, `STRUCT`, `MAP` | `CellValue::Text(serde_json::to_string(...))` |
+
+**Verified**: `Value::from_blob(Vec<u8>)` exists at `extensions/core/src/types.rs:471`.
+
+#### `bind_turso_value_to_duckdb` Helper
+
+Since `turso_ext::Value` has no Display impl (constraint #10), binding must use accessor methods:
+
+```rust
+fn bind_turso_value_to_duckdb(
+    stmt: &mut duckdb::Statement,
+    idx: usize,  // 1-based DuckDB parameter index
+    value: &Value,
+) -> Result<(), String> {
+    match value.value_type() {
+        ValueType::Null => stmt.raw_bind_parameter(idx, duckdb::types::Null),
+        ValueType::Integer => {
+            let v = value.to_integer().unwrap_or(0);
+            stmt.raw_bind_parameter(idx, v)
+        }
+        ValueType::Float => {
+            let v = value.to_float().unwrap_or(0.0);
+            stmt.raw_bind_parameter(idx, v)
+        }
+        ValueType::Text => {
+            let v = value.to_text().unwrap_or("");
+            stmt.raw_bind_parameter(idx, v)
+        }
+        ValueType::Blob => {
+            let v = value.to_blob().unwrap_or_default();
+            stmt.raw_bind_parameter(idx, v.as_slice())
+        }
+        _ => Err("unsupported value type".to_string()),
+    }.map_err(|e| e.to_string())
+}
+```
+
+#### `fetch_duckdb_rows` Helper
+
+Fetches rows into `Vec<Vec<CellValue>>` (not `turso_ext::Value`).
+When `has_rowid` is true, column 0 in the result set is the DuckDB `rowid`
+pseudocolumn (included via `SELECT rowid, cols...`). It is extracted separately
+and NOT included in the cell data — the rowid is stored in the returned `Vec<i64>`.
+
+```rust
+fn fetch_duckdb_rows(
+    stmt: &mut duckdb::Statement,
+    column_defs: &[ColumnDef],
+    has_rowid: bool,
+) -> (Vec<Vec<CellValue>>, Vec<i64>) {
+    let mut rows_out = Vec::new();
+    let mut row_ids = Vec::new();
+    // If has_rowid, column 0 is rowid and data columns start at offset 1
+    let col_offset = if has_rowid { 1 } else { 0 };
+
+    // IMPORTANT: Use raw_query() because parameters were bound via raw_bind_parameter().
+    // Using query_map([], ...) would pass its own empty params and override our bindings.
+    let mut rows = stmt.raw_query();
+    while let Ok(Some(row)) = rows.next() {
+        // Extract rowid if present (column 0)
+        let rid = if has_rowid {
+            row.get::<_, i64>(0).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut cells = Vec::with_capacity(column_defs.len());
+        for (i, col) in column_defs.iter().enumerate() {
+            let db_col_idx = i + col_offset;
+            let cell = match col.ty.to_uppercase().as_str() {
+                "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" => {
+                    match row.get::<_, Option<i64>>(db_col_idx) {
+                        Ok(Some(v)) => CellValue::Integer(v),
+                        _ => CellValue::Null,
+                    }
+                }
+                // BOOLEAN must be fetched separately — duckdb-rs FromSql<i64>
+                // does NOT accept DuckDB BOOLEAN type (would return InvalidColumnType)
+                "BOOLEAN" | "BOOL" => {
+                    match row.get::<_, Option<bool>>(db_col_idx) {
+                        Ok(Some(v)) => CellValue::Integer(v as i64),
+                        _ => CellValue::Null,
+                    }
+                }
+                "REAL" | "DOUBLE" | "FLOAT" | "DECIMAL" => {
+                    match row.get::<_, Option<f64>>(db_col_idx) {
+                        Ok(Some(v)) => CellValue::Float(v),
+                        _ => CellValue::Null,
+                    }
+                }
+                "BLOB" => {
+                    match row.get::<_, Option<Vec<u8>>>(db_col_idx) {
+                        Ok(Some(v)) => CellValue::Blob(v),
+                        _ => CellValue::Null,
+                    }
+                }
+                _ => { // TEXT, VARCHAR, DATE, TIMESTAMP, etc.
+                    match row.get::<_, Option<String>>(db_col_idx) {
+                        Ok(Some(v)) => CellValue::Text(v),
+                        _ => CellValue::Null,
+                    }
+                }
+            };
+            cells.push(cell);
+        }
+        row_ids.push(rid);
+        rows_out.push(cells);
+    }
+    (rows_out, row_ids)
+}
+```
+
+#### DuckDB `rowid` — How Write Support Works
+
+DuckDB tables have a hidden `rowid` pseudocolumn (integers starting from 0, with gaps after deletions).
+The rowid is critical for UPDATE/DELETE because the Turso engine:
+
+1. Calls `cursor.rowid()` via the `RowId` instruction (`execute.rs:2922`)
+2. Passes it as `argv[0]` (old_rowid) to VUpdate
+3. The derive macro dispatches to `delete(table, old_rowid)` or `update(table, old_rowid, &columns)`
+
+**Implementation (already applied above):**
+- `filter()` in table mode: `SELECT rowid, col1, col2, ... FROM table_name WHERE ...`
+- `fetch_duckdb_rows()` extracts column 0 as rowid, stores in `row_ids: Vec<i64>`
+- `rowid()` returns `self.row_ids[current_row]` (actual DuckDB rowid, NOT sequential index)
+- `update()` binds rowid as the last parameter in `WHERE rowid = ?N`
+- `insert()` uses `INSERT ... RETURNING rowid` (duckdb-rs has no `last_insert_rowid()`)
+- `delete()` binds rowid in `WHERE rowid = ?`
+
+**DuckDB rowid limitations:**
+- Only available on persistent tables (not CSV files, not views)
+- Point lookup uses sequential scan (no index on rowid) — acceptable for FDW use
+- Rowid values are stable within a transaction
+- Deletions create gaps in rowid sequence
+
+## 5. Potential Core Enhancements (v2+)
+
+### 5.1 `CREATE FOREIGN TABLE` Syntax (v2)
+
+Add PostgreSQL-style syntax as sugar. Parser changes in `parser/src/parser.rs`.
+Translates to `CREATE VIRTUAL TABLE` internally.
+
+### 5.2 Async HTTP (v2)
+
+Replace blocking `ureq` with async HTTP. Would need either:
+- A new async cursor trait variant (significant core change), or
+- Run HTTP in a background thread and poll from the VDBE loop
+
+The `VNext` instruction already has a `// TODO: async` comment at `core/vdbe/insn.rs:502`.
+
+### 5.3 Make `best_index` take `&self` (v2)
+
+Adding `&self` to `VTable::best_index` would allow per-instance optimization. This requires:
+- Change trait at `extensions/core/src/vtabs.rs:195`
+- Change derive macro at `macros/src/ext/vtab_derive.rs:220-232` to pass table pointer
+- Change FFI type `BestIdxFn` at `extensions/core/src/vtabs.rs:121-126` to include table ptr
+- Change `ExtVirtualTable::best_index` at `core/vtab.rs:392-405` to pass ptr
+- Update all existing implementations
+
+### 5.4 Use vtab `estimated_cost` in Optimizer (v2)
+
+Fix the TODO at `core/translate/optimizer/access_method.rs:403` to use
+`IndexInfo::estimated_cost` and `estimated_rows` from `best_index`.
+
+## 6. Implementation Phases
+
+### Phase 1: HTTP FDW (Read-Only JSON)
+
+1. Create `extensions/http/` crate with `Cargo.toml` (see CSV as template)
+2. Add to workspace `Cargo.toml` members list
+3. Implement `HttpConfig` parsing (url, format, columns, json_path, headers, method, body, timeout)
+4. Implement `HttpVTabModule::create` - parse args, generate schema with HIDDEN
+5. Implement `HttpTable::best_index` - accept Eq constraints, encode in idx_str
+6. Implement `HttpTable::open` - return HttpCursor
+7. Implement `HttpCursor::filter` - decode idx_str, build URL, execute ureq request, parse JSON
+8. Implement `HttpCursor::column/next/eof/rowid`
+9. Add JSON response parsing with `serde_json` + `jsonpath-rust`
+10. Add CSV response parsing
+11. Write unit tests for config parsing, JSON extraction, constraint encoding/decoding
+12. Write integration `.sqltest` with embedded test HTTP server (`tiny_http` in test harness)
+
+**Dependencies**: `ureq`, `serde_json`, `jsonpath-rust`
+
+### Phase 2: MCP Integration
+
+1. Add MCP format handling to HTTP extension
+2. Build JSON-RPC request bodies for `tools/call` and `resources/read`
+3. Map HIDDEN column constraint values to MCP tool arguments
+4. Parse MCP response `content[]` array into rows
+5. Write tests with mock MCP server (JSON-RPC over HTTP)
+
+### Phase 3: DuckDB FDW
+
+1. Create `extensions/duckdb/` crate
+2. Add to workspace members
+3. Implement `DuckDbConfig` parsing (database, table, query, columns, schema)
+4. Implement `DuckDbVTabModule::create` with auto-schema detection
+5. Implement `DuckDbTable::best_index` - accept comparison constraints, encode col:op in idx_str
+6. Implement `DuckDbCursor::filter` - build SQL with WHERE, bind params, fetch rows
+7. Implement type mapping (`type_map.rs`) with all DuckDB -> Turso conversions
+8. Implement `DuckDbTable::insert/update/delete` for table mode
+9. Write unit tests for type mapping, SQL generation, constraint encoding
+10. Write integration `.sqltest` (test harness creates DuckDB databases with sample data)
+
+**Dependencies**: `duckdb` (with `bundled`)
+
+### Phase 4: Polish
+
+1. Error messages: surface HTTP status codes, DuckDB errors, parse failures
+2. Add to CI (new workspace members auto-build)
+3. Documentation
+
+## 7. Testing Strategy
+
+### 7.1 Unit Tests (Rust `#[test]`)
+
+Tests live in each extension crate, following CSV extension pattern (`extensions/csv/src/lib.rs:370-855`):
+
+```rust
+// extensions/http/src/lib.rs
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: minimal valid HttpConfig for tests
+    fn test_config() -> HttpConfig {
+        HttpConfig {
+            url: "https://example.com".to_string(),
+            method: "GET".to_string(),
+            format: ResponseFormat::Json,
+            json_path: "$".to_string(),
+            headers: Vec::new(),
+            body: None,
+            content_type: "application/json".to_string(),
+            timeout_secs: 30,
+            cache_ttl_secs: 0,
+            mcp_tool: None,
+            mcp_resource: None,
+            column_defs: vec![
+                ColumnDef { name: "id".into(), ty: "INTEGER".into(), hidden: false },
+                ColumnDef { name: "name".into(), ty: "TEXT".into(), hidden: false },
+            ],
+        }
+    }
+
+    // Test config parsing
+    #[test]
+    fn test_parse_http_config_basic() {
+        let args = vec![
+            Value::from_text("url=https://api.example.com/data".into()),
+            Value::from_text("format=json".into()),
+            Value::from_text("columns=id INTEGER, name TEXT".into()),
+        ];
+        let config = HttpConfig::parse(&args).unwrap();
+        assert_eq!(config.url, "https://api.example.com/data");
+        assert_eq!(config.column_defs.len(), 2);
+        assert!(!config.column_defs[0].hidden);
+    }
+
+    #[test]
+    fn test_parse_hidden_columns() {
+        let args = vec![
+            Value::from_text("url=https://example.com".into()),
+            Value::from_text("columns=city TEXT HIDDEN, temp REAL".into()),
+        ];
+        let config = HttpConfig::parse(&args).unwrap();
+        assert!(config.column_defs[0].hidden);
+        assert_eq!(config.column_defs[0].name, "city");
+        assert!(!config.column_defs[1].hidden);
+    }
+
+    #[test]
+    fn test_best_index_encodes_constraints() {
+        let constraints = vec![
+            ConstraintInfo { column_index: 0, op: ConstraintOp::Eq, usable: true, index: 0 },
+            ConstraintInfo { column_index: 2, op: ConstraintOp::Eq, usable: true, index: 1 },
+        ];
+        let result = HttpTable::best_index(&constraints, &[]).unwrap();
+        assert_eq!(result.idx_str, Some("0,2".to_string()));
+        assert_eq!(result.constraint_usages[0].argv_index, Some(1));
+        assert_eq!(result.constraint_usages[1].argv_index, Some(2));
+    }
+
+    #[test]
+    fn test_json_response_parsing() {
+        let body = r#"{"users": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]}"#;
+        let config = HttpConfig { json_path: "$.users".into(), ..test_config() };
+        let rows = parse_json_response(body, &config);
+        assert_eq!(rows.len(), 2);
+    }
+}
+```
+
+```rust
+// extensions/duckdb/src/lib.rs
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_constraint_encoding_decoding() {
+        // Verify idx_str round-trips correctly
+        let constraints = vec![
+            ConstraintInfo { column_index: 0, op: ConstraintOp::Eq, usable: true, index: 0 },
+            ConstraintInfo { column_index: 3, op: ConstraintOp::Gt, usable: true, index: 1 },
+        ];
+        let result = DuckDbTable::best_index(&constraints, &[]).unwrap();
+        assert_eq!(result.idx_str, Some("0:2,3:16".to_string()));
+    }
+
+    #[test]
+    fn test_sql_generation_from_constraints() {
+        // Parse "0:2,3:16" with args ["US", "100"]
+        // Should generate: WHERE region = ?1 AND amount > ?2
+    }
+
+    #[test]
+    fn test_type_mapping_integer() { /* DuckDB i64 -> Value::from_integer */ }
+    #[test]
+    fn test_type_mapping_float() { /* DuckDB f64 -> Value::from_float */ }
+    #[test]
+    fn test_type_mapping_text() { /* DuckDB String -> Value::from_text */ }
+    #[test]
+    fn test_type_mapping_null() { /* DuckDB NULL -> Value::null() */ }
+}
+```
+
+### 7.2 SQL Integration Tests (.sqltest)
+
+Located in `testing/runner/tests/`. Run via `make -C testing/runner run-rust`.
+
+**HTTP tests** need an embedded test server. The test harness spawns `tiny_http`
+on a random port, pre-loads canned JSON/CSV responses, and passes the port via
+a fixture setup step (separate Rust test binary, not inside .sqltest).
+
+**DuckDB tests** need a pre-created DuckDB file. The test harness creates it:
+```rust
+fn setup_duckdb_test_fixture() {
+    let conn = duckdb::Connection::open("/tmp/test_analytics.duckdb").unwrap();
+    conn.execute_batch("
+        CREATE TABLE sales (id INTEGER, product VARCHAR, amount DOUBLE, region VARCHAR);
+        INSERT INTO sales VALUES (1, 'Widget', 9.99, 'US');
+        INSERT INTO sales VALUES (2, 'Gadget', 24.99, 'EU');
+        INSERT INTO sales VALUES (3, 'Widget', 9.99, 'EU');
+    ").unwrap();
+}
+```
+
+### 7.3 Running Tests
+
+```bash
+# All workspace tests
+cargo test --workspace
+
+# Specific extension (crate names follow limbo_* convention, see extensions/csv)
+cargo test -p limbo_http
+cargo test -p limbo_duckdb
+
+# Integration tests
+make -C testing/runner run-rust
+
+# Manual verification
+cargo run -q --bin tursodb -- -q
+> CREATE VIRTUAL TABLE repos USING http(url='https://api.github.com/users/tursodatabase/repos', format='json', columns='name TEXT, stargazers_count INTEGER');
+> SELECT name, stargazers_count FROM repos ORDER BY stargazers_count DESC LIMIT 5;
+```
+
+## 8. Resolved Questions
+
+1. **Async I/O**: v1 uses blocking HTTP/DuckDB. The VDBE stalls during `filter()`. This is
+   acceptable for initial release. Async is a v2 concern requiring core changes (see 5.2).
+
+2. **Connection lifetime**: DuckDB connection is stored in `DuckDbTable` and lives as long as
+   the virtual table (created at `CREATE VIRTUAL TABLE`, freed when table is dropped via
+   `VTable::destroy()`). The derive macro calls `destroy()` which drops the table and its
+   connection (`macros/src/ext/vtab_derive.rs:202-217`).
+
+3. **Response size limits**: Add `max_response_bytes` parameter to HTTP FDW. Default 100MB.
+   Enforced at the `ureq` reader level via `response.into_reader().take(limit)`.
+
+4. **Extension distribution**: Ship as loadable `.so`/`.dylib` files for optional installation.
+   Use the existing `Connection::load_extension()` mechanism (`core/ext/dynamic.rs:38`).
+   For builds that want them built-in, use the `static` feature.
+
+5. **`best_index` static limitation**: Encode constraint metadata in `idx_str` (see 3.4 and
+   4.3). This works without core changes. v2 can add `&self` to `best_index` (see 5.3).
