@@ -829,6 +829,11 @@ pub fn group_by_emit_row_phase<'a>(
         }
     }
 
+    // Disable constant optimization within the GROUP BY output subroutine.
+    // Constants hoisted to the init section would cause the IfPos jump
+    // (targeting label_agg_final) to land in the init block, which ends
+    // with Goto back to the start of the program, creating an infinite loop.
+    let span_idx = program.constant_spans_next_idx();
     match plan.order_by.is_empty() {
         true => {
             emit_select_result(
@@ -847,6 +852,7 @@ pub fn group_by_emit_row_phase<'a>(
             order_by_sorter_insert(program, t_ctx, plan)?;
         }
     }
+    program.constant_spans_invalidate_after(span_idx);
 
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
