@@ -6310,3 +6310,207 @@ fn test_close_persists_drop_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+#[test]
+fn test_partial_commit_visibility_bug() {
+    use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use crate::sync::Arc;
+    use std::collections::HashMap;
+    use std::thread;
+    use std::time::Duration;
+    for _ in 0..10 {
+        // Setup: Create a table with batch_id and row_num columns
+        let db = Arc::new(MvccTestDbNoConn::new_with_random_db());
+        {
+            let conn = db.connect();
+            conn.execute("CREATE TABLE consistency_test (batch_id INTEGER, row_num INTEGER)")
+                .unwrap();
+        }
+
+        const ROWS_PER_BATCH: i64 = 50; // Large enough to increase race window
+        const NUM_BATCHES: u64 = 100;
+        const NUM_READER_THREADS: usize = 4;
+
+        let writer_done = Arc::new(AtomicBool::new(false));
+        let violation_detected = Arc::new(AtomicBool::new(false));
+        let current_batch = Arc::new(AtomicU64::new(0));
+
+        // Writer thread: Insert batches of rows
+        let writer_handle = {
+            let db = db.clone();
+            let writer_done = writer_done.clone();
+            let current_batch = current_batch.clone();
+            thread::spawn(move || {
+                let conn = db.connect();
+
+                for batch_id in 0..NUM_BATCHES {
+                    // Start a transaction
+                    conn.execute("BEGIN CONCURRENT").unwrap();
+
+                    // Insert ROWS_PER_BATCH rows with the same batch_id
+                    // This simulates a multi-row operation like a bank transfer
+                    for row_num in 0..ROWS_PER_BATCH {
+                        conn.execute(format!(
+                            "INSERT INTO consistency_test VALUES ({}, {})",
+                            batch_id, row_num
+                        ))
+                        .unwrap();
+                    }
+
+                    // Update current batch before committing to allow readers to check
+                    current_batch.store(batch_id, Ordering::Release);
+
+                    // Commit the transaction
+                    // BUG LOCATION: During commit, the loop at mod.rs:912-984 updates
+                    // row timestamps one-by-one while state remains Preparing.
+                    // Concurrent readers can see partial updates.
+                    conn.execute("COMMIT").unwrap();
+
+                    // Small delay to allow readers to observe the race window
+                    thread::sleep(Duration::from_micros(100));
+                }
+
+                writer_done.store(true, Ordering::Release);
+            })
+        };
+
+        // Reader threads: Continuously read and verify batch consistency
+        let mut reader_handles = Vec::new();
+        for reader_id in 0..NUM_READER_THREADS {
+            let db = db.clone();
+            let writer_done = writer_done.clone();
+            let violation_detected = violation_detected.clone();
+            let current_batch = current_batch.clone();
+
+            let handle = thread::spawn(move || {
+                let conn = db.connect();
+                let mut iteration = 0u64;
+
+                loop {
+                    iteration += 1;
+
+                    // Start a new transaction to get a fresh snapshot
+                    // Snapshot isolation: This snapshot should see a consistent state
+                    conn.execute("BEGIN CONCURRENT").unwrap();
+
+                    // Read all rows grouped by batch_id
+                    let rows = get_rows(
+                        &conn,
+                        "SELECT batch_id, row_num FROM consistency_test ORDER BY batch_id, row_num",
+                    );
+
+                    // Group rows by batch_id
+                    let mut batches: HashMap<i64, Vec<i64>> = HashMap::new();
+                    for row in rows {
+                        let batch_id = row[0].as_int().unwrap();
+                        let row_num = row[1].as_int().unwrap();
+                        batches
+                            .entry(batch_id)
+                            .or_insert_with(Vec::new)
+                            .push(row_num);
+                    }
+
+                    // Check consistency: Each batch must have EITHER all rows OR no rows
+                    for (batch_id, row_nums) in &batches {
+                        let count = row_nums.len() as i64;
+
+                        // CRITICAL ASSERTION: Snapshot isolation guarantees atomic visibility
+                        // A batch is either fully committed (all 50 rows) or not yet committed (0 rows)
+                        //
+                        // If we see a partial batch (e.g., 23 rows), it means:
+                        // 1. The commit loop updated timestamps for rows 0-22 (visible)
+                        // 2. Transaction still in Preparing state
+                        // 3. Rows 23-49 still have TxID (invisible to us)
+                        // 4. We started our snapshot DURING the commit loop
+                        //
+                        // This is a SNAPSHOT ISOLATION VIOLATION.
+                        if count != 0 && count != ROWS_PER_BATCH {
+                            eprintln!(
+                                "[Reader {}] VIOLATION DETECTED at iteration {}!",
+                                reader_id, iteration
+                            );
+                            eprintln!(
+                                "  Batch {} has {} rows (expected {} or 0)",
+                                batch_id, count, ROWS_PER_BATCH
+                            );
+                            eprintln!("  Visible row_nums: {:?}", row_nums);
+                            eprintln!();
+                            eprintln!("  EXPLANATION:");
+                            eprintln!(
+                                "  - This reader started a snapshot during batch {}'s commit",
+                                batch_id
+                            );
+                            eprintln!(
+                                "  - The commit loop (mod.rs:912-984) was updating timestamps"
+                            );
+                            eprintln!("  - Transaction state was still Preparing(ts)");
+                            eprintln!("  - Rows with updated Timestamps became visible");
+                            eprintln!("  - Rows with TxID timestamps remained invisible");
+                            eprintln!("  - Result: Partial batch visibility (atomicity violation)");
+                            eprintln!();
+                            eprintln!("  RACE TIMELINE:");
+                            eprintln!("  1. Writer: state = Preparing(end_ts)");
+                            eprintln!("  2. Writer: Update row 0's timestamp");
+                            eprintln!("  3. Writer: Update row 1's timestamp");
+                            eprintln!("  ...");
+                            eprintln!("  N. Reader: BEGIN (snapshot)");
+                            eprintln!(
+                                "  N+1. Reader: Read rows 0-{} (visible via Timestamp)",
+                                count - 1
+                            );
+                            eprintln!(
+                                "  N+2. Reader: Read rows {}-{} (invisible, still TxID)",
+                                count,
+                                ROWS_PER_BATCH - 1
+                            );
+                            eprintln!("  N+3. Writer: Continue updating remaining timestamps...");
+
+                            violation_detected.store(true, Ordering::Release);
+
+                            // Continue to accumulate more evidence
+                        }
+                    }
+
+                    conn.execute("COMMIT").unwrap();
+
+                    // Exit if writer is done and we've checked a few more times
+                    if writer_done.load(Ordering::Acquire) {
+                        let final_batch = current_batch.load(Ordering::Acquire);
+                        if iteration > final_batch + 10 {
+                            break;
+                        }
+                    }
+
+                    // Small delay to vary timing
+                    thread::sleep(Duration::from_micros(50));
+                }
+
+                eprintln!("[Reader {}] Completed {} iterations", reader_id, iteration);
+            });
+
+            reader_handles.push(handle);
+        }
+
+        // Wait for writer to complete
+        writer_handle.join().unwrap();
+
+        // Wait for readers to complete
+        for handle in reader_handles {
+            handle.join().unwrap();
+        }
+
+        // ASSERTION: No violations should be detected
+        // With the current bug, this will FAIL because readers observe partial commits
+        assert!(
+            !violation_detected.load(Ordering::Acquire),
+            "Partial commit visibility detected! Transaction atomicity violated.\n\
+         \n\
+         ROOT CAUSE: Commit loop (mod.rs:912-984) updates row timestamps non-atomically\n\
+         while transaction state remains Preparing. Concurrent readers see inconsistent\n\
+         snapshots with partial transaction visibility.\n\
+         \n\
+         FIX REQUIRED: Make timestamp updates atomic, or change visibility logic to\n\
+         always dereference transaction state instead of reading row timestamps directly."
+        );
+    }
+}
