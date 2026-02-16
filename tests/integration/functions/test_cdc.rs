@@ -537,6 +537,35 @@ fn test_cdc_transaction(db: TempDatabase) {
 
 // TODO: cannot use mvcc because of indexes
 #[turso_macros::test()]
+fn test_cdc_ddl_in_explicit_transaction(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn.execute("CREATE TABLE q (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    assert_eq!(
+        rows,
+        vec![
+            // All DDL and DML in explicit transaction: no per-statement COMMITs
+            v2_row(1, "sqlite_schema", 5, None, None, None), // CREATE TABLE t
+            v2_row(1, "t", 1, None, None, None),             // INSERT (1, 10)
+            v2_row(1, "t", 2, None, None, None),             // INSERT (2, 20)
+            v2_row(1, "sqlite_schema", 6, None, None, None), // CREATE TABLE q
+            v2_commit(),                                     // single COMMIT at end
+        ]
+    );
+}
+
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
 fn test_cdc_independent_connections(db: TempDatabase) {
     let conn1 = db.connect_limbo();
     let conn2 = db.connect_limbo();

@@ -180,8 +180,12 @@ impl DatabaseTape {
         tracing::debug!("opening changes iterator with options {:?}", opts);
         let conn = self.inner.connect()?;
 
-        let cdc_version = self.cdc_version.read().unwrap().clone();
-        let cdc_version = cdc_version.expect("tape must be connected before iterate changes");
+        let cdc_version = self
+            .cdc_version
+            .read()
+            .unwrap()
+            .clone()
+            .expect("tape must be connected before iterate changes");
 
         Ok(DatabaseChangesIterator {
             conn,
@@ -806,22 +810,14 @@ mod tests {
             }
         };
         tracing::info!("changes: {:?}", changes);
-        assert_eq!(changes.len(), 4);
-        assert!(matches!(
-            changes[0],
-            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
-                change_id: 2,
-                id: 1,
-                ref table_name,
-                change: DatabaseTapeRowChangeType::Insert { .. },
-                ..
-            }) if table_name == "t"
-        ));
+        assert_eq!(changes.len(), 5);
+        // CREATE TABLE emits a COMMIT record (schema INSERT is filtered by ignore_schema_changes)
+        assert!(matches!(changes[0], DatabaseTapeOperation::Commit));
         assert!(matches!(
             changes[1],
             DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
                 change_id: 3,
-                id: 2,
+                id: 1,
                 ref table_name,
                 change: DatabaseTapeRowChangeType::Insert { .. },
                 ..
@@ -831,13 +827,23 @@ mod tests {
             changes[2],
             DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
                 change_id: 4,
+                id: 2,
+                ref table_name,
+                change: DatabaseTapeRowChangeType::Insert { .. },
+                ..
+            }) if table_name == "t"
+        ));
+        assert!(matches!(
+            changes[3],
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                change_id: 5,
                 id: 3,
                 ref table_name,
                 change: DatabaseTapeRowChangeType::Insert { .. },
                 ..
             }) if table_name == "t"
         ));
-        assert!(matches!(changes[3], DatabaseTapeOperation::Commit));
+        assert!(matches!(changes[4], DatabaseTapeOperation::Commit));
     }
 
     #[test]
