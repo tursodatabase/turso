@@ -932,7 +932,10 @@ pub fn emit_upsert(
             cursor: ctx.cursor_id,
             key_reg: rnew,
             record_reg: rec,
-            flag: InsertFlags::new().require_seek().update_rowid_change(),
+            flag: InsertFlags::new()
+                .require_seek()
+                .update_rowid_change()
+                .skip_last_rowid(),
             table_name: table.get_name().to_string(),
         });
     } else {
@@ -940,7 +943,7 @@ pub fn emit_upsert(
             cursor: ctx.cursor_id,
             key_reg: ctx.conflict_rowid_reg,
             record_reg: rec,
-            flag: InsertFlags::new(),
+            flag: InsertFlags::new().skip_last_rowid(),
             table_name: table.get_name().to_string(),
         });
     }

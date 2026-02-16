@@ -158,6 +158,7 @@ impl InsertFlags {
     pub const UPDATE_ROWID_CHANGE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement where the row's rowid is changed
     pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
     pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
+    pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -179,6 +180,11 @@ impl InsertFlags {
 
     pub fn is_ephemeral_table_insert(mut self) -> Self {
         self.0 |= InsertFlags::EPHEMERAL_TABLE_INSERT;
+        self
+    }
+
+    pub fn skip_last_rowid(mut self) -> Self {
+        self.0 |= InsertFlags::SKIP_LAST_ROWID;
         self
     }
 }
