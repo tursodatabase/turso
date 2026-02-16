@@ -6955,8 +6955,8 @@ fn page_free_array(
     let buf_range = buf.as_ptr_range();
     let mut number_of_cells_removed = 0;
     let mut number_of_cells_buffered = 0;
-    let mut buffered_cells_offsets: [u16; 10] = [0; 10];
-    let mut buffered_cells_ends: [u16; 10] = [0; 10];
+    let mut buffered_cells_offsets: [usize; 10] = [0; 10];
+    let mut buffered_cells_ends: [usize; 10] = [0; 10];
     for i in first..first + count {
         let cell = &cell_array.cell_payloads[i];
         let cell_pointer = cell.as_ptr_range();
@@ -6967,8 +6967,8 @@ fn page_free_array(
                 "whole cell should be inside the page"
             );
             // TODO: remove pointer too
-            let offset = (cell_pointer.start as usize - buf_range.start as usize) as u16;
-            let len = (cell_pointer.end as usize - cell_pointer.start as usize) as u16;
+            let offset = cell_pointer.start as usize - buf_range.start as usize;
+            let len = cell_pointer.end as usize - cell_pointer.start as usize;
             assert!(len > 0, "cell size should be greater than 0");
             let end = offset + len;
 
@@ -6997,8 +6997,8 @@ fn page_free_array(
                     for j in 0..number_of_cells_buffered {
                         free_cell_range(
                             page,
-                            buffered_cells_offsets[j] as usize,
-                            buffered_cells_ends[j] as usize - buffered_cells_offsets[j] as usize,
+                            buffered_cells_offsets[j],
+                            buffered_cells_ends[j] - buffered_cells_offsets[j],
                             usable_space,
                         )?;
                     }
@@ -7015,8 +7015,8 @@ fn page_free_array(
     for j in 0..number_of_cells_buffered {
         free_cell_range(
             page,
-            buffered_cells_offsets[j] as usize,
-            buffered_cells_ends[j] as usize - buffered_cells_offsets[j] as usize,
+            buffered_cells_offsets[j],
+            buffered_cells_ends[j] - buffered_cells_offsets[j],
             usable_space,
         )?;
     }
@@ -7209,6 +7209,9 @@ fn free_cell_range(
 
     let mut size = len;
     let mut end = offset + len;
+    if end > usable_space {
+        return_corrupt!("free_cell_range: freed range extends beyond usable space: offset={offset} len={len} end={end} usable_space={usable_space}");
+    }
     let cur_content_area = page.cell_content_area() as usize;
     let first_block = page.first_freeblock() as usize;
     if first_block == 0 {
@@ -7260,10 +7263,6 @@ fn free_cell_range(
     }
     let mut removed_fragmentation = 0;
     const SINGLE_FRAGMENT_SIZE_MAX: usize = CELL_SIZE_MIN - 1;
-
-    if end > usable_space {
-        return_corrupt!("free_cell_range: freed range extends beyond usable space: offset={offset} len={len} end={end} usable_space={usable_space}");
-    }
 
     // If the freed range extends into the next freeblock, we will merge the freed range into it.
     // If there is a 1-3 byte gap between the freed range and the next freeblock, we are effectively
