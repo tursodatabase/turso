@@ -5627,6 +5627,29 @@ pub fn op_function(
                 };
                 state.registers[*dest] = Register::Value(result);
             }
+            ScalarFunc::ConnTxnId => {
+                // conn_txn_id(candidate): get-or-set semantics for CDC transaction ID.
+                // If unset (-1), store the candidate and return it.
+                // If already set, return the existing value, ignoring the candidate.
+                assert_eq!(arg_count, 1);
+                let candidate = match state.registers[*start_reg].get_value() {
+                    Value::Numeric(Numeric::Integer(n)) => *n,
+                    _ => -1,
+                };
+                let current = program.connection.get_cdc_transaction_id();
+                if current == -1 {
+                    program.connection.set_cdc_transaction_id(candidate);
+                    state.registers[*dest] = Register::Value(Value::from_i64(candidate));
+                } else {
+                    state.registers[*dest] = Register::Value(Value::from_i64(current));
+                }
+            }
+            ScalarFunc::IsAutocommit => {
+                // is_autocommit(): returns 1 if autocommit, 0 otherwise.
+                let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
+                state.registers[*dest] =
+                    Register::Value(Value::from_i64(if auto_commit { 1 } else { 0 }));
+            }
         },
         crate::function::Func::Vector(vector_func) => {
             let args = &state.registers[*start_reg..*start_reg + arg_count];

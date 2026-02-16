@@ -2201,6 +2201,9 @@ pub fn translate_expr(
                                 srf
                             );
                         }
+                        ScalarFunc::ConnTxnId | ScalarFunc::IsAutocommit => {
+                            crate::bail_parse_error!("{} is an internal function used by CDC", srf);
+                        }
                     }
                 }
                 Func::Math(math_func) => match math_func.arity() {
