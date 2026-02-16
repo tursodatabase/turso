@@ -285,6 +285,9 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
       - uses: "./.github/shared/setup-sccache"
+      - name: Run turso_whopper regression tests
+        run: cargo test -p turso_whopper --test regression_tests
+        timeout-minutes: 5
       - name: Run turso_whopper
         run: |
           cargo build -p turso_whopper
