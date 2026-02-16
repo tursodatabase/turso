@@ -1410,22 +1410,87 @@ fn test_cdc_version_helper_defaults_to_v1(db: TempDatabase) {
         "CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
     ).unwrap();
 
-    // Enable CDC — InitCdcVersion will create version table and insert current version
+    // Enable CDC — InitCdcVersion will detect existing v1 table and set version to "v1"
     conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         .unwrap();
 
-    // version() helper should return the current version
+    // version() helper should return v1 since the pre-existing table has v1 schema
     let info = conn.get_capture_data_changes_info();
     let info = info.as_ref().expect("CDC should be enabled");
-    assert_eq!(info.version(), TURSO_CDC_CURRENT_VERSION);
+    assert_eq!(info.version(), "v1");
 
     // Now test with None version directly via parse (simulates old code path)
     let parsed = turso_core::CaptureDataChangesInfo::parse("full", None)
         .unwrap()
         .unwrap();
-    // version field is None, but version() should return V1
+    // version field is None, but version() should return current version
     assert_eq!(parsed.version, None);
     assert_eq!(parsed.version(), TURSO_CDC_CURRENT_VERSION);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_preexisting_v1_table_writes_v1_format(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Simulate a pre-existing v1 CDC table (8 columns, no version table)
+    conn.execute(
+        "CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+    ).unwrap();
+
+    // Enable CDC — should detect v1 schema and use v1 format
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+        .unwrap();
+
+    // Version should be detected as v1
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT version FROM turso_cdc_version WHERE table_name = 'turso_cdc'",
+    );
+    assert_eq!(rows, vec![vec![Value::Text("v1".to_string())]]);
+
+    // Insert multi-row — v1 format has no change_txn_id column and no COMMIT records
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    // Verify CDC rows are in correct v1 format (8 columns, no COMMIT records)
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(2),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Integer(1),
+                Value::Text("t".to_string()),
+                Value::Integer(3),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
 }
 
 #[turso_macros::test(mvcc)]

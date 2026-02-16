@@ -1,4 +1,3 @@
-use crate::cdc_version_has_txn_id;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
@@ -41,6 +40,7 @@ use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
     vector_distance_dot, vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
+use crate::{cdc_version_has_txn_id, TURSO_CDC_VERSION_V1};
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
@@ -8396,6 +8396,22 @@ pub fn op_init_cdc_version(
         }
     }
 
+    // Step 0: Check if the CDC table already exists but has no version row.
+    // If so, it's a legacy v1 table that pre-dates version tracking.
+    let cdc_table_exists = {
+        conn.start_nested();
+        let mut stmt = conn.prepare(format!(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{cdc_table_name}'",
+        ))?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        let rows = stmt.run_collect_rows();
+        conn.end_nested();
+        !rows?.is_empty()
+    };
+
     // Step 1: Create CDC table if needed
     {
         conn.start_nested();
@@ -8434,12 +8450,16 @@ pub fn op_init_cdc_version(
     }
 
     // Step 3: Insert version row only if one doesn't already exist.
-    // If the table was previously initialized with an older version, we must
-    // keep that version (the CDC table schema hasn't been migrated).
+    // If the CDC table pre-existed without a version row, it's a legacy v1 table.
+    let version_to_insert = if cdc_table_exists {
+        TURSO_CDC_VERSION_V1
+    } else {
+        version
+    };
     {
         conn.start_nested();
         let mut stmt = conn.prepare(format!(
-            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{cdc_table_name}', '{version}')",
+            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{cdc_table_name}', '{version_to_insert}')",
         ))?;
         stmt.program
             .prepared
