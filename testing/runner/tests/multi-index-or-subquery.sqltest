@@ -1,0 +1,20 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t1(a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t1(a);
+    CREATE INDEX idx_b ON t1(b);
+    INSERT INTO t1 VALUES(1,10);
+    CREATE TABLE t2(x);
+    INSERT INTO t2 VALUES(1);
+    INSERT INTO t2 VALUES(2);
+}
+
+@setup schema
+test multi-index-or-subquery-with-multiple-outer-rows {
+    SELECT t2.x, sub.a FROM t2, (SELECT a FROM t1 WHERE a=1 OR b=10) sub;
+}
+expect {
+    1|1
+    2|1
+}

@@ -434,9 +434,11 @@ pub fn op_null(
             if let Some(dest_end) = dest_end {
                 for i in *dest..=*dest_end {
                     state.registers[i] = Register::Value(Value::Null);
+                    state.rowsets.remove(&i);
                 }
             } else {
                 state.registers[*dest] = Register::Value(Value::Null);
+                state.rowsets.remove(dest);
             }
         }
         _ => unreachable!("unexpected Insn {:?}", insn),
