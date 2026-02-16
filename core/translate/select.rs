@@ -16,7 +16,7 @@ use crate::translate::planner::{
 };
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
 use crate::translate::window::plan_windows;
-use crate::util::normalize_ident;
+use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::Connection;
@@ -488,6 +488,19 @@ fn prepare_one_select_plan(
                 )?;
 
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
+            }
+            // Remove duplicate ORDER BY expressions, keeping the first occurrence.
+            // Duplicates are semantically redundant.
+            let mut i = 0;
+            while i < key.len() {
+                if key[..i]
+                    .iter()
+                    .any(|(prev, _)| exprs_are_equivalent(prev, &key[i].0))
+                {
+                    key.remove(i);
+                } else {
+                    i += 1;
+                }
             }
             plan.order_by = key;
 

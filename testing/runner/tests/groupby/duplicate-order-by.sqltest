@@ -1,0 +1,34 @@
+@database :memory:
+
+test duplicate_order_by_with_group_by {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (3), (1), (2);
+    SELECT a FROM t GROUP BY a ORDER BY a, a;
+}
+expect {
+    1
+    2
+    3
+}
+
+test duplicate_order_by_desc_with_group_by {
+    CREATE TABLE t2(a);
+    INSERT INTO t2 VALUES (3), (1), (2);
+    SELECT a FROM t2 GROUP BY a ORDER BY a DESC, a DESC;
+}
+expect {
+    3
+    2
+    1
+}
+
+test triple_duplicate_order_by_with_group_by {
+    CREATE TABLE t3(a);
+    INSERT INTO t3 VALUES (3), (1), (2);
+    SELECT a FROM t3 GROUP BY a ORDER BY a, a, a;
+}
+expect {
+    1
+    2
+    3
+}
