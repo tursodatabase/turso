@@ -1303,8 +1303,8 @@ mod tests {
     };
 
     use super::{
-        HeaderReadResult, LogHeader, LogicalLog, LOG_HDR_CRC_START, LOG_HDR_SIZE, TX_HEADER_SIZE,
-        TX_TRAILER_SIZE,
+        HeaderReadResult, LogHeader, LogicalLog, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START,
+        LOG_HDR_SIZE, TX_HEADER_SIZE, TX_TRAILER_SIZE,
     };
     use super::{ParseResult, StreamingLogicalLogReader, StreamingResult};
     use crate::OpenFlags;
@@ -2272,11 +2272,27 @@ mod tests {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let (file, _) = write_single_table_tx(&io, "header-reserved.db-log", 106);
 
-        // Reserved header region starts at offset 8.
+        // Read existing header bytes so we can corrupt reserved and recompute CRC.
+        let header_buf = Arc::new(Buffer::new_temporary(LOG_HDR_SIZE));
+        let c = file
+            .pread(0, Completion::new_read(header_buf.clone(), |_| None))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        let mut header_bytes = header_buf.as_slice()[..LOG_HDR_SIZE].to_vec();
+
+        // Corrupt reserved region (bytes 16-51). Reserved region starts at offset 16 (after salt at 8-15).
+        header_bytes[LOG_HDR_RESERVED_START] = 1;
+
+        // Recompute CRC with CRC field zeroed, then fill in the new CRC.
+        header_bytes[LOG_HDR_CRC_START..LOG_HDR_SIZE].fill(0);
+        let new_crc = crc32c::crc32c(&header_bytes);
+        header_bytes[LOG_HDR_CRC_START..LOG_HDR_SIZE].copy_from_slice(&new_crc.to_le_bytes());
+
+        // Write the corrupted header back.
         let c = file
             .pwrite(
-                10,
-                Arc::new(Buffer::new(vec![1u8])),
+                0,
+                Arc::new(Buffer::new(header_bytes)),
                 Completion::new_write(|_| {}),
             )
             .unwrap();
