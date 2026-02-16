@@ -575,3 +575,27 @@ test upsert-unique-update-rowid-change-preserves-unique {
 }
 expect error {
 }
+
+# Referencing a table other than the target or EXCLUDED in UPSERT DO UPDATE
+# should produce a graceful error, not a panic.
+# https://github.com/tursodatabase/turso/issues/5281
+test upsert-unresolved-table-reference {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE other(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    INSERT INTO t VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET val = other.val;
+}
+expect error {
+    .*no such column.*
+}
+
+# Same for DO UPDATE WHERE clause referencing another table.
+test upsert-unresolved-table-in-where {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE other(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    INSERT INTO t VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET val = excluded.val WHERE other.val > 0;
+}
+expect error {
+    .*no such column.*
+}

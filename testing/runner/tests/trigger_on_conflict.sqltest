@@ -264,3 +264,59 @@ expect {
     insert trigger: original
     insert trigger: replaced
 }
+
+# =============================================================================
+# Trigger with UPSERT referencing NEW.column
+# NEW.column in a trigger body's UPSERT DO UPDATE SET should resolve to
+# the trigger's NEW row, not cause a panic.
+# https://github.com/tursodatabase/turso/issues/5281
+# =============================================================================
+
+test trigger-upsert-new-column {
+    CREATE TABLE balances(id INTEGER PRIMARY KEY, amount INTEGER);
+    CREATE TABLE transactions(id INTEGER PRIMARY KEY, account_id INTEGER, delta INTEGER);
+    INSERT INTO balances VALUES (1, 100);
+    CREATE TRIGGER apply_txn AFTER INSERT ON transactions BEGIN
+      INSERT INTO balances VALUES (NEW.account_id, NEW.delta)
+        ON CONFLICT(id) DO UPDATE SET amount = amount + NEW.delta;
+    END;
+    INSERT INTO transactions VALUES (1, 1, 50);
+    SELECT * FROM balances;
+}
+expect {
+    1|150
+}
+
+# NEW.column in UPSERT DO UPDATE WHERE inside a trigger
+test trigger-upsert-new-in-where {
+    CREATE TABLE balances(id INTEGER PRIMARY KEY, amount INTEGER);
+    CREATE TABLE transactions(id INTEGER PRIMARY KEY, account_id INTEGER, delta INTEGER);
+    INSERT INTO balances VALUES (1, 100);
+    CREATE TRIGGER apply_txn AFTER INSERT ON transactions BEGIN
+      INSERT INTO balances VALUES (NEW.account_id, NEW.delta)
+        ON CONFLICT(id) DO UPDATE SET amount = amount + NEW.delta
+        WHERE NEW.delta > 0;
+    END;
+    INSERT INTO transactions VALUES (1, 1, 50);
+    SELECT * FROM balances;
+}
+expect {
+    1|150
+}
+
+# NEW.column in UPSERT where delta is negative and WHERE filters it out
+test trigger-upsert-new-in-where-no-update {
+    CREATE TABLE balances(id INTEGER PRIMARY KEY, amount INTEGER);
+    CREATE TABLE transactions(id INTEGER PRIMARY KEY, account_id INTEGER, delta INTEGER);
+    INSERT INTO balances VALUES (1, 100);
+    CREATE TRIGGER apply_txn AFTER INSERT ON transactions BEGIN
+      INSERT INTO balances VALUES (NEW.account_id, NEW.delta)
+        ON CONFLICT(id) DO UPDATE SET amount = amount + NEW.delta
+        WHERE NEW.delta > 0;
+    END;
+    INSERT INTO transactions VALUES (1, 1, -50);
+    SELECT * FROM balances;
+}
+expect {
+    1|100
+}
