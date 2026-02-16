@@ -1,0 +1,11 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/5228
+# PRAGMA database_list=1 should not panic; database_list is read-only
+# and assignment values should be ignored.
+test pragma-database-list-with-assignment {
+    PRAGMA database_list=1;
+}
+expect {
+    0|main|
+}
