@@ -810,3 +810,29 @@ test cte-shadow-outer-unused {
 expect {
     12
 }
+
+# =============================================================================
+# CTE aggregate with empty result set
+# =============================================================================
+
+# Non-aggregate columns must be NULL when WHERE filters out all rows
+# from a CTE in a single-row aggregate query.
+test cte-aggregate-empty-result-non-agg-columns {
+    CREATE TABLE t(x INTEGER, y TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    WITH cte AS (SELECT x, y FROM t)
+    SELECT CAST(TOTAL(y) AS INTEGER), x, x FROM cte WHERE x > 999;
+}
+expect {
+    0||
+}
+
+# Same behavior expected with FROM-clause subquery
+test subquery-aggregate-empty-result-non-agg-columns {
+    CREATE TABLE t(x INTEGER, y TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    SELECT CAST(TOTAL(y) AS INTEGER), x, x FROM (SELECT x, y FROM t) sub WHERE x > 999;
+}
+expect {
+    0||
+}
