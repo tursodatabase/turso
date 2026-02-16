@@ -17,6 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::{turso_assert, turso_assert_ne, turso_debug_assert};
 pub mod affinity;
 pub mod bloom_filter;
 pub mod builder;
@@ -53,7 +54,6 @@ use crate::{
     },
     CipherMode, ValueRef,
 };
-
 use smallvec::SmallVec;
 
 use crate::{
@@ -737,7 +737,7 @@ impl Register {
         match self {
             Register::Value(v) => v,
             Register::Record(r) => {
-                assert!(!r.is_invalidated());
+                turso_assert!(!r.is_invalidated());
                 r.as_blob_value()
             }
             _ => panic!("register holds unexpected value: {self:?}"),
@@ -947,7 +947,7 @@ impl Program {
     }
 
     fn explain_step(&self, state: &mut ProgramState, pager: Arc<Pager>) -> Result<StepResult> {
-        debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
+        turso_debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.is_closed() {
             // Connection is closed for whatever reason, rollback the transaction.
             let state = self.connection.get_tx_state();
@@ -1097,7 +1097,7 @@ impl Program {
         state: &mut ProgramState,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
-        debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
+        turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
             if self.connection.is_closed() {
                 // Connection is closed for whatever reason, rollback the transaction.
@@ -1290,9 +1290,10 @@ impl Program {
                             let root_page = view.get_root_page();
 
                             // Materialized views should always have storage (root_page != 0)
-                            assert!(
-                                root_page != 0,
-                                "Materialized view '{view_name}' should have a root page"
+                            turso_assert_ne!(
+                                root_page, 0,
+                                "Materialized view should have a root page",
+                                { "view_name": view_name }
                             );
 
                             views.push(view_name);
@@ -1401,7 +1402,7 @@ impl Program {
                 };
                 match self.step_end_mvcc_txn(state_machine, mv_store)? {
                     IOResult::Done(_) => {
-                        assert!(state_machine.is_finalized());
+                        turso_assert!(state_machine.is_finalized());
                         conn.set_mv_tx(None);
                         conn.set_tx_state(TransactionState::None);
                         pager.end_read_tx();

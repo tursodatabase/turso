@@ -47,12 +47,10 @@ impl DetailsList {
 /// - `(cond)`
 /// - `(cond, "msg")`
 /// - `(cond, "msg", { ... })` - Antithesis details
-/// - `(cond, "msg", fmt_arg1, fmt_arg2, ...)` - format arguments
 pub struct ConditionAssertInput {
     pub condition: Expr,
     pub message: Option<LitStr>,
     pub details: Option<DetailsList>,
-    pub format_args: Option<TokenStream2>,
 }
 
 impl Parse for ConditionAssertInput {
@@ -64,21 +62,12 @@ impl Parse for ConditionAssertInput {
                 condition,
                 message: None,
                 details: None,
-                format_args: None,
             });
         }
         input.parse::<Token![,]>()?;
 
         if !input.peek(LitStr) {
-            // No message literal follows the comma - consume the rest as format args
-            // (shouldn't normally happen, but handle gracefully)
-            let rest: TokenStream2 = input.parse()?;
-            return Ok(ConditionAssertInput {
-                condition,
-                message: None,
-                details: None,
-                format_args: if rest.is_empty() { None } else { Some(rest) },
-            });
+            return Err(input.error("expected a string literal message after comma"));
         }
 
         let message: LitStr = input.parse()?;
@@ -88,7 +77,6 @@ impl Parse for ConditionAssertInput {
                 condition,
                 message: Some(message),
                 details: None,
-                format_args: None,
             });
         }
 
@@ -107,19 +95,15 @@ impl Parse for ConditionAssertInput {
                 condition,
                 message: Some(message),
                 details: Some(details),
-                format_args: None,
             });
         }
 
-        // Otherwise it's format arguments - consume everything remaining
-        input.parse::<Token![,]>()?;
-        let rest: TokenStream2 = input.parse()?;
-        Ok(ConditionAssertInput {
-            condition,
-            message: Some(message),
-            details: None,
-            format_args: if rest.is_empty() { None } else { Some(rest) },
-        })
+        // Format arguments are not supported — use a details block instead
+        Err(input.error(
+            "expected details block `{ ... }` or end of macro input; \
+             format arguments are not supported — use inline format strings \
+             or a details block instead",
+        ))
     }
 }
 
