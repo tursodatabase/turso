@@ -1980,9 +1980,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 if let ast::TableConstraint::PrimaryKey {
                     columns,
                     auto_increment,
-                    ..
+                    conflict_clause,
                 } = &c.constraint
                 {
+                    if conflict_clause.is_some() {
+                        crate::bail_parse_error!(
+                            "ON CONFLICT not implemented for PRIMARY KEY constraint"
+                        );
+                    }
                     if !primary_key_columns.is_empty() {
                         crate::bail_parse_error!(
                             "table \"{}\" has more than one primary key",
@@ -2016,7 +2021,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 } = &c.constraint
                 {
                     if conflict_clause.is_some() {
-                        unimplemented!("ON CONFLICT not implemented");
+                        crate::bail_parse_error!(
+                            "ON CONFLICT not implemented for UNIQUE constraint"
+                        );
                     }
                     let mut unique_columns = Vec::with_capacity(columns.len());
                     for column in columns {
