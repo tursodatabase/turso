@@ -185,6 +185,8 @@ pub enum VectorFunc {
     Vector32,
     Vector32Sparse,
     Vector64,
+    Vector8,
+    Vector1Bit,
     VectorExtract,
     VectorDistanceCos,
     VectorDistanceL2,
@@ -207,6 +209,8 @@ impl Display for VectorFunc {
             Self::Vector32 => "vector32",
             Self::Vector32Sparse => "vector32_sparse",
             Self::Vector64 => "vector64",
+            Self::Vector8 => "vector8",
+            Self::Vector1Bit => "vector1bit",
             Self::VectorExtract => "vector_extract",
             Self::VectorDistanceCos => "vector_distance_cos",
             Self::VectorDistanceL2 => "vector_distance_l2",
@@ -226,6 +230,8 @@ impl VectorFunc {
             | Self::Vector32
             | Self::Vector32Sparse
             | Self::Vector64
+            | Self::Vector8
+            | Self::Vector1Bit
             | Self::VectorExtract => &[1],
             Self::VectorDistanceCos
             | Self::VectorDistanceL2
@@ -1134,6 +1140,8 @@ impl Func {
             "vector32" => Ok(Self::Vector(VectorFunc::Vector32)),
             "vector32_sparse" => Ok(Self::Vector(VectorFunc::Vector32Sparse)),
             "vector64" => Ok(Self::Vector(VectorFunc::Vector64)),
+            "vector8" => Ok(Self::Vector(VectorFunc::Vector8)),
+            "vector1bit" => Ok(Self::Vector(VectorFunc::Vector1Bit)),
             "vector_extract" => Ok(Self::Vector(VectorFunc::VectorExtract)),
             "vector_distance_cos" => Ok(Self::Vector(VectorFunc::VectorDistanceCos)),
             "vector_distance_l2" => Ok(Self::Vector(VectorFunc::VectorDistanceL2)),

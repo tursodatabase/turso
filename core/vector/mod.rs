@@ -70,6 +70,30 @@ pub fn vector64(args: &[Register]) -> Result<Value> {
     Ok(operations::serialize::vector_serialize(vector))
 }
 
+pub fn vector8(args: &[Register]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(LimboError::ConversionError(
+            "vector8 requires exactly one argument".to_string(),
+        ));
+    }
+    let value = args[0].get_value();
+    let vector = parse_vector(value, Some(VectorType::Float8))?;
+    let vector = operations::convert::vector_convert(vector, VectorType::Float8)?;
+    Ok(operations::serialize::vector_serialize(vector))
+}
+
+pub fn vector1bit(args: &[Register]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(LimboError::ConversionError(
+            "vector1bit requires exactly one argument".to_string(),
+        ));
+    }
+    let value = args[0].get_value();
+    let vector = parse_vector(value, Some(VectorType::Float1Bit))?;
+    let vector = operations::convert::vector_convert(vector, VectorType::Float1Bit)?;
+    Ok(operations::serialize::vector_serialize(vector))
+}
+
 pub fn vector_extract(args: &[Register]) -> Result<Value> {
     if args.len() != 1 {
         return Err(LimboError::ConversionError(

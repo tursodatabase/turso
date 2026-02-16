@@ -47,6 +47,9 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector<
                 refer: None,
             })
         }
+        VectorType::Float1Bit | VectorType::Float8 => Err(LimboError::ConversionError(
+            "vector_slice is not supported for float1bit/float8 vectors".to_string(),
+        )),
     }
 }
 

@@ -40,7 +40,24 @@ pub fn vector_distance_l2(v1: &Vector, v2: &Vector) -> Result<f64> {
             v1.as_f32_sparse(),
             v2.as_f32_sparse(),
         )),
+        VectorType::Float1Bit => Err(LimboError::ConversionError(
+            "L2 distance is not supported for float1bit vectors".to_string(),
+        )),
+        VectorType::Float8 => Ok(vector_f8_distance_l2(v1, v2)),
     }
+}
+
+fn vector_f8_distance_l2(v1: &Vector, v2: &Vector) -> f64 {
+    let (data1, alpha1, shift1) = v1.as_f8_data();
+    let (data2, alpha2, shift2) = v2.as_f8_data();
+    let mut sum = 0.0f64;
+    for i in 0..v1.dims {
+        let f1 = alpha1 as f64 * data1[i] as f64 + shift1 as f64;
+        let f2 = alpha2 as f64 * data2[i] as f64 + shift2 as f64;
+        let d = f1 - f2;
+        sum += d * d;
+    }
+    sum.sqrt()
 }
 
 #[allow(dead_code)]
@@ -238,5 +255,30 @@ mod tests {
         let d1 = vector_f64_distance_l2_rust(v1.as_f64_slice(), v2.as_f64_slice());
         let d2 = vector_f64_distance_l2_simsimd(v1.as_f64_slice(), v2.as_f64_slice());
         (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-6
+    }
+
+    /// Float8 L2 distance matches dequantized Float32 L2 distance.
+    #[quickcheck]
+    fn prop_vector_distance_l2_f8_vs_dequantized(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
+        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
+        let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
+        let d_f8 = vector_distance_l2(&v1_f8, &v2_f8).unwrap();
+        let v1_deq = vector_convert(v1_f8, VectorType::Float32Dense).unwrap();
+        let v2_deq = vector_convert(v2_f8, VectorType::Float32Dense).unwrap();
+        let d_deq = vector_distance_l2(&v1_deq, &v2_deq).unwrap();
+        (d_f8.is_nan() && d_deq.is_nan()) || (d_f8 - d_deq).abs() < 1e-4
+    }
+
+    /// Float1Bit L2 distance returns an error.
+    #[test]
+    fn test_vector_distance_l2_1bit_error() {
+        let v1 = Vector::from_1bit(4, vec![0b1010]);
+        let v2 = Vector::from_1bit(4, vec![0b0101]);
+        assert!(vector_distance_l2(&v1, &v2).is_err());
     }
 }

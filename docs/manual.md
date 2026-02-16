@@ -676,7 +676,7 @@ Turso supports vector search for building workloads such as semantic search, rec
 
 ### Vector types
 
-Turso supports both **dense** and **sparse** vector representations:
+Turso supports **dense**, **sparse**, **quantized**, and **binary** vector representations:
 
 #### Dense vectors
 
@@ -694,6 +694,18 @@ Sparse vectors only store non-zero values and their indices, making them memory-
 * **Float32 sparse vectors** (`vector32_sparse`): Stores only non-zero 32-bit float values along with their dimension indices.
 
 Sparse vectors are ideal for TF-IDF representations, bag-of-words models, and other scenarios where most dimensions are zero.
+
+#### Quantized vectors
+
+* **8-bit quantized vectors** (`vector8`): Linearly quantizes each float value to an 8-bit integer using min/max scaling. Uses 1 byte per dimension plus 8 bytes for quantization parameters (alpha and shift). Dequantization formula: `f_i = alpha * q_i + shift`.
+
+Quantized vectors reduce memory usage by ~4x compared to Float32 with minimal precision loss, ideal for large-scale similarity search where storage is a concern.
+
+#### Binary vectors
+
+* **1-bit binary vectors** (`vector1bit`): Packs each dimension into a single bit (positive values → 1, non-positive → 0). Uses 1 bit per dimension. Extracted values are displayed as +1/-1.
+
+Binary vectors provide extreme compression (~32x vs Float32) and fast distance computation via bitwise operations. Ideal for binary hashing techniques and approximate nearest neighbor search.
 
 ### Vector functions
 
@@ -723,6 +735,23 @@ Converts a text or blob value into a 64-bit dense vector.
 SELECT vector64('[1.0, 2.0, 3.0]');
 ```
 
+**`vector8(value)`**
+
+Converts a text or blob value into an 8-bit quantized vector. Float values are linearly quantized to the 0–255 range using the min and max of the input.
+
+```sql
+SELECT vector8('[1.0, 2.0, 3.0, 4.0]');
+```
+
+**`vector1bit(value)`**
+
+Converts a text or blob value into a 1-bit binary vector. Positive values become 1, non-positive values become 0 (displayed as +1/-1 when extracted).
+
+```sql
+SELECT vector_extract(vector1bit('[1, -1, 1, 1, -1, 0, 0.5]'));
+-- Returns: [1,-1,1,1,-1,-1,1]
+```
+
 **`vector_extract(blob)`**
 
 Extracts and displays a vector blob as human-readable text.
@@ -733,11 +762,11 @@ SELECT vector_extract(embedding) FROM documents;
 
 #### Distance functions
 
-Turso provides three distance metrics for measuring vector similarity:
+Turso provides three distance metrics for measuring vector similarity. Both vectors must be of the same type and dimension. All distance functions support Float32, Float64, Float32Sparse, Float8, and Float1Bit vectors unless noted otherwise.
 
 **`vector_distance_cos(v1, v2)`**
 
-Computes the cosine distance between two vectors. Returns a value between 0 (identical direction) and 2 (opposite direction). Cosine distance is computed as `1 - cosine_similarity`.
+Computes the cosine distance between two vectors. Returns a value between 0 (identical direction) and 2 (opposite direction). Cosine distance is computed as `1 - cosine_similarity`. For `vector1bit` vectors, returns the Hamming distance (number of differing bits).
 
 Cosine distance is ideal for:
 - Text embeddings where magnitude is less important than direction
@@ -752,7 +781,7 @@ LIMIT 10;
 
 **`vector_distance_l2(v1, v2)`**
 
-Computes the Euclidean (L2) distance between two vectors. Returns the straight-line distance in n-dimensional space.
+Computes the Euclidean (L2) distance between two vectors. Returns the straight-line distance in n-dimensional space. Not supported for `vector1bit` vectors (returns an error).
 
 L2 distance is ideal for:
 - Image embeddings where absolute differences matter
@@ -766,14 +795,30 @@ ORDER BY distance
 LIMIT 10;
 ```
 
+**`vector_distance_dot(v1, v2)`**
+
+Computes the negative dot product between two vectors. Returns `-sum(v1[i] * v2[i])`. Lower values indicate more similar vectors.
+
+Dot product distance is ideal for:
+- Normalized embeddings (equivalent to cosine distance when vectors are unit-length)
+- Maximum inner product search (MIPS)
+
+```sql
+SELECT name, vector_distance_dot(embedding, vector32('[0.1, 0.5, 0.3]')) AS distance
+FROM documents
+ORDER BY distance
+LIMIT 10;
+```
+
 **`vector_distance_jaccard(v1, v2)`**
 
-Computes the weighted Jaccard distance between two vectors, measuring dissimilarity based on the ratio of minimum to maximum values across dimensions. Note that this is different from the ordinary Jaccard distance, which is defined only for binary vectors.
+Computes the weighted Jaccard distance between two vectors, measuring dissimilarity based on the ratio of minimum to maximum values across dimensions. For `vector1bit` vectors, computes binary Jaccard distance: `1 - |intersection| / |union|` over set bits.
 
-Weighted Jaccard distance is ideal for:
+Jaccard distance is ideal for:
 - Sparse vectors with many zero values
 - Set-like comparisons
 - TF-IDF and bag-of-words representations
+- Binary similarity with `vector1bit`
 
 ```sql
 SELECT name, vector_distance_jaccard(sparse_embedding, vector32_sparse('[0.0, 1.0, 0.0, 2.0]')) AS distance

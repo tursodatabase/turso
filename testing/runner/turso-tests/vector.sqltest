@@ -84,6 +84,91 @@ expect error {
     .*no such column: \[4.000000,5.000000,6.000000\]
 }
 
+test vector1bit-basic {
+    SELECT vector_extract(vector1bit('[1, -1, 1, 1, -1, 0, 0.5]'));
+}
+expect {
+    [1,-1,1,1,-1,-1,1]
+}
+
+test vector1bit-distance-cos {
+    SELECT vector_distance_cos(vector1bit('[1, -1, 1, -1]'), vector1bit('[1, -1, 1, -1]'));
+    SELECT vector_distance_cos(vector1bit('[1, -1, 1, -1]'), vector1bit('[-1, 1, -1, 1]'));
+}
+expect {
+    0.0
+    4.0
+}
+expect @js {
+    0
+    4
+}
+
+test vector1bit-distance-dot {
+    SELECT vector_distance_dot(vector1bit('[1, -1, 1, -1]'), vector1bit('[1, -1, 1, -1]'));
+    SELECT vector_distance_dot(vector1bit('[1, -1, 1, -1]'), vector1bit('[-1, 1, -1, 1]'));
+}
+expect {
+    -4.0
+    4.0
+}
+expect @js {
+    -4
+    4
+}
+
+test vector1bit-distance-l2-error {
+    SELECT vector_distance_l2(vector1bit('[1, -1]'), vector1bit('[1, -1]'));
+}
+expect error {
+    L2 distance is not supported for float1bit vectors
+}
+
+test vector8-basic {
+    SELECT vector_extract(vector8('[0, 255]'));
+}
+expect {
+    [0,255]
+}
+
+test vector8-distance-cos {
+    SELECT vector_distance_cos(vector8('[1, 2, 3, 4]'), vector8('[1, 2, 3, 4]'));
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test vector8-distance-l2 {
+    SELECT vector_distance_l2(vector8('[0, 10, 20]'), vector8('[0, 10, 20]'));
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test vector1bit-insert-roundtrip {
+    CREATE TABLE v1bit_test (id INTEGER PRIMARY KEY, v BLOB);
+    INSERT INTO v1bit_test VALUES (1, vector1bit('[1, -1, 1, 1]'));
+    SELECT vector_extract(v) FROM v1bit_test;
+}
+expect {
+    [1,-1,1,1]
+}
+
+test vector8-insert-roundtrip {
+    CREATE TABLE v8_test (id INTEGER PRIMARY KEY, v BLOB);
+    INSERT INTO v8_test VALUES (1, vector8('[1.0, 2.0, 3.0, 4.0]'));
+    SELECT vector_extract(v) FROM v8_test;
+}
+expect {
+    [1,2,3,4]
+}
+
 test vector-distance-dot-table {
     CREATE TABLE dot_test (
         id INTEGER PRIMARY KEY,

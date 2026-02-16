@@ -40,7 +40,47 @@ pub fn vector_distance_dot(v1: &Vector, v2: &Vector) -> Result<f64> {
             v1.as_f32_sparse(),
             v2.as_f32_sparse(),
         )),
+        VectorType::Float1Bit => Ok(vector_1bit_distance_dot(v1, v2)),
+        VectorType::Float8 => Ok(vector_f8_distance_dot(v1, v2)),
     }
+}
+
+fn vector_1bit_distance_dot(v1: &Vector, v2: &Vector) -> f64 {
+    // 1-bit values represent +1/-1.
+    // Dot product = dims - 2 * hamming_distance
+    // Return negated (consistent with existing dot distance convention).
+    let d1 = v1.as_1bit_data();
+    let d2 = v2.as_1bit_data();
+    let mut hamming = 0u32;
+    for (&a, &b) in d1.iter().zip(d2.iter()) {
+        hamming += (a ^ b).count_ones();
+    }
+    let dot = v1.dims as f64 - 2.0 * hamming as f64;
+    -dot
+}
+
+fn vector_f8_distance_dot(v1: &Vector, v2: &Vector) -> f64 {
+    let (data1, alpha1, shift1) = v1.as_f8_data();
+    let (data2, alpha2, shift2) = v2.as_f8_data();
+    let dims = v1.dims;
+
+    let (mut sum1, mut sum2, mut doti) = (0u64, 0u64, 0u64);
+    for i in 0..dims {
+        let q1 = data1[i] as u64;
+        let q2 = data2[i] as u64;
+        sum1 += q1;
+        sum2 += q2;
+        doti += q1 * q2;
+    }
+
+    let a1 = alpha1 as f64;
+    let a2 = alpha2 as f64;
+    let s1 = shift1 as f64;
+    let s2 = shift2 as f64;
+    let d = dims as f64;
+
+    let dot = a1 * a2 * doti as f64 + a1 * s2 * sum1 as f64 + a2 * s1 * sum2 as f64 + s1 * s2 * d;
+    -dot
 }
 
 #[allow(dead_code)]
@@ -183,5 +223,37 @@ mod tests {
         let d_rust = vector_f64_distance_dot_rust(v1.as_f64_slice(), v2.as_f64_slice());
         let d_simd = vector_f64_distance_dot_simsimd(v1.as_f64_slice(), v2.as_f64_slice());
         (d_rust.is_nan() && d_simd.is_nan()) || (d_rust - d_simd).abs() < 1e-6
+    }
+
+    /// Float8 optimized dot distance matches dequantized Float32 dot distance.
+    #[quickcheck]
+    fn prop_vector_distance_dot_f8_vs_dequantized(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
+        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
+        let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
+        let d_f8 = vector_distance_dot(&v1_f8, &v2_f8).unwrap();
+        let v1_deq = vector_convert(v1_f8, VectorType::Float32Dense).unwrap();
+        let v2_deq = vector_convert(v2_f8, VectorType::Float32Dense).unwrap();
+        let d_deq = vector_distance_dot(&v1_deq, &v2_deq).unwrap();
+        (d_f8.is_nan() && d_deq.is_nan()) || (d_f8 - d_deq).abs() < 1e-3
+    }
+
+    /// Float1Bit dot distance matches dequantized ±1 Float32 dot distance.
+    #[quickcheck]
+    fn prop_vector_distance_dot_1bit_vs_dequantized(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        let v1 = vector_convert(v1.into(), VectorType::Float1Bit).unwrap();
+        let v2 = vector_convert(v2.into(), VectorType::Float1Bit).unwrap();
+        let d_1bit = vector_distance_dot(&v1, &v2).unwrap();
+        let v1_f32 = vector_convert(v1, VectorType::Float32Dense).unwrap();
+        let v2_f32 = vector_convert(v2, VectorType::Float32Dense).unwrap();
+        let d_f32 = vector_distance_dot(&v1_f32, &v2_f32).unwrap();
+        (d_1bit - d_f32).abs() < 1e-6
     }
 }
