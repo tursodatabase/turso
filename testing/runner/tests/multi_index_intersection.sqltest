@@ -1,0 +1,49 @@
+@database :memory:
+
+setup multi_index_schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, d INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    CREATE INDEX idx_b ON t(b);
+    CREATE INDEX idx_c ON t(c);
+    CREATE INDEX idx_d ON t(d);
+    INSERT INTO t VALUES (1, 10, 100, 1000, 10000);
+    INSERT INTO t VALUES (2, 20, 200, 2000, 20000);
+    INSERT INTO t VALUES (3, 10, 100, 3000, 30000);
+}
+
+# 2-way multi-index intersection (AND with 2 indexed columns)
+@setup multi_index_schema
+test multi-index-and-2-way {
+    SELECT * FROM t WHERE a = 10 AND b = 100;
+}
+expect {
+    1|10|100|1000|10000
+    3|10|100|3000|30000
+}
+
+# 3-way multi-index intersection (AND with 3 indexed columns)
+# Regression test for #5285: panic on 3+ way MULTI-INDEX AND
+@setup multi_index_schema
+test multi-index-and-3-way {
+    SELECT * FROM t WHERE a = 10 AND b = 100 AND c = 1000;
+}
+expect {
+    1|10|100|1000|10000
+}
+
+# 4-way multi-index intersection (AND with 4 indexed columns)
+@setup multi_index_schema
+test multi-index-and-4-way {
+    SELECT * FROM t WHERE a = 10 AND b = 100 AND c = 1000 AND d = 10000;
+}
+expect {
+    1|10|100|1000|10000
+}
+
+# 3-way multi-index intersection with no matching rows
+@setup multi_index_schema
+test multi-index-and-3-way-no-match {
+    SELECT * FROM t WHERE a = 10 AND b = 200 AND c = 1000;
+}
+expect {
+}

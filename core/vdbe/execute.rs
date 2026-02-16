@@ -434,9 +434,15 @@ pub fn op_null(
             if let Some(dest_end) = dest_end {
                 for i in *dest..=*dest_end {
                     state.registers[i] = Register::Value(Value::Null);
+                    // Clear any associated RowSet so it can be reused in a fresh
+                    // state.  In SQLite the RowSet lives inside the register and
+                    // is destroyed by OP_Null; we keep RowSets in a side map, so
+                    // we must remove them explicitly.
+                    state.rowsets.remove(&i);
                 }
             } else {
                 state.registers[*dest] = Register::Value(Value::Null);
+                state.rowsets.remove(dest);
             }
         }
         _ => unreachable!("unexpected Insn {:?}", insn),
