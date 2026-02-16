@@ -958,6 +958,51 @@ impl Default for JoinTypeWeights {
 }
 
 // =============================================================================
+// CTE Configuration
+// =============================================================================
+
+/// Configuration for CTE (Common Table Expression) generation.
+#[derive(Debug, Clone)]
+pub struct CteConfig {
+    /// Maximum number of CTEs in a single WITH clause.
+    pub max_ctes: usize,
+
+    /// Probability of generating column aliases for a CTE.
+    pub column_aliases_probability: f64,
+
+    /// Weights for CTE materialization hints.
+    pub materialization_weights: CteMaterializationWeights,
+}
+
+impl Default for CteConfig {
+    fn default() -> Self {
+        Self {
+            max_ctes: 2,
+            column_aliases_probability: 0.2,
+            materialization_weights: CteMaterializationWeights::default(),
+        }
+    }
+}
+
+/// Weights for CTE materialization hints.
+#[derive(Debug, Clone)]
+pub struct CteMaterializationWeights {
+    pub default: u32,
+    pub materialized: u32,
+    pub not_materialized: u32,
+}
+
+impl Default for CteMaterializationWeights {
+    fn default() -> Self {
+        Self {
+            default: 50,
+            materialized: 25,
+            not_materialized: 25,
+        }
+    }
+}
+
+// =============================================================================
 // SELECT Configuration
 // =============================================================================
 
@@ -1049,12 +1094,15 @@ pub struct SelectConfig {
     /// Configuration for JOIN generation.
     pub join_config: JoinConfig,
 
-    // Stubs (not yet implemented, probability 0.0)
-    /// Probability of generating a compound SELECT (UNION/INTERSECT/EXCEPT).
-    pub compound_probability: f64,
+    /// Configuration for CTE generation.
+    pub cte_config: CteConfig,
 
     /// Probability of generating a CTE (WITH clause).
     pub cte_probability: f64,
+
+    // Stubs (not yet implemented, probability 0.0)
+    /// Probability of generating a compound SELECT (UNION/INTERSECT/EXCEPT).
+    pub compound_probability: f64,
 
     /// Probability of generating a derived table (subquery in FROM).
     pub derived_table_probability: f64,
@@ -1090,9 +1138,10 @@ impl Default for SelectConfig {
             subquery_distinct_probability: 0.15,
             restrict_mixed_aggregates: true,
             join_config: JoinConfig::default(),
+            cte_config: CteConfig::default(),
+            cte_probability: 0.15,
             // Stubs
             compound_probability: 0.0,
-            cte_probability: 0.0,
             derived_table_probability: 0.0,
         }
     }
@@ -1113,6 +1162,7 @@ impl SelectConfig {
             subquery_order_by_probability: 0.0,
             subquery_group_by_probability: 0.0,
             subquery_distinct_probability: 0.0,
+            cte_probability: 0.0,
             ..Default::default()
         }
     }
@@ -1205,6 +1255,9 @@ pub struct InsertConfig {
     /// Maximum expression nesting depth for VALUES expressions.
     pub expression_value_max_depth: usize,
 
+    /// Probability of generating a CTE (WITH clause) for INSERT.
+    pub cte_probability: f64,
+
     // Stubs (not yet implemented, probability 0.0)
     /// Probability of INSERT ... SELECT instead of VALUES.
     pub insert_select_probability: f64,
@@ -1230,6 +1283,7 @@ impl Default for InsertConfig {
             or_ignore_probability: 0.0,
             expression_value_probability: 0.3,
             expression_value_max_depth: 2,
+            cte_probability: 0.1,
             // Stubs
             insert_select_probability: 0.0,
             upsert_probability: 0.0,
@@ -1290,6 +1344,9 @@ pub struct UpdateConfig {
     /// Maximum expression nesting depth for SET expressions.
     pub expression_value_max_depth: usize,
 
+    /// Probability of generating a CTE (WITH clause) for UPDATE.
+    pub cte_probability: f64,
+
     // Stubs (not yet implemented, probability 0.0)
     /// Probability of UPDATE ... FROM.
     pub from_probability: f64,
@@ -1309,6 +1366,7 @@ impl Default for UpdateConfig {
             primary_key_update_probability: 0.1,
             expression_value_probability: 0.4,
             expression_value_max_depth: 2,
+            cte_probability: 0.1,
             // Stubs
             from_probability: 0.0,
             returning_probability: 0.0,
@@ -1332,6 +1390,9 @@ pub struct DeleteConfig {
     /// Maximum LIMIT value for DELETE.
     pub max_limit: u64,
 
+    /// Probability of generating a CTE (WITH clause) for DELETE.
+    pub cte_probability: f64,
+
     // Stubs (not yet implemented, probability 0.0)
     /// Probability of RETURNING clause.
     pub returning_probability: f64,
@@ -1343,6 +1404,7 @@ impl Default for DeleteConfig {
             where_probability: 0.95,
             limit_probability: 0.1,
             max_limit: 100,
+            cte_probability: 0.1,
             // Stubs
             returning_probability: 0.0,
         }

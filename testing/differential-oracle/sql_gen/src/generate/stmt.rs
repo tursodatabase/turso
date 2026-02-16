@@ -12,7 +12,7 @@ use crate::context::Context;
 use crate::error::GenError;
 use crate::generate::expr::{generate_condition, generate_expr};
 use crate::generate::literal::generate_literal;
-use crate::generate::select::generate_select;
+use crate::generate::select::{generate_select, generate_with_clause};
 use crate::policy::AlterTableConfig;
 use crate::schema::DataType;
 use crate::trace::{Origin, StmtKind};
@@ -231,6 +231,14 @@ pub fn generate_insert<C: Capabilities>(
 ) -> Result<Stmt, GenError> {
     let insert_config = &generator.policy().insert_config;
 
+    // --- Optional CTE ---
+    let with_clause = if ctx.gen_bool_with_prob(insert_config.cte_probability) {
+        let (wc, _cte_tables) = generate_with_clause(generator, ctx)?;
+        Some(wc)
+    } else {
+        None
+    };
+
     let table = ctx
         .choose(&generator.schema().tables)
         .ok_or_else(|| GenError::schema_empty("tables"))?
@@ -288,6 +296,7 @@ pub fn generate_insert<C: Capabilities>(
     }
 
     Ok(Stmt::Insert(InsertStmt {
+        with_clause,
         table: table.name,
         columns,
         values,
@@ -355,6 +364,14 @@ pub fn generate_update<C: Capabilities>(
 ) -> Result<Stmt, GenError> {
     let update_config = &generator.policy().update_config;
 
+    // --- Optional CTE ---
+    let with_clause = if ctx.gen_bool_with_prob(update_config.cte_probability) {
+        let (wc, _cte_tables) = generate_with_clause(generator, ctx)?;
+        Some(wc)
+    } else {
+        None
+    };
+
     let table = ctx
         .choose(&generator.schema().tables)
         .ok_or_else(|| GenError::schema_empty("tables"))?
@@ -393,6 +410,7 @@ pub fn generate_update<C: Capabilities>(
         }
 
         Ok(Stmt::Update(UpdateStmt {
+            with_clause: with_clause.clone(),
             table: table.name.clone(),
             sets,
             where_clause,
@@ -513,6 +531,14 @@ pub fn generate_delete<C: Capabilities>(
 ) -> Result<Stmt, GenError> {
     let delete_config = &generator.policy().delete_config;
 
+    // --- Optional CTE ---
+    let with_clause = if ctx.gen_bool_with_prob(delete_config.cte_probability) {
+        let (wc, _cte_tables) = generate_with_clause(generator, ctx)?;
+        Some(wc)
+    } else {
+        None
+    };
+
     let table = ctx
         .choose(&generator.schema().tables)
         .ok_or_else(|| GenError::schema_empty("tables"))?
@@ -532,6 +558,7 @@ pub fn generate_delete<C: Capabilities>(
         }
 
         Ok(Stmt::Delete(DeleteStmt {
+            with_clause: with_clause.clone(),
             table: table.name.clone(),
             where_clause,
         }))
@@ -1459,5 +1486,101 @@ mod tests {
                 || sql.contains("RENAME COLUMN ");
             assert!(has_action, "ALTER TABLE should have action: {sql}");
         }
+    }
+
+    #[test]
+    fn test_insert_with_cte() {
+        let policy = Policy::default().with_insert_config(crate::policy::InsertConfig {
+            cte_probability: 1.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut found_cte = false;
+        for seed in 0..50 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(stmt) = generate_insert(&generator, &mut ctx) {
+                let sql = stmt.to_string();
+                if sql.starts_with("WITH") && sql.contains("INSERT") {
+                    found_cte = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_cte, "Should generate INSERT with CTE");
+    }
+
+    #[test]
+    fn test_update_with_cte() {
+        let policy = Policy::default().with_update_config(crate::policy::UpdateConfig {
+            cte_probability: 1.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut found_cte = false;
+        for seed in 0..50 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(stmt) = generate_update(&generator, &mut ctx) {
+                let sql = stmt.to_string();
+                if sql.starts_with("WITH") && sql.contains("UPDATE") {
+                    found_cte = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_cte, "Should generate UPDATE with CTE");
+    }
+
+    #[test]
+    fn test_delete_with_cte() {
+        let policy = Policy::default().with_delete_config(crate::policy::DeleteConfig {
+            cte_probability: 1.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut found_cte = false;
+        for seed in 0..50 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(stmt) = generate_delete(&generator, &mut ctx) {
+                let sql = stmt.to_string();
+                if sql.starts_with("WITH") && sql.contains("DELETE") {
+                    found_cte = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_cte, "Should generate DELETE with CTE");
     }
 }

@@ -211,19 +211,23 @@ fn dispatch_expr_generation<C: Capabilities>(
 fn generate_column_ref(ctx: &mut Context) -> Result<Expr, GenError> {
     let scope_len = ctx.tables_in_scope().len();
     if scope_len > 1 {
-        // Multi-table scope: pick a random scoped table, qualify the column ref
-        let idx = ctx.gen_range(scope_len);
-        let qualifier = ctx.tables_in_scope()[idx].qualifier.clone();
-        let col_names: Vec<String> = ctx.tables_in_scope()[idx]
-            .table
-            .filterable_columns()
-            .map(|c| c.name.clone())
-            .collect();
-        if col_names.is_empty() {
-            return Err(GenError::exhausted("column_ref", "no filterable columns"));
+        // Multi-table scope: pick a random start index, then scan for a table
+        // with filterable columns (handles tables with only Blob columns).
+        let start_idx = ctx.gen_range(scope_len);
+        for offset in 0..scope_len {
+            let idx = (start_idx + offset) % scope_len;
+            let col_names: Vec<String> = ctx.tables_in_scope()[idx]
+                .table
+                .filterable_columns()
+                .map(|c| c.name.clone())
+                .collect();
+            if !col_names.is_empty() {
+                let qualifier = ctx.tables_in_scope()[idx].qualifier.clone();
+                let col_name = ctx.choose(&col_names).unwrap().clone();
+                return Ok(Expr::column_ref(ctx, Some(qualifier), col_name));
+            }
         }
-        let col_name = ctx.choose(&col_names).unwrap().clone();
-        Ok(Expr::column_ref(ctx, Some(qualifier), col_name))
+        Err(GenError::exhausted("column_ref", "no filterable columns"))
     } else if scope_len == 1 {
         // Single scoped table: use it, optionally qualify
         let qualifier = ctx.tables_in_scope()[0].qualifier.clone();

@@ -122,6 +122,14 @@ impl SelectStmt {
     /// Returns a reason code when this SELECT contains a potentially
     /// non-deterministic LIMIT query.
     pub fn unordered_limit_reason(&self) -> Option<&'static str> {
+        // Check CTE inner queries
+        if let Some(with) = &self.with_clause {
+            for cte in &with.ctes {
+                if let Some(reason) = cte.query.unordered_limit_reason() {
+                    return Some(reason);
+                }
+            }
+        }
         if self.limit.is_some() {
             if self.order_by.is_empty() {
                 return Some("limit_without_order_by");
@@ -381,6 +389,76 @@ impl StmtKind {
     }
 }
 
+// =============================================================================
+// CTE (Common Table Expression) types
+// =============================================================================
+
+/// Materialization hint for a CTE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CteMaterialization {
+    /// No hint (default behavior).
+    Default,
+    /// Force materialization.
+    Materialized,
+    /// Suggest against materialization.
+    NotMaterialized,
+}
+
+impl fmt::Display for CteMaterialization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CteMaterialization::Default => Ok(()),
+            CteMaterialization::Materialized => write!(f, "MATERIALIZED "),
+            CteMaterialization::NotMaterialized => write!(f, "NOT MATERIALIZED "),
+        }
+    }
+}
+
+/// A single CTE definition: `name[(col1, col2)] AS [MATERIALIZED ](SELECT ...)`.
+#[derive(Debug, Clone)]
+pub struct CteDefinition {
+    pub name: String,
+    pub column_aliases: Vec<String>,
+    pub materialization: CteMaterialization,
+    pub query: SelectStmt,
+}
+
+impl fmt::Display for CteDefinition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)?;
+        if !self.column_aliases.is_empty() {
+            write!(f, "(")?;
+            for (i, alias) in self.column_aliases.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{alias}")?;
+            }
+            write!(f, ")")?;
+        }
+        write!(f, " AS {}({})", self.materialization, self.query)
+    }
+}
+
+/// A WITH clause containing one or more CTEs.
+#[derive(Debug, Clone)]
+pub struct WithClause {
+    pub ctes: Vec<CteDefinition>,
+}
+
+impl fmt::Display for WithClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WITH ")?;
+        for (i, cte) in self.ctes.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{cte}")?;
+        }
+        Ok(())
+    }
+}
+
 /// The FROM clause of a SELECT statement.
 #[derive(Debug, Clone)]
 pub struct FromClause {
@@ -415,6 +493,7 @@ pub enum JoinConstraint {
 /// A SELECT statement.
 #[derive(Debug, Clone)]
 pub struct SelectStmt {
+    pub with_clause: Option<WithClause>,
     pub distinct: bool,
     pub columns: Vec<SelectColumn>,
     /// The FROM clause. None for table-less SELECTs (e.g. `SELECT 1+2`).
@@ -436,6 +515,9 @@ pub struct GroupByClause {
 
 impl fmt::Display for SelectStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(with) = &self.with_clause {
+            write!(f, "{with} ")?;
+        }
         write!(f, "SELECT ")?;
         if self.distinct {
             write!(f, "DISTINCT ")?;
@@ -605,6 +687,7 @@ impl fmt::Display for ConflictClause {
 /// An INSERT statement.
 #[derive(Debug, Clone)]
 pub struct InsertStmt {
+    pub with_clause: Option<WithClause>,
     pub table: String,
     pub columns: Vec<String>,
     pub values: Vec<Vec<Expr>>,
@@ -613,6 +696,9 @@ pub struct InsertStmt {
 
 impl fmt::Display for InsertStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(with) = &self.with_clause {
+            write!(f, "{with} ")?;
+        }
         write!(f, "INSERT")?;
         if let Some(conflict) = &self.conflict {
             write!(f, "{conflict}")?;
@@ -652,6 +738,7 @@ impl fmt::Display for InsertStmt {
 /// An UPDATE statement.
 #[derive(Debug, Clone)]
 pub struct UpdateStmt {
+    pub with_clause: Option<WithClause>,
     pub table: String,
     pub sets: Vec<(String, Expr)>,
     pub where_clause: Option<Expr>,
@@ -660,6 +747,9 @@ pub struct UpdateStmt {
 
 impl fmt::Display for UpdateStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(with) = &self.with_clause {
+            write!(f, "{with} ")?;
+        }
         write!(f, "UPDATE")?;
         if let Some(conflict) = &self.conflict {
             write!(f, "{conflict}")?;
@@ -684,12 +774,16 @@ impl fmt::Display for UpdateStmt {
 /// A DELETE statement.
 #[derive(Debug, Clone)]
 pub struct DeleteStmt {
+    pub with_clause: Option<WithClause>,
     pub table: String,
     pub where_clause: Option<Expr>,
 }
 
 impl fmt::Display for DeleteStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(with) = &self.with_clause {
+            write!(f, "{with} ")?;
+        }
         write!(f, "DELETE FROM {}", self.table)?;
 
         if let Some(where_clause) = &self.where_clause {
@@ -1590,6 +1684,7 @@ mod tests {
     #[test]
     fn test_select_display() {
         let select = SelectStmt {
+            with_clause: None,
             distinct: false,
             columns: vec![SelectColumn {
                 expr: Expr::ColumnRef(ColumnRef {
@@ -1616,6 +1711,7 @@ mod tests {
     #[test]
     fn test_select_distinct_display() {
         let select = SelectStmt {
+            with_clause: None,
             distinct: true,
             columns: vec![SelectColumn {
                 expr: Expr::ColumnRef(ColumnRef {
@@ -1642,6 +1738,7 @@ mod tests {
     #[test]
     fn test_select_with_join_display() {
         let select = SelectStmt {
+            with_clause: None,
             distinct: false,
             columns: vec![],
             from: Some(FromClause {
@@ -1674,6 +1771,7 @@ mod tests {
     fn test_insert_display() {
         let mut ctx = Context::new_with_seed(42);
         let insert = InsertStmt {
+            with_clause: None,
             table: "users".to_string(),
             columns: vec!["name".to_string(), "age".to_string()],
             values: vec![vec![
@@ -1718,6 +1816,7 @@ mod tests {
     #[test]
     fn test_has_unordered_limit_for_constant_order_by() {
         let select = SelectStmt {
+            with_clause: None,
             distinct: false,
             columns: vec![SelectColumn {
                 expr: Expr::Literal(Literal::Integer(1)),
@@ -1745,6 +1844,7 @@ mod tests {
     #[test]
     fn test_has_unordered_limit_false_for_column_order_by() {
         let select = SelectStmt {
+            with_clause: None,
             distinct: false,
             columns: vec![SelectColumn {
                 expr: Expr::ColumnRef(ColumnRef {
@@ -1778,6 +1878,7 @@ mod tests {
     #[test]
     fn test_unordered_limit_reason_for_scalar_subquery_order_by() {
         let select = SelectStmt {
+            with_clause: None,
             distinct: false,
             columns: vec![SelectColumn {
                 expr: Expr::ColumnRef(ColumnRef {
@@ -1801,6 +1902,7 @@ mod tests {
                     }),
                     op: BinOp::Or,
                     right: Expr::Subquery(Box::new(SelectStmt {
+                        with_clause: None,
                         distinct: false,
                         columns: vec![SelectColumn {
                             expr: Expr::Literal(Literal::Integer(1)),
@@ -1832,6 +1934,7 @@ mod tests {
     #[test]
     fn test_unordered_limit_reason_for_constant_order_by() {
         let select = SelectStmt {
+            with_clause: None,
             distinct: false,
             columns: vec![SelectColumn {
                 expr: Expr::ColumnRef(ColumnRef {
@@ -1859,6 +1962,228 @@ mod tests {
         assert_eq!(
             select.unordered_limit_reason(),
             Some("limit_constant_order_by")
+        );
+    }
+
+    #[test]
+    fn test_cte_display() {
+        let cte = CteDefinition {
+            name: "cte_0".to_string(),
+            column_aliases: vec![],
+            materialization: CteMaterialization::Default,
+            query: SelectStmt {
+                with_clause: None,
+                distinct: false,
+                columns: vec![SelectColumn {
+                    expr: Expr::Literal(Literal::Integer(1)),
+                    alias: None,
+                }],
+                from: None,
+                joins: vec![],
+                where_clause: None,
+                group_by: None,
+                order_by: vec![],
+                limit: None,
+                offset: None,
+            },
+        };
+
+        assert_eq!(cte.to_string(), "cte_0 AS (SELECT 1)");
+    }
+
+    #[test]
+    fn test_with_clause_display() {
+        let wc = WithClause {
+            ctes: vec![
+                CteDefinition {
+                    name: "cte_0".to_string(),
+                    column_aliases: vec![],
+                    materialization: CteMaterialization::Default,
+                    query: SelectStmt {
+                        with_clause: None,
+                        distinct: false,
+                        columns: vec![SelectColumn {
+                            expr: Expr::Literal(Literal::Integer(1)),
+                            alias: Some("x".to_string()),
+                        }],
+                        from: None,
+                        joins: vec![],
+                        where_clause: None,
+                        group_by: None,
+                        order_by: vec![],
+                        limit: None,
+                        offset: None,
+                    },
+                },
+                CteDefinition {
+                    name: "cte_1".to_string(),
+                    column_aliases: vec!["a".to_string(), "b".to_string()],
+                    materialization: CteMaterialization::Default,
+                    query: SelectStmt {
+                        with_clause: None,
+                        distinct: false,
+                        columns: vec![SelectColumn {
+                            expr: Expr::Literal(Literal::Integer(2)),
+                            alias: None,
+                        }],
+                        from: None,
+                        joins: vec![],
+                        where_clause: None,
+                        group_by: None,
+                        order_by: vec![],
+                        limit: None,
+                        offset: None,
+                    },
+                },
+            ],
+        };
+
+        assert_eq!(
+            wc.to_string(),
+            "WITH cte_0 AS (SELECT 1 AS x), cte_1(a, b) AS (SELECT 2)"
+        );
+    }
+
+    #[test]
+    fn test_select_with_cte_display() {
+        let select = SelectStmt {
+            with_clause: Some(WithClause {
+                ctes: vec![CteDefinition {
+                    name: "cte_0".to_string(),
+                    column_aliases: vec![],
+                    materialization: CteMaterialization::Default,
+                    query: SelectStmt {
+                        with_clause: None,
+                        distinct: false,
+                        columns: vec![SelectColumn {
+                            expr: Expr::Literal(Literal::Integer(1)),
+                            alias: Some("x".to_string()),
+                        }],
+                        from: None,
+                        joins: vec![],
+                        where_clause: None,
+                        group_by: None,
+                        order_by: vec![],
+                        limit: None,
+                        offset: None,
+                    },
+                }],
+            }),
+            distinct: false,
+            columns: vec![],
+            from: Some(FromClause {
+                table: "cte_0".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        assert_eq!(
+            select.to_string(),
+            "WITH cte_0 AS (SELECT 1 AS x) SELECT * FROM cte_0"
+        );
+    }
+
+    #[test]
+    fn test_insert_with_cte_display() {
+        let mut ctx = Context::new_with_seed(42);
+        let insert = InsertStmt {
+            with_clause: Some(WithClause {
+                ctes: vec![CteDefinition {
+                    name: "cte_0".to_string(),
+                    column_aliases: vec![],
+                    materialization: CteMaterialization::Default,
+                    query: SelectStmt {
+                        with_clause: None,
+                        distinct: false,
+                        columns: vec![SelectColumn {
+                            expr: Expr::Literal(Literal::Integer(1)),
+                            alias: None,
+                        }],
+                        from: None,
+                        joins: vec![],
+                        where_clause: None,
+                        group_by: None,
+                        order_by: vec![],
+                        limit: None,
+                        offset: None,
+                    },
+                }],
+            }),
+            table: "users".to_string(),
+            columns: vec!["id".to_string()],
+            values: vec![vec![Expr::literal(&mut ctx, Literal::Integer(1))]],
+            conflict: None,
+        };
+
+        let sql = insert.to_string();
+        assert!(sql.starts_with("WITH cte_0 AS (SELECT 1) INSERT INTO users"));
+    }
+
+    #[test]
+    fn test_materialization_display() {
+        assert_eq!(CteMaterialization::Default.to_string(), "");
+        assert_eq!(
+            CteMaterialization::Materialized.to_string(),
+            "MATERIALIZED "
+        );
+        assert_eq!(
+            CteMaterialization::NotMaterialized.to_string(),
+            "NOT MATERIALIZED "
+        );
+    }
+
+    #[test]
+    fn test_unordered_limit_in_cte_detected() {
+        let select = SelectStmt {
+            with_clause: Some(WithClause {
+                ctes: vec![CteDefinition {
+                    name: "cte_0".to_string(),
+                    column_aliases: vec![],
+                    materialization: CteMaterialization::Default,
+                    query: SelectStmt {
+                        with_clause: None,
+                        distinct: false,
+                        columns: vec![SelectColumn {
+                            expr: Expr::Literal(Literal::Integer(1)),
+                            alias: None,
+                        }],
+                        from: Some(FromClause {
+                            table: "t".to_string(),
+                            alias: None,
+                        }),
+                        joins: vec![],
+                        where_clause: None,
+                        group_by: None,
+                        order_by: vec![],
+                        limit: Some(5),
+                        offset: None,
+                    },
+                }],
+            }),
+            distinct: false,
+            columns: vec![],
+            from: Some(FromClause {
+                table: "cte_0".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        assert!(select.has_unordered_limit());
+        assert_eq!(
+            select.unordered_limit_reason(),
+            Some("limit_without_order_by")
         );
     }
 }

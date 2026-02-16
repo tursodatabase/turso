@@ -2,8 +2,9 @@
 
 use crate::SqlGen;
 use crate::ast::{
-    BinOp, Expr, FromClause, GroupByClause, JoinClause, JoinConstraint, JoinType, NullsOrder,
-    OrderByItem, OrderDirection, SelectColumn, SelectStmt,
+    BinOp, CteDefinition, CteMaterialization, Expr, FromClause, GroupByClause, JoinClause,
+    JoinConstraint, JoinType, NullsOrder, OrderByItem, OrderDirection, SelectColumn, SelectStmt,
+    WithClause,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -12,7 +13,7 @@ use crate::functions::AGGREGATE_FUNCTIONS;
 use crate::generate::expr::generate_condition;
 use crate::generate::expr::generate_expr;
 use crate::generate::literal::generate_literal;
-use crate::schema::DataType;
+use crate::schema::{ColumnDef, DataType, Table};
 use crate::trace::Origin;
 use sql_gen_macros::trace_gen;
 
@@ -54,6 +55,7 @@ pub fn generate_tableless_select<C: Capabilities>(
     }
 
     Ok(SelectStmt {
+        with_clause: None,
         distinct: false,
         columns,
         from: None,
@@ -104,10 +106,23 @@ fn generate_select_impl<C: Capabilities>(
     let select_config = &generator.policy().select_config;
     let ident_config = &generator.policy().identifier_config;
 
-    // --- CTE (not yet implemented) ---
-    if ctx.gen_bool_with_prob(select_config.cte_probability) {
-        generate_cte(generator, ctx)?;
-    }
+    // --- CTE ---
+    let (with_clause, cte_tables) =
+        if mode == SelectMode::Full && ctx.gen_bool_with_prob(select_config.cte_probability) {
+            let (wc, tables) = generate_with_clause(generator, ctx)?;
+            (Some(wc), tables)
+        } else {
+            (None, vec![])
+        };
+
+    // --- Choose FROM source: primary table or a CTE table ---
+    let from_table = if !cte_tables.is_empty() && ctx.gen_bool() {
+        // Use a CTE table as the FROM source
+        let idx = ctx.gen_range(cte_tables.len());
+        cte_tables[idx].clone()
+    } else {
+        table
+    };
 
     // --- Alias for primary table ---
     let from_alias = if mode == SelectMode::Full
@@ -123,9 +138,17 @@ fn generate_select_impl<C: Capabilities>(
         None
     };
 
-    ctx.with_table_scope([(table, from_alias)], |ctx| {
+    // Only the FROM source table goes into scope. Extra CTE tables are defined
+    // in the WITH clause but not referenced in FROM/JOIN, so column refs to them
+    // would produce invalid SQL (e.g. `SELECT cte_0.x FROM users`).
+    let scope_entries: Vec<(Table, Option<String>)> = vec![(from_table, from_alias)];
+
+    let mut select = ctx.with_table_scope(scope_entries, |ctx| {
         generate_select_impl_inner(generator, ctx, mode)
-    })
+    })?;
+
+    select.with_clause = with_clause;
+    Ok(select)
 }
 
 /// Inner implementation, runs inside a table scope frame.
@@ -291,6 +314,7 @@ fn generate_select_impl_inner<C: Capabilities>(
     }
 
     Ok(SelectStmt {
+        with_clause: None,
         distinct,
         columns,
         from,
@@ -939,12 +963,257 @@ fn generate_compound_except<C: Capabilities>(
     todo!("EXCEPT generation")
 }
 
+/// Generate a WITH clause containing 1..max_ctes CTEs.
+///
+/// Returns the `WithClause` and a `Vec<Table>` representing the CTE tables
+/// that can be used as FROM sources or JOIN targets. This function is public
+/// so it can be reused by INSERT/UPDATE/DELETE generation.
 #[trace_gen(Origin::Cte)]
-fn generate_cte<C: Capabilities>(
-    _generator: &SqlGen<C>,
-    _ctx: &mut Context,
-) -> Result<(), GenError> {
-    todo!("CTE generation")
+pub fn generate_with_clause<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<(WithClause, Vec<Table>), GenError> {
+    let cte_config = &generator.policy().select_config.cte_config;
+    let num_ctes = ctx.gen_range_inclusive(1, cte_config.max_ctes);
+    let mut cte_defs = Vec::with_capacity(num_ctes);
+    let mut cte_tables = Vec::with_capacity(num_ctes);
+
+    // Collect existing schema table names to avoid conflicts
+    let schema_names: Vec<String> = generator
+        .schema()
+        .tables
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+
+    for i in 0..num_ctes {
+        // Generate a unique CTE name
+        let cte_name = generate_cte_name(i, &schema_names, &cte_tables);
+
+        // Generate the inner SELECT for this CTE (with CTEs disabled)
+        let inner_select = generate_cte_inner_select(generator, ctx)?;
+
+        // Derive effective columns from the inner SELECT
+        let effective_columns =
+            derive_effective_columns(&inner_select, generator, &cte_tables, &schema_names);
+
+        // Generate column aliases. Required when any inner SELECT column is an
+        // expression (not a bare column ref) without an explicit alias, because
+        // SQLite names such columns by the expression text (e.g.
+        // "GROUP_CONCAT(col)") which is unusable as a column reference.
+        let needs_aliases = inner_select
+            .columns
+            .iter()
+            .any(|col| !matches!(col.expr, crate::ast::Expr::ColumnRef(_)) && col.alias.is_none());
+        let column_aliases = if !effective_columns.is_empty()
+            && (needs_aliases || ctx.gen_bool_with_prob(cte_config.column_aliases_probability))
+        {
+            effective_columns
+                .iter()
+                .enumerate()
+                .map(|(j, _)| format!("c{j}"))
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Choose materialization hint
+        let materialization = choose_materialization(ctx, &cte_config.materialization_weights);
+
+        // Build a Table for this CTE so it can be used in FROM/JOINs
+        let cte_col_defs: Vec<ColumnDef> = if column_aliases.is_empty() {
+            effective_columns
+        } else {
+            column_aliases
+                .iter()
+                .zip(effective_columns.iter())
+                .map(|(alias, orig)| ColumnDef {
+                    name: alias.clone(),
+                    data_type: orig.data_type,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                })
+                .collect()
+        };
+
+        let cte_table = Table::new(cte_name.clone(), cte_col_defs);
+        cte_tables.push(cte_table);
+
+        cte_defs.push(CteDefinition {
+            name: cte_name,
+            column_aliases,
+            materialization,
+            query: inner_select,
+        });
+    }
+
+    Ok((WithClause { ctes: cte_defs }, cte_tables))
+}
+
+/// Generate the inner SELECT for a CTE definition.
+///
+/// This uses a fresh scope and bypasses CTE generation to prevent recursion.
+fn generate_cte_inner_select<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<SelectStmt, GenError> {
+    // Create a policy copy with CTE disabled to prevent recursion
+    let mut inner_policy = generator.policy().clone();
+    inner_policy.select_config.cte_probability = 0.0;
+    let inner_gen = SqlGen::<C>::new(generator.schema().clone(), inner_policy);
+
+    if inner_gen.schema().tables.is_empty() {
+        return generate_tableless_select(&inner_gen, ctx);
+    }
+
+    let table = ctx
+        .choose(&inner_gen.schema().tables)
+        .ok_or_else(|| GenError::schema_empty("tables"))?
+        .clone();
+
+    ctx.with_table_scope([(table, None)], |ctx| {
+        generate_select_impl_inner(&inner_gen, ctx, SelectMode::Full)
+    })
+}
+
+/// Derive effective column definitions from a SELECT statement.
+///
+/// For column refs, uses the column name and type. For expressions,
+/// generates `c{i}` names with inferred types. For SELECT *, expands
+/// all source table columns.
+fn derive_effective_columns<C: Capabilities>(
+    select: &SelectStmt,
+    generator: &SqlGen<C>,
+    cte_tables: &[Table],
+    schema_names: &[String],
+) -> Vec<ColumnDef> {
+    let cols = if select.columns.is_empty() {
+        // SELECT * — expand from the FROM table
+        if let Some(from) = &select.from {
+            let table_name = &from.table;
+            // Check schema tables
+            if let Some(t) = generator
+                .schema()
+                .tables
+                .iter()
+                .find(|t| &t.name == table_name)
+            {
+                t.columns.clone()
+            } else if let Some(t) = cte_tables.iter().find(|t| &t.name == table_name) {
+                // Check CTE tables
+                t.columns.clone()
+            } else {
+                // Fallback: single integer column
+                vec![ColumnDef::new("c0", DataType::Integer)]
+            }
+        } else {
+            // Fallback: single integer column
+            vec![ColumnDef::new("c0", DataType::Integer)]
+        }
+    } else {
+        select
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                let (name, data_type) = match &col.expr {
+                    crate::ast::Expr::ColumnRef(cr) => {
+                        let dt = infer_column_type(
+                            cr.table.as_deref(),
+                            &cr.column,
+                            generator,
+                            cte_tables,
+                            schema_names,
+                        );
+                        (cr.column.clone(), dt)
+                    }
+                    _ => {
+                        let name = col.alias.clone().unwrap_or_else(|| format!("c{i}"));
+                        (name, DataType::Integer)
+                    }
+                };
+                ColumnDef::new(name, data_type)
+            })
+            .collect()
+    };
+
+    // CTE column types are inferred, not declared. Blob columns are
+    // considered unfilterable, which causes generate_column_ref to fail
+    // when a CTE table is used as a FROM source. Convert Blob → Integer
+    // so CTE tables always have filterable columns.
+    cols.into_iter()
+        .map(|mut c| {
+            if c.data_type == DataType::Blob {
+                c.data_type = DataType::Integer;
+            }
+            c
+        })
+        .collect()
+}
+
+/// Infer the data type of a column by looking it up in schema/CTE tables.
+fn infer_column_type<C: Capabilities>(
+    table_qualifier: Option<&str>,
+    column_name: &str,
+    generator: &SqlGen<C>,
+    cte_tables: &[Table],
+    _schema_names: &[String],
+) -> DataType {
+    let search_tables: Vec<&Table> = if let Some(q) = table_qualifier {
+        generator
+            .schema()
+            .tables
+            .iter()
+            .chain(cte_tables.iter())
+            .filter(|t| t.name == q)
+            .collect()
+    } else {
+        generator
+            .schema()
+            .tables
+            .iter()
+            .chain(cte_tables.iter())
+            .collect()
+    };
+
+    for table in search_tables {
+        if let Some(col) = table.columns.iter().find(|c| c.name == column_name) {
+            return col.data_type;
+        }
+    }
+    DataType::Integer
+}
+
+/// Generate a unique CTE name that doesn't conflict with schema tables or other CTEs.
+fn generate_cte_name(index: usize, schema_names: &[String], cte_tables: &[Table]) -> String {
+    let name = format!("cte_{index}");
+    if schema_names.contains(&name) || cte_tables.iter().any(|t| t.name == name) {
+        format!("cte_{index}_{}", cte_tables.len())
+    } else {
+        name
+    }
+}
+
+/// Choose a materialization hint based on weights.
+fn choose_materialization(
+    ctx: &mut Context,
+    weights: &crate::policy::CteMaterializationWeights,
+) -> CteMaterialization {
+    let items = [
+        (CteMaterialization::Default, weights.default),
+        (CteMaterialization::Materialized, weights.materialized),
+        (
+            CteMaterialization::NotMaterialized,
+            weights.not_materialized,
+        ),
+    ];
+    let weight_vec: Vec<u32> = items.iter().map(|(_, w)| *w).collect();
+    match ctx.weighted_index(&weight_vec) {
+        Some(idx) => items[idx].0,
+        None => CteMaterialization::Default,
+    }
 }
 
 #[trace_gen(Origin::RecursiveCte)]
@@ -1481,5 +1750,177 @@ mod tests {
                 "Expected ORDER BY when LIMIT is present with require_order_by_with_limit=true"
             );
         }
+    }
+
+    #[test]
+    fn test_generate_select_with_cte() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            cte_probability: 1.0,
+            group_by_probability: 0.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut found_cte = false;
+        for seed in 0..50 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full) {
+                let sql = select.to_string();
+                if sql.contains("WITH") && sql.contains("AS") {
+                    found_cte = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_cte, "Should generate SELECT with CTE");
+    }
+
+    #[test]
+    fn test_cte_does_not_recurse() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            cte_probability: 1.0,
+            group_by_probability: 0.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        for seed in 0..50 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full) {
+                if let Some(with) = &select.with_clause {
+                    for cte in &with.ctes {
+                        // Inner CTE query should NOT have its own WITH clause
+                        assert!(
+                            cte.query.with_clause.is_none(),
+                            "CTE inner query should not have a WITH clause (no recursion)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_scalar_subquery_no_cte() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            cte_probability: 1.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        // Scalar mode should never get CTEs
+        for seed in 0..50 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Scalar) {
+                assert!(
+                    select.with_clause.is_none(),
+                    "Scalar subquery should not have CTE"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cte_can_be_used_as_from_source() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            cte_probability: 1.0,
+            group_by_probability: 0.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut found_cte_from = false;
+        for seed in 0..200 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full) {
+                if select.with_clause.is_some() {
+                    if let Some(from) = &select.from {
+                        if from.table.starts_with("cte_") {
+                            found_cte_from = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_cte_from, "CTE table should be usable as FROM source");
+    }
+
+    #[test]
+    fn test_cte_can_be_join_target() {
+        use crate::policy::JoinConfig;
+
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            cte_probability: 1.0,
+            group_by_probability: 0.0,
+            join_config: JoinConfig {
+                join_probability: 1.0,
+                max_joins: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut found_cte_join = false;
+        for seed in 0..200 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(select) = generate_select_impl(&generator, &mut ctx, SelectMode::Full) {
+                if select.with_clause.is_some() {
+                    let sql = select.to_string();
+                    if sql.contains("JOIN cte_") {
+                        found_cte_join = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_cte_join, "CTE table should be usable as JOIN target");
     }
 }
