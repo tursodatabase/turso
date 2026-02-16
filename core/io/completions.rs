@@ -377,6 +377,16 @@ impl Completion {
         }
     }
 
+    /// Returns true if this completion is an explicit yield — a signal to
+    /// return control to the cooperative scheduler so other connections can make
+    /// progress. Unlike real I/O completions that happen to be finished,
+    /// yield completions must not be treated as "ready to continue immediately"
+    /// because the yielding operation is waiting on external state (e.g. a lock
+    /// held by another fiber) that can only change when other fibers are stepped.
+    pub fn is_explicit_yield(&self) -> bool {
+        self.inner.is_none()
+    }
+
     pub fn complete(&self, result: i32) {
         let result = Ok(result);
         self.callback(result);
