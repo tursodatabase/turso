@@ -30,3 +30,10 @@ test limit-one {
 expect {
     1
 }
+
+test limit-in-subquery {
+    SELECT 1 LIMIT (1 IN (SELECT 1));
+}
+expect {
+    1
+}
