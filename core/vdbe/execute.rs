@@ -3735,7 +3735,7 @@ pub fn op_decr_jump_zero(
     }
     match state.registers[*reg].get_value() {
         Value::Numeric(Numeric::Integer(n)) => {
-            let n = n - 1;
+            let n = n.saturating_sub(1);
             state.registers[*reg] = Register::Value(Value::from_i64(n));
             if n == 0 {
                 state.pc = target_pc.as_offset_int();
