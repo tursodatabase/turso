@@ -912,7 +912,7 @@ impl Connection {
     }
 
     /// Close a connection and checkpoint.
-    pub fn close(&self) -> Result<()> {
+    pub fn close(self: &Arc<Self>) -> Result<()> {
         if self.is_closed() {
             return Ok(());
         }
@@ -939,6 +939,25 @@ impl Connection {
         }
 
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1) && !self.db.is_readonly() {
+            // MVCC checkpoint to persist committed-but-uncheckpointed changes
+            if let Some(mv_store) = self.mv_store().as_ref() {
+                if mv_store.has_uncheckpointed_changes() {
+                    let pager = self.pager.load().clone();
+                    let io = pager.io.clone();
+                    let mut ckpt_sm = crate::state_machine::StateMachine::new(
+                        crate::mvcc::database::CheckpointStateMachine::new(
+                            pager,
+                            mv_store.clone(),
+                            self.clone(),
+                            false,
+                            self.get_sync_mode(),
+                        ),
+                    );
+                    if let Err(e) = io.as_ref().block(|| ckpt_sm.step(&())) {
+                        tracing::warn!("MVCC checkpoint on close failed: {e}");
+                    }
+                }
+            }
             self.pager.load().checkpoint_shutdown(
                 self.is_wal_auto_checkpoint_disabled(),
                 self.get_sync_mode(),
