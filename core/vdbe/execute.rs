@@ -6093,8 +6093,7 @@ pub fn op_function(
                                     let column = columns
                                         .iter_mut()
                                         .find(|column| {
-                                            column.col_name.as_str()
-                                                == original_rename_from.as_str()
+                                            normalize_ident(column.col_name.as_str()) == rename_from
                                         })
                                         .expect("column being renamed should be present");
 

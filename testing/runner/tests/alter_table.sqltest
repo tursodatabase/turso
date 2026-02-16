@@ -20,6 +20,16 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+# https://github.com/tursodatabase/turso/issues/5246
+test alter-table-rename-column-case-insensitive {
+    CREATE TABLE t (a INT);
+    ALTER TABLE t RENAME COLUMN A TO b;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE t (b INT)
+}
+
 test alter-table-rename-quoted-column {
     CREATE TABLE t (a INTEGER);
     ALTER TABLE t RENAME a TO "ab cd";
