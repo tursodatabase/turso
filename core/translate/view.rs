@@ -238,7 +238,7 @@ pub fn translate_create_view(
     view_name: &ast::Name,
     resolver: &Resolver,
     select_stmt: &ast::Select,
-    _columns: &[ast::IndexedColumn],
+    columns: &[ast::IndexedColumn],
     _connection: Arc<Connection>,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
@@ -267,8 +267,8 @@ pub fn translate_create_view(
         )));
     }
 
-    // Reconstruct the SQL string
-    let sql = create_view_to_str(&view_name.as_ident(), select_stmt);
+    // Reconstruct the SQL string (including explicit column names if provided)
+    let sql = create_view_to_str(&view_name.as_ident(), columns, select_stmt);
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
@@ -308,8 +308,20 @@ pub fn translate_create_view(
     Ok(program)
 }
 
-fn create_view_to_str(view_name: &str, select_stmt: &ast::Select) -> String {
-    format!("CREATE VIEW {view_name} AS {select_stmt}")
+fn create_view_to_str(
+    view_name: &str,
+    columns: &[ast::IndexedColumn],
+    select_stmt: &ast::Select,
+) -> String {
+    if columns.is_empty() {
+        format!("CREATE VIEW {view_name} AS {select_stmt}")
+    } else {
+        let column_names: Vec<_> = columns.iter().map(|c| c.col_name.as_str()).collect();
+        format!(
+            "CREATE VIEW {view_name}({}) AS {select_stmt}",
+            column_names.join(", ")
+        )
+    }
 }
 
 pub fn translate_drop_view(
