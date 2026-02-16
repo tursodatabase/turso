@@ -1433,6 +1433,11 @@ pub fn op_column(
                         index_cursor_id: deferred.index_cursor_id,
                         table_cursor_id: deferred.table_cursor_id,
                     };
+                } else if state.cursors[*cursor_id].is_none() {
+                    // Cursor was never opened (e.g. OpenAutoindex inside a loop
+                    // that was skipped because the table was empty).
+                    state.registers[*dest] = Register::Value(Value::Null);
+                    break 'outer;
                 } else {
                     state.op_column_state = OpColumnState::GetColumn;
                 }
