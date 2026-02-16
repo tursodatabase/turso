@@ -1686,7 +1686,7 @@ mod tests {
                 commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
             }
 
-            conn.close().unwrap();
+            drop(conn);
             pager
         };
 

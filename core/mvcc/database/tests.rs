@@ -5333,6 +5333,83 @@ fn test_checkpoint_drop_table() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// Reproducer: DROP TABLE ghost data after restart without explicit checkpoint.
+/// Session 1: create + insert + checkpoint. Session 2: drop. Session 3: reopen.
+#[test]
+fn test_close_persists_drop_table() {
+    // Session 1: create table, insert data, checkpoint to DB file
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE todrop(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO todrop VALUES (1, 'data')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.close().unwrap();
+
+    // Session 2: drop table (no explicit checkpoint, rely on close)
+    let conn = db.connect();
+    conn.execute("DROP TABLE todrop").unwrap();
+    conn.close().unwrap();
+
+    // Session 3: reopen — table must be gone
+    db.restart();
+    let conn = db.connect();
+
+    // The table must not exist — CREATE should succeed
+    let create_result = conn.execute("CREATE TABLE todrop(id INTEGER PRIMARY KEY, newval TEXT)");
+    assert!(
+        create_result.is_ok(),
+        "CREATE TABLE should succeed after DROP, but got: {:?}",
+        create_result.unwrap_err()
+    );
+
+    // No ghost data from old table
+    let rows = get_rows(&conn, "SELECT * FROM todrop");
+    assert!(rows.is_empty(), "New table should be empty, got {rows:?}");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Reproducer: DROP INDEX ghost after restart without explicit checkpoint.
+#[test]
+fn test_close_persists_drop_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_data ON t(data)").unwrap();
+    for i in 0..5 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'val_{i}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.close().unwrap();
+
+    // Session 2: drop index only (no explicit checkpoint)
+    let conn = db.connect();
+    conn.execute("DROP INDEX idx_t_data").unwrap();
+    conn.close().unwrap();
+
+    // Session 3: reopen — index must be gone, table+data intact
+    db.restart();
+    let conn = db.connect();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    // Index must be gone — re-create should succeed
+    conn.execute("CREATE INDEX idx_t_data ON t(data)").unwrap();
+
+    // Table and data must still be intact
+    let rows = get_rows(&conn, "SELECT count(*) FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "5");
+}
+
 /// Test that inserting a duplicate primary key fails when the existing row
 /// was committed before this transaction started (and thus is visible).
 #[test]
