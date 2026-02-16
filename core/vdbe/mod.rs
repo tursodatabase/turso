@@ -1213,10 +1213,18 @@ impl Program {
                 Ok(InsnFunctionStepResult::IO(io)) => {
                     // Instruction not complete - waiting for I/O, will resume at same PC
                     io.set_waker(waker);
-                    let finished = io.finished();
                     let is_yield = io.is_explicit_yield();
+                    if is_yield {
+                        // Yield: return control to the cooperative scheduler so
+                        // other connections can make progress (e.g. release a
+                        // contended lock). Don't store in io_completions —
+                        // yields aren't pending I/O, so the instruction will
+                        // simply re-execute on the next step.
+                        return Ok(StepResult::IO);
+                    }
+                    let finished = io.finished();
                     state.io_completions = Some(io);
-                    if !finished || is_yield {
+                    if !finished {
                         return Ok(StepResult::IO);
                     }
                     // just continue the outer loop if IO is finished so db will continue execution immediately
