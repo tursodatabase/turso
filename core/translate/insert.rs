@@ -4,8 +4,8 @@ use crate::{
     sync::Arc,
     translate::{
         emitter::{
-            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
-            prepare_cdc_if_necessary, OperationMode, Resolver,
+            emit_cdc_full_record, emit_cdc_patch_record, emit_cdc_with_autocommit_check,
+            emit_check_constraints, prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
@@ -734,7 +734,7 @@ pub fn translate_insert(
         } else {
             None
         };
-        emit_cdc_insns(
+        emit_cdc_with_autocommit_check(
             &mut program,
             resolver,
             OperationMode::INSERT,
@@ -2951,7 +2951,7 @@ fn emit_replace_delete_conflicting_row(
         } else {
             None
         };
-        emit_cdc_insns(
+        emit_cdc_with_autocommit_check(
             program,
             resolver,
             OperationMode::DELETE,

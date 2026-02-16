@@ -1314,7 +1314,7 @@ fn update_cache_size(
 
 pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
 pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
-pub const TURSO_CDC_CURRENT_VERSION: &str = "v1";
+pub const TURSO_CDC_CURRENT_VERSION: &str = "v2";
 
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;

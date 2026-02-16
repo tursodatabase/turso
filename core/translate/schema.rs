@@ -10,7 +10,8 @@ use crate::schema::{
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+    emit_cdc_full_record, emit_cdc_with_autocommit_check, prepare_cdc_if_necessary, OperationMode,
+    Resolver,
 };
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
@@ -505,7 +506,7 @@ pub fn emit_schema_entry(
         } else {
             None
         };
-        emit_cdc_insns(
+        emit_cdc_with_autocommit_check(
             program,
             resolver,
             OperationMode::INSERT,
@@ -851,7 +852,7 @@ pub fn translate_drop_table(
         } else {
             None
         };
-        emit_cdc_insns(
+        emit_cdc_with_autocommit_check(
             &mut program,
             resolver,
             OperationMode::DELETE,

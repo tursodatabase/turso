@@ -23,7 +23,8 @@ use crate::{
     schema::{Index, Schema, Table},
     translate::{
         emitter::{
-            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, OperationMode, Resolver,
+            emit_cdc_full_record, emit_cdc_patch_record, emit_cdc_with_autocommit_check,
+            OperationMode, Resolver,
         },
         expr::{
             emit_returning_results, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
@@ -981,7 +982,7 @@ pub fn emit_upsert(
             } else {
                 None
             };
-            emit_cdc_insns(
+            emit_cdc_with_autocommit_check(
                 program,
                 resolver,
                 OperationMode::DELETE,
@@ -1001,7 +1002,7 @@ pub fn emit_upsert(
             } else {
                 None
             };
-            emit_cdc_insns(
+            emit_cdc_with_autocommit_check(
                 program,
                 resolver,
                 OperationMode::INSERT,
@@ -1034,7 +1035,7 @@ pub fn emit_upsert(
             } else {
                 None
             };
-            emit_cdc_insns(
+            emit_cdc_with_autocommit_check(
                 program,
                 resolver,
                 OperationMode::UPDATE(UpdateRowSource::Normal),

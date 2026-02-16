@@ -2024,11 +2024,12 @@ pub fn halt(
         let result = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
             .map(Into::into);
-        // Apply deferred CDC state after successful commit
+        // Apply deferred CDC state and reset CDC txn ID after successful commit
         if matches!(result, Ok(InsnFunctionStepResult::Done)) {
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
+            program.connection.set_cdc_transaction_id(-1);
         }
         result
     } else {
@@ -2493,6 +2494,7 @@ pub fn op_auto_commit(
             }
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
+            conn.set_cdc_transaction_id(-1);
         } else {
             // BEGIN (true->false) or COMMIT (false->true)
             if is_commit_req {
@@ -2544,6 +2546,15 @@ pub fn op_auto_commit(
         && (is_rollback_req || is_commit_req)
     {
         conn.clear_deferred_foreign_key_violations();
+    }
+
+    // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
+    if matches!(
+        res,
+        Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
+    ) && (is_rollback_req || is_commit_req)
+    {
+        conn.set_cdc_transaction_id(-1);
     }
 
     res
@@ -8387,9 +8398,16 @@ pub fn op_init_cdc_version(
     // Step 1: Create CDC table if needed
     {
         conn.start_nested();
-        let mut stmt = conn.prepare(format!(
-            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
-        ))?;
+        let create_sql = if version == "v2" {
+            format!(
+                "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+            )
+        } else {
+            format!(
+                "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+            )
+        };
+        let mut stmt = conn.prepare(create_sql)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
