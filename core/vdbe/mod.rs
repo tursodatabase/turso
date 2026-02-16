@@ -1211,14 +1211,13 @@ impl Program {
                     return Ok(StepResult::Done);
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
-                    // Instruction not complete - waiting for I/O, will resume at same PC
+                    // Instruction not complete - waiting for I/O, will resume at same PC.
+                    // Always yield to the caller so other fibers/connections get a chance
+                    // to make progress (prevents spin-loops when yield completions are
+                    // used for lock contention, e.g. pager_commit_lock in MVCC commits).
                     io.set_waker(waker);
-                    let finished = io.finished();
                     state.io_completions = Some(io);
-                    if !finished {
-                        return Ok(StepResult::IO);
-                    }
-                    // just continue the outer loop if IO is finished so db will continue execution immediately
+                    return Ok(StepResult::IO);
                 }
                 Ok(InsnFunctionStepResult::Row) => {
                     // Instruction completed (ResultRow already incremented PC)
