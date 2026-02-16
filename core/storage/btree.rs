@@ -2354,6 +2354,15 @@ impl BTreeCursor {
                         panic!("expected write state");
                     };
                     if overflows || underflows {
+                        eprintln!("DEBUG overwrite->Balancing: page_id={}, overflows={}, underflows={}, stack_depth={}, root_page={}",
+                            page.get().id, overflows, underflows, self.stack.current(), self.root_page);
+                        for i in 0..=self.stack.current() {
+                            if let Some(pg) = self.stack.get_page_at_level(i) {
+                                let c = pg.get_contents();
+                                eprintln!("  DEBUG stack[{}]: page_id={}, page_type={:?}, cells={}, overflow={}",
+                                    i, pg.get().id, c.page_type(), c.cell_count(), c.overflow_cells.len());
+                            }
+                        }
                         *write_state = WriteState::Balancing;
                         assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "There should be no balancing operation in progress when overwrite state is {:?}, got: {:?}", self.state, self.balance_state.sub_state);
                         // If we balance, we must save the cursor position and seek to it later.
@@ -2457,6 +2466,27 @@ impl BTreeCursor {
                     let cur_page = self.stack.top_ref();
                     let cur_page_contents = cur_page.get_contents();
 
+                    eprintln!("DEBUG balance Decide: stack_depth={}, cur_page_id={}, cur_page_type={:?}, overflow_cells={}, root_page={}",
+                        self.stack.current(), cur_page.get().id, cur_page_contents.page_type(), cur_page_contents.overflow_cells.len(), self.root_page);
+                    for i in 0..=self.stack.current() {
+                        if let Some(pg) = self.stack.get_page_at_level(i) {
+                            let c = pg.get_contents();
+                            eprintln!("  DEBUG stack[{}]: page_id={}, page_type={:?}, cells={}, overflow={}, dirty={}, ptr={:p}",
+                                i, pg.get().id, c.page_type(), c.cell_count(), c.overflow_cells.len(), pg.is_dirty(), &**pg as *const _);
+                        }
+                    }
+                    // Also check what's in the cache for comparison
+                    if let Ok((cached_root, _)) = self.read_page(self.root_page) {
+                        let c = cached_root.get_contents();
+                        eprintln!(
+                            "  DEBUG cached root: page_id={}, page_type={:?}, cells={}, ptr={:p}",
+                            cached_root.get().id,
+                            c.page_type(),
+                            c.cell_count(),
+                            &*cached_root as *const _
+                        );
+                    }
+
                     // Check if we can use the balance_quick() fast path.
                     let mut do_quick = false;
                     if cur_page_contents.page_type()? == PageType::TableLeaf
@@ -2472,8 +2502,8 @@ impl BTreeCursor {
                                 .expect("parent page should be on the stack");
                             let parent_contents = parent.get_contents();
                             if parent.get().id != 1
-                                && parent_contents.rightmost_pointer()?.unwrap()
-                                    == cur_page.get().id as u32
+                                && parent_contents.rightmost_pointer()?
+                                    == Some(cur_page.get().id as u32)
                             {
                                 // If all of the following are true, we can use the balance_quick() fast path:
                                 // - The page is a table leaf page
@@ -4423,6 +4453,12 @@ impl BTreeCursor {
 
         root_contents.write_fragmented_bytes_count(0);
         root_contents.overflow_cells.clear();
+        eprintln!(
+            "DEBUG balance_root: root_id={}, new_type={:?}, child_id={}",
+            root.get().id,
+            root.get_contents().page_type(),
+            child.get().id
+        );
         self.root_page = root.get().id as i64;
         self.stack.clear();
         self.stack.push(root);
