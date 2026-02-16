@@ -788,7 +788,7 @@ pub fn translate_expr(
                             lhs_column_regs_start + i,
                             resolver,
                         )?;
-                        if !lhs_column.is_nonnull(referenced_tables.as_ref().unwrap()) {
+                        if !referenced_tables.is_some_and(|tables| lhs_column.is_nonnull(tables)) {
                             // If LHS is NULL, we need to check if ephemeral is empty first.
                             // - If empty: IN returns FALSE, NOT IN returns TRUE
                             // - If not empty: result is NULL (unknown)
