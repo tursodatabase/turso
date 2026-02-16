@@ -1270,14 +1270,17 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     // A SELECT during normal processing may have speculatively read
                     // from a Preparing transaction (Hekaton §2.7), incrementing our
                     // CommitDepCounter. We must wait for those to resolve.
-                    if tx.abort_now.load(Ordering::Acquire) {
-                        return Err(LimboError::CommitDependencyAborted);
-                    }
                     if tx.commit_dep_counter.load(Ordering::Acquire) > 0 {
                         // Unresolved dependencies — skip validation (no writes)
                         // and go straight to WaitForDependencies.
                         self.state = CommitState::WaitForDependencies { end_ts };
                         return Ok(TransitionResult::Continue);
+                    }
+                    // Check abort_now AFTER counter: rollback_tx stores abort_now
+                    // (Release) before fetch_sub (AcqRel). Once counter == 0, all
+                    // decrements have completed and the abort_now flag is visible.
+                    if tx.abort_now.load(Ordering::Acquire) {
+                        return Err(LimboError::CommitDependencyAborted);
                     }
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
@@ -1328,12 +1331,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .ok_or(LimboError::TxTerminated)?;
                 let tx = tx.value();
 
-                // Hekaton Section 3.2: "T can proceed to the postprocessing phase
-                // if either its CommitDepCounter is zero or its AbortNow flag is set."
-                if tx.abort_now.load(Ordering::Acquire) {
-                    return Err(LimboError::CommitDependencyAborted);
-                }
-
                 // Hekaton Section 2.7: "A transaction cannot commit until this
                 // counter is zero." Deadlock impossible: edges always go from higher
                 // end_ts to lower end_ts, so the wait graph is acyclic.
@@ -1341,6 +1338,32 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Io(IOCompletions::Single(
                         Completion::new_yield(),
                     )));
+                }
+
+                // Check abort_now AFTER counter reaches 0. Memory ordering:
+                // rollback_tx does abort_now.store(true, Release) BEFORE
+                // counter.fetch_sub(1, AcqRel). Our Acquire load of counter==0
+                // synchronizes-with that fetch_sub, making the abort_now store
+                // visible. Checking in the opposite order (abort_now first) has a
+                // TOCTOU race: an aborting dep can set abort_now and decrement
+                // between our two reads, letting us see (false, 0) and commit.
+                if tx.abort_now.load(Ordering::Acquire) {
+                    return Err(LimboError::CommitDependencyAborted);
+                }
+
+                // Read-only fast path: if write_set is empty, commit without
+                // going through CommitEnd. CommitEnd updates last_committed_tx_ts
+                // which would make a read-only transaction look like a write,
+                // causing spurious Busy errors from acquire_exclusive_tx.
+                if self.write_set.is_empty() {
+                    tx.state.store(TransactionState::Committed(*end_ts));
+                    if mvcc_store.is_exclusive_tx(&self.tx_id) {
+                        mvcc_store.release_exclusive_tx(&self.tx_id);
+                        self.commit_coordinator.pager_commit_lock.unlock();
+                    }
+                    mvcc_store.remove_tx(self.tx_id);
+                    self.finalize(mvcc_store)?;
+                    return Ok(TransitionResult::Done(()));
                 }
 
                 // All dependencies resolved — proceed with timestamp updates
@@ -3188,9 +3211,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
-        // FIXME: verify that we can already remove the transaction here!
-        // Maybe it's fine for snapshot isolation, but too early for serializable?
-        self.remove_tx(tx_id);
+        // Do NOT remove the transaction from `txs` here. register_commit_dependency
+        // treats txs.get() == None as "already committed," so removing an aborted tx
+        // would let a speculative reader skip the abort_now flag and commit after
+        // reading data from a rolled-back transaction. The tx stays with
+        // state=Terminated so the Aborted/Terminated match arm fires correctly.
+        // TODO: GC terminated transactions once no active tx can reference them.
+        //
+        // We still must release the blocking_checkpoint_lock so checkpoints aren't
+        // permanently blocked by the aborted transaction.
+        self.blocking_checkpoint_lock.unlock();
     }
 
     fn rollback_rowid(&self, tx_id: u64, rowid: &RowID) {
@@ -4717,11 +4747,16 @@ fn register_commit_dependency(
     let mut dep_set = depended_on.commit_dep_set.lock();
     match depended_on.state.load() {
         TransactionState::Preparing(_) | TransactionState::Active => {
-            dep_set.push(dependent_tx.tx_id);
-            drop(dep_set);
+            // Increment counter BEFORE pushing to dep_set and BEFORE dropping
+            // the lock. This prevents underflow: if we pushed first and
+            // released the lock, the depended-on tx could drain the dep_set
+            // and call fetch_sub before we increment, wrapping the counter
+            // from 0 to u64::MAX.
             dependent_tx
                 .commit_dep_counter
                 .fetch_add(1, Ordering::AcqRel);
+            dep_set.push(dependent_tx.tx_id);
+            drop(dep_set);
             tracing::trace!(
                 "register_commit_dependency: tx {} depends on tx {}",
                 dependent_tx.tx_id,

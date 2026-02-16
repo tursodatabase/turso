@@ -3525,6 +3525,268 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
     );
 }
 
+/// Test that register_commit_dependency increments counter before pushing to
+/// dep_set, preventing underflow. If counter is incremented after push+unlock,
+/// a concurrent drain could fetch_sub(1) on a zero counter, wrapping to MAX.
+#[test]
+fn test_commit_dependency_counter_no_underflow() {
+    let txs: SkipMap<TxID, Transaction> =
+        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let reader = new_tx(2, 10, TransactionState::Active);
+
+    // Register dependency: counter should go 0 → 1
+    register_commit_dependency(&txs, &reader, 1);
+    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 1);
+
+    // Simulate drain (as in CommitEnd): fetch_sub should go 1 → 0, not wrap
+    reader.commit_dep_counter.fetch_sub(1, Ordering::AcqRel);
+    assert_eq!(
+        reader.commit_dep_counter.load(Ordering::Acquire),
+        0,
+        "counter should be exactly 0, not u64::MAX (underflow)"
+    );
+}
+
+/// Test that registering a dependency on a Terminated (aborted+removed from map)
+/// transaction correctly sets AbortNow. Before the fix, rollback_tx removed the
+/// tx from txs, so register_commit_dependency saw None and assumed "committed."
+#[test]
+fn test_commit_dependency_terminated_tx_sets_abort() {
+    let txs: SkipMap<TxID, Transaction> =
+        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Terminated))]);
+
+    let reader = new_tx(2, 10, TransactionState::Active);
+    register_commit_dependency(&txs, &reader, 1);
+
+    // Terminated means the tx aborted — must set abort_now
+    assert!(
+        reader.abort_now.load(Ordering::Acquire),
+        "dependency on Terminated tx should set abort_now"
+    );
+    assert_eq!(
+        reader.commit_dep_counter.load(Ordering::Acquire),
+        0,
+        "no counter increment for aborted/terminated dependency"
+    );
+}
+
+/// Test that when tx is NOT in the map (removed), register_commit_dependency
+/// treats it as committed (no abort_now, no counter increment). This is correct
+/// only for committed transactions. Aborted transactions should NOT be removed
+/// from the map (Issue #3 fix ensures this).
+#[test]
+fn test_commit_dependency_missing_tx_assumes_committed() {
+    let txs: SkipMap<TxID, Transaction> = SkipMap::new();
+
+    let reader = new_tx(2, 10, TransactionState::Active);
+    register_commit_dependency(&txs, &reader, 99);
+
+    assert!(
+        !reader.abort_now.load(Ordering::Acquire),
+        "missing tx (committed+removed) should not set abort_now"
+    );
+    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 0);
+}
+
+/// Test that read-only transactions with resolved dependencies do NOT advance
+/// last_committed_tx_ts. A read-only tx going through WaitForDependencies →
+/// CommitEnd would update last_committed_tx_ts, causing spurious Busy errors
+/// from acquire_exclusive_tx.
+#[test]
+fn test_commit_dep_readonly_does_not_advance_timestamp() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let mvcc_store = db.get_mvcc_store();
+    let ts_before = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
+
+    // Writer: UPDATE then set to Preparing
+    let writer_conn = db.connect();
+    writer_conn.execute("BEGIN CONCURRENT").unwrap();
+    writer_conn
+        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
+        .unwrap();
+    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
+
+    let end_ts = mvcc_store.clock.get_timestamp();
+    mvcc_store
+        .txs
+        .get(&writer_tx_id)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Preparing(end_ts));
+
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+
+    let db_arc = db.get_db();
+    let mvcc_clone = mvcc_store.clone();
+    let reader_handle = std::thread::spawn(move || {
+        let reader_conn = db_arc.connect().unwrap();
+        reader_conn.execute("BEGIN CONCURRENT").unwrap();
+
+        // Read-only: SELECT only → speculative read registers dependency
+        let mut stmt = reader_conn
+            .prepare("SELECT value FROM t WHERE id = 1")
+            .unwrap();
+        let _rows = stmt.run_collect_rows().unwrap();
+
+        signal_tx.send(()).unwrap();
+
+        // COMMIT: read-only with dependency → WaitForDependencies
+        let commit_result = reader_conn.execute("COMMIT");
+        let _ = reader_conn.close();
+        commit_result
+    });
+
+    signal_rx.recv().unwrap();
+
+    // Complete writer's commit manually (resolve dependency)
+    {
+        let writer_tx = mvcc_store.txs.get(&writer_tx_id).unwrap();
+        let writer_tx = writer_tx.value();
+        for entry in mvcc_store.rows.iter() {
+            let mut rvs = entry.value().write();
+            for rv in rvs.iter_mut() {
+                if rv.begin == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                }
+                if rv.end == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                }
+            }
+        }
+        writer_tx.state.store(TransactionState::Committed(end_ts));
+        for dep_tx_id in writer_tx.commit_dep_set.lock().drain(..) {
+            if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
+                dep_tx_entry
+                    .value()
+                    .commit_dep_counter
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    let commit_result = reader_handle.join().unwrap();
+    assert!(
+        commit_result.is_ok(),
+        "read-only tx with resolved dependency should commit: {commit_result:?}",
+    );
+
+    let ts_after = mvcc_clone.last_committed_tx_ts.load(Ordering::Acquire);
+    assert_eq!(
+        ts_before, ts_after,
+        "read-only tx should NOT advance last_committed_tx_ts (was {ts_before}, now {ts_after})"
+    );
+}
+
+/// Test that a new transaction can still acquire the exclusive lock after a
+/// read-only dependent tx commits. Before the fix, the read-only tx would
+/// advance last_committed_tx_ts via CommitEnd, making acquire_exclusive_tx
+/// return Busy for transactions that started before the read.
+#[test]
+fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let mvcc_store = db.get_mvcc_store();
+
+    // Writer: UPDATE then set to Preparing
+    let writer_conn = db.connect();
+    writer_conn.execute("BEGIN CONCURRENT").unwrap();
+    writer_conn
+        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
+        .unwrap();
+    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
+
+    let end_ts = mvcc_store.clock.get_timestamp();
+    mvcc_store
+        .txs
+        .get(&writer_tx_id)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Preparing(end_ts));
+
+    // Start a non-CONCURRENT tx that will try to get exclusive lock later.
+    // Its begin_ts is assigned now, before the read-only tx commits.
+    let exclusive_conn = db.connect();
+    exclusive_conn.execute("BEGIN CONCURRENT").unwrap();
+    let exclusive_tx_id = exclusive_conn.get_mv_tx_id().unwrap();
+
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+
+    let db_arc = db.get_db();
+    let reader_handle = std::thread::spawn(move || {
+        let reader_conn = db_arc.connect().unwrap();
+        reader_conn.execute("BEGIN CONCURRENT").unwrap();
+
+        let mut stmt = reader_conn
+            .prepare("SELECT value FROM t WHERE id = 1")
+            .unwrap();
+        let _rows = stmt.run_collect_rows().unwrap();
+
+        signal_tx.send(()).unwrap();
+
+        let commit_result = reader_conn.execute("COMMIT");
+        let _ = reader_conn.close();
+        commit_result
+    });
+
+    signal_rx.recv().unwrap();
+
+    // Resolve the writer's commit (unblocks reader's WaitForDependencies)
+    {
+        let writer_tx = mvcc_store.txs.get(&writer_tx_id).unwrap();
+        let writer_tx = writer_tx.value();
+        for entry in mvcc_store.rows.iter() {
+            let mut rvs = entry.value().write();
+            for rv in rvs.iter_mut() {
+                if rv.begin == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                }
+                if rv.end == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                }
+            }
+        }
+        writer_tx.state.store(TransactionState::Committed(end_ts));
+        for dep_tx_id in writer_tx.commit_dep_set.lock().drain(..) {
+            if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
+                dep_tx_entry
+                    .value()
+                    .commit_dep_counter
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    let commit_result = reader_handle.join().unwrap();
+    assert!(commit_result.is_ok());
+
+    // Now try to acquire exclusive lock for the tx that started before the
+    // read-only dependent committed. Should succeed because the read-only tx
+    // did not advance last_committed_tx_ts.
+    let acquire_result = mvcc_store.acquire_exclusive_tx(&exclusive_tx_id);
+    assert!(
+        acquire_result.is_ok(),
+        "acquire_exclusive_tx should not return Busy after a read-only dependent committed: {acquire_result:?}",
+    );
+    mvcc_store.release_exclusive_tx(&exclusive_tx_id);
+}
+
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
