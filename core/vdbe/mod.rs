@@ -398,6 +398,9 @@ pub struct ProgramState {
     /// Pending CDC info to apply after the program completes successfully.
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
+    ///
+    /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
+    /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
 }
 
