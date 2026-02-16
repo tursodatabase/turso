@@ -2,6 +2,7 @@
 name = "turso-dbhash"
 version.workspace = true
 edition = "2021"
+license.workspace = true
 description = "Compute SHA1 hash of SQLite database content"
 
 [[bin]]
