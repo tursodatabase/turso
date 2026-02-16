@@ -52,6 +52,7 @@ impl VirtualTable {
         Arc::new(dbpage_vtab)
     }
 
+    #[cfg(feature = "cli_only")]
     fn btree_dump_virtual_table() -> Arc<VirtualTable> {
         let btree_dump_table = crate::btree_dump::BtreeDumpTable::new();
         let vtab = VirtualTable {
@@ -87,6 +88,7 @@ impl VirtualTable {
         #[cfg(feature = "cli_only")]
         vtables.push(Self::dbpage_virtual_table());
 
+        #[cfg(feature = "cli_only")]
         vtables.push(Self::btree_dump_virtual_table());
 
         vtables
