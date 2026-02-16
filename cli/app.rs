@@ -520,10 +520,12 @@ impl Limbo {
 
         let conn = self.conn.clone();
         let runner = conn.query_runner(input.as_bytes());
+        let had_error_before = self.had_query_error;
         for output in runner {
             if self
                 .print_query_result(input, output, stats.as_mut())
                 .is_err()
+                || self.had_query_error != had_error_before
             {
                 self.had_query_error = true;
                 break;
