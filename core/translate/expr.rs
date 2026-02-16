@@ -4917,6 +4917,14 @@ pub fn process_returning_clause(
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
 
+                let vec_size = expr_vector_size(expr)?;
+                if vec_size != 1 {
+                    crate::bail_parse_error!(
+                        "sub-select returns {} columns - expected 1",
+                        vec_size
+                    );
+                }
+
                 result_columns.push(ResultSetColumn {
                     expr: expr.as_ref().clone(),
                     alias: alias.as_ref().map(alias_to_string),
