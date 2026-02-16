@@ -137,6 +137,12 @@ debug = false
 codegen-units = 16
 lto = false
 
+[profile.fuzzing]
+inherits = "dev"
+opt-level = 3
+debug = "line-tables-only"
+panic = "abort"
+
 [profile.antithesis]
 inherits = "release"
 debug = true
