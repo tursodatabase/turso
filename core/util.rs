@@ -837,7 +837,10 @@ pub fn columns_from_create_table_body(
         ));
     };
 
-    Ok(columns.iter().map(Into::into).collect())
+    columns
+        .iter()
+        .map(Column::try_from)
+        .collect::<crate::Result<Vec<Column>>>()
 }
 
 #[derive(Debug, Default, PartialEq)]

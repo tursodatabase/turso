@@ -338,3 +338,11 @@ expect {
     1|3.14
 }
 
+test alter-add-column-invalid-collation {
+    CREATE TABLE t(c1 INTEGER);
+    ALTER TABLE t ADD COLUMN c2 INTEGER COLLATE compile_options;
+}
+expect error {
+    no such collation sequence: compile_options
+}
+

@@ -2732,8 +2732,10 @@ impl Column {
 }
 
 // TODO: This might replace some of util::columns_from_create_table_body
-impl From<&ColumnDefinition> for Column {
-    fn from(value: &ColumnDefinition) -> Self {
+impl TryFrom<&ColumnDefinition> for Column {
+    type Error = crate::LimboError;
+
+    fn try_from(value: &ColumnDefinition) -> crate::Result<Self> {
         let name = value.col_name.as_str();
 
         let mut default = None;
@@ -2754,10 +2756,7 @@ impl From<&ColumnDefinition> for Column {
                     );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    collation.replace(
-                        CollationSeq::new(collation_name.as_str())
-                            .expect("collation should have been set correctly in create table"),
-                    );
+                    collation.replace(CollationSeq::new(collation_name.as_str())?);
                 }
                 ast::ColumnConstraint::Generated { expr, .. } => {
                     generated = Some(expr.clone());
@@ -2779,7 +2778,7 @@ impl From<&ColumnDefinition> for Column {
 
         let hidden = ty_str.contains("HIDDEN");
 
-        Column::new(
+        Ok(Column::new(
             Some(normalize_ident(name)),
             ty_str,
             default,
@@ -2793,7 +2792,7 @@ impl From<&ColumnDefinition> for Column {
                 unique,
                 hidden,
             },
-        )
+        ))
     }
 }
 

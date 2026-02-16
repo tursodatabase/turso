@@ -529,7 +529,7 @@ pub fn translate_alter_table(
                 ));
             }
             let constraints = col_def.constraints.clone();
-            let column = Column::from(&col_def);
+            let column = Column::try_from(&col_def)?;
 
             // SQLite is very strict about what constitutes a "constant" default for
             // ALTER TABLE ADD COLUMN. It only allows literals and signed literals,
