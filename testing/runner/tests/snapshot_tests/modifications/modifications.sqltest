@@ -179,3 +179,25 @@ snapshot insert-or-replace-multi-unique {
     INSERT OR REPLACE INTO items (id, sku, barcode, name)
     VALUES (1, 'SKU-001', 'BC-001', 'Widget');
 }
+
+# INSERT OR REPLACE with multiple NOT NULL DEFAULT columns
+# Verify each column gets its own independent IsNull/default block
+# so that non-null user values are never overwritten by defaults.
+
+setup notnull_defaults {
+    CREATE TABLE t_defaults (
+        id INTEGER PRIMARY KEY,
+        val INTEGER NOT NULL DEFAULT 42,
+        name TEXT NOT NULL DEFAULT 'unnamed'
+    );
+}
+
+@setup notnull_defaults
+snapshot insert-or-replace-multi-notnull-default {
+    INSERT OR REPLACE INTO t_defaults VALUES (1, 100, 'hello');
+}
+
+@setup notnull_defaults
+snapshot insert-or-replace-multi-notnull-default-partial {
+    INSERT OR REPLACE INTO t_defaults(id, val) VALUES (1, 100);
+}

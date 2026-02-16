@@ -572,7 +572,7 @@ pub fn translate_insert(
         &mut preflight_ctx,
     )?;
 
-    let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
+    emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
 
     // Create and insert the record
     let affinity_str = insertion
@@ -581,9 +581,6 @@ pub fn translate_insert(
         .map(|col_mapping| col_mapping.column.affinity().aff_mask())
         .collect::<String>();
 
-    if let Some(lbl) = notnull_resume_label {
-        program.preassign_label_to_next_insn(lbl);
-    }
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u16(insertion.first_col_register()),
         count: to_u16(insertion.col_mappings.len()),
@@ -1168,10 +1165,9 @@ fn emit_notnulls(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     resolver: &Resolver,
-) -> Result<Option<BranchOffset>> {
+) -> Result<()> {
     let on_replace = matches!(ctx.on_conflict, ResolveType::Replace);
     let on_ignore = matches!(ctx.on_conflict, ResolveType::Ignore);
-    let mut pending_resume_label = None;
     for column_mapping in insertion
         .col_mappings
         .iter()
@@ -1186,25 +1182,12 @@ fn emit_notnulls(
         // or if the column has no default value, then the ABORT algorithm is used
         if on_replace {
             if let Some(default_expr) = column_mapping.column.default.as_ref() {
-                let default_label = {
-                    if let Some(lbl) = pending_resume_label {
-                        lbl
-                    } else {
-                        program.allocate_label()
-                    }
-                };
-                let resume_label = program.allocate_label();
+                let skip_label = program.allocate_label();
 
-                program.emit_insn(Insn::IsNull {
+                program.emit_insn(Insn::NotNull {
                     reg: column_mapping.register,
-                    target_pc: default_label,
+                    target_pc: skip_label,
                 });
-
-                program.emit_insn(Insn::Goto {
-                    target_pc: resume_label,
-                });
-
-                program.resolve_label(default_label, program.offset());
 
                 // Evaluate default expression into the column register.
                 translate_expr_no_constant_opt(
@@ -1216,10 +1199,7 @@ fn emit_notnulls(
                     NoConstantOptReason::RegisterReuse,
                 )?;
 
-                program.emit_insn(Insn::Goto {
-                    target_pc: resume_label,
-                });
-                pending_resume_label = Some(resume_label);
+                program.preassign_label_to_next_insn(skip_label);
             }
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
         }
@@ -1259,7 +1239,7 @@ fn emit_notnulls(
             });
         }
     }
-    Ok(pending_resume_label)
+    Ok(())
 }
 
 struct BoundInsertResult {
