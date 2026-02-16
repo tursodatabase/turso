@@ -7209,6 +7209,9 @@ fn free_cell_range(
 
     let mut size = len;
     let mut end = offset + len;
+    if end > usable_space {
+        return_corrupt!("free_cell_range: freed range extends beyond usable space: offset={offset} len={len} end={end} usable_space={usable_space}");
+    }
     let cur_content_area = page.cell_content_area() as usize;
     let first_block = page.first_freeblock() as usize;
     if first_block == 0 {
@@ -7260,10 +7263,6 @@ fn free_cell_range(
     }
     let mut removed_fragmentation = 0;
     const SINGLE_FRAGMENT_SIZE_MAX: usize = CELL_SIZE_MIN - 1;
-
-    if end > usable_space {
-        return_corrupt!("free_cell_range: freed range extends beyond usable space: offset={offset} len={len} end={end} usable_space={usable_space}");
-    }
 
     // If the freed range extends into the next freeblock, we will merge the freed range into it.
     // If there is a 1-3 byte gap between the freed range and the next freeblock, we are effectively
