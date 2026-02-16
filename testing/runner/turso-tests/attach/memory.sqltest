@@ -59,3 +59,10 @@ expect {
 expect @js {
     1|hat|79|1
 }
+
+test database-list-with-arg {
+    PRAGMA database_list('t1');
+}
+expect {
+    0|main|
+}
