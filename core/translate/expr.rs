@@ -5058,6 +5058,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             if evs_left != evs_right {
                 crate::bail_parse_error!("all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})");
             }
+            if evs_left != 1 {
+                crate::bail_parse_error!("sub-select returns {} columns - expected 1", evs_left);
+            }
             1
         }
         Expr::Register(_) => 1,
