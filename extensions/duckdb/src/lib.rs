@@ -1,4 +1,4 @@
-// Copyright 2023-2025 the Limbo authors. All rights reserved. MIT license.
+// Copyright 2023-2026 the Limbo authors. All rights reserved. MIT license.
 
 use std::sync::Arc;
 use turso_ext::*;
@@ -296,15 +296,26 @@ fn fetch_duckdb_rows(
     (rows_out, row_ids)
 }
 
+/// Escape a SQL identifier by double-quoting and doubling internal double-quotes.
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 /// Map a ConstraintOp repr(u8) byte to a SQL operator string.
 fn op_byte_to_sql(op: u8) -> Option<&'static str> {
+    const EQ: u8 = ConstraintOp::Eq as u8;
+    const LT: u8 = ConstraintOp::Lt as u8;
+    const LE: u8 = ConstraintOp::Le as u8;
+    const GT: u8 = ConstraintOp::Gt as u8;
+    const GE: u8 = ConstraintOp::Ge as u8;
+    const NE: u8 = ConstraintOp::Ne as u8;
     match op {
-        2 => Some("="),
-        4 => Some("<"),
-        8 => Some("<="),
-        16 => Some(">"),
-        32 => Some(">="),
-        68 => Some("!="),
+        EQ => Some("="),
+        LT => Some("<"),
+        LE => Some("<="),
+        GT => Some(">"),
+        GE => Some(">="),
+        NE => Some("!="),
         _ => None,
     }
 }
@@ -439,7 +450,7 @@ impl VTable for DuckDbTable {
         if self.config.mode != DuckDbMode::Table {
             return Err("INSERT not supported in query mode".into());
         }
-        let table_name = self.config.table.as_ref().unwrap();
+        let table_name = quote_ident(self.config.table.as_ref().unwrap());
         let placeholders = (0..args.len()).map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!("INSERT INTO {table_name} VALUES ({placeholders})");
         let owned_params: Vec<OwnedParam> = args.iter().map(turso_value_to_param).collect();
@@ -459,7 +470,7 @@ impl VTable for DuckDbTable {
         if self.config.mode != DuckDbMode::Table {
             return Err("DELETE not supported in query mode".into());
         }
-        let table_name = self.config.table.as_ref().unwrap();
+        let table_name = quote_ident(self.config.table.as_ref().unwrap());
         let sql = format!("DELETE FROM {table_name} WHERE rowid = ?");
         self.conn
             .execute(&sql, [rowid])
@@ -471,17 +482,15 @@ impl VTable for DuckDbTable {
         if self.config.mode != DuckDbMode::Table {
             return Err("UPDATE not supported in query mode".into());
         }
-        let table_name = self.config.table.as_ref().unwrap();
+        let table_name = quote_ident(self.config.table.as_ref().unwrap());
         let sets: Vec<String> = self
             .config
             .column_defs
             .iter()
-            .enumerate()
-            .map(|(i, col)| format!("{} = ?{}", col.name, i + 1))
+            .map(|col| format!("{} = ?", quote_ident(&col.name)))
             .collect();
-        let rowid_param_idx = args.len() + 1;
         let sql = format!(
-            "UPDATE {table_name} SET {} WHERE rowid = ?{rowid_param_idx}",
+            "UPDATE {table_name} SET {} WHERE rowid = ?",
             sets.join(", "),
         );
         let mut owned_params: Vec<OwnedParam> = args.iter().map(turso_value_to_param).collect();
@@ -531,27 +540,26 @@ impl VTabCursor for DuckDbCursor {
                     .config
                     .column_defs
                     .iter()
-                    .map(|c| c.name.as_str())
+                    .map(|c| quote_ident(&c.name))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let table = self.config.table.as_ref().unwrap();
+                let table = quote_ident(self.config.table.as_ref().unwrap());
                 let mut sql = format!("SELECT rowid, {cols} FROM {table}");
 
                 // Decode idx_str: "0:2,3:16" -> [(col0, Eq), (col3, Gt)]
                 if let Some((idx_str, _)) = idx_info {
                     let clauses: Vec<String> = idx_str
                         .split(',')
-                        .enumerate()
-                        .filter_map(|(i, part)| {
+                        .filter_map(|part| {
                             let parts: Vec<&str> = part.split(':').collect();
                             if parts.len() != 2 {
                                 return None;
                             }
                             let col_idx: usize = parts[0].parse().ok()?;
                             let op: u8 = parts[1].parse().ok()?;
-                            let col_name = &self.config.column_defs[col_idx].name;
+                            let col_name = quote_ident(&self.config.column_defs[col_idx].name);
                             let op_str = op_byte_to_sql(op)?;
-                            Some(format!("{col_name} {op_str} ?{}", i + 1))
+                            Some(format!("{col_name} {op_str} ?"))
                         })
                         .collect();
                     if !clauses.is_empty() {
@@ -1088,5 +1096,22 @@ mod tests {
     fn test_empty_column_defs() {
         let defs = parse_column_defs("").unwrap();
         assert!(defs.is_empty());
+    }
+
+    // ---- quote_ident tests ----
+
+    #[test]
+    fn test_quote_ident_simple() {
+        assert_eq!(quote_ident("sales"), "\"sales\"");
+    }
+
+    #[test]
+    fn test_quote_ident_with_double_quotes() {
+        assert_eq!(quote_ident("my\"table"), "\"my\"\"table\"");
+    }
+
+    #[test]
+    fn test_quote_ident_with_spaces() {
+        assert_eq!(quote_ident("my table"), "\"my table\"");
     }
 }

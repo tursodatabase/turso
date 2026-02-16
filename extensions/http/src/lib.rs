@@ -1,4 +1,4 @@
-// Copyright 2023-2025 the Limbo authors. All rights reserved. MIT license.
+// Copyright 2023-2026 the Limbo authors. All rights reserved. MIT license.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -346,6 +346,28 @@ fn parse_mcp_response(
 }
 
 // ---------------------------------------------------------------------------
+// URL encoding
+// ---------------------------------------------------------------------------
+
+/// Minimal percent-encoding for query parameter keys and values.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(b"0123456789ABCDEF"[(b >> 4) as usize]));
+                out.push(char::from(b"0123456789ABCDEF"[(b & 0x0f) as usize]));
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // VTabModule: HttpVTabModule
 // ---------------------------------------------------------------------------
 
@@ -527,10 +549,10 @@ impl VTabCursor for HttpCursor {
         // Build HTTP request URL
         let mut url = self.config.url.clone();
         if !params.is_empty() && self.config.method == "GET" {
-            // Append HIDDEN column values as query params
+            // Append HIDDEN column values as query params (percent-encoded)
             let query: String = params
                 .iter()
-                .map(|(k, v)| format!("{k}={v}"))
+                .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
                 .collect::<Vec<_>>()
                 .join("&");
             if url.contains('?') {
@@ -998,5 +1020,20 @@ mod tests {
     #[test]
     fn test_column_defs_single_token_fails() {
         assert!(parse_column_defs("badcolumn").is_err());
+    }
+
+    // ---- URL encoding tests ----
+
+    #[test]
+    fn test_url_encode_unreserved() {
+        assert_eq!(url_encode("hello"), "hello");
+        assert_eq!(url_encode("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    #[test]
+    fn test_url_encode_special_chars() {
+        assert_eq!(url_encode("foo bar"), "foo%20bar");
+        assert_eq!(url_encode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(url_encode("100%"), "100%25");
     }
 }
