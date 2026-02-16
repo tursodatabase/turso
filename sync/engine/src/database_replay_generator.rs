@@ -170,6 +170,10 @@ impl DatabaseReplayGenerator {
                 }
                 values
             }
+            DatabaseChangeType::Commit => {
+                // COMMIT records are handled at the tape level, not here
+                Vec::new()
+            }
         }
     }
     pub async fn replay_info<Ctx>(

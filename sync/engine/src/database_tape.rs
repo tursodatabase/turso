@@ -10,8 +10,8 @@ use crate::{
     database_sync_operations::WAL_FRAME_HEADER,
     errors::Error,
     types::{
-        Coro, DatabaseChange, DatabaseChangeType, DatabaseTapeOperation, DatabaseTapeRowChange,
-        DatabaseTapeRowChangeType, SyncEngineIoResult,
+        Coro, DatabaseChange, DatabaseChangeType, DatabaseTapeOperation, DatabaseTapeRowChangeType,
+        SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -23,6 +23,7 @@ pub struct DatabaseTape {
     inner: Arc<turso_core::Database>,
     cdc_table: Arc<String>,
     pragma_query: String,
+    cdc_version: std::sync::RwLock<Option<String>>,
 }
 
 const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
@@ -125,6 +126,7 @@ impl DatabaseTape {
             inner: database,
             cdc_table: Arc::new(cdc_table_name.to_string()),
             pragma_query,
+            cdc_version: std::sync::RwLock::new(None),
         }
     }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
@@ -136,8 +138,40 @@ impl DatabaseTape {
         tracing::debug!("set '{CDC_PRAGMA_NAME}' for new connection");
         let mut stmt = connection.prepare(&self.pragma_query)?;
         run_stmt_ignore_rows(coro, &mut stmt).await?;
+        // Cache CDC version from turso_cdc_version table
+        if self.cdc_version.read().unwrap().is_none() {
+            let version = Self::read_cdc_version(coro, &connection, &self.cdc_table).await?;
+            *self.cdc_version.write().unwrap() = Some(version);
+        }
         Ok(connection)
     }
+
+    async fn read_cdc_version<Ctx>(
+        coro: &Coro<Ctx>,
+        connection: &Arc<turso_core::Connection>,
+        cdc_table: &str,
+    ) -> Result<String> {
+        let query =
+            format!("SELECT version FROM turso_cdc_version WHERE table_name = '{cdc_table}'");
+        let mut stmt = match connection.prepare(&query) {
+            Ok(stmt) => stmt,
+            Err(turso_core::LimboError::ParseError(err)) if err.contains("no such table") => {
+                return Ok("v1".to_string())
+            }
+            Err(err) => return Err(err.into()),
+        };
+        match run_stmt_expect_one_row(coro, &mut stmt).await? {
+            Some(row) if !row.is_empty() => {
+                if let turso_core::Value::Text(text) = &row[0] {
+                    Ok(text.to_string())
+                } else {
+                    Ok("v1".to_string())
+                }
+            }
+            _ => Ok("v1".to_string()),
+        }
+    }
+
     /// Builds an iterator which emits [DatabaseTapeOperation] by extracting data from CDC table
     pub fn iterate_changes(
         &self,
@@ -145,9 +179,14 @@ impl DatabaseTape {
     ) -> Result<DatabaseChangesIterator> {
         tracing::debug!("opening changes iterator with options {:?}", opts);
         let conn = self.inner.connect()?;
+
+        let cdc_version = self.cdc_version.read().unwrap().clone();
+        let cdc_version = cdc_version.expect("tape must be connected before iterate changes");
+
         Ok(DatabaseChangesIterator {
             conn,
             cdc_table: self.cdc_table.clone(),
+            cdc_version,
             first_change_id: opts.first_change_id,
             batch: VecDeque::with_capacity(opts.batch_size),
             query_stmt: None,
@@ -376,9 +415,10 @@ impl Default for DatabaseChangesIteratorOpts {
 pub struct DatabaseChangesIterator {
     conn: Arc<turso_core::Connection>,
     cdc_table: Arc<String>,
+    cdc_version: String,
     query_stmt: Option<turso_core::Statement>,
     first_change_id: Option<i64>,
-    batch: VecDeque<DatabaseTapeRowChange>,
+    batch: VecDeque<DatabaseTapeOperation>,
     txn_boundary_returned: bool,
     mode: DatabaseChangesIteratorMode,
     batch_size: usize,
@@ -391,13 +431,14 @@ impl DatabaseChangesIterator {
         if self.batch.is_empty() {
             self.refill(coro).await?;
         }
-        // todo(sivukhin): iterator must be more clever about transaction boundaries - but for that we need to extend CDC table
-        // for now, if iterator reach the end of CDC table - we are sure that this is a transaction boundary
         loop {
-            let next = if let Some(change) = self.batch.pop_front() {
-                self.txn_boundary_returned = false;
-                Some(DatabaseTapeOperation::RowChange(change))
+            let next = if let Some(op) = self.batch.pop_front() {
+                self.txn_boundary_returned = matches!(op, DatabaseTapeOperation::Commit);
+                Some(op)
             } else if !self.txn_boundary_returned {
+                // For v1 (no explicit COMMIT records), emit a synthetic Commit at end of batch.
+                // For v2, COMMIT records are already in the batch, but we also emit a final
+                // synthetic one at end-of-table for safety.
                 self.txn_boundary_returned = true;
                 Some(DatabaseTapeOperation::Commit)
             } else {
@@ -430,17 +471,23 @@ impl DatabaseChangesIterator {
             turso_core::Value::from_i64(change_id_filter),
         );
 
+        let mut last_change_id = None;
         while let Some(row) = run_stmt_once(coro, query_stmt).await? {
-            let database_change: DatabaseChange = row.try_into()?;
-            let tape_change = match self.mode {
-                DatabaseChangesIteratorMode::Apply => database_change.into_apply()?,
-                DatabaseChangesIteratorMode::Revert => database_change.into_revert()?,
-            };
-            self.batch.push_back(tape_change);
+            let database_change = DatabaseChange::from_row(row, &self.cdc_version)?;
+            last_change_id = Some(database_change.change_id);
+            if database_change.change_type == DatabaseChangeType::Commit {
+                self.batch.push_back(DatabaseTapeOperation::Commit);
+            } else {
+                let tape_change = match self.mode {
+                    DatabaseChangesIteratorMode::Apply => database_change.into_apply()?,
+                    DatabaseChangesIteratorMode::Revert => database_change.into_revert()?,
+                };
+                self.batch
+                    .push_back(DatabaseTapeOperation::RowChange(tape_change));
+            }
         }
-        let batch_len = self.batch.len();
-        if batch_len > 0 {
-            self.first_change_id = Some(self.mode.next_id(self.batch[batch_len - 1].change_id));
+        if let Some(change_id) = last_change_id {
+            self.first_change_id = Some(self.mode.next_id(change_id));
         }
         Ok(())
     }
