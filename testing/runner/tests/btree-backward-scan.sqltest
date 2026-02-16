@@ -1,0 +1,18 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/5277
+# ORDER BY rowid DESC silently drops rows when the table B-tree has 3+ levels.
+# The going_upwards flag in get_prev_record was never cleared when descending
+# between interior pages, causing rightmost subtrees to be skipped.
+
+test backward-scan-deep-btree {
+    PRAGMA page_size = 512;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t SELECT value, printf('val_%06d', value) FROM generate_series(1, 1800);
+    SELECT count(*) FROM (SELECT * FROM t ORDER BY a DESC);
+    SELECT min(a), max(a) FROM (SELECT * FROM t ORDER BY a DESC);
+}
+expect {
+    1800
+    1|1800
+}

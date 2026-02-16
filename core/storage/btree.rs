@@ -830,7 +830,7 @@ impl BTreeCursor {
                         let past_rightmost_pointer = cell_count as i32 + 1;
                         self.stack.set_cell_index(past_rightmost_pointer);
                         let (page, c) = self.read_page(rightmost_pointer as i64)?;
-                        self.stack.push_backwards(page);
+                        self.descend_backwards(page);
                         if let Some(c) = c {
                             io_yield_one!(c);
                         }
@@ -861,11 +861,9 @@ impl BTreeCursor {
                             break;
                         }
                         if self.stack.has_parent() {
-                            self.going_upwards = true;
-                            self.stack.pop();
+                            self.pop_upwards();
                         } else {
                             // moved to begin of btree
-                            // dbg!(false);
                             return Ok(IOResult::Done(false));
                         }
                     }
@@ -902,7 +900,7 @@ impl BTreeCursor {
                 }
 
                 let (mem_page, c) = self.read_page(left_child_page as i64)?;
-                self.stack.push_backwards(mem_page);
+                self.descend_backwards(mem_page);
                 if let Some(c) = c {
                     io_yield_one!(c);
                 }
@@ -1056,7 +1054,7 @@ impl BTreeCursor {
                             // do rightmost
                             self.stack.advance();
                             let (mem_page, c) = self.read_page(right_most_pointer as i64)?;
-                            self.stack.push(mem_page);
+                            self.descend(mem_page);
                             if let Some(c) = c {
                                 io_yield_one!(c);
                             }
@@ -1065,8 +1063,7 @@ impl BTreeCursor {
                         _ => {
                             if self.ancestor_pages_have_more_children() {
                                 tracing::trace!("moving simple upwards");
-                                self.going_upwards = true;
-                                self.stack.pop();
+                                self.pop_upwards();
                                 continue;
                             } else {
                                 // If none of the ancestor pages have more children to iterate, that means we are at the end of the btree and should stop iterating.
@@ -1094,7 +1091,7 @@ impl BTreeCursor {
 
                 let left_child_page = contents.cell_interior_read_left_child_page(cell_idx)?;
                 let (mem_page, c) = self.read_page(left_child_page as i64)?;
-                self.stack.push(mem_page);
+                self.descend(mem_page);
                 if let Some(c) = c {
                     io_yield_one!(c);
                 }
@@ -1131,6 +1128,27 @@ impl BTreeCursor {
         let ret = return_if_io!(self.indexbtree_seek_unpacked(registers, op));
         self.valid_state = CursorValidState::Valid;
         Ok(IOResult::Done(ret))
+    }
+
+    /// Pop the stack and mark that we are going upwards in the B-tree.
+    /// This is the only place where `going_upwards` should be set to `true`.
+    fn pop_upwards(&mut self) {
+        self.going_upwards = true;
+        self.stack.pop();
+    }
+
+    /// Descend into a child page during forward iteration.
+    /// Clears the `going_upwards` flag — once we descend, we are no longer going upwards.
+    fn descend(&mut self, page: PageRef) {
+        self.going_upwards = false;
+        self.stack.push(page);
+    }
+
+    /// Descend into a child page during backward iteration.
+    /// Clears the `going_upwards` flag — once we descend, we are no longer going upwards.
+    fn descend_backwards(&mut self, page: PageRef) {
+        self.going_upwards = false;
+        self.stack.push_backwards(page);
     }
 
     /// Move the cursor to the root page of the btree.
