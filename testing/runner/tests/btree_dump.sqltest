@@ -3,6 +3,7 @@
 @skip-file-if sqlite "btree_dump is a turso-specific virtual table"
 
 # Dump an index with data
+@backend cli
 test btree-dump-index {
     CREATE TABLE t1 (a INTEGER, b TEXT);
     INSERT INTO t1 VALUES (1, 'hello');
@@ -16,6 +17,7 @@ expect {
 }
 
 # Dump an empty index
+@backend cli
 test btree-dump-empty-index {
     CREATE TABLE t2 (a INTEGER, b TEXT);
     CREATE INDEX idx2 ON t2(b);
@@ -26,6 +28,7 @@ expect {
 }
 
 # Dump a nonexistent name returns an error
+@backend cli
 test btree-dump-nonexistent {
     SELECT count(*) FROM btree_dump('nonexistent');
 }
@@ -34,6 +37,7 @@ expect error {
 }
 
 # Dump a table
+@backend cli
 test btree-dump-table {
     CREATE TABLE t3 (a INTEGER, b TEXT);
     INSERT INTO t3 VALUES (10, 'alpha');
@@ -45,6 +49,7 @@ expect {
 }
 
 # Record column returns a blob (non-null)
+@backend cli
 test btree-dump-record-not-null {
     CREATE TABLE t4 (x INTEGER);
     INSERT INTO t4 VALUES (42);
@@ -57,6 +62,7 @@ expect {
 
 # Parse single-column index records with bin_record_json_object
 # Index on (name) stores [name, rowid] - results are in index key order (alphabetical by name)
+@backend cli
 test btree-dump-bin-record-single-col {
     CREATE TABLE t5 (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t5 VALUES (1, 'alice');
@@ -73,6 +79,7 @@ expect {
 
 # Parse multi-column index records with bin_record_json_object
 # Index on (last, first) stores [last, first, rowid] - sorted by last then first
+@backend cli
 test btree-dump-bin-record-multi-col {
     CREATE TABLE t6 (id INTEGER PRIMARY KEY, first TEXT, last TEXT);
     INSERT INTO t6 VALUES (1, 'John', 'Doe');
@@ -88,6 +95,7 @@ expect {
 }
 
 # Parse table records with bin_record_json_object
+@backend cli
 test btree-dump-bin-record-table {
     CREATE TABLE t7 (a INTEGER, b REAL, c TEXT);
     INSERT INTO t7 VALUES (100, 3.14, 'pi');
@@ -100,6 +108,7 @@ expect {
 }
 
 # Index with null values - nulls sort first in index order
+@backend cli
 test btree-dump-index-with-nulls {
     CREATE TABLE t8 (id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO t8 VALUES (1, NULL);
@@ -115,6 +124,7 @@ expect {
 }
 
 # Index with integer values - sorted numerically
+@backend cli
 test btree-dump-integer-index {
     CREATE TABLE t9 (id INTEGER PRIMARY KEY, score INTEGER);
     INSERT INTO t9 VALUES (1, 100);
@@ -130,6 +140,7 @@ expect {
 }
 
 # Multiple calls to btree_dump in same query
+@backend cli
 test btree-dump-multiple-calls {
     CREATE TABLE t10 (a INTEGER, b TEXT);
     INSERT INTO t10 VALUES (1, 'x');
@@ -143,6 +154,7 @@ expect {
 }
 
 # Unique index inspection
+@backend cli
 test btree-dump-unique-index {
     CREATE TABLE t11 (id INTEGER PRIMARY KEY, email TEXT UNIQUE);
     INSERT INTO t11 VALUES (1, 'a@b.com');
@@ -156,6 +168,7 @@ expect {
 }
 
 # Dump after deletes - only remaining rows appear
+@backend cli
 test btree-dump-after-delete {
     CREATE TABLE t12 (id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO t12 VALUES (1, 'keep');
@@ -171,6 +184,7 @@ expect {
 }
 
 # Dump after update - reflects updated values
+@backend cli
 test btree-dump-after-update {
     CREATE TABLE t13 (id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t13 VALUES (1, 10);
@@ -185,6 +199,7 @@ expect {
 }
 
 # Index on mixed types
+@backend cli
 test btree-dump-mixed-types {
     CREATE TABLE t14 (id INTEGER PRIMARY KEY, a INTEGER, b REAL, c TEXT);
     INSERT INTO t14 VALUES (1, 42, 3.14, 'hello');
