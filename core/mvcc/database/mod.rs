@@ -3596,6 +3596,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
         let mut index_infos: HashMap<MVTableId, Arc<IndexInfo>> = HashMap::default();
 
+        // Track whether we have pending schema changes that need a rebuild.
+        // We defer rebuild_schema() until all consecutive schema rows have been
+        // inserted, because an intermediate rebuild (e.g. after inserting the
+        // renamed table row but before inserting the renamed index row) can see
+        // an inconsistent state and panic in populate_indices().
+        // Cell is used so the get_index_info closure can flush the pending rebuild.
+        let needs_schema_rebuild = std::cell::Cell::new(false);
+
         let rebuild_schema =
             |connection: &Arc<Connection>, schema_rows: &HashMap<i64, ImmutableRecord>| {
                 let pager = connection.pager.load().clone();
@@ -3693,6 +3701,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 if let Some(index_info) = index_infos.get(&index_id) {
                     Ok(index_info.clone())
                 } else {
+                    // Flush any pending schema rebuild so we can see newly created indexes.
+                    if needs_schema_rebuild.get() {
+                        rebuild_schema(&connection, &schema_rows)?;
+                        index_infos.clear();
+                        needs_schema_rebuild.set(false);
+                    }
                     let schema = connection.schema.read();
                     let root_page = self
                         .table_id_to_rootpage
@@ -3773,8 +3787,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
                         let rowid_int = rowid.row_id.to_int_or_panic();
                         schema_rows.insert(rowid_int, record);
-                        rebuild_schema(&connection, &schema_rows)?;
-                        index_infos.clear();
+                        needs_schema_rebuild.set(true);
                     } else {
                         assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
                     }
@@ -3796,10 +3809,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                     let allocator = self.get_rowid_allocator(&rowid.table_id);
                     allocator.insert_row_id_maybe_update(rowid.row_id.to_int_or_panic());
-
-                    if is_schema_row {
-                        // schema already rebuilt above
-                    }
                 }
                 StreamingResult::DeleteTableRow {
                     rowid,
@@ -3853,8 +3862,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                         let rowid_int = rowid.row_id.to_int_or_panic();
                         schema_rows.remove(&rowid_int);
-                        rebuild_schema(&connection, &schema_rows)?;
-                        index_infos.clear();
+                        needs_schema_rebuild.set(true);
                     }
                 }
                 StreamingResult::UpsertIndexRow {
@@ -3926,6 +3934,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     break;
                 }
             }
+        }
+        // Flush any remaining pending schema rebuild after processing all log records.
+        if needs_schema_rebuild.get() {
+            rebuild_schema(&connection, &schema_rows)?;
         }
 
         assert!(
