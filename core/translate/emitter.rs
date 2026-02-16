@@ -1526,6 +1526,9 @@ fn emit_program_for_delete(
         )?;
     }
     program.preassign_label_to_next_insn(after_main_loop_label);
+    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
     // Finalize program
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
@@ -1965,7 +1968,7 @@ fn emit_delete_row_common(
             } else {
                 None
             };
-            emit_cdc_with_autocommit_check(
+            emit_cdc_insns(
                 program,
                 &t_ctx.resolver,
                 OperationMode::DELETE,
@@ -2429,6 +2432,9 @@ fn emit_program_for_update(
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
+    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
     after(program);
 
     program.result_columns = plan.returning.unwrap_or_default();
@@ -3938,7 +3944,7 @@ fn emit_update_insns<'a>(
                     None,
                     table_name,
                 )?;
-                emit_cdc_with_autocommit_check(
+                emit_cdc_insns(
                     program,
                     &t_ctx.resolver,
                     OperationMode::INSERT,
@@ -3950,7 +3956,7 @@ fn emit_update_insns<'a>(
                     table_name,
                 )?;
             } else {
-                emit_cdc_with_autocommit_check(
+                emit_cdc_insns(
                     program,
                     &t_ctx.resolver,
                     OperationMode::UPDATE(if ephemeral_plan.is_some() {
@@ -4473,32 +4479,13 @@ pub fn emit_cdc_commit_insns(
     Ok(())
 }
 
-/// Wrapper that emits CDC instructions and, for v2, conditionally emits a COMMIT
-/// record when in autocommit mode.
-#[allow(clippy::too_many_arguments)]
-pub fn emit_cdc_with_autocommit_check(
+/// Emit a CDC COMMIT record at end-of-statement when in autocommit mode (v2 only).
+/// This should be called once per statement, after the main loop, not per-row.
+pub fn emit_cdc_autocommit_commit(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    operation_mode: OperationMode,
     cdc_cursor_id: usize,
-    rowid_reg: usize,
-    before_record_reg: Option<usize>,
-    after_record_reg: Option<usize>,
-    updates_record_reg: Option<usize>,
-    table_name: &str,
 ) -> Result<()> {
-    emit_cdc_insns(
-        program,
-        resolver,
-        operation_mode,
-        cdc_cursor_id,
-        rowid_reg,
-        before_record_reg,
-        after_record_reg,
-        updates_record_reg,
-        table_name,
-    )?;
-
     let is_v2 = program
         .capture_data_changes_info()
         .as_ref()

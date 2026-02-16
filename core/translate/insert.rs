@@ -4,8 +4,9 @@ use crate::{
     sync::Arc,
     translate::{
         emitter::{
-            emit_cdc_full_record, emit_cdc_patch_record, emit_cdc_with_autocommit_check,
-            emit_check_constraints, prepare_cdc_if_necessary, OperationMode, Resolver,
+            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
+            emit_cdc_patch_record, emit_check_constraints, prepare_cdc_if_necessary, OperationMode,
+            Resolver,
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
@@ -734,7 +735,7 @@ pub fn translate_insert(
         } else {
             None
         };
-        emit_cdc_with_autocommit_check(
+        emit_cdc_insns(
             &mut program,
             resolver,
             OperationMode::INSERT,
@@ -775,7 +776,7 @@ pub fn translate_insert(
         )?;
     }
 
-    emit_epilogue(&mut program, &ctx, inserting_multiple_rows);
+    emit_epilogue(&mut program, resolver, &ctx, inserting_multiple_rows)?;
 
     program.set_needs_stmt_subtransactions(true);
     program.result_columns = result_columns;
@@ -783,7 +784,12 @@ pub fn translate_insert(
     Ok(program)
 }
 
-fn emit_epilogue(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, inserting_multiple_rows: bool) {
+fn emit_epilogue(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    ctx: &InsertEmitCtx,
+    inserting_multiple_rows: bool,
+) -> Result<()> {
     if inserting_multiple_rows {
         if let Some(temp_table_ctx) = &ctx.temp_table_ctx {
             program.resolve_label(ctx.loop_labels.row_done, program.offset());
@@ -821,7 +827,11 @@ fn emit_epilogue(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, inserting_mu
         });
     }
     program.preassign_label_to_next_insn(ctx.loop_labels.stmt_epilogue);
+    if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
+        emit_cdc_autocommit_commit(program, resolver, *cdc_cursor_id)?;
+    }
     program.resolve_label(ctx.halt_label, program.offset());
+    Ok(())
 }
 
 /// Evaluates a partial index WHERE clause and emits code to skip if the predicate is false.
@@ -2951,7 +2961,7 @@ fn emit_replace_delete_conflicting_row(
         } else {
             None
         };
-        emit_cdc_with_autocommit_check(
+        emit_cdc_insns(
             program,
             resolver,
             OperationMode::DELETE,

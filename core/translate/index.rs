@@ -8,8 +8,8 @@ use crate::numeric::Numeric;
 use crate::schema::{Column, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_with_autocommit_check, prepare_cdc_if_necessary, OperationMode,
-    Resolver,
+    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
+    OperationMode, Resolver,
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
@@ -876,7 +876,7 @@ pub fn translate_drop_index(
         } else {
             None
         };
-        emit_cdc_with_autocommit_check(
+        emit_cdc_insns(
             &mut program,
             resolver,
             OperationMode::DELETE,
@@ -902,6 +902,9 @@ pub fn translate_drop_index(
     });
 
     program.resolve_label(loop_end_label, program.offset());
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        emit_cdc_autocommit_commit(&mut program, resolver, cdc_cursor_id)?;
+    }
 
     program.emit_insn(Insn::SetCookie {
         db: 0,

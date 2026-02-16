@@ -89,7 +89,6 @@ fn test_cdc_simple_id(db: TempDatabase) {
         rows,
         vec![
             v2_row(1, "t", 10, None, None, None),
-            v2_commit(),
             v2_row(1, "t", 5, None, None, None),
             v2_commit(),
         ]
@@ -129,7 +128,6 @@ fn test_cdc_simple_before(db: TempDatabase) {
         rows,
         vec![
             v2_row(1, "t", 1, None, None, None),
-            v2_commit(),
             v2_row(1, "t", 3, None, None, None),
             v2_commit(),
             v2_row(
@@ -187,7 +185,6 @@ fn test_cdc_simple_after(db: TempDatabase) {
                 Some(record([Value::Integer(1), Value::Integer(2)])),
                 None,
             ),
-            v2_commit(),
             v2_row(
                 1,
                 "t",
@@ -238,7 +235,6 @@ fn test_cdc_simple_full(db: TempDatabase) {
                 Some(record([Value::Integer(1), Value::Integer(2)])),
                 None,
             ),
-            v2_commit(),
             v2_row(
                 1,
                 "t",
@@ -312,9 +308,7 @@ fn test_cdc_crud(db: TempDatabase) {
         vec![
             // INSERT INTO t VALUES (20, 20), (10, 10), (5, 1)
             v2_row(1, "t", 20, None, None, None),
-            v2_commit(),
             v2_row(1, "t", 10, None, None, None),
-            v2_commit(),
             v2_row(1, "t", 5, None, None, None),
             v2_commit(),
             // UPDATE t SET y = 100 WHERE x = 5
@@ -322,7 +316,6 @@ fn test_cdc_crud(db: TempDatabase) {
             v2_commit(),
             // DELETE FROM t WHERE x > 5
             v2_row(-1, "t", 10, None, None, None),
-            v2_commit(),
             v2_row(-1, "t", 20, None, None, None),
             v2_commit(),
             // INSERT INTO t VALUES (1, 1)
@@ -368,13 +361,11 @@ fn test_cdc_failed_op(db: TempDatabase) {
         vec![
             // INSERT INTO t VALUES (1, 10), (2, 20) — succeeds
             v2_row(1, "t", 1, None, None, None),
-            v2_commit(),
             v2_row(1, "t", 2, None, None, None),
             v2_commit(),
             // INSERT INTO t VALUES (3, 30), (4, 40), (5, 10) — fails, no CDC
             // INSERT INTO t VALUES (6, 60), (7, 70) — succeeds
             v2_row(1, "t", 6, None, None, None),
-            v2_commit(),
             v2_row(1, "t", 7, None, None, None),
             v2_commit(),
         ]
