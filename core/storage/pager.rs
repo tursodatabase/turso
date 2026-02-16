@@ -2154,10 +2154,16 @@ impl Pager {
         });
 
         let reserved_space = self.get_reserved_space().unwrap_or_else(|| {
-            let space = self
-                .io
-                .block(|| self.with_header(|header| header.reserved_space))
-                .unwrap_or_default();
+            let space = if self.db_initialized() {
+                self.io
+                    .block(|| self.with_header(|header| header.reserved_space))
+                    .unwrap_or_default()
+            } else {
+                // Before page 1 is allocated, the in-memory bootstrap header may still carry
+                // reserved_space=0. Use IOContext so checksum/encryption-required tail bytes are
+                // respected when computing usable space for first writes.
+                self.io_ctx.read().get_reserved_space_bytes()
+            };
             self.set_reserved_space(space);
             space
         });
@@ -4403,6 +4409,10 @@ impl Pager {
 
     pub fn is_encryption_ctx_set(&self) -> bool {
         self.io_ctx.write().encryption_context().is_some()
+    }
+
+    pub fn is_encryption_enabled(&self) -> bool {
+        self.enable_encryption.load(Ordering::SeqCst)
     }
 
     pub fn set_encryption_context(
