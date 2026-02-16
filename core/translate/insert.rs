@@ -1566,16 +1566,20 @@ fn init_source_emission<'a>(
                                     .iter()
                                     .any(|s| s.eq_ignore_ascii_case(&column_name))
                                 {
-                                    return Affinity::Integer.aff_mask();
+                                    return Ok(Affinity::Integer.aff_mask());
                                 }
                                 table
                                     .get_column_by_name(&column_name)
-                                    .unwrap()
-                                    .1
-                                    .affinity()
-                                    .aff_mask()
+                                    .map(|(_, col)| col.affinity().aff_mask())
+                                    .ok_or_else(|| {
+                                        crate::error::LimboError::ParseError(format!(
+                                            "table {} has no column named {}",
+                                            table.get_name(),
+                                            column_name
+                                        ))
+                                    })
                             })
-                            .collect::<String>()
+                            .collect::<Result<String>>()?
                     };
 
                     program.emit_insn(Insn::MakeRecord {

@@ -1843,3 +1843,11 @@ expect {
     133|a133
 }
 
+# https://github.com/tursodatabase/turso/issues/5226
+test insert-select-nonexistent-column {
+    CREATE TABLE t(a);
+    INSERT INTO t(x) SELECT a FROM t;
+}
+expect error {
+}
+
