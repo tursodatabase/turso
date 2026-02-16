@@ -3301,11 +3301,8 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
             let rows = stmt.run_collect_rows().unwrap();
 
             // Each reader writes to a unique row (no conflicts)
-            conn.execute(format!(
-                "INSERT INTO t VALUES ({}, 'reader_{i}')",
-                i + 10,
-            ))
-            .unwrap();
+            conn.execute(format!("INSERT INTO t VALUES ({}, 'reader_{i}')", i + 10,))
+                .unwrap();
 
             // Signal: all readers done with speculative reads
             barrier_clone.wait();
@@ -6471,10 +6468,7 @@ fn test_partial_commit_visibility_bug() {
                     for row in rows {
                         let batch_id = row[0].as_int().unwrap();
                         let row_num = row[1].as_int().unwrap();
-                        batches
-                            .entry(batch_id)
-                            .or_default()
-                            .push(row_num);
+                        batches.entry(batch_id).or_default().push(row_num);
                     }
 
                     // Check consistency: Each batch must have EITHER all rows OR no rows
