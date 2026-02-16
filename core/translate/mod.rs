@@ -99,12 +99,19 @@ pub fn translate(
     program.prologue();
     let mut resolver = Resolver::new(schema, syms);
 
-    program = match stmt {
+    match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
-            pragma::translate_pragma(&resolver, &name, body, pager, connection.clone(), program)?
+            pragma::translate_pragma(
+                &resolver,
+                &name,
+                body,
+                pager,
+                connection.clone(),
+                &mut program,
+            )?;
         }
-        stmt => translate_inner(stmt, &mut resolver, program, &connection, input)?,
+        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
 
     program.epilogue(schema);
@@ -118,10 +125,10 @@ pub fn translate(
 pub fn translate_inner(
     stmt: ast::Stmt,
     resolver: &mut Resolver,
-    program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
@@ -148,18 +155,18 @@ pub fn translate_inner(
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
 
-    let mut program = match stmt {
+    match stmt {
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input)?
+            translate_alter_table(alter, resolver, program, connection, input)?;
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?
+            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
         ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?
+            translate_create_index(program, connection, resolver, stmt)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -308,8 +315,7 @@ pub fn translate_inner(
                 program,
                 plan::QueryDestination::ResultRows,
                 connection,
-            )?
-            .program
+            )?;
         }
         ast::Stmt::Update(update) => translate_update(update, resolver, program, connection)?,
         ast::Stmt::Vacuum { name, into } => {
@@ -345,7 +351,7 @@ pub fn translate_inner(
         program.begin_read_operation();
     }
 
-    Ok(program)
+    Ok(())
 }
 
 #[cfg(test)]

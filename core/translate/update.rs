@@ -58,20 +58,20 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 pub fn translate_update(
     body: ast::Update,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, resolver, body, connection, false)?;
+) -> crate::Result<()> {
+    let mut plan = prepare_update_plan(program, resolver, body, connection, false)?;
 
     // Plan subqueries in the WHERE clause
     if let Plan::Update(ref mut update_plan) = plan {
         if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
             // When using ephemeral plan (key columns are being updated), subqueries are in the ephemeral_plan's WHERE
-            plan_subqueries_from_select_plan(&mut program, ephemeral_plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection)?;
         } else {
             // Normal path: subqueries are in the UPDATE plan's WHERE
             plan_subqueries_from_where_clause(
-                &mut program,
+                program,
                 &mut update_plan.non_from_clause_subqueries,
                 &mut update_plan.table_references,
                 &mut update_plan.where_clause,
@@ -81,26 +81,26 @@ pub fn translate_update(
         }
     }
 
-    optimize_plan(&mut program, &mut plan, resolver.schema)?;
+    optimize_plan(program, &mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(connection, resolver, &mut program, plan, |_| {})?;
-    Ok(program)
+    emit_program(connection, resolver, program, plan, |_| {})?;
+    Ok(())
 }
 
 pub fn translate_update_for_schema_change(
     body: ast::Update,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
-) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, resolver, body, connection, true)?;
+) -> crate::Result<()> {
+    let mut plan = prepare_update_plan(program, resolver, body, connection, true)?;
 
     if let Plan::Update(update_plan) = &mut plan {
         if program.capture_data_changes_info().has_updates() {
@@ -109,10 +109,10 @@ pub fn translate_update_for_schema_change(
 
         // Plan subqueries in the WHERE clause
         if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
-            plan_subqueries_from_select_plan(&mut program, ephemeral_plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection)?;
         } else {
             plan_subqueries_from_where_clause(
-                &mut program,
+                program,
                 &mut update_plan.non_from_clause_subqueries,
                 &mut update_plan.table_references,
                 &mut update_plan.where_clause,
@@ -122,15 +122,15 @@ pub fn translate_update_for_schema_change(
         }
     }
 
-    optimize_plan(&mut program, &mut plan, resolver.schema)?;
+    optimize_plan(program, &mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(connection, resolver, &mut program, plan, after)?;
-    Ok(program)
+    emit_program(connection, resolver, program, plan, after)?;
+    Ok(())
 }
 
 fn validate_update(

@@ -52,8 +52,8 @@ pub fn translate_pragma(
     body: Option<ast::PragmaBody>,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
-    mut program: ProgramBuilder,
-) -> crate::Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> crate::Result<()> {
     let opts = ProgramBuilderOpts {
         num_cursors: 0,
         approx_num_insns: 20,
@@ -62,8 +62,8 @@ pub fn translate_pragma(
     program.extend(&opts);
 
     if name.name.as_str().eq_ignore_ascii_case("pragma_list") {
-        list_pragmas(&mut program);
-        return Ok(program);
+        list_pragmas(program);
+        return Ok(());
     }
 
     let pragma = match PragmaName::from_str(name.name.as_str()) {
@@ -71,7 +71,7 @@ pub fn translate_pragma(
         Err(_) => bail_parse_error!("Not a valid pragma name"),
     };
 
-    let (mut program, mode) = match body {
+    let mode = match body {
         None => query_pragma(pragma, resolver, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
@@ -102,7 +102,7 @@ pub fn translate_pragma(
         }
     }
 
-    Ok(program)
+    Ok(())
 }
 
 fn update_pragma(
@@ -111,8 +111,8 @@ fn update_pragma(
     value: ast::Expr,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
-    mut program: ProgramBuilder,
-) -> crate::Result<(ProgramBuilder, TransactionMode)> {
+    program: &mut ProgramBuilder,
+) -> crate::Result<TransactionMode> {
     let parse_pragma_enabled = |expr: &ast::Expr| -> bool {
         if let Expr::Literal(Literal::Numeric(n)) = expr {
             return !matches!(n.as_str(), "0");
@@ -142,7 +142,7 @@ fn update_pragma(
                 value: app_id_value,
                 p5: 1,
             });
-            Ok((program, TransactionMode::Write))
+            Ok(TransactionMode::Write)
         }
         PragmaName::BusyTimeout => {
             let data = parse_signed_number(&value)?;
@@ -153,7 +153,7 @@ fn update_pragma(
             };
             let busy_timeout_ms = busy_timeout_ms.max(0);
             connection.set_busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64));
-            Ok((program, TransactionMode::Write))
+            Ok(TransactionMode::Write)
         }
         PragmaName::CacheSize => {
             let cache_size = match parse_signed_number(&value)? {
@@ -162,12 +162,12 @@ fn update_pragma(
                 _ => bail_parse_error!("Invalid value for cache size pragma"),
             };
             update_cache_size(cache_size, pager, connection)?;
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::CacheSpill => {
             let enabled = parse_pragma_enabled(&value);
             connection.get_pager().set_spill_enabled(enabled);
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::Encoding => {
             let year = chrono::Local::now().year();
@@ -189,9 +189,9 @@ fn update_pragma(
 
             program.emit_result_row(result_reg, 1);
             program.add_pragma_result_column("journal_mode".into());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
-        PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
+        PragmaName::LegacyFileFormat => Ok(TransactionMode::None),
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
             resolver,
@@ -200,7 +200,7 @@ fn update_pragma(
             connection,
             program,
         ),
-        PragmaName::ModuleList => Ok((program, TransactionMode::None)),
+        PragmaName::ModuleList => Ok(TransactionMode::None),
         PragmaName::PageCount => query_pragma(
             PragmaName::PageCount,
             resolver,
@@ -225,7 +225,7 @@ fn update_pragma(
             });
             program.emit_result_row(result_reg, 1);
             program.add_pragma_result_column("max_page_count".into());
-            Ok((program, TransactionMode::Write))
+            Ok(TransactionMode::Write)
         }
         PragmaName::UserVersion => {
             let data = parse_signed_number(&value)?;
@@ -241,13 +241,13 @@ fn update_pragma(
                 value: version_value,
                 p5: 1,
             });
-            Ok((program, TransactionMode::Write))
+            Ok(TransactionMode::Write)
         }
         PragmaName::SchemaVersion => {
             // SQLite allowing this to be set is an incredibly stupid idea in my view.
             // In "defensive mode", this is a silent nop. So let's emulate that always.
             program.emit_insn(Insn::Noop {});
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::TableInfo => {
             // because we need control over the write parameter for the transaction,
@@ -268,7 +268,7 @@ fn update_pragma(
                 _ => bail_parse_error!("Invalid value for page size pragma"),
             };
             update_page_size(connection, page_size as u32)?;
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
             // Check if autovacuum is enabled in database opts
@@ -287,8 +287,10 @@ fn update_pragma(
 
             if !is_empty {
                 // SQLite's behavior is to silently ignore this pragma if the database is not empty.
-                tracing::debug!("Attempted to set auto_vacuum, database is not empty so we are ignoring pragma.");
-                return Ok((program, TransactionMode::None));
+                tracing::debug!(
+                    "Attempted to set auto_vacuum, database is not empty so we are ignoring pragma."
+                );
+                return Ok(TransactionMode::None);
             }
 
             let auto_vacuum_mode = match value {
@@ -308,7 +310,7 @@ fn update_pragma(
                 _ => {
                     return Err(LimboError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
-                    ))
+                    ));
                 }
             };
             match auto_vacuum_mode {
@@ -318,7 +320,7 @@ fn update_pragma(
                 _ => {
                     return Err(LimboError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
-                    ))
+                    ));
                 }
             }
             let largest_root_page_number_reg = program.alloc_register();
@@ -344,7 +346,7 @@ fn update_pragma(
                 value: auto_vacuum_mode - 1,
                 p5: 0,
             });
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
@@ -365,7 +367,7 @@ fn update_pragma(
                 version: TURSO_CDC_CURRENT_VERSION.to_string(),
                 cdc_mode: value,
             });
-            Ok((program, TransactionMode::Write))
+            Ok(TransactionMode::Write)
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
         PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
@@ -392,13 +394,13 @@ fn update_pragma(
             let value = parse_string(&value)?;
             let key = EncryptionKey::from_hex_string(&value)?;
             connection.set_encryption_key(key)?;
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::EncryptionCipher => {
             let value = parse_string(&value)?;
             let cipher = CipherMode::try_from(value.as_str())?;
             connection.set_encryption_cipher(cipher)?;
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::Synchronous => {
             use crate::SyncMode;
@@ -421,12 +423,12 @@ fn update_pragma(
                 })
             };
             connection.set_sync_mode(mode);
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::DataSyncRetry => {
             let retry_enabled = parse_pragma_enabled(&value);
             connection.set_data_sync_retry(retry_enabled);
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::MvccCheckpointThreshold => {
             let threshold = match parse_signed_number(&value)? {
@@ -437,17 +439,17 @@ fn update_pragma(
             };
 
             connection.set_mvcc_checkpoint_threshold(threshold)?;
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::ForeignKeys => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_foreign_keys_enabled(enabled);
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::IgnoreCheckConstraints => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_check_constraints_ignored(enabled);
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         #[cfg(target_vendor = "apple")]
         PragmaName::Fullfsync => {
@@ -458,7 +460,7 @@ fn update_pragma(
                 crate::io::FileSyncType::Fsync
             };
             connection.set_sync_type(sync_type);
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::TempStore => {
             use crate::TempStore;
@@ -487,7 +489,7 @@ fn update_pragma(
                 })
             };
             connection.set_temp_store(temp_store);
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::FunctionList => query_pragma(
             PragmaName::FunctionList,
@@ -506,8 +508,8 @@ fn query_pragma(
     value: Option<ast::Expr>,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
-    mut program: ProgramBuilder,
-) -> crate::Result<(ProgramBuilder, TransactionMode)> {
+    program: &mut ProgramBuilder,
+) -> crate::Result<TransactionMode> {
     let schema = resolver.schema;
     let register = program.alloc_register();
     match pragma {
@@ -519,26 +521,26 @@ fn query_pragma(
             });
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
-            Ok((program, TransactionMode::Read))
+            Ok(TransactionMode::Read)
         }
         PragmaName::BusyTimeout => {
             program.emit_int(connection.get_busy_timeout().as_millis() as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::CacheSize => {
             program.emit_int(connection.get_cache_size() as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::CacheSpill => {
             let spill_enabled = connection.get_pager().get_spill_enabled();
             program.emit_int(spill_enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::DatabaseList => {
             let base_reg = register;
@@ -563,7 +565,7 @@ fn query_pragma(
             for col_name in pragma.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::Encoding => {
             let encoding = pager
@@ -574,7 +576,7 @@ fn query_pragma(
             program.emit_string8(encoding, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::JournalMode => {
             // Use the JournalMode opcode to get the current journal mode
@@ -585,9 +587,9 @@ fn query_pragma(
             });
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
-        PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
+        PragmaName::LegacyFileFormat => Ok(TransactionMode::None),
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
@@ -613,7 +615,7 @@ fn query_pragma(
             program.add_pragma_result_column("busy".to_string());
             program.add_pragma_result_column("log".to_string());
             program.add_pragma_result_column("checkpointed".to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::ModuleList => {
             let modules = connection.get_syms_vtab_mods();
@@ -623,7 +625,7 @@ fn query_pragma(
             }
 
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::FunctionList => {
             // 6 columns: name, builtin, type, enc, narg, flags
@@ -666,7 +668,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::PageCount => {
             program.emit_insn(Insn::PageCount {
@@ -675,7 +677,7 @@ fn query_pragma(
             });
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::Read))
+            Ok(TransactionMode::Read)
         }
         PragmaName::MaxPageCount => {
             program.emit_insn(Insn::MaxPgcnt {
@@ -685,7 +687,7 @@ fn query_pragma(
             });
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::Read))
+            Ok(TransactionMode::Read)
         }
         PragmaName::IndexInfo => {
             let index_name = match value {
@@ -718,7 +720,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::IndexXinfo => {
             let index_name = match value {
@@ -772,7 +774,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::IndexList => {
             let table_name = match value {
@@ -828,7 +830,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::TableList => {
             let name = match value {
@@ -863,7 +865,7 @@ fn query_pragma(
                         None => (false, false),
                     };
                     emit_table_row(
-                        &mut program,
+                        program,
                         table.get_name(),
                         "table",
                         table.columns().len(),
@@ -872,7 +874,7 @@ fn query_pragma(
                     );
                 } else if let Some(view) = schema.get_view(&name) {
                     emit_table_row(
-                        &mut program,
+                        program,
                         &view.name,
                         "view",
                         view.columns.len(),
@@ -887,7 +889,7 @@ fn query_pragma(
                         continue;
                     };
                     emit_table_row(
-                        &mut program,
+                        program,
                         &bt.name,
                         "table",
                         bt.columns.len(),
@@ -897,7 +899,7 @@ fn query_pragma(
                 }
                 for view in schema.views.values() {
                     emit_table_row(
-                        &mut program,
+                        program,
                         &view.name,
                         "view",
                         view.columns.len(),
@@ -911,7 +913,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::TableInfo => {
             let name = match value {
@@ -924,20 +926,20 @@ fn query_pragma(
             program.alloc_registers(5);
             if let Some(name) = name {
                 if let Some(table) = schema.get_table(&name) {
-                    emit_columns_for_table_info(&mut program, table.columns(), base_reg, false);
+                    emit_columns_for_table_info(program, table.columns(), base_reg, false);
                 } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
                     let view = view_mutex.lock();
                     let flat_columns = view.column_schema.flat_columns();
-                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg, false);
+                    emit_columns_for_table_info(program, &flat_columns, base_reg, false);
                 } else if let Some(view) = schema.get_view(&name) {
-                    emit_columns_for_table_info(&mut program, &view.columns, base_reg, false);
+                    emit_columns_for_table_info(program, &view.columns, base_reg, false);
                 }
             }
             let col_names = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::TableXinfo => {
             let name = match value {
@@ -950,13 +952,13 @@ fn query_pragma(
             program.alloc_registers(6);
             if let Some(name) = name {
                 if let Some(table) = schema.get_table(&name) {
-                    emit_columns_for_table_info(&mut program, table.columns(), base_reg, true);
+                    emit_columns_for_table_info(program, table.columns(), base_reg, true);
                 } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
                     let view = view_mutex.lock();
                     let flat_columns = view.column_schema.flat_columns();
-                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg, true);
+                    emit_columns_for_table_info(program, &flat_columns, base_reg, true);
                 } else if let Some(view) = schema.get_view(&name) {
-                    emit_columns_for_table_info(&mut program, &view.columns, base_reg, true);
+                    emit_columns_for_table_info(program, &view.columns, base_reg, true);
                 }
             }
             let col_names = [
@@ -971,7 +973,7 @@ fn query_pragma(
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::UserVersion => {
             program.emit_insn(Insn::ReadCookie {
@@ -981,7 +983,7 @@ fn query_pragma(
             });
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
-            Ok((program, TransactionMode::Read))
+            Ok(TransactionMode::Read)
         }
         PragmaName::SchemaVersion => {
             program.emit_insn(Insn::ReadCookie {
@@ -991,7 +993,7 @@ fn query_pragma(
             });
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
-            Ok((program, TransactionMode::Read))
+            Ok(TransactionMode::Read)
         }
         PragmaName::PageSize => {
             program.emit_int(
@@ -1003,7 +1005,7 @@ fn query_pragma(
             );
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
             let auto_vacuum_mode = pager.get_auto_vacuum_mode();
@@ -1020,17 +1022,17 @@ fn query_pragma(
                 value: auto_vacuum_mode_i64,
             });
             program.emit_result_row(register, 1);
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_integrity_check(schema, &mut program, resolver, max_errors)?;
-            Ok((program, TransactionMode::Read))
+            translate_integrity_check(schema, program, resolver, max_errors)?;
+            Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_quick_check(schema, &mut program, resolver, max_errors)?;
-            Ok((program, TransactionMode::Read))
+            translate_quick_check(schema, program, resolver, max_errors)?;
+            Ok(TransactionMode::Read)
         }
         PragmaName::UnstableCaptureDataChangesConn => {
             let pragma = pragma_for(&pragma);
@@ -1056,7 +1058,7 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.columns[0].to_string());
             program.add_pragma_result_column(pragma.columns[1].to_string());
             program.add_pragma_result_column(pragma.columns[2].to_string());
-            Ok((program, TransactionMode::Read))
+            Ok(TransactionMode::Read)
         }
         PragmaName::QueryOnly => {
             if let Some(value_expr) = value {
@@ -1080,7 +1082,7 @@ fn query_pragma(
                     }
                 };
                 connection.set_query_only(is_query_only);
-                return Ok((program, TransactionMode::None));
+                return Ok(TransactionMode::None);
             };
 
             let register = program.alloc_register();
@@ -1089,7 +1091,7 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
 
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::FreelistCount => {
             let value = pager.freepage_list();
@@ -1097,7 +1099,7 @@ fn query_pragma(
             program.emit_int(value as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::EncryptionKey => {
             let msg = {
@@ -1111,7 +1113,7 @@ fn query_pragma(
             program.emit_string8(msg.to_string(), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::EncryptionCipher => {
             if let Some(cipher) = connection.get_encryption_cipher_mode() {
@@ -1120,7 +1122,7 @@ fn query_pragma(
                 program.emit_result_row(register, 1);
                 program.add_pragma_result_column(pragma.to_string());
             }
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::Synchronous => {
             let mode = connection.get_sync_mode();
@@ -1128,7 +1130,7 @@ fn query_pragma(
             program.emit_int(mode as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::DataSyncRetry => {
             let retry_enabled = connection.get_data_sync_retry();
@@ -1136,7 +1138,7 @@ fn query_pragma(
             program.emit_int(retry_enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::MvccCheckpointThreshold => {
             let threshold = connection.mvcc_checkpoint_threshold()?;
@@ -1144,7 +1146,7 @@ fn query_pragma(
             program.emit_int(threshold, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::ForeignKeys => {
             let enabled = connection.foreign_keys_enabled();
@@ -1152,7 +1154,7 @@ fn query_pragma(
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::IgnoreCheckConstraints => {
             let ignored = connection.check_constraints_ignored();
@@ -1160,7 +1162,7 @@ fn query_pragma(
             program.emit_int(ignored as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         #[cfg(target_vendor = "apple")]
         PragmaName::Fullfsync => {
@@ -1169,7 +1171,7 @@ fn query_pragma(
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
         PragmaName::TempStore => {
             let temp_store = connection.get_temp_store();
@@ -1177,7 +1179,7 @@ fn query_pragma(
             program.emit_int(temp_store as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
     }
 }

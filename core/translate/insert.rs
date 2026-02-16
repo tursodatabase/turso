@@ -211,9 +211,9 @@ pub fn translate_insert(
     mut body: InsertBody,
     mut returning: Vec<ResultColumn>,
     with: Option<With>,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 30,
@@ -257,7 +257,7 @@ pub fn translate_insert(
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
-        program = translate_virtual_table_insert(
+        translate_virtual_table_insert(
             program,
             virtual_table.clone(),
             columns,
@@ -265,7 +265,7 @@ pub fn translate_insert(
             on_conflict,
             resolver,
         )?;
-        return Ok(program);
+        return Ok(());
     }
 
     let Some(btree_table) = table.btree() else {
@@ -277,7 +277,7 @@ pub fn translate_insert(
         mut upsert_actions,
         inserting_multiple_rows,
     } = bind_insert(
-        &mut program,
+        program,
         resolver,
         &table,
         &mut body,
@@ -286,10 +286,10 @@ pub fn translate_insert(
     )?;
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
-        ensure_sequence_initialized(&mut program, resolver.schema, &btree_table)?;
+        ensure_sequence_initialized(program, resolver.schema, &btree_table)?;
     }
 
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, table.get_name())?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, table.get_name())?;
 
     let mut table_references = TableReferences::new(
         vec![JoinedTable {
@@ -314,7 +314,7 @@ pub fn translate_insert(
     plan_ctes_as_outer_refs(
         with_for_returning,
         resolver,
-        &mut program,
+        program,
         &mut table_references,
         connection,
     )?;
@@ -323,7 +323,7 @@ pub fn translate_insert(
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut returning_subqueries = vec![];
     plan_subqueries_from_returning(
-        &mut program,
+        program,
         &mut returning_subqueries,
         &mut table_references,
         &mut returning,
@@ -341,7 +341,7 @@ pub fn translate_insert(
                 .any_resolved_fks_referencing(table_name.as_str()));
 
     let mut ctx = InsertEmitCtx::new(
-        &mut program,
+        program,
         resolver,
         &btree_table,
         on_conflict,
@@ -350,7 +350,7 @@ pub fn translate_insert(
         None,
     )?;
 
-    program = init_source_emission(
+    init_source_emission(
         program,
         &table,
         connection,
@@ -367,10 +367,10 @@ pub fn translate_insert(
     if !result_columns.is_empty() {
         program.result_columns.clone_from(&result_columns);
     }
-    let insertion = build_insertion(&mut program, &table, &columns, ctx.num_values)?;
+    let insertion = build_insertion(program, &table, &columns, ctx.num_values)?;
 
     translate_rows_and_open_tables(
-        &mut program,
+        program,
         resolver,
         &insertion,
         &ctx,
@@ -390,7 +390,7 @@ pub fn translate_insert(
         let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
 
         emit_non_from_clause_subquery(
-            &mut program,
+            program,
             resolver,
             *subquery_plan,
             &subquery.query_type,
@@ -401,7 +401,7 @@ pub fn translate_insert(
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 
     if ctx.table.has_autoincrement {
-        init_autoincrement(&mut program, &mut ctx, resolver)?;
+        init_autoincrement(program, &mut ctx, resolver)?;
     }
 
     // Fire BEFORE INSERT triggers
@@ -457,7 +457,7 @@ pub fn translate_insert(
             )
         };
         for trigger in relevant_before_triggers {
-            fire_trigger(&mut program, resolver, trigger, &trigger_ctx, connection)?;
+            fire_trigger(program, resolver, trigger, &trigger_ctx, connection)?;
         }
     }
 
@@ -485,7 +485,7 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_generation);
 
-    emit_rowid_generation(&mut program, resolver, &ctx, &insertion)?;
+    emit_rowid_generation(program, resolver, &ctx, &insertion)?;
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
@@ -521,7 +521,7 @@ pub fn translate_insert(
 
     // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
     emit_check_constraints(
-        &mut program,
+        program,
         &ctx.table.check_constraints,
         resolver,
         &ctx.table.name,
@@ -564,7 +564,7 @@ pub fn translate_insert(
         table_references: &mut table_references,
     };
     emit_preflight_constraint_checks(
-        &mut program,
+        program,
         &mut ctx,
         resolver,
         &insertion,
@@ -572,7 +572,7 @@ pub fn translate_insert(
         &mut preflight_ctx,
     )?;
 
-    emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
+    emit_notnulls(program, &ctx, &insertion, resolver)?;
 
     // Create and insert the record
     let affinity_str = insertion
@@ -594,13 +594,13 @@ pub fn translate_insert(
     // IGNORE/ROLLBACK). REPLACE inserts eagerly in the preflight phase because it needs
     // to delete-then-insert per index.
     if has_upsert || !on_replace {
-        emit_commit_phase(&mut program, resolver, &insertion, &ctx)?;
+        emit_commit_phase(program, resolver, &insertion, &ctx)?;
     }
 
     if has_fks {
         // Child-side check must run before Insert (may HALT or increment deferred counter)
         emit_fk_child_insert_checks(
-            &mut program,
+            program,
             resolver,
             &btree_table,
             insertion.first_col_register(),
@@ -666,13 +666,7 @@ pub fn translate_insert(
             TriggerContext::new(btree_table.clone(), Some(new_registers_after), None)
         };
         for trigger in relevant_after_triggers {
-            fire_trigger(
-                &mut program,
-                resolver,
-                trigger,
-                &trigger_ctx_after,
-                connection,
-            )?;
+            fire_trigger(program, resolver, trigger, &trigger_ctx_after, connection)?;
         }
     }
 
@@ -681,7 +675,7 @@ pub fn translate_insert(
         // For REPLACE: delete increments counters above; the insert path should try to repay
         // them, even for immediate/self-ref FKs.
         emit_parent_side_fk_decrement_on_insert(
-            &mut program,
+            program,
             resolver,
             &btree_table,
             &insertion,
@@ -706,7 +700,7 @@ pub fn translate_insert(
         });
 
         emit_update_sqlite_sequence(
-            &mut program,
+            program,
             resolver.schema,
             seq_cursor_id,
             r_seq_rowid,
@@ -725,7 +719,7 @@ pub fn translate_insert(
         let cdc_has_after = program.capture_data_changes_info().has_after();
         let after_record_reg = if cdc_has_after {
             Some(emit_cdc_patch_record(
-                &mut program,
+                program,
                 &table,
                 insertion.first_col_register(),
                 insertion.record_register(),
@@ -735,7 +729,7 @@ pub fn translate_insert(
             None
         };
         emit_cdc_insns(
-            &mut program,
+            program,
             resolver,
             OperationMode::INSERT,
             *cdc_cursor_id,
@@ -750,7 +744,7 @@ pub fn translate_insert(
     // Emit RETURNING results if specified
     if !result_columns.is_empty() {
         emit_returning_results(
-            &mut program,
+            program,
             &table_references,
             &result_columns,
             insertion.first_col_register(),
@@ -763,7 +757,7 @@ pub fn translate_insert(
     });
     if !upsert_actions.is_empty() {
         resolve_upserts(
-            &mut program,
+            program,
             resolver,
             &mut upsert_actions,
             &ctx,
@@ -775,12 +769,12 @@ pub fn translate_insert(
         )?;
     }
 
-    emit_epilogue(&mut program, &ctx, inserting_multiple_rows);
+    emit_epilogue(program, &ctx, inserting_multiple_rows);
 
     program.set_needs_stmt_subtransactions(true);
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
-    Ok(program)
+    Ok(())
 }
 
 fn emit_epilogue(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, inserting_multiple_rows: bool) {
@@ -1417,7 +1411,7 @@ fn bind_insert(
 /// registers later.
 #[allow(clippy::too_many_arguments, clippy::vec_box)]
 fn init_source_emission<'a>(
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     table: &Table,
     connection: &Arc<Connection>,
     ctx: &mut InsertEmitCtx<'a>,
@@ -1426,7 +1420,7 @@ fn init_source_emission<'a>(
     body: InsertBody,
     columns: &'a [ast::Name],
     table_references: &TableReferences,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     let required_column_count = if columns.is_empty() {
         table.columns().len()
     } else {
@@ -1482,15 +1476,14 @@ fn init_source_emission<'a>(
                     coroutine_implementation_start: ctx.halt_label,
                 };
                 program.incr_nesting();
-                let result =
+                let num_result_cols =
                     translate_select(select, resolver, program, query_destination, connection)?;
-                if result.num_result_cols != required_column_count {
+                if num_result_cols != required_column_count {
                     crate::bail_parse_error!(
                         "{} values for {required_column_count} columns",
-                        result.num_result_cols,
+                        num_result_cols,
                     );
                 }
-                program = result.program;
                 program.decr_nesting();
 
                 program.emit_insn(Insn::EndCoroutine { yield_reg });
@@ -1567,7 +1560,7 @@ fn init_source_emission<'a>(
 
                     program.emit_insn(Insn::MakeRecord {
                         start_reg: to_u16(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
-                        count: to_u16(result.num_result_cols),
+                        count: to_u16(num_result_cols),
                         dest_reg: to_u16(record_reg),
                         index_name: None,
                         affinity_str: Some(affinity_str),
@@ -1617,7 +1610,7 @@ fn init_source_emission<'a>(
                 }
 
                 ctx.yield_reg_opt = Some(yield_reg);
-                (result.num_result_cols, cursor_id)
+                (num_result_cols, cursor_id)
             }
         }
         InsertBody::DefaultValues => {
@@ -1638,7 +1631,7 @@ fn init_source_emission<'a>(
     };
     ctx.num_values = num_values;
     ctx.cursor_id = cursor_id;
-    Ok(program)
+    Ok(())
 }
 
 pub struct AutoincMeta {
@@ -2371,13 +2364,13 @@ fn emit_preflight_constraint_checks(
 
 // TODO: comeback here later to apply the same improvements on select
 fn translate_virtual_table_insert(
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     virtual_table: Arc<VirtualTable>,
     columns: Vec<ast::Name>,
     mut body: InsertBody,
     on_conflict: Option<ResolveType>,
     resolver: &Resolver,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     if virtual_table.readonly() {
         crate::bail_constraint_error!("Table is read-only: {}", virtual_table.name);
     }
@@ -2406,9 +2399,9 @@ fn translate_virtual_table_insert(
      * argv[1] = (rowid for insert - NULL in most cases)
      * argv[2..] = column values
      * */
-    let insertion = build_insertion(&mut program, &table, &columns, num_values)?;
+    let insertion = build_insertion(program, &table, &columns, num_values)?;
 
-    translate_rows_single(&mut program, &value, &insertion, resolver)?;
+    translate_rows_single(program, &value, &insertion, resolver)?;
     let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
 
     program.emit_insn(Insn::VUpdate {
@@ -2423,7 +2416,7 @@ fn translate_virtual_table_insert(
     let halt_label = program.allocate_label();
     program.resolve_label(halt_label, program.offset());
 
-    Ok(program)
+    Ok(())
 }
 
 ///  makes sure that an AUTOINCREMENT table has a sequence row in `sqlite_sequence`, inserting one with 0 if missing.

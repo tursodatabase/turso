@@ -28,27 +28,22 @@ use turso_parser::ast::{self, CompoundSelect, Expr};
 /// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
 const SQLITE_MAX_COLUMN: usize = 2000;
 
-pub struct TranslateSelectResult {
-    pub program: ProgramBuilder,
-    pub num_result_cols: usize,
-}
-
 pub fn translate_select(
     select: ast::Select,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
-) -> Result<TranslateSelectResult> {
+) -> Result<usize> {
     let mut select_plan = prepare_select_plan(
         select,
         resolver,
-        &mut program,
+        program,
         &[],
         query_destination,
         connection,
     )?;
-    optimize_plan(&mut program, &mut select_plan, resolver.schema)?;
+    optimize_plan(program, &mut select_plan, resolver.schema)?;
     let num_result_cols;
     let opts = match &select_plan {
         Plan::Select(select) => {
@@ -87,11 +82,8 @@ pub fn translate_select(
     };
 
     program.extend(&opts);
-    emit_program(connection, resolver, &mut program, select_plan, |_| {})?;
-    Ok(TranslateSelectResult {
-        program,
-        num_result_cols,
-    })
+    emit_program(connection, resolver, program, select_plan, |_| {})?;
+    Ok(num_result_cols)
 }
 
 pub fn prepare_select_plan(
@@ -157,7 +149,10 @@ pub fn prepare_select_plan(
             let right_most_num_result_columns = last.result_columns.len();
             for (plan, operator) in left.iter() {
                 if plan.result_columns.len() != right_most_num_result_columns {
-                    crate::bail_parse_error!("SELECTs to the left and right of {} do not have the same number of result columns", operator);
+                    crate::bail_parse_error!(
+                        "SELECTs to the left and right of {} do not have the same number of result columns",
+                        operator
+                    );
                 }
             }
             let (limit, offset) = select

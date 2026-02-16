@@ -14,8 +14,8 @@ pub fn translate_create_materialized_view(
     resolver: &Resolver,
     select_stmt: &ast::Select,
     connection: Arc<Connection>,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> Result<()> {
     // Check if experimental views are enabled
     if !connection.experimental_views_enabled() {
         return Err(crate::LimboError::ParseError(
@@ -133,7 +133,7 @@ pub fn translate_create_materialized_view(
 
     // Add the materialized view entry to sqlite_schema
     emit_schema_entry(
-        &mut program,
+        program,
         resolver,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
@@ -167,7 +167,7 @@ pub fn translate_create_materialized_view(
     );
 
     emit_schema_entry(
-        &mut program,
+        program,
         resolver,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id
@@ -194,7 +194,7 @@ pub fn translate_create_materialized_view(
         &dbsp_table_name.as_str()
     );
     emit_schema_entry(
-        &mut program,
+        program,
         resolver,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id
@@ -227,7 +227,7 @@ pub fn translate_create_materialized_view(
     });
 
     program.epilogue(resolver.schema);
-    Ok(program)
+    Ok(())
 }
 
 fn create_materialized_view_to_str(view_name: &str, select_stmt: &ast::Select) -> String {
@@ -240,8 +240,8 @@ pub fn translate_create_view(
     select_stmt: &ast::Select,
     _columns: &[ast::IndexedColumn],
     _connection: Arc<Connection>,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> Result<()> {
     let normalized_view_name = normalize_ident(view_name.as_str());
 
     // Check for name conflicts with existing schema objects
@@ -281,7 +281,7 @@ pub fn translate_create_view(
 
     // Add the view entry to sqlite_schema
     emit_schema_entry(
-        &mut program,
+        program,
         resolver,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
@@ -305,7 +305,7 @@ pub fn translate_create_view(
         p5: 0,
     });
 
-    Ok(program)
+    Ok(())
 }
 
 fn create_view_to_str(view_name: &str, select_stmt: &ast::Select) -> String {
@@ -316,8 +316,8 @@ pub fn translate_drop_view(
     schema: &Schema,
     view_name: &str,
     if_exists: bool,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> Result<()> {
     let normalized_view_name = normalize_ident(view_name);
 
     // Check if view exists (either regular or materialized)
@@ -333,7 +333,7 @@ pub fn translate_drop_view(
 
     if !view_exists && if_exists {
         // View doesn't exist but IF EXISTS was specified, nothing to do
-        return Ok(program);
+        return Ok(());
     }
 
     // If this is a materialized view, we need to destroy its btree as well
@@ -600,5 +600,5 @@ pub fn translate_drop_view(
     });
 
     program.epilogue(schema);
-    Ok(program)
+    Ok(())
 }
