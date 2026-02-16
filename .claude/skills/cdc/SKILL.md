@@ -52,6 +52,15 @@ User SQL (INSERT/UPDATE/DELETE/DDL)
 CDC behavior is controlled by two types:
 
 ```rust
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(u8)]
+enum CdcVersion {
+    V1 = 1,
+    V2 = 2,
+}
+
+const CDC_VERSION_CURRENT: CdcVersion = CdcVersion::V2;
+
 enum CaptureDataChangesMode {
     Id,          // capture only rowid
     Before,      // capture before-image
@@ -61,15 +70,20 @@ enum CaptureDataChangesMode {
 
 struct CaptureDataChangesInfo {
     mode: CaptureDataChangesMode,
-    table: String,           // CDC table name
-    version: Option<String>, // schema version (e.g. "v1")
+    table: String,                  // CDC table name
+    version: Option<CdcVersion>,    // schema version (V1 or V2)
 }
 ```
 
 The connection stores `Option<CaptureDataChangesInfo>` — `None` means CDC is off.
 
+Key methods on `CdcVersion`:
+- `has_commit_record()` — `self >= V2`, gates COMMIT record emission
+- `Display`/`FromStr` — round-trips `"v1"` ↔ `V1`, `"v2"` ↔ `V2`
+
 Key methods on `CaptureDataChangesInfo`:
-- `parse(value: &str, version: Option<String>)` — parses PRAGMA argument `"<mode>[,<table_name>]"`, returns `None` for "off"
+- `parse(value: &str, version: Option<CdcVersion>)` — parses PRAGMA argument `"<mode>[,<table_name>]"`, returns `None` for "off"
+- `cdc_version()` — returns `CdcVersion` (panics if version is None). Single accessor replacing old `is_v1()`/`is_v2()`/`version()` methods.
 - `has_before()` / `has_after()` / `has_updates()` — mode capability checks
 - `mode_name()` — returns mode as string
 
@@ -127,7 +141,7 @@ CREATE TABLE turso_cdc_version (
 );
 ```
 
-Current version: `TURSO_CDC_CURRENT_VERSION = "v2"` (defined in `core/translate/pragma.rs`)
+Current version: `CDC_VERSION_CURRENT = CdcVersion::V2` (defined in `core/lib.rs`, re-exported from `core/translate/pragma.rs`)
 
 ### Version Detection in InitCdcVersion
 
@@ -154,7 +168,8 @@ Used by `emit_cdc_insns()` to determine `change_type` value:
 ### 1. PRAGMA — Enable/Disable CDC
 
 **Set:** `core/translate/pragma.rs`
-- Parses mode string via `CaptureDataChangesInfo::parse()` with `TURSO_CDC_CURRENT_VERSION`
+- Checks MVCC is not enabled (CDC and MVCC are mutually exclusive)
+- Parses mode string via `CaptureDataChangesInfo::parse()` with `CDC_VERSION_CURRENT`
 - Emits a single `InitCdcVersion` opcode — all CDC setup (table creation, version tracking, state change) happens at execution time
 
 **Get (read current mode):** `core/translate/pragma.rs`
@@ -270,7 +285,7 @@ The sync engine is the primary consumer of CDC data.
 - **CDC config:** `DEFAULT_CDC_TABLE_NAME = "turso_cdc"`, `DEFAULT_CDC_MODE = "full"`
 - **PRAGMA name:** `CDC_PRAGMA_NAME = "unstable_capture_data_changes_conn"`
 - **Initialization:** `connect()` sets CDC pragma and caches `cdc_version` from `turso_cdc_version` table. Must be called before `iterate_changes()`.
-- **Version caching:** `cdc_version: RwLock<Option<String>>` — set by `connect()`, read by `iterate_changes()`. Panics if not set.
+- **Version caching:** `cdc_version: RwLock<Option<CdcVersion>>` — set by `connect()`, read by `iterate_changes()`. Panics if not set.
 - **Iterator:** `DatabaseChangesIterator` reads CDC table in batches, emits `DatabaseTapeOperation`. For v2, real COMMIT records from the table are emitted. For v1, a synthetic Commit is appended at end of batch. `ignore_schema_changes: true` (default) filters out `sqlite_schema` row changes but not COMMIT records.
 
 ### Sync Operations — `sync/engine/src/database_sync_operations.rs`
@@ -321,4 +336,6 @@ Run: `cargo test -- test_cdc` (integration) or `cargo test -p turso_sync_engine 
 7. **Version tracking.** CDC schema version is recorded in `turso_cdc_version` table and carried in `CaptureDataChangesInfo.version` for future schema evolution.
 8. **Atomic PRAGMA.** Connection CDC state is deferred via `pending_cdc_info` in `ProgramState` and applied only at Halt. If the PRAGMA's disk writes fail and the transaction rolls back, the connection state stays unchanged.
 9. **Per-statement COMMIT (v2).** COMMIT records are emitted once per statement (not per row), using `emit_cdc_autocommit_commit()` which checks `is_autocommit()` at runtime. In explicit transactions, only the final `COMMIT` emits a COMMIT CDC record.
-10. **Backward-compatible version detection.** Pre-existing v1 CDC tables (without `turso_cdc_version`) are detected by checking table existence before creation. Existing tables get "v1" inserted into the version table.
+10. **Backward-compatible version detection.** Pre-existing v1 CDC tables (without `turso_cdc_version`) are detected by checking table existence before creation. Existing tables get `CdcVersion::V1` inserted into the version table.
+11. **Typed version enum.** `CdcVersion` enum with `#[repr(u8)]` and `Ord`/`PartialOrd` enables feature gating via integer comparison (`has_commit_record()` = `self >= V2`). `Display`/`FromStr` handles database round-trip.
+12. **CDC and MVCC mutual exclusion.** Enabling CDC when MVCC is active (or vice versa) returns an error. Checked at PRAGMA set time and journal mode switch time.
