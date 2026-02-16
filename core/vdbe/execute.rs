@@ -10608,7 +10608,7 @@ pub fn op_alter_column(
             .expect("column being ALTERed should be named")
             .clone()
     };
-    let new_column = crate::schema::Column::from(definition.as_ref());
+    let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
 
     conn.with_schema_mut(|schema| {
