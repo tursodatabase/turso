@@ -5584,7 +5584,10 @@ fn test_concurrent_commit_yield_spin() {
             _ => {}
         }
     }
-    assert!(returned_io, "step() should return IO when pager_commit_lock is contended");
+    assert!(
+        returned_io,
+        "step() should return IO when pager_commit_lock is contended"
+    );
 
     // Release the lock and let the commit finish
     lock.unlock();
