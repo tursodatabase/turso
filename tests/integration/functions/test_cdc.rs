@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
-use turso_core::TURSO_CDC_CURRENT_VERSION;
+use turso_core::CDC_VERSION_CURRENT;
 
 use crate::common::{limbo_exec_rows, TempDatabase};
 
@@ -952,7 +952,7 @@ fn test_cdc_version_table_created(db: TempDatabase) {
         rows,
         vec![vec![
             Value::Text("turso_cdc".to_string()),
-            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
+            Value::Text(CDC_VERSION_CURRENT.to_string()),
         ]]
     );
 }
@@ -970,7 +970,7 @@ fn test_cdc_version_custom_table(db: TempDatabase) {
         rows,
         vec![vec![
             Value::Text("my_cdc".to_string()),
-            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
+            Value::Text(CDC_VERSION_CURRENT.to_string()),
         ]]
     );
 }
@@ -994,7 +994,7 @@ fn test_cdc_version_not_created_when_exists(db: TempDatabase) {
         rows,
         vec![vec![
             Value::Text("turso_cdc".to_string()),
-            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
+            Value::Text(CDC_VERSION_CURRENT.to_string()),
         ]]
     );
 }
@@ -1309,37 +1309,12 @@ fn test_cdc_version_preserves_old_version(db: TempDatabase) {
     conn.execute("INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v0')")
         .unwrap();
 
-    // Enable CDC — should preserve the existing "v0" version, not overwrite with current
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
-        .unwrap();
-
-    // Version table should still have "v0"
-    let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
-    assert_eq!(
-        rows,
-        vec![vec![
-            Value::Text("turso_cdc".to_string()),
-            Value::Text("v0".to_string()),
-        ]]
+    // Enable CDC — should fail because "v0" is an unknown version
+    let result = conn.execute("PRAGMA unstable_capture_data_changes_conn('full')");
+    assert!(
+        result.is_err(),
+        "enabling CDC with unknown version 'v0' should fail"
     );
-
-    // PRAGMA GET should also report "v0"
-    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
-    assert_eq!(
-        rows,
-        vec![vec![
-            Value::Text("full".to_string()),
-            Value::Text("turso_cdc".to_string()),
-            Value::Text("v0".to_string()),
-        ]]
-    );
-
-    // Connection state should carry "v0" version
-    let info = conn.get_capture_data_changes_info();
-    let info = info.as_ref().expect("CDC should be enabled");
-    assert_eq!(info.mode, turso_core::CaptureDataChangesMode::Full);
-    assert_eq!(info.table, "turso_cdc");
-    assert_eq!(info.version, Some("v0".to_string()));
 }
 
 #[turso_macros::test]
@@ -1370,7 +1345,7 @@ fn test_cdc_pragma_get_returns_version(db: TempDatabase) {
         vec![vec![
             Value::Text("full".to_string()),
             Value::Text("turso_cdc".to_string()),
-            Value::Text(TURSO_CDC_CURRENT_VERSION.to_string()),
+            Value::Text(CDC_VERSION_CURRENT.to_string()),
         ]]
     );
 
@@ -1446,7 +1421,7 @@ fn test_cdc_version_helper_defaults_to_v1(db: TempDatabase) {
     // version() helper should return v1 since the pre-existing table has v1 schema
     let info = conn.get_capture_data_changes_info();
     let info = info.as_ref().expect("CDC should be enabled");
-    assert_eq!(info.version(), "v1");
+    assert_eq!(info.cdc_version(), turso_core::CdcVersion::V1);
 
     // Now test with None version directly via parse (simulates old code path)
     let parsed = turso_core::CaptureDataChangesInfo::parse("full", None)
@@ -1454,7 +1429,7 @@ fn test_cdc_version_helper_defaults_to_v1(db: TempDatabase) {
         .unwrap();
     // version field is None, but version() should return current version
     assert_eq!(parsed.version, None);
-    assert_eq!(parsed.version(), TURSO_CDC_CURRENT_VERSION);
+    assert_eq!(parsed.cdc_version(), CDC_VERSION_CURRENT);
 }
 
 #[turso_macros::test]
@@ -1538,7 +1513,7 @@ fn test_cdc_drop_table_cleans_up_version(db: TempDatabase) {
         rows,
         vec![vec![
             Value::Text("turso_cdc".into()),
-            Value::Text(TURSO_CDC_CURRENT_VERSION.into())
+            Value::Text(CDC_VERSION_CURRENT.to_string())
         ]]
     );
 

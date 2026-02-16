@@ -1470,7 +1470,7 @@ pub enum Insn {
     /// are deferred to execution time via this opcode.
     InitCdcVersion {
         cdc_table_name: String,
-        version: String,
+        version: crate::CdcVersion,
         cdc_mode: String,
     },
 }

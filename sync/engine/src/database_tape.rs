@@ -23,7 +23,7 @@ pub struct DatabaseTape {
     inner: Arc<turso_core::Database>,
     cdc_table: Arc<String>,
     pragma_query: String,
-    cdc_version: std::sync::RwLock<Option<String>>,
+    cdc_version: std::sync::RwLock<Option<turso_core::CdcVersion>>,
 }
 
 const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
@@ -150,25 +150,29 @@ impl DatabaseTape {
         coro: &Coro<Ctx>,
         connection: &Arc<turso_core::Connection>,
         cdc_table: &str,
-    ) -> Result<String> {
+    ) -> Result<turso_core::CdcVersion> {
         let query =
             format!("SELECT version FROM turso_cdc_version WHERE table_name = '{cdc_table}'");
         let mut stmt = match connection.prepare(&query) {
             Ok(stmt) => stmt,
             Err(turso_core::LimboError::ParseError(err)) if err.contains("no such table") => {
-                return Ok(turso_core::TURSO_CDC_VERSION_V1.to_string())
+                return Ok(turso_core::CdcVersion::V1)
             }
             Err(err) => return Err(err.into()),
         };
         match run_stmt_expect_one_row(coro, &mut stmt).await? {
             Some(row) if !row.is_empty() => {
                 if let turso_core::Value::Text(text) = &row[0] {
-                    Ok(text.to_string())
+                    text.to_string()
+                        .parse()
+                        .map_err(|e: turso_core::LimboError| {
+                            Error::DatabaseTapeError(e.to_string())
+                        })
                 } else {
-                    Ok(turso_core::TURSO_CDC_VERSION_V1.to_string())
+                    Ok(turso_core::CdcVersion::V1)
                 }
             }
-            _ => Ok(turso_core::TURSO_CDC_VERSION_V1.to_string()),
+            _ => Ok(turso_core::CdcVersion::V1),
         }
     }
 
@@ -184,7 +188,6 @@ impl DatabaseTape {
             .cdc_version
             .read()
             .unwrap()
-            .clone()
             .expect("tape must be connected before iterate changes");
 
         Ok(DatabaseChangesIterator {
@@ -419,7 +422,7 @@ impl Default for DatabaseChangesIteratorOpts {
 pub struct DatabaseChangesIterator {
     conn: Arc<turso_core::Connection>,
     cdc_table: Arc<String>,
-    cdc_version: String,
+    cdc_version: turso_core::CdcVersion,
     query_stmt: Option<turso_core::Statement>,
     first_change_id: Option<i64>,
     batch: VecDeque<DatabaseTapeOperation>,
@@ -477,7 +480,7 @@ impl DatabaseChangesIterator {
 
         let mut last_change_id = None;
         while let Some(row) = run_stmt_once(coro, query_stmt).await? {
-            let database_change = DatabaseChange::from_row(row, &self.cdc_version)?;
+            let database_change = DatabaseChange::from_row(row, self.cdc_version)?;
             last_change_id = Some(database_change.change_id);
             if database_change.change_type == DatabaseChangeType::Commit {
                 self.batch.push_back(DatabaseTapeOperation::Commit);

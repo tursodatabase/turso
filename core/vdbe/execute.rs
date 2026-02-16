@@ -40,6 +40,7 @@ use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
     vector_distance_dot, vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
+use crate::CdcVersion;
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
@@ -60,7 +61,6 @@ use crate::{
     get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
     IOExt, MvCursor,
 };
-use crate::{TURSO_CDC_VERSION_V1, TURSO_CDC_VERSION_V2};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
@@ -8389,7 +8389,7 @@ pub fn op_init_cdc_version(
     {
         let current = conn.get_capture_data_changes_info();
         if let Some(info) = current.as_ref() {
-            let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version.clone())?;
+            let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version)?;
             state.pending_cdc_info = Some(opts);
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -8415,18 +8415,13 @@ pub fn op_init_cdc_version(
     // Step 1: Create CDC table if needed
     {
         conn.start_nested();
-        let create_sql = if version == TURSO_CDC_VERSION_V1 {
-            format!(
+        let create_sql = match version {
+            CdcVersion::V1 => format!(
                 "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
-            )
-        } else if version == TURSO_CDC_VERSION_V2 {
-            format!(
+            ),
+            CdcVersion::V2 => format!(
                 "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
-            )
-        } else {
-            return Err(LimboError::InternalError(format!(
-                "unexpected cdc version: {version}"
-            )));
+            ),
         };
         let mut stmt = conn.prepare(create_sql)?;
         stmt.program
@@ -8456,9 +8451,9 @@ pub fn op_init_cdc_version(
     // Step 3: Insert version row only if one doesn't already exist.
     // If the CDC table pre-existed without a version row, it's a legacy v1 table.
     let version_to_insert = if cdc_table_exists {
-        TURSO_CDC_VERSION_V1
+        CdcVersion::V1
     } else {
-        version
+        *version
     };
     {
         conn.start_nested();
@@ -8489,8 +8484,8 @@ pub fn op_init_cdc_version(
         conn.end_nested();
         let rows = rows?;
         match rows.first().and_then(|r| r.first()) {
-            Some(crate::Value::Text(text)) => text.to_string(),
-            _ => version.to_string(),
+            Some(crate::Value::Text(text)) => text.to_string().parse::<CdcVersion>()?,
+            _ => *version,
         }
     };
 

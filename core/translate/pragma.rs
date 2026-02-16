@@ -348,8 +348,7 @@ fn update_pragma(
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
-            let opts =
-                CaptureDataChangesInfo::parse(&value, Some(TURSO_CDC_CURRENT_VERSION.to_string()))?;
+            let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
             if opts.is_some() && connection.mvcc_enabled() {
                 bail_parse_error!("CDC is not supported in MVCC mode");
             }
@@ -363,7 +362,7 @@ fn update_pragma(
                 .unwrap_or_default();
             program.emit_insn(Insn::InitCdcVersion {
                 cdc_table_name,
-                version: TURSO_CDC_CURRENT_VERSION.to_string(),
+                version: CDC_VERSION_CURRENT,
                 cdc_mode: value,
             });
             Ok((program, TransactionMode::Write))
@@ -1043,7 +1042,7 @@ fn query_pragma(
                     program.emit_string8(info.mode_name().to_string(), register);
                     program.emit_string8(info.table.clone(), second_column);
                     match &info.version {
-                        Some(v) => program.emit_string8(v.clone(), third_column),
+                        Some(v) => program.emit_string8(v.to_string(), third_column),
                         None => program.emit_null(third_column, None),
                     }
                 }
@@ -1318,17 +1317,7 @@ fn update_cache_size(
 pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
 pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
 
-/// CDC v1 schema (8 columns):
-/// (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER,
-///  change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)
-pub const TURSO_CDC_VERSION_V1: &str = "v1";
-
-/// CDC v2 schema (9 columns) — adds `change_txn_id` column and COMMIT records (change_type=2):
-/// (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER,
-///  change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)
-pub const TURSO_CDC_VERSION_V2: &str = "v2";
-
-pub const TURSO_CDC_CURRENT_VERSION: &str = TURSO_CDC_VERSION_V2;
+pub use crate::CDC_VERSION_CURRENT;
 
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;

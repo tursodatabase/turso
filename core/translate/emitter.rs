@@ -4112,8 +4112,8 @@ pub fn emit_cdc_insns(
     table_name: &str,
 ) -> Result<()> {
     let cdc_info = program.capture_data_changes_info().as_ref();
-    if cdc_info.is_some_and(|info| info.is_v2()) {
-        emit_cdc_insns_v2(
+    match cdc_info.map(|info| info.cdc_version()) {
+        Some(crate::CdcVersion::V2) => emit_cdc_insns_v2(
             program,
             resolver,
             operation_mode,
@@ -4123,9 +4123,8 @@ pub fn emit_cdc_insns(
             after_record_reg,
             updates_record_reg,
             table_name,
-        )
-    } else if cdc_info.is_some_and(|info| info.is_v1()) {
-        emit_cdc_insns_v1(
+        ),
+        Some(crate::CdcVersion::V1) => emit_cdc_insns_v1(
             program,
             resolver,
             operation_mode,
@@ -4135,12 +4134,10 @@ pub fn emit_cdc_insns(
             after_record_reg,
             updates_record_reg,
             table_name,
-        )
-    } else {
-        Err(crate::LimboError::InternalError(format!(
-            "unexpected cdc version: {:?}",
-            cdc_info.map(|x| x.version())
-        )))
+        ),
+        None => Err(crate::LimboError::InternalError(
+            "cdc info not set".to_string(),
+        )),
     }
 }
 
@@ -4488,7 +4485,7 @@ pub fn emit_cdc_autocommit_commit(
     cdc_cursor_id: usize,
 ) -> Result<()> {
     let cdc_info = program.capture_data_changes_info().as_ref();
-    if cdc_info.is_some_and(|info| info.has_commit_record_type()) {
+    if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         // Check if we're in autocommit mode; if so, emit a COMMIT record.
         let Some(is_autocommit_fn) = resolver.resolve_function("is_autocommit", 0) else {
             bail_parse_error!("no function {}", "is_autocommit");
