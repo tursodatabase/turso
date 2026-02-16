@@ -24,6 +24,10 @@ use crate::{vdbe::builder::ProgramBuilder, Result};
 use turso_parser::ast::ResultColumn;
 use turso_parser::ast::{self, CompoundSelect, Expr};
 
+/// Maximum number of columns in a result set.
+/// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
+const SQLITE_MAX_COLUMN: usize = 2000;
+
 pub struct TranslateSelectResult {
     pub program: ProgramBuilder,
     pub num_result_cols: usize,
@@ -395,6 +399,10 @@ fn prepare_one_select_plan(
                 }
             }
 
+            if plan.result_columns.len() > SQLITE_MAX_COLUMN {
+                crate::bail_parse_error!("too many columns in result set");
+            }
+
             // This step can only be performed at this point, because all table references are now available.
             // Virtual table predicates may depend on column bindings from tables to the right in the join order,
             // so we must wait until the full set of references has been collected.
@@ -562,6 +570,9 @@ fn prepare_one_select_plan(
                 crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
             }
             let len = values[0].len();
+            if len > SQLITE_MAX_COLUMN {
+                crate::bail_parse_error!("too many columns in result set");
+            }
             let mut result_columns = Vec::with_capacity(len);
             for i in 0..len {
                 result_columns.push(ResultSetColumn {
