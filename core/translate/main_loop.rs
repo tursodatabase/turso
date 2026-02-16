@@ -1785,10 +1785,10 @@ enum LoopEmitTarget {
 
 /// Emits the bytecode for the inner loop of a query.
 /// At this point the cursors for all tables have been opened and rewound.
-pub fn emit_loop(
+pub fn emit_loop<'a>(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
-    plan: &SelectPlan,
+    t_ctx: &mut TranslateCtx<'a>,
+    plan: &'a SelectPlan,
 ) -> Result<()> {
     // if we have a group by, we emit a record into the group by sorter,
     // or if the rows are already sorted, we do the group by aggregation phase directly.
@@ -1823,10 +1823,10 @@ pub fn emit_loop(
 /// This is a helper function for inner_loop_emit,
 /// which does a different thing depending on the emit target.
 /// See the InnerLoopEmitTarget enum for more details.
-fn emit_loop_source(
+fn emit_loop_source<'a>(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
-    plan: &SelectPlan,
+    t_ctx: &mut TranslateCtx<'a>,
+    plan: &'a SelectPlan,
     emit_target: LoopEmitTarget,
 ) -> Result<()> {
     match emit_target {
@@ -1976,6 +1976,45 @@ fn emit_loop_source(
                     &t_ctx.resolver,
                 )?;
             }
+
+            // For result columns that contain aggregates but also reference
+            // non-aggregate columns (e.g. CASE WHEN SUM(1) THEN a ELSE b END),
+            // pre-read those column references while the cursor is still valid.
+            // They are cached in expr_to_reg_cache so that when the full
+            // expression is evaluated after AggFinal, translate_expr finds
+            // the cached values instead of reading from the exhausted cursor.
+            for rc in plan
+                .result_columns
+                .iter()
+                .filter(|rc| rc.contains_aggregates)
+            {
+                walk_expr(&rc.expr, &mut |expr: &'a Expr| -> Result<WalkControl> {
+                    match expr {
+                        Expr::Column { .. } | Expr::RowId { .. } => {
+                            let reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                Some(&plan.table_references),
+                                expr,
+                                reg,
+                                &t_ctx.resolver,
+                            )?;
+                            t_ctx
+                                .resolver
+                                .expr_to_reg_cache
+                                .push((Cow::Borrowed(expr), reg));
+                            Ok(WalkControl::SkipChildren)
+                        }
+                        _ => {
+                            if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
+                                return Ok(WalkControl::SkipChildren);
+                            }
+                            Ok(WalkControl::Continue)
+                        }
+                    }
+                })?;
+            }
+
             if let Some(label) = label_emit_nonagg_only_once {
                 program.resolve_label(label, program.offset());
                 let flag = t_ctx.reg_nonagg_emit_once_flag.unwrap();
