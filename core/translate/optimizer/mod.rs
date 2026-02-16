@@ -715,6 +715,13 @@ fn add_ephemeral_table_to_update_plan(
             });
     }
 
+    // Preserve outer query references from the original plan (e.g. CTEs) so that
+    // SET clause expressions referencing them can still resolve.
+    for outer_ref in table_references_ephemeral_select.outer_query_refs() {
+        plan.table_references
+            .add_outer_query_reference(outer_ref.clone());
+    }
+
     let join_order = table_references_ephemeral_select
         .joined_tables()
         .iter()

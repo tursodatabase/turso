@@ -1042,6 +1042,42 @@ pub fn emit_from_clause_subqueries(
     Ok(())
 }
 
+/// Emit coroutines for CTE outer query references in DML statements (UPDATE/DELETE).
+/// CTEs in DML are stored as outer query references with Table::FromClauseSubquery,
+/// but their coroutines are not emitted by default. This function emits them so that
+/// direct column references to CTEs (e.g. `SET a = cte.col`) can resolve the result registers.
+pub fn emit_cte_outer_ref_coroutines(
+    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
+    t_ctx: &mut TranslateCtx,
+) -> Result<()> {
+    // Collect internal IDs of CTE outer refs that need coroutine emission.
+    let cte_ids: Vec<TableInternalId> = table_references
+        .outer_query_refs()
+        .iter()
+        .filter(|r| matches!(&r.table, Table::FromClauseSubquery(_)))
+        .map(|r| r.internal_id)
+        .collect();
+
+    for id in cte_ids {
+        // Skip if already emitted (e.g. by the ephemeral select plan).
+        if program.get_subquery_result_reg(id).is_some() {
+            continue;
+        }
+        let outer_ref = table_references
+            .find_outer_query_ref_by_internal_id_mut(id)
+            .unwrap();
+        if let Table::FromClauseSubquery(from_clause_subquery) = &mut outer_ref.table {
+            let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+            let result_columns_start =
+                emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
+            from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
+            program.set_subquery_result_reg(id, result_columns_start);
+        }
+    }
+    Ok(())
+}
+
 /// Emit a FROM clause subquery and return the start register of the result columns.
 /// This is done by emitting a coroutine that stores the result columns in sequential registers.
 /// Each FROM clause subquery has its own Plan (either SelectPlan or CompoundSelect) which is wrapped in a coroutine.

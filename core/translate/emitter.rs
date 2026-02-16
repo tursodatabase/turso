@@ -50,7 +50,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::planner::{table_mask_from_expr, TableMask};
-use crate::translate::subquery::emit_non_from_clause_subquery;
+use crate::translate::subquery::{emit_cte_outer_ref_coroutines, emit_non_from_clause_subquery};
 use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
     TriggerContext,
@@ -2195,6 +2195,10 @@ fn emit_program_for_update(
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
     init_limit(program, &mut t_ctx, &plan.limit, &plan.offset)?;
+
+    // Emit coroutines for CTE outer query references so that direct column references
+    // (e.g. `SET a = cte.col`) can read from the CTE's result registers.
+    emit_cte_outer_ref_coroutines(program, &mut plan.table_references, &mut t_ctx)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
