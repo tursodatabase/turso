@@ -692,6 +692,14 @@ impl ScalarFunc {
             Self::Max | Self::Min => &[-1],
         }
     }
+
+    /// Returns true for functions that can turn NULL arguments into a non-NULL result.
+    ///
+    /// This is used by planner/optimizer logic that needs to reason about whether
+    /// predicates are null-rejecting for outer-join simplification.
+    pub fn can_mask_nulls(&self) -> bool {
+        matches!(self, Self::Coalesce | Self::IfNull)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, strum::EnumIter)]
@@ -916,6 +924,16 @@ impl Func {
             }
             // Aggregate functions with (*) syntax are handled separately in the planner
             Self::Agg(_) => false,
+            _ => false,
+        }
+    }
+
+    /// Returns true for functions that can turn NULL arguments into a non-NULL result.
+    ///
+    /// This metadata is currently used by optimizer null-rejection analysis.
+    pub fn can_mask_nulls(&self) -> bool {
+        match self {
+            Self::Scalar(scalar_func) => scalar_func.can_mask_nulls(),
             _ => false,
         }
     }
