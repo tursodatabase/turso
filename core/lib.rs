@@ -145,6 +145,9 @@ pub use vdbe::{
 };
 
 #[cfg(feature = "cli_only")]
+pub(crate) mod btree_dump;
+
+#[cfg(feature = "cli_only")]
 pub mod dbpage;
 
 pub(crate) mod sync;

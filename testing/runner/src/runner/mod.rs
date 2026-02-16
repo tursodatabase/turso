@@ -30,8 +30,8 @@ pub struct RunOptions {
     pub setups: HashMap<String, String>,
     /// Whether MVCC mode is enabled
     pub mvcc: bool,
-    /// Global skip directive
-    pub global_skip: Option<Skip>,
+    /// Global skip directives
+    pub global_skip: Vec<Skip>,
     /// Global capability requirements (used by tests)
     pub global_requires: Vec<Requirement>,
     /// Backend capabilities (used by tests)
@@ -51,7 +51,7 @@ pub trait Runnable: Clone + Send + 'static {
     fn name(&self) -> &str;
 
     /// Get the skip configuration, if any
-    fn skip(&self) -> Option<&Skip>;
+    fn skip(&self) -> &[Skip];
 
     /// Get setup references
     fn setups(&self) -> &[SetupRef];
@@ -82,8 +82,8 @@ impl Runnable for TestCase {
         &self.name
     }
 
-    fn skip(&self) -> Option<&Skip> {
-        self.modifiers.skip.as_ref()
+    fn skip(&self) -> &[Skip] {
+        &self.modifiers.skip
     }
 
     fn setups(&self) -> &[SetupRef] {
@@ -131,8 +131,8 @@ impl Runnable for SnapshotCase {
         &self.name
     }
 
-    fn skip(&self) -> Option<&Skip> {
-        self.modifiers.skip.as_ref()
+    fn skip(&self) -> &[Skip] {
+        &self.modifiers.skip
     }
 
     fn setups(&self) -> &[SetupRef] {
@@ -260,8 +260,7 @@ async fn run_single<B: SqlBackend, R: Runnable>(
 
     let test_future = async move {
         // Check if skipped (per-item skip overrides global skip)
-        let effective_skip = test.skip().or(options.global_skip.as_ref());
-        if let Some(skip) = effective_skip {
+        for skip in test.skip().iter().chain(options.global_skip.iter()) {
             let should_skip = match &skip.condition {
                 None => true, // Unconditional skip
                 Some(SkipCondition::Mvcc) => options.mvcc,

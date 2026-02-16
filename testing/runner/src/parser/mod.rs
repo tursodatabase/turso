@@ -38,7 +38,7 @@ impl Parser {
         let mut setups = HashMap::new();
         let mut tests = Vec::new();
         let mut snapshots = Vec::new();
-        let mut global_skip = None;
+        let mut global_skip = Vec::new();
         let mut global_requires = Vec::new();
 
         while !self.is_at_end() {
@@ -54,10 +54,10 @@ impl Parser {
                 }
                 // Global @skip-file or @skip-file-if: applies to all tests in the file
                 Some(Token::AtSkipFile) => {
-                    global_skip = Some(self.parse_global_skip()?);
+                    global_skip.push(self.parse_global_skip()?);
                 }
                 Some(Token::AtSkipFileIf) => {
-                    global_skip = Some(self.parse_global_skip_if()?);
+                    global_skip.push(self.parse_global_skip_if()?);
                 }
                 // Global @requires-file: applies to all tests in the file
                 Some(Token::AtRequiresFile) => {
@@ -199,7 +199,7 @@ impl Parser {
 
     fn parse_test_or_snapshot(&mut self) -> Result<TestOrSnapshot, ParseError> {
         let mut test_setups = Vec::new();
-        let mut skip = None;
+        let mut skip = vec![];
         let mut backend = None;
         let mut requires = Vec::new();
 
@@ -219,7 +219,7 @@ impl Parser {
                 Some(Token::AtSkip) => {
                     self.advance();
                     let reason = self.expect_string()?;
-                    skip = Some(ast::Skip {
+                    skip.push(ast::Skip {
                         reason,
                         condition: None,
                     });
@@ -229,7 +229,7 @@ impl Parser {
                     self.advance();
                     let condition = self.parse_skip_condition()?;
                     let reason = self.expect_string()?;
-                    skip = Some(ast::Skip {
+                    skip.push(ast::Skip {
                         reason,
                         condition: Some(condition),
                     });
@@ -866,10 +866,10 @@ expect {
         let file = parse(input).unwrap();
         assert_eq!(
             file.tests[0].modifiers.skip,
-            Some(ast::Skip {
+            vec![ast::Skip {
                 reason: "known bug".to_string(),
                 condition: None,
-            })
+            }]
         );
     }
 
@@ -890,10 +890,10 @@ expect {
         let file = parse(input).unwrap();
         assert_eq!(
             file.tests[0].modifiers.skip,
-            Some(ast::Skip {
+            vec![ast::Skip {
                 reason: "total_changes not supported in MVCC".to_string(),
                 condition: Some(ast::SkipCondition::Mvcc),
-            })
+            }]
         );
     }
 
@@ -914,10 +914,10 @@ expect {
         let file = parse(input).unwrap();
         assert_eq!(
             file.tests[0].modifiers.skip,
-            Some(ast::Skip {
+            vec![ast::Skip {
                 reason: "sqlite has different error message".to_string(),
                 condition: Some(ast::SkipCondition::Sqlite),
-            })
+            }]
         );
     }
 
@@ -1052,13 +1052,13 @@ expect {
         let file = parse(input).unwrap();
         assert_eq!(
             file.global_skip,
-            Some(ast::Skip {
+            vec![ast::Skip {
                 reason: "all tests skipped".to_string(),
                 condition: None,
-            })
+            }]
         );
         // Per-test skip should be None since we're using global skip
-        assert!(file.tests[0].modifiers.skip.is_none());
+        assert!(file.tests[0].modifiers.skip.is_empty());
     }
 
     #[test]
@@ -1085,14 +1085,14 @@ expect {
         let file = parse(input).unwrap();
         assert_eq!(
             file.global_skip,
-            Some(ast::Skip {
+            vec![ast::Skip {
                 reason: "MVCC not supported for this file".to_string(),
                 condition: Some(ast::SkipCondition::Mvcc),
-            })
+            }]
         );
         // All tests should have no per-test skip
-        assert!(file.tests[0].modifiers.skip.is_none());
-        assert!(file.tests[1].modifiers.skip.is_none());
+        assert!(file.tests[0].modifiers.skip.is_empty());
+        assert!(file.tests[1].modifiers.skip.is_empty());
     }
 
     #[test]
@@ -1112,12 +1112,12 @@ expect {
         let file = parse(input).unwrap();
         assert_eq!(
             file.global_skip,
-            Some(ast::Skip {
+            vec![ast::Skip {
                 reason: "sqlite backend not supported".to_string(),
                 condition: Some(ast::SkipCondition::Sqlite),
-            })
+            }]
         );
-        assert!(file.tests[0].modifiers.skip.is_none());
+        assert!(file.tests[0].modifiers.skip.is_empty());
     }
 
     #[test]
@@ -1275,20 +1275,20 @@ expect {
         // Global skip should be set
         assert_eq!(
             file.global_skip,
-            Some(ast::Skip {
+            vec![ast::Skip {
                 reason: "global skip reason".to_string(),
                 condition: Some(ast::SkipCondition::Mvcc),
-            })
+            }]
         );
         // First test has no per-test skip (uses global)
-        assert!(file.tests[0].modifiers.skip.is_none());
+        assert!(file.tests[0].modifiers.skip.is_empty());
         // Second test has per-test skip (overrides global)
         assert_eq!(
             file.tests[1].modifiers.skip,
-            Some(ast::Skip {
+            vec![ast::Skip {
                 reason: "per-test skip".to_string(),
                 condition: None,
-            })
+            }]
         );
     }
 
@@ -1457,7 +1457,7 @@ snapshot query-plan {
         assert_eq!(file.snapshots[0].name, "query-plan");
         assert_eq!(file.snapshots[0].sql, "SELECT * FROM users WHERE id = 1;");
         assert!(file.snapshots[0].modifiers.setups.is_empty());
-        assert!(file.snapshots[0].modifiers.skip.is_none());
+        assert!(file.snapshots[0].modifiers.skip.is_empty());
     }
 
     #[test]
@@ -1494,11 +1494,8 @@ snapshot query-plan {
 
         let file = parse(input).unwrap();
         assert_eq!(file.snapshots.len(), 1);
-        assert!(file.snapshots[0].modifiers.skip.is_some());
-        assert_eq!(
-            file.snapshots[0].modifiers.skip.as_ref().unwrap().reason,
-            "not ready"
-        );
+        assert_eq!(file.snapshots[0].modifiers.skip.len(), 1);
+        assert_eq!(file.snapshots[0].modifiers.skip[0].reason, "not ready");
     }
 
     #[test]
