@@ -1214,8 +1214,9 @@ impl Program {
                     // Instruction not complete - waiting for I/O, will resume at same PC
                     io.set_waker(waker);
                     let finished = io.finished();
+                    let is_yield = io.is_explicit_yield();
                     state.io_completions = Some(io);
-                    if !finished {
+                    if !finished || is_yield {
                         return Ok(StepResult::IO);
                     }
                     // just continue the outer loop if IO is finished so db will continue execution immediately
