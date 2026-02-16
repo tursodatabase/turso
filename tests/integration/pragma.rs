@@ -368,3 +368,11 @@ fn test_pragma_synchronous_normal(db: TempDatabase) {
     };
     assert_eq!(*count, 7, "all inserts should have succeeded");
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_cache_size_i64_min(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    // This value is i64::MIN
+    let result = conn.execute("PRAGMA cache_size=-9223372036854775808");
+    assert!(result.is_ok());
+}
