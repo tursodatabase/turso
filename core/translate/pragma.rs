@@ -82,6 +82,7 @@ pub fn translate_pragma(
             | PragmaName::TableInfo
             | PragmaName::TableXinfo
             | PragmaName::IntegrityCheck
+            | PragmaName::DatabaseList
             | PragmaName::QuickCheck => {
                 query_pragma(pragma, resolver, Some(*value), pager, connection, program)?
             }
