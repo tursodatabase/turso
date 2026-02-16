@@ -18,6 +18,10 @@ path = "lib.rs"
 name = "turso_whopper"
 path = "main.rs"
 
+[[test]]
+name = "regression_tests"
+path = "regression_tests.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
