@@ -11,6 +11,16 @@ expect {
     1a|text
 }
 
+test affinity-nan-inf-integer {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('nan'), ('inf');
+    SELECT typeof(c), quote(c) FROM t1 ORDER BY rowid;
+}
+expect {
+    text|'nan'
+    text|'inf'
+}
+
 test affinity-rowid {
     create table t(a integer);
     insert into t(rowid, a) values (1, 1);
