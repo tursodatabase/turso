@@ -69,6 +69,7 @@ expect {
     1
 }
 
+@skip-if mvcc "views not supported in mvcc"
 test group-by-view-constant-order-by {
     CREATE TABLE v3 (c1 INT);
     INSERT INTO v3 VALUES (1), (2);
