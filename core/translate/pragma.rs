@@ -1271,7 +1271,10 @@ fn update_cache_size(
     let mut cache_size_unformatted: i64 = value;
 
     let mut cache_size = if cache_size_unformatted < 0 {
-        let kb = cache_size_unformatted.abs().saturating_mul(1024);
+        let kb = cache_size_unformatted
+            .checked_abs()
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1024);
         let page_size = pager
             .io
             .block(|| pager.with_header(|header| header.page_size))
