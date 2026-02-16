@@ -3460,6 +3460,79 @@ fn test_commit_dep_threaded_commit_resolves() {
     }
 }
 
+/// Regression: the write_set.is_empty() fast path used to commit read-only
+/// transactions without checking commit dependencies. A read-only tx that
+/// speculatively read from a Preparing writer must still honour AbortNow.
+#[test]
+fn test_commit_dep_threaded_readonly_abort_cascades() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let mvcc_store = db.get_mvcc_store();
+
+    // Writer
+    let writer_conn = db.connect();
+    writer_conn.execute("BEGIN CONCURRENT").unwrap();
+    writer_conn
+        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
+        .unwrap();
+    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
+
+    let end_ts = mvcc_store.clock.get_timestamp();
+    mvcc_store
+        .txs
+        .get(&writer_tx_id)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Preparing(end_ts));
+
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+
+    let db_arc = db.get_db();
+    let reader_handle = std::thread::spawn(move || {
+        let reader_conn = db_arc.connect().unwrap();
+        reader_conn.execute("BEGIN CONCURRENT").unwrap();
+
+        // Read-only: no writes, only SELECT → triggers speculative read
+        let mut stmt = reader_conn
+            .prepare("SELECT value FROM t WHERE id = 1")
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+
+        signal_tx.send(()).unwrap();
+
+        // COMMIT on a read-only tx hits the write_set.is_empty() fast path.
+        // It must still check commit dependencies.
+        let commit_result = reader_conn.execute("COMMIT");
+        let _ = reader_conn.close();
+        (rows, commit_result)
+    });
+
+    signal_rx.recv().unwrap();
+
+    // Abort writer → cascade to read-only reader
+    mvcc_store.rollback_tx(writer_tx_id, writer_conn.pager.load().clone(), &writer_conn);
+
+    let (rows, commit_result) = reader_handle.join().unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_text().unwrap(), "modified");
+
+    // Read-only tx must still fail when its dependency aborts
+    assert!(
+        matches!(commit_result, Err(LimboError::CommitDependencyAborted)),
+        "read-only tx should fail with CommitDependencyAborted, got: {:?}",
+        commit_result
+    );
+}
+
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]

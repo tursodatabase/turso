@@ -1195,6 +1195,19 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
                 });
                 if self.write_set.is_empty() {
+                    // Even read-only transactions must honour commit dependencies.
+                    // A SELECT during normal processing may have speculatively read
+                    // from a Preparing transaction (Hekaton §2.7), incrementing our
+                    // CommitDepCounter. We must wait for those to resolve.
+                    if tx.abort_now.load(Ordering::Acquire) {
+                        return Err(LimboError::CommitDependencyAborted);
+                    }
+                    if tx.commit_dep_counter.load(Ordering::Acquire) > 0 {
+                        // Unresolved dependencies — skip validation (no writes)
+                        // and go straight to WaitForDependencies.
+                        self.state = CommitState::WaitForDependencies { end_ts };
+                        return Ok(TransitionResult::Continue);
+                    }
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
@@ -4620,9 +4633,12 @@ fn register_commit_dependency(
     dependent_tx: &Transaction,
     depended_on_tx_id: TxID,
 ) {
-    let depended_on = txs
-        .get(&depended_on_tx_id)
-        .expect("depended-on transaction should exist in txs map");
+    let Some(depended_on) = txs.get(&depended_on_tx_id) else {
+        // Transaction was already committed and removed from the map
+        // (CommitEnd calls remove_tx after setting Committed and draining
+        // CommitDepSet). Dependency is trivially resolved.
+        return;
+    };
     let depended_on = depended_on.value();
 
     // Hold lock while checking state to serialize with the drain in
