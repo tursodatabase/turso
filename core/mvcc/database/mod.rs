@@ -1651,6 +1651,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Returns true if there are committed transactions that have not yet been checkpointed
+    /// to the DB file (i.e. they only exist in the logical log / in-memory MVCC store).
+    pub fn has_uncheckpointed_changes(&self) -> bool {
+        let last_committed = self.last_committed_tx_ts.load(Ordering::SeqCst);
+        let last_checkpointed = self.durable_txid_max.load(Ordering::SeqCst);
+        last_committed > last_checkpointed
+    }
+
     /// Get the table ID from the root page.
     /// If the root page is negative, it is a non-checkpointed table and the table ID and root page are both the same negative value.
     /// If the root page is positive, it is a checkpointed table and there should be a corresponding table ID.
