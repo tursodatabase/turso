@@ -3772,12 +3772,16 @@ pub fn op_decr_jump_zero(
 fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
     let s = acc.as_float();
     let t = s + r;
-    let correction = if s.abs() > r.abs() {
-        (s - t) + r
-    } else {
-        (r - t) + s
-    };
-    state.r_err += correction;
+    // When t is infinite, the KBN correction computes inf - inf = NaN,
+    // which is meaningless. Skip compensation in that case.
+    if t.is_finite() {
+        let correction = if s.abs() > r.abs() {
+            (s - t) + r
+        } else {
+            (r - t) + s
+        };
+        state.r_err += correction;
+    }
     *acc = Value::from_f64(t);
 }
 
@@ -3935,12 +3939,16 @@ fn update_agg_payload(
             // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
             let s = sum_val.as_float();
             let t = s + val;
-            let correction = if s.abs() > val.abs() {
-                (s - t) + val
-            } else {
-                (val - t) + s
-            };
-            *r_err_val = Value::from_f64(r_err + correction);
+            // When t is infinite, the KBN correction computes inf - inf = NaN,
+            // which is meaningless. Skip compensation in that case.
+            if t.is_finite() {
+                let correction = if s.abs() > val.abs() {
+                    (s - t) + val
+                } else {
+                    (val - t) + s
+                };
+                *r_err_val = Value::from_f64(r_err + correction);
+            }
             *sum_val = Value::from_f64(t);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
