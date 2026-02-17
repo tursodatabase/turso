@@ -13,7 +13,7 @@ use super::{
         ConditionMetadata, NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
-    optimizer::Optimizable,
+    optimizer::{constraints::BinaryExprSide, Optimizable},
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
         Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, IterationDirection,
@@ -25,7 +25,7 @@ use super::{
 use crate::{
     schema::{Index, Table},
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
         expr::comparison_affinity,
         planner::{table_mask_from_expr, TableMask},
@@ -514,15 +514,25 @@ fn emit_hash_build_phase(
         key_affinities.push(affinity.aff_mask());
     }
 
-    // Extract collations for each join key expression
+    // Extract collations for each join key by examining both sides of the comparison.
+    // This follows SQLite's collation precedence rules using the original LHS/RHS
+    // of the comparison, not the build/probe assignment (which can be swapped by the
+    // optimizer based on ORDER BY or cost estimates).
     let collations: Vec<CollationSeq> = hash_join_op
         .join_keys
         .iter()
         .map(|join_key| {
-            let build_expr = join_key.get_build_expr(predicates);
-            get_collseq_from_expr(build_expr, table_references)
-                .ok()
-                .flatten()
+            let (original_lhs, original_rhs) = match join_key.build_side {
+                BinaryExprSide::Lhs => (
+                    join_key.get_build_expr(predicates),
+                    join_key.get_probe_expr(predicates),
+                ),
+                BinaryExprSide::Rhs => (
+                    join_key.get_probe_expr(predicates),
+                    join_key.get_build_expr(predicates),
+                ),
+            };
+            resolve_comparison_collseq(original_lhs, original_rhs, table_references)
                 .unwrap_or(CollationSeq::Binary)
         })
         .collect();

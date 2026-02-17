@@ -98,6 +98,36 @@ pub fn get_collseq_from_expr(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
 ) -> Result<Option<CollationSeq>> {
+    let (explicit, column) = get_collseq_parts_from_expr(top_expr, referenced_tables)?;
+    Ok(explicit.or(column))
+}
+
+/// Resolve the collation for a binary comparison (=, <, >, etc.) per SQLite rules:
+/// 1. Explicit COLLATE operator on either side wins (LHS takes precedence)
+/// 2. Column with defined collation on either side wins (LHS takes precedence)
+/// 3. Otherwise BINARY
+pub fn resolve_comparison_collseq(
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<CollationSeq> {
+    let (lhs_explicit, lhs_column) = get_collseq_parts_from_expr(lhs_expr, referenced_tables)?;
+    let (rhs_explicit, rhs_column) = get_collseq_parts_from_expr(rhs_expr, referenced_tables)?;
+    Ok(lhs_explicit
+        .or(rhs_explicit)
+        .or(lhs_column)
+        .or(rhs_column)
+        .unwrap_or(CollationSeq::Binary))
+}
+
+/// Returns (explicit_collation, column_collation) from a single expression.
+/// Explicit collation comes from COLLATE operators; column collation comes from
+/// column definitions. These are kept separate to allow proper precedence resolution
+/// in binary comparisons.
+fn get_collseq_parts_from_expr(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
     let mut maybe_column_collseq = None;
     let mut maybe_explicit_collseq = None;
 
@@ -142,7 +172,7 @@ pub fn get_collseq_from_expr(
         Ok(WalkControl::Continue)
     })?;
 
-    Ok(maybe_explicit_collseq.or(maybe_column_collseq))
+    Ok((maybe_explicit_collseq, maybe_column_collseq))
 }
 
 #[cfg(test)]
@@ -343,6 +373,85 @@ mod tests {
         };
         let collseq = get_collseq_from_expr(&expr, &table_references).unwrap();
         assert_eq!(collseq, Some(CollationSeq::NoCase));
+    }
+
+    #[test]
+    fn test_resolve_comparison_collseq_nocase_column_vs_binary_default() {
+        // LHS has NOCASE column, RHS has no collation → NOCASE
+        let table_refs = get_table_references_two_tables_single_column_with_collations(
+            Some(CollationSeq::NoCase),
+            None,
+        );
+        let lhs = Expr::Column {
+            database: None,
+            table: TableInternalId::from(1),
+            column: 0,
+            is_rowid_alias: false,
+        };
+        let rhs = Expr::Column {
+            database: None,
+            table: TableInternalId::from(2),
+            column: 0,
+            is_rowid_alias: false,
+        };
+        assert_eq!(
+            resolve_comparison_collseq(&lhs, &rhs, &table_refs).unwrap(),
+            CollationSeq::NoCase
+        );
+        // Swapped: RHS has NOCASE, LHS has no collation → still NOCASE
+        assert_eq!(
+            resolve_comparison_collseq(&rhs, &lhs, &table_refs).unwrap(),
+            CollationSeq::NoCase
+        );
+    }
+
+    #[test]
+    fn test_resolve_comparison_collseq_explicit_beats_column() {
+        // LHS column is NOCASE, but RHS has explicit RTRIM → RTRIM wins
+        let table_refs = get_table_references_two_tables_single_column_with_collations(
+            Some(CollationSeq::NoCase),
+            None,
+        );
+        let lhs = Expr::Column {
+            database: None,
+            table: TableInternalId::from(1),
+            column: 0,
+            is_rowid_alias: false,
+        };
+        let rhs = Expr::Collate(
+            Box::new(Expr::Column {
+                database: None,
+                table: TableInternalId::from(2),
+                column: 0,
+                is_rowid_alias: false,
+            }),
+            Name::exact("RTRIM".to_string()),
+        );
+        assert_eq!(
+            resolve_comparison_collseq(&lhs, &rhs, &table_refs).unwrap(),
+            CollationSeq::Rtrim
+        );
+    }
+
+    #[test]
+    fn test_resolve_comparison_collseq_both_default_is_binary() {
+        let table_refs = get_table_references_two_tables_single_column_with_collations(None, None);
+        let lhs = Expr::Column {
+            database: None,
+            table: TableInternalId::from(1),
+            column: 0,
+            is_rowid_alias: false,
+        };
+        let rhs = Expr::Column {
+            database: None,
+            table: TableInternalId::from(2),
+            column: 0,
+            is_rowid_alias: false,
+        };
+        assert_eq!(
+            resolve_comparison_collseq(&lhs, &rhs, &table_refs).unwrap(),
+            CollationSeq::Binary
+        );
     }
 
     // Helpers //
