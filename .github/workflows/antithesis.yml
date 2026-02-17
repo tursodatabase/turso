@@ -66,4 +66,3 @@ jobs:
         test_name: ${{ github.event.inputs.test_name }}
         additional_parameters: |-
           antithesis.duration=${{ github.event.inputs.duration }}
-          antithesis.source=${{ github.ref_name }}

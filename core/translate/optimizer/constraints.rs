@@ -12,7 +12,6 @@ use crate::{
     vdbe::affinity::Affinity,
     Result,
 };
-use crate::{turso_assert, turso_debug_assert};
 use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
@@ -1069,7 +1068,7 @@ pub fn constraints_from_where_clause(
                         index.expression_to_index_pos(&normalized)
                     }),
                 } {
-                    turso_assert!(
+                    assert!(
                         constraint.usable,
                         "constraint collation must match table column collation"
                     );
@@ -1169,7 +1168,7 @@ impl SeekRangeConstraint {
         lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
         upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
     ) -> Self {
-        turso_assert!(lower_bound.is_some() || upper_bound.is_some());
+        assert!(lower_bound.is_some() || upper_bound.is_some());
         Self {
             sort_order,
             eq: None,
@@ -1212,7 +1211,7 @@ pub fn usable_constraints_for_join_order<'a>(
     refs: &'a [ConstraintRef],
     join_order: &[JoinOrderMember],
 ) -> Vec<RangeConstraintRef> {
-    turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
+    debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
 
     let table_idx = join_order.last().unwrap().original_idx;
     let lhs_mask = TableMask::from_table_number_iter(

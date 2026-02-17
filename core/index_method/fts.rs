@@ -1,6 +1,4 @@
 use crate::sync::Arc;
-use crate::turso_assert;
-use crate::turso_debug_assert;
 use crate::{
     index_method::{
         parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
@@ -13,6 +11,7 @@ use crate::{
         pager::Pager,
     },
     translate::collate::CollationSeq,
+    turso_assert,
     types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text},
     vdbe::Register,
     Connection, LimboError, Result, Value,
@@ -980,10 +979,12 @@ impl FileHandle for LazyFileHandle {
             };
 
             // Defensive bounds check - should not be needed if logic is correct
-            turso_debug_assert!(
+            debug_assert!(
                 local_start <= chunk.len() && local_end <= chunk.len(),
-                "chunk slice out of bounds",
-                { "local_start": local_start, "local_end": local_end, "chunk_len": chunk.len() }
+                "chunk slice out of bounds: local_start={}, local_end={}, chunk_len={}",
+                local_start,
+                local_end,
+                chunk.len()
             );
             let local_end = local_end.min(chunk.len());
             let local_start = local_start.min(local_end);
@@ -2443,8 +2444,8 @@ impl Drop for FtsCursor {
         // "dirty pages must be empty for read txn" panic on the next read.
         turso_assert!(
             conn.is_in_write_tx(),
-            "FTS Drop: transaction already committed, cannot flush",
-            { "pending_docs_count": self.pending_docs_count }
+            "FTS Drop: {} docs remaining: transaction already committed, cannot flush",
+            self.pending_docs_count
         );
 
         // Commit any pending writes to Tantivy

@@ -1,4 +1,3 @@
-use crate::turso_debug_assert;
 use branches::{mark_unlikely, unlikely};
 use either::Either;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
@@ -143,7 +142,7 @@ impl<T: AnyText> Extendable<T> for Text {
                 let needed = other_str.len();
                 if s.capacity() >= needed {
                     // SAFETY: capacity >= needed, source is valid UTF-8
-                    turso_debug_assert!(
+                    debug_assert!(
                         s.as_ptr().wrapping_add(s.len()) <= other_str.as_ptr()
                             || other_str.as_ptr().wrapping_add(other_str.len()) <= s.as_ptr(),
                         "source and destination ranges must not overlap"
@@ -171,7 +170,7 @@ impl<T: AnyBlob> Extendable<T> for Vec<u8> {
         let needed = other_slice.len();
         if self.capacity() >= needed {
             // SAFETY: capacity >= needed
-            turso_debug_assert!(
+            debug_assert!(
                 self.as_ptr().wrapping_add(self.len()) <= other_slice.as_ptr()
                     || other_slice.as_ptr().wrapping_add(other_slice.len()) <= self.as_ptr(),
                 "source and destination ranges must not overlap"
@@ -2166,7 +2165,7 @@ where
     let string_len = (first_serial_type as usize - 13) / 2;
     let data_start = header_size;
 
-    turso_debug_assert!(data_start + string_len <= payload.len());
+    debug_assert!(data_start + string_len <= payload.len());
 
     let serial_type = SerialType::try_from(first_serial_type)?;
     let (lhs_value, _) = read_value(&payload[data_start..], serial_type)?;
@@ -2253,7 +2252,7 @@ where
 
     let (header_size, mut header_pos) = read_varint(payload)?;
     let header_end = header_size as usize;
-    turso_debug_assert!(header_end <= payload.len());
+    debug_assert!(header_end <= payload.len());
 
     let mut data_pos = header_size as usize;
 

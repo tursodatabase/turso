@@ -1,5 +1,4 @@
 //! Check for additional syntax error
-
 use crate::ast::*;
 
 impl Cmd {
@@ -136,8 +135,8 @@ impl OneSelect {
 
                 #[cfg(debug_assertions)]
                 for row in values {
-                    assert_ne!(row.len(), 0, "Values row should not be empty");
-                    assert_eq!(
+                    debug_assert!(!row.is_empty(), "Values row should not be empty");
+                    debug_assert_eq!(
                         row.len(),
                         values[0].len(),
                         "All rows in VALUES should have the same length"

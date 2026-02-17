@@ -98,15 +98,14 @@
 //!
 //! Frame-level atomicity only: torn tails are discarded; partially written frames are not salvaged.
 #![allow(dead_code)]
-
 use crate::io::FileSyncType;
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::turso_assert;
 use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint_to_vec},
+    turso_assert,
     types::IndexInfo,
     Buffer, Completion, CompletionError, LimboError, Result,
 };
@@ -1165,8 +1164,8 @@ impl StreamingLogicalLogReader {
             let buffer_size_before_read = self.buffer.read().len();
             turso_assert!(
                 buffer_size_before_read >= self.buffer_offset,
-                "buffer_size_before_read < buffer_offset",
-                { "buffer_size_before_read": buffer_size_before_read, "buffer_offset": self.buffer_offset }
+                "buffer_size_before_read={buffer_size_before_read} < buffer_offset={}",
+                self.buffer_offset
             );
             let bytes_available_in_buffer = buffer_size_before_read - self.buffer_offset;
             let still_need = need.saturating_sub(bytes_available_in_buffer);
@@ -1177,8 +1176,9 @@ impl StreamingLogicalLogReader {
 
             turso_assert!(
                 self.file_size >= self.offset,
-                "file_size < offset",
-                { "file_size": self.file_size, "offset": self.offset }
+                "file_size={} < offset={}",
+                self.file_size,
+                self.offset
             );
             let to_read = 4096.max(still_need).min(self.file_size - self.offset);
 

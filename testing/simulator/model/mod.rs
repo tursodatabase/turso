@@ -17,7 +17,6 @@ use sql_generation::model::{
     table::{Column, ColumnType, Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
 use turso_core::Value;
-use turso_core::turso_assert_eq;
 use turso_parser::ast::Distinctness;
 
 use crate::runner::env::TransactionMode;
@@ -775,7 +774,7 @@ impl Shadow for Insert {
                                         Some(conflict_idx),
                                     )?;
 
-                                    staged_rows[conflict_idx].clone_from(&new_row);
+                                    staged_rows[conflict_idx] = new_row.clone();
                                     staged_ops.push(StagedOp::Update { old_row, new_row });
                                 }
                             }
@@ -1034,8 +1033,7 @@ impl Shadow for Update {
                                     then_value,
                                     else_column,
                                 } => {
-                                    #[cfg(debug_assertions)]
-                                    turso_assert_eq!(else_column, column);
+                                    debug_assert_eq!(else_column, column);
                                     if condition.test(old_row, &t2) {
                                         new_row[idx] = then_value.clone();
                                     }
@@ -1106,7 +1104,7 @@ impl Shadow for Update {
         // Second pass: apply the updates
         if let Some(table) = tables.iter_mut().find(|t| t.name == self.table) {
             for (row_idx, _, new_row) in &updates {
-                table.rows[*row_idx].clone_from(new_row);
+                table.rows[*row_idx] = new_row.clone();
             }
         }
 
@@ -1159,7 +1157,7 @@ impl Shadow for AlterTable {
 
         match &self.alter_table_type {
             AlterTableType::RenameTo { new_name } => {
-                table.name.clone_from(new_name);
+                table.name = new_name.clone();
             }
             AlterTableType::AddColumn { column } => {
                 table.columns.push(column.clone());
@@ -1173,18 +1171,18 @@ impl Shadow for AlterTable {
                 table.indexes.iter_mut().for_each(|index| {
                     index.columns.iter_mut().for_each(|(col_name, _)| {
                         if col_name == old {
-                            col_name.clone_from(&new.name);
+                            *col_name = new.name.clone();
                         }
                     });
                 });
             }
             AlterTableType::RenameColumn { old, new } => {
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
-                col.name.clone_from(new);
+                col.name = new.clone();
                 table.indexes.iter_mut().for_each(|index| {
                     index.columns.iter_mut().for_each(|(col_name, _)| {
                         if col_name == old {
-                            col_name.clone_from(new);
+                            *col_name = new.clone();
                         }
                     });
                 });

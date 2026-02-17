@@ -150,7 +150,6 @@ impl TempDatabaseBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn with_io_uring(mut self, enable: bool) -> Self {
         self.io_uring = enable;
         self

@@ -1,6 +1,5 @@
 use indexmap::IndexSet;
 use sql_generation::model::query::alter_table::{AlterTable, AlterTableType};
-use turso_core::turso_assert_eq;
 
 use crate::{
     SandboxedResult, SimulatorEnv,
@@ -266,8 +265,7 @@ impl InteractionPlan {
             }
         }
 
-        #[cfg(debug_assertions)]
-        turso_assert_eq!(self.len(), retain_map.len());
+        debug_assert_eq!(self.len(), retain_map.len());
 
         let mut idx = 0;
         // Remove all properties that do not use the failing tables

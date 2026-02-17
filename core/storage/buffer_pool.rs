@@ -3,8 +3,7 @@ use crate::fast_lock::SpinLock;
 use crate::io::TEMP_BUFFER_CACHE;
 use crate::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
-use crate::turso_assert;
-use crate::{Buffer, LimboError, IO};
+use crate::{turso_assert, Buffer, LimboError, IO};
 
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
@@ -146,8 +145,9 @@ impl BufferPool {
     fn new(arena_size: usize) -> Self {
         turso_assert!(
             (Self::MIN_ARENA_SIZE..Self::MAX_ARENA_SIZE).contains(&arena_size),
-            "Arena size out of valid range",
-            { "arena_size": arena_size, "min": Self::MIN_ARENA_SIZE, "max": Self::MAX_ARENA_SIZE }
+            "Arena size needs to be between {}..{} bytes",
+            Self::MIN_ARENA_SIZE,
+            Self::MAX_ARENA_SIZE
         );
         Self {
             inner: UnsafeCell::new(PoolInner {

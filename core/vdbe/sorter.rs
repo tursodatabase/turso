@@ -1,4 +1,3 @@
-use crate::{turso_assert, turso_assert_eq};
 use branches::mark_unlikely;
 use turso_parser::ast::SortOrder;
 
@@ -17,6 +16,7 @@ use crate::{
     io::{Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
+    turso_assert,
     types::{IOResult, ImmutableRecord, KeyInfo, ValueRef},
     Result,
 };
@@ -96,7 +96,7 @@ impl Sorter {
         io: Arc<dyn IO>,
         temp_store: crate::TempStore,
     ) -> Self {
-        turso_assert_eq!(order.len(), collations.len());
+        assert_eq!(order.len(), collations.len());
         Self {
             arena: Bump::new(),
             records: Vec::new(),
@@ -681,7 +681,7 @@ impl SortedChunk {
         record_size_lengths: Vec<usize>,
         chunk_size: usize,
     ) -> Result<Completion> {
-        turso_assert_eq!(*self.io_state.read(), SortedChunkIOState::None);
+        assert!(*self.io_state.read() == SortedChunkIOState::None);
         *self.io_state.write() = SortedChunkIOState::WaitingForWrite;
         self.chunk_size = chunk_size;
 

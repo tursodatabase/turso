@@ -4,7 +4,6 @@ use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
 };
-use crate::turso_assert;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -14,7 +13,7 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, PlatformIO, IO},
-    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate,
+    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
     AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesInfo,

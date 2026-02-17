@@ -623,10 +623,10 @@ impl PageCache {
 
         while examined < max_examinations {
             // Clock hand should never be null here since we checked len() > 0
-            turso_assert!(
+            assert!(
                 !self.clock_hand.is_null(),
-                "page_cache: clock hand is null during eviction",
-                { "entries": self.len() }
+                "clock hand is null but cache has {} entries",
+                self.len()
             );
 
             let entry_ptr = self.clock_hand;

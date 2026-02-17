@@ -2,7 +2,6 @@
 //! More info: https://www.sqlite.org/pragma.html.
 
 use crate::sync::Arc;
-use crate::turso_soft_unreachable;
 use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::PragmaName;
@@ -1284,7 +1283,6 @@ fn update_cache_size(
             .unwrap_or_default()
             .get() as i64;
         if page_size == 0 {
-            turso_soft_unreachable!("Page size cannot be zero");
             return Err(LimboError::InternalError(
                 "Page size cannot be zero".to_string(),
             ));

@@ -1,5 +1,7 @@
 use turso_parser::ast::{Expr, SortOrder};
 
+use std::{borrow::Cow, collections::HashSet, sync::Arc};
+
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     emitter::{
@@ -31,7 +33,7 @@ use crate::{
         subquery::emit_non_from_clause_subquery,
         window::emit_window_loop_source,
     },
-    turso_assert, turso_assert_eq,
+    turso_assert,
     types::SeekOp,
     vdbe::{
         affinity::{self, Affinity},
@@ -44,8 +46,6 @@ use crate::{
     },
     Result,
 };
-use std::{borrow::Cow, collections::HashSet, sync::Arc};
-use turso_macros::turso_assert_some;
 
 // Metadata for handling LEFT JOIN operations
 #[derive(Debug)]
@@ -110,17 +110,16 @@ pub fn init_loop(
     join_order: &[JoinOrderMember],
     subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
-    turso_assert_eq!(
-        t_ctx.meta_left_joins.len(),
-        tables.joined_tables().len(),
-        "meta_left_joins length must match tables length"
+    assert!(
+        t_ctx.meta_left_joins.len() == tables.joined_tables().len(),
+        "meta_left_joins length does not match tables length"
     );
 
     if matches!(
         &mode,
         OperationMode::INSERT | OperationMode::UPDATE { .. } | OperationMode::DELETE
     ) {
-        turso_assert_eq!(tables.joined_tables().len(), 1);
+        assert!(tables.joined_tables().len() == 1);
         let changed_table = &tables.joined_tables()[0].table;
         let prepared =
             prepare_cdc_if_necessary(program, t_ctx.resolver.schema, changed_table.get_name())?;
@@ -131,9 +130,8 @@ pub fn init_loop(
 
     // Initialize distinct aggregates using hash tables
     for agg in aggregates.iter_mut().filter(|agg| agg.is_distinct()) {
-        turso_assert_eq!(
-            agg.args.len(),
-            1,
+        assert!(
+            agg.args.len() == 1,
             "DISTINCT aggregate functions must have exactly one argument"
         );
         let collations = vec![
@@ -1647,7 +1645,7 @@ pub fn open_loop(
         )?;
 
         for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
-            turso_assert!(subquery.correlated, "subquery must be correlated");
+            assert!(subquery.correlated, "subquery must be correlated");
             let eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
 
             if eval_at != EvalAt::Loop(join_index) {
@@ -2026,9 +2024,9 @@ fn emit_loop_source<'a>(
             Ok(())
         }
         LoopEmitTarget::QueryResult => {
-            turso_assert!(
+            assert!(
                 plan.aggregates.is_empty(),
-                "QueryResult target should not have aggregates"
+                "We should not get here with aggregates"
             );
             let offset_jump_to = t_ctx
                 .labels_main_loop
@@ -2161,11 +2159,9 @@ pub fn close_loop(
                 // Materialized subqueries with ephemeral indexes are allowed
                 let is_materialized_subquery = matches!(&table.table, Table::FromClauseSubquery(_))
                     && matches!(search, Search::Seek { index: Some(idx), .. } if idx.ephemeral);
-                turso_assert_some!(
-                    {
-                        is_from_clause: !matches!(table.table, Table::FromClauseSubquery(_)),
-                        is_materialized_subquery: is_materialized_subquery
-                    },
+                assert!(
+                    !matches!(table.table, Table::FromClauseSubquery(_))
+                        || is_materialized_subquery,
                     "Subqueries do not support index seeks unless materialized"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
@@ -2726,7 +2722,7 @@ fn emit_autoindex(
     num_seek_keys: usize,
     seek_def: &SeekDef,
 ) -> Result<AutoIndexResult> {
-    turso_assert!(index.ephemeral, "index must be ephemeral", { "index_name": &index.name });
+    assert!(index.ephemeral, "Index {} is not ephemeral", index.name);
     let label_ephemeral_build_end = program.allocate_label();
     // Since this typically happens in an inner loop, we only build it once.
     program.emit_insn(Insn::Once {

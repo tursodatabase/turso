@@ -1,4 +1,3 @@
-use crate::turso_assert_eq;
 use core::fmt::{self, Debug};
 use std::{
     sync::{
@@ -219,7 +218,7 @@ impl GroupCompletion {
     }
 
     pub fn callback(&self, result: Result<i32, CompletionError>) {
-        turso_assert_eq!(
+        assert_eq!(
             self.inner.outstanding.load(Ordering::SeqCst),
             0,
             "callback called before all completions finished"

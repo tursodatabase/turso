@@ -1,5 +1,4 @@
 #![allow(unused_variables, dead_code)]
-use crate::turso_assert;
 use crate::{LimboError, Result};
 use aegis::aegis128l::Aegis128L;
 use aegis::aegis128x2::Aegis128X2;
@@ -612,6 +611,7 @@ impl EncryptionContext {
 
         #[cfg(debug_assertions)]
         {
+            use crate::turso_assert;
             let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
             turso_assert!(
                 reserved_bytes_zeroed,
@@ -696,7 +696,7 @@ impl EncryptionContext {
         );
 
         // since this is page 1, this must have header
-        turso_assert!(
+        crate::turso_assert!(
             page.starts_with(SQLITE_HEADER),
             "Page 1 must start with SQLite header"
         );
@@ -706,6 +706,7 @@ impl EncryptionContext {
 
         #[cfg(debug_assertions)]
         {
+            use crate::turso_assert;
             // In debug builds, ensure that the reserved bytes are zeroed out. So even when we are
             // reusing a page from buffer pool, we zero out in debug build so that we can be
             // sure that b tree layer is not writing any data into the reserved space.

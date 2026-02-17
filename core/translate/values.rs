@@ -2,7 +2,6 @@ use crate::translate::emitter::TranslateCtx;
 use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 use crate::translate::plan::{QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_offset;
-use crate::turso_assert_eq;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{to_u16, IdxInsertFlags, InsertFlags, Insn};
 use crate::vdbe::BranchOffset;
@@ -211,11 +210,7 @@ fn emit_values_to_destination(
             result_reg_start,
             num_regs,
         } => {
-            turso_assert_eq!(
-                row_len,
-                *num_regs,
-                "row value subqueries must have matching result columns and registers"
-            );
+            assert!(row_len == *num_regs, "Row value subqueries should have the same number of result columns as the number of registers");
             program.emit_insn(Insn::Copy {
                 src_reg: start_reg,
                 dst_reg: *result_reg_start,
