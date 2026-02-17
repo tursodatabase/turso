@@ -11356,13 +11356,18 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                         return false;
                     }
 
-                    // For affinity conversion, only convert strings that are entirely numeric
-                    let num = if let Ok(i) = text.parse::<i64>() {
-                        Value::from_i64(i)
-                    } else if let Ok(f) = text.parse::<f64>() {
-                        Value::from_f64(f)
-                    } else {
-                        return false;
+                    let (parse_result, parsed_value) = try_for_float(text.as_bytes());
+                    let num = match parse_result {
+                        NumericParseResult::NotNumeric | NumericParseResult::ValidPrefixOnly => {
+                            return false;
+                        }
+                        NumericParseResult::PureInteger | NumericParseResult::HasDecimalOrExp => {
+                            match parsed_value {
+                                ParsedNumber::Integer(i) => Value::from_i64(i),
+                                ParsedNumber::Float(f) => Value::from_f64(f),
+                                ParsedNumber::None => return false,
+                            }
+                        }
                     };
 
                     match num {
@@ -12669,6 +12674,35 @@ mod tests {
                     panic!("String '{input}' should NOT be converted to integer");
                 }
                 other => panic!("Unexpected value type: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_affinity_keeps_nan_inf_text() {
+        let cases = ["nan", "inf"];
+
+        for input in cases {
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Integer);
+            match register {
+                Register::Value(Value::Text(t)) => {
+                    assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
+                }
+                other => {
+                    panic!("'{input}' should remain text, got {other:?}");
+                }
+            }
+
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Numeric);
+            match register {
+                Register::Value(Value::Text(t)) => {
+                    assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
+                }
+                other => {
+                    panic!("'{input}' should remain text, got {other:?}");
+                }
             }
         }
     }
