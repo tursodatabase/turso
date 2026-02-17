@@ -78,6 +78,9 @@ pub struct Connection {
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
     pub(super) wal_auto_checkpoint_disabled: AtomicBool,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
+    /// CDC v2: transaction ID for grouping CDC records by transaction.
+    /// -1 means unset (will be assigned on first CDC write in the transaction).
+    pub(crate) cdc_transaction_id: AtomicI64,
     pub(super) closed: AtomicBool,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
@@ -996,6 +999,12 @@ impl Connection {
     }
     pub fn set_capture_data_changes_info(&self, opts: Option<CaptureDataChangesInfo>) {
         *self.capture_data_changes.write() = opts;
+    }
+    pub fn get_cdc_transaction_id(&self) -> i64 {
+        self.cdc_transaction_id.load(Ordering::SeqCst)
+    }
+    pub fn set_cdc_transaction_id(&self, id: i64) {
+        self.cdc_transaction_id.store(id, Ordering::SeqCst);
     }
     pub fn get_page_size(&self) -> PageSize {
         let value = self.page_size.load(Ordering::SeqCst);

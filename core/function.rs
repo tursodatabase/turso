@@ -465,6 +465,8 @@ pub enum ScalarFunc {
     StatInit,
     StatPush,
     StatGet,
+    ConnTxnId,
+    IsAutocommit,
 }
 
 impl Deterministic for ScalarFunc {
@@ -532,6 +534,8 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::StatInit => false, // internal ANALYZE function
             ScalarFunc::StatPush => false, // internal ANALYZE function
             ScalarFunc::StatGet => false,  // internal ANALYZE function
+            ScalarFunc::ConnTxnId => false, // depends on connection state
+            ScalarFunc::IsAutocommit => false, // depends on connection state
         }
     }
 }
@@ -601,6 +605,8 @@ impl Display for ScalarFunc {
             Self::StatInit => "stat_init",
             Self::StatPush => "stat_push",
             Self::StatGet => "stat_get",
+            Self::ConnTxnId => "conn_txn_id",
+            Self::IsAutocommit => "is_autocommit",
         };
         write!(f, "{str}")
     }
@@ -619,6 +625,8 @@ impl ScalarFunc {
                 | Self::Detach
                 | Self::TableColumnsJsonArray
                 | Self::BinRecordJsonObject
+                | Self::ConnTxnId
+                | Self::IsAutocommit
         )
     }
 
@@ -687,7 +695,9 @@ impl ScalarFunc {
             | Self::Attach
             | Self::Detach
             | Self::TableColumnsJsonArray
-            | Self::BinRecordJsonObject => &[0],
+            | Self::BinRecordJsonObject
+            | Self::ConnTxnId
+            | Self::IsAutocommit => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
         }
@@ -1120,6 +1130,8 @@ impl Func {
             "soundex" => Ok(Self::Scalar(ScalarFunc::Soundex)),
             "table_columns_json_array" => Ok(Self::Scalar(ScalarFunc::TableColumnsJsonArray)),
             "bin_record_json_object" => Ok(Self::Scalar(ScalarFunc::BinRecordJsonObject)),
+            "conn_txn_id" => Ok(Self::Scalar(ScalarFunc::ConnTxnId)),
+            "is_autocommit" => Ok(Self::Scalar(ScalarFunc::IsAutocommit)),
             "acos" => Ok(Self::Math(MathFunc::Acos)),
             "acosh" => Ok(Self::Math(MathFunc::Acosh)),
             "asin" => Ok(Self::Math(MathFunc::Asin)),

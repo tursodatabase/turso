@@ -71,7 +71,6 @@ use crate::sync::{
     Arc, LazyLock, Weak,
 };
 use crate::sync::{Mutex, RwLock};
-pub use crate::translate::pragma::TURSO_CDC_CURRENT_VERSION;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
@@ -1199,6 +1198,7 @@ impl Database {
             page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_checkpoint_disabled: AtomicBool::new(false),
             capture_data_changes: RwLock::new(None),
+            cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
@@ -1513,15 +1513,60 @@ pub enum CaptureDataChangesMode {
     Full,
 }
 
+/// CDC schema version with integer ordering for feature checks.
+/// Higher versions are supersets of lower versions.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(u8)]
+pub enum CdcVersion {
+    /// 8 columns: change_id, change_time, change_type, table_name, id, before, after, updates
+    V1 = 1,
+    /// 9 columns (adds change_txn_id + COMMIT records with change_type=2)
+    V2 = 2,
+}
+
+pub const CDC_VERSION_CURRENT: CdcVersion = CdcVersion::V2;
+
+impl CdcVersion {
+    /// Whether this version emits COMMIT records (change_type=2)
+    pub fn has_commit_record(self) -> bool {
+        self >= CdcVersion::V2
+    }
+}
+
+impl std::fmt::Display for CdcVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CdcVersion::V1 => write!(f, "v1"),
+            CdcVersion::V2 => write!(f, "v2"),
+        }
+    }
+}
+
+impl std::str::FromStr for CdcVersion {
+    type Err = LimboError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "v1" => Ok(CdcVersion::V1),
+            "v2" => Ok(CdcVersion::V2),
+            _ => Err(LimboError::InternalError(format!(
+                "unexpected CDC version: {s}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CaptureDataChangesInfo {
     pub mode: CaptureDataChangesMode,
     pub table: String,
-    pub version: Option<String>,
+    pub version: Option<CdcVersion>,
 }
 
 impl CaptureDataChangesInfo {
-    pub fn parse(value: &str, version: Option<String>) -> Result<Option<CaptureDataChangesInfo>> {
+    pub fn parse(
+        value: &str,
+        version: Option<CdcVersion>,
+    ) -> Result<Option<CaptureDataChangesInfo>> {
         let (mode, table) = value
             .split_once(",")
             .unwrap_or((value, TURSO_CDC_DEFAULT_TABLE_NAME));
@@ -1559,10 +1604,8 @@ impl CaptureDataChangesInfo {
             CaptureDataChangesMode::Full => "full",
         }
     }
-    /// Returns the CDC schema version, defaulting to V1 for tables that
-    /// predate version tracking (version field is None).
-    pub fn version(&self) -> &str {
-        self.version.as_deref().unwrap_or(TURSO_CDC_CURRENT_VERSION)
+    pub fn cdc_version(&self) -> CdcVersion {
+        self.version.unwrap_or(CDC_VERSION_CURRENT)
     }
 }
 

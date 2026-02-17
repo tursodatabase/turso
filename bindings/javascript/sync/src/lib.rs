@@ -49,11 +49,12 @@ pub enum SyncEngineProtocolVersion {
     V1,
 }
 
-fn core_change_type_to_js(value: DatabaseChangeType) -> DatabaseChangeTypeJs {
+fn core_change_type_to_js(value: DatabaseChangeType) -> Option<DatabaseChangeTypeJs> {
     match value {
-        DatabaseChangeType::Delete => DatabaseChangeTypeJs::Delete,
-        DatabaseChangeType::Update => DatabaseChangeTypeJs::Update,
-        DatabaseChangeType::Insert => DatabaseChangeTypeJs::Insert,
+        DatabaseChangeType::Delete => Some(DatabaseChangeTypeJs::Delete),
+        DatabaseChangeType::Update => Some(DatabaseChangeTypeJs::Update),
+        DatabaseChangeType::Insert => Some(DatabaseChangeTypeJs::Insert),
+        DatabaseChangeType::Commit => None,
     }
 }
 fn js_value_to_core(value: Either5<Null, i64, f64, String, Vec<u8>>) -> turso_core::Value {

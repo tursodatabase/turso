@@ -164,7 +164,9 @@ pub fn translate_inner(
             attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
-        ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
+        ast::Stmt::Commit { name } => {
+            translate_tx_commit(name, resolver.schema, resolver, program)?
+        }
         ast::Stmt::CreateIndex { .. } => {
             translate_create_index(program, connection, resolver, stmt)?;
         }

@@ -10,7 +10,8 @@ use crate::schema::{
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
+    OperationMode, Resolver,
 };
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
@@ -516,6 +517,7 @@ pub fn emit_schema_entry(
             None,
             SQLITE_TABLEID,
         )?;
+        emit_cdc_autocommit_commit(program, resolver, cdc_table_cursor_id)?;
     }
     Ok(())
 }
@@ -877,6 +879,9 @@ pub fn translate_drop_table(
     });
     program.preassign_label_to_next_insn(end_metadata_label);
     // end of loop on schema table
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
 
     //  2. Destroy the indices within a loop
     let indices = resolver.schema.get_indices(tbl_name.name.as_str());

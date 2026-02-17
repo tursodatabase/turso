@@ -351,8 +351,10 @@ fn update_pragma(
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
-            let opts =
-                CaptureDataChangesInfo::parse(&value, Some(TURSO_CDC_CURRENT_VERSION.to_string()))?;
+            let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
+            if opts.is_some() && connection.mvcc_enabled() {
+                bail_parse_error!("CDC is not supported in MVCC mode");
+            }
             // InitCdcVersion handles everything at execution time:
             // - For enable: creates CDC table + version table, records version,
             //   reads back actual version, defers CDC state to Halt
@@ -363,7 +365,7 @@ fn update_pragma(
                 .unwrap_or_default();
             program.emit_insn(Insn::InitCdcVersion {
                 cdc_table_name,
-                version: TURSO_CDC_CURRENT_VERSION.to_string(),
+                version: CDC_VERSION_CURRENT,
                 cdc_mode: value,
             });
             Ok(TransactionMode::Write)
@@ -1043,7 +1045,7 @@ fn query_pragma(
                     program.emit_string8(info.mode_name().to_string(), register);
                     program.emit_string8(info.table.clone(), second_column);
                     match &info.version {
-                        Some(v) => program.emit_string8(v.clone(), third_column),
+                        Some(v) => program.emit_string8(v.to_string(), third_column),
                         None => program.emit_null(third_column, None),
                     }
                 }
@@ -1320,7 +1322,8 @@ fn update_cache_size(
 
 pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
 pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
-pub const TURSO_CDC_CURRENT_VERSION: &str = "v1";
+
+pub use crate::CDC_VERSION_CURRENT;
 
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
