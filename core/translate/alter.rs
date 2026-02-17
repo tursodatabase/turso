@@ -96,15 +96,12 @@ fn default_requires_empty_table(expr: &ast::Expr) -> bool {
 fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
-        ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(
-            s,
-        ))),
+        ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(s))),
         ast::Literal::Blob(s) => Ok(Value::Blob(
             s.as_bytes()
                 .chunks_exact(2)
                 .map(|pair| {
-                    let hex_byte =
-                        std::str::from_utf8(pair).expect("parser validated hex string");
+                    let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
                     u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
                 })
                 .collect(),
