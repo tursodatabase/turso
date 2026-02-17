@@ -255,6 +255,7 @@ expect {
     A|250
 }
 
+@skip-if sqlite "sqlite supports FILTER in aggregate functions"
 test view-rejects-filter-clause {
     CREATE TABLE t(val INT, status TEXT);
     CREATE VIEW v AS SELECT SUM(val) FILTER (WHERE status = 'ok') FROM t;
