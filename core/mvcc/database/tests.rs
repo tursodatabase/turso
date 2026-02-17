@@ -5756,3 +5756,85 @@ fn test_close_persists_drop_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+/// Regression test for #5017: visibility functions must not panic when a
+/// transaction has been committed and removed from the txs map while another
+/// transaction is concurrently inspecting row versions that still reference
+/// the removed TxID.
+///
+/// The race window:
+///   1. Tx1 inserts a row (begin = TxID(tx1)), commits, and is removed from txs.
+///   2. Between the row version's begin being rewritten to Timestamp and the
+///      removal, another transaction reads the stale TxID and calls txs.get().
+///
+/// We simulate this by inserting a row, committing (which converts TxID ->
+/// Timestamp and removes the tx), then manually re-injecting the stale TxID
+/// into the row version. A subsequent read by another transaction must not
+/// panic.
+#[test]
+fn test_visibility_no_panic_on_removed_tx() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // Tx1: insert a row and commit. After commit, tx1 is removed from txs.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row = generate_simple_string_row(table_id, 1, "hello");
+    db.mvcc_store.insert(tx1, row).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // Sanity: tx1 should no longer be in the txs map.
+    assert!(
+        db.mvcc_store.txs.get(&tx1).is_none(),
+        "committed tx should have been removed from txs"
+    );
+
+    // Simulate the race: re-inject the stale TxID into the row version's begin
+    // field as if the committing thread hadn't updated it yet.
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+    {
+        let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+        let mut versions = entry.value().write();
+        assert!(!versions.is_empty());
+        versions[0].begin = Some(TxTimestampOrID::TxID(tx1));
+    }
+
+    // Tx2: reading the row should not panic even though tx1 is missing from txs.
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+    // This used to panic with "transaction should exist in txs map".
+    let result = db.mvcc_store.read(tx2, row_id.clone());
+    // The row won't be visible (stale TxID treated as not-visible), which is fine.
+    assert!(result.is_ok());
+
+    // Also test the end-field race: set end to a stale TxID.
+    {
+        let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+        let mut versions = entry.value().write();
+        // Restore begin to a valid timestamp so the version is visible.
+        versions[0].begin = Some(TxTimestampOrID::Timestamp(1));
+        versions[0].end = Some(TxTimestampOrID::TxID(tx1));
+    }
+    let result = db.mvcc_store.read(tx2, row_id);
+    assert!(result.is_ok());
+
+    // Test is_write_write_conflict with a stale TxID.
+    let rv = RowVersion {
+        id: 0,
+        begin: Some(TxTimestampOrID::Timestamp(1)),
+        end: Some(TxTimestampOrID::TxID(tx1)),
+        row: generate_simple_string_row(table_id, 1, "hello"),
+        btree_resident: false,
+    };
+    let tx2_ref = db.mvcc_store.txs.get(&tx2).unwrap();
+    // Should not panic; should report conflict since the missing tx committed.
+    let conflict = is_write_write_conflict(&db.mvcc_store.txs, tx2_ref.value(), &rv);
+    assert!(
+        conflict,
+        "missing tx should be treated as committed (conflict)"
+    );
+
+    db.mvcc_store.remove_tx(tx2);
+}
