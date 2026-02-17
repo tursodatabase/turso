@@ -1774,6 +1774,7 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
         } else if self.pos == self.seek_def.prefix.len() {
             match &self.seek_key.last_component {
                 SeekKeyComponent::Expr(expr) => Some(SeekKeyComponent::Expr(expr)),
+                SeekKeyComponent::Null => Some(SeekKeyComponent::Null),
                 SeekKeyComponent::None => None,
             }
         } else {
@@ -1793,6 +1794,8 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
         } else if self.pos == self.seek_def.prefix.len() {
             match &self.seek_key.last_component {
                 SeekKeyComponent::Expr(..) => Some(self.seek_key.affinity),
+                // NULL sentinel does not require conversion; use NONE affinity so width matches.
+                SeekKeyComponent::Null => Some(Affinity::Blob),
                 SeekKeyComponent::None => None,
             }
         } else {
@@ -1810,6 +1813,7 @@ impl SeekDef {
         self.prefix.len()
             + match key.last_component {
                 SeekKeyComponent::Expr(_) => 1,
+                SeekKeyComponent::Null => 1,
                 SeekKeyComponent::None => 0,
             }
     }
@@ -1837,16 +1841,15 @@ impl SeekDef {
     }
 }
 
-/// [SeekKeyComponent] enum represents optional last_component of the [SeekKey]
-///
-/// This component represented by separate enum instead of Option<E> because before there were third Sentinel value
-/// For now - we don't need this and it's enough to just either use some user-provided expression or omit last component of the key completely
-/// But as separate enum is almost never a harm - I decided to keep it here.
-///
-/// This enum accepts generic argument E in order to use both SeekKeyComponent<ast::Expr> and SeekKeyComponent<&ast::Expr>
+/// [SeekKeyComponent] represents the optional trailing component of a seek key.
+/// Besides user-provided expressions, planner logic may inject a synthetic NULL sentinel
+/// to encode SQLite-compatible boundary behavior on composite indexes.
+/// This enum accepts generic argument E so we can use both
+/// SeekKeyComponent<ast::Expr> and SeekKeyComponent<&ast::Expr>.
 #[derive(Debug, Clone)]
 pub enum SeekKeyComponent<E> {
     Expr(E),
+    Null,
     None,
 }
 

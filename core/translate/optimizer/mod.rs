@@ -2364,9 +2364,97 @@ fn build_seek_def(
 
     // pop last key as we will do some form of range search
     let last = key.pop().unwrap();
-
+    let has_upper_bound_only = last.upper_bound.is_some() && last.lower_bound.is_none();
+    let upper_bound_is_lt_or_le = matches!(
+        last.upper_bound.as_ref().map(|(op, _, _)| op),
+        Some(ast::Operator::Less | ast::Operator::LessEquals)
+    );
     // after that all key components must be equality constraints
     debug_assert!(key.iter().all(|k| k.eq.is_some()));
+
+    let has_prefix = !key.is_empty();
+    let apply_null_boundaries = |start: &mut SeekKey, end: &mut SeekKey| {
+        // Sometimes we must add an extra NULL to the key on purpose.
+        // We do this so scans over composite indexes match SQLite exactly.
+        let start_is_prefix_only = matches!(start.last_component, SeekKeyComponent::None);
+        let start_has_range_component = matches!(start.last_component, SeekKeyComponent::Expr(_));
+        let end_is_prefix_only = matches!(end.last_component, SeekKeyComponent::None);
+        let end_has_range_component = matches!(end.last_component, SeekKeyComponent::Expr(_));
+        let start_is_forward_ge = matches!(start.op, SeekOp::GE { .. })
+            && matches!(iter_dir, IterationDirection::Forwards);
+        let start_is_backward_le = matches!(start.op, SeekOp::LE { .. })
+            && matches!(iter_dir, IterationDirection::Backwards);
+        let end_is_forward_gt =
+            matches!(end.op, SeekOp::GT) && matches!(iter_dir, IterationDirection::Forwards);
+        let end_is_backward_lt =
+            matches!(end.op, SeekOp::LT) && matches!(iter_dir, IterationDirection::Backwards);
+        // 1) Choose a better starting point.
+        //
+        // Example:
+        //   INDEX(c1, c2 ASC)
+        //   WHERE c1='a' AND c2<=999
+        //
+        // If we start from key [c1='a'], we hit rows where c2 is NULL first.
+        // For this case we want to start right after that NULL boundary.
+        // So we:
+        // - use start key [c1='a', NULL]
+        // - change start op from GE to GT
+        // - for backward scans in the symmetric shape, change LE to LT
+        //
+        // We only do this for "< / <=" ranges that do not also have a lower bound.
+        if has_prefix
+            && start_is_prefix_only
+            && end_has_range_component
+            && start_is_forward_ge
+            && has_upper_bound_only
+            && upper_bound_is_lt_or_le
+        {
+            start.last_component = SeekKeyComponent::Null;
+            start.op = SeekOp::GT;
+        } else if has_prefix
+            && start_is_prefix_only
+            && end_has_range_component
+            && start_is_backward_le
+            && has_upper_bound_only
+            && upper_bound_is_lt_or_le
+        {
+            start.last_component = SeekKeyComponent::Null;
+            start.op = SeekOp::LT;
+        }
+
+        // 2) Choose a better stopping point.
+        //
+        // Example:
+        //   INDEX(c1, c2 DESC)
+        //   WHERE c1='a' AND c2<=999
+        //
+        // The stop check must also respect the NULL boundary for c2.
+        // So we:
+        // - use stop key [c1='a', NULL]
+        // - change end op from GT to GE
+        // - for backward scans, change LT to LE
+        //
+        // Same limit as above: only "< / <=" ranges with no lower bound.
+        if has_prefix
+            && end_is_prefix_only
+            && start_has_range_component
+            && end_is_forward_gt
+            && has_upper_bound_only
+            && upper_bound_is_lt_or_le
+        {
+            end.last_component = SeekKeyComponent::Null;
+            end.op = SeekOp::GE { eq_only: false };
+        } else if has_prefix
+            && end_is_prefix_only
+            && start_has_range_component
+            && end_is_backward_lt
+            && has_upper_bound_only
+            && upper_bound_is_lt_or_le
+        {
+            end.last_component = SeekKeyComponent::Null;
+            end.op = SeekOp::LE { eq_only: false };
+        }
+    };
 
     // For the commented examples below, keep in mind that since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.
     // Also keep in mind that index keys are compared based on the number of columns given, so for example:
@@ -2375,7 +2463,7 @@ fn build_seek_def(
     // - if key is GT(x:10, y:NULL), then (x=10, y=0) is GT because NULL is always LT in index key comparisons.
     Ok(match iter_dir {
         IterationDirection::Forwards => {
-            let (start, end) = match last.sort_order {
+            let (mut start, mut end) = match last.sort_order {
                 SortOrder::Asc => {
                     let start = match last.lower_bound {
                         // Forwards, Asc, GT: (x=10 AND y>20)
@@ -2487,6 +2575,7 @@ fn build_seek_def(
                     (start, end)
                 }
             };
+            apply_null_boundaries(&mut start, &mut end);
             SeekDef {
                 prefix: key,
                 iter_dir,
@@ -2495,7 +2584,7 @@ fn build_seek_def(
             }
         }
         IterationDirection::Backwards => {
-            let (start, end) = match last.sort_order {
+            let (mut start, mut end) = match last.sort_order {
                 SortOrder::Asc => {
                     let start = match last.upper_bound {
                         // Backwards, Asc, LT: (x=10 AND y<30)
@@ -2607,6 +2696,7 @@ fn build_seek_def(
                     (start, end)
                 }
             };
+            apply_null_boundaries(&mut start, &mut end);
             SeekDef {
                 prefix: key,
                 iter_dir,
