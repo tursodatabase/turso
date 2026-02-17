@@ -961,21 +961,21 @@ pub fn translate_expr(
                     null_value,
                     invert,
                 });
-                return Ok(target_register);
+                Ok(target_register)
+            } else {
+                binary_expr_shared(
+                    program,
+                    referenced_tables,
+                    e1,
+                    e2,
+                    op,
+                    target_register,
+                    resolver,
+                    None,
+                    emit_binary_insn,
+                )?;
+                Ok(target_register)
             }
-
-            binary_expr_shared(
-                program,
-                referenced_tables,
-                e1,
-                e2,
-                op,
-                target_register,
-                resolver,
-                None,
-                emit_binary_insn,
-            )?;
-            Ok(target_register)
         }
         ast::Expr::Case {
             base,
