@@ -22,12 +22,14 @@ use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
-use crate::Completion;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
 use crate::Result;
 use crate::ValueRef;
+use crate::{
+    contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Completion,
+};
 use crate::{turso_assert, Numeric};
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
@@ -3789,6 +3791,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 record.column_count()
                             )));
                         }
+                        let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
+                            return Err(LimboError::Corrupt(
+                                "sqlite_schema type must be text".to_string(),
+                            ));
+                        };
+                        let row_type = row_type.as_str();
                         let val = match record.get_value_opt(3) {
                             Some(v) => v,
                             None => {
@@ -3801,23 +3809,47 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         else {
                             panic!("Expected integer value for root page, got {val:?}");
                         };
-                        if root_page < 0 {
-                            let table_id = self.get_table_id_from_root_page(root_page);
-                            if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
-                                if let Some(value) = *entry.value() {
-                                    panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
-                                }
+                        let sql = match record.get_value_opt(4) {
+                            Some(ValueRef::Text(v)) => Some(v.as_str()),
+                            _ => None,
+                        };
+                        let is_virtual_table = row_type == "table"
+                            && sql.is_some_and(|sql| {
+                                contains_ignore_ascii_case!(sql.as_bytes(), b"create virtual")
+                            });
+                        let has_btree = match row_type {
+                            "index" => true,
+                            "table" => !is_virtual_table,
+                            _ => false,
+                        };
+                        if has_btree {
+                            if root_page == 0 {
+                                return Err(LimboError::Corrupt(format!(
+                                    "sqlite_schema root_page=0 for btree {row_type}"
+                                )));
                             }
-                            self.insert_table_id_to_rootpage(table_id, None);
-                        } else {
-                            let table_id = self.get_table_id_from_root_page(root_page);
-                            let Some(entry) = self.table_id_to_rootpage.get(&table_id) else {
-                                panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
-                            };
-                            let Some(value) = *entry.value() else {
-                                panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
-                            };
-                            assert!(value == root_page as u64, "Logical log contains root page reference {root_page} that does not match the root page in the table_id_to_rootpage map({value})");
+                            if root_page < 0 {
+                                let table_id = self.get_table_id_from_root_page(root_page);
+                                if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
+                                    if let Some(value) = *entry.value() {
+                                        panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
+                                    }
+                                }
+                                self.insert_table_id_to_rootpage(table_id, None);
+                            } else {
+                                let table_id = self.get_table_id_from_root_page(root_page);
+                                let Some(entry) = self.table_id_to_rootpage.get(&table_id) else {
+                                    panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
+                                };
+                                let Some(value) = *entry.value() else {
+                                    panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
+                                };
+                                assert!(value == root_page as u64, "Logical log contains root page reference {root_page} that does not match the root page in the table_id_to_rootpage map({value})");
+                            }
+                        } else if root_page != 0 {
+                            return Err(LimboError::Corrupt(format!(
+                                "sqlite_schema root_page must be 0 for {row_type}, got {root_page}"
+                            )));
                         }
                         let rowid_int = rowid.row_id.to_int_or_panic();
                         schema_rows.insert(rowid_int, record);
