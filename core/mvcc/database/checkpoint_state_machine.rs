@@ -12,6 +12,7 @@ use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
+use crate::turso_assert;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Numeric, Pager, Result, SyncMode,
@@ -172,6 +173,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             .values()
             .flatten()
             .map(|index| {
+                turso_assert!(index.root_page != 0, "index root_page must be non-zero");
                 (
                     mvstore.get_table_id_from_root_page(index.root_page),
                     index.clone(),
@@ -179,6 +181,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             })
             .collect();
         let mvcc_meta_table = schema.get_btree_table(MVCC_META_TABLE_NAME).map(|table| {
+            turso_assert!(
+                table.root_page != 0,
+                "mvcc meta table root_page must be non-zero"
+            );
             (
                 mvstore.get_table_id_from_root_page(table.root_page),
                 table.columns.len(),
