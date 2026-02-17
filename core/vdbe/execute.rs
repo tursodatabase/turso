@@ -9328,7 +9328,7 @@ pub enum OpIntegrityCheckState {
         /// State of the current validation sub-phase
         substate: IndexCountValidationSubstate,
         /// Cursor used for counting (persisted across I/O yields)
-        cursor: Option<Box<BTreeCursor>>,
+        cursor: Option<Box<dyn CursorTrait>>,
     },
     /// Phase 3: NOT NULL constraint validation (skipped when quick=true)
     /// Scans table rows and checks that NOT NULL columns don't contain NULL values.
@@ -9337,7 +9337,7 @@ pub enum OpIntegrityCheckState {
         /// Index into the tables list
         current_table_idx: usize,
         /// Cursor used for row scanning (persisted across I/O yields)
-        cursor: Option<Box<BTreeCursor>>,
+        cursor: Option<Box<dyn CursorTrait>>,
         /// State of the current validation sub-phase
         substate: NotNullValidationSubstate,
     },
@@ -9350,7 +9350,7 @@ pub enum OpIntegrityCheckState {
         /// Index into the current table's indexes list
         current_index_idx: usize,
         /// Cursor used for index scanning (persisted across I/O yields)
-        cursor: Option<Box<BTreeCursor>>,
+        cursor: Option<Box<dyn CursorTrait>>,
         /// Previous key values for duplicate detection (None if at start of index or prev had NULL)
         /// Excludes rowid. Set to None if any value is NULL (NULL != NULL for UNIQUE).
         previous_key: Option<Vec<Value>>,
@@ -9364,9 +9364,9 @@ pub enum OpIntegrityCheckState {
         /// Index into the tables list
         current_table_idx: usize,
         /// Cursor for scanning table rows
-        table_cursor: Option<Box<BTreeCursor>>,
+        table_cursor: Option<Box<dyn CursorTrait>>,
         /// Cursor for searching in indexes
-        index_cursor: Option<Box<BTreeCursor>>,
+        index_cursor: Option<Box<dyn CursorTrait>>,
         /// Current row number (1-indexed, for error messages)
         row_number: usize,
         /// State of the current validation sub-phase
@@ -9454,6 +9454,34 @@ pub enum RowIndexValidationSubstate {
     },
     /// Advancing to the next row
     Advancing,
+}
+
+/// Create a cursor for integrity check. In MVCC mode, wraps the BTreeCursor with
+/// an MvccLazyCursor so that integrity check sees the MVCC-visible state.
+fn integrity_check_cursor(
+    program: &Program,
+    pager: Arc<Pager>,
+    root_page: i64,
+    mv_cursor_type: MvccCursorType,
+) -> Result<Box<dyn CursorTrait>> {
+    let mut raw_cursor = BTreeCursor::new(pager, root_page, 0);
+    if let MvccCursorType::Index(ref index_info) = mv_cursor_type {
+        raw_cursor.index_info = Some(index_info.clone());
+    }
+    let btree_cursor: Box<dyn CursorTrait> = Box::new(raw_cursor);
+    if let Some(tx_id) = program.connection.get_mv_tx_id() {
+        let mv_store = program.connection.mv_store();
+        if let Some(mv_store) = mv_store.as_ref() {
+            return Ok(Box::new(MvCursor::new(
+                mv_store.clone(),
+                tx_id,
+                root_page,
+                mv_cursor_type,
+                btree_cursor,
+            )?));
+        }
+    }
+    Ok(btree_cursor)
 }
 
 pub fn op_integrity_check(
@@ -9710,16 +9738,17 @@ pub fn op_integrity_check(
 
                         // Create cursor for current table
                         let table = &tables[*current_table_idx];
-                        *cursor = Some(Box::new(BTreeCursor::new(
+                        *cursor = Some(integrity_check_cursor(
+                            program,
                             pager.clone(),
                             table.root_page,
-                            0, // num_columns not needed for counting
-                        )));
+                            MvccCursorType::Table,
+                        )?);
                         *substate = IndexCountValidationSubstate::CountingTableRows;
                     }
                     IndexCountValidationSubstate::CountingTableRows => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        let count = return_if_io!(btree_cursor.count());
+                        let c = cursor.as_mut().unwrap();
+                        let count = return_if_io!(c.count());
                         *table_row_count = count;
                         *cursor = None;
                         *current_index_idx = 0;
@@ -9736,16 +9765,17 @@ pub fn op_integrity_check(
 
                         // Create cursor for current index
                         let index = &table.indexes[*current_index_idx];
-                        *cursor = Some(Box::new(BTreeCursor::new(
+                        *cursor = Some(integrity_check_cursor(
+                            program,
                             pager.clone(),
                             index.root_page,
-                            0, // num_columns not needed for counting
-                        )));
+                            MvccCursorType::Index(index.index_info.clone()),
+                        )?);
                         *substate = IndexCountValidationSubstate::CountingIndexEntries;
                     }
                     IndexCountValidationSubstate::CountingIndexEntries => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        let count = return_if_io!(btree_cursor.count());
+                        let c = cursor.as_mut().unwrap();
+                        let count = return_if_io!(c.count());
                         *index_entry_count = count;
                         *cursor = None;
                         *substate = IndexCountValidationSubstate::ComparingCounts;
@@ -9845,17 +9875,18 @@ pub fn op_integrity_check(
 
                         // Create cursor for current table
                         let table = &tables[*current_table_idx];
-                        *cursor = Some(Box::new(BTreeCursor::new(
+                        *cursor = Some(integrity_check_cursor(
+                            program,
                             pager.clone(),
                             table.root_page,
-                            0,
-                        )));
+                            MvccCursorType::Table,
+                        )?);
                         *substate = NotNullValidationSubstate::Rewinding;
                     }
                     NotNullValidationSubstate::Rewinding => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.rewind());
-                        if !btree_cursor.has_record() {
+                        let c = cursor.as_mut().unwrap();
+                        return_if_io!(c.rewind());
+                        if !c.has_record() {
                             // Table is empty, move to next table
                             *cursor = None;
                             *current_table_idx += 1;
@@ -9866,14 +9897,14 @@ pub fn op_integrity_check(
                     }
                     NotNullValidationSubstate::CheckingRow => {
                         let table = &tables[*current_table_idx];
-                        let btree_cursor = cursor.as_mut().unwrap();
+                        let c = cursor.as_mut().unwrap();
 
                         // Get rowid for error messages - must exist since has_record() was true
-                        let rowid = return_if_io!(btree_cursor.rowid())
+                        let rowid = return_if_io!(c.rowid())
                             .expect("rowid must exist when has_record() is true");
 
                         // Get the record and check NOT NULL columns
-                        let record = return_if_io!(btree_cursor.record())
+                        let record = return_if_io!(c.record())
                             .expect("record must exist when has_record() is true");
                         let values = record.get_values()?;
                         for (col_idx, col_name) in &table.not_null_columns {
@@ -9903,9 +9934,9 @@ pub fn op_integrity_check(
                         *substate = NotNullValidationSubstate::Advancing;
                     }
                     NotNullValidationSubstate::Advancing => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.next());
-                        if btree_cursor.has_record() {
+                        let c = cursor.as_mut().unwrap();
+                        return_if_io!(c.next());
+                        if c.has_record() {
                             *substate = NotNullValidationSubstate::CheckingRow;
                         } else {
                             // Done with this table, move to next
@@ -9987,18 +10018,19 @@ pub fn op_integrity_check(
 
                         // Create cursor for current unique index
                         let index = &table.indexes[*current_index_idx];
-                        *cursor = Some(Box::new(BTreeCursor::new(
+                        *cursor = Some(integrity_check_cursor(
+                            program,
                             pager.clone(),
                             index.root_page,
-                            0,
-                        )));
+                            MvccCursorType::Index(index.index_info.clone()),
+                        )?);
                         *previous_key = None;
                         *substate = UniqueValidationSubstate::Rewinding;
                     }
                     UniqueValidationSubstate::Rewinding => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.rewind());
-                        if !btree_cursor.has_record() {
+                        let c = cursor.as_mut().unwrap();
+                        return_if_io!(c.rewind());
+                        if !c.has_record() {
                             // Index is empty, move to next index
                             *cursor = None;
                             *current_index_idx += 1;
@@ -10010,10 +10042,10 @@ pub fn op_integrity_check(
                     UniqueValidationSubstate::CheckingKey => {
                         let table = &tables[*current_table_idx];
                         let index = &table.indexes[*current_index_idx];
-                        let btree_cursor = cursor.as_mut().unwrap();
+                        let c = cursor.as_mut().unwrap();
 
                         // Get current record (index key) - must exist since has_record() was true
-                        let record = return_if_io!(btree_cursor.record())
+                        let record = return_if_io!(c.record())
                             .expect("record must exist when has_record() is true");
                         let values = record.get_values()?;
 
@@ -10061,9 +10093,9 @@ pub fn op_integrity_check(
                         *substate = UniqueValidationSubstate::Advancing;
                     }
                     UniqueValidationSubstate::Advancing => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.next());
-                        if btree_cursor.has_record() {
+                        let c = cursor.as_mut().unwrap();
+                        return_if_io!(c.next());
+                        if c.has_record() {
                             *substate = UniqueValidationSubstate::CheckingKey;
                         } else {
                             // Done with this index, move to next
@@ -10105,18 +10137,19 @@ pub fn op_integrity_check(
 
                         // Create cursor for current table
                         let table = &tables[*current_table_idx];
-                        *table_cursor = Some(Box::new(BTreeCursor::new(
+                        *table_cursor = Some(integrity_check_cursor(
+                            program,
                             pager.clone(),
                             table.root_page,
-                            0,
-                        )));
+                            MvccCursorType::Table,
+                        )?);
                         *row_number = 0;
                         *substate = RowIndexValidationSubstate::RewindingTable;
                     }
                     RowIndexValidationSubstate::RewindingTable => {
-                        let btree_cursor = table_cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.rewind());
-                        if !btree_cursor.has_record() {
+                        let c = table_cursor.as_mut().unwrap();
+                        return_if_io!(c.rewind());
+                        if !c.has_record() {
                             // Table is empty, move to next table
                             *table_cursor = None;
                             *current_table_idx += 1;
@@ -10129,15 +10162,15 @@ pub fn op_integrity_check(
                         continue;
                     }
                     RowIndexValidationSubstate::FetchingRowId => {
-                        let btree_cursor = table_cursor.as_mut().unwrap();
-                        let rowid = return_if_io!(btree_cursor.rowid())
+                        let c = table_cursor.as_mut().unwrap();
+                        let rowid = return_if_io!(c.rowid())
                             .expect("rowid must exist when has_record() is true");
                         *substate = RowIndexValidationSubstate::FetchingRecord { rowid };
                         continue;
                     }
                     RowIndexValidationSubstate::FetchingRecord { rowid } => {
-                        let btree_cursor = table_cursor.as_mut().unwrap();
-                        let record = return_if_io!(btree_cursor.record())
+                        let c = table_cursor.as_mut().unwrap();
+                        let record = return_if_io!(c.record())
                             .expect("record must exist when has_record() is true");
                         let row_values =
                             record.get_values()?.iter().map(|v| v.to_owned()).collect();
@@ -10165,9 +10198,12 @@ pub fn op_integrity_check(
                         // Open cursor for this index if not already open
                         let index = &table.indexes[*current_index_idx];
                         if index_cursor.is_none() {
-                            let mut cursor = BTreeCursor::new(pager.clone(), index.root_page, 0);
-                            cursor.index_info = Some(index.index_info.clone());
-                            *index_cursor = Some(Box::new(cursor));
+                            *index_cursor = Some(integrity_check_cursor(
+                                program,
+                                pager.clone(),
+                                index.root_page,
+                                MvccCursorType::Index(index.index_info.clone()),
+                            )?);
                         }
 
                         // Build the index key from table row values
@@ -10323,9 +10359,9 @@ pub fn op_integrity_check(
                         };
                     }
                     RowIndexValidationSubstate::Advancing => {
-                        let btree_cursor = table_cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.next());
-                        if btree_cursor.has_record() {
+                        let c = table_cursor.as_mut().unwrap();
+                        return_if_io!(c.next());
+                        if c.has_record() {
                             *row_number += 1;
                             *substate = RowIndexValidationSubstate::FetchingRowId;
                             continue;

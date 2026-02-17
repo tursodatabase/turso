@@ -5756,3 +5756,101 @@ fn test_close_persists_drop_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+/// Test that integrity_check in MVCC mode validates the MVCC-visible state,
+/// not just the raw B-tree state. When a row is deleted via MVCC (tombstone
+/// over B-tree resident row), the integrity check should see consistent
+/// table/index state through MVCC-aware cursors.
+///
+/// Issue #5293: integrity_check used raw B-tree cursors, which meant it could
+/// not detect inconsistencies visible at the MVCC level (zombie rows).
+#[test]
+fn test_integrity_check_mvcc_delete_with_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    // Session 1: Create table with index, insert rows, checkpoint to B-tree
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t1_val ON t1(val)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'b')").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'c')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    // Restart: clean MVCC state, data only in B-tree
+    db.restart();
+    let conn = db.connect();
+
+    // Delete row 2 via MVCC (creates tombstone over B-tree resident row)
+    conn.execute("DELETE FROM t1 WHERE id = 2").unwrap();
+
+    // Verify the delete is visible through queries
+    let rows = get_rows(&conn, "SELECT * FROM t1 ORDER BY id");
+    assert_eq!(rows.len(), 2, "Table scan should show 2 rows after delete");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 3);
+
+    // Verify index scan also shows consistent state
+    let rows = get_rows(&conn, "SELECT * FROM t1 WHERE val = 'b'");
+    assert_eq!(
+        rows.len(),
+        0,
+        "Index scan for deleted row should return nothing"
+    );
+
+    // integrity_check must pass - MVCC-visible state is consistent
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test that integrity_check passes after MVCC delete + checkpoint on indexed table.
+/// After checkpoint, both B-tree table and index should reflect the deletion.
+#[test]
+fn test_integrity_check_mvcc_delete_checkpoint_with_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    // Session 1: Create table with index, insert rows, checkpoint
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t1_val ON t1(val)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'b')").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'c')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    // Restart, delete, checkpoint
+    db.restart();
+    let conn = db.connect();
+    conn.execute("DELETE FROM t1 WHERE id = 2").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Verify state after checkpoint
+    let rows = get_rows(&conn, "SELECT * FROM t1 ORDER BY id");
+    assert_eq!(rows.len(), 2);
+
+    let rows = get_rows(&conn, "SELECT * FROM t1 WHERE val = 'b'");
+    assert_eq!(rows.len(), 0);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    // Restart again - should still be consistent
+    drop(conn);
+    db.restart();
+    let conn = db.connect();
+
+    let rows = get_rows(&conn, "SELECT * FROM t1 ORDER BY id");
+    assert_eq!(rows.len(), 2);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
