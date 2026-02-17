@@ -36,10 +36,11 @@ members = [
     "perf/encryption",
     "tools/dbhash",
     "sdk-kit",
-    "sdk-kit-macros", 
+    "sdk-kit-macros",  
     "testing/differential-oracle/sql_gen_prop", 
     "testing/differential-oracle/fuzzer",
-    "testing/runner"
+    "testing/runner",
+    "testing/coverage",
 ]
 exclude = ["perf/latency/limbo"]
 
