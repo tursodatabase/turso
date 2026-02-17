@@ -498,6 +498,13 @@ impl Database {
         let io = self.inner()?.io.clone();
         Ok(AsyncTask::new(IoLoopTask { io }))
     }
+
+    /// Classify SQL without executing. Returns true if all statements are read-only.
+    #[napi(js_name = "isReadonly")]
+    pub fn is_readonly(&self, sql: String) -> napi::Result<bool> {
+        turso_core::Connection::is_readonly_sql(&sql)
+            .map_err(|e| to_generic_error("classify failed", e))
+    }
 }
 
 #[napi]
@@ -566,6 +573,12 @@ impl Statement {
     pub fn reset(&self) -> Result<()> {
         self.stmt()?.borrow_mut().reset();
         Ok(())
+    }
+
+    /// Returns whether the statement is read-only.
+    #[napi(getter)]
+    pub fn readonly(&self) -> Result<bool> {
+        Ok(self.stmt()?.borrow().is_readonly())
     }
 
     /// Returns the number of parameters in the statement.
