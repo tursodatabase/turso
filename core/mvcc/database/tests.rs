@@ -5756,3 +5756,170 @@ fn test_close_persists_drop_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+/// Speculative ignore bug: T2 misses a row that should be visible.
+///
+/// Hekaton Table 2 (End field, Preparing):
+///   "If TS < RT, T speculatively ignores V."
+/// This is a speculative ignore, which we don't do.
+///
+/// For snapshot isolation (without commit dependencies), a Preparing deletion
+/// should NOT hide a row - the deletion hasn't committed yet.
+///
+/// Sequence:
+///   1. Setup: row(1, 10) committed
+///   2. T1 deletes row 1
+///   3. T1 begins commit → enters Preparing(end_ts) via step_once()
+///   4. T2 begins (begin_ts > end_ts due to monotonic clock)
+///   5. T2 reads row 1 → should see 10, but gets None (speculative ignore)
+///   6. T1 aborts → deletion never happened, but T2 already missed the row
+#[test]
+fn test_speculative_ignore_preparing_delete() {
+    use crate::numeric::Numeric;
+    use crate::state_machine::TransitionResult;
+
+    let table_id = MVTableId(-2);
+    let db = MvccTestDb::new();
+
+    // setup: insert row(1, 10)
+    let tx_setup = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row1 = Row::new_table_row(
+        RowID::new(table_id, RowKey::Int(1)),
+        ImmutableRecord::from_values(&[Value::Numeric(Numeric::Integer(10))], 1)
+            .as_blob()
+            .to_vec(),
+        1,
+    );
+    db.mvcc_store.insert(tx_setup, row1).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx_setup).unwrap();
+
+    let conn1 = db.db.connect().unwrap();
+
+    // T1: delete row 1
+    let tx1 = db.mvcc_store.begin_tx(conn1.pager.load().clone()).unwrap();
+    db.mvcc_store
+        .delete(tx1, RowID::new(table_id, RowKey::Int(1)))
+        .unwrap();
+
+    // T1: can still read the row while Preparing (not committed) - should see the row, not None
+    let read_result = db
+        .mvcc_store
+        .read(tx1, RowID::new(table_id, RowKey::Int(1)))
+        .unwrap();
+    assert!(
+        read_result.is_none(),
+        "row must NOT be visible to T1 since it deleted."
+    );
+
+    // Begin T1's commit — step_once advances through Initial, which:
+    //   1. Acquires end_ts
+    //   2. Sets T1's state to Preparing(end_ts)
+    //   3. Returns Continue (row versions still have TxID references)
+    let mut sm = db.mvcc_store.commit_tx(tx1, &conn1).unwrap();
+    let result = sm.step_once(&db.mvcc_store).unwrap();
+    assert!(matches!(result, TransitionResult::Continue));
+    // T1 is now Preparing. rv.end for row 1's old version = TxID(T1).
+    assert!(db.mvcc_store.is_tx_preparing(tx1));
+
+    // T2: begins AFTER T1 acquired its end_ts (monotonic clock guarantees begin_ts > end_ts)
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+
+    // T2 reads row 1 while T1 is still Preparing.
+    // T1 hasn't committed!!!!!!!!!!!!
+    // So T2 must see the row
+    let read_result = db
+        .mvcc_store
+        .read(tx2, RowID::new(table_id, RowKey::Int(1)))
+        .unwrap();
+    assert!(
+        read_result.is_some(),
+        "Row must be visible: T1 is Preparing (not committed), So T2 must see the row (paper Section 2.7)."
+    );
+
+    // T1: abort — the deletion never happened.
+    db.mvcc_store
+        .rollback_tx(tx1, conn1.pager.load().clone(), &conn1);
+}
+
+/// Speculative read bug: T2 sees a row that hasn't been committed yet.
+///
+/// Hekaton Table 1 (Begin field, Preparing):
+///   "Use TS as V's begin time when testing visibility. If the test is true,
+///    allow T to speculatively read V."
+/// This is a speculative read, which we don't do.
+///
+/// For snapshot isolation (without commit dependencies), a Preparing insert
+/// should NOT be visible — the insert hasn't committed yet.
+///
+/// Sequence:
+///   1. T1 inserts row(1, 42)
+///   2. T1 begins commit → enters Preparing(end_ts) via step_once()
+///   3. T2 begins (begin_ts > end_ts due to monotonic clock)
+///   4. T2 reads row 1 → should get None (T1 hasn't committed)
+///   5. T1 aborts → insert never happened, T2 correctly never saw it
+#[test]
+fn test_no_speculative_read_preparing_insert() {
+    use crate::numeric::Numeric;
+    use crate::state_machine::TransitionResult;
+
+    let table_id = MVTableId(-2);
+    let db = MvccTestDb::new();
+
+    let conn1 = db.db.connect().unwrap();
+
+    // T1: insert row(1, 42)
+    let tx1 = db.mvcc_store.begin_tx(conn1.pager.load().clone()).unwrap();
+    let row1 = Row::new_table_row(
+        RowID::new(table_id, RowKey::Int(1)),
+        ImmutableRecord::from_values(&[Value::Numeric(Numeric::Integer(42))], 1)
+            .as_blob()
+            .to_vec(),
+        1,
+    );
+    db.mvcc_store.insert(tx1, row1).unwrap();
+
+    // T1 can see its own insert
+    let read_result = db
+        .mvcc_store
+        .read(tx1, RowID::new(table_id, RowKey::Int(1)))
+        .unwrap();
+    assert!(
+        read_result.is_some(),
+        "T1 must see its own uncommitted insert"
+    );
+
+    // Begin T1's commit — step_once advances through Initial, which:
+    //   1. Acquires end_ts
+    //   2. Sets T1's state to Preparing(end_ts)
+    //   3. Returns Continue (row versions still have TxID references)
+    let mut sm = db.mvcc_store.commit_tx(tx1, &conn1).unwrap();
+    let result = sm.step_once(&db.mvcc_store).unwrap();
+    assert!(matches!(result, TransitionResult::Continue));
+    // T1 is now Preparing. rv.begin for row 1's new version = TxID(T1).
+    assert!(db.mvcc_store.is_tx_preparing(tx1));
+
+    // T2: begins AFTER T1 acquired its end_ts (monotonic clock guarantees begin_ts > end_ts)
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+
+    // T2 reads row 1 while T1 is still Preparing.
+    // T1 hasn't committed!!!!!!
+    // Hekaton would speculatively read here (begin_ts >= end_ts → visible,
+    // take commit dep on T1), but we don't track commit deps.
+    let read_result = db
+        .mvcc_store
+        .read(tx2, RowID::new(table_id, RowKey::Int(1)))
+        .unwrap();
+    assert!(
+        read_result.is_none(),
+        "Row must NOT be visible: T1 is Preparing (not committed), so T2 must not see the insert."
+    );
+
+    // T1: abort — the insert never happened. T2 correctly never saw it.
+    db.mvcc_store
+        .rollback_tx(tx1, conn1.pager.load().clone(), &conn1);
+}

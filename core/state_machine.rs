@@ -66,6 +66,23 @@ impl<State: StateTransition> StateMachine<State> {
         }
     }
 
+    /// Advance the state machine by exactly one inner transition.
+    /// Unlike `step()` which loops on `Continue`, this returns after each
+    /// inner state transition, giving the caller control over interleaving.
+    #[cfg(test)]
+    pub fn step_once(
+        &mut self,
+        context: &State::Context,
+    ) -> Result<TransitionResult<State::SMResult>> {
+        assert!(!self.is_finalized, "state machine is already finalized");
+        let result = self.state.step(context)?;
+        if let TransitionResult::Done(_) = &result {
+            assert!(self.state.is_finalized());
+            self.is_finalized = true;
+        }
+        Ok(result)
+    }
+
     pub fn finalize(&mut self, context: &State::Context) -> Result<()> {
         self.state.finalize(context)?;
         self.is_finalized = true;

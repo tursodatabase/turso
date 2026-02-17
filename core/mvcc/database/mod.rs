@@ -3101,6 +3101,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.clock.get_timestamp()
     }
 
+    /// Returns true if the given transaction is in the Preparing state.
+    #[cfg(test)]
+    pub fn is_tx_preparing(&self, tx_id: TxID) -> bool {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
+        matches!(tx.value().state.load(), TransactionState::Preparing(_))
+    }
+
     /// Compute the low-water mark: the minimum begin_ts of all active or
     /// preparing transactions. Returns u64::MAX if no transactions are active.
     /// Used by GC to determine which row versions are safe to reclaim.
