@@ -1272,7 +1272,6 @@ fn emit_fk_action_subprogram(
         built_subprogram,
         connection.pager.load().clone(),
         QueryMode::Normal,
-        false,
     );
     program.emit_insn(Insn::Program {
         params,

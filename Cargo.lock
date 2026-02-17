@@ -6279,6 +6279,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso_core",
+ "turso_parser",
 ]
 
 [[package]]

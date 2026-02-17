@@ -245,7 +245,6 @@ impl Connection {
         self.maybe_update_schema();
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
-        let readonly = cmd.readonly();
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
 
         // Read lock + Arc::Clone the schema here to avoid a possible recursive read lock in `op_parse_schema`,
@@ -261,7 +260,7 @@ impl Connection {
             mode,
             input,
         )?;
-        Ok(Statement::new(program, pager, mode, readonly))
+        Ok(Statement::new(program, pager, mode))
     }
 
     /// Prepare a statement from an AST node directly, skipping SQL parsing.
@@ -274,7 +273,6 @@ impl Connection {
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let mode = QueryMode::Normal;
-        let readonly = stmt.readonly();
         let schema = self.schema.read().clone();
         let program = translate::translate(
             &schema,
@@ -285,7 +283,7 @@ impl Connection {
             mode,
             "<ast>", // No SQL input string available
         )?;
-        Ok(Statement::new(program, pager, mode, readonly))
+        Ok(Statement::new(program, pager, mode))
     }
 
     /// Whether this is an internal connection used for MVCC bootstrap
@@ -455,7 +453,6 @@ impl Connection {
                 .unwrap()
                 .trim();
             let mode = QueryMode::new(&cmd);
-            let readonly = cmd.readonly();
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let schema = self.schema.read().clone();
             let program = translate::translate(
@@ -467,7 +464,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, pager.clone(), mode, readonly).run_ignore_rows()?;
+            Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -504,7 +501,6 @@ impl Connection {
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
-        let readonly = cmd.readonly();
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let schema = self.schema.read().clone();
         let program = translate::translate(
@@ -516,23 +512,12 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, pager, mode, readonly);
+        let stmt = Statement::new(program, pager, mode);
         Ok(Some(stmt))
     }
 
     pub fn query_runner<'a>(self: &'a Arc<Connection>, sql: &'a [u8]) -> QueryRunner<'a> {
         QueryRunner::new(self, sql)
-    }
-
-    /// Classify SQL without executing. Returns true if all statements are readonly.
-    pub fn is_readonly_sql(sql: &str) -> Result<bool> {
-        let mut parser = Parser::new(sql.as_bytes());
-        while let Some(cmd) = parser.next_cmd()? {
-            if !cmd.readonly() {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
@@ -553,7 +538,6 @@ impl Connection {
                 .unwrap()
                 .trim();
             let mode = QueryMode::new(&cmd);
-            let readonly = cmd.readonly();
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let schema = self.schema.read().clone();
             let program = translate::translate(
@@ -565,7 +549,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, pager.clone(), mode, readonly).run_ignore_rows()?;
+            Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -586,7 +570,6 @@ impl Connection {
             .unwrap()
             .trim();
         let mode = QueryMode::new(&cmd);
-        let readonly = cmd.readonly();
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let schema = self.schema.read().clone();
         let program = translate::translate(
@@ -598,7 +581,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, pager, mode, readonly);
+        let stmt = Statement::new(program, pager, mode);
         Ok(Some((stmt, parser.offset())))
     }
 

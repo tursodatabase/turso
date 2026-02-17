@@ -114,6 +114,33 @@ export class RemoteWriter {
         }
     }
 
+    /**
+     * Execute SQL on remote with auto-detection of BEGIN/COMMIT/ROLLBACK.
+     * Manages session lifecycle based on SQL category.
+     */
+    async execRemote(sql: string, category: string): Promise<{ shouldPull: boolean }> {
+        if (category === "begin") {
+            this.session = await this.createSession();
+            await this.session.sequence(sql);
+            this._inRemoteTxn = true;
+            return { shouldPull: false };
+        }
+        if (category === "commit") {
+            if (!this.session) throw new Error("No active remote transaction");
+            try { await this.session.sequence(sql); }
+            finally { this._inRemoteTxn = false; await this.session.close(); this.session = null; }
+            return { shouldPull: true };
+        }
+        if (category === "rollback") {
+            if (!this.session) throw new Error("No active remote transaction");
+            try { await this.session.sequence(sql); }
+            finally { this._inRemoteTxn = false; await this.session.close(); this.session = null; }
+            return { shouldPull: false };
+        }
+        await this.sequence(sql);
+        return { shouldPull: !this._inRemoteTxn };
+    }
+
     get isInTransaction(): boolean {
         return this._inRemoteTxn;
     }

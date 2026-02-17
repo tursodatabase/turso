@@ -499,11 +499,29 @@ impl Database {
         Ok(AsyncTask::new(IoLoopTask { io }))
     }
 
-    /// Classify SQL without executing. Returns true if all statements are read-only.
-    #[napi(js_name = "isReadonly")]
-    pub fn is_readonly(&self, sql: String) -> napi::Result<bool> {
-        turso_core::Connection::is_readonly_sql(&sql)
-            .map_err(|e| to_generic_error("classify failed", e))
+    /// Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback".
+    #[napi(js_name = "classifySql")]
+    pub fn classify_sql(&self, sql: String) -> napi::Result<String> {
+        use turso_parser::{ast::Stmt, parser::Parser};
+        let mut parser = Parser::new(sql.as_bytes());
+        match parser.next_cmd() {
+            Ok(Some(cmd)) => {
+                if cmd.is_explain() {
+                    return Ok("read".to_string());
+                }
+                let category = match cmd.stmt() {
+                    Stmt::Select(..) | Stmt::Pragma { .. } | Stmt::Attach { .. }
+                    | Stmt::Detach { .. } | Stmt::Reindex { .. } => "read",
+                    Stmt::Begin { .. } | Stmt::Savepoint { .. } => "begin",
+                    Stmt::Commit { .. } | Stmt::Release { .. } => "commit",
+                    Stmt::Rollback { .. } => "rollback",
+                    _ => "write",
+                };
+                Ok(category.to_string())
+            }
+            Ok(None) => Ok("read".to_string()),
+            Err(e) => Err(napi::Error::from_reason(format!("classify failed: {e}"))),
+        }
     }
 }
 
@@ -573,12 +591,6 @@ impl Statement {
     pub fn reset(&self) -> Result<()> {
         self.stmt()?.borrow_mut().reset();
         Ok(())
-    }
-
-    /// Returns whether the statement is read-only.
-    #[napi(getter)]
-    pub fn readonly(&self) -> Result<bool> {
-        Ok(self.stmt()?.borrow().is_readonly())
     }
 
     /// Returns the number of parameters in the statement.

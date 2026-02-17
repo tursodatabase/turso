@@ -208,25 +208,19 @@ class Database extends DatabasePromise {
      * When remoteWrites is enabled, write statements are sent to the remote server.
      */
     override async exec(sql: string) {
-        if (!this.#remoteWriter) {
-            return await super.exec(sql);
-        }
+        if (!this.#remoteWriter) return super.exec(sql);
+        const category = this.#db.classifySql(sql);
 
         if (this.#remoteWriter.isInTransaction) {
-            // Everything in a remote txn goes remote
-            await this.#remoteWriter.sequence(sql);
+            const { shouldPull } = await this.#remoteWriter.execRemote(sql, category);
+            if (shouldPull) await this.pull();
             return;
         }
 
-        // Use Rust classifier — no SQL parsing in JS
-        const readonly = this.#db.isReadonly(sql);
-        if (!readonly) {
-            await this.#remoteWriter.sequence(sql);
-            await this.pull();
-            return;
-        }
+        if (category === "read") return super.exec(sql);
 
-        return await super.exec(sql);
+        const { shouldPull } = await this.#remoteWriter.execRemote(sql, category);
+        if (shouldPull) await this.pull();
     }
 
     /**
@@ -240,11 +234,12 @@ class Database extends DatabasePromise {
             return localStmt;
         }
 
-        const isStmtReadonly = this.#db.isReadonly(sql);
+        const category = this.#db.classifySql(sql);
+        const isReadonly = category === "read";
         return new RemoteWriteStatement(
             localStmt,
             sql,
-            isStmtReadonly,
+            isReadonly,
             this.#remoteWriter,
             () => this.pull(),
         ) as any;
