@@ -271,8 +271,9 @@ impl Connection {
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let mode = QueryMode::Normal;
+        let schema = self.schema.read().clone();
         let program = translate::translate(
-            self.schema.read().deref(),
+            &schema,
             stmt,
             pager.clone(),
             self.clone(),
@@ -451,8 +452,9 @@ impl Connection {
                 .trim();
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+            let schema = self.schema.read().clone();
             let program = translate::translate(
-                self.schema.read().deref(),
+                &schema,
                 stmt,
                 pager.clone(),
                 self.clone(),
@@ -498,8 +500,9 @@ impl Connection {
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let schema = self.schema.read().clone();
         let program = translate::translate(
-            self.schema.read().deref(),
+            &schema,
             stmt,
             pager.clone(),
             self.clone(),
@@ -534,8 +537,9 @@ impl Connection {
                 .trim();
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+            let schema = self.schema.read().clone();
             let program = translate::translate(
-                self.schema.read().deref(),
+                &schema,
                 stmt,
                 pager.clone(),
                 self.clone(),
@@ -565,8 +569,9 @@ impl Connection {
             .trim();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let schema = self.schema.read().clone();
         let program = translate::translate(
-            self.schema.read().deref(),
+            &schema,
             stmt,
             pager.clone(),
             self.clone(),
