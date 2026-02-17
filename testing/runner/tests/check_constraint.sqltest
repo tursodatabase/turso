@@ -1651,3 +1651,46 @@ test check_constraint_keyword_constraint_name_quoting_after_alter {
 expect {
     1
 }
+
+# UPSERT should evaluate CHECK on final values, not INSERT values (#5287)
+# When INSERT values violate CHECK but conflict triggers DO UPDATE with valid
+# values, the statement should succeed.
+test check_constraint_upsert_do_update_insert_violates_check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
+    INSERT INTO t VALUES (1, 50, 'one');
+    INSERT INTO t VALUES (1, 200, 'bad') ON CONFLICT(id) DO UPDATE SET val = 70, name = 'fixed';
+    SELECT * FROM t;
+}
+expect {
+    1|70|fixed
+}
+
+# DO NOTHING with conflict should not fail CHECK on INSERT values
+test check_constraint_upsert_do_nothing_insert_violates_check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
+    INSERT INTO t VALUES (1, 50, 'one');
+    INSERT INTO t VALUES (1, 200, 'bad') ON CONFLICT(id) DO NOTHING;
+    SELECT * FROM t;
+}
+expect {
+    1|50|one
+}
+
+# No conflict: INSERT values that violate CHECK must still fail
+test check_constraint_upsert_do_update_no_conflict_insert_violates_check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
+    INSERT INTO t VALUES (1, 200, 'bad') ON CONFLICT(id) DO UPDATE SET val = 70, name = 'fixed';
+}
+expect error {
+    CHECK constraint failed
+}
+
+# Conflict with DO UPDATE: updated values that violate CHECK must fail
+test check_constraint_upsert_do_update_update_violates_check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
+    INSERT INTO t VALUES (1, 50, 'one');
+    INSERT INTO t VALUES (1, 200, 'bad') ON CONFLICT(id) DO UPDATE SET val = 200, name = 'also bad';
+}
+expect error {
+    CHECK constraint failed
+}

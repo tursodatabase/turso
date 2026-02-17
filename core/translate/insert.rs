@@ -519,29 +519,34 @@ pub fn translate_insert(
         }
     }
 
-    // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
-    emit_check_constraints(
-        program,
-        &ctx.table.check_constraints,
-        resolver,
-        &ctx.table.name,
-        insertion.key_register(),
-        insertion.col_mappings.iter().filter_map(|m| {
-            m.column.name.as_deref().map(|n| {
-                // Rowid alias columns have NULL in their register (the real value
-                // lives in the key register), so point CHECK to the key register.
-                let reg = if m.column.is_rowid_alias() {
-                    insertion.key_register()
-                } else {
-                    m.register
-                };
-                (n, reg)
-            })
-        }),
-        connection,
-        ctx.on_conflict,
-        ctx.loop_labels.row_done,
-    )?;
+    // When there's a UPSERT clause, defer CHECK constraint evaluation on
+    // INSERT values to after the preflight uniqueness checks. If a conflict is
+    // detected, the flow jumps to the UPSERT handler (DO UPDATE evaluates CHECK
+    // on the updated values; DO NOTHING skips the row entirely), so the INSERT
+    // values' CHECK should not fire for conflicting rows.
+    if !has_upsert {
+        // No UPSERT: evaluate CHECK constraints early (before preflight)
+        emit_check_constraints(
+            program,
+            &ctx.table.check_constraints,
+            resolver,
+            &ctx.table.name,
+            insertion.key_register(),
+            insertion.col_mappings.iter().filter_map(|m| {
+                m.column.name.as_deref().map(|n| {
+                    let reg = if m.column.is_rowid_alias() {
+                        insertion.key_register()
+                    } else {
+                        m.register
+                    };
+                    (n, reg)
+                })
+            }),
+            connection,
+            ctx.on_conflict,
+            ctx.loop_labels.row_done,
+        )?;
+    }
 
     // Build a list of upsert constraints/indexes we need to run preflight
     // checks against, in the proper order of evaluation,
@@ -571,6 +576,32 @@ pub fn translate_insert(
         &constraints,
         &mut preflight_ctx,
     )?;
+
+    if has_upsert {
+        // With UPSERT: evaluate CHECK constraints after preflight. If a
+        // conflict was detected, the flow already jumped to the UPSERT handler.
+        // We only reach here for the INSERT path (no conflict).
+        emit_check_constraints(
+            program,
+            &ctx.table.check_constraints,
+            resolver,
+            &ctx.table.name,
+            insertion.key_register(),
+            insertion.col_mappings.iter().filter_map(|m| {
+                m.column.name.as_deref().map(|n| {
+                    let reg = if m.column.is_rowid_alias() {
+                        insertion.key_register()
+                    } else {
+                        m.register
+                    };
+                    (n, reg)
+                })
+            }),
+            connection,
+            ctx.on_conflict,
+            ctx.loop_labels.row_done,
+        )?;
+    }
 
     emit_notnulls(program, &ctx, &insertion, resolver)?;
 
