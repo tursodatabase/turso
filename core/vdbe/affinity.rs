@@ -509,7 +509,7 @@ pub fn is_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
 }
 
-fn real_to_i64(r: f64) -> i64 {
+pub(crate) fn real_to_i64(r: f64) -> i64 {
     if r < -9223372036854774784.0 {
         i64::MIN
     } else if r > 9223372036854774784.0 {

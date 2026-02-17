@@ -3,7 +3,7 @@ use crate::{
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
-    vdbe::affinity::Affinity,
+    vdbe::affinity::{real_to_i64, Affinity},
     LimboError, Result, Value, ValueRef,
 };
 
@@ -746,20 +746,9 @@ impl Value {
                 }
                 Value::Text(t) => Value::from_i64(crate::numeric::str_to_i64(t).unwrap_or(0)),
                 Value::Numeric(Numeric::Integer(i)) => Value::from_i64(*i),
-                // A cast of a REAL value into an INTEGER results in the integer between the REAL value and zero
-                // that is closest to the REAL value. If a REAL is greater than the greatest possible signed integer (+9223372036854775807)
-                // then the result is the greatest possible signed integer and if the REAL is less than the least possible signed integer (-9223372036854775808)
-                // then the result is the least possible signed integer.
-                Value::Numeric(Numeric::Float(f)) => {
-                    let i = f64::from(*f).trunc() as i128;
-                    if i > i64::MAX as i128 {
-                        Value::from_i64(i64::MAX)
-                    } else if i < i64::MIN as i128 {
-                        Value::from_i64(i64::MIN)
-                    } else {
-                        Value::from_i64(i as i64)
-                    }
-                }
+                // A cast of a REAL value into an INTEGER follows SQLite's sqlite3RealToI64:
+                // truncate toward zero and clamp to i64::MIN/MAX if outside the safe range.
+                Value::Numeric(Numeric::Float(f)) => Value::from_i64(real_to_i64(f64::from(*f))),
                 _ => Value::from_i64(0),
             },
             Affinity::Numeric => match self {
