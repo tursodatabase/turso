@@ -436,6 +436,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let main_db_io = main_db.io.clone();
         let main_db_file = main_db.db_file.clone();
         let main_tape = DatabaseTape::new_with_opts(main_db, tape_opts);
+        // Initialize CDC pragma and cache CDC version so iterate_changes() can work
+        main_tape.connect(coro).await?;
 
         let changes_path = create_changes_path(&main_db_path);
         let changes_file = main_db_io.open_file(&changes_path, OpenFlags::Create, false)?;

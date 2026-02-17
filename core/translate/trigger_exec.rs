@@ -603,10 +603,10 @@ fn execute_trigger_commands(
     for command in trigger.commands.iter() {
         let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
         subprogram_builder.prologue();
-        subprogram_builder = translate_inner(
+        translate_inner(
             stmt,
             resolver,
-            subprogram_builder,
+            &mut subprogram_builder,
             connection,
             "trigger subprogram",
         )?;

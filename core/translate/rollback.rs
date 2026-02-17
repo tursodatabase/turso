@@ -7,10 +7,10 @@ use crate::{
 };
 
 pub fn translate_rollback(
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     txn_name: Option<Name>,
     savepoint_name: Option<Name>,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     if txn_name.is_some() || savepoint_name.is_some() {
         bail_parse_error!("txn_name and savepoint not supported yet");
     }
@@ -20,5 +20,5 @@ pub fn translate_rollback(
         rollback: true,
     });
     program.rollback();
-    Ok(program)
+    Ok(())
 }

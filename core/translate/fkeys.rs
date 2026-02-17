@@ -1241,8 +1241,13 @@ fn emit_fk_action_subprogram(
         FK_SUBPROGRAM_OPTS,
     );
     subprogram_builder.prologue();
-    subprogram_builder =
-        translate_inner(stmt, resolver, subprogram_builder, connection, description)?;
+    translate_inner(
+        stmt,
+        resolver,
+        &mut subprogram_builder,
+        connection,
+        description,
+    )?;
     subprogram_builder.epilogue(resolver.schema);
     let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
 

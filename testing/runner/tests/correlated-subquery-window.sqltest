@@ -1,0 +1,45 @@
+@database :memory:
+
+# Regression tests for correlated subqueries with window functions in WHERE clause.
+# The WHERE filter must not be hoisted before the main scan loop when
+# the subquery is correlated, even if it contains a window function.
+
+setup tables {
+    CREATE TABLE t1 (c1 INTEGER PRIMARY KEY, c2 INTEGER);
+    INSERT INTO t1 VALUES (0, 0), (1, 1), (2, 2);
+}
+
+@setup tables
+test exists-correlated-window-count {
+    SELECT COUNT(*) FROM t1 AS a WHERE EXISTS(
+      SELECT 1 FROM t1 AS b WHERE a.c1 = a.c1
+      ORDER BY +sum(1) OVER (ORDER BY 0)
+    );
+}
+expect {
+    3
+}
+
+@setup tables
+test exists-correlated-window-total {
+    SELECT TOTAL(CAST(EXISTS(
+      SELECT 1 FROM t1 AS b WHERE a.c1 = a.c1
+      ORDER BY +sum(1) OVER (ORDER BY 0)
+    ) AS BOOL) != 0) FROM t1 AS a;
+}
+expect {
+    3.0
+}
+expect @js {
+    3
+}
+
+@setup tables
+test exists-correlated-no-window {
+    SELECT COUNT(*) FROM t1 AS a WHERE EXISTS(
+      SELECT 1 FROM t1 AS b WHERE a.c1 = a.c1
+    );
+}
+expect {
+    3
+}

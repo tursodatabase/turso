@@ -369,7 +369,9 @@ pub fn translate_condition_expr(
             }
         },
         ast::Expr::Register(_) => {
-            crate::bail_parse_error!("Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead");
+            crate::bail_parse_error!(
+                "Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead"
+            );
         }
         ast::Expr::Collate(_, _) => {
             crate::bail_parse_error!("Collate in WHERE clause is not supported");
@@ -2199,6 +2201,9 @@ pub fn translate_expr(
                                 "{} is an internal function used by ANALYZE",
                                 srf
                             );
+                        }
+                        ScalarFunc::ConnTxnId | ScalarFunc::IsAutocommit => {
+                            crate::bail_parse_error!("{} is an internal function used by CDC", srf);
                         }
                     }
                 }
@@ -4979,7 +4984,10 @@ pub(crate) fn emit_returning_results<'a>(
         return Ok(());
     }
 
-    turso_assert!(table_references.joined_tables().len() == 1, "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table");
+    turso_assert!(
+        table_references.joined_tables().len() == 1,
+        "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table"
+    );
     let table = table_references.joined_tables().first().unwrap();
 
     resolver.enable_expr_to_reg_cache();
@@ -5047,7 +5055,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             let evs_start = expr_vector_size(start)?;
             let evs_end = expr_vector_size(end)?;
             if evs_left != evs_start || evs_left != evs_end {
-                crate::bail_parse_error!("all arguments to BETWEEN must return the same number of values. Got: ({evs_left}) BETWEEN ({evs_start}) AND ({evs_end})");
+                crate::bail_parse_error!(
+                    "all arguments to BETWEEN must return the same number of values. Got: ({evs_left}) BETWEEN ({evs_start}) AND ({evs_end})"
+                );
             }
             1
         }
@@ -5055,7 +5065,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             let evs_left = expr_vector_size(expr)?;
             let evs_right = expr_vector_size(expr1)?;
             if evs_left != evs_right {
-                crate::bail_parse_error!("all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})");
+                crate::bail_parse_error!(
+                    "all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})"
+                );
             }
             1
         }
@@ -5136,7 +5148,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             for rhs in rhs.iter() {
                 let evs_rhs = expr_vector_size(rhs)?;
                 if evs_lhs != evs_rhs {
-                    crate::bail_parse_error!("all arguments to IN list must return the same number of values, got: ({evs_lhs}) IN ({evs_rhs})");
+                    crate::bail_parse_error!(
+                        "all arguments to IN list must return the same number of values, got: ({evs_lhs}) IN ({evs_rhs})"
+                    );
                 }
             }
             1
@@ -5192,7 +5206,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::Unary(unary_operator, expr) => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {
-                crate::bail_parse_error!("argument to unary operator {unary_operator} must return 1 value. Got: ({evs_expr})");
+                crate::bail_parse_error!(
+                    "argument to unary operator {unary_operator} must return 1 value. Got: ({evs_expr})"
+                );
             }
             1
         }

@@ -10,7 +10,8 @@ use crate::schema::{
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
+    OperationMode, Resolver,
 };
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
@@ -177,9 +178,9 @@ pub fn translate_create_table(
     temporary: bool,
     if_not_exists: bool,
     body: ast::CreateTableBody,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Connection,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     if temporary {
         bail_parse_error!("TEMPORARY table not supported yet");
@@ -210,7 +211,7 @@ pub fn translate_create_table(
         match object_type {
             // IF NOT EXISTS suppresses errors for table/view conflicts
             SchemaObjectType::Table | SchemaObjectType::View if if_not_exists => {
-                return Ok(program);
+                return Ok(());
             }
             _ => {
                 let type_str = match object_type {
@@ -267,7 +268,7 @@ pub fn translate_create_table(
         root_page: 1i64.into(),
         db: 0,
     });
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
 
     let created_sequence_table = if has_autoincrement
         && resolver
@@ -284,7 +285,7 @@ pub fn translate_create_table(
 
         let seq_sql = "CREATE TABLE sqlite_sequence(name,seq)";
         emit_schema_entry(
-            &mut program,
+            program,
             resolver,
             sqlite_schema_cursor_id,
             cdc_table.as_ref().map(|x| x.0),
@@ -338,7 +339,7 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs = collect_autoindexes(&body, &mut program, &normalized_tbl_name)?;
+    let index_regs = collect_autoindexes(&body, program, &normalized_tbl_name)?;
     if let Some(index_regs) = index_regs.as_ref() {
         for index_reg in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
@@ -357,10 +358,10 @@ pub fn translate_create_table(
         db: 0,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
 
     emit_schema_entry(
-        &mut program,
+        program,
         resolver,
         sqlite_schema_cursor_id,
         cdc_table.as_ref().map(|x| x.0),
@@ -379,7 +380,7 @@ pub fn translate_create_table(
                 idx + 1
             );
             emit_schema_entry(
-                &mut program,
+                program,
                 resolver,
                 sqlite_schema_cursor_id,
                 None,
@@ -415,7 +416,7 @@ pub fn translate_create_table(
 
     // TODO: SqlExec
 
-    Ok(program)
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -516,6 +517,7 @@ pub fn emit_schema_entry(
             None,
             SQLITE_TABLEID,
         )?;
+        emit_cdc_autocommit_commit(program, resolver, cdc_table_cursor_id)?;
     }
     Ok(())
 }
@@ -631,8 +633,8 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
 pub fn translate_create_virtual_table(
     vtab: ast::CreateVirtualTable,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> Result<()> {
     let ast::CreateVirtualTable {
         if_not_exists,
         tbl_name,
@@ -651,7 +653,7 @@ pub fn translate_create_virtual_table(
     };
     if resolver.schema.get_table(&table_name).is_some() {
         if *if_not_exists {
-            return Ok(program);
+            return Ok(());
         }
         bail_parse_error!("Table {} already exists", tbl_name);
     }
@@ -699,10 +701,10 @@ pub fn translate_create_virtual_table(
         db: 0,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
     let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
     emit_schema_entry(
-        &mut program,
+        program,
         resolver,
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
@@ -725,7 +727,7 @@ pub fn translate_create_virtual_table(
         where_clause: Some(parse_schema_where_clause),
     });
 
-    Ok(program)
+    Ok(())
 }
 
 /// Validates whether a DROP TABLE operation is allowed on the given table name.
@@ -754,9 +756,9 @@ pub fn translate_drop_table(
     tbl_name: ast::QualifiedName,
     resolver: &mut Resolver,
     if_exists: bool,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts {
         num_cursors: 4,
@@ -766,7 +768,7 @@ pub fn translate_drop_table(
     program.extend(&opts);
     let Some(table) = resolver.schema.get_table(name) else {
         if if_exists {
-            return Ok(program);
+            return Ok(());
         }
         bail_parse_error!("No such table: {name}");
     };
@@ -774,9 +776,9 @@ pub fn translate_drop_table(
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled() && resolver.schema.any_resolved_fks_referencing(name) {
-        emit_fk_drop_table_check(&mut program, resolver, name, connection)?;
+        emit_fk_drop_table_check(program, resolver, name, connection)?;
     }
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
 
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
@@ -843,7 +845,7 @@ pub fn translate_drop_table(
         });
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
-                &mut program,
+                program,
                 &schema_table.columns,
                 sqlite_schema_cursor_id_0,
                 row_id_reg,
@@ -852,7 +854,7 @@ pub fn translate_drop_table(
             None
         };
         emit_cdc_insns(
-            &mut program,
+            program,
             resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
@@ -877,6 +879,9 @@ pub fn translate_drop_table(
     });
     program.preassign_label_to_next_insn(end_metadata_label);
     // end of loop on schema table
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
 
     //  2. Destroy the indices within a loop
     let indices = resolver.schema.get_indices(tbl_name.name.as_str());
@@ -1213,5 +1218,5 @@ pub fn translate_drop_table(
         p5: 0,
     });
 
-    Ok(program)
+    Ok(())
 }

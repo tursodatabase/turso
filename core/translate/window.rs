@@ -193,7 +193,10 @@ fn prepare_window_subquery(
         original_idx: 0,
         is_outer: false,
     }];
-    let new_table_references = TableReferences::new(vec![], vec![]);
+    let new_table_references = TableReferences::new(
+        vec![],
+        outer_plan.table_references.outer_query_refs().to_vec(),
+    );
 
     let mut inner_plan = SelectPlan {
         join_order: mem::replace(&mut outer_plan.join_order, new_join_order),
@@ -918,7 +921,9 @@ fn emit_aggregation_step(
         let args = match &func.original_expr {
             Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
             Expr::FunctionCallStar { .. } => vec![],
-            _ => unreachable!("All window functions should be either FunctionCall or FunctionCallStar expressions"),
+            _ => unreachable!(
+                "All window functions should be either FunctionCall or FunctionCallStar expressions"
+            ),
         };
 
         let reg_acc_start = registers.acc_start + i;

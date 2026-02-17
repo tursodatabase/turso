@@ -1,0 +1,44 @@
+---
+source: modifications.sqltest
+expression: INSERT OR REPLACE INTO t_defaults(id, val) VALUES (1, 100);
+info:
+  statement_type: INSERT
+  setup_blocks:
+  - notnull_defaults
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4               p5  comment
+   0  Init            0  27   0                    0  Start at 27
+   1  OpenWrite       0   2   0                    0  root=2; iDb=0
+   2  Integer         1   2   0                    0  r[2]=1
+   3  SoftNull        3   0   0                    0
+   4  Integer       100   4   0                    0  r[4]=100
+   5  NotNull         2   7   0                    0  r[2]!=NULL -> goto 7
+   6  Goto            0   9   0                    0
+   7  MustBeInt       2   0   0                    0
+   8  Goto            0  10   0                    0
+   9  NewRowid        0   2   0                    0  r[2]=rowid
+  10  Affinity        3   3   0                    0  r[3..6] = D, D, B
+  11  NotExists       0  16   2                    0
+  12  Copy            2   1   0                    0  r[1]=r[2]
+  13  SeekRowid       0   1  26                    0  if (r[1]!=cursor 0 for table t_defaults.rowid) goto 26
+  14  Delete          0   0   0  t_defaults        0
+  15  Goto            0  16   0                    0
+  16  NotNull         4  18   0                    0  r[4]!=NULL -> goto 18
+  17  Integer        42   4   0                    0  r[4]=42
+  18  HaltIfNull   1299   0   4  t_defaults.val    0
+  19  NotNull         5  21   0                    0  r[5]!=NULL -> goto 21
+  20  String8         0   5   0  unnamed           0  r[5]='unnamed'
+  21  HaltIfNull   1299   0   5  t_defaults.name   0
+  22  MakeRecord      3   3   6                    0  r[6]=mkrec(r[3..5])
+  23  Insert          0   6   2  t_defaults        2  intkey=r[2] data=r[6]
+  24  Goto            0  25   0                    0
+  25  Goto            0  26   0                    0
+  26  Halt            0   0   0                    0
+  27  Transaction     0   2   1                    0  iDb=0 tx_mode=Write
+  28  String8         0   5   0  unnamed           0  r[5]='unnamed'
+  29  Goto            0   1   0                    0

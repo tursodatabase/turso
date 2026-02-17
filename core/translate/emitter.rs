@@ -417,7 +417,14 @@ fn emit_program_for_select_with_inputs(
     t_ctx.materialized_build_inputs = materialized_build_inputs;
 
     // Emit main parts of query
-    emit_query(program, &mut plan, &mut t_ctx)?;
+    let result_cols_start = emit_query(program, &mut plan, &mut t_ctx)?;
+    // TODO: This solution works but it's just a hack/quick fix.
+    // Ideally we should do some refactor on how we scope queries, subqueries, and registers so that we don't have to do these ad-hoc/unintuitive adjustments.
+
+    // Restore reg_result_cols_start after emit_query, because nested subqueries
+    // (e.g. correlated scalar subqueries in WHERE) can overwrite
+    // program.reg_result_cols_start with their own result column registers.
+    program.reg_result_cols_start = Some(result_cols_start);
 
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
@@ -623,16 +630,17 @@ fn emit_materialized_build_inputs(
             cursor_id,
             is_table: true,
         });
-        program.incr_nesting();
-        program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
-        emit_program_for_select_with_inputs(
-            program,
-            resolver,
-            materialize_plan,
-            build_inputs.clone(),
-        )?;
-        program.clear_hash_tables_to_keep_open();
-        program.decr_nesting();
+        program.nested(|program| -> Result<()> {
+            program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
+            emit_program_for_select_with_inputs(
+                program,
+                resolver,
+                materialize_plan,
+                build_inputs.clone(),
+            )?;
+            program.clear_hash_tables_to_keep_open();
+            Ok(())
+        })?;
         program.pop_current_parent_explain();
 
         build_inputs.insert(
@@ -1417,9 +1425,7 @@ fn emit_program_for_delete(
         });
 
         // Execute the rowset SELECT plan to populate the rowset.
-        program.incr_nesting();
-        emit_program_for_select(program, resolver, rowset_plan)?;
-        program.decr_nesting();
+        program.nested(|program| emit_program_for_select(program, resolver, rowset_plan))?;
 
         // Close the read cursor(s) opened by the rowset plan before opening for writing
         let table_ref = plan.table_references.joined_tables().first().unwrap();
@@ -1526,6 +1532,9 @@ fn emit_program_for_delete(
         )?;
     }
     program.preassign_label_to_next_insn(after_main_loop_label);
+    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
     // Finalize program
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
@@ -2223,9 +2232,7 @@ fn emit_program_for_update(
             cursor_id: temp_cursor_id.unwrap(),
             is_table: true,
         });
-        program.incr_nesting();
-        emit_program_for_select(program, resolver, ephemeral_plan)?;
-        program.decr_nesting();
+        program.nested(|program| emit_program_for_select(program, resolver, ephemeral_plan))?;
         Arc::new(table)
     } else {
         Arc::new(
@@ -2429,6 +2436,9 @@ fn emit_program_for_update(
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
+    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
     after(program);
 
     program.result_columns = plan.returning.unwrap_or_default();
@@ -4108,7 +4118,49 @@ pub fn emit_cdc_insns(
     updates_record_reg: Option<usize>,
     table_name: &str,
 ) -> Result<()> {
-    // (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)
+    let cdc_info = program.capture_data_changes_info().as_ref();
+    match cdc_info.map(|info| info.cdc_version()) {
+        Some(crate::CdcVersion::V2) => emit_cdc_insns_v2(
+            program,
+            resolver,
+            operation_mode,
+            cdc_cursor_id,
+            rowid_reg,
+            before_record_reg,
+            after_record_reg,
+            updates_record_reg,
+            table_name,
+        ),
+        Some(crate::CdcVersion::V1) => emit_cdc_insns_v1(
+            program,
+            resolver,
+            operation_mode,
+            cdc_cursor_id,
+            rowid_reg,
+            before_record_reg,
+            after_record_reg,
+            updates_record_reg,
+            table_name,
+        ),
+        None => Err(crate::LimboError::InternalError(
+            "cdc info not set".to_string(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_cdc_insns_v1(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    operation_mode: OperationMode,
+    cdc_cursor_id: usize,
+    rowid_reg: usize,
+    before_record_reg: Option<usize>,
+    after_record_reg: Option<usize>,
+    updates_record_reg: Option<usize>,
+    table_name: &str,
+) -> Result<()> {
+    // v1: (change_id, change_time, change_type, table_name, id, before, after, updates)
     let turso_cdc_registers = program.alloc_registers(8);
     program.emit_insn(Insn::Null {
         dest: turso_cdc_registers,
@@ -4204,6 +4256,272 @@ pub fn emit_cdc_insns(
         flag: InsertFlags::new(),
         table_name: "".to_string(),
     });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_cdc_insns_v2(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    operation_mode: OperationMode,
+    cdc_cursor_id: usize,
+    rowid_reg: usize,
+    before_record_reg: Option<usize>,
+    after_record_reg: Option<usize>,
+    updates_record_reg: Option<usize>,
+    table_name: &str,
+) -> Result<()> {
+    // v2: (change_id, change_time, change_txn_id, change_type, table_name, id, before, after, updates)
+    let turso_cdc_registers = program.alloc_registers(9);
+    program.emit_insn(Insn::Null {
+        dest: turso_cdc_registers,
+        dest_end: None,
+    });
+    program.mark_last_insn_constant();
+
+    // change_time = unixepoch()
+    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0) else {
+        bail_parse_error!("no function {}", "unixepoch");
+    };
+    let unixepoch_fn_ctx = crate::function::FuncCtx {
+        func: unixepoch_fn,
+        arg_count: 0,
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: 0,
+        dest: turso_cdc_registers + 1,
+        func: unixepoch_fn_ctx,
+    });
+
+    // change_txn_id = conn_txn_id(new_rowid)
+    // First generate a candidate rowid, then pass it to conn_txn_id for get-or-set.
+    let candidate_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: cdc_cursor_id,
+        rowid_reg: candidate_reg,
+        prev_largest_reg: 0,
+    });
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1) else {
+        bail_parse_error!("no function {}", "conn_txn_id");
+    };
+    let conn_txn_id_fn_ctx = crate::function::FuncCtx {
+        func: conn_txn_id_fn,
+        arg_count: 1,
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: candidate_reg,
+        dest: turso_cdc_registers + 2,
+        func: conn_txn_id_fn_ctx,
+    });
+
+    // change_type
+    let change_type = match operation_mode {
+        OperationMode::INSERT => 1,
+        OperationMode::UPDATE { .. } | OperationMode::SELECT => 0,
+        OperationMode::DELETE => -1,
+    };
+    program.emit_int(change_type, turso_cdc_registers + 3);
+    program.mark_last_insn_constant();
+
+    // table_name
+    program.emit_string8(table_name.to_string(), turso_cdc_registers + 4);
+    program.mark_last_insn_constant();
+
+    // id
+    program.emit_insn(Insn::Copy {
+        src_reg: rowid_reg,
+        dst_reg: turso_cdc_registers + 5,
+        extra_amount: 0,
+    });
+
+    // before
+    if let Some(before_record_reg) = before_record_reg {
+        program.emit_insn(Insn::Copy {
+            src_reg: before_record_reg,
+            dst_reg: turso_cdc_registers + 6,
+            extra_amount: 0,
+        });
+    } else {
+        program.emit_null(turso_cdc_registers + 6, None);
+        program.mark_last_insn_constant();
+    }
+
+    // after
+    if let Some(after_record_reg) = after_record_reg {
+        program.emit_insn(Insn::Copy {
+            src_reg: after_record_reg,
+            dst_reg: turso_cdc_registers + 7,
+            extra_amount: 0,
+        });
+    } else {
+        program.emit_null(turso_cdc_registers + 7, None);
+        program.mark_last_insn_constant();
+    }
+
+    // updates
+    if let Some(updates_record_reg) = updates_record_reg {
+        program.emit_insn(Insn::Copy {
+            src_reg: updates_record_reg,
+            dst_reg: turso_cdc_registers + 8,
+            extra_amount: 0,
+        });
+    } else {
+        program.emit_null(turso_cdc_registers + 8, None);
+        program.mark_last_insn_constant();
+    }
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: cdc_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(turso_cdc_registers),
+        count: to_u16(9),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+
+    program.emit_insn(Insn::Insert {
+        cursor: cdc_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: "".to_string(),
+    });
+    Ok(())
+}
+
+/// Emit a COMMIT record into the CDC table (v2 only).
+/// change_type=2, all other data fields NULL.
+pub fn emit_cdc_commit_insns(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    cdc_cursor_id: usize,
+) -> Result<()> {
+    // v2 COMMIT record: (NULL, unixepoch(), conn_txn_id(-1), 2, NULL, NULL, NULL, NULL, NULL)
+    let regs = program.alloc_registers(9);
+    // reg+0: NULL (change_id, autoincrement)
+    program.emit_insn(Insn::Null {
+        dest: regs,
+        dest_end: None,
+    });
+    program.mark_last_insn_constant();
+
+    // reg+1: change_time = unixepoch()
+    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0) else {
+        bail_parse_error!("no function {}", "unixepoch");
+    };
+    let unixepoch_fn_ctx = crate::function::FuncCtx {
+        func: unixepoch_fn,
+        arg_count: 0,
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: 0,
+        dest: regs + 1,
+        func: unixepoch_fn_ctx,
+    });
+
+    // reg+2: change_txn_id = conn_txn_id(-1)
+    // Pass -1 as candidate: if a txn_id exists, return it; if not, -1 is stored (and will be reset).
+    let minus_one_reg = program.alloc_register();
+    program.emit_int(-1, minus_one_reg);
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1) else {
+        bail_parse_error!("no function {}", "conn_txn_id");
+    };
+    let conn_txn_id_fn_ctx = crate::function::FuncCtx {
+        func: conn_txn_id_fn,
+        arg_count: 1,
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: minus_one_reg,
+        dest: regs + 2,
+        func: conn_txn_id_fn_ctx,
+    });
+
+    // reg+3: change_type = 2 (COMMIT)
+    program.emit_int(2, regs + 3);
+    program.mark_last_insn_constant();
+
+    // reg+4..8: NULL (table_name, id, before, after, updates)
+    program.emit_insn(Insn::Null {
+        dest: regs + 4,
+        dest_end: Some(regs + 8),
+    });
+    program.mark_last_insn_constant();
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: cdc_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(regs),
+        count: to_u16(9),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+
+    program.emit_insn(Insn::Insert {
+        cursor: cdc_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: "".to_string(),
+    });
+    Ok(())
+}
+
+/// Emit a CDC COMMIT record at end-of-statement when in autocommit mode (v2 only).
+/// This should be called once per statement, after the main loop, not per-row.
+pub fn emit_cdc_autocommit_commit(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    cdc_cursor_id: usize,
+) -> Result<()> {
+    let cdc_info = program.capture_data_changes_info().as_ref();
+    if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
+        // Check if we're in autocommit mode; if so, emit a COMMIT record.
+        let Some(is_autocommit_fn) = resolver.resolve_function("is_autocommit", 0) else {
+            bail_parse_error!("no function {}", "is_autocommit");
+        };
+        let is_autocommit_fn_ctx = crate::function::FuncCtx {
+            func: is_autocommit_fn,
+            arg_count: 0,
+        };
+        let autocommit_reg = program.alloc_register();
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: 0,
+            dest: autocommit_reg,
+            func: is_autocommit_fn_ctx,
+        });
+
+        // IfNot jumps when reg == 0 (not autocommit). Skip the COMMIT in that case.
+        let skip_label = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: autocommit_reg,
+            target_pc: skip_label,
+            jump_if_null: true,
+        });
+
+        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+
+        program.resolve_label(skip_label, program.offset());
+    }
+
     Ok(())
 }
 /// Initialize the limit/offset counters and registers.

@@ -18,10 +18,10 @@ use turso_parser::ast::{Expr, Literal, Name};
 /// # Returns
 /// The modified program builder on success
 pub fn translate_vacuum(
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     schema_name: Option<&Name>,
     into: Option<&Expr>,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     // Schema name support (for attached databases) is not yet implemented
     if schema_name.is_some() {
         bail_parse_error!("VACUUM with schema name is not supported yet");
@@ -32,11 +32,13 @@ pub fn translate_vacuum(
             // VACUUM INTO 'path' - create compacted copy at destination
             let dest_path = extract_path_from_expr(dest_expr)?;
             program.emit_insn(Insn::VacuumInto { dest_path });
-            Ok(program)
+            Ok(())
         }
         None => {
             // Plain VACUUM - not yet supported
-            bail_parse_error!("VACUUM is not supported yet. Use VACUUM INTO 'filename' to create a compacted copy.");
+            bail_parse_error!(
+                "VACUUM is not supported yet. Use VACUUM INTO 'filename' to create a compacted copy."
+            );
         }
     }
 }

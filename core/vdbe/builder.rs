@@ -1254,12 +1254,20 @@ impl ProgramBuilder {
     }
 
     #[inline]
-    pub fn incr_nesting(&mut self) {
+    pub fn nested<T>(&mut self, body: impl FnOnce(&mut Self) -> T) -> T {
+        self.incr_nesting();
+        let res = body(self);
+        self.decr_nesting();
+        res
+    }
+
+    #[inline]
+    fn incr_nesting(&mut self) {
         self.nested_level += 1;
     }
 
     #[inline]
-    pub fn decr_nesting(&mut self) {
+    fn decr_nesting(&mut self) {
         self.nested_level -= 1;
     }
 

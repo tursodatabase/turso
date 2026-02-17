@@ -40,6 +40,7 @@ use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
     vector_distance_dot, vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
+use crate::CdcVersion;
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
@@ -2030,11 +2031,12 @@ pub fn halt(
         let result = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
             .map(Into::into);
-        // Apply deferred CDC state after successful commit
+        // Apply deferred CDC state and reset CDC txn ID after successful commit
         if matches!(result, Ok(InsnFunctionStepResult::Done)) {
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
+            program.connection.set_cdc_transaction_id(-1);
         }
         result
     } else {
@@ -2499,6 +2501,7 @@ pub fn op_auto_commit(
             }
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
+            conn.set_cdc_transaction_id(-1);
         } else {
             // BEGIN (true->false) or COMMIT (false->true)
             if is_commit_req {
@@ -2550,6 +2553,15 @@ pub fn op_auto_commit(
         && (is_rollback_req || is_commit_req)
     {
         conn.clear_deferred_foreign_key_violations();
+    }
+
+    // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
+    if matches!(
+        res,
+        Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
+    ) && (is_rollback_req || is_commit_req)
+    {
+        conn.set_cdc_transaction_id(-1);
     }
 
     res
@@ -5641,6 +5653,29 @@ pub fn op_function(
                 };
                 state.registers[*dest] = Register::Value(result);
             }
+            ScalarFunc::ConnTxnId => {
+                // conn_txn_id(candidate): get-or-set semantics for CDC transaction ID.
+                // If unset (-1), store the candidate and return it.
+                // If already set, return the existing value, ignoring the candidate.
+                assert_eq!(arg_count, 1);
+                let candidate = match state.registers[*start_reg].get_value() {
+                    Value::Numeric(Numeric::Integer(n)) => *n,
+                    _ => -1,
+                };
+                let current = program.connection.get_cdc_transaction_id();
+                if current == -1 {
+                    program.connection.set_cdc_transaction_id(candidate);
+                    state.registers[*dest] = Register::Value(Value::from_i64(candidate));
+                } else {
+                    state.registers[*dest] = Register::Value(Value::from_i64(current));
+                }
+            }
+            ScalarFunc::IsAutocommit => {
+                // is_autocommit(): returns 1 if autocommit, 0 otherwise.
+                let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
+                state.registers[*dest] =
+                    Register::Value(Value::from_i64(if auto_commit { 1 } else { 0 }));
+            }
         },
         crate::function::Func::Vector(vector_func) => {
             let args = &state.registers[*start_reg..*start_reg + arg_count];
@@ -8370,19 +8405,41 @@ pub fn op_init_cdc_version(
     {
         let current = conn.get_capture_data_changes_info();
         if let Some(info) = current.as_ref() {
-            let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version.clone())?;
+            let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version)?;
             state.pending_cdc_info = Some(opts);
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
     }
 
+    // Step 0: Check if the CDC table already exists but has no version row.
+    // If so, it's a legacy v1 table that pre-dates version tracking.
+    let cdc_table_exists = {
+        conn.start_nested();
+        let mut stmt = conn.prepare(format!(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{cdc_table_name}'",
+        ))?;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
+        let rows = stmt.run_collect_rows();
+        conn.end_nested();
+        !rows?.is_empty()
+    };
+
     // Step 1: Create CDC table if needed
     {
         conn.start_nested();
-        let mut stmt = conn.prepare(format!(
-            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
-        ))?;
+        let create_sql = match version {
+            CdcVersion::V1 => format!(
+                "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+            ),
+            CdcVersion::V2 => format!(
+                "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+            ),
+        };
+        let mut stmt = conn.prepare(create_sql)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
@@ -8408,12 +8465,16 @@ pub fn op_init_cdc_version(
     }
 
     // Step 3: Insert version row only if one doesn't already exist.
-    // If the table was previously initialized with an older version, we must
-    // keep that version (the CDC table schema hasn't been migrated).
+    // If the CDC table pre-existed without a version row, it's a legacy v1 table.
+    let version_to_insert = if cdc_table_exists {
+        CdcVersion::V1
+    } else {
+        *version
+    };
     {
         conn.start_nested();
         let mut stmt = conn.prepare(format!(
-            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{cdc_table_name}', '{version}')",
+            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{cdc_table_name}', '{version_to_insert}')",
         ))?;
         stmt.program
             .prepared
@@ -8439,8 +8500,8 @@ pub fn op_init_cdc_version(
         conn.end_nested();
         let rows = rows?;
         match rows.first().and_then(|r| r.first()) {
-            Some(crate::Value::Text(text)) => text.to_string(),
-            _ => version.to_string(),
+            Some(crate::Value::Text(text)) => text.to_string().parse::<CdcVersion>()?,
+            _ => *version,
         }
     };
 
@@ -11356,13 +11417,18 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                         return false;
                     }
 
-                    // For affinity conversion, only convert strings that are entirely numeric
-                    let num = if let Ok(i) = text.parse::<i64>() {
-                        Value::from_i64(i)
-                    } else if let Ok(f) = text.parse::<f64>() {
-                        Value::from_f64(f)
-                    } else {
-                        return false;
+                    let (parse_result, parsed_value) = try_for_float(text.as_bytes());
+                    let num = match parse_result {
+                        NumericParseResult::NotNumeric | NumericParseResult::ValidPrefixOnly => {
+                            return false;
+                        }
+                        NumericParseResult::PureInteger | NumericParseResult::HasDecimalOrExp => {
+                            match parsed_value {
+                                ParsedNumber::Integer(i) => Value::from_i64(i),
+                                ParsedNumber::Float(f) => Value::from_f64(f),
+                                ParsedNumber::None => return false,
+                            }
+                        }
                     };
 
                     match num {
@@ -11719,6 +11785,12 @@ fn op_journal_mode_inner(
 
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc) {
+                    let cdc_info = program.connection.get_capture_data_changes_info();
+                    if cdc_info.is_some() {
+                        return Err(LimboError::InternalError(
+                            "cannot enable MVCC while CDC is active".to_string(),
+                        ));
+                    }
                     let db_path = program.connection.get_database_canonical_path();
                     let mv_store = journal_mode::open_mv_store(
                         pager.io.clone(),
@@ -12669,6 +12741,35 @@ mod tests {
                     panic!("String '{input}' should NOT be converted to integer");
                 }
                 other => panic!("Unexpected value type: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_affinity_keeps_nan_inf_text() {
+        let cases = ["nan", "inf"];
+
+        for input in cases {
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Integer);
+            match register {
+                Register::Value(Value::Text(t)) => {
+                    assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
+                }
+                other => {
+                    panic!("'{input}' should remain text, got {other:?}");
+                }
+            }
+
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Numeric);
+            match register {
+                Register::Value(Value::Text(t)) => {
+                    assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
+                }
+                other => {
+                    panic!("'{input}' should remain text, got {other:?}");
+                }
             }
         }
     }

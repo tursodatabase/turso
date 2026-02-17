@@ -1099,6 +1099,27 @@ expect {
     mbo
 }
 
+test substr-large-float-clamp {
+    SELECT substr('abcdefghijklmnopqrstuvwxyz', 18446744073709551488);
+}
+expect {
+}
+
+test cast-real-overflow-clamp {
+    SELECT CAST(9223372036854775808 AS INTEGER);
+}
+expect {
+    9223372036854775807
+}
+
+# 2^64 - 128 rounds to 2^64 in f64, so it clamps to i64::MAX.
+test cast-real-overflow-clamp-rounded {
+    SELECT CAST(18446744073709551488 AS INTEGER);
+}
+expect {
+    9223372036854775807
+}
+
 test substring-3-args {
     SELECT substring('limbo', 1, 3);
 }
