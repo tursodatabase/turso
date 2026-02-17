@@ -30,6 +30,9 @@ test exists-correlated-window-total {
 expect {
     3.0
 }
+expect @js {
+    3
+}
 
 @setup tables
 test exists-correlated-no-window {
