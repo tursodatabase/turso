@@ -1655,6 +1655,13 @@ impl DatabaseCatalog {
             .map(|(db, _pager)| db.clone())
     }
 
+    fn get_name_by_index(&self, index: usize) -> Option<String> {
+        self.name_to_index
+            .iter()
+            .find(|(_, &idx)| idx == index)
+            .map(|(name, _)| name.clone())
+    }
+
     fn get_database_by_name(&self, s: &str) -> Option<(usize, Arc<Database>)> {
         match self.name_to_index.get(s) {
             None => None,

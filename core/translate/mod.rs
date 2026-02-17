@@ -159,7 +159,7 @@ pub fn translate_inner(
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
         }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
+        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program, connection)?,
         ast::Stmt::Attach { expr, db_name, key } => {
             attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
@@ -225,7 +225,7 @@ pub fn translate_inner(
             columns,
             ..
         } => view::translate_create_view(
-            &view_name.name,
+            &view_name,
             resolver,
             &select,
             &columns,
@@ -235,7 +235,7 @@ pub fn translate_inner(
         ast::Stmt::CreateMaterializedView {
             view_name, select, ..
         } => view::translate_create_materialized_view(
-            &view_name.name,
+            &view_name,
             resolver,
             &select,
             connection.clone(),
@@ -276,7 +276,7 @@ pub fn translate_inner(
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(idx_name.name.as_str(), resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, resolver, if_exists, program, connection)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
@@ -284,19 +284,11 @@ pub fn translate_inner(
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(
-            resolver.schema,
-            trigger_name.name.as_str(),
-            if_exists,
-            program,
-            connection.clone(),
-        )?,
+        } => trigger::translate_drop_trigger(connection, &trigger_name, if_exists, program)?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => {
-            view::translate_drop_view(resolver.schema, view_name.name.as_str(), if_exists, program)?
-        }
+        } => view::translate_drop_view(connection, resolver, &view_name, if_exists, program)?,
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }

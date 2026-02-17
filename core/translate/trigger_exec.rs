@@ -79,6 +79,8 @@ struct TriggerSubprogramContext {
     table: Arc<BTreeTable>,
     /// Override conflict resolution for statements within this trigger.
     override_conflict: Option<ast::ResolveType>,
+    /// Database name for the trigger's database (used to qualify unqualified table names in body)
+    db_name: Option<ast::Name>,
 }
 
 impl TriggerSubprogramContext {
@@ -273,7 +275,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
-                    db_name: None,
+                    db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
@@ -315,7 +317,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
-                    db_name: None,
+                    db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
@@ -344,7 +346,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
 
             Ok(ast::Stmt::Delete {
                 tbl_name: QualifiedName {
-                    db_name: None,
+                    db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
@@ -548,6 +550,7 @@ fn execute_trigger_commands(
     trigger: &Arc<Trigger>,
     ctx: &TriggerContext,
     connection: &Arc<crate::Connection>,
+    database_id: usize,
 ) -> Result<bool> {
     if connection.trigger_is_compiling(trigger) {
         // Do not recursively compile the same trigger
@@ -579,11 +582,21 @@ fn execute_trigger_commands(
         })
         .map(ParamMap);
 
+    // For triggers on attached databases, resolve the database name so unqualified
+    // table references in the trigger body are correctly qualified to the trigger's database.
+    let db_name = if database_id == 0 {
+        None
+    } else {
+        connection
+            .get_database_name_by_index(database_id)
+            .map(ast::Name::exact)
+    };
     let subprogram_ctx = TriggerSubprogramContext {
         new_param_map,
         old_param_map,
         table: ctx.table.clone(),
         override_conflict: ctx.override_conflict,
+        db_name,
     };
     let mut subprogram_builder = ProgramBuilder::new_for_trigger(
         QueryMode::Normal,
@@ -747,6 +760,7 @@ pub fn fire_trigger(
     trigger: Arc<Trigger>,
     ctx: &TriggerContext,
     connection: &Arc<crate::Connection>,
+    database_id: usize,
 ) -> Result<()> {
     // Evaluate WHEN clause if present
     if let Some(mut when_expr) = trigger.when_clause.clone() {
@@ -764,12 +778,12 @@ pub fn fire_trigger(
         });
 
         // Execute trigger commands if WHEN clause is true
-        execute_trigger_commands(program, resolver, &trigger, ctx, connection)?;
+        execute_trigger_commands(program, resolver, &trigger, ctx, connection, database_id)?;
 
         program.preassign_label_to_next_insn(skip_label);
     } else {
         // No WHEN clause - always execute
-        execute_trigger_commands(program, resolver, &trigger, ctx, connection)?;
+        execute_trigger_commands(program, resolver, &trigger, ctx, connection, database_id)?;
     }
 
     Ok(())

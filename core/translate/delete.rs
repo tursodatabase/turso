@@ -31,6 +31,7 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    let database_id = connection.resolve_database_id(tbl_name)?;
     let tbl_name = normalize_ident(tbl_name.name.as_str());
 
     // Check if this is a system table that should be protected from direct writes
@@ -39,6 +40,11 @@ pub fn translate_delete(
         && crate::schema::is_system_table(&tbl_name)
     {
         crate::bail_parse_error!("table {} may not be modified", tbl_name);
+    }
+
+    if database_id >= 2 {
+        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie);
     }
 
     let mut delete_plan = prepare_delete_plan(
@@ -50,6 +56,7 @@ pub fn translate_delete(
         returning,
         with,
         connection,
+        database_id,
     )?;
 
     // Plan subqueries in the WHERE clause
@@ -70,7 +77,7 @@ pub fn translate_delete(
         }
     }
 
-    optimize_plan(program, &mut delete_plan, resolver.schema)?;
+    optimize_plan(program, &mut delete_plan, resolver.schema, connection)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Rewrite the Delete plan after optimization whenever a RowSet is used (DELETE triggers
         // are present), so the joined table is treated as a plain table scan again.
@@ -119,9 +126,10 @@ pub fn prepare_delete_plan(
     mut returning: Vec<ResultColumn>,
     with: Option<With>,
     connection: &Arc<crate::Connection>,
+    database_id: usize,
 ) -> Result<Plan> {
     let schema = resolver.schema;
-    let table = match schema.get_table(&tbl_name) {
+    let table = match connection.with_schema(database_id, |s| s.get_table(&tbl_name)) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", tbl_name),
     };
@@ -164,7 +172,7 @@ pub fn prepare_delete_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id: 0,
+        database_id,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
@@ -207,7 +215,11 @@ pub fn prepare_delete_plan(
     // to skip the rowset materialization.
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
-        .map(|bt| has_relevant_triggers_type_only(schema, TriggerEvent::Delete, None, bt))
+        .map(|bt| {
+            connection.with_schema(database_id, |s| {
+                has_relevant_triggers_type_only(s, TriggerEvent::Delete, None, bt)
+            })
+        })
         .unwrap_or(false);
 
     if has_delete_triggers {

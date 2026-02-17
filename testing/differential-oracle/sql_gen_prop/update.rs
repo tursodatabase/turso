@@ -91,7 +91,7 @@ pub fn update_for_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<UpdateStatement> {
-    let table_name = table.name.clone();
+    let table_name = table.qualified_name();
     let updatable: Vec<ColumnDef> = table.updatable_columns().cloned().collect();
     let functions = builtin_functions();
 

@@ -43,7 +43,7 @@ pub fn translate_select(
         query_destination,
         connection,
     )?;
-    optimize_plan(program, &mut select_plan, resolver.schema)?;
+    optimize_plan(program, &mut select_plan, resolver.schema, connection)?;
     let num_result_cols;
     let opts = match &select_plan {
         Plan::Select(select) => {

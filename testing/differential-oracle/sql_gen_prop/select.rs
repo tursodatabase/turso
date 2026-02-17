@@ -280,7 +280,7 @@ pub fn select_single_column_for_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<SelectStatement> {
-    let table_name = table.name.clone();
+    let table_name = table.qualified_name();
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
 
     let select_profile = profile.select_profile();
@@ -402,7 +402,7 @@ pub fn select_for_table(
             // Pick a source to query from (could be original table or a CTE)
             proptest::sample::select(sources).prop_flat_map(move |source| {
                 let with_clause = with_for_closure.clone();
-                let source_name = source.name.clone();
+                let source_name = source.qualified_name();
 
                 select_body_for_source(&source, &schema, &profile).prop_map(
                     move |(columns, where_clause, order_by, limit, offset)| SelectStatement {

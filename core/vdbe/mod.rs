@@ -812,6 +812,8 @@ pub struct PreparedProgram {
     pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
+    /// Set of attached database indices that need write transactions.
+    pub write_databases: std::collections::HashSet<usize>,
 }
 
 #[derive(Clone)]
@@ -1423,6 +1425,7 @@ impl Program {
                 TransactionState::Read => {
                     connection.set_tx_state(TransactionState::None);
                     pager.end_read_tx();
+                    self.end_attached_read_txns(&connection);
                     Ok(IOResult::Done(()))
                 }
                 TransactionState::None => Ok(IOResult::Done(())),
@@ -1491,6 +1494,8 @@ impl Program {
         match txn_finish_result? {
             IOResult::Done(_) => {
                 *commit_state = CommitState::Ready;
+                // Also commit/rollback attached database pagers
+                self.end_attached_write_txns(connection, rollback)?;
             }
             IOResult::IO(io) => {
                 tracing::trace!("Cacheflush IO");
@@ -1499,6 +1504,47 @@ impl Program {
             }
         }
         Ok(IOResult::Done(()))
+    }
+
+    /// End write transactions on all attached databases that were written to.
+    fn end_attached_write_txns(&self, connection: &Connection, rollback: bool) -> Result<()> {
+        for &db_id in &self.prepared.write_databases {
+            if db_id < 2 {
+                continue;
+            }
+            let attached_pager = connection.get_pager_from_database_index(&db_id);
+            if !rollback {
+                // Commit dirty pages to WAL, then end write+read transactions.
+                // We disable auto-checkpoint and avoid pager.commit_tx() since
+                // the checkpoint logic can leave read locks held.
+                match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
+                    Ok(IOResult::Done(_)) => {}
+                    Ok(IOResult::IO(_)) => {
+                        tracing::warn!("attached pager commit_dirty_pages returned IO");
+                    }
+                    Err(e) => {
+                        tracing::warn!("attached pager commit_dirty_pages error: {e}");
+                    }
+                }
+                attached_pager.end_write_tx();
+                attached_pager.end_read_tx();
+                attached_pager.commit_dirty_pages_end();
+            } else {
+                attached_pager.rollback_attached();
+            }
+        }
+        Ok(())
+    }
+
+    /// End read transactions on all attached databases that had transactions started.
+    fn end_attached_read_txns(&self, connection: &Connection) {
+        for &db_id in &self.prepared.write_databases {
+            if db_id < 2 {
+                continue;
+            }
+            let attached_pager = connection.get_pager_from_database_index(&db_id);
+            attached_pager.end_read_tx();
+        }
     }
 
     #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
@@ -1613,6 +1659,10 @@ impl Program {
         } else {
             pager.rollback_tx(&self.connection);
             self.connection.auto_commit.store(true, Ordering::SeqCst);
+        }
+        // Also rollback all attached database pagers that hold write locks
+        for attached_pager in self.connection.get_all_attached_pagers() {
+            attached_pager.rollback_attached();
         }
         self.connection.set_tx_state(TransactionState::None);
     }

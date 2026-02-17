@@ -2426,6 +2426,45 @@ impl Pager {
         wal.end_read_tx();
     }
 
+    /// End just the write transaction on the WAL, without affecting the read lock.
+    pub fn end_write_tx(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        wal.end_write_tx();
+    }
+
+    /// Returns true if this pager's WAL currently holds a read lock.
+    pub fn holds_read_lock(&self) -> bool {
+        let Some(wal) = self.wal.as_ref() else {
+            return false;
+        };
+        wal.holds_read_lock()
+    }
+
+    /// Rollback and clean up an attached database pager's transaction.
+    /// Unlike rollback_tx, this doesn't modify connection-level state.
+    pub fn rollback_attached(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        let is_write = wal.holds_write_lock();
+        if is_write {
+            self.clear_savepoints()
+                .expect("clear_savepoints should not fail for attached DB");
+            // Clear dirty pages and page cache before releasing the write lock
+            self.clear_page_cache(true);
+            self.dirty_pages.write().clear();
+            self.reset_internal_states();
+            self.set_schema_cookie(None);
+            wal.rollback(None);
+            wal.end_write_tx();
+        }
+        if wal.holds_read_lock() {
+            wal.end_read_tx();
+        }
+    }
+
     /// Reads a page from disk (either WAL or DB file) bypassing page-cache
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
     pub fn read_page_no_cache(
