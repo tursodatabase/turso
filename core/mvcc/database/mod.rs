@@ -33,6 +33,7 @@ use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -3582,6 +3583,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let mut max_commit_ts_seen = persistent_tx_ts_max;
         let replay_cutoff_ts = persistent_tx_ts_max;
         let mut schema_rows: HashMap<i64, ImmutableRecord> = HashMap::default();
+        let mut dropped_root_pages: HashSet<i64> = HashSet::default();
         if let Some(mut stmt) = connection
             .query("SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema")?
         {
@@ -3861,6 +3863,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                     if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                         let rowid_int = rowid.row_id.to_int_or_panic();
+                        let record = schema_rows.get(&rowid_int).ok_or_else(|| {
+                            LimboError::Corrupt(format!(
+                                "Logical log deletes sqlite_schema rowid {rowid_int} that does not exist in merged schema state"
+                            ))
+                        })?;
+                        if record.column_count() < 5 {
+                            return Err(LimboError::Corrupt(format!(
+                                "sqlite_schema row must have at least 5 columns, got {}",
+                                record.column_count()
+                            )));
+                        }
+                        let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
+                            return Err(LimboError::Corrupt(
+                                "sqlite_schema type must be text".to_string(),
+                            ));
+                        };
+                        let row_type = row_type.as_str();
+                        let Some(ValueRef::Numeric(Numeric::Integer(root_page))) =
+                            record.get_value_opt(3)
+                        else {
+                            return Err(LimboError::Corrupt(
+                                "sqlite_schema root_page must be integer".to_string(),
+                            ));
+                        };
+                        if (row_type == "table" || row_type == "index") && root_page > 0 {
+                            dropped_root_pages.insert(root_page);
+                        }
                         schema_rows.remove(&rowid_int);
                         needs_schema_rebuild.set(true);
                     }
@@ -3944,6 +3973,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             max_commit_ts_seen >= persistent_tx_ts_max,
             "replay clock would rewind below metadata boundary: max_commit_ts_seen={max_commit_ts_seen} persistent_tx_ts_max={persistent_tx_ts_max}"
         );
+        connection.with_schema_mut(|schema| {
+            schema.dropped_root_pages = dropped_root_pages;
+        });
+        *connection.db.schema.lock() = connection.schema.read().clone();
         self.clock.reset(max_commit_ts_seen + 1);
         self.last_committed_tx_ts
             .store(max_commit_ts_seen, Ordering::SeqCst);
