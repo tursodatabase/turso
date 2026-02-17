@@ -1916,3 +1916,35 @@ expect {
     3|300|30
 }
 
+test insert-autoincrement-ipk-index-sync {
+    CREATE TABLE v0 (c1 INTEGER PRIMARY KEY AUTOINCREMENT, c2 TEXT);
+    CREATE INDEX i3 ON v0 (c1);
+    INSERT INTO v0 (c2) VALUES ('x') RETURNING c1, c2;
+    PRAGMA integrity_check;
+}
+expect {
+    1|x
+    ok
+}
+
+test insert-ipk-index-no-autoincrement {
+    CREATE TABLE t_ipk (c1 INTEGER PRIMARY KEY, c2 TEXT);
+    CREATE INDEX idx_ipk ON t_ipk (c1);
+    INSERT INTO t_ipk (c2) VALUES ('a');
+    INSERT INTO t_ipk (c2) VALUES ('b');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test insert-ipk-index-explicit-value {
+    CREATE TABLE t_ipk2 (c1 INTEGER PRIMARY KEY, c2 TEXT);
+    CREATE INDEX idx_ipk2 ON t_ipk2 (c1);
+    INSERT INTO t_ipk2 VALUES (10, 'a');
+    INSERT INTO t_ipk2 (c2) VALUES ('b');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
