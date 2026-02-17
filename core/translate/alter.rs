@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use rustc_hash::FxHashMap as HashMap;
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -15,6 +16,7 @@ use crate::{
     },
     util::{check_expr_references_column, normalize_ident},
     vdbe::{
+        affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
         insn::{to_u16, Cookie, Insn, RegisterOrLiteral},
     },
@@ -441,6 +443,7 @@ pub fn translate_alter_table(
                 program,
                 connection,
                 input,
+                None,
                 |program| {
                     let column_count = btree.columns.len();
                     let root_page = btree.root_page;
@@ -753,6 +756,7 @@ pub fn translate_alter_table(
                 program,
                 connection,
                 input,
+                None,
                 |program| {
                     program.emit_insn(Insn::SetCookie {
                         db: 0,
@@ -1170,8 +1174,52 @@ pub fn translate_alter_table(
                     program,
                     connection,
                     input,
+                    None,
                     |_program| {},
                 )?;
+            }
+
+            // When the column's type affinity changes, rewrite table data so that
+            // stored values conform to the new affinity. Without this, SQLite's
+            // integrity_check reports corruption (e.g. "NUMERIC value in t.col").
+            if !rename {
+                let old_affinity = original_btree.columns[column_index].affinity();
+                let new_affinity = definition
+                    .col_type
+                    .as_ref()
+                    .map(|t| Affinity::affinity(&t.name))
+                    .unwrap_or(Affinity::Blob);
+
+                if old_affinity != new_affinity {
+                    let rewrite_update = ast::Update {
+                        with: None,
+                        or_conflict: None,
+                        tbl_name: ast::QualifiedName::single(ast::Name::exact(
+                            table_name.to_string(),
+                        )),
+                        indexed: None,
+                        sets: vec![ast::Set {
+                            col_names: vec![ast::Name::exact(from.to_string())],
+                            expr: Box::new(ast::Expr::Id(ast::Name::exact(from.to_string()))),
+                        }],
+                        from: None,
+                        where_clause: None,
+                        returning: vec![],
+                        order_by: vec![],
+                        limit: None,
+                    };
+                    let affinity_overrides: HashMap<usize, Affinity> =
+                        [(column_index, new_affinity)].into_iter().collect();
+                    translate_update_for_schema_change(
+                        rewrite_update,
+                        resolver,
+                        program,
+                        connection,
+                        input,
+                        Some(affinity_overrides),
+                        |_program| {},
+                    )?;
+                }
             }
 
             program.emit_insn(Insn::SetCookie {

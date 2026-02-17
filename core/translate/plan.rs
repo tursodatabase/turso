@@ -613,6 +613,9 @@ pub struct UpdatePlan {
     // For ALTER TABLE turso-db emits appropriate DDL statement in the "updates" cell of CDC table
     // This field is present only for update plan created for ALTER TABLE when CDC mode has "updates" values
     pub cdc_update_alter_statement: Option<String>,
+    /// Per-column affinity overrides used by internal schema-change rewrites.
+    /// This allows ALTER COLUMN to reuse the UPDATE path while applying the target affinity.
+    pub affinity_overrides: HashMap<usize, Affinity>,
     /// Subqueries that appear in the WHERE clause (for non-ephemeral path)
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
 }

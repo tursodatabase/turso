@@ -1,3 +1,4 @@
+pub mod alter_column_affinity;
 pub mod cte;
 pub mod grammar_generator;
 pub mod journal_mode;

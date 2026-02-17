@@ -2411,6 +2411,7 @@ fn emit_program_for_update(
         &mut plan.table_references,
         &plan.set_clauses,
         plan.cdc_update_alter_statement.as_deref(),
+        &plan.affinity_overrides,
         &plan.indexes_to_update,
         plan.returning.as_ref(),
         plan.ephemeral_plan.as_ref(),
@@ -2674,6 +2675,7 @@ fn emit_update_insns<'a>(
     table_references: &mut TableReferences,
     set_clauses: &[(usize, Box<ast::Expr>)],
     cdc_update_alter_statement: Option<&str>,
+    affinity_overrides: &HashMap<usize, Affinity>,
     indexes_to_update: &[Arc<Index>],
     returning: Option<&'a Vec<ResultSetColumn>>,
     ephemeral_plan: Option<&SelectPlan>,
@@ -2850,7 +2852,12 @@ fn emit_update_insns<'a>(
     // use the converted values.
     if let Some(btree_table) = target_table.table.btree() {
         if !btree_table.is_strict {
-            let affinity = btree_table.columns.iter().map(|c| c.affinity());
+            let affinity = btree_table.columns.iter().enumerate().map(|(idx, c)| {
+                affinity_overrides
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or_else(|| c.affinity())
+            });
 
             // Only emit Affinity if there's meaningful affinity to apply
             if affinity.clone().any(|a| a != Affinity::Blob) {
@@ -3095,8 +3102,12 @@ fn emit_update_insns<'a>(
                     if ic.expr.is_some() {
                         Affinity::Blob.aff_mask()
                     } else {
-                        target_table.table.columns()[ic.pos_in_table]
-                            .affinity()
+                        affinity_overrides
+                            .get(&ic.pos_in_table)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                target_table.table.columns()[ic.pos_in_table].affinity()
+                            })
                             .aff_mask()
                     }
                 })
@@ -3449,8 +3460,10 @@ fn emit_update_insns<'a>(
                 if ic.expr.is_some() {
                     Affinity::Blob.aff_mask()
                 } else {
-                    target_table.table.columns()[ic.pos_in_table]
-                        .affinity()
+                    affinity_overrides
+                        .get(&ic.pos_in_table)
+                        .copied()
+                        .unwrap_or_else(|| target_table.table.columns()[ic.pos_in_table].affinity())
                         .aff_mask()
                 }
             })
@@ -3732,7 +3745,14 @@ fn emit_update_insns<'a>(
             .table
             .columns()
             .iter()
-            .map(|col| col.affinity().aff_mask())
+            .enumerate()
+            .map(|(idx, col)| {
+                affinity_overrides
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or_else(|| col.affinity())
+                    .aff_mask()
+            })
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
