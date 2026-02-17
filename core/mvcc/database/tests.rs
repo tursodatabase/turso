@@ -5679,3 +5679,80 @@ fn test_alter_table_rename_with_unique_constraint_panics_on_restart() {
         assert_eq!(rows.len(), 1);
     }
 }
+
+/// Reproducer: DROP TABLE ghost data after restart without explicit checkpoint.
+/// Session 1: create + insert + checkpoint. Session 2: drop. Session 3: reopen.
+#[test]
+fn test_close_persists_drop_table() {
+    // Session 1: create table, insert data, checkpoint to DB file
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE todrop(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO todrop VALUES (1, 'data')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.close().unwrap();
+
+    // Session 2: drop table (no explicit checkpoint, rely on close)
+    let conn = db.connect();
+    conn.execute("DROP TABLE todrop").unwrap();
+    conn.close().unwrap();
+
+    // Session 3: reopen — table must be gone
+    db.restart();
+    let conn = db.connect();
+
+    // The table must not exist — CREATE should succeed
+    let create_result = conn.execute("CREATE TABLE todrop(id INTEGER PRIMARY KEY, newval TEXT)");
+    assert!(
+        create_result.is_ok(),
+        "CREATE TABLE should succeed after DROP, but got: {:?}",
+        create_result.unwrap_err()
+    );
+
+    // No ghost data from old table
+    let rows = get_rows(&conn, "SELECT * FROM todrop");
+    assert!(rows.is_empty(), "New table should be empty, got {rows:?}");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Reproducer: DROP INDEX ghost pages after restart without explicit checkpoint.
+/// Session 1: create table + index + insert + checkpoint. Session 2: drop index. Session 3: reopen.
+#[test]
+fn test_close_persists_drop_index() {
+    // Session 1: create table/index, insert data, checkpoint to DB file
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE tdropidx(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_tdropidx_val ON tdropidx(val)")
+        .unwrap();
+    conn.execute("INSERT INTO tdropidx VALUES (1, 'data')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.close().unwrap();
+
+    // Session 2: drop index (no explicit checkpoint, rely on close)
+    let conn = db.connect();
+    conn.execute("DROP INDEX idx_tdropidx_val").unwrap();
+    conn.close().unwrap();
+
+    // Session 3: reopen - index must be gone and integrity check must pass
+    db.restart();
+    let conn = db.connect();
+
+    let recreate_index = conn.execute("CREATE INDEX idx_tdropidx_val ON tdropidx(val)");
+    assert!(
+        recreate_index.is_ok(),
+        "CREATE INDEX should succeed after DROP INDEX, but got: {:?}",
+        recreate_index.unwrap_err()
+    );
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
