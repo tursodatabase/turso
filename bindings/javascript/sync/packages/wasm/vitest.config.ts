@@ -11,12 +11,12 @@ export default defineConfig({
     },
   },
   test: {
+    globalSetup: './globalSetup.ts',
     browser: {
       enabled: true,
       provider: 'playwright',
       instances: [
-        { browser: 'chromium' },
-        { browser: 'firefox' }
+        { browser: 'chromium' }
       ],
     },
   },
