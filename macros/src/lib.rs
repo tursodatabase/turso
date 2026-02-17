@@ -89,8 +89,9 @@ mod test;
 mod assert;
 
 use assert::{
-    comparison_auto_message, details_format_args, details_json, expr_to_lit_str,
-    BooleanGuidanceInput, ComparisonAssertInput, ConditionAssertInput, MessageAssertInput,
+    comparison_auto_message, details_debug_check, details_format_args, details_json,
+    expr_to_lit_str, BooleanGuidanceInput, ComparisonAssertInput, ConditionAssertInput,
+    MessageAssertInput,
 };
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
 use quote::quote;
@@ -826,6 +827,7 @@ fn emit_sometimes_comparison(
         .unwrap_or_else(|| comparison_auto_message(left, right, op_str));
     let prefixed = prefix_message(file_path, &msg);
     let details = details_json(&input.details);
+    let debug_check = details_debug_check(&input.details);
 
     let env_check = antithesis_env_check();
     quote! {
@@ -840,6 +842,7 @@ fn emit_sometimes_comparison(
             #[cfg(not(antithesis))]
             {
                 let _ = (__turso_left, __turso_right);
+                #debug_check
             }
         }
     }
@@ -999,6 +1002,7 @@ pub fn turso_assert_sometimes(input: TokenStream) -> TokenStream {
     let prefixed = prefix_message(&file_path, &msg);
     let details = details_json(&input.details);
 
+    let debug_check = details_debug_check(&input.details);
     let env_check = antithesis_env_check();
     quote! {
         {
@@ -1011,6 +1015,7 @@ pub fn turso_assert_sometimes(input: TokenStream) -> TokenStream {
             #[cfg(not(antithesis))]
             {
                 let _ = __turso_cond;
+                #debug_check
             }
         }
     }
@@ -1242,6 +1247,7 @@ pub fn turso_soft_unreachable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as MessageAssertInput);
     let prefixed = prefix_message(&file_path, &input.message);
     let details = details_json(&input.details);
+    let debug_check = details_debug_check(&input.details);
 
     let env_check = antithesis_env_check();
     quote! {
@@ -1250,6 +1256,10 @@ pub fn turso_soft_unreachable(input: TokenStream) -> TokenStream {
             {
                 #env_check
                 antithesis_sdk::assert_unreachable!(#prefixed, #details);
+            }
+            #[cfg(not(antithesis))]
+            {
+                #debug_check
             }
         }
     }

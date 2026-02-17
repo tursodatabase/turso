@@ -222,9 +222,24 @@ pub fn details_json(details: &Option<DetailsList>) -> TokenStream2 {
         Some(list) if !list.pairs.is_empty() => {
             let keys: Vec<_> = list.pairs.iter().map(|p| &p.key).collect();
             let vals: Vec<_> = list.pairs.iter().map(|p| &p.value).collect();
-            quote! { &serde_json::json!({ #( #keys: #vals ),* }) }
+            quote! { &serde_json::json!({ #( #keys: format!("{:?}", &#vals) ),* }) }
         }
         _ => quote! { &serde_json::json!({}) },
+    }
+}
+
+/// Generate a compile-time `Debug` check for detail values.
+pub fn details_debug_check(details: &Option<DetailsList>) -> TokenStream2 {
+    match details {
+        Some(list) if !list.pairs.is_empty() => {
+            let vals: Vec<_> = list.pairs.iter().map(|p| &p.value).collect();
+            quote! {
+                if false {
+                    #( let _ = format!("{:?}", &#vals); )*
+                }
+            }
+        }
+        _ => quote! {},
     }
 }
 
