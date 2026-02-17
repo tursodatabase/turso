@@ -179,3 +179,8 @@ required-features = ["bench"]
 [[bench]]
 name = "write_perf_benchmark"
 harness = false
+
+[[bench]]
+name = "sorter_benchmark"
+harness = false
+required-features = ["bench"]
