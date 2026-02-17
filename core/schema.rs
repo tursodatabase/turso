@@ -1127,6 +1127,8 @@ impl Schema {
                             select,
                             ..
                         } => {
+                            crate::util::validate_view_select(&select)?;
+
                             // Extract actual columns from the SELECT statement
                             let view_column_schema =
                                 crate::util::extract_view_columns(&select, self)?;

@@ -267,6 +267,8 @@ pub fn translate_create_view(
         )));
     }
 
+    crate::util::validate_view_select(select_stmt)?;
+
     // Reconstruct the SQL string
     let sql = create_view_to_str(&view_name.as_ident(), select_stmt);
 

@@ -1376,6 +1376,176 @@ impl ViewColumnSchema {
     }
 }
 
+/// Validate that a view SELECT does not include unsupported constructs.
+pub fn validate_view_select(select_stmt: &ast::Select) -> Result<()> {
+    struct Validator;
+
+    impl Validator {
+        fn walk_select(&mut self, select: &ast::Select) -> Result<()> {
+            if let Some(with_clause) = &select.with {
+                for cte in &with_clause.ctes {
+                    self.walk_select(&cte.select)?;
+                }
+            }
+
+            self.walk_one_select(&select.body.select)?;
+            for compound in &select.body.compounds {
+                self.walk_one_select(&compound.select)?;
+            }
+
+            for sorted_col in &select.order_by {
+                self.check_expr(&sorted_col.expr)?;
+            }
+
+            if let Some(limit) = &select.limit {
+                self.check_expr(&limit.expr)?;
+                if let Some(offset) = &limit.offset {
+                    self.check_expr(offset)?;
+                }
+            }
+
+            Ok(())
+        }
+
+        fn walk_one_select(&mut self, one_select: &ast::OneSelect) -> Result<()> {
+            match one_select {
+                ast::OneSelect::Select {
+                    columns,
+                    from,
+                    where_clause,
+                    group_by,
+                    window_clause,
+                    ..
+                } => {
+                    for col in columns {
+                        if let ast::ResultColumn::Expr(expr, _) = col {
+                            self.check_expr(expr)?;
+                        }
+                    }
+
+                    if let Some(from_clause) = from {
+                        self.walk_from_clause(from_clause)?;
+                    }
+
+                    if let Some(where_expr) = where_clause {
+                        self.check_expr(where_expr)?;
+                    }
+
+                    if let Some(group_by) = group_by {
+                        for expr in &group_by.exprs {
+                            self.check_expr(expr)?;
+                        }
+                        if let Some(having_expr) = &group_by.having {
+                            self.check_expr(having_expr)?;
+                        }
+                    }
+
+                    for window_def in window_clause {
+                        self.walk_window(&window_def.window)?;
+                    }
+                }
+                ast::OneSelect::Values(values) => {
+                    for row in values {
+                        for expr in row {
+                            self.check_expr(expr)?;
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        fn walk_from_clause(&mut self, from_clause: &ast::FromClause) -> Result<()> {
+            self.walk_select_table(&from_clause.select)?;
+
+            for join in &from_clause.joins {
+                self.walk_select_table(&join.table)?;
+
+                if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+                    self.check_expr(expr)?;
+                }
+            }
+
+            Ok(())
+        }
+
+        fn walk_select_table(&mut self, select_table: &ast::SelectTable) -> Result<()> {
+            match select_table {
+                ast::SelectTable::Select(select, _) => self.walk_select(select),
+                ast::SelectTable::Sub(from_clause, _) => self.walk_from_clause(from_clause),
+                ast::SelectTable::TableCall(_, args, _) => {
+                    for arg in args {
+                        self.check_expr(arg)?;
+                    }
+                    Ok(())
+                }
+                ast::SelectTable::Table(_, _, _) => Ok(()),
+            }
+        }
+
+        fn walk_window(&mut self, window: &ast::Window) -> Result<()> {
+            for expr in &window.partition_by {
+                self.check_expr(expr)?;
+            }
+
+            for sorted_col in &window.order_by {
+                self.check_expr(&sorted_col.expr)?;
+            }
+
+            if let Some(frame_clause) = &window.frame_clause {
+                self.walk_frame_bound(&frame_clause.start)?;
+                if let Some(end_bound) = &frame_clause.end {
+                    self.walk_frame_bound(end_bound)?;
+                }
+            }
+
+            Ok(())
+        }
+
+        fn walk_frame_bound(&mut self, bound: &ast::FrameBound) -> Result<()> {
+            match bound {
+                ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
+                    self.check_expr(expr)
+                }
+                ast::FrameBound::CurrentRow
+                | ast::FrameBound::UnboundedFollowing
+                | ast::FrameBound::UnboundedPreceding => Ok(()),
+            }
+        }
+
+        fn check_expr(&mut self, expr: &ast::Expr) -> Result<()> {
+            walk_expr(expr, &mut |e| self.check_expr_node(e))?;
+            Ok(())
+        }
+
+        fn check_expr_node(&mut self, expr: &ast::Expr) -> Result<WalkControl> {
+            match expr {
+                ast::Expr::FunctionCall { filter_over, .. }
+                | ast::Expr::FunctionCallStar { filter_over, .. } => {
+                    if filter_over.filter_clause.is_some() {
+                        crate::bail_parse_error!(
+                            "FILTER clause is not supported yet in aggregate functions"
+                        );
+                    }
+                }
+                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                    self.walk_select(select)?;
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    self.walk_select(rhs)?;
+                }
+                _ => {}
+            }
+
+            Ok(WalkControl::Continue)
+        }
+    }
+
+    let mut validator = Validator;
+    validator.walk_select(select_stmt)
+}
+
 /// Extract column information from a SELECT statement for view creation
 pub fn extract_view_columns(
     select_stmt: &ast::Select,
