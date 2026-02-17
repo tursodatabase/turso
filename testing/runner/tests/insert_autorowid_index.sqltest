@@ -1,0 +1,46 @@
+@database :memory:
+
+# Regression test for #5240: INSERT with auto-assigned rowid skips explicit
+# index on INTEGER PRIMARY KEY column.
+
+setup schema {
+    CREATE TABLE v0 (c1 INTEGER PRIMARY KEY, c2 TEXT, c3 INT, c4 TEXT);
+    CREATE INDEX i6 ON v0 (c1);
+}
+
+@setup schema
+test auto-rowid-upsert-index {
+    INSERT INTO v0 VALUES (10, 'av3 b', 10, 'a__');
+    INSERT INTO v0 (c4, c2, c2) VALUES ('v1', 18446744073709551615, 'hijklmnop')
+      ON CONFLICT DO UPDATE SET c2 = c4, c4 = c3;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@setup schema
+test auto-rowid-plain-insert-index {
+    INSERT INTO v0 VALUES (1, 'first', 10, 'a');
+    INSERT INTO v0 (c2) VALUES ('second');
+    INSERT INTO v0 (c2) VALUES ('third');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@setup schema
+test auto-rowid-index-values-correct {
+    INSERT INTO v0 VALUES (5, 'a', 1, 'x');
+    INSERT INTO v0 (c2, c3) VALUES ('b', 2);
+    INSERT INTO v0 (c2, c3) VALUES ('c', 3);
+    SELECT c1, c2, c3 FROM v0 ORDER BY c1;
+    PRAGMA integrity_check;
+}
+expect {
+    5|a|1
+    6|b|2
+    7|c|3
+    ok
+}
