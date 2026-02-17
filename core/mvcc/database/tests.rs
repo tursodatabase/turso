@@ -195,6 +195,25 @@ fn overwrite_file_with_junk(path: &std::path::Path, size: usize, byte: u8) {
     file.sync_all().unwrap();
 }
 
+/// Manually set journal_mode='experimental_mvcc' in DB header bytes for corruption tests.
+fn set_db_header_journal_mode_mvcc(path: &str) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut header = [0u8; 100];
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.read_exact(&mut header).unwrap();
+    // SQLite header bytes: write-version at 18, read-version at 19.
+    header[18] = 255; // Version::Mvcc
+    header[19] = 255; // Version::Mvcc
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&header).unwrap();
+    file.sync_all().unwrap();
+}
+
 fn wal_path_for_db(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{path}-wal"))
 }
@@ -826,10 +845,10 @@ fn test_recovery_overwrites_torn_tail_on_next_append() {
     }
 }
 
-/// What this test checks: First-time MVCC bootstrap repairs a torn short `.db-log` header before metadata writes commit.
-/// Why this matters: Otherwise a crash after metadata WAL commit can leave an unrecoverable startup state.
+/// What this test checks: Given a synthetic first-MVCC-boot state (`header=MVCC`, missing metadata table,
+/// and a torn short `.db-log`), bootstrap repairs the log header and initializes metadata.
+/// Why this matters: Startup must recover this pre-bootstrap crash residue state instead of failing closed.
 #[test]
-#[ignore = "Needs a dedicated bootstrap harness that can create header=MVCC + missing metadata + torn short log atomically"]
 fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir
@@ -846,21 +865,13 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
         conn.close().unwrap();
     }
 
+    // Build a first-boot MVCC state manually:
+    // - db header says MVCC
+    // - metadata table is still missing (never bootstrapped in MVCC mode)
+    // - logical log is torn short
+    set_db_header_journal_mode_mvcc(&db_path_str);
     let log_path = std::path::Path::new(&db_path_str).with_extension("db-log");
     overwrite_file_with_junk(&log_path, LOG_HDR_SIZE / 2, 0xAB);
-
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
-    {
-        let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path_str).unwrap();
-        let conn = db.connect().unwrap();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
-        conn.close().unwrap();
-    }
 
     {
         let mut manager = DATABASE_MANAGER.lock();
@@ -3112,7 +3123,6 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
 /// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
 /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
 #[test]
-#[ignore]
 fn test_concurrent_writes() {
     struct ConnectionState {
         conn: Arc<Connection>,
@@ -3149,11 +3159,9 @@ fn test_concurrent_writes() {
                 break;
             }
         }
-        for (conn_id, conn) in connections.iter_mut().enumerate() {
-            // println!("connection {conn_id} inserts: {:?}", conn.inserts);
+        for conn in connections.iter_mut() {
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
-                println!("inserting row {write} from connection {conn_id}");
                 conn.current_statement = Some(
                     conn.conn
                         .prepare(format!("INSERT INTO test (x) VALUES ({write})"))
@@ -3163,7 +3171,6 @@ fn test_concurrent_writes() {
             if conn.current_statement.is_none() {
                 continue;
             }
-            println!("connection step {conn_id}");
             let stmt = conn.current_statement.as_mut().unwrap();
             match stmt.step().unwrap() {
                 // These you be only possible cases in write concurrency.
@@ -3171,14 +3178,12 @@ fn test_concurrent_writes() {
                 // No interrupt because insert doesn't interrupt
                 // No busy because insert in mvcc should be multi concurrent write
                 StepResult::Done => {
-                    println!("connection {conn_id} done");
                     conn.current_statement = None;
                 }
                 StepResult::IO => {
                     // let's skip doing I/O here, we want to perform io only after all the statements are stepped
                 }
                 StepResult::Busy => {
-                    println!("connection {conn_id} busy");
                     // stmt.reprepare().unwrap();
                     unreachable!();
                 }
@@ -3190,7 +3195,6 @@ fn test_concurrent_writes() {
         db.get_db().io.step().unwrap();
 
         if all_finished {
-            println!("all finished");
             break;
         }
     }
@@ -3206,39 +3210,6 @@ fn test_concurrent_writes() {
         assert_eq!(row[0].as_int().unwrap(), row_id as i64);
     }
     conn.close().unwrap();
-}
-
-fn generate_batched_insert(num_inserts: usize) -> String {
-    let mut inserts = String::from("INSERT INTO test (x) VALUES ");
-    for i in 0..num_inserts {
-        inserts.push_str(&format!("({i})"));
-        if i < num_inserts - 1 {
-            inserts.push(',');
-        }
-    }
-    inserts.push(';');
-    inserts
-}
-/// What this test checks: The implementation maintains the intended invariant for this scenario.
-/// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
-#[test]
-#[ignore]
-fn test_batch_writes() {
-    let mut start = 0;
-    let mut end = 5000;
-    while start < end {
-        let i = ((end - start) / 2) + start;
-        let db = MvccTestDbNoConn::new_with_random_db();
-        let conn = db.connect();
-        conn.execute("CREATE TABLE test (x)").unwrap();
-        let inserts = generate_batched_insert(i);
-        if conn.execute(inserts.clone()).is_err() {
-            end = i;
-        } else {
-            start = i + 1;
-        }
-    }
-    println!("start: {start} end: {end}");
 }
 
 /// What this test checks: The implementation maintains the intended invariant for this scenario.
@@ -3502,7 +3473,6 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
-#[ignore] // FIXME: This fails constantly on main and is really annoying, disabling for now :]
 fn test_cursor_with_btree_and_mvcc_fuzz() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let mut rows_in_db = sorted_vec::SortedVec::new();
@@ -3550,7 +3520,9 @@ fn test_cursor_with_btree_and_mvcc_fuzz() {
         let conn = maybe_conn.as_mut().unwrap();
         let op = rng.random_range(0..=Op::Checkpoint as usize);
         let op = Op::from(op as u8);
-        println!("tick: {i} op: {op:?} ");
+        if i % 1000 == 0 {
+            println!("tick: {i} op: {op:?} rows_in_db: {rows_in_db:?}");
+        }
         match op {
             Op::Insert => {
                 let value = loop {
@@ -3561,7 +3533,7 @@ fn test_cursor_with_btree_and_mvcc_fuzz() {
                     }
                 };
                 let query = format!("INSERT INTO t VALUES ({value})");
-                println!("inserting: {query}");
+                tracing::trace!("inserting: {query}");
                 conn.execute(query.as_str()).unwrap();
                 rows_in_db.push(value);
             }
@@ -3572,7 +3544,7 @@ fn test_cursor_with_btree_and_mvcc_fuzz() {
                 let index = rng.random_range(0..rows_in_db.len());
                 let value = rows_in_db[index];
                 let query = format!("DELETE FROM t WHERE x = {value}");
-                println!("deleting: {query}");
+                tracing::trace!("deleting: {query}");
                 conn.execute(query.as_str()).unwrap();
                 rows_in_db.remove_index(index);
                 seen.remove(&value);
