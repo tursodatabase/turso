@@ -5148,7 +5148,7 @@ impl CursorTrait for BTreeCursor {
                             self.state = CursorState::None;
                             return Ok(IOResult::Done(()));
                         }
-                    } else if self.reusable_immutable_record.is_none() {
+                    } else if !self.has_record() {
                         self.state = CursorState::None;
                         return Ok(IOResult::Done(()));
                     }
