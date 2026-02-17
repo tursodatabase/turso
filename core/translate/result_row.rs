@@ -1,3 +1,4 @@
+use crate::turso_assert_eq;
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
@@ -305,8 +306,9 @@ pub fn emit_columns_to_destination(
             result_reg_start,
             num_regs,
         } => {
-            assert!(
-                num_columns == *num_regs,
+            turso_assert_eq!(
+                num_columns,
+                *num_regs,
                 "Row value subqueries should have the same number of result columns as the number of registers"
             );
             program.emit_insn(Insn::Copy {
@@ -316,8 +318,9 @@ pub fn emit_columns_to_destination(
             });
         }
         QueryDestination::RowSet { rowset_reg } => {
-            assert_eq!(
-                num_columns, 1,
+            turso_assert_eq!(
+                num_columns,
+                1,
                 "RowSet should only have one result column (rowid)"
             );
             program.emit_insn(Insn::RowSetAdd {

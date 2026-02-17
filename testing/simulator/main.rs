@@ -195,7 +195,7 @@ fn run_simulator(
                 let plan = sim_plan.generator(&mut gen_rng);
                 run_simulation(sim_env, plan, sim_execution)
             }),
-            last_execution.clone(),
+            last_execution,
         )
     };
     env.clear_poison();
@@ -311,7 +311,7 @@ fn run_simulator(
 
                         let final_plan = if cli_opts.enable_brute_force_shrinking {
                             let brute_shrunk_plan =
-                                shrunk_plan.brute_shrink_interaction_plan(&shrunk, env.clone());
+                                shrunk_plan.brute_shrink_interaction_plan(&shrunk, env);
                             tracing::info!("Brute force shrinking completed");
                             brute_shrunk_plan
                         } else {
@@ -325,12 +325,7 @@ fn run_simulator(
                         );
                         // Save the shrunk database
                         if let Some(bugbase) = bugbase.as_deref_mut() {
-                            bugbase.save_shrunk(
-                                seed,
-                                cli_opts,
-                                final_plan.clone(),
-                                Some(e1.clone()),
-                            )?;
+                            bugbase.save_shrunk(seed, cli_opts, final_plan, Some(e1.clone()))?;
                         }
                         Err(anyhow!("failed with error: '{}'", e1))
                     }

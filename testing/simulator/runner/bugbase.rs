@@ -222,7 +222,7 @@ impl BugBase {
                 }],
             };
 
-            self.bugs.insert(seed, Some(bug.clone()));
+            self.bugs.insert(seed, Some(bug));
             self.bugs.get_mut(&seed).unwrap().as_mut().unwrap()
         };
 

@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::{turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -276,7 +277,7 @@ pub fn translate_alter_table(
             let column_name = column_name.as_str();
 
             // Tables always have at least one column.
-            assert_ne!(btree.columns.len(), 0);
+            turso_assert_ne!(btree.columns.len(), 0);
 
             if btree.columns.len() == 1 {
                 return Err(LimboError::ParseError(format!(
@@ -823,7 +824,7 @@ pub fn translate_alter_table(
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns.len();
-                assert_eq!(sqlite_schema_column_len, 5);
+                turso_assert_eq!(sqlite_schema_column_len, 5);
 
                 let first_column = program.alloc_registers(sqlite_schema_column_len);
 
@@ -1104,7 +1105,7 @@ pub fn translate_alter_table(
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns.len();
-                assert_eq!(sqlite_schema_column_len, 5);
+                turso_assert_eq!(sqlite_schema_column_len, 5);
 
                 let first_column = program.alloc_registers(sqlite_schema_column_len);
 
@@ -1256,7 +1257,7 @@ fn translate_rename_virtual_table(
 
     program.cursor_loop(schema_cur, |program, rowid| {
         let ncols = sqlite_schema.columns.len();
-        assert_eq!(ncols, 5);
+        turso_assert_eq!(ncols, 5);
 
         let first_col = program.alloc_registers(ncols);
         for i in 0..ncols {

@@ -1,3 +1,4 @@
+use crate::turso_assert;
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
@@ -67,7 +68,7 @@ use crate::vdbe::insn::{
 };
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, emit_explain, Result, SymbolTable};
-use crate::{turso_assert, CaptureDataChangesExt, Connection, QueryMode};
+use crate::{CaptureDataChangesExt, Connection, QueryMode};
 
 /// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
 /// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).

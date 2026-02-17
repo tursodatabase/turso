@@ -29,6 +29,7 @@ use crate::{
     },
     LimboError, Result,
 };
+use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint,
     ConstraintOperator, ConstraintRef,
@@ -798,6 +799,9 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
                     }
                 }
                 Plan::Delete(_) | Plan::Update(_) => {
+                    turso_soft_unreachable!(
+                        "DELETE/UPDATE plans should not appear in FROM clause subqueries"
+                    );
                     return Err(LimboError::InternalError(
                         "DELETE/UPDATE plans should not appear in FROM clause subqueries"
                             .to_string(),
@@ -1340,7 +1344,7 @@ fn optimize_table_access(
                     pos_by_table[*build_table_idx],
                     pos_by_table[*probe_table_idx],
                 ) {
-                    crate::turso_assert!(
+                    turso_assert!(
                         probe_pos == build_pos + 1,
                         "hash join build/probe tables are not adjacent in join order"
                     );
@@ -1352,7 +1356,7 @@ fn optimize_table_access(
 
         for (build_table_idx, materialize_build_input) in build_tables {
             if probe_tables.contains(&build_table_idx) {
-                crate::turso_assert!(
+                turso_assert!(
                     materialize_build_input,
                     "probe->build chaining requires materialized build input"
                 );
@@ -1538,9 +1542,10 @@ fn optimize_table_access(
                             let constraint =
                                 &constraints_per_table[table_idx].constraints[*constraint_vec_pos];
                             let where_term = &mut where_clause[constraint.where_clause_pos.0];
-                            assert!(
+                            turso_assert!(
                                 !where_term.consumed,
-                                "trying to consume a where clause term twice: {where_term:?}",
+                                "trying to consume a where clause term twice",
+                                {"where_term": format!("{where_term:?}")}
                             );
                             if is_outer_join && where_term.from_outer_join.is_none() {
                                 // Don't consume WHERE terms from outer joins if the where term is not part of the outer join condition. Consider:
@@ -1572,9 +1577,11 @@ fn optimize_table_access(
                             });
                         continue;
                     }
-                    assert!(
-                        constraint_refs.len() == 1,
-                        "expected exactly one constraint for rowid seek, got {constraint_refs:?}"
+                    turso_assert_eq!(
+                        constraint_refs.len(),
+                        1,
+                        "expected exactly one constraint for rowid seek",
+                        {"constraint_refs": format!("{constraint_refs:?}")}
                     );
                     table_references.joined_tables_mut()[table_idx].op =
                         if let Some(eq) = constraint_refs[0].eq {
@@ -2305,7 +2312,7 @@ pub fn build_seek_def_from_constraints(
     where_clause: &[WhereTerm],
     referenced_tables: Option<&TableReferences>,
 ) -> Result<SeekDef> {
-    assert!(
+    turso_assert!(
         !constraint_refs.is_empty(),
         "cannot build seek def from empty list of constraint refs"
     );
@@ -2348,7 +2355,7 @@ fn build_seek_def(
     iter_dir: IterationDirection,
     mut key: Vec<SeekRangeConstraint>,
 ) -> Result<SeekDef> {
-    assert!(!key.is_empty());
+    turso_assert!(!key.is_empty());
     let last = key.last().unwrap();
 
     // if we searching for exact key - emit definition immediately with prefix as a full key
@@ -2372,7 +2379,7 @@ fn build_seek_def(
             },
         });
     }
-    assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
+    turso_assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
 
     // pop last key as we will do some form of range search
     let last = key.pop().unwrap();
@@ -2382,7 +2389,7 @@ fn build_seek_def(
         Some(ast::Operator::Less | ast::Operator::LessEquals)
     );
     // after that all key components must be equality constraints
-    debug_assert!(key.iter().all(|k| k.eq.is_some()));
+    turso_debug_assert!(key.iter().all(|k| k.eq.is_some()));
 
     let has_prefix = !key.is_empty();
     let apply_null_boundaries = |start: &mut SeekKey, end: &mut SeekKey| {

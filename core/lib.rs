@@ -964,7 +964,7 @@ impl Database {
         let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
 
         let mut pager = self._init(encryption_key)?;
-        assert!(pager.wal.is_none(), "Pager should have no WAL yet");
+        turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
 
         let is_autovacuumed_db = self.io.block(|| {
             pager.with_header(|header| {
@@ -1681,7 +1681,11 @@ impl DatabaseCatalog {
     }
 
     fn add(&mut self, s: &str) -> usize {
-        assert_eq!(self.name_to_index.get(s), None);
+        turso_assert!(
+            !self.name_to_index.contains_key(s),
+            "lib: database name already exists in catalog",
+            { "name": s }
+        );
 
         let index = self.allocate_index();
         self.name_to_index.insert(s.to_string(), index);
@@ -1697,7 +1701,7 @@ impl DatabaseCatalog {
     fn remove(&mut self, s: &str) -> Option<usize> {
         if let Some(index) = self.name_to_index.remove(s) {
             // Should be impossible to remove main or temp.
-            assert!(index >= 2);
+            turso_assert_greater_than_or_equal!(index, 2);
             self.deallocate_index(index);
             self.index_to_data.remove(&index);
             Some(index)

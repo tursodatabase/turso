@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use crate::translate::optimizer::constraints::ConstraintOperator;
+use crate::turso_assert;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
@@ -28,7 +29,7 @@ use crate::vdbe::{
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
-use crate::{turso_assert, Numeric, Result, Value};
+use crate::{Numeric, Result, Value};
 
 use super::collate::{get_collseq_from_expr, CollationSeq};
 
