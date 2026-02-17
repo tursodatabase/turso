@@ -849,6 +849,10 @@ fn test_recovery_overwrites_torn_tail_on_next_append() {
 /// and a torn short `.db-log`), bootstrap repairs the log header and initializes metadata.
 /// Why this matters: Startup must recover this pre-bootstrap crash residue state instead of failing closed.
 #[test]
+#[cfg_attr(
+    feature = "checksum",
+    ignore = "byte-level tamper caught by checksum layer"
+)]
 fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir
