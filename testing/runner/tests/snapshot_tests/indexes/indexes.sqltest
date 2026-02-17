@@ -318,7 +318,27 @@ snapshot full-scan-leading-wildcard {
 }
 
 # =============================================================================
-# 7. Additional Index Patterns
+# 7. Rowid Seek - WHERE rowid = ? on tables without INTEGER PRIMARY KEY alias
+# =============================================================================
+
+setup no_rowid_alias {
+    CREATE TABLE items (name TEXT NOT NULL, value REAL NOT NULL);
+}
+
+# Rowid equality seek on table without explicit INTEGER PRIMARY KEY alias
+@setup no_rowid_alias
+snapshot rowid-seek-no-alias {
+    SELECT rowid, name, value FROM items WHERE rowid = 5;
+}
+
+# Rowid range scan on table without explicit INTEGER PRIMARY KEY alias
+@setup no_rowid_alias
+snapshot rowid-range-no-alias {
+    SELECT rowid, name, value FROM items WHERE rowid > 10 AND rowid < 20;
+}
+
+# =============================================================================
+# 8. Additional Index Patterns
 # =============================================================================
 
 # Index used for ORDER BY without WHERE clause
