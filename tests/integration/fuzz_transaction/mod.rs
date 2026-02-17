@@ -497,8 +497,7 @@ async fn test_multiple_connections_fuzz_mvcc() {
                 weight_update: 25,
             },
         },
-        // FIXME: temporary disable reopen logic for MVCC because it will spam CI otherwise (due to some unfixed bug)
-        reopen_probability: 0.0,
+        reopen_probability: 0.1,
         ..FuzzOptions::default()
     };
     multiple_connections_fuzz(mvcc_fuzz_options).await
@@ -687,6 +686,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
         // Interleave operations between all connections
         for op_num in 0..opts.operations_per_connection {
             if rng.random_bool(opts.reopen_probability) {
+                // Rollback any in-flight transactions in the shadow DB,
+                // since closing the database implicitly aborts them.
+                for (_, _, current_tx_id) in &connections {
+                    if let Some(tx_id) = current_tx_id {
+                        shared_shadow_db.rollback_transaction(*tx_id);
+                    }
+                }
                 connections.clear();
                 let _ = db.take();
                 let reopened = Builder::new_local(db_path.to_str().unwrap())
