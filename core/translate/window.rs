@@ -922,7 +922,9 @@ fn emit_aggregation_step(
         let args = match &func.original_expr {
             Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
             Expr::FunctionCallStar { .. } => vec![],
-            _ => unreachable!("All window functions should be either FunctionCall or FunctionCallStar expressions"),
+            _ => unreachable!(
+                "All window functions should be either FunctionCall or FunctionCallStar expressions"
+            ),
         };
 
         let reg_acc_start = registers.acc_start + i;

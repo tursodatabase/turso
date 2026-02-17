@@ -8,8 +8,8 @@ pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
     schema: &Schema,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> Result<()> {
     program.extend(&ProgramBuilderOpts {
         num_cursors: 0,
         approx_num_insns: 0,
@@ -48,13 +48,10 @@ pub fn translate_tx_begin(
             });
         }
     }
-    Ok(program)
+    Ok(())
 }
 
-pub fn translate_tx_commit(
-    _tx_name: Option<Name>,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+pub fn translate_tx_commit(_tx_name: Option<Name>, program: &mut ProgramBuilder) -> Result<()> {
     program.extend(&ProgramBuilderOpts {
         num_cursors: 0,
         approx_num_insns: 0,
@@ -64,5 +61,5 @@ pub fn translate_tx_commit(
         auto_commit: true,
         rollback: false,
     });
-    Ok(program)
+    Ok(())
 }
