@@ -749,6 +749,7 @@ impl TursoDatabase {
 struct CachedStatement {
     program: Arc<turso_core::PreparedProgram>,
     query_mode: QueryMode,
+    readonly: bool,
 }
 
 #[derive(Clone)]
@@ -800,8 +801,12 @@ impl TursoConnection {
                     cached.program.clone(),
                     self.connection.clone(),
                 );
-                let statement =
-                    Statement::new(program, self.connection.get_pager(), cached.query_mode);
+                let statement = Statement::new(
+                    program,
+                    self.connection.get_pager(),
+                    cached.query_mode,
+                    cached.readonly,
+                );
                 return Ok(Box::new(TursoStatement {
                     concurrent_guard: self.concurrent_guard.clone(),
                     async_io: self.async_io,
@@ -817,6 +822,7 @@ impl TursoConnection {
         let cached = Arc::new(CachedStatement {
             program: statement.get_program().prepared().clone(),
             query_mode: statement.get_query_mode(),
+            readonly: statement.is_readonly(),
         });
         self.cached_statements
             .lock()

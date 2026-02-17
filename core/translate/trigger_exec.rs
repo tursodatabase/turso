@@ -640,6 +640,7 @@ fn execute_trigger_commands(
         built_subprogram,
         connection.pager.load().clone(),
         QueryMode::Normal,
+        false,
     );
     program.emit_insn(Insn::Program {
         params,

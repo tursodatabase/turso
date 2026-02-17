@@ -36,6 +36,8 @@ pub struct Statement {
     pager: Arc<Pager>,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
     query_mode: QueryMode,
+    /// Whether the statement is read-only (SELECT, BEGIN, COMMIT, etc.)
+    readonly: bool,
     /// Flag to show if the statement was busy
     busy: bool,
     /// Busy handler state for tracking invocations and timeouts
@@ -57,7 +59,12 @@ impl Drop for Statement {
 }
 
 impl Statement {
-    pub fn new(program: vdbe::Program, pager: Arc<Pager>, query_mode: QueryMode) -> Self {
+    pub fn new(
+        program: vdbe::Program,
+        pager: Arc<Pager>,
+        query_mode: QueryMode,
+        readonly: bool,
+    ) -> Self {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
@@ -69,9 +76,15 @@ impl Statement {
             state,
             pager,
             query_mode,
+            readonly,
             busy: false,
             busy_handler_state: None,
         }
+    }
+
+    /// Returns whether the statement is read-only.
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
     }
 
     pub fn get_trigger(&self) -> Option<Arc<Trigger>> {
@@ -545,5 +558,37 @@ impl Statement {
     /// Prefer to use helper methods instead such as [Self::run_with_row_callback]
     pub fn _io(&self) -> &dyn crate::IO {
         self.pager.io.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Connection;
+
+    #[test]
+    fn test_is_readonly_sql() {
+        // Read-only statements
+        assert!(Connection::is_readonly_sql("SELECT 1").unwrap());
+        assert!(Connection::is_readonly_sql("SELECT * FROM foo").unwrap());
+        assert!(Connection::is_readonly_sql("BEGIN").unwrap());
+        assert!(Connection::is_readonly_sql("COMMIT").unwrap());
+        assert!(Connection::is_readonly_sql("ROLLBACK").unwrap());
+        assert!(Connection::is_readonly_sql("PRAGMA table_info('foo')").unwrap());
+
+        // Write statements
+        assert!(!Connection::is_readonly_sql("INSERT INTO foo VALUES (1)").unwrap());
+        assert!(!Connection::is_readonly_sql("UPDATE foo SET x = 1").unwrap());
+        assert!(!Connection::is_readonly_sql("DELETE FROM foo").unwrap());
+        assert!(!Connection::is_readonly_sql("CREATE TABLE foo (x INT)").unwrap());
+        assert!(!Connection::is_readonly_sql("DROP TABLE foo").unwrap());
+
+        // Empty SQL
+        assert!(Connection::is_readonly_sql("").unwrap());
+
+        // Multi-statement: all readonly → true
+        assert!(Connection::is_readonly_sql("SELECT 1; SELECT 2").unwrap());
+
+        // Multi-statement: one write → false
+        assert!(!Connection::is_readonly_sql("SELECT 1; INSERT INTO foo VALUES (1)").unwrap());
     }
 }
