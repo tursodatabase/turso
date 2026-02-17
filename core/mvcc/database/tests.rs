@@ -5603,3 +5603,79 @@ fn test_concurrent_commit_yield_spin() {
     let rows = get_rows(&conn, "SELECT COUNT(*) FROM t");
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
 }
+
+/// ALTER TABLE RENAME TO on a table with a CREATE INDEX panics on the next
+/// session open. Reproduces the issue with 3 separate sessions (DB restarts).
+#[test]
+fn test_alter_table_rename_with_index_panics_on_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // Session 1: Create indexed table + checkpoint
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1")
+            .unwrap();
+        conn.execute("CREATE TABLE old_name(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_val ON old_name(val)")
+            .unwrap();
+        conn.execute("INSERT INTO old_name VALUES (1, 'a')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    // Session 2: Rename table
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        conn.execute("ALTER TABLE old_name RENAME TO new_name")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    // Session 3: PANIC
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        let rows = get_rows(&conn, "SELECT * FROM new_name");
+        assert_eq!(rows.len(), 1);
+    }
+}
+
+/// Same as above but with a UNIQUE constraint (autoindex).
+#[test]
+fn test_alter_table_rename_with_unique_constraint_panics_on_restart() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // Session 1
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1")
+            .unwrap();
+        conn.execute("CREATE TABLE old_name(id INTEGER PRIMARY KEY, val TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO old_name VALUES (1, 'a')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    // Session 2
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        conn.execute("ALTER TABLE old_name RENAME TO new_name")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    // Session 3: PANIC
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        let rows = get_rows(&conn, "SELECT * FROM new_name");
+        assert_eq!(rows.len(), 1);
+    }
+}
