@@ -8,29 +8,29 @@ use crate::{
 use turso_parser::ast::Name;
 
 /// Emits bytecode for `SAVEPOINT <name>`.
-pub fn translate_savepoint(mut program: ProgramBuilder, name: Name) -> Result<ProgramBuilder> {
+pub fn translate_savepoint(program: &mut ProgramBuilder, name: Name) -> Result<()> {
     program.emit_insn(Insn::Savepoint {
         op: SavepointOp::Begin,
         name: name.as_str().to_ascii_lowercase(),
     });
-    Ok(program)
+    Ok(())
 }
 
 /// Emits bytecode for `RELEASE [SAVEPOINT] <name>`.
-pub fn translate_release(mut program: ProgramBuilder, name: Name) -> Result<ProgramBuilder> {
+pub fn translate_release(program: &mut ProgramBuilder, name: Name) -> Result<()> {
     program.emit_insn(Insn::Savepoint {
         op: SavepointOp::Release,
         name: name.as_str().to_ascii_lowercase(),
     });
-    Ok(program)
+    Ok(())
 }
 
 /// Emits bytecode for either full transaction rollback or `ROLLBACK TO` named savepoint.
 pub fn translate_rollback(
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     _txn_name: Option<Name>,
     savepoint_name: Option<Name>,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     if let Some(savepoint_name) = savepoint_name {
         program.emit_insn(Insn::Savepoint {
             op: SavepointOp::RollbackTo,
@@ -43,5 +43,5 @@ pub fn translate_rollback(
         });
         program.rollback();
     }
-    Ok(program)
+    Ok(())
 }
