@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "total_changes not supported in MVCC mode"
 
 test total-changes-on-basic-insert {
     create table temp (t1 integer, primary key (t1));
