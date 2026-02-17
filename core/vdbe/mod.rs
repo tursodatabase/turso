@@ -1383,73 +1383,93 @@ impl Program {
             // We don't want to commit on nested statements. Let parent handle it.
             return Ok(IOResult::Done(()));
         }
-        if let Some(mv_store) = mv_store {
-            let conn = self.connection.clone();
-            let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
-            if auto_commit {
-                // FIXME: we don't want to commit stuff from other programs.
-                if matches!(program_state.commit_state, CommitState::Ready) {
-                    let Some(tx_id) = conn.get_mv_tx_id() else {
-                        return Ok(IOResult::Done(()));
-                    };
-                    let state_machine = mv_store.commit_tx(tx_id, &conn)?;
-                    program_state.commit_state = CommitState::CommitingMvcc { state_machine };
+        let res = if let Some(mv_store) = mv_store {
+            self.commit_txn_mvcc(pager, program_state, mv_store, rollback)
+        } else {
+            self.commit_txn_wal(pager, program_state, rollback)
+        }?;
+        if !res.is_io() && self.change_cnt_on {
+            self.connection
+                .set_changes(program_state.n_change.load(Ordering::SeqCst));
+        }
+        Ok(res)
+    }
+
+    fn commit_txn_wal(
+        &self,
+        pager: Arc<Pager>,
+        program_state: &mut ProgramState,
+        rollback: bool,
+    ) -> Result<IOResult<()>> {
+        let connection = self.connection.clone();
+        let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
+        let tx_state = connection.get_tx_state();
+        tracing::debug!(
+            "Halt auto_commit {}, commit_state={:?}, tx_state={:?}",
+            auto_commit,
+            program_state.commit_state,
+            tx_state,
+        );
+        if matches!(program_state.commit_state, CommitState::Committing) {
+            let TransactionState::Write { .. } = tx_state else {
+                unreachable!("invalid state for write commit step")
+            };
+            self.step_end_write_txn(&pager, &connection, program_state, rollback)
+        } else if auto_commit {
+            match tx_state {
+                TransactionState::Write { .. } => {
+                    self.step_end_write_txn(&pager, &connection, program_state, rollback)
                 }
-                let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
-                else {
-                    panic!("invalid state for mvcc commit step")
-                };
-                match self.step_end_mvcc_txn(state_machine, mv_store)? {
-                    IOResult::Done(_) => {
-                        assert!(state_machine.is_finalized());
-                        conn.set_mv_tx(None);
-                        conn.set_tx_state(TransactionState::None);
-                        pager.end_read_tx();
-                        program_state.commit_state = CommitState::Ready;
-                        return Ok(IOResult::Done(()));
-                    }
-                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                TransactionState::Read => {
+                    connection.set_tx_state(TransactionState::None);
+                    pager.end_read_tx();
+                    Ok(IOResult::Done(()))
+                }
+                TransactionState::None => Ok(IOResult::Done(())),
+                TransactionState::PendingUpgrade { .. } => {
+                    panic!("Unexpected transaction state: {tx_state:?} during auto-commit",)
                 }
             }
-            Ok(IOResult::Done(()))
         } else {
-            let connection = self.connection.clone();
-            let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
-            let tx_state = connection.get_tx_state();
-            tracing::debug!(
-                "Halt auto_commit {}, commit_state={:?}, tx_state={:?}",
-                auto_commit,
-                program_state.commit_state,
-                tx_state,
-            );
-            if matches!(program_state.commit_state, CommitState::Committing) {
-                let TransactionState::Write { .. } = tx_state else {
-                    unreachable!("invalid state for write commit step")
+            Ok(IOResult::Done(()))
+        }
+    }
+
+    fn commit_txn_mvcc(
+        &self,
+        pager: Arc<Pager>,
+        program_state: &mut ProgramState,
+        mv_store: &Arc<MvStore>,
+        _rollback: bool,
+    ) -> Result<IOResult<()>> {
+        let conn = self.connection.clone();
+        let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
+        if auto_commit {
+            // FIXME: we don't want to commit stuff from other programs.
+            if matches!(program_state.commit_state, CommitState::Ready) {
+                let Some(tx_id) = conn.get_mv_tx_id() else {
+                    return Ok(IOResult::Done(()));
                 };
-                self.step_end_write_txn(&pager, &connection, program_state, rollback)
-            } else if auto_commit {
-                match tx_state {
-                    TransactionState::Write { .. } => {
-                        self.step_end_write_txn(&pager, &connection, program_state, rollback)
-                    }
-                    TransactionState::Read => {
-                        connection.set_tx_state(TransactionState::None);
-                        pager.end_read_tx();
-                        Ok(IOResult::Done(()))
-                    }
-                    TransactionState::None => Ok(IOResult::Done(())),
-                    TransactionState::PendingUpgrade { .. } => {
-                        panic!("Unexpected transaction state: {tx_state:?} during auto-commit",)
-                    }
+                let state_machine = mv_store.commit_tx(tx_id, &conn)?;
+                program_state.commit_state = CommitState::CommitingMvcc { state_machine };
+            }
+            let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
+            else {
+                panic!("invalid state for mvcc commit step")
+            };
+            match self.step_end_mvcc_txn(state_machine, mv_store)? {
+                IOResult::Done(_) => {
+                    assert!(state_machine.is_finalized());
+                    conn.set_mv_tx(None);
+                    conn.set_tx_state(TransactionState::None);
+                    pager.end_read_tx();
+                    program_state.commit_state = CommitState::Ready;
+                    return Ok(IOResult::Done(()));
                 }
-            } else {
-                if self.change_cnt_on {
-                    self.connection
-                        .set_changes(program_state.n_change.load(Ordering::SeqCst));
-                }
-                Ok(IOResult::Done(()))
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
+        Ok(IOResult::Done(()))
     }
 
     #[instrument(skip(self, pager, connection, program_state), level = Level::DEBUG)]
@@ -1470,10 +1490,6 @@ impl Program {
         tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
         match txn_finish_result? {
             IOResult::Done(_) => {
-                if self.change_cnt_on {
-                    self.connection
-                        .set_changes(program_state.n_change.load(Ordering::SeqCst));
-                }
                 *commit_state = CommitState::Ready;
             }
             IOResult::IO(io) => {
