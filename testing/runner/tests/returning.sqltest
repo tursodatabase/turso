@@ -1988,3 +1988,36 @@ test insert-returning-aggregate-count {
 expect error {
 }
 
+# RETURNING with multi-column scalar subquery (should error)
+test insert-returning-multi-column-subquery {
+    CREATE TABLE t (x);
+    INSERT INTO t VALUES (1) RETURNING (SELECT 1, 2);
+}
+expect error {
+}
+
+test update-returning-multi-column-subquery {
+    CREATE TABLE t (x);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET x = 2 RETURNING (SELECT 1, 2);
+}
+expect error {
+}
+
+test delete-returning-multi-column-subquery {
+    CREATE TABLE t (x);
+    INSERT INTO t VALUES (1);
+    DELETE FROM t RETURNING (SELECT 1, 2);
+}
+expect error {
+}
+
+# RETURNING with single-column scalar subquery (should work)
+test insert-returning-single-column-subquery {
+    CREATE TABLE t (x);
+    INSERT INTO t VALUES (1) RETURNING (SELECT 42);
+}
+expect {
+    42
+}
+

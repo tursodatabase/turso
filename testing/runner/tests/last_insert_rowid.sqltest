@@ -1,0 +1,33 @@
+@database :memory:
+
+test last-insert-rowid-unchanged-after-update {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'a');
+    INSERT INTO t1 VALUES (5, 'b');
+    INSERT INTO t1(val) VALUES ('c');
+    SELECT last_insert_rowid();
+    UPDATE t1 SET val = 'updated' WHERE id = 1;
+    SELECT last_insert_rowid();
+    UPDATE t1 SET id = id + 10 WHERE id = 1;
+    SELECT last_insert_rowid();
+}
+expect {
+    6
+    6
+    6
+}
+
+test last-insert-rowid-unchanged-after-upsert-update {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'a');
+    INSERT INTO t1 VALUES (5, 'b');
+    INSERT INTO t1(val) VALUES ('c');
+    SELECT last_insert_rowid();
+    INSERT INTO t1(id, val) VALUES (1, 'updated')
+        ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    SELECT last_insert_rowid();
+}
+expect {
+    6
+    6
+}

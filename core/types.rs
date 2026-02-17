@@ -2720,6 +2720,14 @@ impl IOCompletions {
         }
     }
 
+    /// Returns true if this is an explicit yield — a signal to return control
+    /// to the cooperative scheduler so other fibers can make progress.
+    pub fn is_explicit_yield(&self) -> bool {
+        match self {
+            IOCompletions::Single(c) => c.is_explicit_yield(),
+        }
+    }
+
     /// Send abort signal to completions
     pub fn abort(&self) {
         match self {

@@ -11,8 +11,8 @@ pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
     schema: &Schema,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> Result<()> {
     program.extend(&ProgramBuilderOpts {
         num_cursors: 0,
         approx_num_insns: 0,
@@ -51,15 +51,15 @@ pub fn translate_tx_begin(
             });
         }
     }
-    Ok(program)
+    Ok(())
 }
 
 pub fn translate_tx_commit(
     _tx_name: Option<Name>,
     schema: &Schema,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> Result<()> {
     program.extend(&ProgramBuilderOpts {
         num_cursors: 0,
         approx_num_insns: 0,
@@ -71,9 +71,9 @@ pub fn translate_tx_commit(
         // Use a dummy table name for prepare_cdc_if_necessary — any name that isn't the
         // CDC table itself will work.
         if let Some((cdc_cursor_id, _)) =
-            prepare_cdc_if_necessary(&mut program, schema, "__tx_commit__")?
+            prepare_cdc_if_necessary(program, schema, "__tx_commit__")?
         {
-            emit_cdc_commit_insns(&mut program, resolver, cdc_cursor_id)?;
+            emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
         }
     }
 
@@ -81,5 +81,5 @@ pub fn translate_tx_commit(
         auto_commit: true,
         rollback: false,
     });
-    Ok(program)
+    Ok(())
 }

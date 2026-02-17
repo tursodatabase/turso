@@ -35,9 +35,9 @@ fig, ax = plt.subplots(figsize=(10, 6))
 x_pos = np.arange(len(threads))
 bar_width = 0.35
 
-# Get colors from the current color cycle
-prop_cycle = plt.rcParams["axes.prop_cycle"]
-colors_list = prop_cycle.by_key()["color"]
+# Colors and hatching patterns matching TPC-H plot
+system_colors = {"Turso": "#2E7D32", "SQLite": "#1976D2"}
+system_hatches = {"Turso": "//", "SQLite": "///"}
 
 # Plot bars for each system
 for i, system in enumerate(systems):
@@ -47,8 +47,10 @@ for i, system in enumerate(systems):
     offset = (i - len(systems)/2 + 0.5) * bar_width
     bars = ax.bar(x_pos + offset, throughput, bar_width,
                    label=system,
-                   color=colors_list[i % len(colors_list)],
-                   edgecolor="black", linewidth=1.2)
+                   color=system_colors.get(system, "#888888"),
+                   edgecolor="black", linewidth=0.5,
+                   hatch=system_hatches.get(system, ""),
+                   rasterized=True)
 
 # Customize the plot
 ax.set_xlabel("Number of Threads", fontsize=14, fontweight="bold")

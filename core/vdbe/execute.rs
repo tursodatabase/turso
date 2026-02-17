@@ -439,9 +439,15 @@ pub fn op_null(
             if let Some(dest_end) = dest_end {
                 for i in *dest..=*dest_end {
                     state.registers[i] = Register::Value(Value::Null);
+                    // Clear any associated RowSet so it can be reused in a fresh
+                    // state.  In SQLite the RowSet lives inside the register and
+                    // is destroyed by OP_Null; we keep RowSets in a side map, so
+                    // we must remove them explicitly.
+                    state.rowsets.remove(&i);
                 }
             } else {
                 state.registers[*dest] = Register::Value(Value::Null);
+                state.rowsets.remove(dest);
             }
         }
         _ => unreachable!("unexpected Insn {:?}", insn),
@@ -3778,12 +3784,16 @@ pub fn op_decr_jump_zero(
 fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
     let s = acc.as_float();
     let t = s + r;
-    let correction = if s.abs() > r.abs() {
-        (s - t) + r
-    } else {
-        (r - t) + s
-    };
-    state.r_err += correction;
+    // When t is infinite, the KBN correction computes inf - inf = NaN,
+    // which is meaningless. Skip compensation in that case.
+    if t.is_finite() {
+        let correction = if s.abs() > r.abs() {
+            (s - t) + r
+        } else {
+            (r - t) + s
+        };
+        state.r_err += correction;
+    }
     *acc = Value::from_f64(t);
 }
 
@@ -3941,12 +3951,16 @@ fn update_agg_payload(
             // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
             let s = sum_val.as_float();
             let t = s + val;
-            let correction = if s.abs() > val.abs() {
-                (s - t) + val
-            } else {
-                (val - t) + s
-            };
-            *r_err_val = Value::from_f64(r_err + correction);
+            // When t is infinite, the KBN correction computes inf - inf = NaN,
+            // which is meaningless. Skip compensation in that case.
+            if t.is_finite() {
+                let correction = if s.abs() > val.abs() {
+                    (s - t) + val
+                } else {
+                    (val - t) + s
+                };
+                *r_err_val = Value::from_f64(r_err + correction);
+            }
             *sum_val = Value::from_f64(t);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
@@ -6753,7 +6767,9 @@ pub fn op_insert(
                     return_if_io!(cursor.rowid())
                 };
                 if let Some(rowid) = maybe_rowid {
-                    program.connection.update_last_rowid(rowid);
+                    if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
+                        program.connection.update_last_rowid(rowid);
+                    }
                     state
                         .n_change
                         .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
@@ -11401,13 +11417,18 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                         return false;
                     }
 
-                    // For affinity conversion, only convert strings that are entirely numeric
-                    let num = if let Ok(i) = text.parse::<i64>() {
-                        Value::from_i64(i)
-                    } else if let Ok(f) = text.parse::<f64>() {
-                        Value::from_f64(f)
-                    } else {
-                        return false;
+                    let (parse_result, parsed_value) = try_for_float(text.as_bytes());
+                    let num = match parse_result {
+                        NumericParseResult::NotNumeric | NumericParseResult::ValidPrefixOnly => {
+                            return false;
+                        }
+                        NumericParseResult::PureInteger | NumericParseResult::HasDecimalOrExp => {
+                            match parsed_value {
+                                ParsedNumber::Integer(i) => Value::from_i64(i),
+                                ParsedNumber::Float(f) => Value::from_f64(f),
+                                ParsedNumber::None => return false,
+                            }
+                        }
                     };
 
                     match num {
@@ -11772,7 +11793,7 @@ fn op_journal_mode_inner(
                     }
                     let db_path = program.connection.get_database_canonical_path();
                     let mv_store = journal_mode::open_mv_store(
-                        pager.io.as_ref(),
+                        pager.io.clone(),
                         &db_path,
                         program.connection.db.open_flags,
                     )?;
@@ -12109,8 +12130,14 @@ fn op_vacuum_into_inner(
                 // This batches all writes and ensures destination is either empty or complete.
                 dest_conn.execute("BEGIN")?;
 
-                let schema_sql = "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END";
-                let schema_stmt = program.connection.prepare(schema_sql)?;
+                // Exclude the MVCC metadata table from the vacuum destination — it is an
+                // internal artifact of experimental_mvcc mode and must not appear in a
+                // standalone SQLite file produced by VACUUM INTO.
+                let schema_sql = format!(
+                    "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
+                    crate::mvcc::database::MVCC_META_TABLE_NAME
+                );
+                let schema_stmt = program.connection.prepare(schema_sql.as_str())?;
 
                 vacuum_state.dest_db = Some(dest_db);
                 vacuum_state.source_user_version = user_version;
@@ -12157,6 +12184,7 @@ fn op_vacuum_into_inner(
                                         if type_val.as_str() == "table"
                                             && (!name.starts_with("sqlite_")
                                                 || name == "sqlite_sequence")
+                                            && name != crate::mvcc::database::MVCC_META_TABLE_NAME
                                         {
                                             return Some(name.to_string());
                                         }
@@ -12713,6 +12741,35 @@ mod tests {
                     panic!("String '{input}' should NOT be converted to integer");
                 }
                 other => panic!("Unexpected value type: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_affinity_keeps_nan_inf_text() {
+        let cases = ["nan", "inf"];
+
+        for input in cases {
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Integer);
+            match register {
+                Register::Value(Value::Text(t)) => {
+                    assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
+                }
+                other => {
+                    panic!("'{input}' should remain text, got {other:?}");
+                }
+            }
+
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Numeric);
+            match register {
+                Register::Value(Value::Text(t)) => {
+                    assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
+                }
+                other => {
+                    panic!("'{input}' should remain text, got {other:?}");
+                }
             }
         }
     }

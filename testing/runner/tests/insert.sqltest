@@ -1843,3 +1843,108 @@ expect {
     133|a133
 }
 
+# https://github.com/tursodatabase/turso/issues/5226
+test insert-select-nonexistent-column {
+    CREATE TABLE t(a);
+    INSERT INTO t(x) SELECT a FROM t;
+}
+expect error {
+}
+
+# https://github.com/tursodatabase/turso/issues/5278
+test insert-select-correlated-subquery-not-in {
+    CREATE TABLE products(id INTEGER PRIMARY KEY, price INTEGER, category TEXT);
+    CREATE TABLE expensive(id INTEGER PRIMARY KEY, price INTEGER, category TEXT);
+    INSERT INTO products VALUES (1, 10, 'A'), (2, 50, 'B'), (3, 200, 'A'), (4, 75, 'B'), (5, 30, 'A');
+    INSERT INTO expensive SELECT * FROM products WHERE price > 40 AND category = 'B';
+    INSERT INTO expensive SELECT * FROM products p
+      WHERE price > (SELECT AVG(price) FROM products WHERE category = p.category)
+      AND id NOT IN (SELECT id FROM expensive);
+    SELECT * FROM expensive ORDER BY id;
+}
+expect {
+    2|50|B
+    3|200|A
+    4|75|B
+}
+
+# https://github.com/tursodatabase/turso/issues/3974
+test insert-select-multiple-correlated-subqueries {
+    CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, price REAL);
+    CREATE TABLE sales(id INTEGER PRIMARY KEY, product_id INTEGER, quantity INTEGER);
+    CREATE TABLE summary(product_id INTEGER PRIMARY KEY, name TEXT, total_quantity INTEGER, avg_price REAL);
+    INSERT INTO products VALUES (1, 'A', 10.0), (2, 'B', 20.0), (3, 'C', 30.0);
+    INSERT INTO sales VALUES (1, 1, 5), (2, 1, 10), (3, 2, 15), (4, 3, 20);
+    INSERT INTO summary(product_id, name, total_quantity, avg_price)
+    SELECT
+        p.id,
+        p.name,
+        (SELECT SUM(quantity) FROM sales WHERE product_id = p.id),
+        (SELECT AVG(price) FROM products WHERE id = p.id)
+    FROM products p;
+    SELECT * FROM summary ORDER BY product_id;
+}
+expect {
+    1|A|15|10.0
+    2|B|15|20.0
+    3|C|20|30.0
+}
+expect @js {
+    1|A|15|10
+    2|B|15|20
+    3|C|20|30
+}
+
+# https://github.com/tursodatabase/turso/issues/3974
+test insert-select-two-correlated-subqueries {
+    CREATE TABLE p(id INT PRIMARY KEY, x INT);
+    CREATE TABLE q(pid INT, val INT);
+    CREATE TABLE r(a INT, b INT, c INT);
+    INSERT INTO p VALUES (1,10),(2,20),(3,30);
+    INSERT INTO q VALUES (1,100),(1,101),(2,200),(3,300);
+    INSERT INTO r
+    SELECT
+        p.id,
+        (SELECT val FROM q WHERE pid = p.id LIMIT 1),
+        (SELECT x FROM p AS p2 WHERE p2.id = p.id)
+    FROM p;
+    SELECT * FROM r ORDER BY a;
+}
+expect {
+    1|100|10
+    2|200|20
+    3|300|30
+}
+
+test insert-autoincrement-ipk-index-sync {
+    CREATE TABLE v0 (c1 INTEGER PRIMARY KEY AUTOINCREMENT, c2 TEXT);
+    CREATE INDEX i3 ON v0 (c1);
+    INSERT INTO v0 (c2) VALUES ('x') RETURNING c1, c2;
+    PRAGMA integrity_check;
+}
+expect {
+    1|x
+    ok
+}
+
+test insert-ipk-index-no-autoincrement {
+    CREATE TABLE t_ipk (c1 INTEGER PRIMARY KEY, c2 TEXT);
+    CREATE INDEX idx_ipk ON t_ipk (c1);
+    INSERT INTO t_ipk (c2) VALUES ('a');
+    INSERT INTO t_ipk (c2) VALUES ('b');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test insert-ipk-index-explicit-value {
+    CREATE TABLE t_ipk2 (c1 INTEGER PRIMARY KEY, c2 TEXT);
+    CREATE INDEX idx_ipk2 ON t_ipk2 (c1);
+    INSERT INTO t_ipk2 VALUES (10, 'a');
+    INSERT INTO t_ipk2 (c2) VALUES ('b');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

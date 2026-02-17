@@ -169,6 +169,81 @@ expect {
     2|two
 }
 
+# INSERT OR REPLACE should preserve user values for multiple NOT NULL DEFAULT columns
+
+test insert-or-replace-multi-notnull-default {
+    CREATE TABLE t1(
+        id INTEGER PRIMARY KEY,
+        val INTEGER NOT NULL DEFAULT 42,
+        name TEXT NOT NULL DEFAULT 'unnamed'
+    );
+    INSERT OR REPLACE INTO t1 VALUES (1, 100, 'hello');
+    SELECT * FROM t1;
+}
+expect {
+    1|100|hello
+}
+
+test insert-or-replace-multi-notnull-default-many-cols {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY,
+        a TEXT NOT NULL DEFAULT 'da',
+        b TEXT NOT NULL DEFAULT 'db',
+        c TEXT NOT NULL DEFAULT 'dc');
+    INSERT OR REPLACE INTO t1 VALUES (1, 'one', 'two', 'three');
+    SELECT * FROM t1;
+}
+expect {
+    1|one|two|three
+}
+
+# INSERT OR REPLACE must not bypass CHECK constraints via default substitution
+
+test insert-or-replace-notnull-default-respects-check {
+    CREATE TABLE t1(
+        id INTEGER PRIMARY KEY,
+        a INTEGER NOT NULL DEFAULT 999 CHECK(a < 100),
+        b INTEGER NOT NULL DEFAULT 999 CHECK(b < 100)
+    );
+    INSERT OR REPLACE INTO t1 VALUES (1, 10, 20);
+    SELECT * FROM t1;
+}
+expect {
+    1|10|20
+}
+
+# INSERT OR REPLACE must keep index and table data consistent for NOT NULL DEFAULT UNIQUE columns
+
+test insert-or-replace-notnull-default-unique-index-consistent {
+    CREATE TABLE t1(
+        id INTEGER PRIMARY KEY,
+        a INTEGER NOT NULL DEFAULT 42,
+        b INTEGER NOT NULL DEFAULT 42 UNIQUE
+    );
+    INSERT INTO t1 VALUES (1, 10, 42);
+    INSERT OR REPLACE INTO t1 VALUES (2, 20, 99);
+    SELECT * FROM t1 WHERE b = 99;
+}
+expect {
+    2|20|99
+}
+
+# INSERT OR REPLACE ... SELECT should also preserve user values for NOT NULL DEFAULT columns
+
+test insert-or-replace-select-multi-notnull-default {
+    CREATE TABLE src(id INTEGER PRIMARY KEY, val INTEGER, name TEXT);
+    INSERT INTO src VALUES (1, 100, 'hello');
+    CREATE TABLE dst(
+        id INTEGER PRIMARY KEY,
+        val INTEGER NOT NULL DEFAULT 42,
+        name TEXT NOT NULL DEFAULT 'unnamed'
+    );
+    INSERT OR REPLACE INTO dst SELECT * FROM src;
+    SELECT * FROM dst;
+}
+expect {
+    1|100|hello
+}
+
 # =============================================================================
 # INSERT OR ROLLBACK tests
 # =============================================================================

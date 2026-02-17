@@ -73,7 +73,7 @@ addr  opcode            p1  p2  p3  p4            p5  comment
   28  Rewind             4  50   0                 0  Rewind table customers
   29    Integer          0  20   0                 0  r[20]=0
   30    RowId            4  21   0                 0  r[21]=customers.rowid
-  31    Affinity        21   1   0                 0  r[21..22] = D
+  31    Affinity        21   1   0                 0  r[21..22] = C
   32    NotFound         0  34  21                 0  if not found goto 34
   33    Goto             0  40   0                 0
   34    Rewind           0  42   0                 0  Rewind  ephemeral_index_where_sub_t4

@@ -47,7 +47,7 @@ addr  opcode           p1  p2  p3  p4              p5  comment
   14    Integer         0   8   0                   0  r[8]=0
   15    Column          2   2   9                   0  r[9]=products.category_id
   16    IsNull          9  20   0                   0  if (r[9]==NULL) goto 20
-  17    Affinity        9   1   0                   0  r[9..10] = D
+  17    Affinity        9   1   0                   0  r[9..10] = C
   18    NotFound        0  20   9                   0  if not found goto 20
   19    Goto            0  26   0                   0
   20    Rewind          0  28   0                   0  Rewind  ephemeral_index_where_sub_t2

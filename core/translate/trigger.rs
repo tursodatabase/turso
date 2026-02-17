@@ -89,10 +89,10 @@ pub fn translate_create_trigger(
     if_not_exists: bool,
     time: Option<ast::TriggerTime>,
     tbl_name: QualifiedName,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     sql: String,
     connection: Arc<Connection>,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     // Check if experimental triggers are enabled
     if !connection.experimental_triggers_enabled() {
         return Err(crate::LimboError::ParseError(
@@ -116,7 +116,7 @@ pub fn translate_create_trigger(
         .is_some()
     {
         if if_not_exists {
-            return Ok(program);
+            return Ok(());
         }
         bail_parse_error!("Trigger {} already exists", normalized_trigger_name);
     }
@@ -155,7 +155,7 @@ pub fn translate_create_trigger(
 
     // Add the trigger entry to sqlite_schema
     emit_schema_entry(
-        &mut program,
+        program,
         resolver,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for triggers
@@ -180,7 +180,7 @@ pub fn translate_create_trigger(
         where_clause: Some(format!("name = '{normalized_trigger_name}'")),
     });
 
-    Ok(program)
+    Ok(())
 }
 
 /// Translate DROP TRIGGER statement
@@ -188,9 +188,9 @@ pub fn translate_drop_trigger(
     schema: &crate::schema::Schema,
     trigger_name: &str,
     if_exists: bool,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: Arc<Connection>,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     // Check if experimental triggers are enabled
     if !connection.experimental_triggers_enabled() {
         return Err(crate::LimboError::ParseError(
@@ -205,7 +205,7 @@ pub fn translate_drop_trigger(
     // Check if trigger exists
     if schema.get_trigger(&normalized_trigger_name).is_none() {
         if if_exists {
-            return Ok(program);
+            return Ok(());
         }
         bail_parse_error!("no such trigger: {}", normalized_trigger_name);
     }
@@ -312,5 +312,5 @@ pub fn translate_drop_trigger(
         trigger_name: normalized_trigger_name,
     });
 
-    Ok(program)
+    Ok(())
 }

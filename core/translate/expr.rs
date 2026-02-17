@@ -369,7 +369,9 @@ pub fn translate_condition_expr(
             }
         },
         ast::Expr::Register(_) => {
-            crate::bail_parse_error!("Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead");
+            crate::bail_parse_error!(
+                "Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead"
+            );
         }
         ast::Expr::Collate(_, _) => {
             crate::bail_parse_error!("Collate in WHERE clause is not supported");
@@ -757,7 +759,10 @@ pub fn translate_expr(
                     });
                     Ok(target_register)
                 }
-                SubqueryType::In { cursor_id } => {
+                SubqueryType::In {
+                    cursor_id,
+                    affinity_str,
+                } => {
                     // jump here when we can definitely skip the row (result = 0/false)
                     let label_skip_row = program.allocate_label();
                     // jump here when we can definitely include the row (result = 1/true)
@@ -788,7 +793,7 @@ pub fn translate_expr(
                             lhs_column_regs_start + i,
                             resolver,
                         )?;
-                        if !lhs_column.is_nonnull(referenced_tables.as_ref().unwrap()) {
+                        if !referenced_tables.is_some_and(|tables| lhs_column.is_nonnull(tables)) {
                             // If LHS is NULL, we need to check if ephemeral is empty first.
                             // - If empty: IN returns FALSE, NOT IN returns TRUE
                             // - If not empty: result is NULL (unknown)
@@ -800,22 +805,18 @@ pub fn translate_expr(
                         }
                     }
 
-                    // Compute and apply affinity for the LHS columns before the index probe.
-                    // This follows SQLite's approach where OP_Affinity is emitted before
-                    // Found/NotFound operations on ephemeral indices for IN subqueries.
-
-                    let affinity = lhs_columns
-                        .iter()
-                        .map(|col| get_expr_affinity(col, referenced_tables));
-
                     // Only emit Affinity instruction if there's meaningful affinity to apply
                     // (i.e., not all BLOB/NONE affinity)
-                    if affinity.clone().any(|a| a != Affinity::Blob) {
+                    if affinity_str
+                        .chars()
+                        .map(Affinity::from_char)
+                        .any(|a| a != Affinity::Blob)
+                    {
                         if let Ok(count) = std::num::NonZeroUsize::try_from(lhs_column_count) {
                             program.emit_insn(Insn::Affinity {
                                 start_reg: lhs_column_regs_start,
                                 count,
-                                affinities: affinity.clone().map(|a| a.aff_mask()).collect(),
+                                affinities: affinity_str.as_ref().clone(),
                             });
                         }
                     }
@@ -858,7 +859,7 @@ pub fn translate_expr(
                     });
                     program.preassign_label_to_next_insn(label_null_checks_loop_start);
                     let column_check_reg = program.alloc_register();
-                    for (i, affinity) in affinity.enumerate().take(lhs_column_count) {
+                    for (i, affinity) in affinity_str.chars().map(Affinity::from_char).enumerate() {
                         program.emit_insn(Insn::Column {
                             cursor_id: *cursor_id,
                             column: i,
@@ -4920,6 +4921,14 @@ pub fn process_returning_clause(
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
 
+                let vec_size = expr_vector_size(expr)?;
+                if vec_size != 1 {
+                    crate::bail_parse_error!(
+                        "sub-select returns {} columns - expected 1",
+                        vec_size
+                    );
+                }
+
                 result_columns.push(ResultSetColumn {
                     expr: expr.as_ref().clone(),
                     alias: alias.as_ref().map(alias_to_string),
@@ -4975,7 +4984,10 @@ pub(crate) fn emit_returning_results<'a>(
         return Ok(());
     }
 
-    turso_assert!(table_references.joined_tables().len() == 1, "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table");
+    turso_assert!(
+        table_references.joined_tables().len() == 1,
+        "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table"
+    );
     let table = table_references.joined_tables().first().unwrap();
 
     resolver.enable_expr_to_reg_cache();
@@ -5043,7 +5055,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             let evs_start = expr_vector_size(start)?;
             let evs_end = expr_vector_size(end)?;
             if evs_left != evs_start || evs_left != evs_end {
-                crate::bail_parse_error!("all arguments to BETWEEN must return the same number of values. Got: ({evs_left}) BETWEEN ({evs_start}) AND ({evs_end})");
+                crate::bail_parse_error!(
+                    "all arguments to BETWEEN must return the same number of values. Got: ({evs_left}) BETWEEN ({evs_start}) AND ({evs_end})"
+                );
             }
             1
         }
@@ -5051,7 +5065,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             let evs_left = expr_vector_size(expr)?;
             let evs_right = expr_vector_size(expr1)?;
             if evs_left != evs_right {
-                crate::bail_parse_error!("all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})");
+                crate::bail_parse_error!(
+                    "all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})"
+                );
             }
             1
         }
@@ -5132,7 +5148,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             for rhs in rhs.iter() {
                 let evs_rhs = expr_vector_size(rhs)?;
                 if evs_lhs != evs_rhs {
-                    crate::bail_parse_error!("all arguments to IN list must return the same number of values, got: ({evs_lhs}) IN ({evs_rhs})");
+                    crate::bail_parse_error!(
+                        "all arguments to IN list must return the same number of values, got: ({evs_lhs}) IN ({evs_rhs})"
+                    );
                 }
             }
             1
@@ -5188,7 +5206,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::Unary(unary_operator, expr) => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {
-                crate::bail_parse_error!("argument to unary operator {unary_operator} must return 1 value. Got: ({evs_expr})");
+                crate::bail_parse_error!(
+                    "argument to unary operator {unary_operator} must return 1 value. Got: ({evs_expr})"
+                );
             }
             1
         }

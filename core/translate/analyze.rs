@@ -22,8 +22,8 @@ use turso_parser::ast;
 pub fn translate_analyze(
     target_opt: Option<ast::QualifiedName>,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> Result<()> {
     // Collect all analyze targets up front so we can create/open sqlite_stat1 just once.
     let analyze_targets: Vec<(Arc<BTreeTable>, Option<Arc<Index>>)> = match target_opt {
         Some(target) => {
@@ -90,7 +90,7 @@ pub fn translate_analyze(
     };
 
     if analyze_targets.is_empty() {
-        return Ok(program);
+        return Ok(());
     }
 
     // This is emitted early because SQLite does, and thus generated VDBE matches a bit closer.
@@ -146,7 +146,7 @@ pub fn translate_analyze(
 
         // Add the table entry to sqlite_schema
         emit_schema_entry(
-            &mut program,
+            program,
             resolver,
             sqlite_schema_cursor_id,
             None,
@@ -353,13 +353,13 @@ pub fn translate_analyze(
                 .collect(),
         };
         for index in indexes {
-            emit_index_stats(&mut program, stat_cursor, &target_table, &index);
+            emit_index_stats(program, stat_cursor, &target_table, &index);
         }
     }
 
     // FIXME: Emit LoadAnalysis
     // FIXME: Emit Expire
-    Ok(program)
+    Ok(())
 }
 
 /// Emit VDBE code to gather and insert statistics for a single index.

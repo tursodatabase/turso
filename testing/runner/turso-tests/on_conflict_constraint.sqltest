@@ -1,0 +1,41 @@
+@database :memory:
+
+# https://github.com/tursodatabase/turso/issues/5221
+# ON CONFLICT clause on table-level UNIQUE constraint should return an error
+# (not yet implemented, was previously panicking with unimplemented!())
+
+test create-table-unique-on-conflict-ignore {
+    CREATE TABLE t(a, b, UNIQUE(a) ON CONFLICT IGNORE);
+}
+expect error {
+}
+
+test create-table-unique-on-conflict-replace {
+    CREATE TABLE t(a, b, UNIQUE(a) ON CONFLICT REPLACE);
+}
+expect error {
+}
+
+test create-table-unique-on-conflict-abort {
+    CREATE TABLE t(a, b, UNIQUE(a) ON CONFLICT ABORT);
+}
+expect error {
+}
+
+test create-table-unique-on-conflict-rollback {
+    CREATE TABLE t(a, b, UNIQUE(a) ON CONFLICT ROLLBACK);
+}
+expect error {
+}
+
+test create-table-unique-on-conflict-fail {
+    CREATE TABLE t(a, b, UNIQUE(a) ON CONFLICT FAIL);
+}
+expect error {
+}
+
+test create-table-primary-key-on-conflict-ignore {
+    CREATE TABLE t(a, b, PRIMARY KEY(a) ON CONFLICT IGNORE);
+}
+expect error {
+}

@@ -637,10 +637,6 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         seed
     };
 
-    if opts.nr_threads > 1 {
-        println!("WARNING: Multi-threaded data access is not yet supported: https://github.com/tursodatabase/turso/issues/1552");
-    }
-
     // Generate schema upfront on main thread with seed
     let mut main_rng = ThreadRng::new(global_seed);
     let schema = if let Some(ref db_ref) = opts.db_ref {

@@ -176,6 +176,10 @@ pub struct ProgramBuilder {
     /// Global count of references to each CTE across the entire query.
     /// Used to determine whether a CTE should be materialized (multi-ref) or use coroutine (single-ref).
     cte_reference_counts: HashMap<usize, usize>,
+    /// Stack of CTE names currently being planned. Used to detect circular
+    /// references in non-recursive CTEs and to prevent fallthrough to schema
+    /// resolution for same-named tables/views.
+    ctes_being_defined: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -401,6 +405,7 @@ impl ProgramBuilder {
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             cte_reference_counts: HashMap::default(),
+            ctes_being_defined: Vec::new(),
         }
     }
 
@@ -442,6 +447,34 @@ impl ProgramBuilder {
     /// Used during emission to decide whether to materialize (multi-ref) or use coroutine (single-ref).
     pub fn get_cte_reference_count(&self, cte_id: usize) -> usize {
         self.cte_reference_counts.get(&cte_id).copied().unwrap_or(0)
+    }
+
+    /// Mark a CTE name as currently being planned. While on the stack,
+    /// `parse_table` will reject references to this name with "circular
+    /// reference" instead of falling through to schema resolution.
+    pub fn push_cte_being_defined(&mut self, name: String) {
+        self.ctes_being_defined.push(name);
+    }
+
+    /// Remove the most recently pushed CTE name after planning completes.
+    pub fn pop_cte_being_defined(&mut self) {
+        self.ctes_being_defined.pop();
+    }
+
+    /// Check whether a name refers to a CTE currently being planned.
+    pub fn is_cte_being_defined(&self, name: &str) -> bool {
+        self.ctes_being_defined.iter().any(|n| n == name)
+    }
+
+    /// Temporarily take the CTE-being-defined stack (e.g. during view
+    /// expansion, which should not see CTE context from the caller).
+    pub fn take_ctes_being_defined(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.ctes_being_defined)
+    }
+
+    /// Restore the CTE-being-defined stack after a context-isolated expansion.
+    pub fn restore_ctes_being_defined(&mut self, saved: Vec<String>) {
+        self.ctes_being_defined = saved;
     }
 
     pub fn set_resolve_type(&mut self, resolve_type: ResolveType) {
@@ -1221,12 +1254,20 @@ impl ProgramBuilder {
     }
 
     #[inline]
-    pub fn incr_nesting(&mut self) {
+    pub fn nested<T>(&mut self, body: impl FnOnce(&mut Self) -> T) -> T {
+        self.incr_nesting();
+        let res = body(self);
+        self.decr_nesting();
+        res
+    }
+
+    #[inline]
+    fn incr_nesting(&mut self) {
         self.nested_level += 1;
     }
 
     #[inline]
-    pub fn decr_nesting(&mut self) {
+    fn decr_nesting(&mut self) {
         self.nested_level -= 1;
     }
 

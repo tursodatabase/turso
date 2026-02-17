@@ -1,7 +1,8 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, RowID, RowKey, RowVersion, TxTimestampOrID,
-    WriteRowStateMachine, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, TxTimestampOrID,
+    WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
+    SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::schema::Index;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
@@ -19,7 +20,7 @@ use crate::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     AcquireLock,
     BeginPagerTxn,
@@ -49,10 +50,10 @@ pub enum CheckpointState {
     /// This ensures durability: if we crash after WAL truncation but before DB fsync,
     /// the data would be lost.
     SyncDbFile,
-    /// Truncate the WAL file after DB file is safely synced (for TRUNCATE checkpoint mode)
-    TruncateWal,
     TruncateLogicalLog,
     FsyncLogicalLog,
+    /// Truncate the WAL file after DB file and logical-log cleanup are safely durable.
+    TruncateWal,
     Finalize,
 }
 
@@ -73,8 +74,8 @@ pub struct LockStates {
 /// 4. Writes all the selected row versions to the B-tree.
 /// 5. Commits the pager transaction, effectively flushing to the WAL
 /// 6. Immediately does a TRUNCATE checkpoint from the WAL to the DB
-/// 7. Fsync the DB file, then truncate the WAL
-/// 8. Truncate + fsync the logical log
+/// 7. Fsync the DB file
+/// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
 /// 9. Releases the blocking_checkpoint_lock
 pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// The current state of the state machine
@@ -82,10 +83,10 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// The states of the locks held by the state machine - these are tracked for error handling so that they are
     /// released if the state machine fails.
     lock_states: LockStates,
-    /// The highest transaction ID that has been checkpointed in a previous checkpoint.
-    checkpointed_txid_max_old: Option<NonZeroU64>,
-    /// The highest transaction ID that will be checkpointed in the current checkpoint.
-    checkpointed_txid_max_new: u64,
+    /// The highest transaction ID that has been made durable in the WAL in a previous checkpoint.
+    durable_txid_max_old: Option<NonZeroU64>,
+    /// The highest transaction ID that will be made durable in the WAL in the current checkpoint.
+    durable_txid_max_new: u64,
     /// Pager used for writing to the B-tree
     pager: Arc<Pager>,
     /// MVCC store containing the row versions.
@@ -123,6 +124,10 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     update_transaction_state: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    /// Internal metadata table info for persisting `persistent_tx_ts_max` atomically with pager commit.
+    mvcc_meta_table: Option<(MVTableId, usize)>,
+    /// File-backed databases must persist replay boundary durably.
+    durable_mvcc_metadata: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -173,8 +178,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 )
             })
             .collect();
-        let checkpoint_tx_max = mvstore.checkpointed_txid_max.load(Ordering::SeqCst);
-        let checkpointed_txid_max_old = NonZeroU64::new(checkpoint_tx_max);
+        let mvcc_meta_table = schema.get_btree_table(MVCC_META_TABLE_NAME).map(|table| {
+            (
+                mvstore.get_table_id_from_root_page(table.root_page),
+                table.columns.len(),
+            )
+        });
+        let durable_mvcc_metadata =
+            !connection.db.path.starts_with(":memory:") && mvcc_meta_table.is_some();
+        let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
+        let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
         Self {
             state: CheckpointState::AcquireLock,
             lock_states: LockStates {
@@ -183,8 +196,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 pager_write_tx: false,
             },
             pager,
-            checkpointed_txid_max_old,
-            checkpointed_txid_max_new: mvstore.checkpointed_txid_max.load(Ordering::SeqCst),
+            durable_txid_max_old,
+            durable_txid_max_new: mvstore.durable_txid_max.load(Ordering::SeqCst),
             mvstore,
             connection,
             checkpoint_lock,
@@ -200,7 +213,22 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             checkpoint_result: None,
             update_transaction_state,
             sync_mode,
+            mvcc_meta_table,
+            durable_mvcc_metadata,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_for_test(&self) -> CheckpointState {
+        self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_bounds_for_test(&self) -> (Option<u64>, u64) {
+        (
+            self.durable_txid_max_old.map(u64::from),
+            self.durable_txid_max_new,
+        )
     }
 
     /// Determine whether the newest valid version of a row should be checkpointed.
@@ -214,23 +242,22 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let mut exists_in_db_file = false;
         // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
         for version in versions.iter() {
+            // Rows marked btree_resident existed in the DB file before MVCC tracked them.
+            // This also applies to synthetic tombstones that use begin=None.
+            if version.btree_resident {
+                exists_in_db_file = true;
+            }
             // A row is in the database file if:
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
             if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
                 begin_ts = Some(b);
-                // A row exists in the DB file if:
-                // 1. It was checkpointed in a previous checkpoint (begin_ts <= checkpointed_txid_max_old), OR
-                // 2. The version is marked as btree_resident (the row existed in B-tree when it was
-                //    first modified in MVCC after a WAL->MVCC switch)
-                //
-                // When checkpointed_txid_max_old is None and begin_ts > 0 and not btree_resident,
-                // no MVCC row has been checkpointed yet, so the row does NOT exist in the database file.
-                if version.btree_resident
-                    || self
-                        .checkpointed_txid_max_old
-                        .is_some_and(|txid_max_old| b <= u64::from(txid_max_old))
+                // A row exists in the DB file if it was checkpointed in a previous checkpoint.
+                // For btree_resident rows we set exists_in_db_file above, regardless of begin encoding.
+                if self
+                    .durable_txid_max_old
+                    .is_some_and(|txid_max_old| b <= u64::from(txid_max_old))
                 {
                     exists_in_db_file = true;
                 }
@@ -239,7 +266,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
                 end_ts = Some(e);
                 if self
-                    .checkpointed_txid_max_old
+                    .durable_txid_max_old
                     .is_some_and(|txid_max_old| e <= u64::from(txid_max_old))
                 {
                     exists_in_db_file = false;
@@ -250,11 +277,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
             // Should checkpoint the newest version if:
             // - It is not a delete and it hasn't been checkpointed yet OR (begin_ts > max_old)
-            // Note: We use >= because rows recovered from the logical log have begin_ts = 0,
-            // We need the `self.checkpointed_txid_max_old.is_none()` check as we may have not checkpointed yet,
-            // and without this check, recovered rows could skipped accidently
+            // We need the `self.durable_txid_max_old.is_none()` check because before
+            // the first checkpoint there is no persisted MVCC watermark.
             let is_uncheckpointed_insert = end_ts.is_none()
-                && self.checkpointed_txid_max_old.is_none_or(|txid_max_old| {
+                && self.durable_txid_max_old.is_none_or(|txid_max_old| {
                     begin_ts.is_some_and(|b| b > u64::from(txid_max_old))
                 });
             // - It is a delete, AND some version of the row exists in the database file.
@@ -265,7 +291,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
                 && !exists_in_db_file
                 && self
-                    .checkpointed_txid_max_old
+                    .durable_txid_max_old
                     .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
             let should_checkpoint =
                 is_uncheckpointed_insert || is_delete_and_exists_in_db_file || is_schema_delete;
@@ -288,10 +314,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         // Keep track of the highest timestamp that will be checkpointed in the current checkpoint;
         // This value will be used at the end of the checkpoint to update the corresponding value in
         // the MVCC store, so that we don't checkpoint the same row versions again on the next checkpoint.
-        let mut max_timestamp = self.checkpointed_txid_max_old;
+        let mut max_timestamp = self.durable_txid_max_old;
 
-        // Since table ids are negative, and we want schema changes (table_id=-1) to be processed first, we iterate in reverse order.
-        // Reliance on SkipMap ordering is a bit yolo-swag fragile, but oh well.
+        // Invariant: RowID ordering is (table_id, row_id) with table_id ascending.
+        // Since MV table IDs are negative and sqlite_schema is table_id=-1, iterating
+        // in reverse visits sqlite_schema first so CREATE/DROP metadata is applied
+        // before user-table rows in this checkpoint pass.
         for entry in self.mvstore.rows.iter().rev() {
             let key = entry.key();
             tracing::trace!("collecting {key:?}");
@@ -388,7 +416,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     sqlite_schema_rowid,
                                 });
                             } else {
-                                panic!("Unexpected modify operation on existing index with root page {root_page}");
+                                // Index schema row update (e.g. ALTER TABLE RENAME COLUMN propagates
+                                // to index SQL). No B-tree creation needed; the row itself is written
+                                // to sqlite_schema below. See: test_checkpoint_allows_index_schema_update_after_rename_column.
                             }
                         } else if type_str.as_str() == "table" {
                             // This is a table schema change (existing logic)
@@ -450,9 +480,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 version.0.row.id.row_id.clone(),
             )
         });
-        self.checkpointed_txid_max_new = max_timestamp
-            .map_or(self.checkpointed_txid_max_new, |max_timestamp| {
-                self.checkpointed_txid_max_new.max(max_timestamp.into())
+        self.durable_txid_max_new = max_timestamp
+            .map_or(self.durable_txid_max_new, |max_timestamp| {
+                self.durable_txid_max_new.max(max_timestamp.into())
             });
     }
 
@@ -464,7 +494,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     ///    * The row is not a delete (we inserted or changed an existing row), OR
     ///    * The row is a delete AND it exists in the database file already.
     fn collect_committed_index_row_versions(&mut self) {
-        let mut max_timestamp = self.checkpointed_txid_max_old;
+        let mut max_timestamp = self.durable_txid_max_old;
         for entry in self.mvstore.index_rows.iter() {
             let index_id = *entry.key();
 
@@ -496,9 +526,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
         }
 
-        self.checkpointed_txid_max_new = max_timestamp
-            .map_or(self.checkpointed_txid_max_new, |max_timestamp| {
-                self.checkpointed_txid_max_new.max(max_timestamp.into())
+        self.durable_txid_max_new = max_timestamp
+            .map_or(self.durable_txid_max_new, |max_timestamp| {
+                self.durable_txid_max_new.max(max_timestamp.into())
             });
     }
 
@@ -550,7 +580,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     }
 
     /// Garbage-collect row versions for rows that were just checkpointed.
-    /// Must be called AFTER checkpointed_txid_max is updated and BEFORE the
+    /// Must be called AFTER durable_txid_max is updated and BEFORE the
     /// checkpoint lock is released (no concurrent writers under blocking lock).
     fn gc_checkpointed_versions(&self) {
         // Safety: entry removal after dropping the version-chain write lock has a
@@ -558,21 +588,27 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         // only safe because the blocking checkpoint lock prevents concurrent writers.
         // If we ever move to a non-blocking checkpoint, this must switch to lazy
         // removal (like background GC) or hold the write lock across the remove().
-        debug_assert!(
+        assert!(
             self.lock_states.blocking_checkpoint_lock_held,
             "gc_checkpointed_versions requires the blocking checkpoint lock"
         );
         let lwm = self.mvstore.compute_lwm();
-        let ckpt_max = self.checkpointed_txid_max_new;
+        let ckpt_max = self.durable_txid_max_new;
 
         for (row_version, _special_write) in &self.write_set {
             let row_id = &row_version.row.id;
+            let Some(entry) = self.mvstore.rows.get(row_id) else {
+                // The MVCC metadata table row (persistent_tx_ts_max) is staged
+                // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
+                // have a backing in-memory MVCC version chain. Skip GC for these.
+                assert!(
+                    self.mvcc_meta_table
+                        .is_some_and(|(tid, _)| tid == row_id.table_id),
+                    "row {row_id:?} missing from MVCC store but is not an MVCC metadata table row"
+                );
+                continue;
+            };
             let is_now_empty = {
-                let entry = self
-                    .mvstore
-                    .rows
-                    .get(row_id)
-                    .expect("write set row must exist in SkipMap");
                 let mut versions = entry.value().write();
                 MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
                 versions.is_empty()
@@ -606,6 +642,54 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
+    /// Stages synthetic `persistent_tx_ts_max` row into the checkpoint write set
+    /// so it is committed atomically with all other data in the same pager transaction.
+    /// This is the mechanism that advances the durable replay boundary; on recovery, only
+    /// logical-log frames with `commit_ts > persistent_tx_ts_max` are replayed.
+    /// No-op when metadata hasn't advanced or when running in-memory (no durable metadata).
+    fn maybe_stage_mvcc_metadata_write(&mut self) -> Result<()> {
+        if !self.durable_mvcc_metadata {
+            return Ok(());
+        }
+        let old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
+        let new = self.durable_txid_max_new;
+        if new <= old {
+            return Ok(());
+        }
+
+        let (table_id, num_columns) = self.mvcc_meta_table.ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "Missing required internal metadata table {MVCC_META_TABLE_NAME}"
+            ))
+        })?;
+        let new_i64 = i64::try_from(new).map_err(|_| {
+            LimboError::Corrupt(format!("MVCC checkpoint timestamp does not fit i64: {new}"))
+        })?;
+        let record = ImmutableRecord::from_values(
+            &[
+                Value::build_text(MVCC_META_KEY_PERSISTENT_TX_TS_MAX),
+                Value::from_i64(new_i64),
+            ],
+            2,
+        );
+        let row = Row::new_table_row(
+            RowID::new(table_id, RowKey::Int(1)),
+            record.get_payload().to_vec(),
+            num_columns,
+        );
+        self.write_set.push((
+            RowVersion {
+                id: 0,
+                begin: Some(TxTimestampOrID::Timestamp(new)),
+                end: None,
+                row,
+                btree_resident: true,
+            },
+            None,
+        ));
+        Ok(())
+    }
+
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::AcquireLock => {
@@ -621,6 +705,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                 self.collect_committed_index_row_versions();
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
+                self.maybe_stage_mvcc_metadata_write()?;
 
                 if self.write_set.is_empty() && self.index_write_set.is_empty() {
                     // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
@@ -1129,12 +1214,23 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::CommitPagerTxn => {
+                // If commit_tx fails, the `?` propagates to step() which rolls back
+                // the pager transaction. durable_txid_max is NOT advanced (only happens
+                // on success below), so a retry will re-stage from the previous boundary.
+                // The logical log is also unaffected — its offset is not advanced here.
                 tracing::debug!("Committing pager transaction");
                 let result = self
                     .pager
                     .commit_tx(&self.connection, self.update_transaction_state)?;
                 match result {
                     IOResult::Done(_) => {
+                        // Pager commit atomically staged data + metadata into WAL.
+                        // Advance the in-memory durable boundary immediately so that if
+                        // later checkpoint phases fail, a same-process retry starts from
+                        // this durable prefix instead of re-staging older versions.
+                        self.mvstore
+                            .durable_txid_max
+                            .store(self.durable_txid_max_new, Ordering::SeqCst);
                         self.state = CheckpointState::CheckpointWal;
                         self.lock_states.pager_read_tx = false;
                         self.lock_states.pager_write_tx = false;
@@ -1168,12 +1264,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Skip fsync when synchronous mode is off
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
-                    self.state = CheckpointState::Finalize;
+                    self.state = CheckpointState::TruncateWal;
                     return Ok(TransitionResult::Continue);
                 }
                 tracing::debug!("Fsyncing logical log file");
                 let c = self.fsync_logical_log()?;
-                self.state = CheckpointState::Finalize;
+                self.state = CheckpointState::TruncateWal;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
@@ -1200,7 +1296,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // the checkpointed data would be lost.
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of database file (synchronous=off)");
-                    self.state = CheckpointState::TruncateWal;
+                    self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
 
@@ -1211,13 +1307,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                 // Only sync if we actually backfilled any frames
                 if checkpoint_result.wal_checkpoint_backfilled == 0 {
-                    self.state = CheckpointState::TruncateWal;
+                    self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
 
                 // Check if we already sent the sync
                 if checkpoint_result.db_sync_sent {
-                    self.state = CheckpointState::TruncateWal;
+                    self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
 
@@ -1243,7 +1339,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .expect("checkpoint_result should be set");
                 match wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())? {
                     IOResult::Done(()) => {
-                        self.state = CheckpointState::TruncateLogicalLog;
+                        self.state = CheckpointState::Finalize;
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -1337,8 +1433,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 })?;
 
                 self.mvstore
-                    .checkpointed_txid_max
-                    .store(self.checkpointed_txid_max_new, Ordering::SeqCst);
+                    .durable_txid_max
+                    .store(self.durable_txid_max_new, Ordering::SeqCst);
                 self.gc_checkpointed_versions();
                 self.mvstore.drop_unused_row_versions();
                 self.checkpoint_lock.unlock();

@@ -11,6 +11,16 @@ expect {
     1a|text
 }
 
+test affinity-nan-inf-integer {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('nan'), ('inf');
+    SELECT typeof(c), quote(c) FROM t1 ORDER BY rowid;
+}
+expect {
+    text|'nan'
+    text|'inf'
+}
+
 test affinity-rowid {
     create table t(a integer);
     insert into t(rowid, a) values (1, 1);
@@ -131,6 +141,39 @@ expect {
     1
     2
     3
+}
+
+test affinity-in-subquery-cast-text {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v REAL);
+    INSERT INTO t1 VALUES (893900, 835162.5053372835);
+    SELECT id FROM t1 WHERE id IN (SELECT CAST(id AS TEXT) FROM t1);
+}
+expect {
+    893900
+}
+
+test affinity-in-subquery-group-concat {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v REAL);
+    INSERT INTO t1 VALUES (1, 1.0), (2, 2.0), (3, 3.0);
+    SELECT id FROM t1 WHERE id IN (
+        SELECT GROUP_CONCAT(id) FROM t1 GROUP BY v ORDER BY v DESC LIMIT 1
+    );
+}
+expect {
+    3
+}
+
+test affinity-in-subquery-text-lhs-integer-rhs {
+    CREATE TABLE t_text (a TEXT);
+    CREATE TABLE t_int (i INTEGER);
+    INSERT INTO t_text VALUES ('1'), ('01'), ('1.0'), ('abc');
+    INSERT INTO t_int VALUES (1);
+    SELECT a FROM t_text WHERE a IN (SELECT i FROM t_int) ORDER BY a;
+}
+expect {
+    01
+    1
+    1.0
 }
 
 # ============================================

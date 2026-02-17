@@ -539,7 +539,7 @@ fn test_mvcc_checkpoint_works() {
 
     assert_eq!(rows, expected);
 
-    // Assert that the db file size is larger than 4096, assert .db-wal size is 32 bytes, assert there is no .db-log file
+    // Assert that the db file size is larger than 4096, .db-wal is empty, and .db-log is truncated to 0.
     let db_file_size = std::fs::metadata(&tmp_db.path).unwrap().len();
     assert!(db_file_size > 4096);
     assert!(db_file_size % 4096 == 0);
@@ -555,7 +555,7 @@ fn test_mvcc_checkpoint_works() {
         .len();
     assert!(
         log_size == 0,
-        "log size should be 0 bytes, but is {log_size} bytes"
+        "log size should be 0 bytes after checkpoint, but is {log_size} bytes"
     );
 }
 

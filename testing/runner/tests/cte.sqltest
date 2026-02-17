@@ -649,6 +649,75 @@ expect error {
 #     Materialized CTEs are not yet supported
 # }
 
+setup cte_shadow_view {
+    CREATE VIEW v AS SELECT 1 as val;
+}
+
+setup cte_shadow_table {
+    CREATE TABLE t(x TEXT);
+    INSERT INTO t VALUES('from_table');
+}
+
+# CTE can shadow a view (sqlite compat)
+@skip-if mvcc "views not supported in MVCC"
+@setup cte_shadow_view
+test cte-shadows-view {
+    WITH v AS (SELECT 'from_cte' as val) SELECT * FROM v;
+}
+expect {
+    from_cte
+}
+
+# CTE can shadow a table
+@setup cte_shadow_table
+test cte-shadows-table {
+    WITH t AS (SELECT 'from_cte' as x) SELECT * FROM t;
+}
+expect {
+    from_cte
+}
+
+# Self-referencing non-recursive CTE with same name as view = circular reference
+@skip-if mvcc "views not supported in MVCC"
+@setup cte_shadow_view
+test cte-circular-ref-view {
+    WITH v AS (SELECT * FROM v) SELECT * FROM v;
+}
+expect error {
+    circular reference: v
+}
+
+# Self-referencing non-recursive CTE with same name as table = circular reference
+@setup cte_shadow_table
+test cte-circular-ref-table {
+    WITH t AS (SELECT * FROM t) SELECT * FROM t;
+}
+expect error {
+    circular reference: t
+}
+
+# CTE shadows table but references different table
+@setup cte_shadow_table
+test cte-shadows-table-refs-other {
+    CREATE TABLE other(y TEXT);
+    INSERT INTO other VALUES('from_other');
+    WITH t AS (SELECT y as x FROM other) SELECT * FROM t;
+}
+expect {
+    from_other
+}
+
+# CTE does not leak into view expansion — view sees the real table
+@skip-if mvcc "views not supported in MVCC"
+@setup cte_shadow_table
+test cte-does-not-leak-into-view {
+    CREATE VIEW v AS SELECT * FROM t;
+    WITH t AS (SELECT 'from_cte' as x) SELECT * FROM v;
+}
+expect {
+    from_table
+}
+
 # =============================================================================
 # Multi-reference CTE with materialization - regression tests
 # =============================================================================

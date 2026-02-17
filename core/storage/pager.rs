@@ -1025,6 +1025,7 @@ pub enum BtreePageAllocMode {
 /// This will keep track of the state of current cache commit in order to not repeat work
 struct CommitInfo {
     completions: Vec<Completion>,
+    completion_group: Option<Completion>,
     state: CommitState,
     collected_pages: Vec<PageRef>,
     page_sources: Vec<PageSource>,
@@ -1043,6 +1044,7 @@ enum PageSource {
 impl CommitInfo {
     fn reset(&mut self) {
         self.completions.clear();
+        self.completion_group = None;
         self.state = CommitState::PrepareWal;
         self.collected_pages.clear();
         self.page_sources.clear();
@@ -1056,6 +1058,7 @@ impl CommitInfo {
         self.page_sources.reserve(n.min(IOV_MAX));
         self.completions.clear();
         self.completions.reserve(n / 4);
+        self.completion_group = None;
         self.collected_pages.reserve(n.min(IOV_MAX));
     }
 }
@@ -1363,6 +1366,7 @@ impl Pager {
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
                 completions: Vec::new(),
+                completion_group: None,
                 state: CommitState::PrepareWal,
                 collected_pages: Vec::new(),
                 prepared_frames: Vec::new(),
@@ -2150,10 +2154,16 @@ impl Pager {
         });
 
         let reserved_space = self.get_reserved_space().unwrap_or_else(|| {
-            let space = self
-                .io
-                .block(|| self.with_header(|header| header.reserved_space))
-                .unwrap_or_default();
+            let space = if self.db_initialized() {
+                self.io
+                    .block(|| self.with_header(|header| header.reserved_space))
+                    .unwrap_or_default()
+            } else {
+                // Before page 1 is allocated, the in-memory bootstrap header may still carry
+                // reserved_space=0. Use IOContext so checksum/encryption-required tail bytes are
+                // respected when computing usable space for first writes.
+                self.io_ctx.read().get_reserved_space_bytes()
+            };
             self.set_reserved_space(space);
             space
         });
@@ -3229,22 +3239,22 @@ impl Pager {
                     if !commit_info.completions.is_empty() {
                         commit_info.state = CommitState::WaitBatchedReads { db_size };
                         drop(commit_info);
-                        io_yield_one!(self.build_commit_completion_group());
+                        io_yield_one!(self.commit_completion());
                     }
                     commit_info.state = CommitState::PrepareFrames { db_size };
                 }
                 CommitState::WaitBatchedReads { db_size } => {
-                    let mut commit_info = self.commit_info.write();
-                    // Wait for all batched reads to complete
-                    let all_done = commit_info.completions.iter().all(|c| c.finished());
+                    let all_done = self
+                        .commit_info
+                        .read()
+                        .completions
+                        .iter()
+                        .all(|c| c.finished());
                     if !all_done {
-                        let mut group = CompletionGroup::new(|_| {});
-                        for c in commit_info.completions.iter().filter(|c| !c.finished()) {
-                            group.add(c);
-                        }
-                        io_yield_one!(group.build());
+                        io_yield_one!(self.commit_completion());
                     }
                     // Check for any read errors
+                    let mut commit_info = self.commit_info.write();
                     let failed = commit_info
                         .completions
                         .iter()
@@ -3259,6 +3269,7 @@ impl Pager {
                     }
                     // All reads complete and successful, proceed to frame preparation
                     commit_info.completions.clear();
+                    commit_info.completion_group = None;
                     commit_info.state = CommitState::PrepareFrames { db_size };
                 }
                 CommitState::PrepareFrames { db_size } => {
@@ -3312,6 +3323,7 @@ impl Pager {
                         batch.writev(prepared.offset, &prepared.bufs);
                     }
                     commit_info.completions = batch.submit()?;
+                    commit_info.completion_group = None;
                     commit_info.state = CommitState::WaitWrites;
                 }
                 CommitState::WaitWrites => {
@@ -3322,7 +3334,7 @@ impl Pager {
                         .iter()
                         .all(|c| c.finished())
                     {
-                        io_yield_one!(self.build_commit_completion_group());
+                        io_yield_one!(self.commit_completion());
                     }
                     // Check for any write errors
                     let failed = self
@@ -3336,6 +3348,7 @@ impl Pager {
                     let mut commit_info = self.commit_info.write();
                     if let Some(failed) = failed {
                         commit_info.completions.clear();
+                        commit_info.completion_group = None;
                         commit_info.prepared_frames.clear();
                         return Err(std::io::Error::other(format!(
                             "WAL write failed: {:?}",
@@ -3344,6 +3357,7 @@ impl Pager {
                         .into());
                     }
                     commit_info.completions.clear();
+                    commit_info.completion_group = None;
                     // Writes done, submit fsync if needed.
                     // NORMAL mode skips fsync on WAL commit (but still fsyncs on checkpoint and wal restart).
                     if sync_mode == SyncMode::Full {
@@ -3430,13 +3444,18 @@ impl Pager {
         Ok(())
     }
 
-    fn build_commit_completion_group(&self) -> Completion {
-        let commit_info = self.commit_info.read();
+    fn commit_completion(&self) -> Completion {
+        let mut commit_info = self.commit_info.write();
+        if let Some(group) = &commit_info.completion_group {
+            return group.clone();
+        }
         let mut group = CompletionGroup::new(|_| {});
         for c in commit_info.completions.iter() {
             group.add(c);
         }
-        group.build()
+        let result = group.build();
+        commit_info.completion_group = Some(result.clone());
+        result
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -4390,6 +4409,10 @@ impl Pager {
 
     pub fn is_encryption_ctx_set(&self) -> bool {
         self.io_ctx.write().encryption_context().is_some()
+    }
+
+    pub fn is_encryption_enabled(&self) -> bool {
+        self.enable_encryption.load(Ordering::SeqCst)
     }
 
     pub fn set_encryption_context(

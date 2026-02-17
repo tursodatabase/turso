@@ -211,10 +211,10 @@ fn emit_add_column_check_validation(
 pub fn translate_alter_table(
     alter: ast::AlterTable,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     input: &str,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     program.begin_write_operation();
     let ast::AlterTable {
         name: table_name,
@@ -258,7 +258,7 @@ pub fn translate_alter_table(
 
     let mut btree = (*original_btree).clone();
 
-    Ok(match alter_table {
+    match alter_table {
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
 
@@ -738,7 +738,7 @@ pub fn translate_alter_table(
             // value and evaluate it. If the result is false, we reject the ALTER when
             // the table has rows.
             emit_add_column_check_validation(
-                &mut program,
+                program,
                 &btree,
                 &original_btree,
                 new_column_name,
@@ -870,8 +870,6 @@ pub fn translate_alter_table(
                 from: table_name.to_owned(),
                 to: new_name.to_owned(),
             });
-
-            program
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
         | ast::AlterTableBody::RenameColumn { .. }) => {
@@ -1166,7 +1164,7 @@ pub fn translate_alter_table(
                     )));
                 };
 
-                program = translate_update_for_schema_change(
+                translate_update_for_schema_change(
                     update,
                     resolver,
                     program,
@@ -1188,20 +1186,20 @@ pub fn translate_alter_table(
                 definition: Box::new(definition),
                 rename,
             });
-
-            program
         }
-    })
+    };
+
+    Ok(())
 }
 
 fn translate_rename_virtual_table(
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     vtab: Arc<VirtualTable>,
     old_name: &str,
     new_name_norm: String,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     program.begin_write_operation();
     let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
     program.emit_insn(Insn::VOpen {
@@ -1303,7 +1301,7 @@ fn translate_rename_virtual_table(
         cursor_id: vtab_cur,
     });
 
-    Ok(program)
+    Ok(())
 }
 
 /* Triggers must be rewritten when a column is renamed, and DROP COLUMN on table T must be forbidden if any trigger on T references the column.

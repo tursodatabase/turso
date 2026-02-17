@@ -105,7 +105,7 @@ addr  opcode                           p1   p2  p3  p4                          
   51          Rewind                    6   85   0                                                 0  Rewind table orders
   52            Integer                 0   45   0                                                 0  r[45]=0
   53            RowId                   6   46   0                                                 0  r[46]=orders.rowid
-  54            Affinity               46    1   0                                                 0  r[46..47] = D
+  54            Affinity               46    1   0                                                 0  r[46..47] = C
   55            NotFound                0   57  46                                                 0  if not found goto 57
   56            Goto                    0   63   0                                                 0
   57            Rewind                  0   65   0                                                 0  Rewind  ephemeral_index_where_sub_t4

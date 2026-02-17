@@ -12,7 +12,7 @@ GC is driven by two parameters computed at GC time:
 - **LWM (low-water mark)**: `min(tx.begin_ts)` across Active/Preparing
   transactions, or `u64::MAX` if none. Tells GC which versions are still
   visible to some reader.
-- **ckpt_max** (`checkpointed_txid_max`): the highest committed timestamp
+- **ckpt_max** (`durable_txid_max`): the highest committed timestamp
   whose data has been written to the B-tree. Tells GC when B-tree fallthrough
   is safe.
 
@@ -101,7 +101,7 @@ requiring `ckpt_max > 0` (see Recovery below).
 ## Recovery Versions
 
 Log recovery stamps versions with `LOGICAL_LOG_RECOVERY_COMMIT_TIMESTAMP = 0`.
-Since `checkpointed_txid_max` is advanced via `NonZeroU64`, it stays at 0
+Since `durable_txid_max` is advanced via `NonZeroU64`, it stays at 0
 until the first real transaction is checkpointed. This means `ckpt_max == 0`
 acts as a natural "recovery data not yet checkpointed" flag:
 

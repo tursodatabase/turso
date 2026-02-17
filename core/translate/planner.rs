@@ -495,6 +495,12 @@ fn plan_cte(
         });
     }
 
+    // Block the CTE's own name from resolving to a schema object during
+    // planning of its body. Without this, a same-named view would be expanded
+    // recursively (stack overflow) and a same-named table would give wrong
+    // results. `parse_table` checks this and produces "circular reference".
+    program.push_cte_being_defined(cte_def.name.clone());
+
     // Plan this CTE with fresh IDs
     let cte_plan = prepare_select_plan(
         cte_def.select.clone(),
@@ -503,7 +509,9 @@ fn plan_cte(
         &outer_query_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
-    )?;
+    );
+    program.pop_cte_being_defined();
+    let cte_plan = cte_plan?;
 
     // CTEs can be either simple SELECT or compound SELECT (UNION/INTERSECT/EXCEPT)
     let explicit_cols = if cte_def.explicit_columns.is_empty() {
@@ -572,18 +580,15 @@ pub fn plan_ctes_as_outer_refs(
             crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
         }
 
-        // Check if CTE name conflicts with catalog table
-        if resolver.schema.get_table(&cte_name).is_some() {
-            crate::bail_parse_error!(
-                "CTE name {} conflicts with catalog table name",
-                cte.tbl_name.as_str()
-            );
-        }
-
         // Clone the CTE select AST before planning, so we can store it for re-planning
         let cte_select_ast = cte.select.clone();
         // AS MATERIALIZED forces materialization
         let materialize_hint = cte.materialized == Materialized::Yes;
+
+        // Block the CTE's own name from resolving to a schema object during
+        // planning of its body (see push_cte_being_defined).
+        program.push_cte_being_defined(cte_name.clone());
+
         // Plan the CTE SELECT
         let cte_plan = prepare_select_plan(
             cte.select,
@@ -592,7 +597,9 @@ pub fn plan_ctes_as_outer_refs(
             table_references.outer_query_refs(),
             QueryDestination::placeholder_for_subquery(),
             connection,
-        )?;
+        );
+        program.pop_cte_being_defined();
+        let cte_plan = cte_plan?;
 
         // Convert plan to JoinedTable to extract column info
         let explicit_cols = if explicit_columns.is_empty() {
@@ -800,6 +807,12 @@ fn parse_table(
         return Ok(());
     }
 
+    // A non-recursive CTE's body cannot reference its own name. The CTE name
+    // shadows any same-named schema object, but without RECURSIVE it's circular.
+    if program.is_cte_being_defined(&normalized_qualified_name) {
+        crate::bail_parse_error!("circular reference: {}", table_name.as_str());
+    }
+
     // Check if the table is a CTE from an outer scope (e.g., a CTE referencing another CTE).
     // This handles cases like: WITH a AS (...), b AS (SELECT ... FROM a) SELECT * FROM b;
     // When planning b's body, 'a' is in outer_query_refs.
@@ -925,16 +938,22 @@ fn parse_table(
             .cloned()
             .or_else(|| Some(ast::As::As(table_name.clone())));
 
-        // Recursively call parse_from_clause_table with the view as a SELECT
+        // Views are pre-defined definitions — their body resolves against the
+        // schema only, not against CTEs from the calling query context.
+        // Pass empty cte_definitions and temporarily clear the ctes_being_defined
+        // stack so that e.g. `WITH t AS (...) SELECT * FROM v` where view v
+        // references table t will correctly use the real table, not the CTE.
+        let saved_ctes = program.take_ctes_being_defined();
         let result = parse_from_clause_table(
             ast::SelectTable::Select(*subselect, view_alias),
             resolver,
             program,
             table_references,
             vtab_predicates,
-            cte_definitions,
+            &[],
             connection,
         );
+        program.restore_ctes_being_defined(saved_ctes);
         view.done();
         return result;
     }
@@ -1148,22 +1167,12 @@ pub fn parse_from(
                 .map(|c| normalize_ident(c.col_name.as_str()))
                 .collect();
 
-            // Check if normalized name conflicts with catalog tables or other CTEs
-            // TODO: sqlite actually allows overriding a catalog table with a CTE.
-            // We should carry over the 'Scope' struct to all of our identifier resolution.
             let cte_name_normalized = normalize_ident(cte.tbl_name.as_str());
             if cte_definitions
                 .iter()
                 .any(|d| d.name == cte_name_normalized)
             {
                 crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
-            }
-
-            if resolver.schema.get_table(&cte_name_normalized).is_some() {
-                crate::bail_parse_error!(
-                    "CTE name {} conflicts with catalog table name",
-                    cte.tbl_name.as_str()
-                );
             }
             // Collect table names referenced in this CTE's FROM clause.
             let mut referenced_tables = Vec::new();

@@ -37,11 +37,11 @@ use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
 pub fn translate_create_index(
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
-) -> crate::Result<ProgramBuilder> {
+) -> crate::Result<()> {
     let sql = stmt.to_string();
     let ast::Stmt::CreateIndex {
         unique,
@@ -94,7 +94,7 @@ pub fn translate_create_index(
     if !resolver.schema.is_unique_idx_name(&idx_name) {
         // If IF NOT EXISTS is specified, silently return without error
         if if_not_exists {
-            return Ok(program);
+            return Ok(());
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
@@ -216,9 +216,9 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: 0,
     });
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
     emit_schema_entry(
-        &mut program,
+        program,
         resolver,
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
@@ -265,7 +265,7 @@ pub fn translate_create_index(
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
             translate_condition_expr(
-                &mut program,
+                program,
                 &table_references,
                 &where_clause,
                 ConditionMetadata {
@@ -282,7 +282,7 @@ pub fn translate_create_index(
         let start_reg = program.alloc_registers(columns.len() + 1);
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
-                &mut program,
+                program,
                 resolver,
                 &mut table_references,
                 connection,
@@ -362,7 +362,7 @@ pub fn translate_create_index(
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
             translate_condition_expr(
-                &mut program,
+                program,
                 &table_references,
                 &where_clause,
                 ConditionMetadata {
@@ -379,7 +379,7 @@ pub fn translate_create_index(
         let start_reg = program.alloc_registers(columns.len() + 1);
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
-                &mut program,
+                program,
                 resolver,
                 &mut table_references,
                 connection,
@@ -506,7 +506,7 @@ pub fn translate_create_index(
         cursor_id: sqlite_schema_cursor_id,
     });
 
-    Ok(program)
+    Ok(())
 }
 
 pub fn resolve_sorted_columns(
@@ -746,8 +746,8 @@ pub fn translate_drop_index(
     idx_name: &str,
     resolver: &Resolver,
     if_exists: bool,
-    mut program: ProgramBuilder,
-) -> crate::Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> crate::Result<()> {
     let idx_name = normalize_ident(idx_name);
     let opts = ProgramBuilderOpts {
         num_cursors: 5,
@@ -774,7 +774,7 @@ pub fn translate_drop_index(
     // then return normaly, otherwise show an error.
     if maybe_index.is_none() {
         if if_exists {
-            return Ok(program);
+            return Ok(());
         } else {
             return Err(crate::error::LimboError::InvalidArgument(format!(
                 "No such index: {}",
@@ -792,7 +792,7 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -868,7 +868,7 @@ pub fn translate_drop_index(
     if let Some((cdc_cursor_id, _)) = cdc_table {
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
-                &mut program,
+                program,
                 &sqlite_table.columns,
                 sqlite_schema_cursor_id,
                 row_id_reg,
@@ -877,7 +877,7 @@ pub fn translate_drop_index(
             None
         };
         emit_cdc_insns(
-            &mut program,
+            program,
             resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
@@ -903,7 +903,7 @@ pub fn translate_drop_index(
 
     program.resolve_label(loop_end_label, program.offset());
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(&mut program, resolver, cdc_cursor_id)?;
+        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
     }
 
     program.emit_insn(Insn::SetCookie {
@@ -932,7 +932,7 @@ pub fn translate_drop_index(
         db: 0,
     });
 
-    Ok(program)
+    Ok(())
 }
 
 /// Translate `OPTIMIZE INDEX [idx_name]` statement.
@@ -941,9 +941,9 @@ pub fn translate_drop_index(
 pub fn translate_optimize(
     idx_name: Option<ast::QualifiedName>,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-) -> crate::Result<ProgramBuilder> {
+) -> crate::Result<()> {
     if !connection.experimental_index_method_enabled() {
         crate::bail_parse_error!(
             "OPTIMIZE INDEX requires experimental index method feature. Enable with --experimental-index-method flag"
@@ -1002,7 +1002,7 @@ pub fn translate_optimize(
 
         if indexes_to_optimize.is_empty() {
             tracing::debug!("OPTIMIZE INDEX: no index method indexes found to optimize");
-            return Ok(program);
+            return Ok(());
         }
     }
 
@@ -1012,5 +1012,5 @@ pub fn translate_optimize(
         program.emit_insn(Insn::IndexMethodOptimize { db: 0, cursor_id });
     }
 
-    Ok(program)
+    Ok(())
 }

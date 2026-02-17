@@ -1,13 +1,20 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT id, name, department\n    FROM employees\n    WHERE id NOT IN (\n        SELECT DISTINCT manager_id\n        FROM employees\n        WHERE manager_id IS NOT NULL\n    );"
+expression: |-
+  SELECT id, name, department
+      FROM employees
+      WHERE id NOT IN (
+          SELECT DISTINCT manager_id
+          FROM employees
+          WHERE manager_id IS NOT NULL
+      );
 info:
   statement_type: SELECT
   tables:
-    - employees
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN employees USING COVERING INDEX idx_employees_manager
@@ -32,7 +39,7 @@ addr  opcode                  p1  p2  p3  p4              p5  comment
   14  Rewind                   2  36   0                   0  Rewind table employees
   15    Integer                0   7   0                   0  r[7]=0
   16    RowId                  2   8   0                   0  r[8]=employees.rowid
-  17    Affinity               8   1   0                   0  r[8..9] = D
+  17    Affinity               8   1   0                   0  r[8..9] = C
   18    Found                  0  27   8                   0  if found goto 27
   19    Rewind                 0  25   0                   0  Rewind  ephemeral_index_where_sub_t2
   20      Column               0   0   9                   0  r[9]=ephemeral_index_where_sub_t2.manager_id

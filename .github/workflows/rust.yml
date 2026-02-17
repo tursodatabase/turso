@@ -22,9 +22,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check licenses
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check licenses
 
   cargo-fmt-check:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -285,6 +285,9 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
       - uses: "./.github/shared/setup-sccache"
+      - name: Run turso_whopper regression tests
+        run: cargo test -p turso_whopper --test regression_tests
+        timeout-minutes: 5
       - name: Run turso_whopper
         run: |
           cargo build -p turso_whopper

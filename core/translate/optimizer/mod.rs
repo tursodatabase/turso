@@ -30,7 +30,8 @@ use crate::{
     LimboError, Result,
 };
 use constraints::{
-    constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
+    constraints_from_where_clause, usable_constraints_for_join_order, Constraint,
+    ConstraintOperator, ConstraintRef,
 };
 use cost::Cost;
 use join::{compute_best_join_order, BestJoinOrderResult};
@@ -970,6 +971,62 @@ fn base_row_estimate(
     }
 }
 
+/// Returns true if a WHERE-term predicate is null-rejecting for a table.
+///
+/// Non-rejecting cases include:
+/// - `IS`/`IS NOT` comparisons, which can evaluate true for NULL-containing inputs.
+/// - Expressions that route the table's values through NULL-masking functions
+///   like `ifnull`/`coalesce`.
+fn where_term_is_null_rejecting_for_table(
+    expr: &ast::Expr,
+    operator: ConstraintOperator,
+    table_id: ast::TableInternalId,
+) -> bool {
+    if matches!(
+        operator,
+        ConstraintOperator::AstNativeOperator(ast::Operator::Is | ast::Operator::IsNot)
+    ) {
+        return false;
+    }
+
+    !expr_has_null_masking_for_table(expr, table_id)
+}
+
+/// Returns true if an expression uses a NULL-masking function over columns from `table_id`.
+fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> bool {
+    use crate::translate::expr::{walk_expr, WalkControl};
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::FunctionCall { name, args, .. } = e {
+            if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), args.len()) {
+                if !func.can_mask_nulls() {
+                    return Ok(WalkControl::Continue);
+                }
+                for arg in args {
+                    let mut refs_table = false;
+                    let _ = walk_expr(arg, &mut |inner: &ast::Expr| -> Result<WalkControl> {
+                        match inner {
+                            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. }
+                                if *table == table_id =>
+                            {
+                                refs_table = true;
+                            }
+                            _ => {}
+                        }
+                        Ok(WalkControl::Continue)
+                    });
+                    if refs_table {
+                        found = true;
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
 /// Optimize the join order and index selection for a query.
 ///
 /// This function does the following:
@@ -1115,10 +1172,16 @@ fn optimize_table_access(
             // Most binary ops like x = foo filter out NULL rows, but
             // IS NULL constraints do NOT - they specifically KEEP them.
             // So we should not convert LEFT JOIN to INNER JOIN based on IS NULL constraints.
+            // Also, expressions wrapped in ifnull()/coalesce() are NOT null-rejecting because
+            // they explicitly handle NULLs and can produce non-NULL values for NULL inputs.
             if constraints_per_table[i].constraints.iter().any(|c| {
                 let is_from_where = where_clause[c.where_clause_pos.0].from_outer_join.is_none();
-                let is_is_null = c.operator == ast::Operator::Is.into();
-                is_from_where && !is_is_null
+                let is_null_rejecting = where_term_is_null_rejecting_for_table(
+                    &where_clause[c.where_clause_pos.0].expr,
+                    c.operator,
+                    t.internal_id,
+                );
+                is_from_where && is_null_rejecting
             }) {
                 t.join_info.as_mut().unwrap().outer = false;
                 for term in where_clause.iter_mut() {
@@ -2566,7 +2629,7 @@ impl TakeOwnership for ast::Expr {
 
 #[cfg(test)]
 mod tests {
-    use super::Optimizable;
+    use super::{where_term_is_null_rejecting_for_table, Optimizable};
     use crate::translate::emitter::Resolver;
     use crate::{schema::Schema, SymbolTable};
     use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
@@ -2636,5 +2699,182 @@ mod tests {
         );
 
         assert!(!expr.is_constant(&resolver));
+    }
+
+    #[test]
+    fn null_rejection_detection_uses_function_resolution() {
+        let table = TableInternalId::from(42);
+        let expr = Expr::Binary(
+            Box::new(fn_call(
+                "IFNULL",
+                vec![
+                    Expr::Column {
+                        database: None,
+                        table,
+                        column: 0,
+                        is_rowid_alias: false,
+                    },
+                    Expr::Literal(ast::Literal::Numeric("2147483647".into())),
+                ],
+            )),
+            ast::Operator::GreaterEquals,
+            Box::new(Expr::Literal(ast::Literal::Numeric("127".into()))),
+        );
+
+        assert!(!where_term_is_null_rejecting_for_table(
+            &expr,
+            ast::Operator::GreaterEquals.into(),
+            table
+        ));
+    }
+
+    #[test]
+    fn null_rejection_detection_requires_target_table_reference() {
+        let target_table = TableInternalId::from(7);
+        let other_table = TableInternalId::from(8);
+        let expr = Expr::Binary(
+            Box::new(fn_call(
+                "coalesce",
+                vec![
+                    Expr::Column {
+                        database: None,
+                        table: other_table,
+                        column: 0,
+                        is_rowid_alias: false,
+                    },
+                    Expr::Literal(ast::Literal::Numeric("0".into())),
+                ],
+            )),
+            ast::Operator::Greater,
+            Box::new(Expr::Literal(ast::Literal::Numeric("1".into()))),
+        );
+
+        assert!(where_term_is_null_rejecting_for_table(
+            &expr,
+            ast::Operator::Greater.into(),
+            target_table
+        ));
+    }
+
+    #[test]
+    fn null_rejection_detection_handles_nested_null_masking_functions() {
+        let table = TableInternalId::from(9);
+        let expr = Expr::Binary(
+            Box::new(fn_call(
+                "coalesce",
+                vec![
+                    fn_call(
+                        "ifnull",
+                        vec![
+                            Expr::Column {
+                                database: None,
+                                table,
+                                column: 1,
+                                is_rowid_alias: false,
+                            },
+                            Expr::Literal(ast::Literal::Numeric("0".into())),
+                        ],
+                    ),
+                    Expr::Literal(ast::Literal::Numeric("2".into())),
+                ],
+            )),
+            ast::Operator::Equals,
+            Box::new(Expr::Literal(ast::Literal::Numeric("2".into()))),
+        );
+
+        assert!(!where_term_is_null_rejecting_for_table(
+            &expr,
+            ast::Operator::Equals.into(),
+            table
+        ));
+    }
+
+    #[test]
+    fn null_rejection_detection_treats_is_operator_as_non_rejecting() {
+        let table = TableInternalId::from(11);
+        let expr = Expr::Binary(
+            Box::new(Expr::Column {
+                database: None,
+                table,
+                column: 0,
+                is_rowid_alias: false,
+            }),
+            ast::Operator::Is,
+            Box::new(Expr::Literal(ast::Literal::Null)),
+        );
+
+        assert!(!where_term_is_null_rejecting_for_table(
+            &expr,
+            ast::Operator::Is.into(),
+            table
+        ));
+    }
+
+    #[test]
+    fn null_rejection_detection_treats_is_between_columns_as_non_rejecting() {
+        let table = TableInternalId::from(12);
+        let expr = Expr::Binary(
+            Box::new(Expr::Column {
+                database: None,
+                table,
+                column: 0,
+                is_rowid_alias: false,
+            }),
+            ast::Operator::Is,
+            Box::new(Expr::Column {
+                database: None,
+                table,
+                column: 1,
+                is_rowid_alias: false,
+            }),
+        );
+
+        assert!(!where_term_is_null_rejecting_for_table(
+            &expr,
+            ast::Operator::Is.into(),
+            table
+        ));
+    }
+
+    #[test]
+    fn null_rejection_detection_treats_is_with_non_null_literal_as_non_rejecting() {
+        let table = TableInternalId::from(13);
+        let expr = Expr::Binary(
+            Box::new(Expr::Column {
+                database: None,
+                table,
+                column: 0,
+                is_rowid_alias: false,
+            }),
+            ast::Operator::Is,
+            Box::new(Expr::Literal(ast::Literal::Numeric("5".into()))),
+        );
+
+        assert!(!where_term_is_null_rejecting_for_table(
+            &expr,
+            ast::Operator::Is.into(),
+            table
+        ));
+    }
+
+    #[test]
+    fn null_rejection_detection_treats_is_not_with_non_null_literal_as_non_rejecting() {
+        let table = TableInternalId::from(14);
+        let expr = Expr::Binary(
+            Box::new(Expr::Column {
+                database: None,
+                table,
+                column: 0,
+                is_rowid_alias: false,
+            }),
+            ast::Operator::IsNot,
+            Box::new(Expr::Literal(ast::Literal::Numeric("5".into()))),
+        );
+
+        assert!(!where_term_is_null_rejecting_for_table(
+            &expr,
+            ast::Operator::IsNot.into(),
+            table
+        ));
     }
 }

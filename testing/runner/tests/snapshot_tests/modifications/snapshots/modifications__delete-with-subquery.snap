@@ -37,7 +37,7 @@ addr  opcode          p1  p2  p3  p4            p5  comment
   15    DeferredSeek   3   2   0                 0
   16    Integer        0   6   0                 0  r[6]=0
   17    Column         3   0   7                 0  r[7]=idx_orders_user_id.user_id
-  18    Affinity       7   1   0                 0  r[7..8] = D
+  18    Affinity       7   1   0                 0  r[7..8] = C
   19    NotFound       0  21   7                 0  if not found goto 21
   20    Goto           0  27   0                 0
   21    Rewind         0  29   0                 0  Rewind  ephemeral_index_where_sub_t2

@@ -417,7 +417,14 @@ fn emit_program_for_select_with_inputs(
     t_ctx.materialized_build_inputs = materialized_build_inputs;
 
     // Emit main parts of query
-    emit_query(program, &mut plan, &mut t_ctx)?;
+    let result_cols_start = emit_query(program, &mut plan, &mut t_ctx)?;
+    // TODO: This solution works but it's just a hack/quick fix.
+    // Ideally we should do some refactor on how we scope queries, subqueries, and registers so that we don't have to do these ad-hoc/unintuitive adjustments.
+
+    // Restore reg_result_cols_start after emit_query, because nested subqueries
+    // (e.g. correlated scalar subqueries in WHERE) can overwrite
+    // program.reg_result_cols_start with their own result column registers.
+    program.reg_result_cols_start = Some(result_cols_start);
 
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
@@ -623,16 +630,17 @@ fn emit_materialized_build_inputs(
             cursor_id,
             is_table: true,
         });
-        program.incr_nesting();
-        program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
-        emit_program_for_select_with_inputs(
-            program,
-            resolver,
-            materialize_plan,
-            build_inputs.clone(),
-        )?;
-        program.clear_hash_tables_to_keep_open();
-        program.decr_nesting();
+        program.nested(|program| -> Result<()> {
+            program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
+            emit_program_for_select_with_inputs(
+                program,
+                resolver,
+                materialize_plan,
+                build_inputs.clone(),
+            )?;
+            program.clear_hash_tables_to_keep_open();
+            Ok(())
+        })?;
         program.pop_current_parent_explain();
 
         build_inputs.insert(
@@ -1417,9 +1425,7 @@ fn emit_program_for_delete(
         });
 
         // Execute the rowset SELECT plan to populate the rowset.
-        program.incr_nesting();
-        emit_program_for_select(program, resolver, rowset_plan)?;
-        program.decr_nesting();
+        program.nested(|program| emit_program_for_select(program, resolver, rowset_plan))?;
 
         // Close the read cursor(s) opened by the rowset plan before opening for writing
         let table_ref = plan.table_references.joined_tables().first().unwrap();
@@ -2226,9 +2232,7 @@ fn emit_program_for_update(
             cursor_id: temp_cursor_id.unwrap(),
             is_table: true,
         });
-        program.incr_nesting();
-        emit_program_for_select(program, resolver, ephemeral_plan)?;
-        program.decr_nesting();
+        program.nested(|program| emit_program_for_select(program, resolver, ephemeral_plan))?;
         Arc::new(table)
     } else {
         Arc::new(
@@ -3804,9 +3808,12 @@ fn emit_update_insns<'a>(
             flag: if not_exists_check_required {
                 // The previous Insn::NotExists and Insn::Delete seek to the old rowid,
                 // so to insert a new user-provided rowid, we need to seek to the correct place.
-                InsertFlags::new().require_seek().update_rowid_change()
-            } else {
                 InsertFlags::new()
+                    .require_seek()
+                    .update_rowid_change()
+                    .skip_last_rowid()
+            } else {
+                InsertFlags::new().skip_last_rowid()
             },
             table_name: target_table.identifier.clone(),
         });
