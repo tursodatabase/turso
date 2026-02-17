@@ -712,6 +712,9 @@ pub struct WriteRowStateMachine {
 pub enum DeleteRowState {
     Initial,
     Seek,
+    /// After seek returns TryAdvance (key found in interior node, not leaf),
+    /// advance the cursor to position it on the interior cell.
+    Advance,
     Delete,
 }
 
@@ -1442,9 +1445,38 @@ impl StateTransition for DeleteRowStateMachine {
                     .seek(seek_key, SeekOp::GE { eq_only: true })?
                 {
                     IOResult::Done(seek_res) => {
-                        if seek_res == SeekResult::NotFound {
+                        match seek_res {
+                            SeekResult::Found => {
+                                self.state = DeleteRowState::Delete;
+                            }
+                            SeekResult::TryAdvance => {
+                                // In index B-trees, the key can reside in an interior node
+                                // rather than a leaf. The seek descends to the leaf but
+                                // doesn't find it there, returning TryAdvance. Advancing
+                                // the cursor will move up to the interior cell.
+                                self.state = DeleteRowState::Advance;
+                            }
+                            SeekResult::NotFound => {
+                                crate::bail_corrupt_error!(
+                                    "MVCC delete: rowid {} not found",
+                                    self.rowid.row_id
+                                );
+                            }
+                        }
+                        Ok(TransitionResult::Continue)
+                    }
+                    IOResult::IO(io) => {
+                        return Ok(TransitionResult::Io(io));
+                    }
+                }
+            }
+            DeleteRowState::Advance => {
+                let next_result = self.cursor.write().next()?;
+                match next_result {
+                    IOResult::Done(()) => {
+                        if !self.cursor.read().has_record() {
                             crate::bail_corrupt_error!(
-                                "MVCC delete: rowid {} not found",
+                                "MVCC delete: rowid {} not found after advance",
                                 self.rowid.row_id
                             );
                         }
