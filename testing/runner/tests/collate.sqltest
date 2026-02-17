@@ -167,6 +167,34 @@ expect {
     A|a
 }
 
+# Hash join with COLLATE NOCASE column: ORDER BY can change which table is used
+# as the hash build table. The collation must be determined from both sides of
+# the comparison, not just the build side, to avoid case-sensitive hashing when
+# the join semantics require case-insensitive matching.
+test collate_hash_join_nocase_column_with_order_by {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_name TEXT, data TEXT);
+    INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO t2 VALUES (1, 'alice', 'x'), (2, 'BOB', 'y');
+    SELECT t1.name, t2.data FROM t1 JOIN t2 ON t1.name = t2.ref_name ORDER BY t1.id;
+}
+expect {
+    Alice|x
+    Bob|y
+}
+
+test collate_hash_join_nocase_column_without_order_by {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_name TEXT, data TEXT);
+    INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO t2 VALUES (1, 'alice', 'x'), (2, 'BOB', 'y');
+    SELECT t1.name, t2.data FROM t1 JOIN t2 ON t1.name = t2.ref_name;
+}
+expect {
+    Alice|x
+    Bob|y
+}
+
 test collate_columns_where_implicit {
     CREATE TABLE t(
     a TEXT COLLATE NOCASE,
