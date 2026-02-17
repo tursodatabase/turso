@@ -13,14 +13,16 @@ use crate::{
         expr::{rewrite_between_expr, translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
-    util::{check_expr_references_column, normalize_ident},
+    util::{check_expr_references_column, normalize_ident, parse_numeric_literal},
     vdbe::{
+        affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
         insn::{to_u16, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
-    LimboError, Result,
+    LimboError, Numeric, Result, Value,
 };
+use either::Either;
 
 use super::{
     schema::{validate_check_expr, SQLITE_TABLEID},
@@ -88,6 +90,133 @@ fn default_requires_empty_table(expr: &ast::Expr) -> bool {
             exprs.len() == 1 && default_requires_empty_table(&exprs[0])
         }
         _ => false,
+    }
+}
+
+fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
+    match literal {
+        ast::Literal::Numeric(val) => parse_numeric_literal(val),
+        ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(
+            s,
+        ))),
+        ast::Literal::Blob(s) => Ok(Value::Blob(
+            s.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hex_byte =
+                        std::str::from_utf8(pair).expect("parser validated hex string");
+                    u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
+                })
+                .collect(),
+        )),
+        ast::Literal::Null => Ok(Value::Null),
+        ast::Literal::True => Ok(Value::from_i64(1)),
+        ast::Literal::False => Ok(Value::from_i64(0)),
+        ast::Literal::CurrentDate => Ok(Value::from_text("CURRENT_DATE")),
+        ast::Literal::CurrentTime => Ok(Value::from_text("CURRENT_TIME")),
+        ast::Literal::CurrentTimestamp => Ok(Value::from_text("CURRENT_TIMESTAMP")),
+        ast::Literal::Keyword(_) => Err(LimboError::ParseError(
+            "Cannot add a column with non-constant default".to_string(),
+        )),
+    }
+}
+
+fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
+    match expr {
+        ast::Expr::Literal(literal) => literal_default_value(literal),
+        ast::Expr::Id(name) => Ok(Value::from_text(name.as_str().to_string())),
+        ast::Expr::Unary(op, inner) => {
+            let value = eval_constant_default_value(inner)?;
+            match (op, value) {
+                (ast::UnaryOperator::Positive, value) => Ok(value),
+                (ast::UnaryOperator::Negative, Value::Numeric(Numeric::Integer(i))) => {
+                    Ok(Value::from_i64(-i))
+                }
+                (ast::UnaryOperator::Negative, Value::Numeric(Numeric::Float(f))) => {
+                    Ok(Value::from_f64(-f64::from(f)))
+                }
+                (ast::UnaryOperator::Negative, Value::Null) => Ok(Value::Null),
+                (_, value) => Ok(value),
+            }
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            if exprs.len() == 1 {
+                eval_constant_default_value(&exprs[0])
+            } else {
+                Err(LimboError::ParseError(
+                    "Cannot add a column with non-constant default".to_string(),
+                ))
+            }
+        }
+        _ => Err(LimboError::ParseError(
+            "Cannot add a column with non-constant default".to_string(),
+        )),
+    }
+}
+
+fn apply_affinity_to_value(value: &mut Value, affinity: Affinity) {
+    if let Some(converted) = affinity.convert(value) {
+        *value = match converted {
+            Either::Left(val_ref) => val_ref.to_owned(),
+            Either::Right(val) => val,
+        };
+    }
+}
+
+fn validate_strict_default_type(column: &Column) -> Result<()> {
+    let Some(default_expr) = column.default.as_ref() else {
+        return Ok(());
+    };
+
+    let mut value = eval_constant_default_value(default_expr)?;
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+
+    apply_affinity_to_value(&mut value, column.affinity());
+
+    let ty = column.ty_str.as_str();
+    if ty.eq_ignore_ascii_case("ANY") {
+        return Ok(());
+    }
+
+    let mismatch = || {
+        Err(LimboError::ParseError(
+            "type mismatch on DEFAULT".to_string(),
+        ))
+    };
+
+    if ty.eq_ignore_ascii_case("INT") || ty.eq_ignore_ascii_case("INTEGER") {
+        match value {
+            Value::Numeric(Numeric::Integer(_)) => Ok(()),
+            Value::Numeric(Numeric::Float(f)) => {
+                let f = f64::from(f);
+                let i = f as i64;
+                if (i as f64) == f {
+                    Ok(())
+                } else {
+                    mismatch()
+                }
+            }
+            _ => mismatch(),
+        }
+    } else if ty.eq_ignore_ascii_case("REAL") {
+        match value {
+            Value::Numeric(Numeric::Float(_)) => Ok(()),
+            _ => mismatch(),
+        }
+    } else if ty.eq_ignore_ascii_case("TEXT") {
+        match value {
+            Value::Text(_) => Ok(()),
+            _ => mismatch(),
+        }
+    } else if ty.eq_ignore_ascii_case("BLOB") {
+        match value {
+            Value::Blob(_) => Ok(()),
+            _ => mismatch(),
+        }
+    } else {
+        Ok(())
     }
 }
 
@@ -573,6 +702,8 @@ pub fn translate_alter_table(
                         "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
                     )));
                 }
+
+                validate_strict_default_type(&column)?;
             }
 
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
