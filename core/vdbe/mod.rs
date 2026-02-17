@@ -1402,6 +1402,10 @@ impl Program {
                 match self.step_end_mvcc_txn(state_machine, mv_store)? {
                     IOResult::Done(_) => {
                         assert!(state_machine.is_finalized());
+                        if self.change_cnt_on {
+                            self.connection
+                                .set_changes(program_state.n_change.load(Ordering::SeqCst));
+                        }
                         conn.set_mv_tx(None);
                         conn.set_tx_state(TransactionState::None);
                         pager.end_read_tx();
@@ -1410,6 +1414,10 @@ impl Program {
                     }
                     IOResult::IO(io) => return Ok(IOResult::IO(io)),
                 }
+            }
+            if self.change_cnt_on {
+                self.connection
+                    .set_changes(program_state.n_change.load(Ordering::SeqCst));
             }
             Ok(IOResult::Done(()))
         } else {
