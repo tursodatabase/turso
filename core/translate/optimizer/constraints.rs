@@ -238,6 +238,7 @@ fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
 /// So selectivity = avg_rows_per_key / total_rows
 ///
 /// Falls back to hardcoded estimates when stats are unavailable.
+#[allow(clippy::too_many_arguments)]
 fn estimate_selectivity(
     schema: &Schema,
     table_name: &str,
@@ -935,9 +936,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: false,
                         });
                     }
-                    ast::Expr::RowId { table, .. }
-                        if *table == table_reference.internal_id =>
-                    {
+                    ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator: ConstraintOperator::In {
@@ -1001,9 +1000,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: false,
                             });
                         }
-                        ast::Expr::RowId { table, .. }
-                            if *table == table_reference.internal_id =>
-                        {
+                        ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
                             cs.constraints.push(Constraint {
                                 where_clause_pos: (i, BinaryExprSide::Rhs),
                                 operator: ConstraintOperator::In {
@@ -1060,7 +1057,9 @@ pub fn constraints_from_where_clause(
                 _ => {}
             }
 
-            if constraint.is_rowid || rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p)) {
+            if constraint.is_rowid
+                || rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p))
+            {
                 let rowid_candidate = cs
                     .candidates
                     .iter_mut()
@@ -1497,8 +1496,13 @@ fn analyze_binary_term_for_index(
     };
 
     // Find the best index for this constraint
-    let (best_index, constraint_refs) =
-        find_best_index_for_constraint(table_col_pos, operator, indexes, rowid_alias_column, is_rowid);
+    let (best_index, constraint_refs) = find_best_index_for_constraint(
+        table_col_pos,
+        operator,
+        indexes,
+        rowid_alias_column,
+        is_rowid,
+    );
 
     // If no index can be used, this term is not indexable
     if constraint_refs.is_empty() {
