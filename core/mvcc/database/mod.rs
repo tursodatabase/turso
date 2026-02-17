@@ -3337,7 +3337,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // (e.g. uniqueness/FK failures). Invalidate all allocators so aborted reservations
         // never leak into future rowid choices.
         self.invalidate_all_rowid_allocators();
-        self.invalidate_rowid_allocators_for_rows(&touched_rowids);
     }
 
     fn row_has_uncommitted_version_for_tx(&self, rowid: &RowID, tx_id: TxID) -> bool {
