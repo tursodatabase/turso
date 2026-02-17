@@ -2489,9 +2489,14 @@ impl BTreeCursor {
                                 .get_page_at_level(self.stack.current() - 1)
                                 .expect("parent page should be on the stack");
                             let parent_contents = parent.get_contents();
-                            if parent.get().id != 1
-                                && parent_contents.rightmost_pointer()?.unwrap()
-                                    == cur_page.get().id as u32
+                            let parent_rightmost =
+                                parent_contents.rightmost_pointer()?.ok_or_else(|| {
+                                    LimboError::Corrupt(format!(
+                                        "parent page {} is a leaf page, expected interior page",
+                                        parent.get().id
+                                    ))
+                                })?;
+                            if parent.get().id != 1 && parent_rightmost == cur_page.get().id as u32
                             {
                                 // If all of the following are true, we can use the balance_quick() fast path:
                                 // - The page is a table leaf page
