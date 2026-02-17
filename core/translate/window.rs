@@ -193,7 +193,10 @@ fn prepare_window_subquery(
         original_idx: 0,
         is_outer: false,
     }];
-    let new_table_references = TableReferences::new(vec![], vec![]);
+    let new_table_references = TableReferences::new(
+        vec![],
+        outer_plan.table_references.outer_query_refs().to_vec(),
+    );
 
     let mut inner_plan = SelectPlan {
         join_order: mem::replace(&mut outer_plan.join_order, new_join_order),
