@@ -288,6 +288,7 @@ impl IncrementalView {
         select: &ast::Select,
         schema: &Schema,
     ) -> Result<ViewColumnSchema> {
+        crate::util::validate_select_for_unsupported_features(select)?;
         // Use the shared function to extract columns with full table context
         extract_view_columns(select, schema)
     }

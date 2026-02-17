@@ -264,6 +264,15 @@ expect error {
     FILTER clause is not supported yet in aggregate functions
 }
 
+@skip-if sqlite "sqlite supports ORDER BY in aggregate functions"
+test view-rejects-aggregate-order-by {
+    CREATE TABLE t(val INT);
+    CREATE VIEW v AS SELECT SUM(val ORDER BY val) FROM t;
+}
+expect error {
+    ORDER BY clause is not supported yet in aggregate functions
+}
+
 test view-self-circle-detection {
     CREATE VIEW v AS SELECT * FROM v;
     SELECT * FROM v;
