@@ -1,5 +1,5 @@
 import { DatabasePromise } from "@tursodatabase/database-common"
-import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner } from "@tursodatabase/sync-common";
+import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, Database as NativeDatabase } from "#index";
 import { promises } from "node:fs";
 
@@ -39,13 +39,29 @@ function memoryIO(): ProtocolIo {
         }
     }
 };
+
+function resolveUrl(url: string | (() => string | null)): string {
+    if (typeof url === "function") {
+        const resolved = url();
+        if (resolved == null) {
+            throw new Error("remoteWritesExperimental requires a non-null URL");
+        }
+        return resolved;
+    }
+    return url;
+}
+
 class Database extends DatabasePromise {
     #engine: any;
     #guards: SyncEngineGuards;
     #runner: Runner;
+    #remoteWriter: RemoteWriter | null = null;
+    #db: any;
     constructor(opts: DatabaseOpts) {
         if (opts.url == null) {
-            super(new NativeDatabase(opts.path, { tracing: opts.tracing }) as any);
+            const db = new NativeDatabase(opts.path, { tracing: opts.tracing }) as any;
+            super(db);
+            this.#db = db;
             this.#engine = null;
             return;
         }
@@ -114,9 +130,20 @@ class Database extends DatabasePromise {
 
         super(engine.db() as unknown as any, () => run.wait());
 
+        this.#db = engine.db() as unknown as any;
         this.#runner = run;
         this.#engine = engine;
         this.#guards = new SyncEngineGuards();
+
+        // Initialize remote writer if remoteWrites is enabled
+        if (opts.remoteWritesExperimental && opts.url) {
+            const url = resolveUrl(opts.url);
+            this.#remoteWriter = new RemoteWriter({
+                url,
+                authToken: opts.authToken,
+                remoteEncryptionKey: opts.remoteEncryption?.key,
+            });
+        }
     }
     /**
      * connect database and initialize it in case of clean start
@@ -175,10 +202,103 @@ class Database extends DatabasePromise {
         }
         return (await run(this.#runner, this.#engine.stats()));
     }
+
+    /**
+     * Executes the given SQL string.
+     * When remoteWrites is enabled, write statements are sent to the remote server.
+     */
+    override async exec(sql: string) {
+        if (!this.#remoteWriter) {
+            return await super.exec(sql);
+        }
+
+        if (this.#remoteWriter.isInTransaction) {
+            // Everything in a remote txn goes remote
+            await this.#remoteWriter.sequence(sql);
+            return;
+        }
+
+        // Use Rust classifier — no SQL parsing in JS
+        const readonly = this.#db.isReadonly(sql);
+        if (!readonly) {
+            await this.#remoteWriter.sequence(sql);
+            await this.pull();
+            return;
+        }
+
+        return await super.exec(sql);
+    }
+
+    /**
+     * Prepares a SQL statement for execution.
+     * When remoteWrites is enabled, returns a wrapper that routes writes to remote.
+     */
+    override prepare(sql: string) {
+        const localStmt = super.prepare(sql);
+
+        if (!this.#remoteWriter) {
+            return localStmt;
+        }
+
+        const isStmtReadonly = this.#db.isReadonly(sql);
+        return new RemoteWriteStatement(
+            localStmt,
+            sql,
+            isStmtReadonly,
+            this.#remoteWriter,
+            () => this.pull(),
+        ) as any;
+    }
+
+    /**
+     * Returns a function that executes the given function in a transaction.
+     * When remoteWrites is enabled, the entire transaction goes to remote.
+     */
+    override transaction(fn: (...any) => Promise<any>) {
+        if (typeof fn !== "function")
+            throw new TypeError("Expected first argument to be a function");
+
+        if (!this.#remoteWriter) {
+            return super.transaction(fn);
+        }
+
+        const db = this;
+        const remoteWriter = this.#remoteWriter;
+        const wrapTxn = (mode: string) => {
+            return async (...bindParameters: any[]) => {
+                await remoteWriter.beginTransaction(mode);
+                try {
+                    const result = await fn(...bindParameters);
+                    await remoteWriter.commitTransaction();
+                    await db.pull();
+                    return result;
+                } catch (err) {
+                    await remoteWriter.rollbackTransaction();
+                    throw err;
+                }
+            };
+        };
+        const properties = {
+            default: { value: wrapTxn("") },
+            deferred: { value: wrapTxn("DEFERRED") },
+            immediate: { value: wrapTxn("IMMEDIATE") },
+            exclusive: { value: wrapTxn("EXCLUSIVE") },
+            database: { value: this, enumerable: true },
+        };
+        Object.defineProperties(properties.default.value, properties);
+        Object.defineProperties(properties.deferred.value, properties);
+        Object.defineProperties(properties.immediate.value, properties);
+        Object.defineProperties(properties.exclusive.value, properties);
+        return properties.default.value;
+    }
+
     /**
      * close the database
      */
     override async close(): Promise<void> {
+        if (this.#remoteWriter) {
+            await this.#remoteWriter.close();
+        }
         await super.close();
         if (this.#engine != null) {
             this.#engine.close();
@@ -188,7 +308,7 @@ class Database extends DatabasePromise {
 
 /**
  * Creates a new database connection asynchronously.
- * 
+ *
  * @param {Object} opts - Options for database behavior.
  * @returns {Promise<Database>} - A promise that resolves to a Database instance.
  */
