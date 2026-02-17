@@ -855,7 +855,7 @@ pub fn translate_alter_table(
                     key_reg: rowid,
                     record_reg: record,
                     flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: table_name.to_string(),
+                    table_name: SQLITE_TABLEID.to_string(),
                 });
             });
 
@@ -1137,7 +1137,7 @@ pub fn translate_alter_table(
                     key_reg: rowid,
                     record_reg: record,
                     flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: table_name.to_string(),
+                    table_name: SQLITE_TABLEID.to_string(),
                 });
             });
 
@@ -1277,7 +1277,7 @@ fn translate_rename_virtual_table(
             key_reg: rowid,
             record_reg: rec,
             flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: old_name.to_string(),
+            table_name: SQLITE_TABLEID.to_string(),
         });
     });
 

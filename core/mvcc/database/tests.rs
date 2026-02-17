@@ -1024,6 +1024,60 @@ fn test_checkpoint_allows_index_schema_update_after_rename_column() {
     assert_eq!(rows[0][1].as_int().unwrap(), 2);
 }
 
+/// What this test checks: After RENAME COLUMN + restart, index SQL in sqlite_schema
+/// reflects the new column name so the schema can be parsed on reopen.
+/// Why this matters: If the index SQL still references the old column name, reopening the database
+/// fails with a parse error (#5299).
+#[test]
+fn test_rename_column_updates_index_sql_after_restart() {
+    // Session 1: Create table with indexed column, auto-checkpoint on close.
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, old_col TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_old ON t(old_col)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.close().unwrap();
+    }
+
+    // Session 2: Reopen, rename column, close.
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    // Session 3: Reopen - must not fail with a parse error on the index SQL.
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        let rows = get_rows(&conn, "SELECT new_col FROM t WHERE id = 1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].to_string(), "a");
+
+        // Verify the index SQL was updated to reference the new column name.
+        let schema_rows = get_rows(
+            &conn,
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_old'",
+        );
+        assert_eq!(schema_rows.len(), 1);
+        assert!(
+            schema_rows[0][0].to_string().contains("new_col"),
+            "Index SQL should reference new_col, got: {}",
+            schema_rows[0][0]
+        );
+    }
+}
+
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]

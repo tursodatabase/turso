@@ -3818,6 +3818,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
                             };
                             assert!(value == root_page as u64, "Logical log contains root page reference {root_page} that does not match the root page in the table_id_to_rootpage map({value})");
+                            // Schema UPDATE (DELETE + INSERT) re-inserts the row; undo any
+                            // dropped_root_pages entry from the preceding DELETE so the page
+                            // is not mistakenly treated as freed.
+                            dropped_root_pages.remove(&root_page);
                         }
                         let rowid_int = rowid.row_id.to_int_or_panic();
                         schema_rows.insert(rowid_int, record);
