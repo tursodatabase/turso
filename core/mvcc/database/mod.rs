@@ -1,3 +1,12 @@
+/// Turso MVCC implements snapshot isolation with eager write-write conflict detection based on
+/// Hekaton paper (https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf). However, we deviate from
+/// Hekaton's design:
+///
+///   - Transactions never see uncommitted changes from other active transactions
+///   - So there is no speculative reads / ignores
+///   - We don't track commit dependencies or do waiting during commit
+///
+/// This affects the visibility rules, conflict detection logic and keeps the code simpler.
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::persistent_storage::Storage;
@@ -4222,18 +4231,44 @@ impl RowVersion {
     }
 }
 
-fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &RowVersion) -> bool {
-    match rv.begin {
-        Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => tx.begin_ts >= rv_begin_ts,
+/// `is_begin_visible` says if the row inserted/updated is visible to the current transaction or not.
+/// If the row was inserted/updated after the current tx started, then it's not visible.
+///
+/// This method specifically determines if the begin_ts of a row version is visible to a transaction,
+/// based on the transaction's begin timestamp and the row version's begin field. In following:
+/// can `current_tx` see `row_version`'s begin or not.
+///
+/// Compared to hekathon, our rules are simpler. We don't have commit dependencies nor we allow
+/// speculative reads. The logic is:
+///
+/// - If rv_begin is a timestamp, it's visible if the transaction's begin_ts is greater or equal to
+///   it. i.e. the row was inserted before the transaction's snapshot.
+/// - If rv_begin is a TxID, we check the state of that transaction:
+///   - If it's active, visible only if it's our own transaction and the row
+///     hasn't been deleted (rv.end is None). This is read-your-own-writes.
+///   - If it's preparing, not visible. The insert hasn't committed yet.
+///   - If it's committed, visible if tx.begin_ts >= committed_ts (the insert
+///     landed before our snapshot).
+///   - If it's aborted, not visible. The insert was rolled back.
+///   - If it's terminated, not visible.
+fn is_begin_visible(
+    txs: &SkipMap<TxID, Transaction>,
+    current_tx: &Transaction,
+    row_version: &RowVersion,
+) -> bool {
+    match row_version.begin {
+        Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => current_tx.begin_ts >= rv_begin_ts,
         Some(TxTimestampOrID::TxID(rv_begin)) => {
             let tb = txs
                 .get(&rv_begin)
                 .unwrap_or_else(|| panic!("transaction {rv_begin:?} should exist in txs map"));
             let tb = tb.value();
             let visible = match tb.state.load() {
-                TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
-                TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
-                TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
+                TransactionState::Active => {
+                    current_tx.tx_id == tb.tx_id && row_version.end.is_none()
+                }
+                TransactionState::Preparing(_) => false,
+                TransactionState::Committed(committed_ts) => current_tx.begin_ts >= committed_ts,
                 TransactionState::Aborted => false,
                 TransactionState::Terminated => {
                     tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
@@ -4241,16 +4276,44 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
                 }
             };
             tracing::trace!(
-                "is_begin_visible: tx={tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
-                rv.begin,
-                rv.end
+                "is_begin_visible: tx={current_tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
+                row_version.begin,
+                row_version.end
             );
             visible
         }
+        // Tombstones over B-tree-resident rows have no MVCC creator begin.
+        // They invalidate B-tree visibility via end timestamp only.
         None => false,
     }
 }
 
+/// `is_end_visible` says if the deleted row is visible to the current transaction or not.
+/// If the row was deleted after the current tx started, then the row is visible (i.e. not deleted)
+///
+/// This method specifically determines if a row version is still visible (not yet deleted) to a transaction,
+/// based on the transaction's begin timestamp and the row version's end field. In following:
+/// can `current_tx` still see `row_version` or has it been deleted.
+///
+/// Compared to hekaton, our rules are simpler. We don't have commit dependencies nor we allow
+/// speculative ignores. The logic is:
+///
+/// - If rv_end is a timestamp, it's visible if the transaction's begin_ts is less than it. i.e. row
+///   is still visible because it hasn't been deleted for this txn.
+/// - If rv_end is a TxID, we check the state of that transaction (TE):
+///   - Active: visible only if it's NOT our own transaction. If we deleted it,
+///     we shouldn't see it.
+///   - Preparing: visible. The delete hasn't committed yet, so the row still
+///     exists. Hekaton Table 2 would speculatively ignore here (if TS < RT,
+///     treat delete as committed, take a commit dependency on TE) but we don't
+///     track commit deps, so we conservatively keep it visible.
+///   - Committed(ts): visible if tx.begin_ts < ts (the delete landed after
+///     our snapshot).
+///   - Aborted: visible. The delete was rolled back, so the row still exists.
+///   - Terminated: visible. Only reachable from aborted. In theory the TxID
+///     should have been rewritten to a Timestamp during postprocessing before
+///     removal, so hitting this branch indicates a bug.
+/// - If rv_end is None, visible (the version has no end, it's the latest).
 fn is_end_visible(
     txs: &SkipMap<TxID, Transaction>,
     current_tx: &Transaction,
@@ -4268,8 +4331,11 @@ fn is_end_visible(
                 // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
                 // Source: https://avi.im/blag/2023/hekaton-paper-typo/
                 TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                // Table 2 (Hekaton): If TS > RT, V is visible. If TS < RT, T speculatively ignores V.
-                TransactionState::Preparing(end_ts) => current_tx.begin_ts < end_ts,
+                // Snapshot isolation without commit dependencies: the deletion
+                // hasn't committed yet, so the old version is still visible.
+                // Hekaton Table 2 would speculatively ignore here (begin_ts < end_ts)
+                // and take a commit dependency, but we don't track commit deps.
+                TransactionState::Preparing(_) => true,
                 TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
                 TransactionState::Aborted => true,
                 // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
