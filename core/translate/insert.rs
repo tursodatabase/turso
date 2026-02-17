@@ -2672,8 +2672,16 @@ fn emit_index_column_value_for_insert(
                 "Column not found in INSERT".to_string(),
             ));
         };
+        // For rowid alias columns (INTEGER PRIMARY KEY), the actual value lives
+        // in the key register, not the column register (which may hold NULL,
+        // e.g. when the rowid is auto-generated).
+        let src_reg = if cm.column.is_rowid_alias() {
+            insertion.key_register()
+        } else {
+            cm.register
+        };
         program.emit_insn(Insn::Copy {
-            src_reg: cm.register,
+            src_reg,
             dst_reg: dest_reg,
             extra_amount: 0,
         });
