@@ -12,7 +12,6 @@ use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::turso_assert;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::{turso_assert, turso_assert_eq};
 use crate::{

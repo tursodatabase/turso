@@ -5193,11 +5193,11 @@ impl CursorTrait for BTreeCursor {
                     let cell_idx = self.stack.current_cell_index() as usize;
                     let contents = page.get_contents();
                     if cell_idx >= contents.cell_count() {
-                        return_corrupt!(format!(
+                        return_corrupt!(
                             "Corrupted page: cell index {} is out of bounds for page with {} cells",
                             cell_idx,
                             contents.cell_count()
-                        ));
+                        );
                     }
 
                     tracing::debug!(
@@ -7322,7 +7322,7 @@ fn free_cell_range(
     // instead we are just extending the unallocated region.
     if offset == cur_content_area {
         if prev_block.is_some_and(|prev| prev != first_block) {
-            return_corrupt!("free_cell_range: invalid content area merge - freed range should have been merged with previous freeblock: prev={prev} first_block={first_block}");
+            return_corrupt!("free_cell_range: invalid content area merge - freed range should have been merged with previous freeblock: prev={prev_block:?} first_block={first_block}");
         }
         // If we get here, we are freeing data from the left end of the content area,
         // so we are extending the unallocated region instead of creating a freeblock.
@@ -7385,8 +7385,8 @@ fn defragment_page_fast(
     }
     if freeblock_2nd > 0 && freeblock_1st >= freeblock_2nd {
         return_corrupt!(
-                "defragment_page_fast: first freeblock must be before second freeblock", { "freeblock_1st": freeblock_1st, "freeblock_2nd": freeblock_2nd }
-            );
+            "defragment_page_fast: first freeblock must be before second freeblock: freeblock_1st={freeblock_1st} freeblock_2nd={freeblock_2nd}"
+        );
     }
     const FREEBLOCK_SIZE_MIN: usize = 4;
     if freeblock_1st > usable_space - FREEBLOCK_SIZE_MIN {
