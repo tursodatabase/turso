@@ -742,6 +742,11 @@ pub struct OuterQueryReference {
     /// CTE ID if this is a CTE reference. Used to track CTE reference counts
     /// for materialization decisions.
     pub cte_id: Option<usize>,
+    /// When true, this entry is only for CTE definition lookup in subquery
+    /// FROM clauses, not for column resolution. This is set when the CTE
+    /// has been consumed by a FROM clause (with or without an alias), so
+    /// column resolution goes through the joined_table instead.
+    pub cte_definition_only: bool,
 }
 
 impl OuterQueryReference {
@@ -933,6 +938,21 @@ impl TableReferences {
             .find(|t| t.identifier == identifier)
     }
 
+    /// Marks the pre-planned [OuterQueryReference] with the given identifier as
+    /// "CTE definition only". This prevents it from being used for column
+    /// resolution while still allowing CTE definition lookup in subquery FROM
+    /// clauses. Called when a CTE is consumed by a FROM clause, since column
+    /// resolution is then handled by the joined_table entry instead.
+    pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
+        if let Some(outer_ref) = self
+            .outer_query_refs
+            .iter_mut()
+            .find(|t| t.identifier == identifier)
+        {
+            outer_ref.cte_definition_only = true;
+        }
+    }
+
     /// Returns the internal ID and immutable reference to the [Table] with the given identifier,
     pub fn find_table_and_internal_id_by_identifier(
         &self,
@@ -945,7 +965,7 @@ impl TableReferences {
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.identifier == identifier)
+                    .find(|t| t.identifier == identifier && !t.cte_definition_only)
                     .map(|t| (t.internal_id, &t.table))
             })
     }

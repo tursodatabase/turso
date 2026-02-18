@@ -341,6 +341,7 @@ pub fn translate_alter_table(
                             cte_select: None,
                             cte_explicit_columns: vec![],
                             cte_id: None,
+                            cte_definition_only: false,
                         }],
                     );
                     let where_copy = index

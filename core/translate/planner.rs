@@ -479,6 +479,7 @@ fn plan_cte(
             cte_select: None,
             cte_explicit_columns: vec![],
             cte_id: Some(cte_definitions[ref_idx].cte_id),
+            cte_definition_only: false,
         });
     }
 
@@ -618,6 +619,7 @@ pub fn plan_ctes_as_outer_refs(
             cte_select: Some(cte_select_ast),
             cte_explicit_columns: explicit_columns,
             cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
+            cte_definition_only: false,
         });
     }
 
@@ -691,6 +693,7 @@ fn parse_from_clause_table(
                     cte_select: Some(cte_def.select.clone()),
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
                     cte_id: Some(cte_def.cte_id),
+                    cte_definition_only: false,
                 });
             }
 
@@ -789,6 +792,13 @@ fn parse_table(
             };
             cte_table.identifier = normalize_ident(alias.as_str());
         }
+
+        // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
+        // still available for CTE lookup in subquery FROM clauses (e.g.
+        // EXISTS (SELECT 1 FROM <cte_name> ...)), but no longer participates in
+        // column resolution. Column resolution now goes through the joined_table
+        // which has the alias (if any) or the original name.
+        table_references.mark_outer_query_ref_cte_definition_only(&normalized_qualified_name);
 
         table_references.add_joined_table(cte_table);
         return Ok(());
@@ -1210,6 +1220,7 @@ pub fn parse_from(
                     cte_select: Some(cte_def.select.clone()),
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
                     cte_id: Some(cte_def.cte_id),
+                    cte_definition_only: false,
                 });
             }
         }
