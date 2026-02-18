@@ -1140,7 +1140,6 @@ impl Connection {
                     &mut dbsp_state_roots,
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
-                    None,
                     enable_triggers,
                 ) {
                     Ok(()) => {}

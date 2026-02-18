@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "views not supported in MVCC mode"
 
 test view-basic-filtering {
     CREATE TABLE products(id INTEGER, name TEXT, price INTEGER, category TEXT);

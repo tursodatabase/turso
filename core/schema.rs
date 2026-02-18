@@ -131,7 +131,7 @@ use crate::util::{
 use crate::Result;
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
-    Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
+    Connection, LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
@@ -761,7 +761,6 @@ impl Schema {
                         &mut acc.dbsp_state_roots,
                         &mut acc.dbsp_state_index_roots,
                         &mut acc.materialized_view_info,
-                        None,
                         enable_triggers,
                     )?;
 
@@ -989,7 +988,6 @@ impl Schema {
         dbsp_state_roots: &mut HashMap<String, i64>,
         dbsp_state_index_roots: &mut HashMap<String, i64>,
         materialized_view_info: &mut HashMap<String, (String, i64)>,
-        mv_store: Option<&Arc<MvStore>>,
         enable_triggers: bool,
     ) -> Result<()> {
         match ty {
@@ -1103,8 +1101,6 @@ impl Schema {
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
-                assert!(mv_store.is_none(), "views not yet supported for mvcc");
-
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
                 if let Ok(Some(Cmd::Stmt(stmt))) = parser.next_cmd() {
