@@ -3,10 +3,10 @@ use std::sync::Arc;
 use turso_core::LimboError;
 
 fn setup_fk_tables(conn: &Arc<turso_core::Connection>) {
-    conn.execute("PRAGMA foreign_keys=ON;".to_string()).unwrap();
-    conn.execute("CREATE TABLE parent (id INT PRIMARY KEY);".to_string())
+    conn.execute("PRAGMA foreign_keys=ON;").unwrap();
+    conn.execute("CREATE TABLE parent (id INT PRIMARY KEY);")
         .unwrap();
-    conn.execute("CREATE TABLE child (id INT, pid INT REFERENCES parent(id));".to_string())
+    conn.execute("CREATE TABLE child (id INT, pid INT REFERENCES parent(id));")
         .unwrap();
 }
 
@@ -19,13 +19,13 @@ fn test_fk_violation_in_explicit_txn_continues() {
 
     setup_fk_tables(&conn);
 
-    conn.execute("BEGIN;".to_string()).unwrap();
-    conn.execute("INSERT INTO parent VALUES (2);".to_string())
+    conn.execute("BEGIN;").unwrap();
+    conn.execute("INSERT INTO parent VALUES (2);")
         .unwrap();
 
     // FK violation - this statement should be rolled back but the txn stays open
     let err = conn
-        .execute("INSERT INTO child VALUES (999, 999);".to_string())
+        .execute("INSERT INTO child VALUES (999, 999);")
         .unwrap_err();
     assert!(
         matches!(err, LimboError::ForeignKeyConstraint(_)),
@@ -33,9 +33,9 @@ fn test_fk_violation_in_explicit_txn_continues() {
     );
 
     // Transaction should still be usable
-    conn.execute("INSERT INTO parent VALUES (3);".to_string())
+    conn.execute("INSERT INTO parent VALUES (3);")
         .unwrap();
-    conn.execute("COMMIT;".to_string()).unwrap();
+    conn.execute("COMMIT;").unwrap();
 
     let rows = limbo_exec_rows(&conn, "SELECT id FROM parent ORDER BY id;");
     assert_eq!(rows.len(), 2);
@@ -51,11 +51,11 @@ fn test_fk_violation_autocommit_rollback() {
 
     setup_fk_tables(&conn);
 
-    conn.execute("INSERT INTO parent VALUES (1);".to_string())
+    conn.execute("INSERT INTO parent VALUES (1);")
         .unwrap();
 
     let err = conn
-        .execute("INSERT INTO child VALUES (999, 999);".to_string())
+        .execute("INSERT INTO child VALUES (999, 999);")
         .unwrap_err();
     assert!(matches!(err, LimboError::ForeignKeyConstraint(_)));
 
@@ -75,10 +75,10 @@ fn test_fk_violation_no_wal_lock_leak() {
     setup_fk_tables(&conn);
 
     // Cause FK violation in autocommit mode
-    let _ = conn.execute("INSERT INTO child VALUES (999, 999);".to_string());
+    let _ = conn.execute("INSERT INTO child VALUES (999, 999);");
 
     // Should be able to do normal operations after the FK violation
-    conn.execute("INSERT INTO parent VALUES (1);".to_string())
+    conn.execute("INSERT INTO parent VALUES (1);")
         .unwrap();
 
     let rows = limbo_exec_rows(&conn, "SELECT id FROM parent ORDER BY id;");
@@ -87,6 +87,6 @@ fn test_fk_violation_no_wal_lock_leak() {
 
     // Connection close should succeed without WAL checkpoint errors.
     // The close is implicit via drop, but we can verify by doing a checkpoint.
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);".to_string())
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 }
