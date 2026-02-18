@@ -1440,11 +1440,6 @@ impl Connection {
         Ok(())
     }
 
-    // Get an attached database by alias name
-    pub(crate) fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
-        self.attached_databases.read().get_database_by_name(alias)
-    }
-
     /// List all attached database aliases
     pub fn list_attached_databases(&self) -> Vec<String> {
         self.attached_databases

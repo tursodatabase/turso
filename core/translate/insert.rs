@@ -297,7 +297,7 @@ pub fn translate_insert(
     )?;
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
-        ensure_sequence_initialized(program, connection, &btree_table, database_id)?;
+        ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
     }
 
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
@@ -420,7 +420,7 @@ pub fn translate_insert(
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 
     if ctx.table.has_autoincrement {
-        init_autoincrement(program, &mut ctx, connection)?;
+        init_autoincrement(program, &mut ctx, resolver)?;
     }
 
     // Fire BEFORE INSERT triggers
@@ -513,7 +513,7 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_generation);
 
-    emit_rowid_generation(program, &ctx, &insertion, connection)?;
+    emit_rowid_generation(program, &ctx, &insertion, resolver)?;
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
@@ -569,7 +569,7 @@ pub fn translate_insert(
 
             emit_update_sqlite_sequence(
                 program,
-                connection,
+                resolver,
                 ctx.database_id,
                 seq_cursor_id,
                 r_seq_rowid,
@@ -671,7 +671,6 @@ pub fn translate_insert(
             insertion.key_register(),
             resolver,
             database_id,
-            connection,
         )?;
     }
 
@@ -779,7 +778,7 @@ pub fn translate_insert(
 
         emit_update_sqlite_sequence(
             program,
-            connection,
+            resolver,
             ctx.database_id,
             seq_cursor_id,
             r_seq_rowid,
@@ -1051,7 +1050,7 @@ fn emit_rowid_generation(
     program: &mut ProgramBuilder,
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     if let Some(AutoincMeta {
         r_seq,
@@ -1109,7 +1108,7 @@ fn emit_rowid_generation(
 
         emit_update_sqlite_sequence(
             program,
-            connection,
+            resolver,
             ctx.database_id,
             seq_cursor_id,
             r_seq_rowid,
@@ -1174,9 +1173,9 @@ fn resolve_upserts(
 fn init_autoincrement(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
-    let seq_table = connection
+    let seq_table = resolver
         .with_schema(ctx.database_id, |s| s.get_btree_table("sqlite_sequence"))
         .ok_or_else(|| {
             crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
@@ -2510,11 +2509,11 @@ fn translate_virtual_table_insert(
 ///  makes sure that an AUTOINCREMENT table has a sequence row in `sqlite_sequence`, inserting one with 0 if missing.
 fn ensure_sequence_initialized(
     program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
     table: &schema::BTreeTable,
     database_id: usize,
 ) -> Result<()> {
-    let seq_table = connection
+    let seq_table = resolver
         .with_schema(database_id, |s| s.get_btree_table("sqlite_sequence"))
         .ok_or_else(|| {
             crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
@@ -2846,7 +2845,7 @@ fn build_constraints_to_check(
 
 fn emit_update_sqlite_sequence(
     program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
     database_id: usize,
     seq_cursor_id: usize,
     r_seq_rowid: usize,
@@ -2866,7 +2865,7 @@ fn emit_update_sqlite_sequence(
         extra_amount: 0,
     });
 
-    let seq_table = connection
+    let seq_table = resolver
         .with_schema(database_id, |s| s.get_btree_table("sqlite_sequence"))
         .unwrap();
     let affinity_str = seq_table
@@ -3069,7 +3068,6 @@ pub fn emit_fk_child_insert_checks(
     new_rowid_reg: usize,
     resolver: &Resolver,
     database_id: usize,
-    connection: &Arc<Connection>,
 ) -> crate::Result<()> {
     for fk_ref in
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
@@ -3090,7 +3088,7 @@ pub fn emit_fk_child_insert_checks(
                 target_pc: fk_ok,
             });
         }
-        let parent_tbl = connection
+        let parent_tbl = resolver
             .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
             .expect("parent btree");
         if fk_ref.parent_uses_rowid {

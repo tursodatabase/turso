@@ -122,11 +122,6 @@ pub struct Resolver<'a> {
 }
 
 impl<'a> Resolver<'a> {
-    const MAIN_DB: &'static str = "main";
-    const MAIN_DB_BYTES: &'static [u8] = Self::MAIN_DB.as_bytes();
-    const TEMP_DB: &'static str = "temp";
-    const TEMP_DB_BYTES: &'static [u8] = Self::TEMP_DB.as_bytes();
-
     const MAIN_DB_ID: usize = 0;
     const TEMP_DB_ID: usize = 1;
 
@@ -1376,7 +1371,6 @@ pub fn emit_query<'a>(
         &plan.where_clause,
         &plan.join_order,
         &mut plan.non_from_clause_subqueries,
-        None,
     )?;
 
     if plan.is_simple_count() {
@@ -1510,7 +1504,6 @@ fn emit_program_for_delete(
         &plan.where_clause,
         &join_order,
         &mut plan.non_from_clause_subqueries,
-        Some(connection),
     )?;
 
     // If there's a rowset_plan, materialize rowids into a RowSet first and then iterate the RowSet
@@ -2423,7 +2416,6 @@ fn emit_program_for_update(
         &plan.where_clause,
         &join_order,
         &mut plan.non_from_clause_subqueries,
-        Some(connection),
     )?;
 
     // Prepare index cursors

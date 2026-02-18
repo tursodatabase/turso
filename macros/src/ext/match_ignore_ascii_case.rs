@@ -31,7 +31,6 @@ pub fn match_ignore_ascci_case(input: TokenStream) -> TokenStream {
                     .into();
                 }
             },
-            Pat::
             Pat::Wild(_) => {
                 fallback_arm = Some(arm.clone());
             }

@@ -1668,7 +1668,7 @@ pub fn fire_fk_update_actions(
     connection: &Arc<Connection>,
     database_id: usize,
 ) -> Result<()> {
-    let parent_bt = connection
+    let parent_bt = resolver
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
@@ -1759,7 +1759,7 @@ pub fn emit_fk_drop_table_check(
     connection: &Arc<Connection>,
     database_id: usize,
 ) -> Result<()> {
-    let parent_tbl = connection
+    let parent_tbl = resolver
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| {
             LimboError::InternalError(format!("parent table {parent_table_name} not found"))

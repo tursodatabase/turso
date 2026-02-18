@@ -993,7 +993,7 @@ pub fn translate_alter_table(
                     // or if trigger commands contain qualified references to the trigger table (e.g., t.x)
                     if trigger_table_name_norm == target_table_name_norm {
                         let column_name_norm = normalize_ident(from);
-                        let trigger_table = connection
+                        let trigger_table = resolver
                             .with_schema(database_id, |s| {
                                 s.get_btree_table(&trigger_table_name_norm)
                             })
@@ -1042,7 +1042,7 @@ pub fn translate_alter_table(
 
                     if trigger_table_name_norm == target_table_name_norm {
                         // Trigger is on the table being renamed - check for references
-                        let trigger_table = connection
+                        let trigger_table = resolver
                             .with_schema(database_id, |s| {
                                 s.get_btree_table(&trigger_table_name_norm)
                             })

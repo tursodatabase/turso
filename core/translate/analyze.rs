@@ -15,7 +15,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
-    Connection, Result,
+    Result,
 };
 use turso_parser::ast;
 
@@ -33,7 +33,6 @@ type AnalyzeTarget = (Arc<BTreeTable>, Option<Arc<Index>>);
 fn resolve_analyze_targets(
     target_opt: &Option<ast::QualifiedName>,
     resolver: &Resolver,
-    connection: &Arc<Connection>,
 ) -> Result<(usize, Vec<AnalyzeTarget>)> {
     match target_opt {
         Some(target) => {
@@ -60,7 +59,7 @@ fn resolve_analyze_targets(
             }
 
             // Check if it's an attached database name
-            if let Some((db_id, _)) = connection.get_attached_database(&normalized) {
+            if let Some((db_id, _)) = resolver.get_attached_database(&normalized) {
                 let targets = collect_all_tables_in_db(db_id, resolver);
                 return Ok((db_id, targets));
             }
@@ -138,11 +137,9 @@ pub fn translate_analyze(
     target_opt: Option<ast::QualifiedName>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
 ) -> Result<()> {
     // Resolve the target database and collect analyze targets.
-    let (database_id, analyze_targets) =
-        resolve_analyze_targets(&target_opt, resolver, connection)?;
+    let (database_id, analyze_targets) = resolve_analyze_targets(&target_opt, resolver)?;
 
     if analyze_targets.is_empty() {
         return Ok(());
@@ -193,7 +190,7 @@ pub fn translate_analyze(
         sqlite_stat1_btreetable = Arc::new(BTreeTable::from_sql(sql, 0)?);
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
-        let table = connection
+        let table = resolver
             .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
             .unwrap();
         let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));

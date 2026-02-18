@@ -164,7 +164,7 @@ pub fn translate_inner(
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
         }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program, connection)?,
+        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
             attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
