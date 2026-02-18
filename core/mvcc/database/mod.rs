@@ -1267,12 +1267,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
-                // transaction. Please note that when we move to lockless, the
-                // invariant doesn't necessarily hold anymore because another thread
-                // might have speculatively read a version that we want to remove.
-                // But that's a problem for another day.
-                // FIXME: it actually just become a problem for today!!!
-                // TODO: test that reproduces this failure, and then a fix
+                // transaction. Note: concurrent readers may still encounter a
+                // stale TxID reference due to a race, but is_begin_visible and
+                // is_end_visible handle missing transactions gracefully.
                 mvcc_store.remove_tx(self.tx_id);
 
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
@@ -3240,11 +3237,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         match ts_or_id {
             Some(TxTimestampOrID::Timestamp(ts)) => *ts,
             Some(TxTimestampOrID::TxID(tx_id)) => {
+                // Transaction may have been removed after commit/abort.
+                // Use begin_ts if available, otherwise fall back to 0.
                 self.txs
                     .get(tx_id)
-                    .expect("transaction should exist in txs map")
-                    .value()
-                    .begin_ts
+                    .map(|entry| entry.value().begin_ts)
+                    .unwrap_or(0)
             }
             // This function is intended to be used in the ordering of row versions within the row version chain in `insert_version_raw`.
             //
@@ -4184,10 +4182,16 @@ pub(crate) fn is_write_write_conflict(
 ) -> bool {
     match rv.end {
         Some(TxTimestampOrID::TxID(rv_end)) => {
-            let te = txs
-                .get(&rv_end)
-                .expect("transaction should exist in txs map");
-            let te = te.value();
+            let Some(te_entry) = txs.get(&rv_end) else {
+                // Transaction was already removed from the map after commit/abort.
+                // If it was committed, the end field should have been updated to a
+                // Timestamp but due to a race we still see the stale TxID.
+                // A committed tx holding the end field means conflict (same as
+                // Timestamp case). If it was aborted, the end field should have
+                // been reset to None, so reaching here implies it was committed.
+                return true;
+            };
+            let te = te_entry.value();
             if te.tx_id == tx.tx_id {
                 return false;
             }
@@ -4248,10 +4252,14 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
     match rv.begin {
         Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => tx.begin_ts >= rv_begin_ts,
         Some(TxTimestampOrID::TxID(rv_begin)) => {
-            let tb = txs
-                .get(&rv_begin)
-                .unwrap_or_else(|| panic!("transaction {rv_begin:?} should exist in txs map"));
-            let tb = tb.value();
+            let Some(tb_entry) = txs.get(&rv_begin) else {
+                // Transaction was already removed from the map after commit/abort.
+                // Its row versions should have been updated from TxID to Timestamp,
+                // but due to a race another thread may still see the stale TxID.
+                // Both Aborted and post-commit removal lead to "not visible".
+                return false;
+            };
+            let tb = tb_entry.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
                 TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
@@ -4281,10 +4289,15 @@ fn is_end_visible(
     match row_version.end {
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
-            let other_tx = txs
-                .get(&rv_end)
-                .unwrap_or_else(|| panic!("Transaction {rv_end} not found"));
-            let other_tx = other_tx.value();
+            let Some(other_tx_entry) = txs.get(&rv_end) else {
+                // Transaction was already removed from the map after commit/abort.
+                // Its row versions should have been updated from TxID to Timestamp,
+                // but due to a race another thread may still see the stale TxID.
+                // Both Aborted and Terminated states return true (visible),
+                // so a missing tx is treated the same way.
+                return true;
+            };
+            let other_tx = other_tx_entry.value();
             let visible = match other_tx.state.load() {
                 // V's sharp mind discovered an issue with the hekaton paper which basically states that a
                 // transaction can see a row version if the end is a TXId only if it isn't the same transaction.

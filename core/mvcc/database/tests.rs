@@ -5806,3 +5806,90 @@ fn test_close_persists_drop_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+/// Regression test for #5017: visibility functions must not panic when a
+/// transaction has been removed from the txs map (race between commit/abort
+/// removing the tx and a concurrent reader still referencing it via TxID).
+///
+/// We simulate the race by:
+/// 1. Having tx_a insert a row (creating a version with begin=TxID(tx_a)),
+/// 2. Removing tx_a from the txs map (simulating post-commit removal),
+/// 3. Verifying that tx_b can safely check visibility without panicking.
+#[test]
+fn test_visibility_no_panic_on_removed_transaction() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // Start tx_a and insert a row.
+    let tx_a = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row = generate_simple_string_row(table_id, 1, "hello");
+    db.mvcc_store.insert(tx_a, row).unwrap();
+
+    // Start tx_b (reader).
+    let tx_b = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+
+    // Simulate the race: remove tx_a from the txs map as if it committed
+    // and was cleaned up, while a stale TxID(tx_a) reference still exists
+    // in the row version's begin field.
+    db.mvcc_store.remove_tx(tx_a);
+
+    // This must NOT panic. Before the fix, looking up a removed tx caused
+    // a panic in is_begin_visible.
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+    let result = db.mvcc_store.read(tx_b, row_id);
+    // The row should not be visible (tx_a was removed, treated as if
+    // committed/aborted, which means "not visible" for begin).
+    assert!(
+        result.unwrap().is_none(),
+        "row should not be visible when creator tx was removed"
+    );
+}
+
+/// Regression test for #5017: is_write_write_conflict must not panic when the
+/// transaction referenced in a row version's end field has been removed.
+#[test]
+fn test_write_write_conflict_no_panic_on_removed_transaction() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // Start tx_a and insert a row, then commit it.
+    let tx_a = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row = generate_simple_string_row(table_id, 1, "hello");
+    db.mvcc_store.insert(tx_a, row).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx_a).unwrap();
+
+    // Start tx_b and delete the row (sets end=TxID(tx_b) on the version).
+    let tx_b = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+    db.mvcc_store.delete(tx_b, row_id.clone()).unwrap();
+
+    // Start tx_c which will try to also delete the same row.
+    let tx_c = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+
+    // Simulate the race: remove tx_b before tx_c checks for conflicts.
+    db.mvcc_store.remove_tx(tx_b);
+
+    // This must NOT panic. Before the fix, looking up a removed tx caused
+    // a panic in is_write_write_conflict and is_end_visible.
+    let result = db.mvcc_store.delete(tx_c, row_id);
+    // Should detect a conflict (removed tx_b is treated as committed).
+    assert!(
+        result.is_err() || !result.unwrap(),
+        "should detect conflict or find no deletable version when end-tx was removed"
+    );
+}
