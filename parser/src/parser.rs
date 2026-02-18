@@ -2093,7 +2093,19 @@ impl<'a> Parser<'a> {
             match self.peek()? {
                 Some(tok) if tok.token_type == TK_COMMA => {
                     eat_assert!(self, TK_COMMA);
-                    ctes.push(self.parse_common_table_expr()?);
+                    let cte = self.parse_common_table_expr()?;
+                    if ctes.iter().any(|existing| {
+                        existing
+                            .tbl_name
+                            .as_str()
+                            .eq_ignore_ascii_case(cte.tbl_name.as_str())
+                    }) {
+                        return Err(Error::Custom(format!(
+                            "duplicate WITH table name: {}",
+                            cte.tbl_name
+                        )));
+                    }
+                    ctes.push(cte);
                 }
                 _ => break,
             }
@@ -4209,6 +4221,7 @@ mod tests {
             "CREATE TABLE foo(bar) WITHOUT ROWID",
             "CREATE VIEW foo(bar, bar) AS SELECT 1, 1",
             "CREATE VIEW foo(bar) AS SELECT 1, 1",
+            "CREATE VIEW v AS WITH cte AS (SELECT 1), cte AS (SELECT 1) SELECT 1",
             "DELETE FROM my_table ORDER BY col1",
             "INSERT INTO my_table(bar) DEFAULT VALUES",
             "INSERT INTO my_table(bar, baz, barr) VALUES (1, 1)",

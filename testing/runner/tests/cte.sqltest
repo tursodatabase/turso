@@ -633,6 +633,16 @@ expect error {
     duplicate WITH table name
 }
 
+test cte-duplicate-name-view {
+    CREATE TABLE cte_dup_table(x);
+    CREATE VIEW cte_dup_view AS
+        WITH cte AS (SELECT 1), cte AS (SELECT 2)
+        SELECT * FROM cte_dup_table;
+}
+expect error {
+    duplicate WITH table name
+}
+
 # @skip-if sqlite "sqlite supports recursive CTEs"
 # test cte-recursive-unsupported {
 #     WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT * FROM cnt;
