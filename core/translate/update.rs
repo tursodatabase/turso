@@ -98,11 +98,13 @@ pub fn translate_update_for_schema_change(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     ddl_query: &str,
+    affinity_overrides: Option<HashMap<usize, crate::vdbe::affinity::Affinity>>,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<()> {
     let mut plan = prepare_update_plan(program, resolver, body, connection, true)?;
 
     if let Plan::Update(update_plan) = &mut plan {
+        update_plan.affinity_overrides = affinity_overrides.unwrap_or_default();
         if program.capture_data_changes_info().has_updates() {
             update_plan.cdc_update_alter_statement = Some(ddl_query.to_string());
         }
@@ -438,6 +440,7 @@ pub fn prepare_update_plan(
         indexes_to_update,
         ephemeral_plan: None,
         cdc_update_alter_statement: None,
+        affinity_overrides: HashMap::default(),
         non_from_clause_subqueries,
     }))
 }

@@ -357,6 +357,77 @@ expect error {
     Parse error: must have at least one non-generated column
 }
 
+# Verify that changing column type affinity rewrites stored data so that
+# values conform to the new type. Without this, integrity_check reports
+# corruption (e.g. "NUMERIC value in t.y").
+test alter-column-numeric-to-text-converts-data {
+    CREATE TABLE t(x NUMERIC);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (2.5);
+    INSERT INTO t VALUES ('hello');
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+    SELECT typeof(y), y FROM t ORDER BY rowid;
+}
+expect {
+    text|1
+    text|2.5
+    text|hello
+}
+
+test alter-column-integer-to-text-converts-data {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (42);
+    INSERT INTO t VALUES (0);
+    INSERT INTO t VALUES (-7);
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+    SELECT typeof(y), y FROM t ORDER BY rowid;
+}
+expect {
+    text|42
+    text|0
+    text|-7
+}
+
+test alter-column-text-to-numeric-converts-data {
+    CREATE TABLE t(x TEXT);
+    INSERT INTO t VALUES ('100');
+    INSERT INTO t VALUES ('3.14');
+    INSERT INTO t VALUES ('not_a_number');
+    ALTER TABLE t ALTER COLUMN x TO y NUMERIC;
+    SELECT typeof(y), y FROM t ORDER BY rowid;
+}
+expect {
+    integer|100
+    real|3.14
+    text|not_a_number
+}
+
+test alter-column-integer-to-real-converts-data {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (5);
+    INSERT INTO t VALUES (-3);
+    ALTER TABLE t ALTER COLUMN x TO y REAL;
+    SELECT typeof(y), y FROM t ORDER BY rowid;
+}
+expect {
+    real|5.0
+    real|-3.0
+}
+expect @js {
+    real|5
+    real|-3
+}
+
+test alter-column-same-affinity-no-change {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (10);
+    ALTER TABLE t ALTER COLUMN x TO y INT;
+    SELECT typeof(y), y FROM t;
+}
+expect {
+    integer|10
+}
+
 test alter-column-to-generated-with-other-columns {
     CREATE TABLE t(a, b);
     ALTER TABLE t ALTER COLUMN a TO c AS (123);
