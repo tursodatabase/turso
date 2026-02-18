@@ -81,7 +81,7 @@ export class Session {
     if (response.results && response.results[0]) {
       const result = response.results[0];
       if (result.type === "error") {
-        throw new DatabaseError(result.error?.message || 'Describe execution failed');
+        throw new DatabaseError(result.error?.message || 'Describe execution failed', result.error?.code);
       }
 
       if (result.response?.type === "describe" && result.response.result) {
@@ -214,7 +214,7 @@ export class Session {
           break;
         case 'step_error':
         case 'error':
-          throw new DatabaseError(entry.error?.message || 'SQL execution failed');
+          throw new DatabaseError(entry.error?.message || 'SQL execution failed', entry.error?.code);
       }
     }
 
@@ -296,7 +296,7 @@ export class Session {
           break;
         case 'step_error':
         case 'error':
-          throw new DatabaseError(entry.error?.message || 'Batch execution failed');
+          throw new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
       }
     }
 
@@ -332,7 +332,7 @@ export class Session {
     if (response.results && response.results[0]) {
       const result = response.results[0];
       if (result.type === "error") {
-        throw new DatabaseError(result.error?.message || 'Sequence execution failed');
+        throw new DatabaseError(result.error?.message || 'Sequence execution failed', result.error?.code);
       }
     }
   }
