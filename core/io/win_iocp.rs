@@ -38,11 +38,10 @@
 //  `process_packet_from_iocp`
 
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
-use crate::io::common;
 use crate::sync::Arc;
 
 use crate::sync::Mutex;
-use crate::{Clock, Completion, File, LimboError, OpenFlags, Result, IO};
+use crate::{Clock, Completion, File, IO, LimboError, OpenFlags, Result};
 
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
@@ -50,27 +49,27 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr::NonNull;
-use windows_sys::core::BOOL;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    FormatMessageW, FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM,
-    FORMAT_MESSAGE_IGNORE_INSERTS,
+    FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
+    FormatMessageW,
 };
+use windows_sys::core::BOOL;
 
 use std::{io, mem, ptr};
-use tracing::{debug, instrument, trace, warn, Level};
+use tracing::{Level, debug, instrument, trace, warn};
 
 use super::FileSyncType;
 use crate::io::completions::CompletionInner;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, FALSE,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
+    CloseHandle, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
-    SetFileInformationByHandle, UnlockFileEx, WriteFile, FILE_END_OF_FILE_INFO,
-    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    OPEN_ALWAYS, OPEN_EXISTING,
+    CreateFileW, FILE_END_OF_FILE_INFO, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
+    FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LOCKFILE_EXCLUSIVE_LOCK,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
+    SetFileInformationByHandle, UnlockFileEx, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
@@ -146,16 +145,6 @@ fn get_unique_key_from_completion(c: &Completion) -> CompletionKey {
 }
 
 #[inline]
-fn get_limboerror_from_os_err(err: u32) -> LimboError {
-    let Ok(error_code) = err.try_into() else {
-        return LimboError::InternalError(format!("Unknown error [{err}]"));
-    };
-
-    let error = std::io::Error::from_raw_os_error(error_code);
-    error.into()
-}
-
-#[inline]
 fn get_generic_limboerror_from_last_os_err() -> LimboError {
     get_generic_limboerror_from_os_err(unsafe { GetLastError() })
 }
@@ -196,11 +185,6 @@ fn get_generic_limboerror_from_os_err(err: u32) -> LimboError {
 
         LimboError::InternalError(format!("Windows Error: [{err}]{string}"))
     }
-}
-
-#[inline]
-fn get_limboerror_from_last_os_err() -> LimboError {
-    get_limboerror_from_os_err(unsafe { GetLastError() })
 }
 
 #[inline]
@@ -873,17 +857,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        io::{
-            common,
-            win_iocp::{get_generic_limboerror_from_os_err, get_limboerror_from_os_err},
-            TempFile,
-        },
         Buffer, Completion, IO,
+        io::{TempFile, win_iocp::get_generic_limboerror_from_os_err},
     };
 
     use super::WindowsIOCP;
-
-    
 
     #[test]
     fn test_file_read_write() {
@@ -933,20 +911,6 @@ mod tests {
 
     #[test]
     fn test_error_functions() {
-        assert_eq!(
-            get_limboerror_from_os_err(5).to_string(),
-            String::from("I/O error: permission denied")
-        );
-        assert_eq!(
-            get_limboerror_from_os_err(u32::MAX).to_string(),
-            String::from("Internal error: Unknown error [4294967295]")
-        );
-
-        assert_eq!(
-            get_limboerror_from_os_err(15818).to_string(),
-            String::from("I/O error: uncategorized error")
-        );
-
         assert_eq!(
             get_generic_limboerror_from_os_err(5).to_string(),
             String::from("Internal error: Windows Error: [5]Access is denied.\r\n")
