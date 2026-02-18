@@ -39,6 +39,7 @@ nanosecond-bench = ["bench"]
 fts = ["dep:tantivy"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
+win_iocp = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [
