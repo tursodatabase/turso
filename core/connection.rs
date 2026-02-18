@@ -15,18 +15,34 @@ use crate::{
     io::{MemoryIO, PlatformIO, IO},
     match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
-    AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesInfo,
-    CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
-    DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
-    LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
-    Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
+    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
+    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
+    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
+    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
+    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
+    Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::Display;
 use std::ops::Deref;
 use tracing::{instrument, Level};
+use turso_macros::AtomicEnum;
+
+#[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TransactionState {
+    Write {
+        schema_did_change: bool,
+    },
+    Read,
+    /// PendingUpgrade remembers what transaction state was before upgrade to write (has_read_txn is true if before transaction were in Read state)
+    /// This is important, because if we failed to initialize write transaction immediatley - we need to end implicitly started read txn (e.g. for simiple INSERT INTO operation)
+    /// But for late upgrade of transaction we should keep read transaction active (e.g. BEGIN; SELECT ...; INSERT INTO ...)
+    PendingUpgrade {
+        has_read_txn: bool,
+    },
+    None,
+}
 
 /// Database connection handle.
 ///
