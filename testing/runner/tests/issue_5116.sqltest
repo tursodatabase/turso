@@ -1,0 +1,22 @@
+@database :memory:
+
+test setup_db_for_cli_test_workaround_parser {
+    -- This test just initializes the database connection so subsequent tests can reuse it
+    -- and work around parser limitation on consecutive decorators.
+}
+expect {
+}
+
+@backend cli
+test issue_5116_multiline_string {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES('a
+b');
+    SELECT length(a) FROM t;
+    SELECT a FROM t;
+}
+expect {
+    3
+    a
+    b
+}

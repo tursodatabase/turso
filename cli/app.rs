@@ -1629,7 +1629,9 @@ impl Limbo {
             self.read_state.process(&self.input_buff[prev_len..]);
         }
 
-        let _ = self.input_buff.write_char(' ');
+        if !self.input_buff.ends_with(char::is_whitespace) {
+            let _ = self.input_buff.write_char('\n');
+        }
         Ok(())
     }
 
