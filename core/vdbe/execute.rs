@@ -3310,13 +3310,41 @@ pub fn seek_internal(
                     let actual_op = if lost_precision {
                         match &temp_value {
                             Value::Numeric(Numeric::Float(f)) => {
-                                let int_key_as_float = int_key as f64;
-                                let c = if int_key_as_float > f64::from(*f) {
-                                    1
-                                } else if int_key_as_float < f64::from(*f) {
+                                let f_val = f64::from(*f);
+                                // When extract_int_value clamped to i64::MAX/MIN,
+                                // the cast `int_key as f64` loses the fact that the
+                                // float is outside the i64 range. Detect this and
+                                // set the comparison result directly.
+                                //
+                                // For i64::MAX: any float > 9223372036854774784.0
+                                // is >= 9223372036854775808.0 (the next f64), which
+                                // exceeds i64::MAX (9223372036854775807). i64::MAX
+                                // is not exactly representable as f64, so the float
+                                // is always strictly greater.
+                                //
+                                // For i64::MIN: -2^63 IS exactly representable as
+                                // f64, so we must distinguish the exact match from
+                                // floats that are strictly less.
+                                let c = if int_key == i64::MAX && f_val > 9223372036854774784.0 {
+                                    // Float exceeds i64::MAX, so int_key < float
                                     -1
+                                } else if int_key == i64::MIN && f_val < -9223372036854774784.0 {
+                                    if f_val == (i64::MIN as f64) {
+                                        // Float is exactly i64::MIN
+                                        0
+                                    } else {
+                                        // Float is below i64::MIN, so int_key > float
+                                        1
+                                    }
                                 } else {
-                                    0
+                                    let int_key_as_float = int_key as f64;
+                                    if int_key_as_float > f_val {
+                                        1
+                                    } else if int_key_as_float < f_val {
+                                        -1
+                                    } else {
+                                        0
+                                    }
                                 };
 
                                 match c.cmp(&0) {
