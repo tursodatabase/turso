@@ -55,88 +55,76 @@ mod numeric;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 
-use crate::busy::{BusyHandler, BusyHandlerCallback};
-use crate::index_method::IndexMethod;
-use crate::schema::Trigger;
-use crate::stats::refresh_analyze_stats;
-use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
-use crate::storage::encryption::{AtomicCipherMode, SQLITE_HEADER, TURSO_HEADER_PREFIX};
-use crate::storage::journal_mode;
-use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
-use crate::storage::sqlite3_ondisk::{RawVersion, TextEncoding, Version};
-use crate::sync::{
-    atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering,
+use crate::{
+    busy::{BusyHandler, BusyHandlerCallback},
+    incremental::view::AllViewsTxState,
+    index_method::IndexMethod,
+    schema::Trigger,
+    stats::refresh_analyze_stats,
+    storage::{
+        checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
+        encryption::{AtomicCipherMode, SQLITE_HEADER, TURSO_HEADER_PREFIX},
+        journal_mode,
+        pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut},
+        sqlite3_ondisk::{RawVersion, TextEncoding, Version},
     },
-    Arc, LazyLock, Weak,
+    sync::{
+        atomic::{
+            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize,
+            Ordering,
+        },
+        Arc, LazyLock, Mutex, RwLock, Weak,
+    },
+    translate::{emitter::TransactionMode, pragma::TURSO_CDC_DEFAULT_TABLE_NAME},
+    vdbe::metrics::ConnectionMetrics,
+    vtab::VirtualTable,
 };
-use crate::sync::{Mutex, RwLock};
-use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
-use crate::vdbe::metrics::ConnectionMetrics;
-use crate::vtab::VirtualTable;
-use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
 use arc_swap::{ArcSwap, ArcSwapOption};
-pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 use core::str;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use schema::Schema;
+use std::{
+    fmt::{self},
+    ops::Deref,
+    time::Duration,
+};
+#[cfg(feature = "fs")]
+use storage::database::DatabaseFile;
+use storage::{page_cache::PageCache, sqlite3_ondisk::PageSize};
+use tracing::{instrument, Level};
+use turso_macros::{match_ignore_ascii_case, AtomicEnum};
+use turso_parser::{ast, ast::Cmd, parser::Parser};
+use util::parse_schema_rows;
+
+pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub use error::{CompletionError, LimboError};
-pub use io::clock::{Clock, MonotonicInstant, WallClockInstant};
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
 pub use io::UringIO;
 pub use io::{
+    clock::{Clock, MonotonicInstant, WallClockInstant},
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
     SyscallIO, WriteCompletion, IO,
 };
-pub use numeric::nonnan::NonNan;
-pub use numeric::Numeric;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use schema::Schema;
+pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::Statement;
-use std::time::Duration;
-use std::{
-    fmt::{self},
-    ops::Deref,
-};
-#[cfg(feature = "fs")]
-use storage::database::DatabaseFile;
-pub use storage::database::IOContext;
-pub use storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
-use storage::page_cache::PageCache;
-use storage::sqlite3_ondisk::PageSize;
 pub use storage::{
     buffer_pool::BufferPool,
-    database::DatabaseStorage,
-    pager::PageRef,
-    pager::{Page, Pager},
+    database::{DatabaseStorage, IOContext},
+    encryption::{CipherMode, EncryptionContext, EncryptionKey},
+    pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
 };
-use tracing::{instrument, Level};
-use turso_macros::{match_ignore_ascii_case, AtomicEnum};
-
-pub use turso_macros::turso_assert;
-pub use turso_macros::turso_assert_all;
-pub use turso_macros::turso_assert_eq;
-pub use turso_macros::turso_assert_greater_than;
-pub use turso_macros::turso_assert_greater_than_or_equal;
-pub use turso_macros::turso_assert_less_than;
-pub use turso_macros::turso_assert_less_than_or_equal;
-pub use turso_macros::turso_assert_ne;
-pub use turso_macros::turso_assert_reachable;
-pub use turso_macros::turso_assert_some;
-pub use turso_macros::turso_assert_sometimes;
-pub use turso_macros::turso_assert_sometimes_greater_than;
-pub use turso_macros::turso_assert_sometimes_greater_than_or_equal;
-pub use turso_macros::turso_assert_sometimes_less_than;
-pub use turso_macros::turso_assert_sometimes_less_than_or_equal;
-pub use turso_macros::turso_assert_unreachable;
-pub use turso_macros::turso_debug_assert;
-pub use turso_macros::turso_soft_unreachable;
-use turso_parser::{ast, ast::Cmd, parser::Parser};
-pub use types::IOResult;
-pub use types::Value;
-pub use types::ValueRef;
-use util::parse_schema_rows;
+pub use turso_macros::{
+    turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
+    turso_assert_greater_than_or_equal, turso_assert_less_than, turso_assert_less_than_or_equal,
+    turso_assert_ne, turso_assert_reachable, turso_assert_some, turso_assert_sometimes,
+    turso_assert_sometimes_greater_than, turso_assert_sometimes_greater_than_or_equal,
+    turso_assert_sometimes_less_than, turso_assert_sometimes_less_than_or_equal,
+    turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
+};
+pub use types::{IOResult, Value, ValueRef};
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
@@ -1782,4 +1770,3 @@ impl Iterator for QueryRunner<'_> {
         }
     }
 }
-
