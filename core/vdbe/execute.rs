@@ -264,10 +264,10 @@ pub fn op_drop_index(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(DropIndex { index, db: _ }, insn);
+    load_insn!(DropIndex { index, db }, insn);
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store().is_some();
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         // In MVCC mode, track dropped index root pages so integrity_check knows about them.
         // The btree pages won't be freed until checkpoint, so integrity_check needs to
         // include them to avoid "page never used" false positives.
@@ -344,11 +344,11 @@ pub fn op_checkpoint(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Checkpoint {
-            database: _,
+            database,
             checkpoint_mode,
             dest,
         },
@@ -361,6 +361,7 @@ pub fn op_checkpoint(
         // however.
         return Err(LimboError::TableLocked);
     }
+    let pager = program.get_pager_from_database_index(database);
     // Re-fetch mv_store from connection to get the latest value.
     // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
     // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "experimental_mvcc"`).
@@ -394,11 +395,7 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    let step_result = program.connection.pager.load().checkpoint(
-        *checkpoint_mode,
-        program.connection.get_sync_mode(),
-        true,
-    );
+    let step_result = pager.checkpoint(*checkpoint_mode, program.connection.get_sync_mode(), true);
     match step_result {
         Ok(IOResult::Done(CheckpointResult {
             wal_max_frame,
@@ -420,7 +417,7 @@ pub fn op_checkpoint(
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             tracing::error!("PRAGMA wal_checkpoint failed: {err:?}");
-            program.connection.pager.load().clear_checkpoint_state();
+            pager.clear_checkpoint_state();
             state.registers[*dest] = Register::Value(Value::from_i64(1));
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -2147,6 +2144,7 @@ pub fn op_halt_if_null(
 #[derive(Debug, Clone, Copy)]
 pub enum OpTransactionState {
     Start,
+    AttachedBeginWriteTx,
     CheckSchemaCookie,
     BeginStatement,
 }
@@ -2198,7 +2196,7 @@ pub fn op_transaction_inner(
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let write = matches!(tx_mode, TransactionMode::Write);
-                if write && conn.db.open_flags.contains(OpenFlags::ReadOnly) {
+                if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
                 }
 
@@ -2326,7 +2324,25 @@ pub fn op_transaction_inner(
                                 .to_string(),
                         ));
                     }
-                    if updated && matches!(current_state, TransactionState::None) {
+                    // For attached databases (db >= 2), always start read+write
+                    // transactions on the attached pager, since the connection-level
+                    // transaction state may already be Write from the main database.
+                    let is_attached = *db >= 2;
+                    if is_attached && matches!(tx_mode, TransactionMode::Write) {
+                        // If the pager already holds a read lock (e.g., after
+                        // SchemaUpdated reprepare), skip to schema cookie check
+                        // since locks persist across reprepare.
+                        if pager.holds_read_lock() {
+                            state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                            continue;
+                        }
+                        pager.begin_read_tx()?;
+                        // Transition to AttachedBeginWriteTx to handle begin_write_tx
+                        // separately, so if it returns IO we don't re-call begin_read_tx
+                        // on re-entry.
+                        state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
+                        continue;
+                    } else if updated && matches!(current_state, TransactionState::None) {
                         turso_assert!(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new read transaction"
@@ -2335,7 +2351,10 @@ pub fn op_transaction_inner(
                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
 
-                    if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
+                    if !is_attached
+                        && updated
+                        && matches!(new_transaction_state, TransactionState::Write { .. })
+                    {
                         turso_assert!(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
@@ -2385,6 +2404,16 @@ pub fn op_transaction_inner(
                 state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                 continue;
             }
+            // 3b. For attached databases, begin the write transaction after
+            // begin_read_tx has already completed in the Start state.
+            OpTransactionState::AttachedBeginWriteTx => {
+                let res = pager.begin_write_tx()?;
+                if let IOResult::IO(io) = res {
+                    return Ok(InsnFunctionStepResult::IO(io));
+                }
+                state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                continue;
+            }
             // 4. Check whether schema has changed if we are actually going to access the database.
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
@@ -2412,7 +2441,10 @@ pub fn op_transaction_inner(
                 state.op_transaction_state = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                if program.needs_stmt_subtransactions.load(Ordering::Relaxed) {
+                // Only begin statement subtransactions for the main database (db 0).
+                // Attached databases (db >= 2) don't manage their own statement
+                // subtransactions; the main pager's end_statement handles cleanup.
+                if *db == 0 && program.needs_stmt_subtransactions.load(Ordering::Relaxed) {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
@@ -2498,6 +2530,10 @@ pub fn op_auto_commit(
                 pager.end_read_tx();
             } else {
                 pager.rollback_tx(&conn);
+            }
+            // Also rollback all attached database pagers
+            for attached_pager in conn.get_all_attached_pagers() {
+                attached_pager.rollback_attached();
             }
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
@@ -7898,18 +7934,12 @@ pub fn op_create_btree(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(CreateBtree { db, root, flags }, insn);
 
-    assert_eq!(*db, 0);
-
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
-    }
-    if *db > 0 {
-        // TODO: implement temp databases
-        todo!("temp databases not implemented yet");
     }
     let mv_store = program.connection.mv_store();
 
@@ -7919,6 +7949,7 @@ pub fn op_create_btree(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    let pager = program.get_pager_from_database_index(db);
     // FIXME: handle page cache is full
     let root_page = return_if_io!(pager.btree_create(flags));
     state.registers[*root] = Register::Value(Value::from_i64(root_page as i64));
@@ -7933,7 +7964,6 @@ pub fn op_index_method_create(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IndexMethodCreate { db, cursor_id }, insn);
-    assert_eq!(*db, 0);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -7965,7 +7995,6 @@ pub fn op_index_method_destroy(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IndexMethodDestroy { db, cursor_id }, insn);
-    assert_eq!(*db, 0);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -7997,7 +8026,6 @@ pub fn op_index_method_optimize(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IndexMethodOptimize { db, cursor_id }, insn);
-    assert_eq!(*db, 0);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -8030,7 +8058,7 @@ pub fn op_index_method_query(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IndexMethodQuery {
-            db,
+            db: _,
             cursor_id,
             start_reg,
             count_reg,
@@ -8038,7 +8066,6 @@ pub fn op_index_method_query(
         },
         insn
     );
-    assert_eq!(*db, 0);
     let mv_store = program.connection.mv_store();
     if let Some(_mv_store) = mv_store.as_ref() {
         todo!("MVCC is not supported yet");
@@ -8070,6 +8097,7 @@ pub fn op_destroy(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Destroy {
+            db,
             root,
             former_root_reg,
             is_temp,
@@ -8086,12 +8114,18 @@ pub fn op_destroy(
         return Ok(InsnFunctionStepResult::Step);
     }
 
+    let destroy_pager = if *db > 0 {
+        program.get_pager_from_database_index(db)
+    } else {
+        pager.clone()
+    };
+
     loop {
         match state.op_destroy_state {
             OpDestroyState::CreateCursor => {
                 // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
                 // table btree cursor for both.
-                let cursor = BTreeCursor::new(pager.clone(), *root, 0);
+                let cursor = BTreeCursor::new(destroy_pager.clone(), *root, 0);
                 state.op_destroy_state =
                     OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
             }
@@ -8149,15 +8183,10 @@ pub fn op_drop_table(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropTable { db, table_name, .. }, insn);
-    if *db > 0 {
-        return Err(LimboError::InternalError(
-            "Temporary databases are not implemented".to_string(),
-        ));
-    }
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store().is_some();
     {
-        conn.with_schema_mut(|schema| {
+        conn.with_database_schema_mut(*db, |schema| {
             // In MVCC mode, track dropped root pages so integrity_check knows about them.
             // The btree pages won't be freed until checkpoint, so integrity_check needs
             // to include them to avoid "page never used" false positives.
@@ -8197,14 +8226,10 @@ pub fn op_drop_view(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropView { db, view_name }, insn);
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
     let conn = program.connection.clone();
-    conn.with_schema_mut(|schema| {
-        schema.remove_view(view_name)?;
-        Ok::<(), crate::LimboError>(())
-    })?;
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.remove_view(view_name).ok();
+    });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8215,19 +8240,12 @@ pub fn op_drop_trigger(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        DropTrigger {
-            db: _,
-            trigger_name
-        },
-        insn
-    );
+    load_insn!(DropTrigger { db, trigger_name }, insn);
 
     let conn = program.connection.clone();
-    conn.with_schema_mut(|schema| {
-        schema.remove_trigger(trigger_name)?;
-        Ok::<(), crate::LimboError>(())
-    })?;
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.remove_trigger(trigger_name).ok();
+    });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8292,15 +8310,12 @@ pub fn op_page_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(PageCount { db, dest }, insn);
-    if *db > 0 {
-        // TODO: implement temp databases
-        todo!("temp databases not implemented yet");
-    }
+    let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
-    let count = match with_header(pager, mv_store.as_ref(), program, |header| {
+    let count = match with_header(&pager, mv_store.as_ref(), program, |header| {
         header.database_size.get()
     }) {
         Err(_) => 0.into(),
@@ -8318,13 +8333,7 @@ pub fn op_parse_schema(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        ParseSchema {
-            db: _,
-            where_clause,
-        },
-        insn
-    );
+    load_insn!(ParseSchema { db, where_clause }, insn);
 
     let conn = program.connection.clone();
     // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
@@ -8333,10 +8342,19 @@ pub fn op_parse_schema(
     conn.auto_commit.store(false, Ordering::SeqCst);
 
     let enable_triggers = conn.experimental_triggers_enabled();
+    // For attached databases, qualify the sqlite_schema table with the database name
+    let schema_table = if *db >= 2 {
+        let db_name = conn
+            .get_database_name_by_index(*db)
+            .unwrap_or_else(|| "main".to_string());
+        format!("{db_name}.sqlite_schema")
+    } else {
+        "sqlite_schema".to_string()
+    };
     let maybe_nested_stmt_err = if let Some(where_clause) = where_clause {
-        let stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
+        let stmt = conn.prepare(format!("SELECT * FROM {schema_table} WHERE {where_clause}"))?;
 
-        conn.with_schema_mut(|schema| {
+        conn.with_database_schema_mut(*db, |schema| {
             // TODO: This function below is synchronous, make it async
             let existing_views = schema.incremental_views.clone();
             conn.start_nested();
@@ -8350,9 +8368,9 @@ pub fn op_parse_schema(
             )
         })
     } else {
-        let stmt = conn.prepare("SELECT * FROM sqlite_schema")?;
+        let stmt = conn.prepare(format!("SELECT * FROM {schema_table}"))?;
 
-        conn.with_schema_mut(|schema| {
+        conn.with_database_schema_mut(*db, |schema| {
             // TODO: This function below is synchronous, make it async
             let existing_views = schema.incremental_views.clone();
             conn.start_nested();
@@ -8595,26 +8613,24 @@ pub fn op_read_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ReadCookie { db, dest, cookie }, insn);
-    if *db > 0 {
-        // TODO: implement temp databases
-        todo!("temp databases not implemented yet");
-    }
+    let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
 
-    let cookie_value = match with_header(pager, mv_store.as_ref(), program, |header| match cookie {
-        Cookie::ApplicationId => header.application_id.get().into(),
-        Cookie::UserVersion => header.user_version.get().into(),
-        Cookie::SchemaVersion => header.schema_cookie.get().into(),
-        Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
-        cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
-    }) {
-        Err(_) => 0.into(),
-        Ok(IOResult::Done(v)) => v,
-        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-    };
+    let cookie_value =
+        match with_header(&pager, mv_store.as_ref(), program, |header| match cookie {
+            Cookie::ApplicationId => header.application_id.get().into(),
+            Cookie::UserVersion => header.user_version.get().into(),
+            Cookie::SchemaVersion => header.schema_cookie.get().into(),
+            Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
+            cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
+        }) {
+            Err(_) => 0.into(),
+            Ok(IOResult::Done(v)) => v,
+            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        };
 
     state.registers[*dest] = Register::Value(Value::from_i64(cookie_value));
     state.pc += 1;
@@ -8625,7 +8641,7 @@ pub fn op_set_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SetCookie {
@@ -8636,13 +8652,11 @@ pub fn op_set_cookie(
         },
         insn
     );
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
+    let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
 
     return_if_io!(with_header_mut(
-        pager,
+        &pager,
         mv_store.as_ref(),
         program,
         |header| {
@@ -8656,18 +8670,21 @@ pub fn op_set_cookie(
                     header.incremental_vacuum_enabled = (*value as u32).into()
                 }
                 Cookie::SchemaVersion => {
-                    // we update transaction state to indicate that the schema has changed
-                    match program.connection.get_tx_state() {
-                    TransactionState::Write { .. } => {
-                        program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
-                    },
-                    TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                    TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                    TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
-                }
-                    program
-                        .connection
-                        .with_schema_mut(|schema| schema.schema_version = *value as u32);
+                    // Only mark schema_did_change on connection for main database (db 0).
+                    // Attached databases track their schema independently.
+                    if *db == 0 {
+                        match program.connection.get_tx_state() {
+                            TransactionState::Write { .. } => {
+                                program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
+                            },
+                            TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
+                            TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
+                            TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
+                        }
+                    }
+                    program.connection.with_database_schema_mut(*db, |schema| {
+                        schema.schema_version = *value as u32
+                    });
                     header.schema_cookie = (*value as u32).into();
                 }
                 cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
@@ -10433,14 +10450,14 @@ pub fn op_rename_table(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(RenameTable { from, to }, insn);
+    load_insn!(RenameTable { db, from, to }, insn);
 
     let normalized_from = normalize_ident(from.as_str());
     let normalized_to = normalize_ident(to.as_str());
 
     let conn = program.connection.clone();
 
-    conn.with_schema_mut(|schema| -> crate::Result<()> {
+    conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
@@ -10515,6 +10532,7 @@ pub fn op_drop_column(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         DropColumn {
+            db,
             table,
             column_index
         },
@@ -10525,8 +10543,7 @@ pub fn op_drop_column(
 
     let normalized_table_name = normalize_ident(table.as_str());
 
-    let column_name = {
-        let schema = conn.schema.read();
+    let column_name = conn.with_schema(*db, |schema| {
         let table = schema
             .tables
             .get(&normalized_table_name)
@@ -10538,9 +10555,9 @@ pub fn op_drop_column(
             .as_ref()
             .expect("column being ALTERed should be named")
             .clone()
-    };
+    });
 
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         let table = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -10563,8 +10580,7 @@ pub fn op_drop_column(
         });
     });
 
-    {
-        let schema = conn.schema.read();
+    conn.with_schema(*db, |schema| -> crate::Result<()> {
         if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
             for index in indexes {
                 if index
@@ -10578,11 +10594,12 @@ pub fn op_drop_column(
                 }
             }
         }
-    }
+        Ok(())
+    })?;
 
     // Update index.pos_in_table for all indexes.
     // For example, if the dropped column had index 2, then anything that was indexed on column 3 or higher should be decremented by 1.
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
@@ -10595,8 +10612,7 @@ pub fn op_drop_column(
         }
     });
 
-    {
-        let schema = conn.schema.read();
+    conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {view_name}");
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
@@ -10606,7 +10622,8 @@ pub fn op_drop_column(
                 ))
             })?;
         }
-    }
+        Ok(())
+    })?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10620,6 +10637,7 @@ pub fn op_add_column(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         AddColumn {
+            db,
             table,
             column,
             check_constraints
@@ -10629,7 +10647,7 @@ pub fn op_add_column(
 
     let conn = program.connection.clone();
 
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         let table_ref = schema
             .tables
             .get_mut(table)
@@ -10659,6 +10677,7 @@ pub fn op_alter_column(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         AlterColumn {
+            db,
             table: table_name,
             column_index,
             definition,
@@ -10670,8 +10689,7 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
-    let old_column_name = {
-        let schema = conn.schema.read();
+    let old_column_name = conn.with_schema(*db, |schema| {
         let table = schema
             .tables
             .get(&normalized_table_name)
@@ -10683,11 +10701,11 @@ pub fn op_alter_column(
             .as_ref()
             .expect("column being ALTERed should be named")
             .clone()
-    };
+    });
     let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
 
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         let table_arc = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -10787,25 +10805,27 @@ pub fn op_alter_column(
         }
     });
 
-    let schema = conn.schema.read();
     if *rename {
-        let table = schema
-            .tables
-            .get(&normalized_table_name)
-            .expect("table being ALTERed should be in schema");
-        let _column = table
-            .get_column_at(*column_index)
-            .expect("column being ALTERed should be in schema");
-        for (view_name, view) in schema.views.iter() {
-            let view_select_sql = format!("SELECT * FROM {view_name}");
-            // FIXME: this should rewrite the view to reference the new column name
-            let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
-                LimboError::ParseError(format!(
-                    "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
-                    old_column_name, view.sql,
-                ))
-            })?;
-        }
+        conn.with_schema(*db, |schema| -> crate::Result<()> {
+            let table = schema
+                .tables
+                .get(&normalized_table_name)
+                .expect("table being ALTERed should be in schema");
+            let _column = table
+                .get_column_at(*column_index)
+                .expect("column being ALTERed should be in schema");
+            for (view_name, view) in schema.views.iter() {
+                let view_select_sql = format!("SELECT * FROM {view_name}");
+                // FIXME: this should rewrite the view to reference the new column name
+                let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
+                    LimboError::ParseError(format!(
+                        "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
+                        old_column_name, view.sql,
+                    ))
+                })?;
+            }
+            Ok(())
+        })?;
     }
 
     state.pc += 1;
@@ -11549,19 +11569,14 @@ pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
 }
 
 pub fn op_max_pgcnt(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MaxPgcnt { db, dest, new_max }, insn);
 
-    if *db > 0 {
-        return Err(LimboError::InternalError(
-            "temp/attached databases not implemented yet".to_string(),
-        ));
-    }
-
+    let pager = program.get_pager_from_database_index(db);
     let result_value = if *new_max == 0 {
         // If new_max is 0, just return current maximum without changing it
         pager.get_max_page_count()
@@ -11631,16 +11646,13 @@ fn op_journal_mode_inner(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     use crate::storage::sqlite3_ondisk::begin_write_btree_page;
 
     load_insn!(JournalMode { db, dest, new_mode }, insn);
-    if *db > 0 {
-        return Err(LimboError::InternalError(
-            "temp/attached databases not implemented yet".to_string(),
-        ));
-    }
+    let pager = program.get_pager_from_database_index(db);
+    let pager = &pager;
 
     loop {
         match state.op_journal_mode_state.sub_state {

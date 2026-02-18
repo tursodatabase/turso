@@ -138,6 +138,10 @@ pub struct ProgramBuilder {
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
+    /// Set of database IDs that need write transactions (for attached databases).
+    write_databases: std::collections::HashSet<usize>,
+    /// Schema cookies for attached databases at prepare time.
+    write_database_cookies: std::collections::HashMap<usize, u32>,
     rollback: bool,
     /// The mode in which the query is being executed.
     query_mode: QueryMode,
@@ -389,6 +393,8 @@ impl ProgramBuilder {
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
             txn_mode: TransactionMode::None,
+            write_databases: std::collections::HashSet::new(),
+            write_database_cookies: std::collections::HashMap::new(),
             rollback: false,
             query_mode,
             current_parent_explain_idx: None,
@@ -1301,10 +1307,17 @@ impl ProgramBuilder {
     }
 
     /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
-    /// TODO: as we currently do not support multiple dbs
-    /// this function just sets a write operation/transaction for the current db
     pub fn begin_write_operation(&mut self) {
         self.txn_mode = TransactionMode::Write;
+        self.write_databases.insert(0);
+    }
+
+    /// Begin a write operation on a specific database (for attached databases).
+    pub fn begin_write_on_database(&mut self, database_id: usize, schema_cookie: u32) {
+        self.txn_mode = TransactionMode::Write;
+        self.write_databases.insert(database_id);
+        self.write_database_cookies
+            .insert(database_id, schema_cookie);
     }
 
     pub fn begin_read_operation(&mut self) {
@@ -1346,11 +1359,27 @@ impl ProgramBuilder {
             self.preassign_label_to_next_insn(self.init_label);
 
             if !matches!(self.txn_mode, TransactionMode::None) {
+                // Emit Transaction for main database (db 0) always
                 self.emit_insn(Insn::Transaction {
                     db: 0,
                     tx_mode: self.txn_mode,
                     schema_cookie: schema.schema_version,
                 });
+                // Emit Transaction for each attached database that needs a write
+                for &db_id in &self.write_databases.clone() {
+                    if db_id >= 2 {
+                        let cookie = self
+                            .write_database_cookies
+                            .get(&db_id)
+                            .copied()
+                            .unwrap_or(0);
+                        self.emit_insn(Insn::Transaction {
+                            db: db_id,
+                            tx_mode: self.txn_mode,
+                            schema_cookie: cookie,
+                        });
+                    }
+                }
             }
 
             if !self.constant_spans.is_empty() {
@@ -1504,6 +1533,7 @@ impl ProgramBuilder {
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
             prepare_context: PrepareContext::from_connection(&connection),
+            write_databases: self.write_databases,
         };
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }

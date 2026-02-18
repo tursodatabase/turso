@@ -1275,6 +1275,7 @@ pub fn emit_query<'a>(
         &plan.where_clause,
         &plan.join_order,
         &mut plan.non_from_clause_subqueries,
+        None,
     )?;
 
     if plan.is_simple_count() {
@@ -1409,6 +1410,7 @@ fn emit_program_for_delete(
         &plan.where_clause,
         &join_order,
         &mut plan.non_from_clause_subqueries,
+        Some(connection),
     )?;
 
     // If there's a rowset_plan, materialize rowids into a RowSet first and then iterate the RowSet
@@ -1446,7 +1448,10 @@ fn emit_program_for_delete(
             });
 
             // Open all indexes for writing (needed for DELETE)
-            for index in resolver.schema.get_indices(table_ref.table.get_name()) {
+            let write_indices: Vec<_> = connection.with_schema(table_ref.database_id, |s| {
+                s.get_indices(table_ref.table.get_name()).cloned().collect()
+            });
+            for index in &write_indices {
                 let index_cursor_id = program.alloc_cursor_index(
                     Some(CursorKey::index(table_ref.internal_id, index.clone())),
                     index,
@@ -1543,13 +1548,16 @@ fn emit_program_for_delete(
 
 pub fn emit_fk_child_decrement_on_delete(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     child_tbl: &BTreeTable,
     child_table_name: &str,
     child_cursor_id: usize,
     child_rowid_reg: usize,
+    database_id: usize,
+    connection: &Arc<Connection>,
 ) -> crate::Result<()> {
-    for fk_ref in resolver.schema.resolved_fks_for_child(child_table_name)? {
+    for fk_ref in
+        connection.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
+    {
         if !fk_ref.fk.deferred {
             continue;
         }
@@ -1577,11 +1585,10 @@ pub fn emit_fk_child_decrement_on_delete(
 
         if fk_ref.parent_uses_rowid {
             // Probe parent table by rowid
-            let parent_tbl = resolver
-                .schema
-                .get_btree_table(&fk_ref.fk.parent_table)
+            let parent_tbl = connection
+                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                 .expect("parent btree");
-            let pcur = open_read_table(program, &parent_tbl);
+            let pcur = open_read_table(program, &parent_tbl, database_id);
 
             let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
             let val = if col.is_rowid_alias() {
@@ -1625,12 +1632,11 @@ pub fn emit_fk_child_decrement_on_delete(
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
-            let parent_tbl = resolver
-                .schema
-                .get_btree_table(&fk_ref.fk.parent_table)
+            let parent_tbl = connection
+                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                 .expect("parent btree");
             let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
-            let icur = open_read_index(program, idx);
+            let icur = open_read_index(program, idx, database_id);
 
             // Build probe from current child row
             let n = fk_ref.child_cols.len();
@@ -1718,15 +1724,13 @@ fn emit_delete_insns<'a>(
         }
     };
     let btree_table = unsafe { &*table_reference }.btree();
+    let database_id = unsafe { (*table_reference).database_id };
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
-        has_relevant_triggers_type_only(
-            t_ctx.resolver.schema,
-            TriggerEvent::Delete,
-            None,
-            &btree_table,
-        )
+        connection.with_schema(database_id, |s| {
+            has_relevant_triggers_type_only(s, TriggerEvent::Delete, None, &btree_table)
+        })
     } else {
         false
     };
@@ -1851,11 +1855,9 @@ fn emit_delete_row_common(
     let table_name = unsafe { &*table_reference }.table.get_name();
 
     if connection.foreign_keys_enabled() {
+        let delete_db_id = unsafe { (*table_reference).database_id };
         if let Some(table) = unsafe { &*table_reference }.btree() {
-            if t_ctx
-                .resolver
-                .schema
-                .any_resolved_fks_referencing(table_name)
+            if connection.with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
             {
                 // Use sub-program based FK actions (CASCADE, SET NULL, SET DEFAULT, and NO ACTION)
                 fire_fk_delete_actions(
@@ -1865,16 +1867,18 @@ fn emit_delete_row_common(
                     main_table_cursor_id,
                     rowid_reg,
                     connection,
+                    delete_db_id,
                 )?;
             }
-            if t_ctx.resolver.schema.has_child_fks(table_name) {
+            if connection.with_schema(delete_db_id, |s| s.has_child_fks(table_name)) {
                 emit_fk_child_decrement_on_delete(
                     program,
-                    &t_ctx.resolver,
                     &table,
                     table_name,
                     main_table_cursor_id,
                     rowid_reg,
+                    delete_db_id,
+                    connection,
                 )?;
             }
         }
@@ -1892,10 +1896,13 @@ fn emit_delete_row_common(
         });
     } else {
         // Delete from all indexes before deleting from the main table.
-        let indexes = t_ctx.resolver.schema.get_indices(table_name);
+        let db_id = unsafe { (*table_reference).database_id };
+        let all_indices: Vec<_> =
+            connection.with_schema(db_id, |s| s.get_indices(table_name).cloned().collect());
 
         // Get indexes to delete from (skip the iteration index if specified)
-        let indexes_to_delete = indexes
+        let indexes_to_delete = all_indices
+            .iter()
             .filter(|index| {
                 skip_iteration_index
                     .as_ref()
@@ -2041,14 +2048,12 @@ fn emit_delete_insns_when_triggers_present(
         return Err(crate::LimboError::ReadOnly);
     }
     let btree_table = unsafe { &*table_reference }.btree();
+    let database_id = unsafe { (*table_reference).database_id };
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
-        has_relevant_triggers_type_only(
-            t_ctx.resolver.schema,
-            TriggerEvent::Delete,
-            None,
-            &btree_table,
-        )
+        connection.with_schema(database_id, |s| {
+            has_relevant_triggers_type_only(s, TriggerEvent::Delete, None, &btree_table)
+        })
     } else {
         false
     };
@@ -2068,15 +2073,17 @@ fn emit_delete_insns_when_triggers_present(
 
     // Fire BEFORE DELETE triggers
     if let Some(btree_table) = unsafe { &*table_reference }.btree() {
-        let relevant_triggers = get_relevant_triggers_type_and_time(
-            t_ctx.resolver.schema,
-            TriggerEvent::Delete,
-            TriggerTime::Before,
-            None,
-            &btree_table,
-        );
-        let has_relevant_triggers = relevant_triggers.clone().count() > 0;
-        if has_relevant_triggers {
+        let relevant_triggers: Vec<_> = connection.with_schema(database_id, |s| {
+            get_relevant_triggers_type_and_time(
+                s,
+                TriggerEvent::Delete,
+                TriggerTime::Before,
+                None,
+                &btree_table,
+            )
+            .collect()
+        });
+        if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg
                 .expect("columns_start_reg must be provided when there are triggers or RETURNING");
             let old_registers = (0..cols_len)
@@ -2086,14 +2093,14 @@ fn emit_delete_insns_when_triggers_present(
             // If the program has a trigger_conflict_override, propagate it to the trigger context.
             let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
                 TriggerContext::new_with_override_conflict(
-                    btree_table.clone(),
+                    btree_table,
                     None, // No NEW for DELETE
                     Some(old_registers),
                     override_conflict,
                 )
             } else {
                 TriggerContext::new(
-                    btree_table.clone(),
+                    btree_table,
                     None, // No NEW for DELETE
                     Some(old_registers),
                 )
@@ -2106,6 +2113,7 @@ fn emit_delete_insns_when_triggers_present(
                     trigger,
                     &trigger_ctx,
                     connection,
+                    database_id,
                 )?;
             }
         }
@@ -2134,15 +2142,17 @@ fn emit_delete_insns_when_triggers_present(
 
     // Fire AFTER DELETE triggers
     if let Some(btree_table) = unsafe { &*table_reference }.btree() {
-        let relevant_triggers = get_relevant_triggers_type_and_time(
-            t_ctx.resolver.schema,
-            TriggerEvent::Delete,
-            TriggerTime::After,
-            None,
-            &btree_table,
-        );
-        let has_relevant_triggers = relevant_triggers.clone().count() > 0;
-        if has_relevant_triggers {
+        let relevant_triggers: Vec<_> = connection.with_schema(database_id, |s| {
+            get_relevant_triggers_type_and_time(
+                s,
+                TriggerEvent::Delete,
+                TriggerTime::After,
+                None,
+                &btree_table,
+            )
+            .collect()
+        });
+        if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg
                 .expect("columns_start_reg must be provided when there are triggers or RETURNING");
             let old_registers = (0..cols_len)
@@ -2153,14 +2163,14 @@ fn emit_delete_insns_when_triggers_present(
             let trigger_ctx_after =
                 if let Some(override_conflict) = program.trigger_conflict_override {
                     TriggerContext::new_with_override_conflict(
-                        btree_table.clone(),
+                        btree_table,
                         None, // No NEW for DELETE
                         Some(old_registers),
                         override_conflict,
                     )
                 } else {
                     TriggerContext::new(
-                        btree_table.clone(),
+                        btree_table,
                         None, // No NEW for DELETE
                         Some(old_registers),
                     )
@@ -2173,6 +2183,7 @@ fn emit_delete_insns_when_triggers_present(
                     trigger,
                     &trigger_ctx_after,
                     connection,
+                    database_id,
                 )?;
             }
         }
@@ -2301,9 +2312,16 @@ fn emit_program_for_update(
         &plan.where_clause,
         &join_order,
         &mut plan.non_from_clause_subqueries,
+        Some(connection),
     )?;
 
     // Prepare index cursors
+    let target_database_id = plan
+        .table_references
+        .joined_tables()
+        .first()
+        .map(|t| t.database_id)
+        .unwrap_or(0);
     let mut index_cursors = Vec::with_capacity(plan.indexes_to_update.len());
     for index in &plan.indexes_to_update {
         let index_cursor = if let Some(cursor) = program.resolve_cursor_id_safe(&CursorKey::index(
@@ -2320,7 +2338,7 @@ fn emit_program_for_update(
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cursor,
                 root_page: RegisterOrLiteral::Literal(index.root_page),
-                db: 0,
+                db: target_database_id,
             });
             cursor
         };
@@ -2355,7 +2373,9 @@ fn emit_program_for_update(
     // iteration and reuse that cursor instead of opening a new one.
     let all_index_cursors = if matches!(program.resolve_type, ResolveType::Replace) {
         let table_name = target_table.table.get_name();
-        let all_indexes = resolver.schema.get_indices(table_name);
+        let all_indexes: Vec<_> = connection.with_schema(target_database_id, |s| {
+            s.get_indices(table_name).cloned().collect()
+        });
         let source_table = plan
             .table_references
             .joined_tables()
@@ -2374,6 +2394,7 @@ fn emit_program_for_update(
         };
 
         all_indexes
+            .into_iter()
             .map(|index| {
                 // Check if this index already has a cursor opened (from indexes_to_update)
                 let existing_cursor = plan
@@ -2392,18 +2413,18 @@ fn emit_program_for_update(
                     // This index is not in indexes_to_update and not used for iteration
                     // Open a new cursor
                     let cursor = program
-                        .alloc_cursor_index(None, index)
+                        .alloc_cursor_index(None, &index)
                         .expect("to allocate index cursor");
                     program.emit_insn(Insn::OpenWrite {
                         cursor_id: cursor,
                         root_page: RegisterOrLiteral::Literal(index.root_page),
-                        db: 0,
+                        db: target_database_id,
                     });
                     cursor
                 };
                 (index, cursor)
             })
-            .collect::<Vec<(&Arc<Index>, usize)>>()
+            .collect::<Vec<(Arc<Index>, usize)>>()
     } else {
         Vec::new()
     };
@@ -2686,7 +2707,7 @@ fn emit_update_insns<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     program: &mut ProgramBuilder,
     index_cursors: &[(usize, usize)],
-    all_index_cursors: &[(&Arc<Index>, usize)],
+    all_index_cursors: &[(Arc<Index>, usize)],
     iteration_cursor_id: usize,
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
@@ -2872,18 +2893,23 @@ fn emit_update_insns<'a>(
     }
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
+    let update_database_id = target_table.database_id;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
         target_table.table.btree()
     {
         let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
-            t_ctx.resolver.schema,
-            TriggerEvent::Update,
-            TriggerTime::Before,
-            Some(updated_column_indices.clone()),
-            &btree_table,
-        );
+        let relevant_before_update_triggers: Vec<_> =
+            connection.with_schema(update_database_id, |s| {
+                get_relevant_triggers_type_and_time(
+                    s,
+                    TriggerEvent::Update,
+                    TriggerTime::Before,
+                    Some(updated_column_indices.clone()),
+                    &btree_table,
+                )
+                .collect()
+            });
         // Read OLD row values for trigger context
         let old_registers: Vec<usize> = (0..col_len)
             .map(|i| {
@@ -2893,8 +2919,7 @@ fn emit_update_insns<'a>(
             })
             .chain(std::iter::once(beg))
             .collect();
-        let has_relevant_triggers = relevant_before_update_triggers.clone().count() > 0;
-        if !has_relevant_triggers {
+        if relevant_before_update_triggers.is_empty() {
             Some(old_registers)
         } else {
             // NEW row values are already in 'start' registers
@@ -2926,6 +2951,7 @@ fn emit_update_insns<'a>(
                     trigger,
                     &trigger_ctx,
                     connection,
+                    update_database_id,
                 )?;
             }
 
@@ -2938,16 +2964,17 @@ fn emit_update_insns<'a>(
                 ),
             });
 
-            let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
-                t_ctx.resolver.schema,
-                TriggerEvent::Update,
-                TriggerTime::After,
-                Some(updated_column_indices),
-                &btree_table,
-            )
-            .clone()
-            .count()
-                > 0;
+            let has_relevant_after_triggers = connection.with_schema(update_database_id, |s| {
+                get_relevant_triggers_type_and_time(
+                    s,
+                    TriggerEvent::Update,
+                    TriggerTime::After,
+                    Some(updated_column_indices),
+                    &btree_table,
+                )
+                .count()
+                    > 0
+            });
             if has_relevant_after_triggers {
                 // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
                 // (since registers might be overwritten during trigger execution)
@@ -3022,31 +3049,29 @@ fn emit_update_insns<'a>(
                 start,
                 rowid_new_reg,
             )?;
-            if t_ctx.resolver.schema.has_child_fks(table_name) {
+            if connection.with_schema(update_database_id, |s| s.has_child_fks(table_name)) {
                 // Child-side checks:
                 // this ensures updated row still satisfies child FKs that point OUT from this table
                 emit_fk_child_update_counters(
                     program,
-                    &t_ctx.resolver,
                     &table_btree,
                     table_name,
                     target_table_cursor_id,
                     start,
                     rowid_new_reg,
                     &set_clauses.iter().map(|(i, _)| *i).collect::<HashSet<_>>(),
+                    update_database_id,
+                    connection,
                 )?;
             }
             // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
             // This checks that no child rows reference the old parent key values.
             // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
-            if t_ctx
-                .resolver
-                .schema
-                .any_resolved_fks_referencing(table_name)
-            {
+            if connection.with_schema(update_database_id, |s| {
+                s.any_resolved_fks_referencing(table_name)
+            }) {
                 emit_fk_update_parent_actions(
                     program,
-                    &t_ctx.resolver,
                     &table_btree,
                     indexes_to_update.iter(),
                     target_table_cursor_id,
@@ -3055,6 +3080,8 @@ fn emit_update_insns<'a>(
                     rowid_new_reg,
                     rowid_set_clause_reg,
                     set_clauses,
+                    update_database_id,
+                    connection,
                 )?;
             }
         }
@@ -3821,10 +3848,9 @@ fn emit_update_insns<'a>(
         // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
         // This ensures the new parent key exists when cascade actions update child rows
         if connection.foreign_keys_enabled()
-            && t_ctx
-                .resolver
-                .schema
-                .any_resolved_fks_referencing(table_name)
+            && connection.with_schema(update_database_id, |s| {
+                s.any_resolved_fks_referencing(table_name)
+            })
         {
             let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
             // OLD column values are stored in preserved_old_registers (contiguous registers)
@@ -3840,6 +3866,7 @@ fn emit_update_insns<'a>(
                 start, // new_values_start
                 new_rowid_reg,
                 connection,
+                update_database_id,
             )?;
         }
 
@@ -3847,15 +3874,17 @@ fn emit_update_insns<'a>(
         if let Some(btree_table) = target_table.table.btree() {
             let updated_column_indices: HashSet<usize> =
                 set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-            let relevant_triggers = get_relevant_triggers_type_and_time(
-                t_ctx.resolver.schema,
-                TriggerEvent::Update,
-                TriggerTime::After,
-                Some(updated_column_indices),
-                &btree_table,
-            );
-            let has_relevant_triggers = relevant_triggers.clone().count() > 0;
-            if has_relevant_triggers {
+            let relevant_triggers: Vec<_> = connection.with_schema(update_database_id, |s| {
+                get_relevant_triggers_type_and_time(
+                    s,
+                    TriggerEvent::Update,
+                    TriggerTime::After,
+                    Some(updated_column_indices),
+                    &btree_table,
+                )
+                .collect()
+            });
+            if !relevant_triggers.is_empty() {
                 let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
                 let new_registers_after = (0..col_len)
                     .map(|i| start + i)
@@ -3869,14 +3898,14 @@ fn emit_update_insns<'a>(
                 let trigger_ctx_after =
                     if let Some(override_conflict) = program.trigger_conflict_override {
                         TriggerContext::new_with_override_conflict(
-                            btree_table.clone(),
+                            btree_table,
                             Some(new_registers_after),
                             old_registers_after, // OLD values preserved from BEFORE trigger
                             override_conflict,
                         )
                     } else {
                         TriggerContext::new(
-                            btree_table.clone(),
+                            btree_table,
                             Some(new_registers_after),
                             old_registers_after, // OLD values preserved from BEFORE trigger
                         )
@@ -3889,6 +3918,7 @@ fn emit_update_insns<'a>(
                         trigger,
                         &trigger_ctx_after,
                         connection,
+                        update_database_id,
                     )?;
                 }
             }
@@ -4033,7 +4063,7 @@ pub fn prepare_cdc_if_necessary(
     program.emit_insn(Insn::OpenWrite {
         cursor_id,
         root_page: cdc_btree.root_page.into(),
-        db: 0, // todo(sivukhin): fix DB number when write will be supported for ATTACH
+        db: 0, // CDC table always lives in the main database
     });
     Ok(Some((cursor_id, cdc_btree)))
 }

@@ -44,7 +44,7 @@ use crate::{
         insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
-    Result,
+    Connection, Result,
 };
 
 // Metadata for handling LEFT JOIN operations
@@ -109,6 +109,7 @@ pub fn init_loop(
     where_clause: &[WhereTerm],
     join_order: &[JoinOrderMember],
     subqueries: &mut [NonFromClauseSubquery],
+    connection: Option<&Arc<Connection>>,
 ) -> Result<()> {
     assert!(
         t_ctx.meta_left_joins.len() == tables.joined_tables().len(),
@@ -209,7 +210,19 @@ pub fn init_loop(
                         });
                     }
                     // For delete, we need to open all the other indexes too for writing
-                    for index in t_ctx.resolver.schema.get_indices(&btree.name) {
+                    let indices: Vec<_> = if let Some(conn) = connection {
+                        conn.with_schema(table.database_id, |s| {
+                            s.get_indices(&btree.name).cloned().collect()
+                        })
+                    } else {
+                        t_ctx
+                            .resolver
+                            .schema
+                            .get_indices(&btree.name)
+                            .cloned()
+                            .collect()
+                    };
+                    for index in &indices {
                         if table
                             .op
                             .index()
@@ -305,7 +318,19 @@ pub fn init_loop(
                         // For DELETE, we need to open all the indexes for writing
                         // UPDATE opens these in emit_program_for_update() separately
                         if matches!(mode, OperationMode::DELETE) {
-                            for index in t_ctx.resolver.schema.get_indices(table.table.get_name()) {
+                            let indices: Vec<_> = if let Some(conn) = connection {
+                                conn.with_schema(table.database_id, |s| {
+                                    s.get_indices(table.table.get_name()).cloned().collect()
+                                })
+                            } else {
+                                t_ctx
+                                    .resolver
+                                    .schema
+                                    .get_indices(table.table.get_name())
+                                    .cloned()
+                                    .collect()
+                            };
+                            for index in &indices {
                                 if table
                                     .op
                                     .index()

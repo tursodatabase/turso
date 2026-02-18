@@ -521,23 +521,27 @@ pub fn emit_upsert(
     let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
 
     // Fire BEFORE UPDATE triggers
+    let upsert_database_id = ctx.database_id;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
         let updated_column_indices: HashSet<usize> =
             set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
-        let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
-            resolver.schema,
-            TriggerEvent::Update,
-            TriggerTime::Before,
-            Some(updated_column_indices.clone()),
-            &btree_table,
-        );
+        let relevant_before_update_triggers: Vec<_> =
+            connection.with_schema(upsert_database_id, |s| {
+                get_relevant_triggers_type_and_time(
+                    s,
+                    TriggerEvent::Update,
+                    TriggerTime::Before,
+                    Some(updated_column_indices.clone()),
+                    &btree_table,
+                )
+                .collect()
+            });
         // OLD row values are in current_start registers
         let old_registers: Vec<usize> = (0..num_cols)
             .map(|i| current_start + i)
             .chain(std::iter::once(ctx.conflict_rowid_reg))
             .collect();
-        let has_relevant_before_triggers = relevant_before_update_triggers.clone().count() > 0;
-        if has_relevant_before_triggers {
+        if !relevant_before_update_triggers.is_empty() {
             // NEW row values are in new_start registers
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_registers: Vec<usize> = (0..num_cols)
@@ -555,7 +559,14 @@ pub fn emit_upsert(
             );
 
             for trigger in relevant_before_update_triggers {
-                fire_trigger(program, resolver, trigger, &trigger_ctx, connection)?;
+                fire_trigger(
+                    program,
+                    resolver,
+                    trigger,
+                    &trigger_ctx,
+                    connection,
+                    upsert_database_id,
+                )?;
             }
 
             // BEFORE UPDATE triggers may have altered the btree, need to re-seek
@@ -565,15 +576,17 @@ pub fn emit_upsert(
                 target_pc: ctx.loop_labels.row_done,
             });
 
-            let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
-                resolver.schema,
-                TriggerEvent::Update,
-                TriggerTime::After,
-                Some(updated_column_indices),
-                &btree_table,
-            )
-            .count()
-                > 0;
+            let has_relevant_after_triggers = connection.with_schema(upsert_database_id, |s| {
+                get_relevant_triggers_type_and_time(
+                    s,
+                    TriggerEvent::Update,
+                    TriggerTime::After,
+                    Some(updated_column_indices),
+                    &btree_table,
+                )
+                .count()
+                    > 0
+            });
             if has_relevant_after_triggers {
                 // Preserve OLD registers for AFTER triggers
                 let preserved: Vec<usize> = old_registers
@@ -594,15 +607,17 @@ pub fn emit_upsert(
             }
         } else {
             // Check if we need to preserve for AFTER triggers
-            let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
-                resolver.schema,
-                TriggerEvent::Update,
-                TriggerTime::After,
-                Some(updated_column_indices),
-                &btree_table,
-            )
-            .count()
-                > 0;
+            let has_relevant_after_triggers = connection.with_schema(upsert_database_id, |s| {
+                get_relevant_triggers_type_and_time(
+                    s,
+                    TriggerEvent::Update,
+                    TriggerTime::After,
+                    Some(updated_column_indices),
+                    &btree_table,
+                )
+                .count()
+                    > 0
+            });
             if has_relevant_after_triggers {
                 Some(old_registers)
             } else {
@@ -632,23 +647,26 @@ pub fn emit_upsert(
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
 
             // Child-side checks
-            if resolver.schema.has_child_fks(bt.name.as_str()) {
+            if connection.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
                 emit_fk_child_update_counters(
                     program,
-                    resolver,
                     &bt,
                     table.get_name(),
                     ctx.cursor_id,
                     new_start,
                     rowid_new_reg,
                     &changed_cols,
+                    upsert_database_id,
+                    connection,
                 )?;
             }
+            let upsert_indices: Vec<_> = connection.with_schema(upsert_database_id, |s| {
+                s.get_indices(table.get_name()).cloned().collect()
+            });
             emit_parent_key_change_checks(
                 program,
-                resolver,
                 &bt,
-                resolver.schema.get_indices(table.get_name()).filter(|idx| {
+                upsert_indices.iter().filter(|idx| {
                     upsert_index_is_affected(table, idx, &changed_cols, rowid_changed)
                 }),
                 ctx.cursor_id,
@@ -657,6 +675,8 @@ pub fn emit_upsert(
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
                 rowid_set_clause_reg,
                 set_pairs,
+                upsert_database_id,
+                connection,
             )?;
         }
     }
@@ -952,9 +972,9 @@ pub fn emit_upsert(
     // This must be done after the update is complete but before AFTER triggers.
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled()
-            && resolver
-                .schema
-                .any_resolved_fks_referencing(bt.name.as_str())
+            && connection.with_schema(upsert_database_id, |s| {
+                s.any_resolved_fks_referencing(bt.name.as_str())
+            })
         {
             fire_fk_update_actions(
                 program,
@@ -965,6 +985,7 @@ pub fn emit_upsert(
                 new_start,              // new_values_start
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
                 connection,
+                upsert_database_id,
             )?;
         }
     }
@@ -1055,15 +1076,17 @@ pub fn emit_upsert(
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
         let updated_column_indices: HashSet<usize> =
             set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
-        let relevant_triggers = get_relevant_triggers_type_and_time(
-            resolver.schema,
-            TriggerEvent::Update,
-            TriggerTime::After,
-            Some(updated_column_indices),
-            &btree_table,
-        );
-        let has_relevant_triggers = relevant_triggers.clone().count() > 0;
-        if has_relevant_triggers {
+        let relevant_triggers: Vec<_> = connection.with_schema(upsert_database_id, |s| {
+            get_relevant_triggers_type_and_time(
+                s,
+                TriggerEvent::Update,
+                TriggerTime::After,
+                Some(updated_column_indices),
+                &btree_table,
+            )
+            .collect()
+        });
+        if !relevant_triggers.is_empty() {
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_registers_after: Vec<usize> = (0..num_cols)
                 .map(|i| new_start + i)
@@ -1073,14 +1096,21 @@ pub fn emit_upsert(
             // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
             // clauses should not suppress errors. Override conflict resolution to Abort.
             let trigger_ctx_after = TriggerContext::new_with_override_conflict(
-                btree_table.clone(),
+                btree_table,
                 Some(new_registers_after),
                 Some(old_regs),
                 ast::ResolveType::Abort,
             );
 
             for trigger in relevant_triggers {
-                fire_trigger(program, resolver, trigger, &trigger_ctx_after, connection)?;
+                fire_trigger(
+                    program,
+                    resolver,
+                    trigger,
+                    &trigger_ctx_after,
+                    connection,
+                    upsert_database_id,
+                )?;
             }
         }
     }

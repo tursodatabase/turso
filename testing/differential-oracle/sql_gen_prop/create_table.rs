@@ -650,6 +650,7 @@ pub fn create_table(
     profile: &StatementProfile,
 ) -> BoxedStrategy<CreateTableStatement> {
     let existing_names = schema.table_names();
+    let attached_databases = schema.attached_databases.clone();
 
     // Extract profile values from the CreateTableProfile
     let create_table_profile = profile.create_table_profile();
@@ -663,33 +664,53 @@ pub fn create_table(
         if_not_exists_with_probability(if_not_exists_prob),
         optional_primary_key(&pk_profile),
         proptest::collection::vec(column_def_with_profile(&column_profile), column_count_range),
+        // 50% chance of targeting an attached database when available
+        any::<proptest::sample::Index>(),
     )
-        .prop_map(|(table_name, if_not_exists, pk_col, other_cols)| {
-            let mut columns = Vec::with_capacity(other_cols.len() + 1);
-            if let Some(pk) = pk_col {
-                columns.push(pk);
-            }
-            columns.extend(other_cols);
+        .prop_map(
+            move |(table_name, if_not_exists, pk_col, other_cols, db_idx)| {
+                let mut columns = Vec::with_capacity(other_cols.len() + 1);
+                if let Some(pk) = pk_col {
+                    columns.push(pk);
+                }
+                columns.extend(other_cols);
 
-            // Ensure at least one column exists
-            if columns.is_empty() {
-                columns.push(ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Integer,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    default: None,
-                    check_constraint: None,
-                });
-            }
+                // Ensure at least one column exists
+                if columns.is_empty() {
+                    columns.push(ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                        default: None,
+                        check_constraint: None,
+                    });
+                }
 
-            CreateTableStatement {
-                table_name,
-                columns,
-                if_not_exists,
-            }
-        })
+                // Optionally qualify the table name with an attached database.
+                // We use a list of [None, Some("aux"), ...] to give ~50% chance to main.
+                let qualified_name = if attached_databases.is_empty() {
+                    table_name
+                } else {
+                    let mut choices: Vec<Option<&str>> = vec![None];
+                    for db in &attached_databases {
+                        choices.push(Some(db.as_str()));
+                    }
+                    let choice = db_idx.index(choices.len());
+                    match choices[choice] {
+                        Some(db) => format!("{db}.{table_name}"),
+                        None => table_name,
+                    }
+                };
+
+                CreateTableStatement {
+                    table_name: qualified_name,
+                    columns,
+                    if_not_exists,
+                }
+            },
+        )
         .boxed()
 }
 

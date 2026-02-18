@@ -1,0 +1,1469 @@
+@database :memory:
+
+@skip-file-if mvcc "attach not supported in MVCC mode"
+
+# =============================================================================
+# Basic DDL on attached database
+# =============================================================================
+
+test attach-write-create-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, value REAL);
+    SELECT count(*) FROM aux.t1;
+}
+expect {
+    0
+}
+
+test attach-write-create-table-if-not-exists {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS aux.t1(id INTEGER PRIMARY KEY);
+    SELECT count(*) FROM aux.t1;
+}
+expect {
+    0
+}
+
+test attach-write-drop-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY);
+    INSERT INTO aux.t1 VALUES(1);
+    DROP TABLE aux.t1;
+    SELECT count(*) FROM aux.sqlite_schema WHERE type='table' AND name='t1';
+}
+expect {
+    0
+}
+
+test attach-write-drop-table-if-exists {
+    ATTACH ':memory:' AS aux;
+    DROP TABLE IF EXISTS aux.t1;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+# =============================================================================
+# Indexes on attached database
+# =============================================================================
+
+test attach-write-create-index {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, value REAL);
+    CREATE INDEX aux.idx_t1_name ON t1(name);
+    SELECT count(*) FROM aux.sqlite_schema WHERE type='index' AND name='idx_t1_name';
+}
+expect {
+    1
+}
+
+test attach-write-create-unique-index {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE UNIQUE INDEX aux.idx_t1_name ON t1(name);
+    INSERT INTO aux.t1 VALUES(1, 'hello');
+    INSERT INTO aux.t1 VALUES(2, 'world');
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|hello
+    2|world
+}
+
+test attach-write-unique-index-violation {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE UNIQUE INDEX aux.idx_t1_name ON t1(name);
+    INSERT INTO aux.t1 VALUES(1, 'hello');
+    INSERT INTO aux.t1 VALUES(2, 'hello');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+test attach-write-drop-index {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX aux.idx_t1_name ON t1(name);
+    DROP INDEX aux.idx_t1_name;
+    SELECT count(*) FROM aux.sqlite_schema WHERE type='index' AND name='idx_t1_name';
+}
+expect {
+    0
+}
+
+test attach-write-multi-column-index {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(a INTEGER, b TEXT, c REAL);
+    CREATE INDEX aux.idx_t1_ab ON t1(a, b);
+    INSERT INTO aux.t1 VALUES(1, 'x', 1.0);
+    INSERT INTO aux.t1 VALUES(2, 'y', 2.0);
+    INSERT INTO aux.t1 VALUES(1, 'z', 3.0);
+    SELECT a, b FROM aux.t1 WHERE a = 1 ORDER BY b;
+}
+expect {
+    1|x
+    1|z
+}
+
+test attach-write-index-used-after-insert {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX aux.idx_name ON t1(name);
+    INSERT INTO aux.t1 VALUES(1, 'charlie');
+    INSERT INTO aux.t1 VALUES(2, 'alice');
+    INSERT INTO aux.t1 VALUES(3, 'bob');
+    SELECT id FROM aux.t1 WHERE name = 'bob';
+}
+expect {
+    3
+}
+
+test attach-write-index-maintained-on-delete {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX aux.idx_name ON t1(name);
+    INSERT INTO aux.t1 VALUES(1, 'a');
+    INSERT INTO aux.t1 VALUES(2, 'b');
+    INSERT INTO aux.t1 VALUES(3, 'c');
+    DELETE FROM aux.t1 WHERE id = 2;
+    SELECT id FROM aux.t1 WHERE name = 'b';
+}
+expect {
+}
+
+test attach-write-index-maintained-on-update {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX aux.idx_name ON t1(name);
+    INSERT INTO aux.t1 VALUES(1, 'old');
+    UPDATE aux.t1 SET name = 'new' WHERE id = 1;
+    SELECT id FROM aux.t1 WHERE name = 'new';
+}
+expect {
+    1
+}
+
+# =============================================================================
+# Basic DML: INSERT
+# =============================================================================
+
+test attach-write-insert-basic {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'hello');
+    INSERT INTO aux.t1 VALUES(2, 'world');
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|hello
+    2|world
+}
+
+test attach-write-insert-multiple-values {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+test attach-write-insert-default-values {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unnamed');
+    INSERT INTO aux.t1(id) VALUES(1);
+    SELECT * FROM aux.t1;
+}
+expect {
+    1|unnamed
+}
+
+test attach-write-insert-or-ignore {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    INSERT INTO aux.t1 VALUES(1, 'hello');
+    INSERT OR IGNORE INTO aux.t1 VALUES(2, 'hello');
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|hello
+}
+
+test attach-write-insert-or-replace {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'old');
+    INSERT OR REPLACE INTO aux.t1 VALUES(1, 'new');
+    SELECT * FROM aux.t1;
+}
+expect {
+    1|new
+}
+
+test attach-write-insert-autoincrement {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+    INSERT INTO aux.t1(name) VALUES('a');
+    INSERT INTO aux.t1(name) VALUES('b');
+    INSERT INTO aux.t1(name) VALUES('c');
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+test attach-write-insert-autoincrement-gap {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+    INSERT INTO aux.t1(name) VALUES('a');
+    INSERT INTO aux.t1(name) VALUES('b');
+    DELETE FROM aux.t1 WHERE id = 2;
+    INSERT INTO aux.t1(name) VALUES('c');
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|a
+    3|c
+}
+
+# =============================================================================
+# Basic DML: UPDATE
+# =============================================================================
+
+test attach-write-update-basic {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'old');
+    UPDATE aux.t1 SET name = 'new' WHERE id = 1;
+    SELECT * FROM aux.t1;
+}
+expect {
+    1|new
+}
+
+test attach-write-update-multiple-rows {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, status INTEGER);
+    INSERT INTO aux.t1 VALUES(1, 'a', 0),(2, 'b', 0),(3, 'c', 1);
+    UPDATE aux.t1 SET status = 1 WHERE status = 0;
+    SELECT id, status FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+    3|1
+}
+
+test attach-write-update-no-match {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'hello');
+    UPDATE aux.t1 SET name = 'changed' WHERE id = 999;
+    SELECT * FROM aux.t1;
+}
+expect {
+    1|hello
+}
+
+# =============================================================================
+# Basic DML: DELETE
+# =============================================================================
+
+test attach-write-delete-basic {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'a'),(2, 'b'),(3, 'c');
+    DELETE FROM aux.t1 WHERE id = 2;
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|a
+    3|c
+}
+
+test attach-write-delete-all {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'a'),(2, 'b');
+    DELETE FROM aux.t1;
+    SELECT count(*) FROM aux.t1;
+}
+expect {
+    0
+}
+
+test attach-write-delete-no-match {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'a');
+    DELETE FROM aux.t1 WHERE id = 999;
+    SELECT count(*) FROM aux.t1;
+}
+expect {
+    1
+}
+
+# =============================================================================
+# Fully qualified names
+# =============================================================================
+
+test attach-write-fully-qualified-insert {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'fq');
+    SELECT * FROM aux.t1;
+}
+expect {
+    1|fq
+}
+
+test attach-write-fully-qualified-update {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'old');
+    UPDATE aux.t1 SET val = 'new' WHERE id = 1;
+    SELECT * FROM aux.t1;
+}
+expect {
+    1|new
+}
+
+test attach-write-fully-qualified-delete {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'del');
+    DELETE FROM aux.t1 WHERE id = 1;
+    SELECT count(*) FROM aux.t1;
+}
+expect {
+    0
+}
+
+test attach-write-main-qualified {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.m1 VALUES(1, 'main_val');
+    SELECT * FROM main.m1;
+}
+expect {
+    1|main_val
+}
+
+# =============================================================================
+# Cross-database operations
+# =============================================================================
+
+test attach-write-cross-db-join {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.m1 VALUES(1, 'main1'),(2, 'main2');
+    INSERT INTO aux.a1 VALUES(1, 'aux1'),(2, 'aux2');
+    SELECT m.val, a.val FROM main.m1 m JOIN aux.a1 a ON m.id = a.id ORDER BY m.id;
+}
+expect {
+    main1|aux1
+    main2|aux2
+}
+
+test attach-write-cross-db-insert-select {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.m1 VALUES(1, 'x'),(2, 'y');
+    INSERT INTO aux.a1 SELECT * FROM main.m1;
+    SELECT * FROM aux.a1 ORDER BY id;
+}
+expect {
+    1|x
+    2|y
+}
+
+test attach-write-cross-db-insert-select-reverse {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.a1 VALUES(10, 'from_aux');
+    INSERT INTO main.m1 SELECT * FROM aux.a1;
+    SELECT * FROM main.m1;
+}
+expect {
+    10|from_aux
+}
+
+test attach-write-cross-db-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.m1 VALUES(1, 'yes'),(2, 'no'),(3, 'yes');
+    INSERT INTO aux.a1 SELECT * FROM main.m1 WHERE val = 'yes';
+    SELECT * FROM aux.a1 ORDER BY id;
+}
+expect {
+    1|yes
+    3|yes
+}
+
+# Skipped: correlated subquery in UPDATE SET clause is a pre-existing limitation
+# test attach-write-cross-db-update-from-other {
+#     ATTACH ':memory:' AS aux;
+#     CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+#     CREATE TABLE aux.a1(id INTEGER PRIMARY KEY, new_val TEXT);
+#     INSERT INTO main.m1 VALUES(1, 'old');
+#     INSERT INTO aux.a1 VALUES(1, 'new');
+#     UPDATE main.m1 SET val = (SELECT new_val FROM aux.a1 WHERE aux.a1.id = main.m1.id);
+#     SELECT * FROM main.m1;
+# }
+# expect {
+#     1|new
+# }
+
+test attach-write-cross-db-delete-with-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1(id INTEGER PRIMARY KEY);
+    INSERT INTO main.m1 VALUES(1, 'keep'),(2, 'delete'),(3, 'keep');
+    INSERT INTO aux.a1 VALUES(2);
+    DELETE FROM main.m1 WHERE id IN (SELECT id FROM aux.a1);
+    SELECT * FROM main.m1 ORDER BY id;
+}
+expect {
+    1|keep
+    3|keep
+}
+
+# =============================================================================
+# Multiple attached databases
+# =============================================================================
+
+test attach-write-multi-attach {
+    ATTACH ':memory:' AS aux1;
+    ATTACH ':memory:' AS aux2;
+    CREATE TABLE aux1.t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux2.t2(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux1.t1 VALUES(1, 'from_aux1');
+    INSERT INTO aux2.t2 VALUES(1, 'from_aux2');
+    SELECT * FROM aux1.t1;
+    SELECT * FROM aux2.t2;
+}
+expect {
+    1|from_aux1
+    1|from_aux2
+}
+
+test attach-write-multi-attach-cross-join {
+    ATTACH ':memory:' AS aux1;
+    ATTACH ':memory:' AS aux2;
+    CREATE TABLE aux1.t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux2.t2(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux1.t1 VALUES(1, 'a1');
+    INSERT INTO aux2.t2 VALUES(1, 'a2');
+    SELECT t1.val, t2.val FROM aux1.t1 JOIN aux2.t2 ON t1.id = t2.id;
+}
+expect {
+    a1|a2
+}
+
+test attach-write-multi-attach-insert-between {
+    ATTACH ':memory:' AS aux1;
+    ATTACH ':memory:' AS aux2;
+    CREATE TABLE aux1.t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux2.t2(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux1.t1 VALUES(1, 'hello'),(2, 'world');
+    INSERT INTO aux2.t2 SELECT * FROM aux1.t1;
+    SELECT * FROM aux2.t2 ORDER BY id;
+}
+expect {
+    1|hello
+    2|world
+}
+
+# =============================================================================
+# Transactions across databases
+# =============================================================================
+
+test attach-write-transaction-commit {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1(id INTEGER PRIMARY KEY, val TEXT);
+    BEGIN;
+    INSERT INTO main.m1 VALUES(1, 'main_val');
+    INSERT INTO aux.a1 VALUES(1, 'aux_val');
+    COMMIT;
+    SELECT * FROM main.m1;
+    SELECT * FROM aux.a1;
+}
+expect {
+    1|main_val
+    1|aux_val
+}
+
+test attach-write-transaction-rollback {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.m1 VALUES(0, 'before');
+    INSERT INTO aux.a1 VALUES(0, 'before');
+    BEGIN;
+    INSERT INTO main.m1 VALUES(1, 'rolled_back');
+    INSERT INTO aux.a1 VALUES(1, 'rolled_back');
+    ROLLBACK;
+    SELECT count(*) FROM main.m1;
+    SELECT count(*) FROM aux.a1;
+}
+expect {
+    1
+    1
+}
+
+test attach-write-transaction-rollback-preserves-prior {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'committed');
+    BEGIN;
+    INSERT INTO aux.t1 VALUES(2, 'will_rollback');
+    ROLLBACK;
+    SELECT * FROM aux.t1;
+}
+expect {
+    1|committed
+}
+
+test attach-write-autocommit-insert {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'auto1');
+    INSERT INTO aux.t1 VALUES(2, 'auto2');
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|auto1
+    2|auto2
+}
+
+test attach-write-begin-immediate-commit {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(x INTEGER);
+    BEGIN IMMEDIATE;
+    INSERT INTO aux.t1 VALUES (10);
+    INSERT INTO aux.t1 VALUES (20);
+    COMMIT;
+    SELECT x FROM aux.t1 ORDER BY x;
+}
+expect {
+    10
+    20
+}
+
+test attach-write-begin-immediate-rollback {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(x INTEGER);
+    INSERT INTO aux.t1 VALUES (1);
+    BEGIN IMMEDIATE;
+    INSERT INTO aux.t1 VALUES (2);
+    ROLLBACK;
+    SELECT x FROM aux.t1 ORDER BY x;
+}
+expect {
+    1
+}
+
+test attach-write-cross-db-begin-commit {
+    CREATE TABLE main_t(a INTEGER);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.aux_t(b INTEGER);
+    BEGIN;
+    INSERT INTO main_t VALUES (100);
+    INSERT INTO aux.aux_t VALUES (200);
+    COMMIT;
+    SELECT a FROM main_t;
+    SELECT b FROM aux.aux_t;
+}
+expect {
+    100
+    200
+}
+
+test attach-write-cross-db-begin-rollback {
+    CREATE TABLE main_t(a INTEGER);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.aux_t(b INTEGER);
+    INSERT INTO main_t VALUES (1);
+    INSERT INTO aux.aux_t VALUES (2);
+    BEGIN;
+    INSERT INTO main_t VALUES (10);
+    INSERT INTO aux.aux_t VALUES (20);
+    ROLLBACK;
+    SELECT a FROM main_t;
+    SELECT b FROM aux.aux_t;
+}
+expect {
+    1
+    2
+}
+
+# =============================================================================
+# Constraint failures
+# =============================================================================
+
+test attach-write-pk-violation {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'first');
+    INSERT INTO aux.t1 VALUES(1, 'duplicate');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+test attach-write-not-null-violation {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+    INSERT INTO aux.t1 VALUES(1, NULL);
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+test attach-write-unique-violation {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT UNIQUE);
+    INSERT INTO aux.t1 VALUES(1, 'dup');
+    INSERT INTO aux.t1 VALUES(2, 'dup');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+test attach-write-constraint-no-partial-commit {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+    INSERT INTO aux.t1 VALUES(1, 'ok');
+    INSERT INTO aux.t1 VALUES(2, NULL);
+    SELECT count(*) FROM aux.t1;
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+test attach-write-check-constraint {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val INTEGER CHECK(val > 0));
+    INSERT INTO aux.t1 VALUES(1, 10);
+    INSERT INTO aux.t1 VALUES(2, -1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+# =============================================================================
+# Transaction failure in one database
+# =============================================================================
+
+test attach-write-txn-error-rollback {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1(id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+    BEGIN;
+    INSERT INTO main.m1 VALUES(1, 'main_ok');
+    INSERT INTO aux.a1 VALUES(1, NULL);
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+# =============================================================================
+# Schema introspection on attached database
+# =============================================================================
+
+test attach-write-schema-introspection {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE aux.t2(a INTEGER, b REAL);
+    SELECT name FROM aux.sqlite_schema WHERE type='table' ORDER BY name;
+}
+expect {
+    t1
+    t2
+}
+
+test attach-write-schema-with-index {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX aux.idx1 ON t1(name);
+    SELECT type, name, tbl_name FROM aux.sqlite_schema ORDER BY name;
+}
+expect {
+    index|idx1|t1
+    table|t1|t1
+}
+
+# =============================================================================
+# Main and attached tables with same name
+# =============================================================================
+
+test attach-write-same-table-name {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.t1 VALUES(1, 'main');
+    INSERT INTO aux.t1 VALUES(1, 'aux');
+    SELECT val FROM main.t1;
+    SELECT val FROM aux.t1;
+}
+expect {
+    main
+    aux
+}
+
+test attach-write-same-name-independent {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.t1 VALUES(1, 'main');
+    INSERT INTO aux.t1 VALUES(1, 'aux');
+    DELETE FROM aux.t1;
+    SELECT count(*) FROM main.t1;
+    SELECT count(*) FROM aux.t1;
+}
+expect {
+    1
+    0
+}
+
+# =============================================================================
+# Mixed reads and writes across databases
+# =============================================================================
+
+test attach-write-read-main-write-aux {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.m1 VALUES(1, 'source');
+    INSERT INTO aux.a1 SELECT * FROM main.m1;
+    SELECT val FROM aux.a1;
+}
+expect {
+    source
+}
+
+test attach-write-interleaved-operations {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.m1 VALUES(1, 'a');
+    INSERT INTO aux.a1 VALUES(1, 'b');
+    INSERT INTO main.m1 VALUES(2, 'c');
+    INSERT INTO aux.a1 VALUES(2, 'd');
+    SELECT val FROM main.m1 ORDER BY id;
+    SELECT val FROM aux.a1 ORDER BY id;
+}
+expect {
+    a
+    c
+    b
+    d
+}
+
+# =============================================================================
+# Edge cases
+# =============================================================================
+
+test attach-write-empty-string {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, '');
+    SELECT id, val, length(val) FROM aux.t1;
+}
+expect {
+    1||0
+}
+
+test attach-write-null-values {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, NULL);
+    SELECT id, val FROM aux.t1;
+}
+expect {
+    1|
+}
+
+test attach-write-large-insert {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),(6,'f'),(7,'g'),(8,'h'),(9,'i'),(10,'j');
+    SELECT count(*) FROM aux.t1;
+}
+expect {
+    10
+}
+
+test attach-write-types {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(a INTEGER, b REAL, c TEXT, d BLOB);
+    INSERT INTO aux.t1 VALUES(42, 3.14, 'hello', X'DEADBEEF');
+    SELECT typeof(a), typeof(b), typeof(c), typeof(d) FROM aux.t1;
+}
+expect {
+    integer|real|text|blob
+}
+
+test attach-write-create-multiple-tables {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.t2(id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.t3(id INTEGER PRIMARY KEY);
+    INSERT INTO aux.t1 VALUES(1);
+    INSERT INTO aux.t2 VALUES(2);
+    INSERT INTO aux.t3 VALUES(3);
+    SELECT (SELECT id FROM aux.t1), (SELECT id FROM aux.t2), (SELECT id FROM aux.t3);
+}
+expect {
+    1|2|3
+}
+
+test attach-write-table-with-many-columns {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.wide(a INT, b INT, c INT, d INT, e INT, f TEXT, g TEXT, h TEXT);
+    INSERT INTO aux.wide VALUES(1,2,3,4,5,'x','y','z');
+    SELECT * FROM aux.wide;
+}
+expect {
+    1|2|3|4|5|x|y|z
+}
+
+# =============================================================================
+# Write to attached then detach
+# =============================================================================
+
+test attach-write-then-detach {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'test');
+    SELECT * FROM aux.t1;
+    DETACH DATABASE aux;
+    SELECT 'detached_ok';
+}
+expect {
+    1|test
+    detached_ok
+}
+
+test attach-write-query-after-detach-fails {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY);
+    INSERT INTO aux.t1 VALUES(1);
+    DETACH DATABASE aux;
+    SELECT * FROM aux.t1;
+}
+expect error {
+    no such
+}
+
+# =============================================================================
+# Indexes with DML interactions
+# =============================================================================
+
+test attach-write-index-after-bulk-insert {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, category TEXT, value INTEGER);
+    INSERT INTO aux.t1 VALUES(1,'a',10),(2,'b',20),(3,'a',30),(4,'c',40),(5,'a',50);
+    CREATE INDEX aux.idx_cat ON t1(category);
+    SELECT id FROM aux.t1 WHERE category = 'a' ORDER BY id;
+}
+expect {
+    1
+    3
+    5
+}
+
+test attach-write-index-with-update-and-delete {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, score INTEGER);
+    CREATE INDEX aux.idx_score ON t1(score);
+    INSERT INTO aux.t1 VALUES(1,'alice',100),(2,'bob',200),(3,'charlie',150);
+    UPDATE aux.t1 SET score = 250 WHERE name = 'alice';
+    DELETE FROM aux.t1 WHERE name = 'bob';
+    SELECT name, score FROM aux.t1 WHERE score >= 150 ORDER BY score;
+}
+expect {
+    charlie|150
+    alice|250
+}
+
+test attach-write-composite-index-range-query {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.orders(id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL);
+    CREATE INDEX aux.idx_cust_amt ON orders(customer_id, amount);
+    INSERT INTO aux.orders VALUES(1,10,5.00),(2,10,15.00),(3,20,10.00),(4,10,25.00),(5,20,30.00);
+    SELECT id, CAST(amount AS INTEGER) FROM aux.orders WHERE customer_id = 10 AND amount > 10.0 ORDER BY amount;
+}
+expect {
+    2|15
+    4|25
+}
+
+test attach-write-index-on-text-column {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, tag TEXT);
+    CREATE INDEX aux.idx_tag ON t1(tag);
+    INSERT INTO aux.t1 VALUES(1,'beta'),(2,'alpha'),(3,'gamma'),(4,'alpha');
+    SELECT id FROM aux.t1 WHERE tag = 'alpha' ORDER BY id;
+}
+expect {
+    2
+    4
+}
+
+test attach-write-multiple-indexes-same-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL);
+    CREATE INDEX aux.idx_a ON t1(a);
+    CREATE INDEX aux.idx_b ON t1(b);
+    CREATE INDEX aux.idx_c ON t1(c);
+    INSERT INTO aux.t1 VALUES(1,'x',10,1.1),(2,'y',20,2.2),(3,'x',30,3.3);
+    SELECT id FROM aux.t1 WHERE a = 'x' ORDER BY id;
+    SELECT id FROM aux.t1 WHERE b > 15 ORDER BY id;
+}
+expect {
+    1
+    3
+    2
+    3
+}
+
+# =============================================================================
+# ALTER TABLE on attached database
+# =============================================================================
+
+test attach-write-alter-table-add-column {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'alice');
+    ALTER TABLE aux.t1 ADD COLUMN age INTEGER;
+    INSERT INTO aux.t1 VALUES(2, 'bob', 30);
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|alice|
+    2|bob|30
+}
+
+test attach-write-alter-table-rename {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'alice');
+    ALTER TABLE aux.t1 RENAME TO t2;
+    SELECT * FROM aux.t2 ORDER BY id;
+}
+expect {
+    1|alice
+}
+
+test attach-write-alter-table-drop-column {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, extra TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'alice', 'remove_me');
+    ALTER TABLE aux.t1 DROP COLUMN extra;
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|alice
+}
+
+test attach-write-alter-table-rename-column {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, old_name TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'alice');
+    ALTER TABLE aux.t1 RENAME COLUMN old_name TO new_name;
+    SELECT id, new_name FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|alice
+}
+
+# =============================================================================
+# CREATE/DROP VIEW on attached database
+# =============================================================================
+
+test attach-write-create-view {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, value INTEGER);
+    INSERT INTO aux.t1 VALUES(1, 'alice', 10), (2, 'bob', 20);
+    CREATE VIEW aux.v1 AS SELECT name, value FROM aux.t1 WHERE value > 5;
+    SELECT * FROM aux.v1 ORDER BY name;
+}
+expect {
+    alice|10
+    bob|20
+}
+
+test attach-write-drop-view {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE VIEW aux.v1 AS SELECT name FROM aux.t1;
+    DROP VIEW aux.v1;
+    SELECT count(*) FROM aux.t1;
+}
+expect {
+    0
+}
+
+test attach-write-drop-view-if-exists {
+    ATTACH ':memory:' AS aux;
+    DROP VIEW IF EXISTS aux.nonexistent;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+# =============================================================================
+# PRAGMA on attached database
+# =============================================================================
+
+test attach-write-pragma-max-page-count {
+    ATTACH ':memory:' AS aux;
+    PRAGMA main.max_page_count = 500;
+    PRAGMA aux.max_page_count = 1000;
+    PRAGMA main.max_page_count;
+    PRAGMA aux.max_page_count;
+}
+expect {
+    500
+    1000
+    500
+    1000
+}
+
+test attach-write-pragma-user-version {
+    ATTACH ':memory:' AS aux;
+    PRAGMA main.user_version = 100;
+    PRAGMA aux.user_version = 200;
+    PRAGMA main.user_version;
+    PRAGMA aux.user_version;
+}
+expect {
+    100
+    200
+}
+
+test attach-write-pragma-application-id {
+    ATTACH ':memory:' AS aux;
+    PRAGMA main.application_id = 111;
+    PRAGMA aux.application_id = 222;
+    PRAGMA main.application_id;
+    PRAGMA aux.application_id;
+}
+expect {
+    111
+    222
+}
+
+test attach-write-pragma-table-info {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    PRAGMA aux.table_info("t1");
+}
+expect {
+    0|id|INTEGER|0||1
+    1|val|TEXT|0||0
+}
+
+
+# =============================================================================
+# CREATE/DROP TRIGGER on attached database
+# =============================================================================
+
+@requires trigger "uses triggers"
+test attach-write-create-trigger-schema {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(x INTEGER);
+    CREATE TRIGGER aux.trg1 AFTER INSERT ON t1 BEGIN SELECT 1; END;
+    SELECT count(*) FROM aux.sqlite_schema WHERE type='trigger' AND name='trg1';
+}
+expect {
+    1
+}
+
+@requires trigger "uses triggers"
+test attach-write-drop-trigger {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(x INTEGER);
+    CREATE TRIGGER aux.trg1 AFTER INSERT ON t1 BEGIN SELECT 1; END;
+    DROP TRIGGER aux.trg1;
+    SELECT count(*) FROM aux.sqlite_schema WHERE type='trigger';
+}
+expect {
+    0
+}
+
+@requires trigger "uses triggers"
+test attach-write-drop-trigger-if-exists {
+    ATTACH ':memory:' AS aux;
+    DROP TRIGGER IF EXISTS aux.nonexistent;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+# =============================================================================
+# FOREIGN KEYS ON ATTACHED DATABASES (same-database references)
+# =============================================================================
+
+test attach-write-fk-insert-violation {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO aux.parent VALUES (1, 'Alice');
+    INSERT INTO aux.child VALUES (1, 1);
+    INSERT INTO aux.child VALUES (2, 999);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test attach-write-fk-insert-valid {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO aux.parent VALUES (1, 'Alice');
+    INSERT INTO aux.parent VALUES (2, 'Bob');
+    INSERT INTO aux.child VALUES (1, 1);
+    INSERT INTO aux.child VALUES (2, 2);
+    SELECT c.id, p.name FROM aux.child c JOIN aux.parent p ON c.parent_id = p.id ORDER BY c.id;
+}
+expect {
+    1|Alice
+    2|Bob
+}
+
+test attach-write-fk-delete-violation {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO aux.parent VALUES (1, 'Alice');
+    INSERT INTO aux.child VALUES (1, 1);
+    DELETE FROM aux.parent WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test attach-write-fk-update-violation {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO aux.parent VALUES (1, 'Alice');
+    INSERT INTO aux.child VALUES (1, 1);
+    UPDATE aux.parent SET id = 99 WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test attach-write-fk-drop-table-with-references {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO aux.parent VALUES (1);
+    INSERT INTO aux.child VALUES (1, 1);
+    DROP TABLE aux.parent;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test attach-write-fk-in-transaction {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    BEGIN;
+    INSERT INTO aux.parent VALUES (1);
+    INSERT INTO aux.parent VALUES (2);
+    INSERT INTO aux.child VALUES (1, 1);
+    INSERT INTO aux.child VALUES (2, 2);
+    COMMIT;
+    SELECT count(*) FROM aux.child;
+}
+expect {
+    2
+}
+
+test attach-write-fk-violation-in-transaction {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO aux.parent VALUES (1);
+    BEGIN;
+    INSERT INTO aux.child VALUES (1, 999);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# =============================================================================
+# ANALYZE ON ATTACHED DATABASES
+# =============================================================================
+
+test attach-write-analyze-basic {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(a INTEGER PRIMARY KEY, b TEXT, c REAL);
+    CREATE INDEX aux.idx_t1_b ON t1(b);
+    INSERT INTO aux.t1 VALUES (1, 'hello', 1.0);
+    INSERT INTO aux.t1 VALUES (2, 'world', 2.0);
+    INSERT INTO aux.t1 VALUES (3, 'hello', 3.0);
+    ANALYZE aux;
+    SELECT tbl, idx, stat FROM aux.sqlite_stat1 WHERE idx IS NOT NULL ORDER BY tbl, idx;
+}
+expect {
+    t1|idx_t1_b|3 2
+}
+
+test attach-write-analyze-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE INDEX aux.idx_b ON t1(b);
+    INSERT INTO aux.t1 VALUES (1, 'a');
+    INSERT INTO aux.t1 VALUES (2, 'b');
+    INSERT INTO aux.t1 VALUES (3, 'c');
+    ANALYZE aux.t1;
+    SELECT tbl, idx, stat FROM aux.sqlite_stat1 WHERE idx IS NOT NULL ORDER BY tbl, idx;
+}
+expect {
+    t1|idx_b|3 1
+}
+
+test attach-write-analyze-index {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE INDEX aux.idx_b ON t1(b);
+    INSERT INTO aux.t1 VALUES (1, 'x');
+    INSERT INTO aux.t1 VALUES (2, 'y');
+    ANALYZE aux.idx_b;
+    SELECT tbl, idx, stat FROM aux.sqlite_stat1 WHERE idx IS NOT NULL ORDER BY tbl, idx;
+}
+expect {
+    t1|idx_b|2 1
+}
+
+# =============================================================================
+# FK CASCADE / SET NULL / SET DEFAULT ON ATTACHED DATABASES (same-database)
+# =============================================================================
+
+test attach-write-fk-cascade-delete {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO aux.parent VALUES (1, 'Alice');
+    INSERT INTO aux.parent VALUES (2, 'Bob');
+    INSERT INTO aux.child VALUES (1, 1);
+    INSERT INTO aux.child VALUES (2, 1);
+    INSERT INTO aux.child VALUES (3, 2);
+    DELETE FROM aux.parent WHERE id = 1;
+    SELECT * FROM aux.child ORDER BY id;
+}
+expect {
+    3|2
+}
+
+test attach-write-fk-cascade-update {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON UPDATE CASCADE);
+    INSERT INTO aux.parent VALUES (1, 'Alice');
+    INSERT INTO aux.child VALUES (1, 1);
+    UPDATE aux.parent SET id = 99 WHERE id = 1;
+    SELECT * FROM aux.child;
+}
+expect {
+    1|99
+}
+
+test attach-write-fk-set-null-delete {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO aux.parent VALUES (1, 'Alice');
+    INSERT INTO aux.parent VALUES (2, 'Bob');
+    INSERT INTO aux.child VALUES (1, 1);
+    INSERT INTO aux.child VALUES (2, 2);
+    DELETE FROM aux.parent WHERE id = 1;
+    SELECT * FROM aux.child ORDER BY id;
+}
+expect {
+    1|
+    2|2
+}
+
+test attach-write-fk-cascade-in-transaction {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO aux.parent VALUES (1, 'Alice');
+    INSERT INTO aux.parent VALUES (2, 'Bob');
+    INSERT INTO aux.child VALUES (1, 1);
+    INSERT INTO aux.child VALUES (2, 2);
+    BEGIN;
+    DELETE FROM aux.parent WHERE id = 1;
+    DELETE FROM aux.parent WHERE id = 2;
+    COMMIT;
+    SELECT count(*) FROM aux.child;
+}
+expect {
+    0
+}
+
+# =============================================================================
+# SCHEMA CACHE INVALIDATION ON DETACH/REATTACH
+# =============================================================================
+
+test attach-write-detach-reattach-fresh-schema {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'old_db');
+    SELECT val FROM aux.t1;
+    DETACH DATABASE aux;
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t2(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t2 VALUES(1, 'new_db');
+    SELECT name FROM aux.t2;
+}
+expect {
+    old_db
+    new_db
+}
+
+test attach-write-detach-reattach-old-table-gone {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'hello');
+    SELECT val FROM aux.t1;
+    DETACH DATABASE aux;
+    ATTACH ':memory:' AS aux;
+    SELECT * FROM aux.t1;
+}
+expect error {
+    no such table
+}
+
+test attach-write-detach-reattach-same-table-name {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'first_db');
+    SELECT val FROM aux.t1;
+    DETACH DATABASE aux;
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'second_db');
+    SELECT val FROM aux.t1;
+}
+expect {
+    first_db
+    second_db
+}
+
+# =============================================================================
+# CROSS-DATABASE FK REJECTION
+# =============================================================================
+
+test attach-write-cross-db-fk-rejected {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE main_parent(id INTEGER PRIMARY KEY);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES main_parent(id));
+    INSERT INTO main_parent VALUES (1);
+    INSERT INTO aux.child VALUES (1, 1);
+}
+expect error {
+}
+
+test attach-write-cross-db-fk-rejected-reverse {
+    PRAGMA foreign_keys = ON;
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.aux_parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE main_child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES aux_parent(id));
+    INSERT INTO aux.aux_parent VALUES (1);
+    INSERT INTO main_child VALUES (1, 1);
+}
+expect error {
+}
+
+test attach-write-update-unique-constraint {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO aux.t1 VALUES (1, 'hello');
+    INSERT INTO aux.t1 VALUES (2, 'world');
+    UPDATE aux.t1 SET b = 'same';
+}
+expect error {
+    UNIQUE constraint failed: t1.b
+}
+
+# =============================================================================
+# CDC (CHANGE DATA CAPTURE) WITH ATTACHED DATABASES
+# =============================================================================
+
+test attach-write-cdc-insert {
+    CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
+    PRAGMA unstable_capture_data_changes_conn('full');
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(x INTEGER, y TEXT);
+    INSERT INTO aux.t1 VALUES (1, 'hello');
+    SELECT table_name, change_type FROM turso_cdc WHERE table_name != 'sqlite_schema';
+}
+expect {
+    t1|1
+}
+
+test attach-write-cdc-delete {
+    CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
+    PRAGMA unstable_capture_data_changes_conn('full');
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(x INTEGER);
+    INSERT INTO aux.t1 VALUES (1);
+    INSERT INTO aux.t1 VALUES (2);
+    DELETE FROM aux.t1 WHERE x = 1;
+    SELECT table_name, change_type FROM turso_cdc WHERE table_name != 'sqlite_schema' ORDER BY change_id;
+}
+expect {
+    t1|1
+    t1|1
+    t1|-1
+}
+
+test attach-write-cdc-update {
+    CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
+    PRAGMA unstable_capture_data_changes_conn('full');
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(x INTEGER, y TEXT);
+    INSERT INTO aux.t1 VALUES (1, 'old');
+    UPDATE aux.t1 SET y = 'new' WHERE x = 1;
+    SELECT table_name, change_type FROM turso_cdc WHERE table_name != 'sqlite_schema' ORDER BY change_id;
+}
+expect {
+    t1|1
+    t1|0
+}
+

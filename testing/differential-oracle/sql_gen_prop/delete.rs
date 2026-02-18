@@ -51,7 +51,7 @@ pub fn delete_for_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<DeleteStatement> {
-    let table_name = table.name.clone();
+    let table_name = table.qualified_name();
 
     optional_where_clause(table, schema, profile)
         .prop_map(move |where_clause| DeleteStatement {

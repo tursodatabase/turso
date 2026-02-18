@@ -42,6 +42,8 @@ use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
+use crate::Connection;
+
 use super::{
     emitter::Resolver,
     plan::{
@@ -411,11 +413,16 @@ fn collect_index_method_candidates(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Schema) -> Result<()> {
+pub fn optimize_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<()> {
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, schema)?,
         Plan::Delete(plan) => optimize_delete_plan(plan, schema)?,
-        Plan::Update(plan) => optimize_update_plan(program, plan, schema)?,
+        Plan::Update(plan) => optimize_update_plan(program, plan, schema, connection)?,
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
@@ -554,6 +561,7 @@ fn optimize_update_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
     schema: &Schema,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
@@ -595,12 +603,15 @@ fn optimize_update_plan(
 
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
-        if has_relevant_triggers_type_only(
-            schema,
-            TriggerEvent::Update,
-            Some(&updated_cols),
-            btree_table,
-        ) {
+        let database_id = table_ref.database_id;
+        if connection.with_schema(database_id, |s| {
+            has_relevant_triggers_type_only(
+                s,
+                TriggerEvent::Update,
+                Some(&updated_cols),
+                btree_table,
+            )
+        }) {
             break 'requires true;
         }
 
