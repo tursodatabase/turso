@@ -546,6 +546,40 @@ pub fn translate_insert(
         }
     }
 
+    // For AUTOINCREMENT tables with an explicit rowid, update sqlite_sequence
+    // before CHECK constraints. SQLite updates sqlite_sequence even when
+    // INSERT OR IGNORE skips the row due to a CHECK failure.
+    if has_user_provided_rowid {
+        if let Some(AutoincMeta {
+            seq_cursor_id,
+            r_seq,
+            r_seq_rowid,
+            table_name_reg,
+        }) = ctx.autoincrement_meta
+        {
+            let skip_seq_update_label = program.allocate_label();
+            program.emit_insn(Insn::Le {
+                lhs: insertion.key_register(),
+                rhs: r_seq,
+                target_pc: skip_seq_update_label,
+                flags: Default::default(),
+                collation: None,
+            });
+
+            emit_update_sqlite_sequence(
+                program,
+                connection,
+                ctx.database_id,
+                seq_cursor_id,
+                r_seq_rowid,
+                table_name_reg,
+                insertion.key_register(),
+            )?;
+
+            program.preassign_label_to_next_insn(skip_seq_update_label);
+        }
+    }
+
     // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
     emit_check_constraints(
         program,

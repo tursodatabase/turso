@@ -1,0 +1,43 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id < 5), val TEXT);
+    INSERT INTO t(val) VALUES('row1');
+}
+
+@setup schema
+test insert-or-ignore-check-failure-updates-sequence {
+    INSERT OR IGNORE INTO t(id, val) VALUES(10, 'row10');
+    SELECT * FROM sqlite_sequence;
+}
+expect {
+    t|10
+}
+
+@setup schema
+test insert-or-ignore-check-failure-does-not-insert-row {
+    INSERT OR IGNORE INTO t(id, val) VALUES(10, 'row10');
+    SELECT * FROM t;
+}
+expect {
+    1|row1
+}
+
+@setup schema
+test insert-or-ignore-check-pass-updates-sequence {
+    INSERT OR IGNORE INTO t(id, val) VALUES(3, 'row3');
+    SELECT * FROM sqlite_sequence;
+}
+expect {
+    t|3
+}
+
+@setup schema
+test insert-or-ignore-check-pass-inserts-row {
+    INSERT OR IGNORE INTO t(id, val) VALUES(3, 'row3');
+    SELECT * FROM t;
+}
+expect {
+    1|row1
+    3|row3
+}
