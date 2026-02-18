@@ -1004,6 +1004,9 @@ pub fn translate_expr(
                     null_value,
                     invert,
                 });
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
                 return Ok(target_register);
             }
 
