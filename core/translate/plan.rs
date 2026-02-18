@@ -67,14 +67,23 @@ impl ResultSetColumn {
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
-                let joined_table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
-                if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
-                    if module.covered_columns.contains_key(column) {
-                        return None;
+                if let Some(joined_table_ref) = tables.find_joined_table_by_internal_id(*table) {
+                    if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
+                        if module.covered_columns.contains_key(column) {
+                            return None;
+                        }
                     }
+                    joined_table_ref
+                        .table
+                        .get_column_at(*column)
+                        .unwrap()
+                        .name
+                        .as_deref()
+                } else {
+                    // Column references an outer query table (correlated subquery).
+                    let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
+                    table_ref.get_column_at(*column).unwrap().name.as_deref()
                 }
-                let table_ref = &joined_table_ref.table;
-                table_ref.get_column_at(*column).unwrap().name.as_deref()
             }
             ast::Expr::RowId { table, .. } => {
                 // If there is a rowid alias column, use its name
@@ -733,6 +742,11 @@ pub struct OuterQueryReference {
     /// CTE ID if this is a CTE reference. Used to track CTE reference counts
     /// for materialization decisions.
     pub cte_id: Option<usize>,
+    /// When true, this entry is only for CTE definition lookup in subquery
+    /// FROM clauses, not for column resolution. This is set when the CTE
+    /// has been consumed by a FROM clause (with or without an alias), so
+    /// column resolution goes through the joined_table instead.
+    pub cte_definition_only: bool,
 }
 
 impl OuterQueryReference {
@@ -924,6 +938,21 @@ impl TableReferences {
             .find(|t| t.identifier == identifier)
     }
 
+    /// Marks the pre-planned [OuterQueryReference] with the given identifier as
+    /// "CTE definition only". This prevents it from being used for column
+    /// resolution while still allowing CTE definition lookup in subquery FROM
+    /// clauses. Called when a CTE is consumed by a FROM clause, since column
+    /// resolution is then handled by the joined_table entry instead.
+    pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
+        if let Some(outer_ref) = self
+            .outer_query_refs
+            .iter_mut()
+            .find(|t| t.identifier == identifier)
+        {
+            outer_ref.cte_definition_only = true;
+        }
+    }
+
     /// Returns the internal ID and immutable reference to the [Table] with the given identifier,
     pub fn find_table_and_internal_id_by_identifier(
         &self,
@@ -936,7 +965,7 @@ impl TableReferences {
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.identifier == identifier)
+                    .find(|t| t.identifier == identifier && !t.cte_definition_only)
                     .map(|t| (t.internal_id, &t.table))
             })
     }
@@ -1774,6 +1803,7 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
         } else if self.pos == self.seek_def.prefix.len() {
             match &self.seek_key.last_component {
                 SeekKeyComponent::Expr(expr) => Some(SeekKeyComponent::Expr(expr)),
+                SeekKeyComponent::Null => Some(SeekKeyComponent::Null),
                 SeekKeyComponent::None => None,
             }
         } else {
@@ -1793,6 +1823,8 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
         } else if self.pos == self.seek_def.prefix.len() {
             match &self.seek_key.last_component {
                 SeekKeyComponent::Expr(..) => Some(self.seek_key.affinity),
+                // NULL sentinel does not require conversion; use NONE affinity so width matches.
+                SeekKeyComponent::Null => Some(Affinity::Blob),
                 SeekKeyComponent::None => None,
             }
         } else {
@@ -1810,6 +1842,7 @@ impl SeekDef {
         self.prefix.len()
             + match key.last_component {
                 SeekKeyComponent::Expr(_) => 1,
+                SeekKeyComponent::Null => 1,
                 SeekKeyComponent::None => 0,
             }
     }
@@ -1837,16 +1870,15 @@ impl SeekDef {
     }
 }
 
-/// [SeekKeyComponent] enum represents optional last_component of the [SeekKey]
-///
-/// This component represented by separate enum instead of Option<E> because before there were third Sentinel value
-/// For now - we don't need this and it's enough to just either use some user-provided expression or omit last component of the key completely
-/// But as separate enum is almost never a harm - I decided to keep it here.
-///
-/// This enum accepts generic argument E in order to use both SeekKeyComponent<ast::Expr> and SeekKeyComponent<&ast::Expr>
+/// [SeekKeyComponent] represents the optional trailing component of a seek key.
+/// Besides user-provided expressions, planner logic may inject a synthetic NULL sentinel
+/// to encode SQLite-compatible boundary behavior on composite indexes.
+/// This enum accepts generic argument E so we can use both
+/// SeekKeyComponent<ast::Expr> and SeekKeyComponent<&ast::Expr>.
 #[derive(Debug, Clone)]
 pub enum SeekKeyComponent<E> {
     Expr(E),
+    Null,
     None,
 }
 

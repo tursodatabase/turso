@@ -262,9 +262,7 @@ impl TryFrom<u8> for ElementType {
             10 => Ok(Self::TEXTRAW),
             11 => Ok(Self::ARRAY),
             12 => Ok(Self::OBJECT),
-            13 => Ok(Self::RESERVED1),
-            14 => Ok(Self::RESERVED2),
-            15 => Ok(Self::RESERVED3),
+            13..=15 => bail_parse_error!("Invalid element type: {}", value),
             _ => bail_parse_error!("Failed to recognize jsonvalue type"),
         }
     }
@@ -3624,6 +3622,14 @@ mod tests {
         ]);
         let err = minus_only_int5.to_string().unwrap_err();
         assert!(err.to_string().contains("malformed JSON"));
+    }
+
+    #[test]
+    fn test_reserved_element_types_rejected() {
+        for value in [13_u8, 14, 15] {
+            let err = ElementType::try_from(value).unwrap_err();
+            assert!(err.to_string().contains("Invalid element type"));
+        }
     }
 
     #[test]

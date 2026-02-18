@@ -83,7 +83,7 @@ pub fn insert_for_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<InsertStatement> {
-    let table_name = table.name.clone();
+    let table_name = table.qualified_name();
     let columns = table.columns.clone();
     let functions = builtin_functions();
 

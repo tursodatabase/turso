@@ -15,5 +15,5 @@
     "sync/packages/native",
     "sync/packages/wasm"
   ],
-  "version": "0.5.0-pre.11"
+  "version": "0.5.0-pre.12"
 }

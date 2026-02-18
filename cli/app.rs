@@ -105,6 +105,7 @@ pub struct Limbo {
     read_state: ReadState,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
+    had_query_error: bool,
 }
 
 struct QueryStatistics {
@@ -265,6 +266,7 @@ impl Limbo {
             db_opts,
             rl: None,
             config: Some(config),
+            had_query_error: false,
         };
         app.first_run(has_sql, quiet)?;
         Ok((app, guard))
@@ -314,7 +316,7 @@ impl Limbo {
     fn handle_first_input(&mut self) -> Result<(), LimboError> {
         self.consume(true);
         self.close_conn()?;
-        std::process::exit(0);
+        std::process::exit(i32::from(self.had_query_error));
     }
 
     fn set_multiline_prompt(&mut self) {
@@ -409,6 +411,10 @@ impl Limbo {
 
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {
         self.interrupt_count.clone()
+    }
+
+    pub fn has_query_error(&self) -> bool {
+        self.had_query_error
     }
 
     fn toggle_echo(&mut self, arg: EchoMode) {
@@ -514,11 +520,14 @@ impl Limbo {
 
         let conn = self.conn.clone();
         let runner = conn.query_runner(input.as_bytes());
+        let had_error_before = self.had_query_error;
         for output in runner {
             if self
                 .print_query_result(input, output, stats.as_mut())
                 .is_err()
+                || self.had_query_error != had_error_before
             {
+                self.had_query_error = true;
                 break;
             }
         }
@@ -1183,6 +1192,7 @@ impl Limbo {
     }
 
     fn handle_step_error(&mut self, err: LimboError) {
+        self.had_query_error = true;
         match err {
             LimboError::Interrupt => {
                 let _ = self.writeln(LimboError::Interrupt.to_string());

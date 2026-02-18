@@ -365,6 +365,34 @@ expect {
     -9e999
 }
 
+test json_extract_malformed_json_1 {
+		SELECT json_extract(X'256162', '$');
+}
+expect error {
+    .*malformed JSON.*
+}
+
+test json_extract_malformed_json_2 {
+		SELECT json_extract(X'45312e652b', '$');
+}
+expect error {
+    .*malformed JSON.*
+}
+
+test json_extract_malformed_json_3 {
+		SELECT json_extract(X'35312e2e31', '$');
+}
+expect error {
+    .*malformed JSON.*
+}
+
+test json_extract_malformed_json_4 {
+		SELECT json_extract(X'266162', '$');
+}
+expect error {
+    .*malformed JSON.*
+}
+
 test json_extract_null {
     SELECT json_extract(null, '$')
 }
@@ -1557,6 +1585,13 @@ expect {
     -1.0e-99
 }
 
+test json_set_notation {
+		SELECT json_set(X'45312e652b', '$.x', 3);
+}
+expect {
+		1.e+
+}
+
 test json_set_blob_value {
     SELECT json_set(3906369340027029955, '$.' || char(8) || '' || CAST(zeroblob(27) AS TEXT) || '5!""!!!$.' || char(6) || '62=!""%!!!!!!QQQQQQQQQQ' || char(13) || CAST(zeroblob(3) AS TEXT), x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00');
 }
@@ -1675,6 +1710,13 @@ test json_insert_negative-expo {
 }
 expect {
     -1.0e-99
+}
+
+test json_insert_notation {
+		SELECT json_insert(X'45312e652b', '$.a', 1);
+}
+expect {
+		1.e+
 }
 
 test json_insert_new_key_in_nested_object {
@@ -2180,6 +2222,12 @@ expect {
 
 test json_remove_root {
     SELECT json_remove('{"a": 1}', '$')
+}
+expect {
+}
+
+test jsonb_remove_root {
+    SELECT jsonb_remove('{"a": 1}', '$');
 }
 expect {
 }

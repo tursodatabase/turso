@@ -1,13 +1,16 @@
 ---
 source: indexes.sqltest
-expression: "SELECT id, order_date, total_amount\n    FROM orders\n    WHERE customer_id = 100 AND order_date >= '2024-01-01' AND order_date < '2024-02-01';"
+expression: |-
+  SELECT id, order_date, total_amount
+      FROM orders
+      WHERE customer_id = 100 AND order_date >= '2024-01-01' AND order_date < '2024-02-01';
 info:
   statement_type: SELECT
   tables:
-    - orders
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SEARCH orders USING INDEX idx_orders_customer_date

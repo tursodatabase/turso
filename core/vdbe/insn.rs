@@ -1053,6 +1053,8 @@ pub enum Insn {
 
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
     Destroy {
+        /// The database index (0 = main, 1 = temp, 2+ = attached)
+        db: usize,
         /// The root page of the table/index to destroy
         root: i64,
         /// Register to store the former value of any moved root page (for AUTOVACUUM)
@@ -1321,19 +1323,23 @@ pub enum Insn {
         tables: Vec<IntegrityCheckTable>,
     },
     RenameTable {
+        db: usize,
         from: String,
         to: String,
     },
     DropColumn {
+        db: usize,
         table: String,
         column_index: usize,
     },
     AddColumn {
+        db: usize,
         table: String,
         column: Box<Column>,
         check_constraints: Vec<CheckConstraint>,
     },
     AlterColumn {
+        db: usize,
         table: String,
         column_index: usize,
         definition: Box<turso_parser::ast::ColumnDefinition>,
@@ -1476,7 +1482,7 @@ pub enum Insn {
     /// are deferred to execution time via this opcode.
     InitCdcVersion {
         cdc_table_name: String,
-        version: String,
+        version: crate::CdcVersion,
         cdc_mode: String,
     },
 }

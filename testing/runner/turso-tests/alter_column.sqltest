@@ -386,16 +386,6 @@ expect {
     CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES s(a))
 }
 
-test alter-table-add-column-with-composite-fk-updates-schema {
-    CREATE TABLE t(a, c);
-    CREATE TABLE s(a);
-    ALTER TABLE s ADD COLUMN b REFERENCES t(a, c);
-    SELECT sql FROM sqlite_schema WHERE name = 's';
-}
-expect {
-    CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a, c))
-}
-
 # NOT NULL column without default on EMPTY table should succeed (SQLite behavior)
 test alter-table-add-notnull-col-empty-table {
     CREATE TABLE t (a);
@@ -517,4 +507,3 @@ test alter-table-add-parens-default {
 expect {
     1|123|-456
 }
-

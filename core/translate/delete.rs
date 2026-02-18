@@ -28,9 +28,10 @@ pub fn translate_delete(
     limit: Option<Limit>,
     returning: Vec<ResultColumn>,
     with: Option<With>,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
+    let database_id = connection.resolve_database_id(tbl_name)?;
     let tbl_name = normalize_ident(tbl_name.name.as_str());
 
     // Check if this is a system table that should be protected from direct writes
@@ -41,8 +42,13 @@ pub fn translate_delete(
         crate::bail_parse_error!("table {} may not be modified", tbl_name);
     }
 
+    if database_id >= 2 {
+        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie);
+    }
+
     let mut delete_plan = prepare_delete_plan(
-        &mut program,
+        program,
         resolver,
         tbl_name,
         where_clause,
@@ -50,17 +56,18 @@ pub fn translate_delete(
         returning,
         with,
         connection,
+        database_id,
     )?;
 
     // Plan subqueries in the WHERE clause
     if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
         if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
             // When using rowset (triggers present), subqueries are in the rowset_plan's WHERE
-            plan_subqueries_from_select_plan(&mut program, rowset_plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(program, rowset_plan, resolver, connection)?;
         } else {
             // Normal path: subqueries are in the DELETE plan's WHERE
             plan_subqueries_from_where_clause(
-                &mut program,
+                program,
                 &mut delete_plan_inner.non_from_clause_subqueries,
                 &mut delete_plan_inner.table_references,
                 &mut delete_plan_inner.where_clause,
@@ -70,7 +77,7 @@ pub fn translate_delete(
         }
     }
 
-    optimize_plan(&mut program, &mut delete_plan, resolver.schema)?;
+    optimize_plan(program, &mut delete_plan, resolver.schema, connection)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Rewrite the Delete plan after optimization whenever a RowSet is used (DELETE triggers
         // are present), so the joined table is treated as a plain table scan again.
@@ -105,8 +112,8 @@ pub fn translate_delete(
         approx_num_labels: 0,
     };
     program.extend(&opts);
-    emit_program(connection, resolver, &mut program, delete_plan, |_| {})?;
-    Ok(program)
+    emit_program(connection, resolver, program, delete_plan, |_| {})?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -119,9 +126,10 @@ pub fn prepare_delete_plan(
     mut returning: Vec<ResultColumn>,
     with: Option<With>,
     connection: &Arc<crate::Connection>,
+    database_id: usize,
 ) -> Result<Plan> {
     let schema = resolver.schema;
-    let table = match schema.get_table(&tbl_name) {
+    let table = match connection.with_schema(database_id, |s| s.get_table(&tbl_name)) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", tbl_name),
     };
@@ -164,7 +172,7 @@ pub fn prepare_delete_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id: 0,
+        database_id,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
@@ -207,7 +215,11 @@ pub fn prepare_delete_plan(
     // to skip the rowset materialization.
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
-        .map(|bt| has_relevant_triggers_type_only(schema, TriggerEvent::Delete, None, bt))
+        .map(|bt| {
+            connection.with_schema(database_id, |s| {
+                has_relevant_triggers_type_only(s, TriggerEvent::Delete, None, bt)
+            })
+        })
         .unwrap_or(false);
 
     if has_delete_triggers {

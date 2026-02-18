@@ -1,14 +1,21 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT c.id, c.name, c.email\n    FROM customers c\n    WHERE NOT EXISTS (\n        SELECT 1\n        FROM orders o\n        WHERE o.customer_id = c.id\n    );"
+expression: |-
+  SELECT c.id, c.name, c.email
+      FROM customers c
+      WHERE NOT EXISTS (
+          SELECT 1
+          FROM orders o
+          WHERE o.customer_id = c.id
+      );
 info:
   statement_type: SELECT
   tables:
-    - customers
-    - orders
+  - customers
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN customers AS c

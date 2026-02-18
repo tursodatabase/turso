@@ -276,6 +276,20 @@ mod fuzz_tests {
                 rng.random_range(0..3000)
             ));
         }
+        // Add explicit NULL-bearing keys to exercise index ordering and seek/termination logic
+        // around NULLs in each indexed column position.
+        const NULL_KEY_ROWS: usize = 256;
+        for _ in 0..NULL_KEY_ROWS {
+            let y = rng.random_range(0..3000);
+            let z = rng.random_range(0..3000);
+            let x = rng.random_range(0..3000);
+            tuples.push(format!("(NULL, {y}, {z}, {})", rng.random_range(0..3000)));
+            tuples.push(format!("({x}, NULL, {z}, {})", rng.random_range(0..3000)));
+            tuples.push(format!("({x}, {y}, NULL, {})", rng.random_range(0..3000)));
+            tuples.push(format!("(NULL, NULL, {z}, {})", rng.random_range(0..3000)));
+            tuples.push(format!("({x}, NULL, NULL, {})", rng.random_range(0..3000)));
+            tuples.push(format!("(NULL, {y}, NULL, {})", rng.random_range(0..3000)));
+        }
         let insert = format!("INSERT INTO t VALUES {}", tuples.join(", "));
 
         let tmp_dir = TempDir::new().unwrap();

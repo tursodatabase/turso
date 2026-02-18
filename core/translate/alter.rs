@@ -99,6 +99,7 @@ fn default_requires_empty_table(expr: &ast::Expr) -> bool {
 /// 1. Checks if the table has any rows (Rewind)
 /// 2. Evaluates the CHECK expression with the column reference substituted by the DEFAULT
 /// 3. Halts with a CHECK constraint error if the result is false
+#[allow(clippy::too_many_arguments)]
 fn emit_add_column_check_validation(
     program: &mut ProgramBuilder,
     btree: &crate::schema::BTreeTable,
@@ -107,6 +108,7 @@ fn emit_add_column_check_validation(
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
     resolver: &Resolver,
+    database_id: usize,
 ) -> Result<()> {
     // Determine the effective default value. If no DEFAULT, existing rows get NULL,
     // which always passes CHECK per SQL standard (NULL is not false).
@@ -139,7 +141,7 @@ fn emit_add_column_check_validation(
     program.emit_insn(Insn::OpenRead {
         cursor_id: check_cursor_id,
         root_page: original_btree.root_page,
-        db: 0,
+        db: database_id,
     });
 
     let skip_check_label = program.allocate_label();
@@ -211,21 +213,29 @@ fn emit_add_column_check_validation(
 pub fn translate_alter_table(
     alter: ast::AlterTable,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     input: &str,
-) -> Result<ProgramBuilder> {
-    program.begin_write_operation();
+) -> Result<()> {
     let ast::AlterTable {
-        name: table_name,
+        name: qualified_name,
         body: alter_table,
     } = alter;
-    let table_name = table_name.name.as_str();
+    let database_id = connection.resolve_database_id(&qualified_name)?;
+    if database_id >= 2 {
+        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie);
+    }
+    program.begin_write_operation();
+    let table_name = qualified_name.name.as_str();
+    let schema_version = connection.with_schema(database_id, |s| s.schema_version);
     validate(&alter_table, table_name)?;
 
-    let table_indexes = resolver.schema.get_indices(table_name).collect::<Vec<_>>();
+    let table_indexes = connection.with_schema(database_id, |s| {
+        s.get_indices(table_name).cloned().collect::<Vec<_>>()
+    });
 
-    let Some(table) = resolver.schema.get_table(table_name) else {
+    let Some(table) = connection.with_schema(database_id, |s| s.get_table(table_name)) else {
         return Err(LimboError::ParseError(format!(
             "no such table: {table_name}"
         )));
@@ -240,6 +250,7 @@ pub fn translate_alter_table(
                 new_name_norm,
                 resolver,
                 connection,
+                database_id,
             );
         }
     }
@@ -248,7 +259,9 @@ pub fn translate_alter_table(
     };
 
     // Check if this table has dependent materialized views
-    let dependent_views = resolver.schema.get_dependent_materialized_views(table_name);
+    let dependent_views = connection.with_schema(database_id, |s| {
+        s.get_dependent_materialized_views(table_name)
+    });
     if !dependent_views.is_empty() {
         return Err(LimboError::ParseError(format!(
             "cannot alter table \"{table_name}\": it has dependent materialized view(s): {}",
@@ -258,7 +271,7 @@ pub fn translate_alter_table(
 
     let mut btree = (*original_btree).clone();
 
-    Ok(match alter_table {
+    match alter_table {
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
 
@@ -328,6 +341,7 @@ pub fn translate_alter_table(
                             cte_select: None,
                             cte_explicit_columns: vec![],
                             cte_id: None,
+                            cte_definition_only: false,
                         }],
                     );
                     let where_copy = index
@@ -404,7 +418,10 @@ pub fn translate_alter_table(
             // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
 
             // Check if any trigger owned by this table references the column being dropped
-            for trigger in resolver.schema.get_triggers_for_table(table_name) {
+            let triggers_for_table: Vec<_> = connection.with_schema(database_id, |s| {
+                s.get_triggers_for_table(table_name).cloned().collect()
+            });
+            for trigger in &triggers_for_table {
                 if trigger_references_column(trigger, &btree, column_name)? {
                     return Err(LimboError::ParseError(format!(
                         "cannot drop column \"{column_name}\": it is referenced in trigger {}",
@@ -451,7 +468,7 @@ pub fn translate_alter_table(
                     program.emit_insn(Insn::OpenWrite {
                         cursor_id,
                         root_page: RegisterOrLiteral::Literal(root_page),
-                        db: 0,
+                        db: database_id,
                     });
 
                     program.cursor_loop(cursor_id, |program, rowid| {
@@ -505,13 +522,14 @@ pub fn translate_alter_table(
                     });
 
                     program.emit_insn(Insn::SetCookie {
-                        db: 0,
+                        db: database_id,
                         cookie: Cookie::SchemaVersion,
-                        value: resolver.schema.schema_version as i32 + 1,
+                        value: schema_version as i32 + 1,
                         p5: 0,
                     });
 
                     program.emit_insn(Insn::DropColumn {
+                        db: database_id,
                         table: table_name,
                         column_index: dropped_index,
                     })
@@ -585,6 +603,12 @@ pub fn translate_alter_table(
                         clause,
                         defer_clause,
                     } => {
+                        if clause.columns.len() > 1 {
+                            return Err(LimboError::ParseError(format!(
+                                "foreign key on {new_column_name} should reference only one column of table {}",
+                                clause.tbl_name.as_str()
+                            )));
+                        }
                         let fk = ForeignKey {
                             parent_table: normalize_ident(clause.tbl_name.as_str()),
                             parent_columns: clause
@@ -713,7 +737,7 @@ pub fn translate_alter_table(
                 program.emit_insn(Insn::OpenRead {
                     cursor_id: check_cursor_id,
                     root_page: original_btree.root_page,
-                    db: 0,
+                    db: database_id,
                 });
 
                 let skip_error_label = program.allocate_label();
@@ -738,13 +762,14 @@ pub fn translate_alter_table(
             // value and evaluate it. If the result is false, we reject the ALTER when
             // the table has rows.
             emit_add_column_check_validation(
-                &mut program,
+                program,
                 &btree,
                 &original_btree,
                 new_column_name,
                 &column,
                 &constraints,
                 resolver,
+                database_id,
             )?;
 
             translate_update_for_schema_change(
@@ -755,12 +780,13 @@ pub fn translate_alter_table(
                 input,
                 |program| {
                     program.emit_insn(Insn::SetCookie {
-                        db: 0,
+                        db: database_id,
                         cookie: Cookie::SchemaVersion,
-                        value: resolver.schema.schema_version as i32 + 1,
+                        value: schema_version as i32 + 1,
                         p5: 0,
                     });
                     program.emit_insn(Insn::AddColumn {
+                        db: database_id,
                         table: table_name.to_owned(),
                         column: Box::new(column),
                         check_constraints: btree.check_constraints.clone(),
@@ -771,14 +797,13 @@ pub fn translate_alter_table(
         ast::AlterTableBody::RenameTo(new_name) => {
             let new_name = new_name.as_str();
 
-            if resolver.schema.get_table(new_name).is_some()
-                || resolver
-                    .schema
-                    .indexes
-                    .values()
-                    .flatten()
-                    .any(|index| index.name == normalize_ident(new_name))
-            {
+            if connection.with_schema(database_id, |s| {
+                s.get_table(new_name).is_some()
+                    || s.indexes
+                        .values()
+                        .flatten()
+                        .any(|index| index.name == normalize_ident(new_name))
+            }) {
                 return Err(LimboError::ParseError(format!(
                     "there is already another table or index with this name: {new_name}"
                 )));
@@ -799,7 +824,7 @@ pub fn translate_alter_table(
             program.emit_insn(Insn::OpenWrite {
                 cursor_id,
                 root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-                db: 0,
+                db: database_id,
             });
 
             program.cursor_loop(cursor_id, |program, rowid| {
@@ -860,18 +885,17 @@ pub fn translate_alter_table(
             });
 
             program.emit_insn(Insn::SetCookie {
-                db: 0,
+                db: database_id,
                 cookie: Cookie::SchemaVersion,
-                value: resolver.schema.schema_version as i32 + 1,
+                value: schema_version as i32 + 1,
                 p5: 0,
             });
 
             program.emit_insn(Insn::RenameTable {
+                db: database_id,
                 from: table_name.to_owned(),
                 to: new_name.to_owned(),
             });
-
-            program
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
         | ast::AlterTableBody::RenameColumn { .. }) => {
@@ -961,16 +985,20 @@ pub fn translate_alter_table(
             if rename {
                 // Find all triggers that might reference this column
                 let target_table_name_norm = normalize_ident(table_name);
-                for trigger in resolver.schema.triggers.values().flatten() {
+                let all_triggers: Vec<_> = connection.with_schema(database_id, |s| {
+                    s.triggers.values().flatten().cloned().collect()
+                });
+                for trigger in &all_triggers {
                     let trigger_table_name_norm = normalize_ident(&trigger.table_name);
 
                     // SQLite fails RENAME COLUMN if a trigger's WHEN clause references the column
                     // or if trigger commands contain qualified references to the trigger table (e.g., t.x)
                     if trigger_table_name_norm == target_table_name_norm {
                         let column_name_norm = normalize_ident(from);
-                        let trigger_table = resolver
-                            .schema
-                            .get_btree_table(&trigger_table_name_norm)
+                        let trigger_table = connection
+                            .with_schema(database_id, |s| {
+                                s.get_btree_table(&trigger_table_name_norm)
+                            })
                             .ok_or_else(|| {
                                 LimboError::ParseError(format!(
                                     "trigger table not found: {trigger_table_name_norm}"
@@ -1016,9 +1044,10 @@ pub fn translate_alter_table(
 
                     if trigger_table_name_norm == target_table_name_norm {
                         // Trigger is on the table being renamed - check for references
-                        let trigger_table = resolver
-                            .schema
-                            .get_btree_table(&trigger_table_name_norm)
+                        let trigger_table = connection
+                            .with_schema(database_id, |s| {
+                                s.get_btree_table(&trigger_table_name_norm)
+                            })
                             .ok_or_else(|| {
                                 LimboError::ParseError(format!(
                                     "trigger table not found: {trigger_table_name_norm}"
@@ -1076,7 +1105,7 @@ pub fn translate_alter_table(
             program.emit_insn(Insn::OpenWrite {
                 cursor_id,
                 root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-                db: 0,
+                db: database_id,
             });
 
             program.cursor_loop(cursor_id, |program, rowid| {
@@ -1166,7 +1195,7 @@ pub fn translate_alter_table(
                     )));
                 };
 
-                program = translate_update_for_schema_change(
+                translate_update_for_schema_change(
                     update,
                     resolver,
                     program,
@@ -1177,31 +1206,34 @@ pub fn translate_alter_table(
             }
 
             program.emit_insn(Insn::SetCookie {
-                db: 0,
+                db: database_id,
                 cookie: Cookie::SchemaVersion,
-                value: resolver.schema.schema_version as i32 + 1,
+                value: schema_version as i32 + 1,
                 p5: 0,
             });
             program.emit_insn(Insn::AlterColumn {
+                db: database_id,
                 table: table_name.to_owned(),
                 column_index,
                 definition: Box::new(definition),
                 rename,
             });
-
-            program
         }
-    })
+    };
+
+    Ok(())
 }
 
 fn translate_rename_virtual_table(
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     vtab: Arc<VirtualTable>,
     old_name: &str,
     new_name_norm: String,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
-) -> Result<ProgramBuilder> {
+    database_id: usize,
+) -> Result<()> {
+    let schema_version = connection.with_schema(database_id, |s| s.schema_version);
     program.begin_write_operation();
     let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
     program.emit_insn(Insn::VOpen {
@@ -1225,7 +1257,7 @@ fn translate_rename_virtual_table(
     program.emit_insn(Insn::OpenWrite {
         cursor_id: schema_cur,
         root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-        db: 0,
+        db: database_id,
     });
 
     program.cursor_loop(schema_cur, |program, rowid| {
@@ -1285,13 +1317,14 @@ fn translate_rename_virtual_table(
 
     // Bump schema cookie
     program.emit_insn(Insn::SetCookie {
-        db: 0,
+        db: database_id,
         cookie: Cookie::SchemaVersion,
-        value: resolver.schema.schema_version as i32 + 1,
+        value: schema_version as i32 + 1,
         p5: 0,
     });
 
     program.emit_insn(Insn::RenameTable {
+        db: database_id,
         from: old_name.to_owned(),
         to: new_name_norm,
     });
@@ -1303,7 +1336,7 @@ fn translate_rename_virtual_table(
         cursor_id: vtab_cur,
     });
 
-    Ok(program)
+    Ok(())
 }
 
 /* Triggers must be rewritten when a column is renamed, and DROP COLUMN on table T must be forbidden if any trigger on T references the column.

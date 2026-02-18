@@ -293,8 +293,9 @@ impl Statement {
             let mode = self.query_mode;
             debug_assert_eq!(QueryMode::new(&cmd), mode,);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+            let schema = conn.schema.read().clone();
             translate::translate(
-                conn.schema.read().deref(),
+                &schema,
                 stmt,
                 self.pager.clone(),
                 conn.clone(),

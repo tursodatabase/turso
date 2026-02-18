@@ -15,66 +15,77 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
-    Result,
+    Connection, Result,
 };
 use turso_parser::ast;
 
-pub fn translate_analyze(
-    target_opt: Option<ast::QualifiedName>,
-    resolver: &Resolver,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
-    // Collect all analyze targets up front so we can create/open sqlite_stat1 just once.
-    let analyze_targets: Vec<(Arc<BTreeTable>, Option<Arc<Index>>)> = match target_opt {
+/// A table paired with an optional specific index to analyze.
+type AnalyzeTarget = (Arc<BTreeTable>, Option<Arc<Index>>);
+
+/// Resolve the target database_id and collect analyze targets from the QualifiedName.
+///
+/// ANALYZE can target:
+/// - Nothing (None): analyze all tables in main (database_id = 0)
+/// - A database name ("main", "aux"): analyze all tables in that database
+/// - A table name: analyze all indexes on that table
+/// - A qualified table name (db.table): analyze in the specified database
+/// - An index name: analyze just that index
+fn resolve_analyze_targets(
+    target_opt: &Option<ast::QualifiedName>,
+    connection: &Arc<Connection>,
+) -> Result<(usize, Vec<AnalyzeTarget>)> {
+    match target_opt {
         Some(target) => {
             let normalized = normalize_ident(target.name.as_str());
-            let db_normalized = target
-                .db_name
-                .as_ref()
-                .map(|db| normalize_ident(db.as_str()));
-            let target_is_main =
-                normalized.eq_ignore_ascii_case("main") || db_normalized.as_deref() == Some("main");
-            if target_is_main {
-                resolver
-                    .schema
-                    .tables
-                    .iter()
-                    .filter_map(|(name, table)| {
-                        if RESERVED_TABLE_PREFIXES
-                            .iter()
-                            .any(|prefix| name.starts_with(prefix))
-                        {
-                            return None;
-                        }
-                        table.btree().map(|bt| (bt, None))
-                    })
-                    .collect()
-            } else if let Some(table) = resolver.schema.get_btree_table(&normalized) {
-                vec![(
-                    table, None, // analyze the whole table and its indexes
-                )]
-            } else {
-                // Try to find an index by this name.
-                let mut found: Option<(Arc<BTreeTable>, Arc<Index>)> = None;
-                for (table_name, indexes) in resolver.schema.indexes.iter() {
-                    if let Some(index) = indexes
-                        .iter()
-                        .find(|idx| idx.name.eq_ignore_ascii_case(&normalized))
-                    {
-                        if let Some(table) = resolver.schema.get_btree_table(table_name) {
-                            found = Some((table, index.clone()));
-                            break;
-                        }
-                    }
+
+            // If db_name is specified, resolve to that database
+            if let Some(db_name) = &target.db_name {
+                let database_id = connection.resolve_database_id(target)?;
+                let db_normalized = normalize_ident(db_name.as_str());
+
+                // "ANALYZE db.table" — the name part is the table/index
+                // But first check if the name is actually a database name too (shouldn't be with db_name set)
+                let targets = resolve_targets_in_db(&normalized, database_id, connection)?;
+                if targets.is_empty() {
+                    bail_parse_error!("no such table or index: {}.{}", db_normalized, normalized);
                 }
-                let Some((table, index)) = found else {
-                    bail_parse_error!("no such table or index: {}", target.name);
-                };
-                vec![(table, Some(index))]
+                return Ok((database_id, targets));
             }
+
+            // No db_name — check if the name is a database name first
+            if normalized.eq_ignore_ascii_case("main") {
+                let targets = collect_all_tables_in_db(0, connection);
+                return Ok((0, targets));
+            }
+
+            // Check if it's an attached database name
+            if let Some((db_id, _)) = connection.get_attached_database(&normalized) {
+                let targets = collect_all_tables_in_db(db_id, connection);
+                return Ok((db_id, targets));
+            }
+
+            // Not a database name — search main schema for table/index
+            let targets = resolve_targets_in_db(&normalized, 0, connection)?;
+            if targets.is_empty() {
+                bail_parse_error!("no such table or index: {}", target.name);
+            }
+            Ok((0, targets))
         }
-        None => resolver
-            .schema
+        None => {
+            // ANALYZE with no target — analyze all tables in main
+            let targets = collect_all_tables_in_db(0, connection);
+            Ok((0, targets))
+        }
+    }
+}
+
+/// Collect all user tables in the given database.
+fn collect_all_tables_in_db(
+    database_id: usize,
+    connection: &Arc<Connection>,
+) -> Vec<AnalyzeTarget> {
+    connection.with_schema(database_id, |schema| {
+        schema
             .tables
             .iter()
             .filter_map(|(name, table)| {
@@ -86,11 +97,56 @@ pub fn translate_analyze(
                 }
                 table.btree().map(|bt| (bt, None))
             })
-            .collect(),
-    };
+            .collect()
+    })
+}
+
+/// Resolve a name as a table or index within a specific database.
+fn resolve_targets_in_db(
+    name: &str,
+    database_id: usize,
+    connection: &Arc<Connection>,
+) -> Result<Vec<AnalyzeTarget>> {
+    // Try as a table first
+    let table_opt: Option<Arc<BTreeTable>> =
+        connection.with_schema(database_id, |s| s.get_btree_table(name));
+    if let Some(table) = table_opt {
+        return Ok(vec![(table, None)]);
+    }
+
+    // Try as an index
+    let found: Option<(Arc<BTreeTable>, Arc<Index>)> =
+        connection.with_schema(database_id, |schema| {
+            for (table_name, indexes) in schema.indexes.iter() {
+                if let Some(index) = indexes
+                    .iter()
+                    .find(|idx| idx.name.eq_ignore_ascii_case(name))
+                {
+                    if let Some(table) = schema.get_btree_table(table_name) {
+                        return Some((table, index.clone()));
+                    }
+                }
+            }
+            None
+        });
+    if let Some((table, index)) = found {
+        return Ok(vec![(table, Some(index))]);
+    }
+
+    Ok(vec![])
+}
+
+pub fn translate_analyze(
+    target_opt: Option<ast::QualifiedName>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    // Resolve the target database and collect analyze targets.
+    let (database_id, analyze_targets) = resolve_analyze_targets(&target_opt, connection)?;
 
     if analyze_targets.is_empty() {
-        return Ok(program);
+        return Ok(());
     }
 
     // This is emitted early because SQLite does, and thus generated VDBE matches a bit closer.
@@ -106,7 +162,9 @@ pub fn translate_analyze(
     let sqlite_stat1_btreetable: Arc<BTreeTable>;
     let sqlite_stat1_source: RegisterOrLiteral<_>;
 
-    if let Some(sqlite_stat1) = resolver.schema.get_btree_table("sqlite_stat1") {
+    let stat1_table: Option<Arc<BTreeTable>> =
+        connection.with_schema(database_id, |s| s.get_btree_table("sqlite_stat1"));
+    if let Some(sqlite_stat1) = stat1_table {
         sqlite_stat1_btreetable = sqlite_stat1.clone();
         sqlite_stat1_source = RegisterOrLiteral::Literal(sqlite_stat1.root_page);
     } else {
@@ -126,7 +184,7 @@ pub fn translate_analyze(
         // implemented.
         let table_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
-            db: 0,
+            db: database_id,
             root: table_root_reg,
             flags: CreateBTreeFlags::new_table(),
         });
@@ -136,17 +194,19 @@ pub fn translate_analyze(
         sqlite_stat1_btreetable = Arc::new(BTreeTable::from_sql(sql, 0)?);
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
-        let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+        let table = connection
+            .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+            .unwrap();
         let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
         program.emit_insn(Insn::OpenWrite {
             cursor_id: sqlite_schema_cursor_id,
             root_page: 1i64.into(),
-            db: 0,
+            db: database_id,
         });
 
         // Add the table entry to sqlite_schema
         emit_schema_entry(
-            &mut program,
+            program,
             resolver,
             sqlite_schema_cursor_id,
             None,
@@ -160,15 +220,16 @@ pub fn translate_analyze(
         let parse_schema_where_clause =
             "tbl_name = 'sqlite_stat1' AND type != 'trigger'".to_string();
         program.emit_insn(Insn::ParseSchema {
-            db: sqlite_schema_cursor_id,
+            db: database_id,
             where_clause: Some(parse_schema_where_clause),
         });
 
         // Bump schema cookie so subsequent statements reparse schema.
+        let schema_version = connection.with_schema(database_id, |s| s.schema_version);
         program.emit_insn(Insn::SetCookie {
-            db: 0,
+            db: database_id,
             cookie: Cookie::SchemaVersion,
-            value: resolver.schema.schema_version as i32 + 1,
+            value: schema_version as i32 + 1,
             p5: 0,
         });
     };
@@ -179,7 +240,7 @@ pub fn translate_analyze(
     program.emit_insn(Insn::OpenWrite {
         cursor_id: stat_cursor,
         root_page: sqlite_stat1_source,
-        db: 0,
+        db: database_id,
     });
 
     for (target_table, target_index) in analyze_targets {
@@ -282,7 +343,7 @@ pub fn translate_analyze(
         program.emit_insn(Insn::OpenRead {
             cursor_id: target_cursor,
             root_page: target_table.root_page,
-            db: 0,
+            db: database_id,
         });
         let rowid_reg = program.alloc_register();
         let tablename_reg = program.alloc_register();
@@ -345,21 +406,21 @@ pub fn translate_analyze(
         // Emit index stats for this table (or for a single index target).
         let indexes: Vec<Arc<Index>> = match target_index {
             Some(idx) => vec![idx],
-            None => resolver
-                .schema
-                .get_indices(&target_table.name)
-                .filter(|idx| idx.index_method.is_none()) // skip custom for now
-                .cloned()
-                .collect(),
+            None => connection.with_schema(database_id, |s| {
+                s.get_indices(&target_table.name)
+                    .filter(|idx| idx.index_method.is_none()) // skip custom for now
+                    .cloned()
+                    .collect()
+            }),
         };
         for index in indexes {
-            emit_index_stats(&mut program, stat_cursor, &target_table, &index);
+            emit_index_stats(program, stat_cursor, &target_table, &index, database_id);
         }
     }
 
     // FIXME: Emit LoadAnalysis
     // FIXME: Emit Expire
-    Ok(program)
+    Ok(())
 }
 
 /// Emit VDBE code to gather and insert statistics for a single index.
@@ -375,6 +436,7 @@ fn emit_index_stats(
     stat_cursor: usize,
     table: &Arc<BTreeTable>,
     index: &Arc<Index>,
+    database_id: usize,
 ) {
     let n_cols = index.columns.len();
     if n_cols == 0 {
@@ -386,7 +448,7 @@ fn emit_index_stats(
     program.emit_insn(Insn::OpenRead {
         cursor_id: idx_cursor,
         root_page: index.root_page,
-        db: 0,
+        db: database_id,
     });
 
     // Allocate registers contiguously for stat_push(accum, chng):

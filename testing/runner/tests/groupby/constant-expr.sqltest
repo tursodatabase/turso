@@ -1,0 +1,91 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(name TEXT);
+    INSERT INTO t VALUES ('a'), ('a'), ('b');
+}
+
+@setup schema
+test group-by-constant-string-in-select {
+    SELECT 'label:', name FROM t GROUP BY name;
+}
+expect {
+    label:|a
+    label:|b
+}
+
+@setup schema
+test group-by-constant-integer-in-select {
+    SELECT 42, name FROM t GROUP BY name;
+}
+expect {
+    42|a
+    42|b
+}
+
+@setup schema
+test group-by-constant-expr-in-select {
+    SELECT 1+1, name FROM t GROUP BY name;
+}
+expect {
+    2|a
+    2|b
+}
+
+test group-by-order-by-constant-float {
+    CREATE TABLE v0 (c1 INT);
+    INSERT INTO v0 VALUES (1), (2);
+    SELECT * FROM v0 GROUP BY c1 ORDER BY 58.058;
+}
+expect {
+    1
+    2
+}
+
+test group-by-order-by-constant-string {
+    CREATE TABLE v1 (c1 INT);
+    INSERT INTO v1 VALUES (1), (2);
+    SELECT * FROM v1 GROUP BY c1 ORDER BY 'hello';
+}
+expect {
+    1
+    2
+}
+
+test group-by-order-by-null {
+    CREATE TABLE v2 (c1 INT);
+    INSERT INTO v2 VALUES (1), (2);
+    SELECT * FROM v2 GROUP BY c1 ORDER BY NULL;
+}
+expect {
+    1
+    2
+}
+
+test group-by-cte-constant-order-by {
+    WITH cte AS (SELECT 1 GROUP BY 1.0 ORDER BY 1.0) SELECT * FROM cte;
+}
+expect {
+    1
+}
+
+@skip-if mvcc "views not supported in mvcc"
+test group-by-view-constant-order-by {
+    CREATE TABLE v3 (c1 INT);
+    INSERT INTO v3 VALUES (1), (2);
+    CREATE VIEW v4 AS SELECT * FROM v3 GROUP BY c1 ORDER BY STRFTIME('test');
+    SELECT * FROM v4;
+}
+expect {
+    1
+    2
+}
+
+test group-by-window-constant-order-by {
+    CREATE TABLE v5 (c1 INT, c2 TEXT, c3 INT);
+    INSERT INTO v5 VALUES (1, 'a', 10);
+    SELECT group_concat(c2) OVER (ORDER BY 0) FROM v5 GROUP BY c3 ORDER BY 1;
+}
+expect {
+    a
+}

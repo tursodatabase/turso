@@ -740,6 +740,46 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 #[turso_macros::test]
+fn test_prepare_rejects_empty_statements(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let empty_inputs = [
+        ";",
+        ";;;",
+        "   ",
+        "\n\t",
+        "-- comment",
+        "/* comment */",
+        "/**/",
+    ];
+
+    for sql in empty_inputs {
+        let Err(err) = conn.prepare(sql) else {
+            panic!("Expected invalid argument error for input: {sql}");
+        };
+        match err {
+            LimboError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("contains no statements"),
+                    "Unexpected error message for input {sql}: {msg}"
+                );
+            }
+            other => panic!("Unexpected error for input {sql}: {other}"),
+        }
+    }
+
+    let invalid_syntax_inputs = ["/* outer /* inner */ still outer */"];
+    for sql in invalid_syntax_inputs {
+        let Err(err) = conn.prepare(sql) else {
+            panic!("Expected parse error for input: {sql}");
+        };
+        match err {
+            LimboError::ParseError(_) | LimboError::LexerError(_) => {}
+            other => panic!("Unexpected error for input {sql}: {other}"),
+        }
+    }
+}
+
+#[turso_macros::test]
 /// Test that we can only join up to 63 tables, and trying to join more should fail with an error instead of panicing.
 fn test_max_joined_tables_limit(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
@@ -856,4 +896,41 @@ fn test_eval_param_only_once(tmp_db: TempDatabase) {
     let elapsed = end_time.duration_since(start_time);
     // the test will allocate 10^8 * 10^4 bytes in case if parameter will be evaluated for every row
     assert!(elapsed < std::time::Duration::from_millis(500));
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/5232
+/// SELECT with more than SQLITE_MAX_COLUMN (2000) columns should return an error,
+/// not panic from u16 overflow.
+#[turso_macros::test]
+fn test_too_many_columns_in_select(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    // 2001 columns should exceed the SQLITE_MAX_COLUMN limit of 2000
+    let columns = std::iter::repeat_n("1", 2001).collect::<Vec<_>>().join(",");
+    let query = format!("SELECT {columns}");
+    let result = conn.prepare(&query);
+    assert!(
+        result.is_err(),
+        "Expected error for SELECT with 2001 columns"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, LimboError::ParseError(ref msg) if msg.contains("too many columns")),
+        "Expected 'too many columns' error, got: {err}"
+    );
+
+    // 2000 columns should be fine
+    let columns = std::iter::repeat_n("1", 2000).collect::<Vec<_>>().join(",");
+    let query = format!("SELECT {columns}");
+    let result = conn.prepare(&query);
+    assert!(result.is_ok(), "SELECT with 2000 columns should succeed");
+
+    // UNION with too many columns should also error
+    let columns = std::iter::repeat_n("1", 2001).collect::<Vec<_>>().join(",");
+    let query = format!("SELECT {columns} UNION SELECT {columns}");
+    let result = conn.prepare(&query);
+    assert!(
+        result.is_err(),
+        "Expected error for UNION with 2001 columns"
+    );
 }

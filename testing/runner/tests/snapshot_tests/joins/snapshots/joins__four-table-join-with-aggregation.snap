@@ -1,19 +1,35 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        c.name AS customer_name,\n        c.city,\n        COUNT(DISTINCT o.order_id) AS order_count,\n        SUM(oi.quantity * oi.unit_price) AS total_spent\n    FROM\n        customers c\n    INNER JOIN orders o ON c.customer_id = o.customer_id\n    INNER JOIN order_items oi ON o.order_id = oi.order_id\n    INNER JOIN products p ON oi.product_id = p.product_id\n    WHERE\n        p.category = 'Electronics'\n    GROUP BY\n        c.customer_id, c.name, c.city\n    ORDER BY\n        total_spent DESC;"
+expression: |-
+  SELECT
+          c.name AS customer_name,
+          c.city,
+          COUNT(DISTINCT o.order_id) AS order_count,
+          SUM(oi.quantity * oi.unit_price) AS total_spent
+      FROM
+          customers c
+      INNER JOIN orders o ON c.customer_id = o.customer_id
+      INNER JOIN order_items oi ON o.order_id = oi.order_id
+      INNER JOIN products p ON oi.product_id = p.product_id
+      WHERE
+          p.category = 'Electronics'
+      GROUP BY
+          c.customer_id, c.name, c.city
+      ORDER BY
+          total_spent DESC;
 info:
   statement_type: SELECT
   tables:
-    - c.customer_id
-    - customers
-    - o.order_id
-    - oi.product_id
-    - order_items
-    - orders
-    - products
+  - c.customer_id
+  - customers
+  - o.order_id
+  - oi.product_id
+  - order_items
+  - orders
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)

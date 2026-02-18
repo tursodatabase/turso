@@ -1,13 +1,16 @@
 ---
 source: indexes.sqltest
-expression: "SELECT id, sku, name, price\n    FROM products\n    WHERE category = 'Electronics' AND price < 100;"
+expression: |-
+  SELECT id, sku, name, price
+      FROM products
+      WHERE category = 'Electronics' AND price < 100;
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SEARCH products USING INDEX idx_products_category

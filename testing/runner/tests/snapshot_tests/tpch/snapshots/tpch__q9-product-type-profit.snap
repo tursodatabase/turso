@@ -75,7 +75,7 @@ addr  opcode                    p1  p2  p3  p4                                  
   20            SeekRowid        5  11  43                                          0  if (r[11]!=cursor 5 for table orders.rowid) goto 43
   21            Column           2   1  12                                          0  r[12]=lineitem.l_partkey
   22            Column           2   2  13                                          0  r[13]=lineitem.l_suppkey
-  23            Affinity        12   2   0                                          0  r[12..14] = C, C
+  23            Affinity        12   2   0                                          0  r[12..14] = D, D
   24            SeekGE           4  43  12                                          0  key=[12..13]
   25              IdxGT          4  43  12                                          0  key=[12..13]
   26              DeferredSeek   4   3   0                                          0

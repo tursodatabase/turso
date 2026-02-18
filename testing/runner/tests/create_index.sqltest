@@ -227,4 +227,25 @@ test create-index-parenthesized-string-no-such-column {
 expect error {
 }
 
+# Ensure version functions are considered non-deterministic and cannot be used in indexes.
+test create-index-sqlite-version {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(sqlite_version());
+}
+expect error {
+}
 
+@skip-if sqlite "turso_version() is not available in standard SQLite"
+test create-index-turso-version {
+    CREATE TABLE t2(x);
+    CREATE INDEX i2 ON t2(turso_version());
+}
+expect error {
+}
+
+test create-index-sqlite-source-id {
+    CREATE TABLE t3(x);
+    CREATE INDEX i3 ON t3(sqlite_source_id());
+}
+expect error {
+}

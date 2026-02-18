@@ -80,7 +80,7 @@ pub fn create_view(schema: &Schema) -> BoxedStrategy<CreateViewStatement> {
     )
         .prop_map(|(if_not_exists, view_name, table)| {
             // Generate a simple SELECT * FROM table
-            let select_sql = format!("SELECT * FROM {}", table.name);
+            let select_sql = format!("SELECT * FROM {}", table.qualified_name());
             CreateViewStatement {
                 if_not_exists,
                 view_name,

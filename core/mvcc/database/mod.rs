@@ -22,17 +22,20 @@ use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
-use crate::Completion;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
 use crate::Result;
 use crate::ValueRef;
+use crate::{
+    contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Completion,
+};
 use crate::{turso_assert, Numeric};
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -712,6 +715,9 @@ pub struct WriteRowStateMachine {
 pub enum DeleteRowState {
     Initial,
     Seek,
+    /// After seek returns TryAdvance (key found in interior node, not leaf),
+    /// advance the cursor to position it on the interior cell.
+    Advance,
     Delete,
 }
 
@@ -1442,9 +1448,38 @@ impl StateTransition for DeleteRowStateMachine {
                     .seek(seek_key, SeekOp::GE { eq_only: true })?
                 {
                     IOResult::Done(seek_res) => {
-                        if seek_res == SeekResult::NotFound {
+                        match seek_res {
+                            SeekResult::Found => {
+                                self.state = DeleteRowState::Delete;
+                            }
+                            SeekResult::TryAdvance => {
+                                // In index B-trees, the key can reside in an interior node
+                                // rather than a leaf. The seek descends to the leaf but
+                                // doesn't find it there, returning TryAdvance. Advancing
+                                // the cursor will move up to the interior cell.
+                                self.state = DeleteRowState::Advance;
+                            }
+                            SeekResult::NotFound => {
+                                crate::bail_corrupt_error!(
+                                    "MVCC delete: rowid {} not found",
+                                    self.rowid.row_id
+                                );
+                            }
+                        }
+                        Ok(TransitionResult::Continue)
+                    }
+                    IOResult::IO(io) => {
+                        return Ok(TransitionResult::Io(io));
+                    }
+                }
+            }
+            DeleteRowState::Advance => {
+                let next_result = self.cursor.write().next()?;
+                match next_result {
+                    IOResult::Done(()) => {
+                        if !self.cursor.read().has_record() {
                             crate::bail_corrupt_error!(
-                                "MVCC delete: rowid {} not found",
+                                "MVCC delete: rowid {} not found after advance",
                                 self.rowid.row_id
                             );
                         }
@@ -3582,6 +3617,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let mut max_commit_ts_seen = persistent_tx_ts_max;
         let replay_cutoff_ts = persistent_tx_ts_max;
         let mut schema_rows: HashMap<i64, ImmutableRecord> = HashMap::default();
+        let mut dropped_root_pages: HashSet<i64> = HashSet::default();
         if let Some(mut stmt) = connection
             .query("SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema")?
         {
@@ -3595,6 +3631,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             })?;
         }
         let mut index_infos: HashMap<MVTableId, Arc<IndexInfo>> = HashMap::default();
+
+        // Track whether we have pending schema changes that need a rebuild.
+        // We defer rebuild_schema() until all consecutive schema rows have been
+        // inserted, because an intermediate rebuild (e.g. after inserting the
+        // renamed table row but before inserting the renamed index row) can see
+        // an inconsistent state and panic in populate_indices().
+        // Cell is used so the get_index_info closure can flush the pending rebuild.
+        let needs_schema_rebuild = std::cell::Cell::new(false);
 
         let rebuild_schema =
             |connection: &Arc<Connection>, schema_rows: &HashMap<i64, ImmutableRecord>| {
@@ -3693,6 +3737,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 if let Some(index_info) = index_infos.get(&index_id) {
                     Ok(index_info.clone())
                 } else {
+                    // Flush any pending schema rebuild so we can see newly created indexes.
+                    if needs_schema_rebuild.get() {
+                        rebuild_schema(&connection, &schema_rows)?;
+                        index_infos.clear();
+                        needs_schema_rebuild.set(false);
+                    }
                     let schema = connection.schema.read();
                     let root_page = self
                         .table_id_to_rootpage
@@ -3741,6 +3791,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 record.column_count()
                             )));
                         }
+                        let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
+                            return Err(LimboError::Corrupt(
+                                "sqlite_schema type must be text".to_string(),
+                            ));
+                        };
+                        let row_type = row_type.as_str();
                         let val = match record.get_value_opt(3) {
                             Some(v) => v,
                             None => {
@@ -3753,28 +3809,51 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         else {
                             panic!("Expected integer value for root page, got {val:?}");
                         };
-                        if root_page < 0 {
-                            let table_id = self.get_table_id_from_root_page(root_page);
-                            if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
-                                if let Some(value) = *entry.value() {
-                                    panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
-                                }
+                        let sql = match record.get_value_opt(4) {
+                            Some(ValueRef::Text(v)) => Some(v.as_str()),
+                            _ => None,
+                        };
+                        let is_virtual_table = row_type == "table"
+                            && sql.is_some_and(|sql| {
+                                contains_ignore_ascii_case!(sql.as_bytes(), b"create virtual")
+                            });
+                        let has_btree = match row_type {
+                            "index" => true,
+                            "table" => !is_virtual_table,
+                            _ => false,
+                        };
+                        if has_btree {
+                            if root_page == 0 {
+                                return Err(LimboError::Corrupt(format!(
+                                    "sqlite_schema root_page=0 for btree {row_type}"
+                                )));
                             }
-                            self.insert_table_id_to_rootpage(table_id, None);
-                        } else {
-                            let table_id = self.get_table_id_from_root_page(root_page);
-                            let Some(entry) = self.table_id_to_rootpage.get(&table_id) else {
-                                panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
-                            };
-                            let Some(value) = *entry.value() else {
-                                panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
-                            };
-                            assert!(value == root_page as u64, "Logical log contains root page reference {root_page} that does not match the root page in the table_id_to_rootpage map({value})");
+                            if root_page < 0 {
+                                let table_id = self.get_table_id_from_root_page(root_page);
+                                if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
+                                    if let Some(value) = *entry.value() {
+                                        panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
+                                    }
+                                }
+                                self.insert_table_id_to_rootpage(table_id, None);
+                            } else {
+                                let table_id = self.get_table_id_from_root_page(root_page);
+                                let Some(entry) = self.table_id_to_rootpage.get(&table_id) else {
+                                    panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
+                                };
+                                let Some(value) = *entry.value() else {
+                                    panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
+                                };
+                                assert!(value == root_page as u64, "Logical log contains root page reference {root_page} that does not match the root page in the table_id_to_rootpage map({value})");
+                            }
+                        } else if root_page != 0 {
+                            return Err(LimboError::Corrupt(format!(
+                                "sqlite_schema root_page must be 0 for {row_type}, got {root_page}"
+                            )));
                         }
                         let rowid_int = rowid.row_id.to_int_or_panic();
                         schema_rows.insert(rowid_int, record);
-                        rebuild_schema(&connection, &schema_rows)?;
-                        index_infos.clear();
+                        needs_schema_rebuild.set(true);
                     } else {
                         assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
                     }
@@ -3796,10 +3875,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                     let allocator = self.get_rowid_allocator(&rowid.table_id);
                     allocator.insert_row_id_maybe_update(rowid.row_id.to_int_or_panic());
-
-                    if is_schema_row {
-                        // schema already rebuilt above
-                    }
                 }
                 StreamingResult::DeleteTableRow {
                     rowid,
@@ -3852,9 +3927,35 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                     if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                         let rowid_int = rowid.row_id.to_int_or_panic();
+                        let record = schema_rows.get(&rowid_int).ok_or_else(|| {
+                            LimboError::Corrupt(format!(
+                                "Logical log deletes sqlite_schema rowid {rowid_int} that does not exist in merged schema state"
+                            ))
+                        })?;
+                        if record.column_count() < 5 {
+                            return Err(LimboError::Corrupt(format!(
+                                "sqlite_schema row must have at least 5 columns, got {}",
+                                record.column_count()
+                            )));
+                        }
+                        let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
+                            return Err(LimboError::Corrupt(
+                                "sqlite_schema type must be text".to_string(),
+                            ));
+                        };
+                        let row_type = row_type.as_str();
+                        let Some(ValueRef::Numeric(Numeric::Integer(root_page))) =
+                            record.get_value_opt(3)
+                        else {
+                            return Err(LimboError::Corrupt(
+                                "sqlite_schema root_page must be integer".to_string(),
+                            ));
+                        };
+                        if (row_type == "table" || row_type == "index") && root_page > 0 {
+                            dropped_root_pages.insert(root_page);
+                        }
                         schema_rows.remove(&rowid_int);
-                        rebuild_schema(&connection, &schema_rows)?;
-                        index_infos.clear();
+                        needs_schema_rebuild.set(true);
                     }
                 }
                 StreamingResult::UpsertIndexRow {
@@ -3927,11 +4028,19 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
         }
+        // Flush any remaining pending schema rebuild after processing all log records.
+        if needs_schema_rebuild.get() {
+            rebuild_schema(&connection, &schema_rows)?;
+        }
 
         assert!(
             max_commit_ts_seen >= persistent_tx_ts_max,
             "replay clock would rewind below metadata boundary: max_commit_ts_seen={max_commit_ts_seen} persistent_tx_ts_max={persistent_tx_ts_max}"
         );
+        connection.with_schema_mut(|schema| {
+            schema.dropped_root_pages = dropped_root_pages;
+        });
+        *connection.db.schema.lock() = connection.schema.read().clone();
         self.clock.reset(max_commit_ts_seen + 1);
         self.last_committed_tx_ts
             .store(max_commit_ts_seen, Ordering::SeqCst);

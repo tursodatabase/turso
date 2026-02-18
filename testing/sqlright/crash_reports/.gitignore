@@ -1,0 +1,9 @@
+# SQLite database files
+crashes.db
+crashes.db-shm
+crashes.db-wal
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

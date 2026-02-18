@@ -47,3 +47,62 @@ test multi-index-and-3-way-no-match {
 }
 expect {
 }
+
+# Correlated subquery tests for multi-index AND
+# Regression tests for #5284: MULTI-INDEX AND in correlated subqueries
+# returned empty results due to stale RowSet state between outer loop iterations
+
+setup correlated_schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, grp TEXT);
+    CREATE INDEX idx_val ON t(val);
+    CREATE INDEX idx_grp ON t(grp);
+    INSERT INTO t VALUES (1, 10, 'A'), (2, 20, 'A'), (3, 30, 'B'),
+                         (4, 40, 'B'), (5, 50, 'C'), (6, 60, 'C');
+}
+
+# EXISTS with MULTI-INDEX AND in correlated subquery
+@setup correlated_schema
+test multi-index-and-correlated-exists {
+    SELECT COUNT(*) FROM t a
+    WHERE EXISTS (SELECT 1 FROM t b WHERE b.grp = a.grp AND b.val = 30);
+}
+expect {
+    2
+}
+
+# NOT EXISTS with MULTI-INDEX AND in correlated subquery
+@setup correlated_schema
+test multi-index-and-correlated-not-exists {
+    SELECT COUNT(*) FROM t a
+    WHERE NOT EXISTS (SELECT 1 FROM t b WHERE b.grp = a.grp AND b.val = 30);
+}
+expect {
+    4
+}
+
+# EXISTS returning matching rows
+@setup correlated_schema
+test multi-index-and-correlated-exists-rows {
+    SELECT a.id, a.grp FROM t a
+    WHERE EXISTS (SELECT 1 FROM t b WHERE b.grp = a.grp AND b.val = 30)
+    ORDER BY a.id;
+}
+expect {
+    3|B
+    4|B
+}
+
+# Scalar correlated subquery with MULTI-INDEX AND
+@setup correlated_schema
+test multi-index-and-correlated-scalar {
+    SELECT a.id, (SELECT b.val FROM t b WHERE b.grp = a.grp AND b.val = 30) FROM t a
+    ORDER BY a.id;
+}
+expect {
+    1|
+    2|
+    3|30
+    4|30
+    5|
+    6|
+}

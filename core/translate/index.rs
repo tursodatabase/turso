@@ -8,7 +8,8 @@ use crate::numeric::Numeric;
 use crate::schema::{Column, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
+    OperationMode, Resolver,
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
@@ -31,16 +32,16 @@ use crate::{
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
-use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
+use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
 pub fn translate_create_index(
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
-) -> crate::Result<ProgramBuilder> {
+) -> crate::Result<()> {
     let sql = stmt.to_string();
     let ast::Stmt::CreateIndex {
         unique,
@@ -65,6 +66,7 @@ pub fn translate_create_index(
     }
 
     let original_idx_name = idx_name;
+    let database_id = connection.resolve_database_id(&original_idx_name)?;
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
@@ -88,16 +90,23 @@ pub fn translate_create_index(
     };
     program.extend(&opts);
 
+    if database_id >= 2 {
+        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie);
+    }
+
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
-    if !resolver.schema.is_unique_idx_name(&idx_name) {
+    let schema_unique = connection.with_schema(database_id, |s| s.is_unique_idx_name(&idx_name));
+    if !schema_unique {
         // If IF NOT EXISTS is specified, silently return without error
         if if_not_exists {
-            return Ok(program);
+            return Ok(());
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let Some(table) = resolver.schema.tables.get(&tbl_name) else {
+    let table = connection.with_schema(database_id, |s| s.get_table(&tbl_name));
+    let Some(table) = table else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
     let Some(tbl) = table.btree() else {
@@ -142,7 +151,7 @@ pub fn translate_create_index(
         index_method: index_method.clone(),
     });
 
-    if !idx.validate_where_expr(table, resolver) {
+    if !idx.validate_where_expr(&table, resolver) {
         crate::bail_parse_error!(
             "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause
@@ -196,14 +205,14 @@ pub fn translate_create_index(
     let root_page_reg = program.alloc_register();
     if idx.index_method.is_some() && !idx.is_backing_btree_index() {
         program.emit_insn(Insn::IndexMethodCreate {
-            db: 0,
+            db: database_id,
             cursor_id: index_cursor_id,
         });
         // index method sqlite_schema row always has root_page equals to zero in the schema (same as virtual tables)
         program.emit_int(0, root_page_reg);
     } else {
         program.emit_insn(Insn::CreateBtree {
-            db: 0,
+            db: database_id,
             root: root_page_reg,
             flags: CreateBTreeFlags::new_index(),
         });
@@ -213,11 +222,11 @@ pub fn translate_create_index(
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
-        db: 0,
+        db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
     emit_schema_entry(
-        &mut program,
+        program,
         resolver,
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
@@ -236,7 +245,7 @@ pub fn translate_create_index(
         program.emit_insn(Insn::OpenRead {
             cursor_id: table_cursor_id,
             root_page: tbl.root_page,
-            db: 0,
+            db: database_id,
         });
 
         // Open the index btree we created for writing to insert the
@@ -244,7 +253,7 @@ pub fn translate_create_index(
         program.emit_insn(Insn::OpenWrite {
             cursor_id: index_cursor_id,
             root_page: RegisterOrLiteral::Register(root_page_reg),
-            db: 0,
+            db: database_id,
         });
 
         let loop_start_label = program.allocate_label();
@@ -264,7 +273,7 @@ pub fn translate_create_index(
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
             translate_condition_expr(
-                &mut program,
+                program,
                 &table_references,
                 &where_clause,
                 ConditionMetadata {
@@ -281,7 +290,7 @@ pub fn translate_create_index(
         let start_reg = program.alloc_registers(columns.len() + 1);
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
-                &mut program,
+                program,
                 resolver,
                 &mut table_references,
                 connection,
@@ -341,7 +350,7 @@ pub fn translate_create_index(
         program.emit_insn(Insn::OpenRead {
             cursor_id: table_cursor_id,
             root_page: tbl.root_page,
-            db: 0,
+            db: database_id,
         });
 
         let loop_start_label = program.allocate_label();
@@ -361,7 +370,7 @@ pub fn translate_create_index(
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
             translate_condition_expr(
-                &mut program,
+                program,
                 &table_references,
                 &where_clause,
                 ConditionMetadata {
@@ -378,7 +387,7 @@ pub fn translate_create_index(
         let start_reg = program.alloc_registers(columns.len() + 1);
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
-                &mut program,
+                program,
                 resolver,
                 &mut table_references,
                 connection,
@@ -419,7 +428,7 @@ pub fn translate_create_index(
         program.emit_insn(Insn::OpenWrite {
             cursor_id: index_cursor_id,
             root_page: RegisterOrLiteral::Register(root_page_reg),
-            db: 0,
+            db: database_id,
         });
 
         let sorted_loop_start = program.allocate_label();
@@ -488,16 +497,17 @@ pub fn translate_create_index(
     // Keep schema table open to emit ParseSchema, close the other cursors.
     program.close_cursors(&[sorter_cursor_id, table_cursor_id, index_cursor_id]);
 
+    let current_schema_version = connection.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
-        db: 0,
+        db: database_id,
         cookie: Cookie::SchemaVersion,
-        value: resolver.schema.schema_version as i32 + 1,
+        value: current_schema_version as i32 + 1,
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
     let parse_schema_where_clause = format!("name = '{idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
+        db: database_id,
         where_clause: Some(parse_schema_where_clause),
     });
     // Close the final sqlite_schema cursor
@@ -505,7 +515,7 @@ pub fn translate_create_index(
         cursor_id: sqlite_schema_cursor_id,
     });
 
-    Ok(program)
+    Ok(())
 }
 
 pub fn resolve_sorted_columns(
@@ -742,12 +752,14 @@ pub fn resolve_index_method_parameters(
 }
 
 pub fn translate_drop_index(
-    idx_name: &str,
+    qualified_name: &QualifiedName,
     resolver: &Resolver,
     if_exists: bool,
-    mut program: ProgramBuilder,
-) -> crate::Result<ProgramBuilder> {
-    let idx_name = normalize_ident(idx_name);
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> crate::Result<()> {
+    let database_id = connection.resolve_database_id(qualified_name)?;
+    let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 40,
@@ -755,25 +767,30 @@ pub fn translate_drop_index(
     };
     program.extend(&opts);
 
+    if database_id >= 2 {
+        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie);
+    }
+
     // Find the index in Schema
     let mut maybe_index = None;
-    for val in resolver.schema.indexes.values() {
-        if maybe_index.is_some() {
-            break;
-        }
-        for idx in val {
-            if idx.name == idx_name {
-                maybe_index = Some(idx);
-                break;
-            }
-        }
+    let indexes: Vec<_> = connection.with_schema(database_id, |s| {
+        s.indexes
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|idx| idx.name == idx_name)
+            .cloned()
+            .collect()
+    });
+    if let Some(idx) = indexes.first() {
+        maybe_index = Some(idx.clone());
     }
 
     // If there's no index if_exist is true,
     // then return normaly, otherwise show an error.
     if maybe_index.is_none() {
         if if_exists {
-            return Ok(program);
+            return Ok(());
         } else {
             return Err(crate::error::LimboError::InvalidArgument(format!(
                 "No such index: {}",
@@ -782,7 +799,7 @@ pub fn translate_drop_index(
         }
     }
     // Return an error if the index is associated with a unique or primary key constraint.
-    if let Some(idx) = maybe_index {
+    if let Some(ref idx) = maybe_index {
         if idx.unique {
             return Err(crate::error::LimboError::InvalidArgument(
                 "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"
@@ -791,7 +808,7 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -811,11 +828,11 @@ pub fn translate_drop_index(
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
 
-    // Open root=1 iDb=0; sqlite_schema for writing
+    // Open sqlite_schema for writing
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
-        db: 0,
+        db: database_id,
     });
 
     let loop_start_label = program.allocate_label();
@@ -867,7 +884,7 @@ pub fn translate_drop_index(
     if let Some((cdc_cursor_id, _)) = cdc_table {
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
-                &mut program,
+                program,
                 &sqlite_table.columns,
                 sqlite_schema_cursor_id,
                 row_id_reg,
@@ -876,7 +893,7 @@ pub fn translate_drop_index(
             None
         };
         emit_cdc_insns(
-            &mut program,
+            program,
             resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
@@ -901,21 +918,29 @@ pub fn translate_drop_index(
     });
 
     program.resolve_label(loop_end_label, program.offset());
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
 
+    let current_schema_version = connection.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
-        db: 0,
+        db: database_id,
         cookie: Cookie::SchemaVersion,
-        value: resolver.schema.schema_version as i32 + 1,
+        value: current_schema_version as i32 + 1,
         p5: 0,
     });
 
     let index = maybe_index.unwrap();
     if index.index_method.is_some() && !index.is_backing_btree_index() {
-        let cursor_id = program.alloc_cursor_index(None, index)?;
-        program.emit_insn(Insn::IndexMethodDestroy { db: 0, cursor_id });
+        let cursor_id = program.alloc_cursor_index(None, &index)?;
+        program.emit_insn(Insn::IndexMethodDestroy {
+            db: database_id,
+            cursor_id,
+        });
     } else {
         // Destroy index btree
         program.emit_insn(Insn::Destroy {
+            db: database_id,
             root: index.root_page,
             former_root_reg: 0,
             is_temp: 0,
@@ -925,10 +950,10 @@ pub fn translate_drop_index(
     // Remove from the Schema any mention of the index
     program.emit_insn(Insn::DropIndex {
         index: index.clone(),
-        db: 0,
+        db: database_id,
     });
 
-    Ok(program)
+    Ok(())
 }
 
 /// Translate `OPTIMIZE INDEX [idx_name]` statement.
@@ -937,9 +962,9 @@ pub fn translate_drop_index(
 pub fn translate_optimize(
     idx_name: Option<ast::QualifiedName>,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-) -> crate::Result<ProgramBuilder> {
+) -> crate::Result<()> {
     if !connection.experimental_index_method_enabled() {
         crate::bail_parse_error!(
             "OPTIMIZE INDEX requires experimental index method feature. Enable with --experimental-index-method flag"
@@ -998,7 +1023,7 @@ pub fn translate_optimize(
 
         if indexes_to_optimize.is_empty() {
             tracing::debug!("OPTIMIZE INDEX: no index method indexes found to optimize");
-            return Ok(program);
+            return Ok(());
         }
     }
 
@@ -1008,5 +1033,5 @@ pub fn translate_optimize(
         program.emit_insn(Insn::IndexMethodOptimize { db: 0, cursor_id });
     }
 
-    Ok(program)
+    Ok(())
 }

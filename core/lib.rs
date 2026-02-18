@@ -1,157 +1,140 @@
-#![allow(clippy::arc_with_non_send_sync)]
-extern crate core;
-mod assert;
 pub mod busy;
+#[cfg(feature = "cli_only")]
+pub mod dbpage;
+#[cfg(any(feature = "fuzz", feature = "bench"))]
+pub mod functions;
+pub mod index_method;
+pub mod io;
+#[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
+pub mod json;
+pub mod mvcc;
+#[cfg(any(feature = "fuzz", feature = "bench"))]
+pub mod numeric;
+pub mod schema;
+pub mod state_machine;
+pub mod storage;
+pub mod types;
+#[cfg(any(feature = "fuzz", feature = "bench"))]
+pub mod vdbe;
+pub mod vector;
+
+#[cfg(feature = "cli_only")]
+pub(crate) mod btree_dump;
+pub(crate) mod sync;
+pub(crate) mod thread;
+
+mod assert;
 mod connection;
 mod error;
 mod ext;
 mod fast_lock;
 mod function;
-#[cfg(any(feature = "fuzz", feature = "bench"))]
-pub mod functions;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod functions;
 mod incremental;
-pub mod index_method;
 mod info;
-pub mod io;
-#[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
-pub mod json;
 #[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
 mod json;
-pub mod mvcc;
+#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+mod numeric;
 mod parameters;
 mod pragma;
 mod pseudo;
 mod regexp;
-pub mod schema;
 #[cfg(feature = "series")]
 mod series;
-pub mod state_machine;
 mod statement;
 mod stats;
-pub mod storage;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;
 mod translate;
-pub mod types;
 mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
-#[cfg(any(feature = "fuzz", feature = "bench"))]
-pub mod vdbe;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod vdbe;
-pub mod vector;
 mod vtab;
-
-#[cfg(any(feature = "fuzz", feature = "bench"))]
-pub mod numeric;
-
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod numeric;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 
-use crate::busy::{BusyHandler, BusyHandlerCallback};
-use crate::index_method::IndexMethod;
-use crate::schema::Trigger;
-use crate::stats::refresh_analyze_stats;
-use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
-use crate::storage::encryption::{AtomicCipherMode, SQLITE_HEADER, TURSO_HEADER_PREFIX};
-use crate::storage::journal_mode;
-use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
-use crate::storage::sqlite3_ondisk::{RawVersion, TextEncoding, Version};
-use crate::sync::{
-    atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering,
+use crate::{
+    busy::{BusyHandler, BusyHandlerCallback},
+    incremental::view::AllViewsTxState,
+    index_method::IndexMethod,
+    schema::Trigger,
+    stats::refresh_analyze_stats,
+    storage::{
+        checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
+        encryption::{AtomicCipherMode, SQLITE_HEADER, TURSO_HEADER_PREFIX},
+        journal_mode,
+        pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut},
+        sqlite3_ondisk::{RawVersion, TextEncoding, Version},
     },
-    Arc, LazyLock, Weak,
+    sync::{
+        atomic::{
+            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize,
+            Ordering,
+        },
+        Arc, LazyLock, Mutex, RwLock, Weak,
+    },
+    translate::{emitter::TransactionMode, pragma::TURSO_CDC_DEFAULT_TABLE_NAME},
+    vdbe::metrics::ConnectionMetrics,
+    vtab::VirtualTable,
 };
-use crate::sync::{Mutex, RwLock};
-pub use crate::translate::pragma::TURSO_CDC_CURRENT_VERSION;
-use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
-use crate::vdbe::metrics::ConnectionMetrics;
-use crate::vtab::VirtualTable;
-use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
 use arc_swap::{ArcSwap, ArcSwapOption};
-pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 use core::str;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use schema::Schema;
+use std::{
+    fmt::{self},
+    ops::Deref,
+    time::Duration,
+};
+#[cfg(feature = "fs")]
+use storage::database::DatabaseFile;
+use storage::{page_cache::PageCache, sqlite3_ondisk::PageSize};
+use tracing::{instrument, Level};
+use turso_macros::{match_ignore_ascii_case, AtomicEnum};
+use turso_parser::{ast, ast::Cmd, parser::Parser};
+use util::parse_schema_rows;
+
+pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
+pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use error::{CompletionError, LimboError};
-pub use io::clock::{Clock, MonotonicInstant, WallClockInstant};
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
 pub use io::UringIO;
 pub use io::{
+    clock::{Clock, MonotonicInstant, WallClockInstant},
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
     SyscallIO, WriteCompletion, IO,
 };
-pub use numeric::nonnan::NonNan;
-pub use numeric::Numeric;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use schema::Schema;
+pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::Statement;
-use std::time::Duration;
-use std::{
-    fmt::{self},
-    ops::Deref,
-};
-#[cfg(feature = "fs")]
-use storage::database::DatabaseFile;
-pub use storage::database::IOContext;
-pub use storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
-use storage::page_cache::PageCache;
-use storage::sqlite3_ondisk::PageSize;
 pub use storage::{
     buffer_pool::BufferPool,
-    database::DatabaseStorage,
-    pager::PageRef,
-    pager::{Page, Pager},
+    database::{DatabaseStorage, IOContext},
+    encryption::{CipherMode, EncryptionContext, EncryptionKey},
+    pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
 };
-use tracing::{instrument, Level};
-use turso_macros::{match_ignore_ascii_case, AtomicEnum};
-
-pub use turso_macros::turso_assert;
-pub use turso_macros::turso_assert_all;
-pub use turso_macros::turso_assert_eq;
-pub use turso_macros::turso_assert_greater_than;
-pub use turso_macros::turso_assert_greater_than_or_equal;
-pub use turso_macros::turso_assert_less_than;
-pub use turso_macros::turso_assert_less_than_or_equal;
-pub use turso_macros::turso_assert_ne;
-pub use turso_macros::turso_assert_reachable;
-pub use turso_macros::turso_assert_some;
-pub use turso_macros::turso_assert_sometimes;
-pub use turso_macros::turso_assert_sometimes_greater_than;
-pub use turso_macros::turso_assert_sometimes_greater_than_or_equal;
-pub use turso_macros::turso_assert_sometimes_less_than;
-pub use turso_macros::turso_assert_sometimes_less_than_or_equal;
-pub use turso_macros::turso_assert_unreachable;
-pub use turso_macros::turso_debug_assert;
-pub use turso_macros::turso_soft_unreachable;
-use turso_parser::{ast, ast::Cmd, parser::Parser};
-pub use types::IOResult;
-pub use types::Value;
-pub use types::ValueRef;
-use util::parse_schema_rows;
+pub use turso_macros::{
+    turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
+    turso_assert_greater_than_or_equal, turso_assert_less_than, turso_assert_less_than_or_equal,
+    turso_assert_ne, turso_assert_reachable, turso_assert_some, turso_assert_sometimes,
+    turso_assert_sometimes_greater_than, turso_assert_sometimes_greater_than_or_equal,
+    turso_assert_sometimes_less_than, turso_assert_sometimes_less_than_or_equal,
+    turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
+};
+pub use types::{IOResult, Value, ValueRef};
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
-
-#[cfg(feature = "cli_only")]
-pub(crate) mod btree_dump;
-
-#[cfg(feature = "cli_only")]
-pub mod dbpage;
-
-pub(crate) mod sync;
-pub(crate) mod thread;
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -226,21 +209,6 @@ impl EncryptionOpts {
 }
 
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
-
-#[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
-enum TransactionState {
-    Write {
-        schema_did_change: bool,
-    },
-    Read,
-    /// PendingUpgrade remembers what transaction state was before upgrade to write (has_read_txn is true if before transaction were in Read state)
-    /// This is important, because if we failed to initialize write transaction immediatley - we need to end implicitly started read txn (e.g. for simiple INSERT INTO operation)
-    /// But for late upgrade of transaction we should keep read transaction active (e.g. BEGIN; SELECT ...; INSERT INTO ...)
-    PendingUpgrade {
-        has_read_txn: bool,
-    },
-    None,
-}
 
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
@@ -1199,6 +1167,7 @@ impl Database {
             page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_checkpoint_disabled: AtomicBool::new(false),
             capture_data_changes: RwLock::new(None),
+            cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
@@ -1513,15 +1482,60 @@ pub enum CaptureDataChangesMode {
     Full,
 }
 
+/// CDC schema version with integer ordering for feature checks.
+/// Higher versions are supersets of lower versions.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(u8)]
+pub enum CdcVersion {
+    /// 8 columns: change_id, change_time, change_type, table_name, id, before, after, updates
+    V1 = 1,
+    /// 9 columns (adds change_txn_id + COMMIT records with change_type=2)
+    V2 = 2,
+}
+
+pub const CDC_VERSION_CURRENT: CdcVersion = CdcVersion::V2;
+
+impl CdcVersion {
+    /// Whether this version emits COMMIT records (change_type=2)
+    pub fn has_commit_record(self) -> bool {
+        self >= CdcVersion::V2
+    }
+}
+
+impl std::fmt::Display for CdcVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CdcVersion::V1 => write!(f, "v1"),
+            CdcVersion::V2 => write!(f, "v2"),
+        }
+    }
+}
+
+impl std::str::FromStr for CdcVersion {
+    type Err = LimboError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "v1" => Ok(CdcVersion::V1),
+            "v2" => Ok(CdcVersion::V2),
+            _ => Err(LimboError::InternalError(format!(
+                "unexpected CDC version: {s}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CaptureDataChangesInfo {
     pub mode: CaptureDataChangesMode,
     pub table: String,
-    pub version: Option<String>,
+    pub version: Option<CdcVersion>,
 }
 
 impl CaptureDataChangesInfo {
-    pub fn parse(value: &str, version: Option<String>) -> Result<Option<CaptureDataChangesInfo>> {
+    pub fn parse(
+        value: &str,
+        version: Option<CdcVersion>,
+    ) -> Result<Option<CaptureDataChangesInfo>> {
         let (mode, table) = value
             .split_once(",")
             .unwrap_or((value, TURSO_CDC_DEFAULT_TABLE_NAME));
@@ -1559,10 +1573,8 @@ impl CaptureDataChangesInfo {
             CaptureDataChangesMode::Full => "full",
         }
     }
-    /// Returns the CDC schema version, defaulting to V1 for tables that
-    /// predate version tracking (version field is None).
-    pub fn version(&self) -> &str {
-        self.version.as_deref().unwrap_or(TURSO_CDC_CURRENT_VERSION)
+    pub fn cdc_version(&self) -> CdcVersion {
+        self.version.unwrap_or(CDC_VERSION_CURRENT)
     }
 }
 
@@ -1610,6 +1622,13 @@ impl DatabaseCatalog {
         self.index_to_data
             .get(&index)
             .map(|(db, _pager)| db.clone())
+    }
+
+    fn get_name_by_index(&self, index: usize) -> Option<String> {
+        self.name_to_index
+            .iter()
+            .find(|(_, &idx)| idx == index)
+            .map(|(name, _)| name.clone())
     }
 
     fn get_database_by_name(&self, s: &str) -> Option<(usize, Arc<Database>)> {
@@ -1729,56 +1748,6 @@ impl Iterator for QueryRunner<'_> {
             }
             Ok(None) => None,
             Err(err) => Some(Result::Err(LimboError::from(err))),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO};
-    use rusqlite::Connection;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_autovacuum_readonly_behavior() {
-        // (autovacuum_mode, enable_autovacuum_flag, expected_readonly)
-        // TODO: Add encrypted case ("NONE", false, false) after fixing https://github.com/tursodatabase/turso/issues/4519
-        let test_cases = [
-            ("NONE", false, false),
-            ("NONE", true, false),
-            ("FULL", false, true),
-            ("FULL", true, false),
-            ("INCREMENTAL", false, true),
-            ("INCREMENTAL", true, false),
-        ];
-
-        for (autovacuum_mode, enable_autovacuum_flag, expected_readonly) in test_cases {
-            let temp_dir = TempDir::new().unwrap();
-            let db_path = temp_dir.path().join("test.db");
-
-            {
-                let conn = Connection::open(&db_path).unwrap();
-                conn.pragma_update(None, "auto_vacuum", autovacuum_mode)
-                    .unwrap();
-            }
-
-            let io = Arc::new(PlatformIO::new().unwrap()) as Arc<dyn crate::IO>;
-            let opts = DatabaseOpts::new().with_autovacuum(enable_autovacuum_flag);
-            let db = Database::open_file_with_flags(
-                io,
-                db_path.to_str().unwrap(),
-                OpenFlags::default(),
-                opts,
-                None,
-            )
-            .unwrap();
-
-            assert_eq!(
-                db.is_readonly(),
-                expected_readonly,
-                "autovacuum={autovacuum_mode}, flag={enable_autovacuum_flag}: expected readonly={expected_readonly}"
-            );
         }
     }
 }

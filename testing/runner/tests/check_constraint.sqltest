@@ -1651,3 +1651,53 @@ test check_constraint_keyword_constraint_name_quoting_after_alter {
 expect {
     1
 }
+
+# Bug fix: CHECK constraint type coercion must use column affinity (#5170)
+# TEXT column comparing with integer literal should use TEXT affinity,
+# meaning the integer is coerced to text for comparison.
+test check_constraint_text_affinity_coercion_violation {
+    CREATE TABLE t(val TEXT CHECK(val > 5));
+    INSERT INTO t VALUES ('10');
+}
+expect error {
+    CHECK constraint failed: val > 5
+}
+
+test check_constraint_text_affinity_coercion_pass {
+    CREATE TABLE t(val TEXT CHECK(val > 5));
+    -- '6' > '5' in text comparison is true
+    INSERT INTO t VALUES ('6');
+    SELECT val FROM t;
+}
+expect {
+    6
+}
+
+test check_constraint_text_affinity_coercion_update_violation {
+    CREATE TABLE t(val TEXT CHECK(val > 5));
+    INSERT INTO t VALUES ('6');
+    -- '10' < '5' in text comparison, should fail CHECK
+    UPDATE t SET val = '10';
+}
+expect error {
+    CHECK constraint failed: val > 5
+}
+
+test check_constraint_integer_affinity_coercion {
+    CREATE TABLE t(val INTEGER CHECK(val > 5));
+    INSERT INTO t VALUES (10);
+    INSERT INTO t VALUES ('20');
+    SELECT val FROM t ORDER BY val;
+}
+expect {
+    10
+    20
+}
+
+test check_constraint_integer_affinity_coercion_violation {
+    CREATE TABLE t(val INTEGER CHECK(val > 5));
+    INSERT INTO t VALUES (3);
+}
+expect error {
+    CHECK constraint failed: val > 5
+}

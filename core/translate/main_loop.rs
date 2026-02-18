@@ -13,19 +13,19 @@ use super::{
         ConditionMetadata, NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
-    optimizer::Optimizable,
+    optimizer::{constraints::BinaryExprSide, Optimizable},
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
         Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, IterationDirection,
         JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery, Operation,
-        QueryDestination, Scan, Search, SeekDef, SeekKeyComponent, SelectPlan, SetOperation,
-        TableReferences, WhereTerm,
+        QueryDestination, Scan, Search, SeekDef, SeekKey, SeekKeyComponent, SelectPlan,
+        SetOperation, TableReferences, WhereTerm,
     },
 };
 use crate::{
     schema::{Index, Table},
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
         expr::comparison_affinity,
         planner::{table_mask_from_expr, TableMask},
@@ -44,7 +44,7 @@ use crate::{
         insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
-    Result,
+    Connection, Result,
 };
 
 // Metadata for handling LEFT JOIN operations
@@ -109,6 +109,7 @@ pub fn init_loop(
     where_clause: &[WhereTerm],
     join_order: &[JoinOrderMember],
     subqueries: &mut [NonFromClauseSubquery],
+    connection: Option<&Arc<Connection>>,
 ) -> Result<()> {
     assert!(
         t_ctx.meta_left_joins.len() == tables.joined_tables().len(),
@@ -209,7 +210,19 @@ pub fn init_loop(
                         });
                     }
                     // For delete, we need to open all the other indexes too for writing
-                    for index in t_ctx.resolver.schema.get_indices(&btree.name) {
+                    let indices: Vec<_> = if let Some(conn) = connection {
+                        conn.with_schema(table.database_id, |s| {
+                            s.get_indices(&btree.name).cloned().collect()
+                        })
+                    } else {
+                        t_ctx
+                            .resolver
+                            .schema
+                            .get_indices(&btree.name)
+                            .cloned()
+                            .collect()
+                    };
+                    for index in &indices {
                         if table
                             .op
                             .index()
@@ -305,7 +318,19 @@ pub fn init_loop(
                         // For DELETE, we need to open all the indexes for writing
                         // UPDATE opens these in emit_program_for_update() separately
                         if matches!(mode, OperationMode::DELETE) {
-                            for index in t_ctx.resolver.schema.get_indices(table.table.get_name()) {
+                            let indices: Vec<_> = if let Some(conn) = connection {
+                                conn.with_schema(table.database_id, |s| {
+                                    s.get_indices(table.table.get_name()).cloned().collect()
+                                })
+                            } else {
+                                t_ctx
+                                    .resolver
+                                    .schema
+                                    .get_indices(table.table.get_name())
+                                    .cloned()
+                                    .collect()
+                            };
+                            for index in &indices {
                                 if table
                                     .op
                                     .index()
@@ -514,15 +539,25 @@ fn emit_hash_build_phase(
         key_affinities.push(affinity.aff_mask());
     }
 
-    // Extract collations for each join key expression
+    // Extract collations for each join key by examining both sides of the comparison.
+    // This follows SQLite's collation precedence rules using the original LHS/RHS
+    // of the comparison, not the build/probe assignment (which can be swapped by the
+    // optimizer based on ORDER BY or cost estimates).
     let collations: Vec<CollationSeq> = hash_join_op
         .join_keys
         .iter()
         .map(|join_key| {
-            let build_expr = join_key.get_build_expr(predicates);
-            get_collseq_from_expr(build_expr, table_references)
-                .ok()
-                .flatten()
+            let (original_lhs, original_rhs) = match join_key.build_side {
+                BinaryExprSide::Lhs => (
+                    join_key.get_build_expr(predicates),
+                    join_key.get_probe_expr(predicates),
+                ),
+                BinaryExprSide::Rhs => (
+                    join_key.get_probe_expr(predicates),
+                    join_key.get_build_expr(predicates),
+                ),
+            };
+            resolve_comparison_collseq(original_lhs, original_rhs, table_references)
                 .unwrap_or(CollationSeq::Binary)
         })
         .collect();
@@ -2352,6 +2387,51 @@ pub fn close_loop(
     Ok(())
 }
 
+/// Build the affinity string for an index seek, skipping positions where the
+/// probe expression already has the right type (mirroring SQLite's optimization
+/// via `sqlite3ExprNeedsNoAffinityChange`).
+///
+/// For each seek key position the index column affinity is checked against the
+/// probe expression. If the expression already matches (e.g. a string literal
+/// seeking a TEXT column), NONE is used so OP_Affinity becomes a no-op for that
+/// slot. When every slot is NONE the caller can skip the instruction entirely.
+fn index_seek_affinities(
+    idx: &Index,
+    tables: &TableReferences,
+    seek_def: &SeekDef,
+    seek_key: &SeekKey,
+) -> String {
+    let table = tables
+        .joined_tables()
+        .iter()
+        .find(|jt| jt.table.get_name() == idx.table_name)
+        .expect("index source table not found in table references");
+
+    idx.columns
+        .iter()
+        .zip(seek_def.iter(seek_key))
+        .map(|(ic, key_component)| {
+            // Expression index columns (e.g. CREATE INDEX ON t(a+b)) have no
+            // corresponding table column; their affinity is BLOB/NONE.
+            let col_aff = if ic.expr.is_some() {
+                Affinity::Blob
+            } else {
+                table
+                    .table
+                    .get_column_at(ic.pos_in_table)
+                    .expect("index column position out of bounds")
+                    .affinity()
+            };
+            match key_component {
+                SeekKeyComponent::Expr(expr) if col_aff.expr_needs_no_affinity_change(expr) => {
+                    affinity::SQLITE_AFF_NONE
+                }
+                _ => col_aff.aff_mask(),
+            }
+        })
+        .collect()
+}
+
 /// Emits instructions for an index seek. See e.g. [crate::translate::plan::SeekDef]
 /// for more details about the seek definition.
 ///
@@ -2424,7 +2504,7 @@ fn emit_seek(
         return Ok(());
     };
     // We allocated registers for the full index key, but our seek key might not use the full index key.
-    // See [crate::translate::optimizer::build_seek_def] for more details about in which cases we do and don't use the full index key.
+    // See [crate::translate::optimizer::build_seek_def] for boundary rewrites (including NULL sentinels).
     for (i, key) in seek_def.iter(&seek_def.start).enumerate() {
         let reg = start_reg + i;
         match key {
@@ -2448,24 +2528,19 @@ fn emit_seek(
                     });
                 }
             }
+            SeekKeyComponent::Null => program.emit_null(reg, None),
             SeekKeyComponent::None => unreachable!("None component is not possible in iterator"),
         }
     }
     let num_regs = seek_def.size(&seek_def.start);
 
-    if is_index {
-        let affinities: String = seek_def
-            .iter_affinity(&seek_def.start)
-            .map(|affinity| affinity.aff_mask())
-            .collect();
+    if let Some(idx) = seek_index {
+        let affinities = index_seek_affinities(idx, tables, seek_def, &seek_def.start);
         if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
             program.emit_insn(Insn::Affinity {
                 start_reg,
                 count: std::num::NonZeroUsize::new(num_regs).unwrap(),
-                affinities: seek_def
-                    .iter_affinity(&seek_def.start)
-                    .map(|affinity| affinity.aff_mask())
-                    .collect(),
+                affinities,
             });
         }
     }
@@ -2589,11 +2664,8 @@ fn emit_seek_termination(
             // Apply affinity to the end key (same as we do for start key).
             // Without this, e.g. BETWEEN '15' AND '35' on a numeric column would
             // compare '35' as a string against numeric values, causing incorrect results.
-            if is_index {
-                let affinities: String = seek_def
-                    .iter_affinity(&seek_def.end)
-                    .map(|affinity| affinity.aff_mask())
-                    .collect();
+            if let Some(idx) = seek_index {
+                let affinities = index_seek_affinities(idx, tables, seek_def, &seek_def.end);
                 if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
                     program.emit_insn(Insn::Affinity {
                         start_reg,
@@ -2613,6 +2685,7 @@ fn emit_seek_termination(
                 });
             }
         }
+        SeekKeyComponent::Null => program.emit_null(last_reg, None),
         SeekKeyComponent::None => {}
     }
     program.preassign_label_to_next_insn(loop_start);

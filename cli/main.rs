@@ -63,7 +63,8 @@ fn main() -> anyhow::Result<()> {
         return run_sync_server(app);
     }
 
-    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    let interactive_stdin = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if interactive_stdin {
         let mut rl = Editor::with_config(rustyline_config())?;
         if HISTORY_FILE.exists() {
             rl.load_history(HISTORY_FILE.as_path())?;
@@ -104,6 +105,9 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!(err)
             }
         }
+    }
+    if !interactive_stdin && app.has_query_error() {
+        std::process::exit(1);
     }
     Ok(())
 }

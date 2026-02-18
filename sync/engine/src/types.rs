@@ -105,6 +105,7 @@ pub enum DatabaseChangeType {
     Delete,
     Update,
     Insert,
+    Commit,
 }
 
 pub const DATABASE_METADATA_VERSION: &str = "v1";
@@ -234,6 +235,8 @@ pub struct DatabaseChange {
     pub change_id: i64,
     /// Unix timestamp of the change (not guaranteed to be strictly monotonic as host clocks can drift)
     pub change_time: u64,
+    /// CDC v2: transaction ID for grouping CDC records by transaction. None for v1.
+    pub change_txn_id: Option<i64>,
     /// Type of the change
     pub change_type: DatabaseChangeType,
     /// Table of the change
@@ -279,6 +282,11 @@ impl DatabaseChange {
                     )
                 })?)?,
             },
+            DatabaseChangeType::Commit => {
+                return Err(Error::DatabaseTapeError(
+                    "Commit changes cannot be converted to row changes".to_string(),
+                ))
+            }
         };
         Ok(DatabaseTapeRowChange {
             change_id: self.change_id,
@@ -316,6 +324,11 @@ impl DatabaseChange {
                     )
                 })?)?,
             },
+            DatabaseChangeType::Commit => {
+                return Err(Error::DatabaseTapeError(
+                    "Commit changes cannot be converted to row changes".to_string(),
+                ))
+            }
         };
         Ok(DatabaseTapeRowChange {
             change_id: self.change_id,
@@ -332,6 +345,7 @@ impl std::fmt::Debug for DatabaseChange {
         f.debug_struct("DatabaseChange")
             .field("change_id", &self.change_id)
             .field("change_time", &self.change_time)
+            .field("change_txn_id", &self.change_txn_id)
             .field("change_type", &self.change_type)
             .field("table_name", &self.table_name)
             .field("id", &self.id)
@@ -344,7 +358,27 @@ impl std::fmt::Debug for DatabaseChange {
 impl TryFrom<&turso_core::Row> for DatabaseChange {
     type Error = Error;
 
+    /// Parse a CDC row using v1 layout (8 columns, no change_txn_id).
     fn try_from(row: &turso_core::Row) -> Result<Self> {
+        Self::from_row_v1(row)
+    }
+}
+
+fn parse_change_type(value: i64) -> Result<DatabaseChangeType> {
+    match value {
+        -1 => Ok(DatabaseChangeType::Delete),
+        0 => Ok(DatabaseChangeType::Update),
+        1 => Ok(DatabaseChangeType::Insert),
+        2 => Ok(DatabaseChangeType::Commit),
+        v => Err(Error::DatabaseTapeError(format!(
+            "unexpected change type: expected -1|0|1|2, got '{v:?}'"
+        ))),
+    }
+}
+
+impl DatabaseChange {
+    /// Parse a CDC row using v1 layout (8 columns, no change_txn_id).
+    pub fn from_row_v1(row: &turso_core::Row) -> Result<Self> {
         let change_id = get_core_value_i64(row, 0)?;
         let change_time = get_core_value_i64(row, 1)? as u64;
         let change_type = get_core_value_i64(row, 2)?;
@@ -353,20 +387,11 @@ impl TryFrom<&turso_core::Row> for DatabaseChange {
         let before = get_core_value_blob_or_null(row, 5)?;
         let after = get_core_value_blob_or_null(row, 6)?;
         let updates = get_core_value_blob_or_null(row, 7)?;
-
-        let change_type = match change_type {
-            -1 => DatabaseChangeType::Delete,
-            0 => DatabaseChangeType::Update,
-            1 => DatabaseChangeType::Insert,
-            v => {
-                return Err(Error::DatabaseTapeError(format!(
-                    "unexpected change type: expected -1|0|1, got '{v:?}'"
-                )))
-            }
-        };
+        let change_type = parse_change_type(change_type)?;
         Ok(Self {
             change_id,
             change_time,
+            change_txn_id: None,
             change_type,
             table_name,
             id,
@@ -374,6 +399,39 @@ impl TryFrom<&turso_core::Row> for DatabaseChange {
             after,
             updates,
         })
+    }
+
+    /// Parse a CDC row using v2 layout (9 columns, with change_txn_id).
+    pub fn from_row_v2(row: &turso_core::Row) -> Result<Self> {
+        let change_id = get_core_value_i64(row, 0)?;
+        let change_time = get_core_value_i64(row, 1)? as u64;
+        let change_txn_id = get_core_value_i64_or_null(row, 2)?;
+        let change_type = get_core_value_i64(row, 3)?;
+        let change_type = parse_change_type(change_type)?;
+        // COMMIT records have NULL for table_name and id
+        let table_name = get_core_value_text_or_null(row, 4)?.unwrap_or_default();
+        let id = get_core_value_i64_or_null(row, 5)?.unwrap_or(0);
+        let before = get_core_value_blob_or_null(row, 6)?;
+        let after = get_core_value_blob_or_null(row, 7)?;
+        let updates = get_core_value_blob_or_null(row, 8)?;
+        Ok(Self {
+            change_id,
+            change_time,
+            change_txn_id,
+            change_type,
+            table_name,
+            id,
+            before,
+            after,
+            updates,
+        })
+    }
+
+    pub fn from_row(row: &turso_core::Row, cdc_version: turso_core::CdcVersion) -> Result<Self> {
+        match cdc_version {
+            turso_core::CdcVersion::V2 => Self::from_row_v2(row),
+            turso_core::CdcVersion::V1 => Self::from_row_v1(row),
+        }
     }
 }
 
@@ -480,11 +538,31 @@ fn get_core_value_i64(row: &turso_core::Row, index: usize) -> Result<i64> {
     }
 }
 
+fn get_core_value_i64_or_null(row: &turso_core::Row, index: usize) -> Result<Option<i64>> {
+    match row.get_value(index) {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(v)) => Ok(Some(*v)),
+        turso_core::Value::Null => Ok(None),
+        v => Err(Error::DatabaseTapeError(format!(
+            "column {index} type mismatch: expected integer or null, got '{v:?}'"
+        ))),
+    }
+}
+
 fn get_core_value_text(row: &turso_core::Row, index: usize) -> Result<String> {
     match row.get_value(index) {
         turso_core::Value::Text(x) => Ok(x.to_string()),
         v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected string, got '{v:?}'"
+        ))),
+    }
+}
+
+fn get_core_value_text_or_null(row: &turso_core::Row, index: usize) -> Result<Option<String>> {
+    match row.get_value(index) {
+        turso_core::Value::Text(x) => Ok(Some(x.to_string())),
+        turso_core::Value::Null => Ok(None),
+        v => Err(Error::DatabaseTapeError(format!(
+            "column {index} type mismatch: expected string or null, got '{v:?}'"
         ))),
     }
 }

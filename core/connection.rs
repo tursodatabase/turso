@@ -15,18 +15,34 @@ use crate::{
     io::{MemoryIO, PlatformIO, IO},
     match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
-    AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesInfo,
-    CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
-    DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
-    LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
-    Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
+    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
+    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
+    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
+    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
+    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
+    Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::Display;
 use std::ops::Deref;
 use tracing::{instrument, Level};
+use turso_macros::AtomicEnum;
+
+#[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TransactionState {
+    Write {
+        schema_did_change: bool,
+    },
+    Read,
+    /// PendingUpgrade remembers what transaction state was before upgrade to write (has_read_txn is true if before transaction were in Read state)
+    /// This is important, because if we failed to initialize write transaction immediatley - we need to end implicitly started read txn (e.g. for simiple INSERT INTO operation)
+    /// But for late upgrade of transaction we should keep read transaction active (e.g. BEGIN; SELECT ...; INSERT INTO ...)
+    PendingUpgrade {
+        has_read_txn: bool,
+    },
+    None,
+}
 
 /// Database connection handle.
 ///
@@ -78,6 +94,9 @@ pub struct Connection {
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
     pub(super) wal_auto_checkpoint_disabled: AtomicBool,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
+    /// CDC v2: transaction ID for grouping CDC records by transaction.
+    /// -1 means unset (will be assigned on first CDC write in the transaction).
+    pub(crate) cdc_transaction_id: AtomicI64,
     pub(super) closed: AtomicBool,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
@@ -232,9 +251,15 @@ impl Connection {
         let sql = sql.as_ref();
         tracing::debug!("Preparing: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let cmd = match parser.next_cmd()? {
+            Some(cmd) => cmd,
+            None => {
+                return Err(LimboError::InvalidArgument(
+                    "The supplied SQL string contains no statements".to_string(),
+                ));
+            }
+        };
         let syms = self.syms.read();
-        let cmd = cmd.expect("Successful parse on nonempty input string should produce a command");
         let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
@@ -270,8 +295,9 @@ impl Connection {
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let mode = QueryMode::Normal;
+        let schema = self.schema.read().clone();
         let program = translate::translate(
-            self.schema.read().deref(),
+            &schema,
             stmt,
             pager.clone(),
             self.clone(),
@@ -450,8 +476,9 @@ impl Connection {
                 .trim();
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+            let schema = self.schema.read().clone();
             let program = translate::translate(
-                self.schema.read().deref(),
+                &schema,
                 stmt,
                 pager.clone(),
                 self.clone(),
@@ -497,8 +524,9 @@ impl Connection {
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let schema = self.schema.read().clone();
         let program = translate::translate(
-            self.schema.read().deref(),
+            &schema,
             stmt,
             pager.clone(),
             self.clone(),
@@ -533,8 +561,9 @@ impl Connection {
                 .trim();
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+            let schema = self.schema.read().clone();
             let program = translate::translate(
-                self.schema.read().deref(),
+                &schema,
                 stmt,
                 pager.clone(),
                 self.clone(),
@@ -564,8 +593,9 @@ impl Connection {
             .trim();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let schema = self.schema.read().clone();
         let program = translate::translate(
-            self.schema.read().deref(),
+            &schema,
             stmt,
             pager.clone(),
             self.clone(),
@@ -992,6 +1022,12 @@ impl Connection {
     pub fn set_capture_data_changes_info(&self, opts: Option<CaptureDataChangesInfo>) {
         *self.capture_data_changes.write() = opts;
     }
+    pub fn get_cdc_transaction_id(&self) -> i64 {
+        self.cdc_transaction_id.load(Ordering::SeqCst)
+    }
+    pub fn set_cdc_transaction_id(&self, id: i64) {
+        self.cdc_transaction_id.store(id, Ordering::SeqCst);
+    }
     pub fn get_page_size(&self) -> PageSize {
         let value = self.page_size.load(Ordering::SeqCst);
         PageSize::new_from_header_u16(value).unwrap_or_default()
@@ -1020,7 +1056,7 @@ impl Connection {
 
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
-        if index == 0 {
+        if index <= 1 {
             self.db.is_readonly()
         } else {
             let db = self.attached_databases.read().get_database_by_index(index);
@@ -1268,6 +1304,34 @@ impl Connection {
         f(schema)
     }
 
+    /// Mutate the schema for a specific database (main or attached).
+    pub(crate) fn with_database_schema_mut<T>(
+        &self,
+        database_id: usize,
+        f: impl FnOnce(&mut Schema) -> T,
+    ) -> T {
+        if database_id < 2 {
+            self.with_schema_mut(f)
+        } else {
+            let db = {
+                let attached_dbs = self.attached_databases.read();
+                let (db, _pager) = attached_dbs
+                    .index_to_data
+                    .get(&database_id)
+                    .expect("Database ID should be valid");
+                db.clone()
+            };
+            let result = {
+                let mut schema_guard = db.schema.lock();
+                let schema = Arc::make_mut(&mut *schema_guard);
+                f(schema)
+            };
+            // Invalidate the cache so with_schema() picks up the new version
+            self.database_schemas.write().remove(&database_id);
+            result
+        }
+    }
+
     pub fn is_db_initialized(&self) -> bool {
         self.db.initialized()
     }
@@ -1277,6 +1341,16 @@ impl Connection {
             self.pager.load().clone()
         } else {
             self.attached_databases.read().get_pager_by_index(index)
+        }
+    }
+
+    /// Get the database name for a given database index.
+    /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
+    pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
+        match index {
+            0 => Some("main".to_string()),
+            1 => Some("temp".to_string()),
+            _ => self.attached_databases.read().get_name_by_index(index),
         }
     }
 
@@ -1327,8 +1401,7 @@ impl Connection {
         } else {
             Arc::new(PlatformIO::new()?)
         };
-        // FIXME: for now, only support read only attach
-        let main_db_flags = self.db.open_flags | OpenFlags::ReadOnly;
+        let main_db_flags = self.db.open_flags;
         let db = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
         let pager = Arc::new(db.init_pager(None)?);
         self.attached_databases.write().insert(alias, (db, pager));
@@ -1350,17 +1423,24 @@ impl Connection {
 
         // Remove from attached databases
         let mut attached_dbs = self.attached_databases.write();
-        if attached_dbs.remove(alias).is_none() {
-            return Err(LimboError::InvalidArgument(format!(
-                "no such database: {alias}"
-            )));
-        }
+        let database_id = match attached_dbs.remove(alias) {
+            Some(id) => id,
+            None => {
+                return Err(LimboError::InvalidArgument(format!(
+                    "no such database: {alias}"
+                )));
+            }
+        };
+
+        // Invalidate the cached schema for this database index so that a future
+        // ATTACH reusing the same index won't see stale schema entries.
+        self.database_schemas.write().remove(&database_id);
 
         Ok(())
     }
 
     // Get an attached database by alias name
-    fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
+    pub(crate) fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
         self.attached_databases.read().get_database_by_name(alias)
     }
 
@@ -1371,6 +1451,16 @@ impl Connection {
             .name_to_index
             .keys()
             .cloned()
+            .collect()
+    }
+
+    /// Get all attached database pagers (excludes main/temp databases)
+    pub fn get_all_attached_pagers(&self) -> Vec<Arc<Pager>> {
+        let catalog = self.attached_databases.read();
+        catalog
+            .index_to_data
+            .values()
+            .map(|(_db, pager)| pager.clone())
             .collect()
     }
 

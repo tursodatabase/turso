@@ -24,7 +24,7 @@ use super::plan::{
 use super::planner::{parse_where, plan_ctes_as_outer_refs};
 use super::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
-    plan_subqueries_from_where_clause,
+    plan_subqueries_from_set_clauses, plan_subqueries_from_where_clause,
 };
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
@@ -58,20 +58,20 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 pub fn translate_update(
     body: ast::Update,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, resolver, body, connection, false)?;
+) -> crate::Result<()> {
+    let mut plan = prepare_update_plan(program, resolver, body, connection, false)?;
 
-    // Plan subqueries in the WHERE clause
+    // Plan subqueries in the WHERE clause and SET clause
     if let Plan::Update(ref mut update_plan) = plan {
         if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
             // When using ephemeral plan (key columns are being updated), subqueries are in the ephemeral_plan's WHERE
-            plan_subqueries_from_select_plan(&mut program, ephemeral_plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection)?;
         } else {
             // Normal path: subqueries are in the UPDATE plan's WHERE
             plan_subqueries_from_where_clause(
-                &mut program,
+                program,
                 &mut update_plan.non_from_clause_subqueries,
                 &mut update_plan.table_references,
                 &mut update_plan.where_clause,
@@ -79,28 +79,37 @@ pub fn translate_update(
                 connection,
             )?;
         }
+        // Plan subqueries in the SET clause (e.g. UPDATE t SET col = (SELECT ...))
+        plan_subqueries_from_set_clauses(
+            program,
+            &mut update_plan.non_from_clause_subqueries,
+            &mut update_plan.table_references,
+            &mut update_plan.set_clauses,
+            resolver,
+            connection,
+        )?;
     }
 
-    optimize_plan(&mut program, &mut plan, resolver.schema)?;
+    optimize_plan(program, &mut plan, resolver.schema, connection)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(connection, resolver, &mut program, plan, |_| {})?;
-    Ok(program)
+    emit_program(connection, resolver, program, plan, |_| {})?;
+    Ok(())
 }
 
 pub fn translate_update_for_schema_change(
     body: ast::Update,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
-) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, resolver, body, connection, true)?;
+) -> crate::Result<()> {
+    let mut plan = prepare_update_plan(program, resolver, body, connection, true)?;
 
     if let Plan::Update(update_plan) = &mut plan {
         if program.capture_data_changes_info().has_updates() {
@@ -109,10 +118,10 @@ pub fn translate_update_for_schema_change(
 
         // Plan subqueries in the WHERE clause
         if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
-            plan_subqueries_from_select_plan(&mut program, ephemeral_plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection)?;
         } else {
             plan_subqueries_from_where_clause(
-                &mut program,
+                program,
                 &mut update_plan.non_from_clause_subqueries,
                 &mut update_plan.table_references,
                 &mut update_plan.where_clause,
@@ -120,17 +129,26 @@ pub fn translate_update_for_schema_change(
                 connection,
             )?;
         }
+        // Plan subqueries in the SET clause (e.g. UPDATE t SET col = (SELECT ...))
+        plan_subqueries_from_set_clauses(
+            program,
+            &mut update_plan.non_from_clause_subqueries,
+            &mut update_plan.table_references,
+            &mut update_plan.set_clauses,
+            resolver,
+            connection,
+        )?;
     }
 
-    optimize_plan(&mut program, &mut plan, resolver.schema)?;
+    optimize_plan(program, &mut plan, resolver.schema, connection)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(connection, resolver, &mut program, plan, after)?;
-    Ok(program)
+    emit_program(connection, resolver, program, plan, after)?;
+    Ok(())
 }
 
 fn validate_update(
@@ -190,12 +208,17 @@ pub fn prepare_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
+    let database_id = connection.resolve_database_id(&body.tbl_name)?;
     let schema = resolver.schema;
     let table_name = &body.tbl_name.name;
-    let table = match schema.get_table(table_name.as_str()) {
+    let table = match connection.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
+    if database_id >= 2 {
+        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie);
+    }
     validate_update(
         schema,
         &body,
@@ -236,7 +259,7 @@ pub fn prepare_update_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id: 0,
+        database_id,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
@@ -369,18 +392,21 @@ pub fn prepare_update_plan(
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.
-    let indexes = schema.get_indices(table_name);
+    let indexes: Vec<_> = connection.with_schema(database_id, |s| {
+        s.get_indices(table_name).cloned().collect()
+    });
     let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
     let rowid_alias_used = set_clauses
         .iter()
         .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
-        indexes.cloned().collect()
+        indexes
     } else {
         // otherwise we need to update the indexes whose columns are set in the SET clause,
         // or if the colunns used in the partial index WHERE clause are being updated
         indexes
+            .into_iter()
             .filter_map(|idx| {
                 let mut needs = idx.columns.iter().any(|c| {
                     c.expr.as_ref().map_or_else(
@@ -413,7 +439,7 @@ pub fn prepare_update_plan(
                     }
                 }
                 if needs {
-                    Some(idx.clone())
+                    Some(idx)
                 } else {
                     None
                 }

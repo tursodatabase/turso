@@ -104,3 +104,86 @@ test null-comparison-desc-order-by {
 expect {
 }
 
+# Composite index: NULL in second column should not match range comparisons
+# https://github.com/tursodatabase/turso/issues/5358
+test composite-index-null-second-col-le {
+    CREATE TABLE t10(c1 TEXT, c2 TEXT);
+    CREATE INDEX t10_idx ON t10(c2, c1);
+    INSERT INTO t10(c2) VALUES ('a'), ('a');
+    SELECT * FROM t10 WHERE c2 = 'a' AND c1 <= 999;
+}
+expect {
+}
+
+test composite-index-null-second-col-lt {
+    CREATE TABLE t11(c1 TEXT, c2 TEXT);
+    CREATE INDEX t11_idx ON t11(c2, c1);
+    INSERT INTO t11(c2) VALUES ('a'), ('a');
+    SELECT * FROM t11 WHERE c2 = 'a' AND c1 < 999;
+}
+expect {
+}
+
+test composite-index-null-second-col-ge {
+    CREATE TABLE t12(c1 TEXT, c2 TEXT);
+    CREATE INDEX t12_idx ON t12(c2, c1);
+    INSERT INTO t12(c2) VALUES ('a'), ('a');
+    SELECT * FROM t12 WHERE c2 = 'a' AND c1 >= 0;
+}
+expect {
+}
+
+test composite-index-null-second-col-le-desc {
+    CREATE TABLE t12d(c1 TEXT, c2 TEXT);
+    CREATE INDEX t12d_idx ON t12d(c2, c1 DESC);
+    INSERT INTO t12d(c2) VALUES ('a'), ('a');
+    SELECT * FROM t12d WHERE c2 = 'a' AND c1 <= 999;
+}
+expect {
+}
+
+test composite-index-null-second-col-lt-desc {
+    CREATE TABLE t12e(c1 TEXT, c2 TEXT);
+    CREATE INDEX t12e_idx ON t12e(c2, c1 DESC);
+    INSERT INTO t12e(c2) VALUES ('a'), ('a');
+    SELECT * FROM t12e WHERE c2 = 'a' AND c1 < 999;
+}
+expect {
+}
+
+test composite-index-null-second-col-gt {
+    CREATE TABLE t13(c1 TEXT, c2 TEXT);
+    CREATE INDEX t13_idx ON t13(c2, c1);
+    INSERT INTO t13(c2) VALUES ('a'), ('a');
+    SELECT * FROM t13 WHERE c2 = 'a' AND c1 > 0;
+}
+expect {
+}
+
+# Composite index with mixed NULL and non-NULL values
+test composite-index-mixed-null-nonnull {
+    CREATE TABLE t14(c1 TEXT, c2 TEXT);
+    CREATE INDEX t14_idx ON t14(c2, c1);
+    INSERT INTO t14(c2) VALUES ('a'), ('a');
+    INSERT INTO t14 VALUES ('abc', 'a'), ('def', 'a');
+    SELECT c1, c2 FROM t14 WHERE c2 = 'a' AND c1 <= 'zzz';
+}
+expect {
+    abc|a
+    def|a
+}
+
+# Regression for simulator seed 16218053103538286000:
+# a prefix-only equality probe on the first column of a composite index must not
+# synthesize an extra NULL key component (that previously caused an OOB panic).
+test composite-index-prefix-eq-no-range-no-crash {
+    CREATE TABLE t15(a INT, b INT);
+    CREATE INDEX t15_idx ON t15(a DESC, b ASC);
+    INSERT INTO t15 VALUES (1, NULL), (1, 20), (2, 30);
+    SELECT a, b FROM t15 WHERE a = 1 LIMIT 4;
+}
+expect {
+    1|
+    1|20
+}
+

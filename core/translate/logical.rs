@@ -1569,7 +1569,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             _ => {
                 return Err(LimboError::ParseError(
                     "LIMIT must be a literal integer".to_string(),
-                ))
+                ));
             }
         };
 
@@ -1579,7 +1579,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 _ => {
                     return Err(LimboError::ParseError(
                         "OFFSET must be a literal integer".to_string(),
-                    ))
+                    ));
                 }
             }
         } else {
@@ -3061,7 +3061,10 @@ mod tests {
                                     LogicalExpr::Column(col) => {
                                         assert!(col.name.starts_with("__agg_arg_proj_"));
                                     }
-                                    _ => panic!("Expected Column reference to projected expression in aggregate args, got {:?}", args[0]),
+                                    _ => panic!(
+                                        "Expected Column reference to projected expression in aggregate args, got {:?}",
+                                        args[0]
+                                    ),
                                 }
                             }
                             _ => panic!("Expected AggregateFunction"),
@@ -3588,7 +3591,9 @@ mod tests {
                         match &args[0] {
                             LogicalExpr::Column(_) => {}
                             LogicalExpr::AggregateFunction { .. } => {
-                                panic!("Aggregate function should not be embedded in projection! It should be in a separate Aggregate operator");
+                                panic!(
+                                    "Aggregate function should not be embedded in projection! It should be in a separate Aggregate operator"
+                                );
                             }
                             _ => panic!(
                                 "Expected column reference as argument to HEX, got: {:?}",
@@ -3621,22 +3626,38 @@ mod tests {
                                 match &args[0] {
                                     LogicalExpr::Column(col) => {
                                         // When aggregate arguments are complex, they get pre-projected
-                                        assert!(col.name.starts_with("__agg_arg_proj_"), 
-                                               "Should reference pre-projected column, got: {}", col.name);
+                                        assert!(
+                                            col.name.starts_with("__agg_arg_proj_"),
+                                            "Should reference pre-projected column, got: {}",
+                                            col.name
+                                        );
                                     }
                                     LogicalExpr::BinaryExpr { left, op, right } => {
                                         // Simple case without pre-projection (shouldn't happen with current implementation)
                                         assert_eq!(*op, ast::Operator::Add, "Should be addition");
 
                                         match (&**left, &**right) {
-                                            (LogicalExpr::Column(col), LogicalExpr::Literal(val)) => {
-                                                assert_eq!(col.name, "age", "Should reference age column");
-                                                assert_eq!(*val, Value::from_i64(2), "Should add 2");
+                                            (
+                                                LogicalExpr::Column(col),
+                                                LogicalExpr::Literal(val),
+                                            ) => {
+                                                assert_eq!(
+                                                    col.name, "age",
+                                                    "Should reference age column"
+                                                );
+                                                assert_eq!(
+                                                    *val,
+                                                    Value::from_i64(2),
+                                                    "Should add 2"
+                                                );
                                             }
                                             _ => panic!("Expected age + 2"),
                                         }
                                     }
-                                    _ => panic!("Expected Column reference or BinaryExpr for aggregate argument, got: {:?}", args[0]),
+                                    _ => panic!(
+                                        "Expected Column reference or BinaryExpr for aggregate argument, got: {:?}",
+                                        args[0]
+                                    ),
                                 }
                             }
                             _ => panic!("Expected AggregateFunction"),

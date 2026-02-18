@@ -99,12 +99,19 @@ pub fn translate(
     program.prologue();
     let mut resolver = Resolver::new(schema, syms);
 
-    program = match stmt {
+    match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
-            pragma::translate_pragma(&resolver, &name, body, pager, connection.clone(), program)?
+            pragma::translate_pragma(
+                &resolver,
+                &name,
+                body,
+                pager,
+                connection.clone(),
+                &mut program,
+            )?;
         }
-        stmt => translate_inner(stmt, &mut resolver, program, &connection, input)?,
+        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
 
     program.epilogue(schema);
@@ -118,10 +125,10 @@ pub fn translate(
 pub fn translate_inner(
     stmt: ast::Stmt,
     resolver: &mut Resolver,
-    program: ProgramBuilder,
+    program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
-) -> Result<ProgramBuilder> {
+) -> Result<()> {
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
@@ -148,18 +155,20 @@ pub fn translate_inner(
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
 
-    let mut program = match stmt {
+    match stmt {
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input)?
+            translate_alter_table(alter, resolver, program, connection, input)?;
         }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
+        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program, connection)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?
+            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
-        ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
+        ast::Stmt::Commit { name } => {
+            translate_tx_commit(name, resolver.schema, resolver, program)?
+        }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?
+            translate_create_index(program, connection, resolver, stmt)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -216,7 +225,7 @@ pub fn translate_inner(
             columns,
             ..
         } => view::translate_create_view(
-            &view_name.name,
+            &view_name,
             resolver,
             &select,
             &columns,
@@ -226,7 +235,7 @@ pub fn translate_inner(
         ast::Stmt::CreateMaterializedView {
             view_name, select, ..
         } => view::translate_create_materialized_view(
-            &view_name.name,
+            &view_name,
             resolver,
             &select,
             connection.clone(),
@@ -267,7 +276,7 @@ pub fn translate_inner(
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(idx_name.name.as_str(), resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, resolver, if_exists, program, connection)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
@@ -275,19 +284,11 @@ pub fn translate_inner(
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(
-            resolver.schema,
-            trigger_name.name.as_str(),
-            if_exists,
-            program,
-            connection.clone(),
-        )?,
+        } => trigger::translate_drop_trigger(connection, &trigger_name, if_exists, program)?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => {
-            view::translate_drop_view(resolver.schema, view_name.name.as_str(), if_exists, program)?
-        }
+        } => view::translate_drop_view(connection, resolver, &view_name, if_exists, program)?,
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
@@ -308,8 +309,7 @@ pub fn translate_inner(
                 program,
                 plan::QueryDestination::ResultRows,
                 connection,
-            )?
-            .program
+            )?;
         }
         ast::Stmt::Update(update) => translate_update(update, resolver, program, connection)?,
         ast::Stmt::Vacuum { name, into } => {
@@ -345,7 +345,7 @@ pub fn translate_inner(
         program.begin_read_operation();
     }
 
-    Ok(program)
+    Ok(())
 }
 
 #[cfg(test)]

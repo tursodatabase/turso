@@ -107,7 +107,7 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   74    Le                      37  38  88  Binary           0  if r[37]<=r[38] goto 88
   75    Column                   6   2  41                   0  r[41]=products.category_id
   76    IsNull                  41  88   0                   0  if (r[41]==NULL) goto 88
-  77    Affinity                41   1   0                   0  r[41..42] = C
+  77    Affinity                41   1   0                   0  r[41..42] = D
   78    SeekGE                   5  88  41                   0  key=[41..41]
   79      IdxGT                  5  88  41                   0  key=[41..41]
   80      Column                 5   0  31                   0  r[31]=ephemeral_subquery_t5.category_id

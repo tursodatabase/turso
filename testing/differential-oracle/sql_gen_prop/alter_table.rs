@@ -209,7 +209,7 @@ impl fmt::Display for AlterTableStatement {
 
 /// Generate an ALTER TABLE RENAME TO statement.
 pub fn alter_table_rename_to(table: &Table, schema: &Schema) -> BoxedStrategy<AlterTableStatement> {
-    let table_name = table.name.clone();
+    let table_name = table.qualified_name();
     let existing_names = schema.table_names();
     identifier_excluding(existing_names)
         .prop_map(move |new_name| AlterTableStatement {
@@ -224,7 +224,7 @@ pub fn alter_table_rename_column(table: &Table) -> BoxedStrategy<AlterTableState
     if table.columns.is_empty() {
         // No columns to rename - return empty strategy
         proptest::strategy::Just(AlterTableStatement {
-            table_name: table.name.clone(),
+            table_name: table.qualified_name(),
             operation: AlterTableOp::RenameColumn {
                 old_name: String::new(),
                 new_name: String::new(),
@@ -233,7 +233,7 @@ pub fn alter_table_rename_column(table: &Table) -> BoxedStrategy<AlterTableState
         .prop_filter("table has no columns", |_| false)
         .boxed()
     } else {
-        let table_name = table.name.clone();
+        let table_name = table.qualified_name();
         let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
         let existing_cols: HashSet<String> = col_names.iter().cloned().collect();
         (
@@ -250,7 +250,7 @@ pub fn alter_table_rename_column(table: &Table) -> BoxedStrategy<AlterTableState
 
 /// Generate an ALTER TABLE ADD COLUMN statement.
 pub fn alter_table_add_column(table: &Table) -> BoxedStrategy<AlterTableStatement> {
-    let table_name = table.name.clone();
+    let table_name = table.qualified_name();
     let existing_cols: HashSet<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     (identifier_excluding(existing_cols), column_def())
         .prop_map(move |(col_name, mut col_def)| {
@@ -278,13 +278,13 @@ pub fn alter_table_drop_column(table: &Table) -> BoxedStrategy<AlterTableStateme
     if droppable_cols.is_empty() || table.columns.len() <= 1 {
         // No columns can be dropped - return empty strategy
         proptest::strategy::Just(AlterTableStatement {
-            table_name: table.name.clone(),
+            table_name: table.qualified_name(),
             operation: AlterTableOp::DropColumn(String::new()),
         })
         .prop_filter("no droppable columns", |_| false)
         .boxed()
     } else {
-        let table_name = table.name.clone();
+        let table_name = table.qualified_name();
         proptest::sample::select(droppable_cols)
             .prop_map(move |col_name| AlterTableStatement {
                 table_name: table_name.clone(),

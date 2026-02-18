@@ -80,6 +80,11 @@ where
     })?;
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
+        if let ValueRef::Text(s) = arg.as_value_ref() {
+            if s.as_str() == "$" {
+                return Ok(Value::Null);
+            }
+        }
         if let Some(path) = json_path_from_db_value(&arg, true)? {
             let mut op = DeleteOperation::new();
             let _ = json.operate_on_path(&path, &mut op);
@@ -108,6 +113,11 @@ where
     })?;
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
+        if let ValueRef::Text(s) = arg.as_value_ref() {
+            if s.as_str() == "$" {
+                return Ok(Value::Null);
+            }
+        }
         if let Some(path) = json_path_from_db_value(&arg, true)? {
             let mut op = DeleteOperation::new();
             let _ = json.operate_on_path(&path, &mut op);
