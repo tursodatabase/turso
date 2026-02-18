@@ -352,6 +352,11 @@ struct Arena {
     slot_size: usize,
 }
 
+// SAFETY: Arena's base pointer comes from mmap and is never aliased. All mutable
+// state is behind AtomicUsize or SpinLock, so concurrent access is safe.
+unsafe impl Send for Arena {}
+unsafe impl Sync for Arena {}
+
 impl Drop for Arena {
     fn drop(&mut self) {
         unsafe { arena::dealloc(self.base.as_ptr(), self.arena_size) };

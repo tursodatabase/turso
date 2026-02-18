@@ -153,8 +153,12 @@ impl AllViewsTxState {
     }
 
     /// Get or create a transaction state for a view
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn get_or_create(&self, view_name: &str) -> Arc<ViewTransactionState> {
         let mut states = self.states.borrow_mut();
+        // ViewTransactionState uses RefCell (not Sync), but AllViewsTxState is
+        // single-threaded (Rc-based). Arc is used for shared ownership, not
+        // cross-thread sharing.
         states
             .entry(view_name.to_string())
             .or_insert_with(|| Arc::new(ViewTransactionState::new()))
