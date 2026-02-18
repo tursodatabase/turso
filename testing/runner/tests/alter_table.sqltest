@@ -358,6 +358,75 @@ expect error {
     type mismatch on DEFAULT
 }
 
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-integer-from-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT '10';
+    INSERT INTO t(a) VALUES (1);
+    SELECT typeof(b), b FROM t;
+}
+expect {
+    integer|10
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-real-from-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT '1.25';
+    INSERT INTO t(a) VALUES (1);
+    SELECT typeof(b), b FROM t;
+}
+expect {
+    real|1.25
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-text-from-integer {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT 123;
+    INSERT INTO t(a) VALUES (1);
+    SELECT typeof(b), b FROM t;
+}
+expect {
+    text|123
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-integer-fractional {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 3.14;
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-real-nonnumeric {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT 'abc';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-text-blob {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT X'CAFE';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-blob-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b BLOB DEFAULT 'abc';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
 test alter-add-column-invalid-collation {
     CREATE TABLE t(c1 INTEGER);
     ALTER TABLE t ADD COLUMN c2 INTEGER COLLATE compile_options;
