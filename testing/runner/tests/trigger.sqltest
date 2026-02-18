@@ -1054,3 +1054,23 @@ expect {
     triggered for id 1
 }
 
+# https://github.com/tursodatabase/turso/issues/5175
+# Subquery in trigger body UPDATE SET clause
+test trigger-update-set-subquery {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY);
+    CREATE TABLE counter(n INTEGER);
+    INSERT INTO counter VALUES(0);
+    INSERT INTO t1 VALUES(1);
+    CREATE TRIGGER tr1 AFTER INSERT ON t1 BEGIN
+      UPDATE counter SET n = (SELECT max(id) FROM t1);
+    END;
+    INSERT INTO t1 VALUES(2);
+    SELECT * FROM t1 ORDER BY id;
+    SELECT * FROM counter;
+}
+expect {
+    1
+    2
+    2
+}
+
