@@ -173,21 +173,20 @@ impl SchemaIntrospector {
         for table_name in table_names {
             let columns = Self::get_columns_turso(conn, &table_name)?;
             if !columns.is_empty() {
-                builder = builder.add_table(Table::new(table_name, columns));
+                builder = builder.table(Table::new(table_name, columns));
             }
         }
 
         // Discover attached databases
         let attached_dbs = Self::get_attached_databases_turso(conn)?;
         for db_name in &attached_dbs {
-            builder = builder.add_database(db_name.clone());
+            builder = builder.database(db_name.clone());
             let tables = Self::get_table_names_turso_db(conn, db_name)?;
             for table_name in tables {
                 let query = format!("PRAGMA {db_name}.table_info(\"{table_name}\")");
                 let columns = Self::get_columns_turso_query(conn, &query)?;
                 if !columns.is_empty() {
-                    builder =
-                        builder.add_table(Table::new(table_name, columns).in_database(db_name));
+                    builder = builder.table(Table::new(table_name, columns).in_database(db_name));
                 }
             }
         }
@@ -203,14 +202,14 @@ impl SchemaIntrospector {
         for table_name in table_names {
             let columns = Self::get_columns_sqlite(conn, &table_name)?;
             if !columns.is_empty() {
-                builder = builder.add_table(Table::new(table_name, columns));
+                builder = builder.table(Table::new(table_name, columns));
             }
         }
 
         // Discover attached databases
         let attached_dbs = Self::get_attached_databases_sqlite(conn)?;
         for db_name in &attached_dbs {
-            builder = builder.add_database(db_name.clone());
+            builder = builder.database(db_name.clone());
             let query = format!(
                 "SELECT name FROM {db_name}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
             );
@@ -255,8 +254,7 @@ impl SchemaIntrospector {
                 }
 
                 if !result.is_empty() {
-                    builder =
-                        builder.add_table(Table::new(table_name, result).in_database(db_name));
+                    builder = builder.table(Table::new(table_name, result).in_database(db_name));
                 }
             }
         }

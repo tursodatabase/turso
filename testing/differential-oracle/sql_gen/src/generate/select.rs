@@ -288,16 +288,16 @@ fn generate_select_impl_inner<C: Capabilities>(
     }
 
     let from = {
-        let primary_name = ctx.tables_in_scope()[0].table.name.clone();
+        let primary_qualified = ctx.tables_in_scope()[0].table.qualified_name();
         let primary_qualifier = ctx.tables_in_scope()[0].qualifier.clone();
-        let from_alias = if primary_qualifier != primary_name {
+        let from_alias = if primary_qualifier != ctx.tables_in_scope()[0].table.name {
             Some(primary_qualifier)
         } else {
             None
         };
         ctx.scope(Origin::From, |_ctx| {
             Some(FromClause {
-                table: primary_name,
+                table: primary_qualified,
                 alias: from_alias,
             })
         })
@@ -835,7 +835,7 @@ fn generate_join_clauses<C: Capabilities>(
                     let on_expr = generate_join_on_condition(generator, ctx)?;
                     joins.push(JoinClause {
                         join_type: JoinType::Inner,
-                        table: joined_table.name.clone(),
+                        table: joined_table.qualified_name(),
                         alias,
                         constraint: Some(JoinConstraint::On(on_expr)),
                     });
@@ -856,7 +856,7 @@ fn generate_join_clauses<C: Capabilities>(
 
         joins.push(JoinClause {
             join_type,
-            table: joined_table.name.clone(),
+            table: joined_table.qualified_name(),
             alias,
             constraint,
         });

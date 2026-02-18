@@ -297,7 +297,7 @@ pub fn generate_insert<C: Capabilities>(
 
     Ok(Stmt::Insert(InsertStmt {
         with_clause,
-        table: table.name,
+        table: table.qualified_name(),
         columns,
         values,
         conflict,
@@ -411,7 +411,7 @@ pub fn generate_update<C: Capabilities>(
 
         Ok(Stmt::Update(UpdateStmt {
             with_clause: with_clause.clone(),
-            table: table.name.clone(),
+            table: table.qualified_name(),
             sets,
             where_clause,
             conflict,
@@ -559,7 +559,7 @@ pub fn generate_delete<C: Capabilities>(
 
         Ok(Stmt::Delete(DeleteStmt {
             with_clause: with_clause.clone(),
-            table: table.name.clone(),
+            table: table.qualified_name(),
             where_clause,
         }))
     })
@@ -644,8 +644,24 @@ pub fn generate_create_table<C: Capabilities>(
         let _ = generate_foreign_key(generator, ctx);
     }
 
+    // Optionally qualify the table name with an attached database.
+    // We use a list of [None, Some("aux"), ...] to give ~50% chance to main.
+    let attached = &generator.schema().attached_databases;
+    let qualified_table_name = if attached.is_empty() {
+        table_name
+    } else {
+        let mut choices: Vec<Option<&str>> = vec![None];
+        for db in attached {
+            choices.push(Some(db.as_str()));
+        }
+        match ctx.choose(&choices).copied().flatten() {
+            Some(db) => format!("{db}.{table_name}"),
+            None => table_name,
+        }
+    };
+
     Ok(Stmt::CreateTable(CreateTableStmt {
-        table: table_name,
+        table: qualified_table_name,
         columns,
         if_not_exists: ctx.gen_bool_with_prob(create_table_config.if_not_exists_probability),
     }))
@@ -663,7 +679,7 @@ pub fn generate_drop_table<C: Capabilities>(
         .ok_or_else(|| GenError::schema_empty("tables"))?;
 
     Ok(Stmt::DropTable(DropTableStmt {
-        table: table.name.clone(),
+        table: table.qualified_name(),
         if_exists: ctx.gen_bool_with_prob(drop_table_config.if_exists_probability),
     }))
 }
@@ -684,7 +700,7 @@ pub fn generate_alter_table<C: Capabilities>(
     let action = generate_alter_table_action(generator, ctx, &table, alter_config)?;
 
     Ok(Stmt::AlterTable(AlterTableStmt {
-        table: table.name.clone(),
+        table: table.qualified_name(),
         action,
     }))
 }
@@ -821,7 +837,7 @@ pub fn generate_create_index<C: Capabilities>(
 
     Ok(Stmt::CreateIndex(CreateIndexStmt {
         name: index_name,
-        table: table.name,
+        table: table.qualified_name(),
         columns,
         unique: ctx.gen_bool_with_prob(create_index_config.unique_probability),
         if_not_exists: ctx.gen_bool_with_prob(create_index_config.if_not_exists_probability),
@@ -896,7 +912,7 @@ pub fn generate_create_trigger<C: Capabilities>(
 
     Ok(Stmt::CreateTrigger(CreateTriggerStmt {
         name: trigger_name,
-        table: table.name.clone(),
+        table: table.qualified_name(),
         timing,
         event,
         for_each_row,

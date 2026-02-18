@@ -107,6 +107,10 @@ impl fmt::Display for ColumnDef {
 pub struct Table {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    /// The database this table belongs to (e.g. "aux" for attached databases).
+    /// `None` means the main database.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub database: Option<String>,
 }
 
 impl Table {
@@ -114,7 +118,22 @@ impl Table {
         Self {
             name: name.into(),
             columns,
+            database: None,
         }
+    }
+
+    /// Returns the qualified table name (e.g. "aux.t1" or just "t1").
+    pub fn qualified_name(&self) -> String {
+        match &self.database {
+            Some(db) => format!("{}.{}", db, self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Set the database this table belongs to.
+    pub fn in_database(mut self, db: impl Into<String>) -> Self {
+        self.database = Some(db.into());
+        self
     }
 
     /// Returns columns that can be used in WHERE clauses (non-blob types).
@@ -185,6 +204,7 @@ pub struct SchemaBuilder {
     tables: Vec<Table>,
     indexes: Vec<Index>,
     triggers: Vec<Trigger>,
+    attached_databases: Vec<String>,
 }
 
 impl SchemaBuilder {
@@ -207,11 +227,17 @@ impl SchemaBuilder {
         self
     }
 
+    pub fn database(mut self, name: impl Into<String>) -> Self {
+        self.attached_databases.push(name.into());
+        self
+    }
+
     pub fn build(self) -> Schema {
         Schema {
             tables: self.tables,
             indexes: self.indexes,
             triggers: self.triggers,
+            attached_databases: self.attached_databases,
         }
     }
 }
@@ -223,6 +249,10 @@ pub struct Schema {
     pub tables: Vec<Table>,
     pub indexes: Vec<Index>,
     pub triggers: Vec<Trigger>,
+    /// Names of attached databases (e.g. ["aux"]).
+    /// Empty means only the main database is available.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
+    pub attached_databases: Vec<String>,
 }
 
 impl Schema {
