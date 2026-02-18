@@ -122,6 +122,9 @@ pub struct Resolver<'a> {
 }
 
 impl<'a> Resolver<'a> {
+    const MAIN_DB: &'static str = "main";
+    const TEMP_DB: &'static str = "temp";
+
     const MAIN_DB_ID: usize = 0;
     const TEMP_DB_ID: usize = 1;
 
@@ -251,6 +254,16 @@ impl<'a> Resolver<'a> {
     // Get an attached database by alias name
     pub(crate) fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
         self.attached_databases.read().get_database_by_name(alias)
+    }
+
+    /// Get the database name for a given database index.
+    /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
+    pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
+        match index {
+            0 => Some(Self::MAIN_DB.to_string()),
+            1 => Some(Self::TEMP_DB.to_string()),
+            _ => self.attached_databases.read().get_name_by_index(index),
+        }
     }
 }
 

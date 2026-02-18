@@ -587,7 +587,7 @@ fn execute_trigger_commands(
     let db_name = if database_id == 0 {
         None
     } else {
-        connection
+        resolver
             .get_database_name_by_index(database_id)
             .map(ast::Name::exact)
     };

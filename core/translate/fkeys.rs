@@ -1483,7 +1483,7 @@ fn fire_fk_cascade_delete(
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id > 0 {
-        connection.get_database_name_by_index(database_id)
+        resolver.get_database_name_by_index(database_id)
     } else {
         None
     };
@@ -1516,7 +1516,7 @@ fn fire_fk_set_null(
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id > 0 {
-        connection.get_database_name_by_index(database_id)
+        resolver.get_database_name_by_index(database_id)
     } else {
         None
     };
@@ -1542,7 +1542,7 @@ fn fire_fk_set_default(
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id > 0 {
-        connection.get_database_name_by_index(database_id)
+        resolver.get_database_name_by_index(database_id)
     } else {
         None
     };
@@ -1568,7 +1568,7 @@ fn fire_fk_cascade_update(
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id > 0 {
-        connection.get_database_name_by_index(database_id)
+        resolver.get_database_name_by_index(database_id)
     } else {
         None
     };
