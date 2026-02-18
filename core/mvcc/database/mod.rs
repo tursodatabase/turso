@@ -3383,18 +3383,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
-    fn invalidate_rowid_allocators_for_rows(&self, rowids: &BTreeSet<RowID>) {
-        let mut table_ids = BTreeSet::new();
-        for rowid in rowids {
-            if rowid.row_id.is_int_key() {
-                table_ids.insert(rowid.table_id);
-            }
-        }
-        for table_id in table_ids {
-            self.invalidate_rowid_allocator(table_id);
-        }
-    }
-
     fn invalidate_all_rowid_allocators(&self) {
         for allocator in self.table_id_to_last_rowid.read().values() {
             allocator.invalidate();

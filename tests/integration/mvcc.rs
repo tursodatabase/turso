@@ -1,6 +1,6 @@
 use crate::common::{ExecRows, TempDatabase};
 use std::sync::Arc;
-use turso_core::{LimboError, StepResult};
+use turso_core::StepResult;
 
 #[turso_macros::test(mvcc)]
 fn test_newrowid_mvcc_concurrent(tmp_db: TempDatabase) -> anyhow::Result<()> {
