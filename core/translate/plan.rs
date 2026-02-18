@@ -81,13 +81,13 @@ impl ResultSetColumn {
                         .as_deref()
                 } else {
                     // Column references an outer query table (correlated subquery).
-                    let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
-                    table_ref.get_column_at(*column).unwrap().name.as_deref()
+                    let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
+                    table_ref.get_column_at(*column)?.name.as_deref()
                 }
             }
             ast::Expr::RowId { table, .. } => {
                 // If there is a rowid alias column, use its name
-                let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
+                let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
                 if let Table::BTree(table) = &table_ref {
                     if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
                         if let Some(name) = &rowid_alias_column.1.name {
