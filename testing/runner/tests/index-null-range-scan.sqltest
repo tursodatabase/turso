@@ -1,0 +1,62 @@
+@database :memory:
+
+setup base {
+    CREATE TABLE t(a INT, b INT, c INT);
+    CREATE INDEX idx ON t(a, b, c);
+    INSERT INTO t VALUES (1, 1, 10), (1, NULL, 20), (1, 5, 30);
+}
+
+# NULLs should be excluded from range comparisons per SQL standard.
+# Index scans must not include NULL values in range results.
+
+@setup base
+test index-null-less-than {
+    SELECT b, c FROM t WHERE a = 1 AND b < 3;
+}
+expect {
+    1|10
+}
+
+@setup base
+test index-null-less-than-or-equal {
+    SELECT b, c FROM t WHERE a = 1 AND b <= 5;
+}
+expect {
+    1|10
+    5|30
+}
+
+@setup base
+test index-null-greater-than {
+    SELECT b, c FROM t WHERE a = 1 AND b > 0;
+}
+expect {
+    1|10
+    5|30
+}
+
+@setup base
+test index-null-greater-than-or-equal {
+    SELECT b, c FROM t WHERE a = 1 AND b >= 1;
+}
+expect {
+    1|10
+    5|30
+}
+
+@setup base
+test index-null-between {
+    SELECT b, c FROM t WHERE a = 1 AND b BETWEEN 1 AND 5;
+}
+expect {
+    1|10
+    5|30
+}
+
+@setup base
+test index-null-is-null {
+    SELECT b, c FROM t WHERE a = 1 AND b IS NULL;
+}
+expect {
+    |20
+}

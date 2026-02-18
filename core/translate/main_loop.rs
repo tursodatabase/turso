@@ -2458,6 +2458,11 @@ fn emit_seek(
                     });
                 }
             }
+            SeekKeyComponent::NullPad => {
+                // Emit a NULL value as padding in the seek key to skip past NULL values
+                // in the index. This is intentional and should NOT trigger an IsNull abort.
+                program.emit_null(reg, None);
+            }
             SeekKeyComponent::None => unreachable!("None component is not possible in iterator"),
         }
     }
@@ -2622,6 +2627,11 @@ fn emit_seek_termination(
                     target_pc: loop_end,
                 });
             }
+        }
+        SeekKeyComponent::NullPad => {
+            // Emit a NULL value as padding in the end key to skip past NULL values
+            // in the index during backwards iteration.
+            program.emit_null(last_reg, None);
         }
         SeekKeyComponent::None => {}
     }

@@ -2393,10 +2393,12 @@ fn build_seek_def(
                             affinity,
                         },
                         // Forwards, Asc, None, (x=10 AND y<30)
-                        // Start key: start from the first GE(x:10)
+                        // Start key: start from the first GT(x:10, NULL)
+                        // NULL sorts before all non-NULL values in ASC index,
+                        // so SeekGT with NULL padding skips past NULL entries.
                         None => SeekKey {
-                            last_component: SeekKeyComponent::None,
-                            op: SeekOp::GE { eq_only: false },
+                            last_component: SeekKeyComponent::NullPad,
+                            op: SeekOp::GT,
                             affinity: Affinity::Blob,
                         },
                         Some((op, _, _)) => {
@@ -2473,11 +2475,13 @@ fn build_seek_def(
                             op: SeekOp::GT,
                             affinity,
                         },
-                        // Forwards, Asc, None, (x=10 AND y<30)
-                        // End key: end at first GT(x:10)
+                        // Forwards, Desc, None, (x=10 AND y<30)
+                        // End key: end at first GE(x:10, NULL)
+                        // NULL sorts after all non-NULL values in DESC index,
+                        // so IdxGE with NULL padding stops before NULL entries.
                         None => SeekKey {
-                            last_component: SeekKeyComponent::None,
-                            op: SeekOp::GT,
+                            last_component: SeekKeyComponent::NullPad,
+                            op: SeekOp::GE { eq_only: false },
                             affinity: Affinity::Blob,
                         },
                         Some((op, _, _)) => {
@@ -2539,10 +2543,13 @@ fn build_seek_def(
                             affinity,
                         },
                         // Backwards, Asc, None, (x=10 AND y<30)
-                        // End key: end at first LT(x:10)
+                        // End key: end at first LE(x:10, NULL)
+                        // NULL sorts before all non-NULL values in ASC index,
+                        // so IdxLE with NULL padding stops before NULL entries
+                        // during backwards iteration.
                         None => SeekKey {
-                            last_component: SeekKeyComponent::None,
-                            op: SeekOp::LT,
+                            last_component: SeekKeyComponent::NullPad,
+                            op: SeekOp::LE { eq_only: false },
                             affinity: Affinity::Blob,
                         },
                         Some((op, _, _)) => {
@@ -2567,11 +2574,14 @@ fn build_seek_def(
                             op: SeekOp::LE { eq_only: false },
                             affinity,
                         },
-                        // Backwards, Desc, LE: (x=10 AND y<30)
-                        // Start key: start from the first LE(x:10)
+                        // Backwards, Desc, LT: (x=10 AND y<30)
+                        // Start key: start from the first LT(x:10, NULL)
+                        // NULL sorts after all non-NULL values in DESC index,
+                        // so SeekLT with NULL padding skips past NULL entries
+                        // during backwards iteration.
                         None => SeekKey {
-                            last_component: SeekKeyComponent::None,
-                            op: SeekOp::LE { eq_only: false },
+                            last_component: SeekKeyComponent::NullPad,
+                            op: SeekOp::LT,
                             affinity: Affinity::Blob,
                         },
                         Some((op, _, _)) => {

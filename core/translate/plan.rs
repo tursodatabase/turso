@@ -1774,6 +1774,7 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
         } else if self.pos == self.seek_def.prefix.len() {
             match &self.seek_key.last_component {
                 SeekKeyComponent::Expr(expr) => Some(SeekKeyComponent::Expr(expr)),
+                SeekKeyComponent::NullPad => Some(SeekKeyComponent::NullPad),
                 SeekKeyComponent::None => None,
             }
         } else {
@@ -1792,7 +1793,9 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
             Some(self.seek_def.prefix[self.pos].eq.as_ref().unwrap().2)
         } else if self.pos == self.seek_def.prefix.len() {
             match &self.seek_key.last_component {
-                SeekKeyComponent::Expr(..) => Some(self.seek_key.affinity),
+                SeekKeyComponent::Expr(..) | SeekKeyComponent::NullPad => {
+                    Some(self.seek_key.affinity)
+                }
                 SeekKeyComponent::None => None,
             }
         } else {
@@ -1809,7 +1812,7 @@ impl SeekDef {
     pub fn size(&self, key: &SeekKey) -> usize {
         self.prefix.len()
             + match key.last_component {
-                SeekKeyComponent::Expr(_) => 1,
+                SeekKeyComponent::Expr(_) | SeekKeyComponent::NullPad => 1,
                 SeekKeyComponent::None => 0,
             }
     }
@@ -1847,6 +1850,9 @@ impl SeekDef {
 #[derive(Debug, Clone)]
 pub enum SeekKeyComponent<E> {
     Expr(E),
+    /// A NULL padding used in seek keys to skip past NULL values in index scans.
+    /// Unlike Expr(NULL), this does not trigger an IsNull abort check.
+    NullPad,
     None,
 }
 
