@@ -55,7 +55,6 @@ expect {
 }
 
 # Foreign key child column rename
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test alter-table-rename-fk-child {
     CREATE TABLE parent (id INTEGER PRIMARY KEY);
     CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent(id));
@@ -71,7 +70,6 @@ expect {
 }
 
 # Foreign key parent column rename - critical test
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test alter-table-rename-fk-parent {
     CREATE TABLE orders (order_id INTEGER PRIMARY KEY, date TEXT);
     CREATE TABLE items (item_id INTEGER PRIMARY KEY, oid INTEGER, FOREIGN KEY (oid) REFERENCES orders(order_id));
@@ -87,7 +85,6 @@ expect {
 }
 
 # Composite foreign key parent rename
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test alter-table-rename-composite-fk-parent {
     CREATE TABLE products (cat TEXT, code TEXT, PRIMARY KEY (cat, code));
     CREATE TABLE inventory (id INTEGER PRIMARY KEY, cat TEXT, code TEXT, FOREIGN KEY (cat, code) REFERENCES products(cat, code));
@@ -118,7 +115,6 @@ expect {
 }
 
 # Self-referencing foreign key
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test alter-table-rename-self-ref-fk {
     CREATE TABLE employees (emp_id INTEGER PRIMARY KEY, manager_id INTEGER,
                             FOREIGN KEY (manager_id) REFERENCES employees(emp_id));
@@ -132,7 +128,6 @@ expect {
 }
 
 # Chain of FK renames - parent is both PK and referenced
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test alter-table-rename-fk-chain {
     CREATE TABLE t1 (a INTEGER PRIMARY KEY);
     CREATE TABLE t2 (b INTEGER PRIMARY KEY, a_ref INTEGER, FOREIGN KEY (a_ref) REFERENCES t1(a));
@@ -150,7 +145,6 @@ expect {
 }
 
 # FK with ON DELETE/UPDATE actions
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test alter-table-rename-fk-actions {
     CREATE TABLE parent (pid INTEGER PRIMARY KEY);
     CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER,
@@ -179,7 +173,6 @@ expect {
 }
 
 # Rename with quoted identifiers in FK
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test alter-table-rename-fk-quoted {
     CREATE TABLE "parent table" ("parent id" INTEGER PRIMARY KEY);
     CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER,
@@ -194,7 +187,6 @@ expect {
 }
 
 # Verify FK constraint still works after rename
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test alter-table-fk-constraint-after-rename {
     PRAGMA foreign_keys = ON;
     CREATE TABLE parent (id INTEGER PRIMARY KEY);
@@ -213,7 +205,6 @@ expect {
 }
 
 # FK constraint violation after rename should still fail
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test alter-table-fk-violation-after-rename {
     PRAGMA foreign_keys = ON;
     CREATE TABLE parent (id INTEGER PRIMARY KEY);
@@ -266,7 +257,6 @@ expect {
     CREATE TABLE child (id INTEGER PRIMARY KEY, parent_ref INTEGER, FOREIGN KEY (id) REFERENCES parent (pid), FOREIGN KEY (parent_ref) REFERENCES parent (pid))
 }
 
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test rename-self-1 {
     PRAGMA foreign_keys = ON;
     CREATE TABLE s1(id INTEGER PRIMARY KEY, parent INTEGER,
@@ -280,7 +270,6 @@ expect {
     s1_new|s1_new|1
 }
 
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test rename-self-2-composite {
     PRAGMA foreign_keys=ON;
     CREATE TABLE sc(id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER,
@@ -297,7 +286,6 @@ expect {
     CREATE TABLE sc_new (id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER, PRIMARY KEY (id, vr), FOREIGN KEY (parent_id, parent_vr) REFERENCES sc_new (id, vr))
 }
 
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test rename-parent-1 {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -316,7 +304,6 @@ expect {
     20|2
 }
 
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test rename-parent-2-inline {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p2(id INTEGER PRIMARY KEY);
@@ -329,7 +316,6 @@ expect {
     CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p2_new (id))
 }
 
-@skip-if mvcc "foreign keys are not yet supported in mvcc"
 test rename-parent-3-composite {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p3(a INTEGER, b INTEGER, PRIMARY KEY(a,b));
