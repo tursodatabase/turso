@@ -474,9 +474,6 @@ fn update_pragma(
         }
         PragmaName::ForeignKeys => {
             let enabled = parse_pragma_enabled(&value);
-            if enabled && connection.mvcc_enabled() {
-                bail_parse_error!("Foreign keys are not supported in MVCC mode");
-            }
             connection.set_foreign_keys_enabled(enabled);
             Ok(TransactionMode::None)
         }
