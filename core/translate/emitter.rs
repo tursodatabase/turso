@@ -2135,6 +2135,7 @@ fn emit_delete_row_common(
     Ok(())
 }
 
+#[expect(clippy::too_many_arguments)]
 /// Helper function to delete a row when we've already seeked to it (e.g., from a RowSet).
 /// This is similar to emit_delete_insns but assumes the cursor is already positioned at the row.
 fn emit_delete_insns_when_triggers_present(
