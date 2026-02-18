@@ -2442,3 +2442,13 @@ test fk-drop-column-composite-fk-fails {
 expect error {
 }
 
+# FK violation in autocommit mode should rollback the implicit transaction
+test fk-violation-autocommit-error {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent (id INT PRIMARY KEY);
+    CREATE TABLE child (id INT, pid INT REFERENCES parent(id));
+    INSERT INTO child VALUES (999, 999);
+}
+expect error {
+}
+
