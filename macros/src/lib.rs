@@ -89,8 +89,9 @@ mod test;
 mod assert;
 
 use assert::{
-    comparison_auto_message, details_format_args, details_json, expr_to_lit_str,
-    BooleanGuidanceInput, ComparisonAssertInput, ConditionAssertInput, MessageAssertInput,
+    comparison_auto_message, details_debug_check, details_format_args, details_json,
+    expr_to_lit_str, BooleanGuidanceInput, ComparisonAssertInput, ConditionAssertInput,
+    MessageAssertInput,
 };
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
 use quote::quote;
@@ -666,37 +667,17 @@ fn emit_condition_assert(
     let prefixed = prefix_message(file_path, &msg);
     let details = details_json(&input.details);
 
-    let (assert_call, exit_msg) = if let Some(fmt_args) = &input.format_args {
-        let assert_call = match kind {
-            ConditionAssertKind::Assert => quote! { assert!(__turso_cond, #msg, #fmt_args); },
-            ConditionAssertKind::DebugAssert => {
-                quote! { debug_assert!(__turso_cond, #msg, #fmt_args); }
-            }
-        };
-        (
-            assert_call,
-            quote! {
-                eprint!("[antithesis] assertion failed: ");
-                eprintln!(#msg, #fmt_args);
-                eprintln!("exiting with code 0 because antithesis already captured this failure");
-            },
-        )
-    } else {
-        let fmt_args = details_format_args(&msg, &input.details);
-        let assert_call = match kind {
-            ConditionAssertKind::Assert => quote! { assert!(__turso_cond, #fmt_args); },
-            ConditionAssertKind::DebugAssert => {
-                quote! { debug_assert!(__turso_cond, #fmt_args); }
-            }
-        };
-        (
-            assert_call,
-            quote! {
-                eprint!("[antithesis] assertion failed: ");
-                eprintln!(#fmt_args);
-                eprintln!("exiting with code 0 because antithesis already captured this failure");
-            },
-        )
+    let fmt_args = details_format_args(&msg, &input.details);
+    let assert_call = match kind {
+        ConditionAssertKind::Assert => quote! { assert!(__turso_cond, #fmt_args); },
+        ConditionAssertKind::DebugAssert => {
+            quote! { debug_assert!(__turso_cond, #fmt_args); }
+        }
+    };
+    let exit_msg = quote! {
+        eprint!("[antithesis] assertion failed: ");
+        eprintln!(#fmt_args);
+        eprintln!("exiting with code 0 because antithesis already captured this failure");
     };
 
     let env_check = antithesis_env_check();
@@ -846,6 +827,7 @@ fn emit_sometimes_comparison(
         .unwrap_or_else(|| comparison_auto_message(left, right, op_str));
     let prefixed = prefix_message(file_path, &msg);
     let details = details_json(&input.details);
+    let debug_check = details_debug_check(&input.details);
 
     let env_check = antithesis_env_check();
     quote! {
@@ -860,6 +842,7 @@ fn emit_sometimes_comparison(
             #[cfg(not(antithesis))]
             {
                 let _ = (__turso_left, __turso_right);
+                #debug_check
             }
         }
     }
@@ -1019,6 +1002,7 @@ pub fn turso_assert_sometimes(input: TokenStream) -> TokenStream {
     let prefixed = prefix_message(&file_path, &msg);
     let details = details_json(&input.details);
 
+    let debug_check = details_debug_check(&input.details);
     let env_check = antithesis_env_check();
     quote! {
         {
@@ -1031,6 +1015,7 @@ pub fn turso_assert_sometimes(input: TokenStream) -> TokenStream {
             #[cfg(not(antithesis))]
             {
                 let _ = __turso_cond;
+                #debug_check
             }
         }
     }
@@ -1262,6 +1247,7 @@ pub fn turso_soft_unreachable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as MessageAssertInput);
     let prefixed = prefix_message(&file_path, &input.message);
     let details = details_json(&input.details);
+    let debug_check = details_debug_check(&input.details);
 
     let env_check = antithesis_env_check();
     quote! {
@@ -1270,6 +1256,10 @@ pub fn turso_soft_unreachable(input: TokenStream) -> TokenStream {
             {
                 #env_check
                 antithesis_sdk::assert_unreachable!(#prefixed, #details);
+            }
+            #[cfg(not(antithesis))]
+            {
+                #debug_check
             }
         }
     }

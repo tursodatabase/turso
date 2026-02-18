@@ -487,7 +487,7 @@ where
                     // Update all existing mappings that pointed to old_name
                     for v in name_to_final.values_mut() {
                         if v == old_name {
-                            *v = new_name.clone();
+                            v.clone_from(new_name);
                         }
                     }
                 }
@@ -525,7 +525,7 @@ where
                                 committed.rows.len()
                             );
                         };
-                        committed.rows[pos] = new_row.clone();
+                        committed.rows[pos].clone_from(new_row);
                     }
                     TxOperation::Delete { table_name, row } => {
                         let committed = self
@@ -568,7 +568,7 @@ where
                             .iter_mut()
                             .find(|t| &t.name == old_name)
                             .expect("Table should exist in committed tables");
-                        committed.name = new_name.clone();
+                        committed.name.clone_from(new_name);
                     }
                     TxOperation::AddColumn { table_name, column } => {
                         let committed = self
@@ -653,12 +653,12 @@ where
                             .iter_mut()
                             .find(|c| &c.name == old_name)
                             .expect("Column should exist");
-                        col.name = new_name.clone();
+                        col.name.clone_from(new_name);
                         // Update index column names
                         for index in &mut committed.indexes {
                             for (col_name, _) in &mut index.columns {
                                 if col_name == old_name {
-                                    *col_name = new_name.clone();
+                                    col_name.clone_from(new_name);
                                 }
                             }
                         }
@@ -682,7 +682,7 @@ where
                         for index in &mut committed.indexes {
                             for (col_name, _) in &mut index.columns {
                                 if col_name == old_name {
-                                    *col_name = new_column.name.clone();
+                                    col_name.clone_from(&new_column.name);
                                 }
                             }
                         }

@@ -262,7 +262,7 @@ impl Property {
                 let table_dependency = table.clone();
                 let table_name = table.clone();
                 let assumption = InteractionType::Assumption(Assertion::new(
-                    format!("table {} exists", table.clone()),
+                    format!("table {table} exists"),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                         let conn_tables = env.get_conn_tables(connection_index);
                         if conn_tables.iter().any(|t| t.name == table_name) {
@@ -280,7 +280,7 @@ impl Property {
                 )));
 
                 let assertion = InteractionType::Assertion(Assertion::new(
-                    format!("table {} should have the expected content", table.clone()),
+                    format!("table {table} should have the expected content"),
                     move |stack: &Vec<ResultSet>, env| {
                         let rows = stack.last().unwrap();
                         let Ok(rows) = rows else {
@@ -312,7 +312,7 @@ impl Property {
                         }
                         Ok(Ok(()))
                     },
-                    vec![table_dependency.clone()],
+                    vec![table_dependency],
                 ));
 
                 vec![
@@ -329,7 +329,7 @@ impl Property {
                 let table = update.table().to_string();
                 let table_dependency = table.clone();
                 let assumption = InteractionType::Assumption(Assertion::new(
-                    format!("table {} exists", table.clone()),
+                    format!("table {table} exists"),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                         let conn_tables = env.get_conn_tables(connection_index);
                         if conn_tables.iter().any(|t| t.name == table) {
@@ -357,8 +357,7 @@ impl Property {
 
                 let assertion = InteractionType::Assertion(Assertion::new(
                     format!(
-                        "verify UPDATE result for table {}: success=values updated, failure=unchanged",
-                        table.clone()
+                        "verify UPDATE result for table {table}: success=values updated, failure=unchanged"
                     ),
                     move |stack: &Vec<ResultSet>, _| {
                         // Stack: [before, BEGIN, UPDATE, COMMIT, after]
@@ -1016,7 +1015,7 @@ impl Property {
                     Predicate::not(predicate.clone()),
                 ]);
                 let p_null = Predicate::and(vec![
-                    old_predicate.clone(),
+                    old_predicate,
                     Predicate::is(predicate.clone(), Predicate::null()),
                 ]);
 
@@ -1147,8 +1146,8 @@ impl Property {
                 let s3 = Select::compound(s1.clone(), s2.clone(), CompoundOperator::UnionAll);
 
                 vec![
-                    InteractionType::Query(Query::Select(s1.clone())),
-                    InteractionType::Query(Query::Select(s2.clone())),
+                    InteractionType::Query(Query::Select(s1)),
+                    InteractionType::Query(Query::Select(s2)),
                     InteractionType::Query(Query::Select(s3.clone())),
                     InteractionType::Assertion(Assertion::new(
                         "UNION ALL should preserve cardinality".to_string(),
