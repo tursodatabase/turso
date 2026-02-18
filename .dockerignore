@@ -1,1 +1,8 @@
 *target
+.git
+turso-test-runner
+assets
+bindings
+perf/clickbench
+perf/tpc-h
+testing/sqlright/build
