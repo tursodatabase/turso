@@ -1,5 +1,3 @@
-extern crate core;
-
 pub mod busy;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
