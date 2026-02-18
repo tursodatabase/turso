@@ -1,13 +1,20 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT p.id, p.name, p.price\n    FROM products p\n    WHERE p.price > (\n        SELECT avg(p2.price)\n        FROM products p2\n        WHERE p2.category_id = p.category_id\n    );"
+expression: |-
+  SELECT p.id, p.name, p.price
+      FROM products p
+      WHERE p.price > (
+          SELECT avg(p2.price)
+          FROM products p2
+          WHERE p2.category_id = p.category_id
+      );
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN products AS p
@@ -27,7 +34,7 @@ addr  opcode              p1  p2  p3  p4              p5  comment
    9      OpenRead         2   8   0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
   10      Column           0   2   9                   0  r[9]=products.category_id
   11      IsNull           9  20   0                   0  if (r[9]==NULL) goto 20
-  12      Affinity         9   1   0                   0  r[9..10] = C
+  12      Affinity         9   1   0                   0  r[9..10] = D
   13      SeekGE           2  20   9                   0  key=[9..9]
   14        IdxGT          2  20   9                   0  key=[9..9]
   15        DeferredSeek   2   1   0                   0

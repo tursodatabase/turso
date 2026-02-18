@@ -19,6 +19,7 @@ use crate::{
         select::prepare_select_plan,
     },
     vdbe::{
+        affinity,
         builder::{CursorType, MaterializedCteInfo, ProgramBuilder},
         insn::Insn,
         CursorID,
@@ -944,18 +945,38 @@ pub fn emit_from_clause_subqueries(
 
                     // If this reference needs a seek index, build it from the dup cursor
                     if let Operation::Search(Search::Seek {
-                        index: Some(index), ..
+                        index: Some(index),
+                        seek_def,
+                        ..
                     }) = &table_reference.op
                     {
                         if !index.ephemeral {
                             panic!("subquery has non-ephemeral index: {}", index.name);
                         }
+                        let dup_affinity_str = {
+                            let num_key_cols = seek_def.size(&seek_def.start);
+                            let total_cols =
+                                index.columns.len() + if index.has_rowid { 1 } else { 0 };
+                            let mut aff: String = seek_def
+                                .iter_affinity(&seek_def.start)
+                                .map(|a| a.aff_mask())
+                                .collect();
+                            for _ in num_key_cols..total_cols {
+                                aff.push(affinity::SQLITE_AFF_NONE);
+                            }
+                            if aff.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+                                Some(Arc::new(aff))
+                            } else {
+                                None
+                            }
+                        };
                         emit_seek_index_from_cursor(
                             program,
                             dup_cursor_id,
                             index,
                             table_reference.internal_id,
                             cte_info.num_columns,
+                            dup_affinity_str.as_ref(),
                         )?;
                     }
 
@@ -982,11 +1003,36 @@ pub fn emit_from_clause_subqueries(
                 }
             }
 
-            let seek_index = match &table_reference.op {
+            let (seek_index, seek_affinity_str) = match &table_reference.op {
                 Operation::Search(Search::Seek {
-                    index: Some(idx), ..
-                }) if idx.ephemeral => Some(idx.clone()),
-                _ => None,
+                    index: Some(idx),
+                    seek_def,
+                    ..
+                }) if idx.ephemeral => {
+                    // Build affinity string for MakeRecord when inserting into the
+                    // ephemeral index. Key columns get the comparison affinity so that
+                    // cross-type seeks work (e.g. integer probe on text CTE values).
+                    // Non-key columns and rowid get NONE (no coercion).
+                    let num_key_cols = seek_def.size(&seek_def.start);
+                    let total_cols = idx.columns.len() + if idx.has_rowid { 1 } else { 0 };
+                    let mut aff: String = seek_def
+                        .iter_affinity(&seek_def.start)
+                        .map(|a| a.aff_mask())
+                        .collect();
+                    for _ in num_key_cols..total_cols {
+                        aff.push(affinity::SQLITE_AFF_NONE);
+                    }
+                    let has_non_none = aff.chars().any(|c| c != affinity::SQLITE_AFF_NONE);
+                    (
+                        Some(idx.clone()),
+                        if has_non_none {
+                            Some(Arc::new(aff))
+                        } else {
+                            None
+                        },
+                    )
+                }
+                _ => (None, None),
             };
 
             // Determine if this CTE/subquery should be materialized:
@@ -1017,6 +1063,7 @@ pub fn emit_from_clause_subqueries(
                         index,
                         table_reference.internal_id,
                         from_clause_subquery.columns.len(),
+                        seek_affinity_str.as_ref(),
                     )?;
                 }
 
@@ -1045,6 +1092,7 @@ pub fn emit_from_clause_subqueries(
                     &index,
                     table_reference.internal_id,
                     from_clause_subquery.columns.len(),
+                    seek_affinity_str,
                 )?;
                 from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
                 program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
@@ -1266,6 +1314,7 @@ fn emit_indexed_materialized_subquery(
     index: &Arc<Index>,
     table_internal_id: TableInternalId,
     num_columns: usize,
+    affinity_str: Option<Arc<String>>,
 ) -> Result<usize> {
     // Allocate index cursor using CursorKey::index so main_loop can find it
     let index_cursor_id = program.alloc_cursor_id_keyed(
@@ -1278,7 +1327,7 @@ fn emit_indexed_materialized_subquery(
         *dest = QueryDestination::EphemeralIndex {
             cursor_id: index_cursor_id,
             index: index.clone(),
-            affinity_str: None,
+            affinity_str,
             is_delete: false,
         };
     }
@@ -1344,6 +1393,7 @@ fn emit_seek_index_from_cursor(
     index: &Arc<Index>,
     table_internal_id: TableInternalId,
     num_columns: usize,
+    affinity_str: Option<&Arc<String>>,
 ) -> Result<()> {
     // Allocate cursor for the seek index
     let index_cursor_id = program.alloc_cursor_id_keyed(
@@ -1399,14 +1449,15 @@ fn emit_seek_index_from_cursor(
         dest: key_regs_start + index.columns.len(),
     });
 
-    // Make record and insert into index
-    // Pass index name for collation handling
+    // Make record and insert into index.
+    // affinity_str coerces key columns so cross-type seeks work (e.g. integer
+    // probe on text CTE values).
     program.emit_insn(Insn::MakeRecord {
         start_reg: key_regs_start as u16,
         count: num_key_cols as u16,
         dest_reg: record_reg as u16,
         index_name: Some(index.name.clone()),
-        affinity_str: None,
+        affinity_str: affinity_str.map(|s| (**s).clone()),
     });
 
     program.emit_insn(Insn::IdxInsert {

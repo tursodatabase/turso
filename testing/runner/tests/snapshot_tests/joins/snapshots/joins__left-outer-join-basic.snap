@@ -1,15 +1,23 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        c.customer_id,\n        c.name,\n        o.order_id,\n        o.order_date\n    FROM\n        customers c\n    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id;"
+expression: |-
+  SELECT
+          c.customer_id,
+          c.name,
+          o.order_id,
+          o.order_date
+      FROM
+          customers c
+      LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id;
 info:
   statement_type: SELECT
   tables:
-    - c.customer_id
-    - customers
-    - orders
+  - c.customer_id
+  - customers
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN customers AS c

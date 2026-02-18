@@ -1,13 +1,13 @@
 ---
 source: indexes.sqltest
-expression: "SELECT id, event_type, severity FROM events WHERE severity > 5;"
+expression: SELECT id, event_type, severity FROM events WHERE severity > 5;
 info:
   statement_type: SELECT
   tables:
-    - events
+  - events
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SEARCH events USING INDEX idx_events_severity

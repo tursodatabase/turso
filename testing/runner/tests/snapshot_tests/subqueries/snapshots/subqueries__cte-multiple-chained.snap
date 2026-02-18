@@ -96,7 +96,7 @@ addr  opcode                  p1  p2  p3  p4            p5  comment
   57    Le                    32  33  70  Binary         0  if r[32]<=r[33] goto 70
   58    Copy                  13  34   0                 0  r[34]=r[13]
   59    IsNull                34  70   0                 0  if (r[34]==NULL) goto 70
-  60    Affinity              34   1   0                 0  r[34..35] = C
+  60    Affinity              34   1   0                 0  r[34..35] = D
   61    SeekGE                 0  70  34                 0  key=[34..34]
   62      IdxGT                0  70  34                 0  key=[34..34]
   63      Column               0   0   1                 0  r[1]=ephemeral_subquery_t2.id

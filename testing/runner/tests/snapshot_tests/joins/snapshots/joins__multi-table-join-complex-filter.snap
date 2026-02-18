@@ -1,13 +1,34 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        c.name,\n        o.order_id,\n        o.order_date,\n        p.name AS product_name,\n        p.category\n    FROM\n        customers c,\n        orders o,\n        order_items oi,\n        products p\n    WHERE\n        c.customer_id = o.customer_id\n        AND o.order_id = oi.order_id\n        AND oi.product_id = p.product_id\n        AND c.city = 'New York'\n        AND o.order_date >= '2024-01-01'\n        AND p.price > 50\n    ORDER BY\n        o.order_date DESC,\n        p.name;"
+expression: |-
+  SELECT
+          c.name,
+          o.order_id,
+          o.order_date,
+          p.name AS product_name,
+          p.category
+      FROM
+          customers c,
+          orders o,
+          order_items oi,
+          products p
+      WHERE
+          c.customer_id = o.customer_id
+          AND o.order_id = oi.order_id
+          AND oi.product_id = p.product_id
+          AND c.city = 'New York'
+          AND o.order_date >= '2024-01-01'
+          AND p.price > 50
+      ORDER BY
+          o.order_date DESC,
+          p.name;
 info:
   statement_type: SELECT
   tables:
-    - customers
+  - customers
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN customers AS c
