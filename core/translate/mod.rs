@@ -195,6 +195,10 @@ pub fn translate_inner(
             when_clause,
             commands,
         } => {
+            // Validate WHEN clause doesn't contain unsupported subqueries
+            if let Some(ref when_expr) = when_clause {
+                trigger::validate_trigger_when_clause(when_expr)?;
+            }
             // Reconstruct SQL for storage
             let sql = trigger::create_trigger_to_sql(
                 temporary,

@@ -1180,6 +1180,10 @@ impl Schema {
                         "invalid trigger sql: {sql}"
                     )));
                 };
+                // Validate WHEN clause doesn't contain unsupported subqueries
+                if let Some(ref when_expr) = when_clause {
+                    crate::translate::trigger::validate_trigger_when_clause(when_expr)?;
+                }
                 self.add_trigger(
                     Trigger::new(
                         trigger_name,

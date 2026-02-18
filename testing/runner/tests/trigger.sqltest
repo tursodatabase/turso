@@ -1021,3 +1021,36 @@ expect {
     new_row|1.0
 }
 
+# Reject NOT EXISTS in trigger WHEN clause (#5174)
+test trigger-reject-not-exists-in-when {
+    CREATE TABLE reject_exists_t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER reject_exists_tr AFTER INSERT ON reject_exists_t WHEN NOT EXISTS (SELECT 1) BEGIN
+      INSERT INTO reject_exists_t VALUES(NEW.id + 100, 'auto');
+    END;
+}
+expect error {
+    EXISTS is not supported in trigger WHEN clause
+}
+
+# Reject IN (subquery) in trigger WHEN clause (#5174)
+test trigger-reject-in-subquery-in-when {
+    CREATE TABLE reject_in_t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER reject_in_tr AFTER INSERT ON reject_in_t WHEN NEW.id IN (SELECT 1) BEGIN
+      INSERT INTO reject_in_t VALUES(NEW.id + 100, 'auto');
+    END;
+}
+expect error {
+    IN \(\.\.\.subquery\) is not supported in trigger WHEN clause
+}
+
+# Reject scalar subquery in trigger WHEN clause (#5174)
+test trigger-reject-scalar-subquery-in-when {
+    CREATE TABLE reject_scalar_t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER reject_scalar_tr AFTER INSERT ON reject_scalar_t WHEN NEW.id = (SELECT 1) BEGIN
+      INSERT INTO reject_scalar_t VALUES(NEW.id + 100, 'auto');
+    END;
+}
+expect error {
+    Subquery is not supported in trigger WHEN clause
+}
+

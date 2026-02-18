@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
@@ -7,7 +8,7 @@ use crate::util::normalize_ident;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, Connection, Result};
-use turso_parser::ast::{self, QualifiedName};
+use turso_parser::ast::{self, Expr, QualifiedName};
 
 /// Reconstruct SQL string from CREATE TRIGGER AST
 #[allow(clippy::too_many_arguments)]
@@ -78,6 +79,35 @@ pub(crate) fn create_trigger_to_sql(
     sql.push_str(" END");
 
     sql
+}
+
+/// Validate that a trigger WHEN clause does not contain subqueries
+/// (EXISTS, IN subquery, scalar subquery), which are not yet supported.
+/// Returns an error if an unsupported expression is found.
+pub(crate) fn validate_trigger_when_clause(when_clause: &Expr) -> Result<()> {
+    let mut err: Option<String> = None;
+    let _ = walk_expr(when_clause, &mut |e| {
+        match e {
+            Expr::Exists(_) => {
+                err = Some("EXISTS is not supported in trigger WHEN clause".to_string());
+                return Ok(WalkControl::SkipChildren);
+            }
+            Expr::InSelect { .. } => {
+                err = Some("IN (...subquery) is not supported in trigger WHEN clause".to_string());
+                return Ok(WalkControl::SkipChildren);
+            }
+            Expr::Subquery(_) => {
+                err = Some("Subquery is not supported in trigger WHEN clause".to_string());
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    if let Some(msg) = err {
+        bail_parse_error!("{}", msg);
+    }
+    Ok(())
 }
 
 /// Translate CREATE TRIGGER statement
