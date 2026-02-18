@@ -1,7 +1,5 @@
 @database :memory:
 
-@skip-file-if mvcc "not supported in MVCC mode"
-
 # Test integrity_check with expression indexes.
 # Expression indexes use computed values rather than direct column references.
 # Previously, this caused a panic because expression index columns have

@@ -3142,8 +3142,7 @@ mod fuzz_tests {
             for i in 0..num_indexes {
                 // Decide if this should be a single-column or multi-column index
                 let is_multi_column = rng.random_bool(0.5) && num_cols > 1;
-                // Expression indexes are not supported in MVCC (at least yet)
-                let is_expr = !is_mvcc && rng.random_bool(0.3);
+                let is_expr = rng.random_bool(0.3);
 
                 if is_multi_column {
                     // Create a multi-column index with 2-3 columns
