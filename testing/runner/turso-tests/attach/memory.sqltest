@@ -1,6 +1,6 @@
 @database :memory:
+@skip-file-if mvcc "attach not supported in MVCC mode"
 
-@skip-if mvcc "attach not supported in MVCC mode"
 # Test querying attached in-memory database
 test attach-db-query {
     ATTACH DATABASE ':memory:' AS small;
@@ -22,7 +22,6 @@ expect {
     0|main|
 }
 
-@skip-if mvcc "attach not supported in MVCC mode"
 # Test attach in-memory database
 test attach-memory-database {
     ATTACH DATABASE ':memory:' AS mem;
@@ -33,7 +32,6 @@ expect {
     2|mem|
 }
 
-@skip-if mvcc "attach not supported in MVCC mode"
 # Test join between main and attached database
 test attach-cross-database-join {
     ATTACH DATABASE ':memory:' as small;
@@ -49,7 +47,6 @@ expect {
     B
 }
 
-@skip-if mvcc "attach not supported in MVCC mode"
 # regression test for https://github.com/tursodatabase/turso/issues/3540
 test attach-from-memory-db {
     CREATE TABLE t(a);

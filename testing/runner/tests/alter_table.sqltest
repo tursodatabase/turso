@@ -259,7 +259,8 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3886
-test alter-tbl-rregression {
+@skip-if mvcc "foreign keys are not supported in MVCC mode"
+test alter-tbl-regression {
     PRAGMA foreign_keys = ON;
     CREATE TABLE p_ren1(id INTEGER PRIMARY KEY);
     CREATE TABLE c_ren1(id INTEGER PRIMARY KEY, pid INTEGER,

@@ -1622,6 +1622,7 @@ expect {
 }
 
 @requires trigger "uses trigger"
+@skip-if mvcc "not supported in MVCC mode"
 test upsert-trigger-causes-fk-violation {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id PRIMARY KEY);
