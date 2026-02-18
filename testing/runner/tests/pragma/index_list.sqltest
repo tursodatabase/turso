@@ -56,7 +56,6 @@ expect {
     sqlite_autoindex_t1_2|1|u|0
 }
 
-@skip-if mvcc "partial indexes not supported with MVCC"
 test pragma-index-list-partial-index {
     CREATE TABLE t1(a, b, c);
     CREATE INDEX idx_partial ON t1(a) WHERE b > 0;

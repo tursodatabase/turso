@@ -1501,7 +1501,7 @@ expect {
     5|three
 }
 
-@skip-if mvcc "not supported in MVCC mode"
+@skip-if mvcc "expression indexes not supported in MVCC mode"
 test partial-expr-index-upsert-conflict {
     CREATE TABLE t(
         id INTEGER PRIMARY KEY,
@@ -1518,7 +1518,7 @@ test partial-expr-index-upsert-conflict {
 expect error {
 }
 
-@skip-if mvcc "not supported in MVCC mode"
+@skip-if mvcc "expression indexes not supported in MVCC mode"
 test partial-expr-index-update-removes-entry {
     CREATE TABLE t(
         id INTEGER PRIMARY KEY,
@@ -1537,7 +1537,7 @@ expect {
     FOO|zzzz|5
 }
 
-@skip-if mvcc "not supported in MVCC mode"
+@skip-if mvcc "expression indexes not supported in MVCC mode"
 test partial-expr-index-delete-clears-entry {
     CREATE TABLE t(
         id INTEGER PRIMARY KEY,

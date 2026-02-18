@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "partial indexes not fully supported in MVCC mode"
 
 test partial-index-unique-basic {
     CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, status TEXT);

@@ -808,9 +808,6 @@ impl Schema {
                 if index.columns.iter().any(|c| c.expr.is_some()) {
                     crate::bail_parse_error!("Expression indexes are not supported with MVCC");
                 }
-                if index.where_clause.is_some() {
-                    crate::bail_parse_error!("Partial indexes are not supported with MVCC");
-                }
                 if index.index_method.is_some() {
                     crate::bail_parse_error!("Custom index modules are not supported with MVCC");
                 }
