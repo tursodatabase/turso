@@ -1,4 +1,3 @@
-#![allow(clippy::arc_with_non_send_sync)]
 extern crate core;
 
 pub mod busy;
