@@ -548,8 +548,10 @@ test check_constraint_real_precision_violation {
 expect error {
 }
 
-# Transaction rollback on CHECK constraint failure
-test check_constraint_transaction_rollback {
+# Transaction behavior on CHECK constraint failure (ABORT semantics)
+# With default ABORT, only the failing statement is rolled back.
+# Prior successful statements in the same transaction are preserved.
+test check_constraint_transaction_abort {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
         age INTEGER CHECK (age >= 18)
@@ -557,14 +559,14 @@ test check_constraint_transaction_rollback {
     BEGIN;
     INSERT INTO employees VALUES (1, 25);
     INSERT INTO employees VALUES (2, 30);
-    -- This should fail and rollback entire transaction
+    -- This fails CHECK; only this statement is rolled back (ABORT semantics)
     INSERT INTO employees VALUES (3, 17);
     COMMIT;
 }
 expect error {
 }
 
-test check_constraint_verify_rollback {
+test check_constraint_verify_abort_preserves_prior {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
         age INTEGER CHECK (age >= 18)
@@ -577,7 +579,7 @@ test check_constraint_verify_rollback {
     BEGIN;
     INSERT INTO employees VALUES (3, 17);
     COMMIT;
-    -- Transaction should have rolled back, only first two rows exist
+    -- ABORT only rolls back the failing statement; first two rows were committed
     SELECT id FROM employees ORDER BY id;
 }
 expect error {
