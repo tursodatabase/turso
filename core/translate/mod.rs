@@ -242,7 +242,7 @@ pub fn translate_inner(
             program,
         )?,
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(vtab, resolver, program)?
+            translate_create_virtual_table(vtab, resolver, program, connection)?
         }
         ast::Stmt::Delete {
             tbl_name,

@@ -790,6 +790,7 @@ expect error {
 }
 
 # Foreign key + CHECK constraint interaction
+@skip-if mvcc "foreign key constraints not supported in MVCC mode"
 test check_constraint_with_foreign_key {
     PRAGMA foreign_keys = ON;
     CREATE TABLE parent (id INTEGER PRIMARY KEY);

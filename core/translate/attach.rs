@@ -24,6 +24,11 @@ pub fn translate_attach(
             "ATTACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
         ));
     }
+    if connection.mvcc_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "ATTACH is not supported in MVCC mode".to_string(),
+        ));
+    }
     // SQLite treats ATTACH as a function call to sqlite_attach(filename, dbname, key)
     // We'll allocate registers for the arguments and call the function
 

@@ -1,5 +1,6 @@
 @database :default:
 @database :default-no-rowidalias:
+@skip-file-if mvcc "attach is not supported in mvcc mode"
 
 # Test attach reserved name - main (should fail)
 test attach-reserved-main {

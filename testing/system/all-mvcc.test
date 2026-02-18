@@ -1,6 +1,0 @@
-#!/usr/bin/env tclsh
-
-set testdir [file dirname $argv0]
-
-# works
-source $testdir/vtab.test

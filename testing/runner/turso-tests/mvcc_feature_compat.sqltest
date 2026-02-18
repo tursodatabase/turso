@@ -1,0 +1,48 @@
+@database :memory:
+
+# Test that incompatible features are properly rejected when MVCC is enabled.
+# These tests only run against tursodb since MVCC is turso-specific.
+
+test mvcc-rejects-create-view {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE VIEW v1 AS SELECT * FROM t1;
+}
+expect error {
+    Views are not supported in MVCC mode
+}
+
+test mvcc-rejects-foreign-keys {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    PRAGMA foreign_keys = ON;
+}
+expect error {
+    Foreign keys are not supported in MVCC mode
+}
+
+test mvcc-rejects-partial-index {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx_partial ON t2(val) WHERE val > 0;
+}
+expect error {
+    Partial indexes are not supported in MVCC mode
+}
+
+test mvcc-rejects-expression-index {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    CREATE TABLE t3 (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_expr ON t3(UPPER(name));
+}
+expect error {
+    Expression indexes are not supported in MVCC mode
+}
+
+test mvcc-rejects-cdc {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    CREATE TABLE t4 (id INTEGER PRIMARY KEY, val TEXT);
+    PRAGMA unstable_capture_data_changes_conn = 'full';
+}
+expect error {
+    CDC is not supported in MVCC mode
+}

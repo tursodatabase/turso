@@ -59,7 +59,7 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-runner test-runner-js test-runner-cli
+test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-runner test-runner-js test-runner-cli
 .PHONY: test
 
 test-runner:
@@ -84,9 +84,6 @@ test-shell: build uv-sync-test
 
 test-compat: check-tcl-version
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/system/all.test
-
-test-compat-mvcc: check-tcl-version
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=scripts/turso-mvcc-sqlite3 ./testing/system/all-mvcc.test
 
 test-single: check-tcl-version
 	@if [ -z "$(TEST)" ]; then \
@@ -142,10 +139,6 @@ test-constraint: build uv-sync-test
 		echo "Skipping test-constraint: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
 	fi
 .PHONY: test-constraint
-
-test-mvcc: build uv-sync-test
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-mvcc;
-.PHONY: test-mvcc
 
 bench-vfs: uv-sync-test build-release
 	RUST_LOG=$(RUST_LOG) uv run --project limbo_test bench-vfs "$(SQL)" "$(N)"

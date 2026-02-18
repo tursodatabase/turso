@@ -639,7 +639,11 @@ pub fn translate_create_virtual_table(
     vtab: ast::CreateVirtualTable,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    if connection.mvcc_enabled() {
+        bail_parse_error!("Virtual tables are not supported in MVCC mode");
+    }
     let ast::CreateVirtualTable {
         if_not_exists,
         tbl_name,
