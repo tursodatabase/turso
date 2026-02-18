@@ -133,6 +133,7 @@ fn translate_integrity_check_impl(
                             column_positions,
                             default_values_start_reg,
                             index_info: Arc::new(IndexInfo::new_from_index(index)),
+                            partial: index.where_clause.is_some(),
                         });
                     }
                 }

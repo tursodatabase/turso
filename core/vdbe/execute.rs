@@ -9815,7 +9815,10 @@ pub fn op_integrity_check(
                         let table = &tables[*current_table_idx];
                         let index = &table.indexes[*current_index_idx];
 
-                        if *table_row_count != *index_entry_count {
+                        // Partial indexes only contain entries for rows matching the
+                        // WHERE predicate, so their entry count will naturally differ
+                        // from the total table row count. Skip the comparison.
+                        if !index.partial && *table_row_count != *index_entry_count {
                             errors.push(IntegrityCheckError::IndexEntryCountMismatch {
                                 index_name: index.name.clone(),
                                 table_name: table.name.clone(),
@@ -10225,6 +10228,14 @@ pub fn op_integrity_check(
 
                         // Open cursor for this index if not already open
                         let index = &table.indexes[*current_index_idx];
+
+                        // Skip partial indexes - we can't verify row-index consistency
+                        // without evaluating the WHERE predicate expression.
+                        if index.partial {
+                            *current_index_idx += 1;
+                            continue;
+                        }
+
                         if index_cursor.is_none() {
                             let mut cursor = BTreeCursor::new(pager.clone(), index.root_page, 0);
                             cursor.index_info = Some(index.index_info.clone());

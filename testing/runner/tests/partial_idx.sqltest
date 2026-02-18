@@ -871,6 +871,44 @@ expect {
     456|2|0|1
 }
 
+# Partial index integrity_check should not report false "wrong # of entries"
+# when non-matching rows exist (issue #5158)
+test partial-index-integrity-check-non-matching-rows {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx1 ON t1(val) WHERE val > 500;
+    INSERT INTO t1 VALUES(1, 100);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Partial index integrity_check with mix of matching and non-matching rows
+test partial-index-integrity-check-mixed-rows {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx1 ON t1(val) WHERE val > 500;
+    INSERT INTO t1 VALUES(1, 100);
+    INSERT INTO t1 VALUES(2, 600);
+    INSERT INTO t1 VALUES(3, 200);
+    INSERT INTO t1 VALUES(4, 700);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Partial index integrity_check with only matching rows
+test partial-index-integrity-check-all-matching {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx1 ON t1(val) WHERE val > 500;
+    INSERT INTO t1 VALUES(1, 600);
+    INSERT INTO t1 VALUES(2, 700);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
 # Partial index with doubly qualified column reference in function
 test partial-index-doubly-qualified-column-in-function {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT, flag INTEGER);

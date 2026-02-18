@@ -59,6 +59,8 @@ pub struct IntegrityCheckIndex {
     pub default_values_start_reg: usize,
     /// Index info for cursor operations (sort order, collation, etc)
     pub index_info: std::sync::Arc<crate::types::IndexInfo>,
+    /// Whether this is a partial index (has a WHERE clause)
+    pub partial: bool,
 }
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
