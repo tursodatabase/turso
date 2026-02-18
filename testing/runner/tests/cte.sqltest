@@ -905,3 +905,46 @@ test subquery-aggregate-empty-result-non-agg-columns {
 expect {
     0||
 }
+
+# =============================================================================
+# Scalar subquery referencing CTE by original name after alias (#5225)
+# =============================================================================
+
+# Scalar subquery using original CTE name when CTE is aliased should error
+test cte-alias-scalar-subquery-original-name {
+    WITH c AS (SELECT 1 x) SELECT (SELECT c.x) FROM c t;
+}
+expect error {
+}
+
+# Scalar subquery uses alias name (should work)
+test cte-alias-scalar-subquery-alias-name {
+    WITH c AS (SELECT 1 x) SELECT (SELECT t.x) FROM c t;
+}
+expect {
+    1
+}
+
+# Without alias, original CTE name works in scalar subquery
+test cte-no-alias-scalar-subquery {
+    WITH c AS (SELECT 1 x) SELECT (SELECT c.x) FROM c;
+}
+expect {
+    1
+}
+
+# Multiple columns referenced by alias in scalar subquery
+test cte-alias-scalar-subquery-multiple-columns {
+    WITH c AS (SELECT 1 x, 2 y) SELECT (SELECT t.x), (SELECT t.y) FROM c t;
+}
+expect {
+    1|2
+}
+
+# Multiple CTEs, each aliased, scalar subqueries reference alias names
+test cte-alias-scalar-subquery-multiple-ctes {
+    WITH a AS (SELECT 1 x), b AS (SELECT 2 y) SELECT (SELECT t1.x), (SELECT t2.y) FROM a t1, b t2;
+}
+expect {
+    1|2
+}
