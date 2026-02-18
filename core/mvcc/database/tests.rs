@@ -5806,3 +5806,61 @@ fn test_close_persists_drop_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+/// Test that IdxDelete does not panic when a concurrent transaction has modified
+/// the same row's index entries. This reproduces the race from issue #5004 where:
+///
+/// 1. Tx1 (auto-commit) reads old table values while the index tombstone's TxID
+///    has not yet been converted to a timestamp (btree entry still valid for Tx1).
+/// 2. Before Tx1 executes IdxDelete, Tx2's commit converts the index tombstone's
+///    end field from TxID to Timestamp, making the btree entry invalid for Tx1.
+/// 3. Tx1's IdxDelete finds no matching index entry and should NOT panic.
+#[test]
+fn test_concurrent_update_idx_delete_no_panic() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+
+    conn1
+        .execute(
+            "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            val TEXT UNIQUE
+        )",
+        )
+        .unwrap();
+
+    conn1
+        .execute("INSERT INTO t VALUES (1, 'original')")
+        .unwrap();
+
+    // conn2 will update the row, changing the index entry
+    let conn2 = db.connect();
+
+    // Tx2: update the indexed column and commit
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("UPDATE t SET val = 'modified' WHERE id = 1")
+        .unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Tx1: now try to update the same row. Tx1 may see old table values
+    // from the btree (if the tombstone TxID hasn't been converted yet),
+    // but the index entry for 'original' may already be invalidated.
+    // This should not panic - it should either succeed or get a write-write conflict.
+    let result = conn1.execute("UPDATE t SET val = 'from_tx1' WHERE id = 1");
+    // The update may succeed (if Tx1 sees the committed state) or fail
+    // with a write-write conflict, but it must NOT panic with a corrupt error.
+    match result {
+        Ok(_) => {
+            // Verify the update took effect
+            let rows = get_rows(&conn1, "SELECT val FROM t WHERE id = 1");
+            assert_eq!(rows.len(), 1);
+        }
+        Err(LimboError::WriteWriteConflict) => {
+            // This is also acceptable - Tx1 detected the conflict
+        }
+        Err(e) => {
+            panic!("Expected success or WriteWriteConflict, got: {e:?}");
+        }
+    }
+}

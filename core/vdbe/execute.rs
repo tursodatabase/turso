@@ -7046,7 +7046,15 @@ pub fn op_idx_delete(
                 if !found {
                     // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
                     // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
-                    if *raise_error_if_no_matching_entry {
+                    //
+                    // In MVCC mode, a missing index entry does not necessarily indicate corruption.
+                    // During concurrent commits, the table row version timestamps and index row version
+                    // timestamps are updated non-atomically, creating a window where a reader can see
+                    // old table values (and thus compute old index keys) while the corresponding index
+                    // entry has already been invalidated by the concurrent commit's timestamp conversion.
+                    // The write-write conflict check at commit time will catch any actual conflicts.
+                    let is_mvcc = program.connection.db.mvcc_enabled();
+                    if *raise_error_if_no_matching_entry && !is_mvcc {
                         let reg_values = (*start_reg..*start_reg + *num_regs)
                             .map(|i| &state.registers[i])
                             .collect::<Vec<_>>();
@@ -7067,13 +7075,19 @@ pub fn op_idx_delete(
                     return_if_io!(cursor.rowid())
                 };
 
-                if rowid.is_none() && *raise_error_if_no_matching_entry {
-                    let reg_values = (*start_reg..*start_reg + *num_regs)
-                        .map(|i| &state.registers[i])
-                        .collect::<Vec<_>>();
-                    return Err(LimboError::Corrupt(format!(
-                        "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
-                    )));
+                if rowid.is_none() {
+                    if *raise_error_if_no_matching_entry && !program.connection.db.mvcc_enabled() {
+                        let reg_values = (*start_reg..*start_reg + *num_regs)
+                            .map(|i| &state.registers[i])
+                            .collect::<Vec<_>>();
+                        return Err(LimboError::Corrupt(format!(
+                            "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
+                        )));
+                    }
+                    // In MVCC mode, skip the delete if the entry is not found
+                    state.pc += 1;
+                    state.op_idx_delete_state = None;
+                    return Ok(InsnFunctionStepResult::Step);
                 }
                 state.op_idx_delete_state = Some(OpIdxDeleteState::Deleting);
             }
