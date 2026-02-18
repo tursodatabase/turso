@@ -602,6 +602,7 @@ pub fn translate_insert(
         connection,
         ctx.on_conflict,
         ctx.loop_labels.row_done,
+        Some(&table_references),
     )?;
 
     // Build a list of upsert constraints/indexes we need to run preflight

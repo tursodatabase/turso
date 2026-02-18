@@ -515,6 +515,7 @@ pub fn emit_upsert(
             connection,
             ast::ResolveType::Abort,
             ctx.loop_labels.row_done,
+            Some(table_references),
         )?;
     }
 
