@@ -1495,6 +1495,14 @@ impl Connection {
         }
     }
 
+    pub(crate) fn database_schemas(&self) -> &RwLock<HashMap<usize, Arc<Schema>>> {
+        &self.database_schemas
+    }
+
+    pub(crate) fn attached_databases(&self) -> &RwLock<DatabaseCatalog> {
+        &self.attached_databases
+    }
+
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         if database_id == 0 {

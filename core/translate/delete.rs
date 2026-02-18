@@ -43,7 +43,7 @@ pub fn translate_delete(
     }
 
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
 
@@ -77,7 +77,7 @@ pub fn translate_delete(
         }
     }
 
-    optimize_plan(program, &mut delete_plan, resolver.schema, connection)?;
+    optimize_plan(program, &mut delete_plan, resolver)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Rewrite the Delete plan after optimization whenever a RowSet is used (DELETE triggers
         // are present), so the joined table is treated as a plain table scan again.
@@ -128,8 +128,8 @@ pub fn prepare_delete_plan(
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> Result<Plan> {
-    let schema = resolver.schema;
-    let table = match connection.with_schema(database_id, |s| s.get_table(&tbl_name)) {
+    let schema = resolver.schema();
+    let table = match resolver.with_schema(database_id, |s| s.get_table(&tbl_name)) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", tbl_name),
     };
@@ -216,7 +216,7 @@ pub fn prepare_delete_plan(
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
         .map(|bt| {
-            connection.with_schema(database_id, |s| {
+            resolver.with_schema(database_id, |s| {
                 has_relevant_triggers_type_only(s, TriggerEvent::Delete, None, bt)
             })
         })

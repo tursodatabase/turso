@@ -889,7 +889,7 @@ fn parse_table(
     }
 
     // Resolve table using connection's with_schema method
-    let table = connection.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+    let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
         let alias = maybe_alias
@@ -924,7 +924,7 @@ fn parse_table(
     };
 
     let regular_view =
-        connection.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
+        resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery
         view.process()?;
@@ -956,12 +956,12 @@ fn parse_table(
         return result;
     }
 
-    let view = connection.with_schema(database_id, |schema| {
+    let view = resolver.with_schema(database_id, |schema| {
         schema.get_materialized_view(table_name.as_str())
     });
     if let Some(view) = view {
         // First check if the DBSP state table exists with the correct version
-        let has_compatible_state = connection.with_schema(database_id, |schema| {
+        let has_compatible_state = resolver.with_schema(database_id, |schema| {
             schema.has_compatible_dbsp_state_table(table_name.as_str())
         });
 
@@ -1053,7 +1053,7 @@ fn parse_table(
     }
 
     // Check if this is an incompatible view
-    let is_incompatible = connection.with_schema(database_id, |schema| {
+    let is_incompatible = resolver.with_schema(database_id, |schema| {
         schema
             .incompatible_views
             .contains(&normalized_qualified_name)

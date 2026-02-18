@@ -90,7 +90,7 @@ pub fn translate_update(
         )?;
     }
 
-    optimize_plan(program, &mut plan, resolver.schema, connection)?;
+    optimize_plan(program, &mut plan, resolver)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -140,7 +140,7 @@ pub fn translate_update_for_schema_change(
         )?;
     }
 
-    optimize_plan(program, &mut plan, resolver.schema, connection)?;
+    optimize_plan(program, &mut plan, resolver)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -209,14 +209,14 @@ pub fn prepare_update_plan(
     is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
     let database_id = connection.resolve_database_id(&body.tbl_name)?;
-    let schema = resolver.schema;
+    let schema = resolver.schema();
     let table_name = &body.tbl_name.name;
-    let table = match connection.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     validate_update(
@@ -392,7 +392,7 @@ pub fn prepare_update_plan(
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.
-    let indexes: Vec<_> = connection.with_schema(database_id, |s| {
+    let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect()
     });
     let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();

@@ -97,7 +97,12 @@ pub fn translate(
     );
 
     program.prologue();
-    let mut resolver = Resolver::new(schema, syms);
+    let mut resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        connection.attached_databases(),
+        syms,
+    );
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -163,9 +168,11 @@ pub fn translate_inner(
         ast::Stmt::Attach { expr, db_name, key } => {
             attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
+        ast::Stmt::Begin { typ, name } => {
+            translate_tx_begin(typ, name, resolver.schema(), program)?
+        }
         ast::Stmt::Commit { name } => {
-            translate_tx_commit(name, resolver.schema, resolver, program)?
+            translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
             translate_create_index(program, connection, resolver, stmt)?;
@@ -284,7 +291,13 @@ pub fn translate_inner(
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(connection, &trigger_name, if_exists, program)?,
+        } => trigger::translate_drop_trigger(
+            connection,
+            resolver,
+            &trigger_name,
+            if_exists,
+            program,
+        )?,
         ast::Stmt::DropView {
             if_exists,
             view_name,

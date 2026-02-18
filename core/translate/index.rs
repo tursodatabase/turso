@@ -100,13 +100,13 @@ pub fn translate_create_index(
     program.extend(&opts);
 
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
-    let schema_unique = connection.with_schema(database_id, |s| s.is_unique_idx_name(&idx_name));
+    let schema_unique = resolver.with_schema(database_id, |s| s.is_unique_idx_name(&idx_name));
     if !schema_unique {
         // If IF NOT EXISTS is specified, silently return without error
         if if_not_exists {
@@ -114,7 +114,7 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let table = connection.with_schema(database_id, |s| s.get_table(&tbl_name));
+    let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
@@ -180,7 +180,7 @@ pub fn translate_create_index(
     // 3. table_cursor_id         - table we are creating the index on
     // 4. sorter_cursor_id        - sorter
     // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
-    let sqlite_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
     let table_ref = program.table_reference_counter.next();
@@ -236,7 +236,7 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
     emit_schema_entry(
         program,
         resolver,
@@ -509,7 +509,7 @@ pub fn translate_create_index(
     // Keep schema table open to emit ParseSchema, close the other cursors.
     program.close_cursors(&[sorter_cursor_id, table_cursor_id, index_cursor_id]);
 
-    let current_schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -780,13 +780,13 @@ pub fn translate_drop_index(
     program.extend(&opts);
 
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
 
     // Find the index in Schema
     let mut maybe_index = None;
-    let indexes: Vec<_> = connection.with_schema(database_id, |s| {
+    let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
         s.indexes
             .values()
             .flat_map(|v| v.iter())
@@ -820,7 +820,7 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -836,7 +836,7 @@ pub fn translate_drop_index(
     let row_id_reg = program.alloc_register();
 
     // We're going to use this cursor to search through sqlite_schema
-    let sqlite_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
 
@@ -934,7 +934,7 @@ pub fn translate_drop_index(
         emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
     }
 
-    let current_schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -997,7 +997,7 @@ pub fn translate_optimize(
         let idx_name = normalize_ident(name.name.as_str());
         let mut found = false;
 
-        for val in resolver.schema.indexes.values() {
+        for val in resolver.schema().indexes.values() {
             for idx in val {
                 if idx.name == idx_name {
                     if idx.index_method.is_some() && !idx.is_backing_btree_index() {
@@ -1025,7 +1025,7 @@ pub fn translate_optimize(
         }
     } else {
         // Optimize all index method indexes
-        for val in resolver.schema.indexes.values() {
+        for val in resolver.schema().indexes.values() {
             for idx in val {
                 if idx.index_method.is_some() && !idx.is_backing_btree_index() {
                     indexes_to_optimize.push(idx.clone());

@@ -527,7 +527,7 @@ pub fn emit_upsert(
         let updated_column_indices: HashSet<usize> =
             set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
         let relevant_before_update_triggers: Vec<_> =
-            connection.with_schema(upsert_database_id, |s| {
+            resolver.with_schema(upsert_database_id, |s| {
                 get_relevant_triggers_type_and_time(
                     s,
                     TriggerEvent::Update,
@@ -577,7 +577,7 @@ pub fn emit_upsert(
                 target_pc: ctx.loop_labels.row_done,
             });
 
-            let has_relevant_after_triggers = connection.with_schema(upsert_database_id, |s| {
+            let has_relevant_after_triggers = resolver.with_schema(upsert_database_id, |s| {
                 get_relevant_triggers_type_and_time(
                     s,
                     TriggerEvent::Update,
@@ -608,7 +608,7 @@ pub fn emit_upsert(
             }
         } else {
             // Check if we need to preserve for AFTER triggers
-            let has_relevant_after_triggers = connection.with_schema(upsert_database_id, |s| {
+            let has_relevant_after_triggers = resolver.with_schema(upsert_database_id, |s| {
                 get_relevant_triggers_type_and_time(
                     s,
                     TriggerEvent::Update,
@@ -648,7 +648,7 @@ pub fn emit_upsert(
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
 
             // Child-side checks
-            if connection.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
+            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
                 emit_fk_child_update_counters(
                     program,
                     &bt,
@@ -658,10 +658,10 @@ pub fn emit_upsert(
                     rowid_new_reg,
                     &changed_cols,
                     upsert_database_id,
-                    connection,
+                    resolver,
                 )?;
             }
-            let upsert_indices: Vec<_> = connection.with_schema(upsert_database_id, |s| {
+            let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
                 s.get_indices(table.get_name()).cloned().collect()
             });
             emit_parent_key_change_checks(
@@ -677,7 +677,7 @@ pub fn emit_upsert(
                 rowid_set_clause_reg,
                 set_pairs,
                 upsert_database_id,
-                connection,
+                resolver,
             )?;
         }
     }
@@ -686,7 +686,7 @@ pub fn emit_upsert(
     if let Some(before) = before_start {
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
-                .schema
+                .schema()
                 .get_index(table.get_name(), idx_name)
                 .expect("index exists");
 
@@ -973,7 +973,7 @@ pub fn emit_upsert(
     // This must be done after the update is complete but before AFTER triggers.
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled()
-            && connection.with_schema(upsert_database_id, |s| {
+            && resolver.with_schema(upsert_database_id, |s| {
                 s.any_resolved_fks_referencing(bt.name.as_str())
             })
         {
@@ -1077,7 +1077,7 @@ pub fn emit_upsert(
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
         let updated_column_indices: HashSet<usize> =
             set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
-        let relevant_triggers: Vec<_> = connection.with_schema(upsert_database_id, |s| {
+        let relevant_triggers: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
             get_relevant_triggers_type_and_time(
                 s,
                 TriggerEvent::Update,

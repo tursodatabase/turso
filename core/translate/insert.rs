@@ -69,7 +69,9 @@ fn validate(
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     // Check if this table has any incompatible dependent views
-    let incompatible_views = resolver.schema.has_incompatible_dependent_views(table_name);
+    let incompatible_views = resolver
+        .schema()
+        .has_incompatible_dependent_views(table_name);
     if !incompatible_views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
@@ -83,7 +85,7 @@ fn validate(
     }
 
     // Check if this is a materialized view
-    if resolver.schema.is_materialized_view(table_name) {
+    if resolver.schema().is_materialized_view(table_name) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
     if table.btree().is_some_and(|t| !t.has_rowid) {
@@ -161,17 +163,17 @@ impl<'a> InsertEmitCtx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         program: &mut ProgramBuilder,
-        _resolver: &Resolver,
+        resolver: &Resolver,
         table: &'a Arc<BTreeTable>,
         on_conflict: Option<ResolveType>,
         cdc_table: Option<(usize, Arc<BTreeTable>)>,
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
         database_id: usize,
-        connection: &Arc<crate::Connection>,
+        _connection: &Arc<crate::Connection>,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
-        let indices: Vec<_> = connection.with_schema(database_id, |s| {
+        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(table.name.as_str()).cloned().collect()
         });
         let mut idx_cursors = Vec::new();
@@ -259,7 +261,7 @@ pub fn translate_insert(
 
     let database_id = connection.resolve_database_id(&tbl_name)?;
     let table_name = &tbl_name.name;
-    let table = match connection.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
@@ -299,10 +301,10 @@ pub fn translate_insert(
         ensure_sequence_initialized(program, connection, &btree_table, database_id)?;
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, table.get_name())?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
 
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
 
@@ -350,8 +352,8 @@ pub fn translate_insert(
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, connection)?;
     let has_fks = fk_enabled
-        && (connection.with_schema(database_id, |s| s.has_child_fks(table_name.as_str()))
-            || connection.with_schema(database_id, |s| {
+        && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name.as_str()))
+            || resolver.with_schema(database_id, |s| {
                 s.any_resolved_fks_referencing(table_name.as_str())
             }));
 
@@ -424,7 +426,7 @@ pub fn translate_insert(
 
     // Fire BEFORE INSERT triggers
 
-    let relevant_before_triggers: Vec<_> = connection.with_schema(database_id, |s| {
+    let relevant_before_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
         get_relevant_triggers_type_and_time(
             s,
             TriggerEvent::Insert,
@@ -611,6 +613,7 @@ pub fn translate_insert(
         table_name.as_str(),
         &upsert_actions,
         has_user_provided_rowid,
+        resolver,
         connection,
         ctx.database_id,
     );
@@ -667,6 +670,7 @@ pub fn translate_insert(
             &btree_table,
             insertion.first_col_register(),
             insertion.key_register(),
+            resolver,
             database_id,
             connection,
         )?;
@@ -689,7 +693,7 @@ pub fn translate_insert(
     });
 
     // Fire AFTER INSERT triggers
-    let relevant_after_triggers: Vec<_> = connection.with_schema(database_id, |s| {
+    let relevant_after_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
         get_relevant_triggers_type_and_time(
             s,
             TriggerEvent::Insert,
@@ -752,6 +756,7 @@ pub fn translate_insert(
             &btree_table,
             &insertion,
             on_replace,
+            resolver,
             database_id,
             connection,
         )?;
@@ -944,9 +949,9 @@ fn emit_commit_phase(
     resolver: &Resolver,
     insertion: &Insertion,
     ctx: &InsertEmitCtx,
-    connection: &Arc<Connection>,
+    _connection: &Arc<Connection>,
 ) -> Result<()> {
-    let indices: Vec<_> = connection.with_schema(ctx.database_id, |s| {
+    let indices: Vec<_> = resolver.with_schema(ctx.database_id, |s| {
         s.get_indices(ctx.table.name.as_str()).cloned().collect()
     });
     for index in &indices {
@@ -1470,7 +1475,7 @@ fn bind_insert(
         let next = upsert_opt.next.take();
         upsert_actions.push((
             // resolve the constrained target for UPSERT in the chain
-            resolve_upsert_target(resolver.schema, table, &upsert_opt)?,
+            resolve_upsert_target(resolver.schema(), table, &upsert_opt)?,
             program.allocate_label(),
             upsert_opt,
         ));
@@ -1525,7 +1530,7 @@ fn init_source_emission<'a>(
         }
     }
     // Check if INSERT triggers exist - if so, we need to use ephemeral table for VALUES with more than one row
-    let has_insert_triggers = connection.with_schema(database_id, |s| {
+    let has_insert_triggers = resolver.with_schema(database_id, |s| {
         has_relevant_triggers_type_only(s, TriggerEvent::Insert, None, ctx.table.as_ref())
     });
 
@@ -2799,7 +2804,8 @@ fn build_constraints_to_check(
     table_name: &str,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     has_user_provided_rowid: bool,
-    connection: &Arc<crate::Connection>,
+    resolver: &Resolver,
+    _connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> ConstraintsToCheck {
     let mut constraints_to_check = Vec::new();
@@ -2811,7 +2817,7 @@ fn build_constraints_to_check(
             .position(|(target, ..)| matches!(target, ResolvedUpsertTarget::PrimaryKey));
         constraints_to_check.push((ResolvedUpsertTarget::PrimaryKey, position));
     }
-    let indices: Vec<_> = connection.with_schema(database_id, |s| {
+    let indices: Vec<_> = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect()
     });
     for index in &indices {
@@ -2949,7 +2955,7 @@ fn emit_replace_delete_conflicting_row(
 
     for (name, _, index_cursor_id) in ctx.idx_cursors.iter() {
         let index = resolver
-            .schema
+            .schema()
             .get_index(table_name, name)
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
@@ -3063,11 +3069,12 @@ pub fn emit_fk_child_insert_checks(
     child_tbl: &BTreeTable,
     new_start_reg: usize,
     new_rowid_reg: usize,
+    resolver: &Resolver,
     database_id: usize,
     connection: &Arc<Connection>,
 ) -> crate::Result<()> {
     for fk_ref in
-        connection.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
+        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
     {
         let is_self_ref = fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
 
@@ -3319,10 +3326,11 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     parent_table: &BTreeTable,
     insertion: &Insertion,
     force_immediate: bool,
+    resolver: &Resolver,
     database_id: usize,
-    connection: &Arc<Connection>,
+    _connection: &Arc<Connection>,
 ) -> crate::Result<()> {
-    for pref in connection.with_schema(database_id, |s| {
+    for pref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&parent_table.name)
     })? {
         let is_self_ref = pref
@@ -3338,7 +3346,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
 
         let child_tbl = &pref.child_table;
         let child_cols = &pref.fk.child_columns;
-        let indices: Vec<_> = connection.with_schema(database_id, |s| {
+        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(&child_tbl.name).cloned().collect()
         });
         let idx = indices.iter().find(|ix| {

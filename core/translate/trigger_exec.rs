@@ -624,7 +624,7 @@ fn execute_trigger_commands(
             "trigger subprogram",
         )?;
     }
-    subprogram_builder.epilogue(resolver.schema);
+    subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
 

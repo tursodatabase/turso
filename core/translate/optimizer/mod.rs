@@ -43,8 +43,6 @@ use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
-use crate::Connection;
-
 use super::{
     emitter::Resolver,
     plan::{
@@ -417,13 +415,13 @@ fn collect_index_method_candidates(
 pub fn optimize_plan(
     program: &mut ProgramBuilder,
     plan: &mut Plan,
-    schema: &Schema,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
+    let schema = resolver.schema();
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, schema)?,
         Plan::Delete(plan) => optimize_delete_plan(plan, schema)?,
-        Plan::Update(plan) => optimize_update_plan(program, plan, schema, connection)?,
+        Plan::Update(plan) => optimize_update_plan(program, plan, resolver)?,
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
@@ -561,9 +559,9 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
 fn optimize_update_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
-    schema: &Schema,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
+    let schema = resolver.schema();
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
@@ -605,7 +603,7 @@ fn optimize_update_plan(
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
         let database_id = table_ref.database_id;
-        if connection.with_schema(database_id, |s| {
+        if resolver.with_schema(database_id, |s| {
             has_relevant_triggers_type_only(
                 s,
                 TriggerEvent::Update,
@@ -2740,11 +2738,17 @@ impl TakeOwnership for ast::Expr {
 mod tests {
     use super::{where_term_is_null_rejecting_for_table, Optimizable};
     use crate::translate::emitter::Resolver;
-    use crate::{schema::Schema, SymbolTable};
+    use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
+    use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
 
-    fn empty_resolver<'a>(schema: &'a Schema, syms: &'a SymbolTable) -> Resolver<'a> {
-        Resolver::new(schema, syms)
+    fn empty_resolver<'a>(
+        schema: &'a Schema,
+        database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
+        attached_databases: &'a RwLock<DatabaseCatalog>,
+        syms: &'a SymbolTable,
+    ) -> Resolver<'a> {
+        Resolver::new(schema, database_schemas, attached_databases, syms)
     }
 
     fn no_tail() -> FunctionTail {
@@ -2768,7 +2772,9 @@ mod tests {
     fn constant_classifier_for_coalesce_with_in_list() {
         let schema = Schema::new();
         let syms = SymbolTable::new();
-        let resolver = empty_resolver(&schema, &syms);
+        let database_schemas = RwLock::new(HashMap::default());
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
 
         let expr = fn_call(
             "coalesce",
@@ -2795,7 +2801,9 @@ mod tests {
     fn constant_classifier_for_quote_of_column() {
         let schema = Schema::new();
         let syms = SymbolTable::new();
-        let resolver = empty_resolver(&schema, &syms);
+        let database_schemas = RwLock::new(HashMap::default());
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
 
         let expr = fn_call(
             "quote",

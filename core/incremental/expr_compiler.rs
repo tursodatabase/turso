@@ -12,8 +12,9 @@ use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::{Program, ProgramState, Register};
-use crate::SymbolTable;
 use crate::{Connection, QueryMode, Result, Value};
+use crate::{DatabaseCatalog, RwLock, SymbolTable};
+use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{Expr, Literal, Operator};
 
 // Transform an expression to replace column references with Register expressions Why do we want to
@@ -325,7 +326,9 @@ impl CompiledExpression {
         let transformed_expr = transform_expr_for_dbsp(expr, input_column_names);
 
         // Create a resolver for translate_expr
-        let resolver = Resolver::new(schema, syms);
+        let database_schemas = RwLock::new(HashMap::default());
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let resolver = Resolver::new(schema, &database_schemas, &attached_databases, syms);
 
         // Translate the transformed expression to bytecode
         translate_expr(
