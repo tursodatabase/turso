@@ -757,12 +757,15 @@ pub fn translate_expr(
         None
     };
 
-    if let Some(reg) = resolver.resolve_cached_expr_reg(expr) {
+    if let Some((reg, collation)) = resolver.resolve_cached_expr_reg(expr) {
         program.emit_insn(Insn::Copy {
             src_reg: reg,
             dst_reg: target_register,
             extra_amount: 0,
         });
+        if let Some(collation) = collation {
+            program.set_collation(Some((collation, false)));
+        }
         if let Some(span) = constant_span {
             program.constant_span_end(span);
         }
@@ -5390,7 +5393,7 @@ pub(crate) fn emit_returning_results<'a>(
     let cache_len = resolver.expr_to_reg_cache.len();
     resolver
         .expr_to_reg_cache
-        .push((std::borrow::Cow::Owned(expr), rowid_reg));
+        .push((std::borrow::Cow::Owned(expr), rowid_reg, None));
     for (i, column) in table.columns().iter().enumerate() {
         let reg = if column.is_rowid_alias() {
             rowid_reg
@@ -5405,7 +5408,7 @@ pub(crate) fn emit_returning_results<'a>(
         };
         resolver
             .expr_to_reg_cache
-            .push((std::borrow::Cow::Owned(expr), reg));
+            .push((std::borrow::Cow::Owned(expr), reg, None));
     }
 
     let result_start_reg = program.alloc_registers(result_columns.len());

@@ -535,6 +535,7 @@ pub fn init_window<'a>(
         t_ctx.resolver.expr_to_reg_cache.push((
             std::borrow::Cow::Borrowed(&func.original_expr),
             reg_acc_result_start + i,
+            None,
         ));
     }
 
@@ -546,10 +547,11 @@ pub fn init_window<'a>(
         collect_expressions_referencing_subquery(result_columns, order_by, &src_table.internal_id)?;
     let reg_col_start = program.alloc_registers(expressions_referencing_subquery.len());
     for (i, (expr, _)) in expressions_referencing_subquery.iter().enumerate() {
-        t_ctx
-            .resolver
-            .expr_to_reg_cache
-            .push((std::borrow::Cow::Borrowed(expr), reg_col_start + i));
+        t_ctx.resolver.expr_to_reg_cache.push((
+            std::borrow::Cow::Borrowed(expr),
+            reg_col_start + i,
+            None,
+        ));
     }
 
     t_ctx.meta_window = Some(WindowMetadata {

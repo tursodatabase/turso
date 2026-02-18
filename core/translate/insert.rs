@@ -536,7 +536,7 @@ pub fn translate_insert(
                 } else {
                     m.register
                 };
-                (n, reg)
+                (n, reg, m.column.collation_opt())
             })
         }),
         connection,

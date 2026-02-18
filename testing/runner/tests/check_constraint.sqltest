@@ -1651,3 +1651,51 @@ test check_constraint_keyword_constraint_name_quoting_after_alter {
 expect {
     1
 }
+
+# Bug fix: CHECK constraint with CASE expression should respect column COLLATE NOCASE
+test check_constraint_case_collate_nocase_violation {
+    CREATE TABLE users(
+        username TEXT COLLATE NOCASE,
+        privilege INT,
+        CHECK(CASE WHEN username='admin' THEN privilege>=100 ELSE 1 END)
+    );
+    INSERT INTO users VALUES ('Admin', 25);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test check_constraint_case_collate_nocase_success {
+    CREATE TABLE users(
+        username TEXT COLLATE NOCASE,
+        privilege INT,
+        CHECK(CASE WHEN username='admin' THEN privilege>=100 ELSE 1 END)
+    );
+    INSERT INTO users VALUES ('admin', 100);
+    INSERT INTO users VALUES ('Admin', 200);
+    INSERT INTO users VALUES ('bob', 25);
+    SELECT username, privilege FROM users ORDER BY username;
+}
+expect {
+    admin|100
+    Admin|200
+    bob|25
+}
+
+# Column COLLATE NOCASE should also work in non-CASE comparisons in CHECK
+test check_constraint_collate_nocase_column_level {
+    CREATE TABLE t(name TEXT COLLATE NOCASE, CHECK(name != 'forbidden'));
+    INSERT INTO t VALUES ('allowed');
+    SELECT * FROM t;
+}
+expect {
+    allowed
+}
+
+test check_constraint_collate_nocase_column_level_violation {
+    CREATE TABLE t(name TEXT COLLATE NOCASE, CHECK(name != 'forbidden'));
+    INSERT INTO t VALUES ('FORBIDDEN');
+}
+expect error {
+    CHECK constraint failed
+}

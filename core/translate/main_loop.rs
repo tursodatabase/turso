@@ -1052,7 +1052,7 @@ fn emit_multi_index_scan_loop(
     t_ctx
         .resolver
         .expr_to_reg_cache
-        .push((Cow::Owned(rowid_expr), rowid_reg));
+        .push((Cow::Owned(rowid_expr), rowid_reg, None));
 
     program.preassign_label_to_next_insn(skip_label);
 
@@ -1541,10 +1541,11 @@ pub fn open_loop(
                 });
                 let build_table_is_live = live_table_ids.contains(&build_table.internal_id);
                 if payload_info.allow_seek && !payload_has_build_rowid && !build_table_is_live {
-                    t_ctx
-                        .resolver
-                        .expr_to_reg_cache
-                        .push((Cow::Owned(rowid_expr), match_reg));
+                    t_ctx.resolver.expr_to_reg_cache.push((
+                        Cow::Owned(rowid_expr),
+                        match_reg,
+                        None,
+                    ));
                 }
                 if let Some(payload_reg) = payload_dest_reg {
                     for (i, payload) in payload_columns.iter().enumerate() {
@@ -1573,10 +1574,11 @@ pub fn open_loop(
                         if live_table_ids.contains(&payload_table_id) {
                             continue;
                         }
-                        t_ctx
-                            .resolver
-                            .expr_to_reg_cache
-                            .push((Cow::Owned(expr), payload_reg + i));
+                        t_ctx.resolver.expr_to_reg_cache.push((
+                            Cow::Owned(expr),
+                            payload_reg + i,
+                            None,
+                        ));
                     }
                 } else if payload_info.allow_seek && !build_table_is_live {
                     // When payload doesn't contain all needed columns, SeekRowid to the build table.
@@ -2012,7 +2014,7 @@ fn emit_loop_source<'a>(
                             t_ctx
                                 .resolver
                                 .expr_to_reg_cache
-                                .push((Cow::Borrowed(expr), reg));
+                                .push((Cow::Borrowed(expr), reg, None));
                             Ok(WalkControl::SkipChildren)
                         }
                         _ => {

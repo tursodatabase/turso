@@ -649,10 +649,11 @@ pub fn group_by_process_single_group(
             {
                 if *in_result {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
-                    t_ctx
-                        .resolver
-                        .expr_to_reg_cache
-                        .push((std::borrow::Cow::Borrowed(expr), next_reg));
+                    t_ctx.resolver.expr_to_reg_cache.push((
+                        std::borrow::Cow::Borrowed(expr),
+                        next_reg,
+                        None,
+                    ));
                     next_reg += 1;
                 }
             }
@@ -675,10 +676,11 @@ pub fn group_by_process_single_group(
                     dest_reg,
                     &t_ctx.resolver,
                 )?;
-                t_ctx
-                    .resolver
-                    .expr_to_reg_cache
-                    .push((std::borrow::Cow::Borrowed(expr), dest_reg));
+                t_ctx.resolver.expr_to_reg_cache.push((
+                    std::borrow::Cow::Borrowed(expr),
+                    dest_reg,
+                    None,
+                ));
             }
         }
     }
@@ -804,6 +806,7 @@ pub fn group_by_emit_row_phase<'a>(
         t_ctx.resolver.expr_to_reg_cache.push((
             std::borrow::Cow::Borrowed(&agg.original_expr),
             agg_result_reg,
+            None,
         ));
     }
 

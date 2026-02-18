@@ -45,6 +45,7 @@ pub fn emit_ungrouped_aggregation<'a>(
         t_ctx.resolver.expr_to_reg_cache.push((
             std::borrow::Cow::Borrowed(&agg.original_expr),
             agg_start_reg + i,
+            None,
         ));
     }
     t_ctx.resolver.enable_expr_to_reg_cache();

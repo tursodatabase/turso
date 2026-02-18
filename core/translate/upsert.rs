@@ -508,10 +508,11 @@ pub fn emit_upsert(
             resolver,
             &bt.name,
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            bt.columns
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| col.name.as_deref().map(|n| (n, new_start + idx))),
+            bt.columns.iter().enumerate().filter_map(|(idx, col)| {
+                col.name
+                    .as_deref()
+                    .map(|n| (n, new_start + idx, col.collation_opt()))
+            }),
             connection,
             ast::ResolveType::Abort,
             ctx.loop_labels.row_done,

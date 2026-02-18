@@ -33,6 +33,7 @@ use crate::function::Func;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL,
 };
+use crate::translate::collate::CollationSeq;
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, rewrite_between_expr,
@@ -108,7 +109,7 @@ pub struct Resolver<'a> {
     pub schema: &'a Schema,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
-    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize)>,
+    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize, Option<CollationSeq>)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -135,17 +136,21 @@ impl<'a> Resolver<'a> {
         self.expr_to_reg_cache_enabled = true;
     }
 
-    /// Returns the register for a previously translated expression, if caching is enabled.
+    /// Returns the register (and optional collation) for a previously translated expression,
+    /// if caching is enabled.
     ///
     /// We scan from newest to oldest so later translations win when equivalent
     /// expressions are seen multiple times in the same translation pass.
-    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<usize> {
+    pub fn resolve_cached_expr_reg(
+        &self,
+        expr: &ast::Expr,
+    ) -> Option<(usize, Option<CollationSeq>)> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()
                 .rev()
-                .find(|(e, _)| exprs_are_equivalent(expr, e))
-                .map(|(_, reg)| *reg)
+                .find(|(e, _, _)| exprs_are_equivalent(expr, e))
+                .map(|(_, reg, collation)| (*reg, *collation))
         } else {
             None
         }
@@ -3300,9 +3305,9 @@ fn emit_update_insns<'a>(
                     .filter_map(|(idx, col)| {
                         col.name.as_deref().map(|n| {
                             if col.is_rowid_alias() {
-                                (n, rowid_set_clause_reg.unwrap_or(beg))
+                                (n, rowid_set_clause_reg.unwrap_or(beg), col.collation_opt())
                             } else {
-                                (n, start + idx)
+                                (n, start + idx, col.collation_opt())
                             }
                         })
                     }),
@@ -4841,7 +4846,7 @@ pub(crate) fn emit_check_constraints<'a>(
     resolver: &mut Resolver,
     table_name: &str,
     rowid_reg: usize,
-    column_mappings: impl Iterator<Item = (&'a str, usize)>,
+    column_mappings: impl Iterator<Item = (&'a str, usize, Option<CollationSeq>)>,
     connection: &Arc<Connection>,
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
@@ -4859,29 +4864,29 @@ pub(crate) fn emit_check_constraints<'a>(
         let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(rowid_expr), rowid_reg));
+            .push((Cow::Owned(rowid_expr), rowid_reg, None));
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(rowid_name.to_string()),
         );
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), rowid_reg));
+            .push((Cow::Owned(qualified_expr), rowid_reg, None));
     }
 
-    // Map each column to its register (both unqualified and qualified forms).
-    for (col_name, register) in column_mappings {
+    // Map each column to its register and collation (both unqualified and qualified forms).
+    for (col_name, register, collation) in column_mappings {
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(column_expr), register));
+            .push((Cow::Owned(column_expr), register, collation));
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(col_name.to_string()),
         );
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), register));
+            .push((Cow::Owned(qualified_expr), register, collation));
     }
 
     resolver.enable_expr_to_reg_cache();
