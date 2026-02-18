@@ -2459,7 +2459,7 @@ fn emit_seek(
         return Ok(());
     };
     // We allocated registers for the full index key, but our seek key might not use the full index key.
-    // See [crate::translate::optimizer::build_seek_def] for more details about in which cases we do and don't use the full index key.
+    // See [crate::translate::optimizer::build_seek_def] for boundary rewrites (including NULL sentinels).
     for (i, key) in seek_def.iter(&seek_def.start).enumerate() {
         let reg = start_reg + i;
         match key {
@@ -2483,6 +2483,7 @@ fn emit_seek(
                     });
                 }
             }
+            SeekKeyComponent::Null => program.emit_null(reg, None),
             SeekKeyComponent::None => unreachable!("None component is not possible in iterator"),
         }
     }
@@ -2648,6 +2649,7 @@ fn emit_seek_termination(
                 });
             }
         }
+        SeekKeyComponent::Null => program.emit_null(last_reg, None),
         SeekKeyComponent::None => {}
     }
     program.preassign_label_to_next_insn(loop_start);
