@@ -10,10 +10,11 @@ use std::{
     time::Instant,
 };
 use test_runner::{
-    DefaultDatabases, Format, GeneratorConfig, OutputFormat, ParseError, RunnerConfig,
-    SnapshotUpdateMode, TestRunner, backends::cli::CliBackend, backends::js::JsBackend,
-    backends::rust::RustBackend, create_output, find_all_pending_snapshots, generate_database,
-    load_test_files, summarize, tcl_converter,
+    DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
+    OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
+    backends::cli::CliBackend, backends::js::JsBackend, backends::rust::RustBackend, create_output,
+    find_all_pending_snapshots, generate_database, generate_integrity_fixture, load_test_files,
+    summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -184,6 +185,23 @@ async fn main() -> ExitCode {
 const DEFAULT_SEED: u64 = 42;
 /// Default number of users to generate
 const DEFAULT_USER_COUNT: usize = 10000;
+fn collect_integrity_fixtures<'a>(
+    test_files: impl Iterator<Item = &'a test_runner::TestFile>,
+) -> Vec<String> {
+    let mut fixtures = std::collections::BTreeSet::new();
+    for file in test_files {
+        for db in &file.databases {
+            if let DatabaseLocation::Path(path) = &db.location {
+                for rel in INTEGRITY_FIXTURE_RELATIVE_PATHS {
+                    if path == Path::new(rel) {
+                        fixtures.insert((*rel).to_string());
+                    }
+                }
+            }
+        }
+    }
+    fixtures.into_iter().collect()
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn run_tests(
@@ -245,6 +263,21 @@ async fn run_tests(
             return ExitCode::from(1);
         }
     };
+
+    let integrity_fixtures = collect_integrity_fixtures(loaded.test_files());
+    if !integrity_fixtures.is_empty() {
+        eprintln!("Generating integrity-check fixtures...");
+        for rel in integrity_fixtures {
+            let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&rel);
+            if let Err(e) = generate_integrity_fixture(&fixture_path, &rel).await {
+                eprintln!(
+                    "Error generating integrity fixture '{}': {e}",
+                    fixture_path.display()
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
 
     // Check if we need to generate default databases
     let needs = DefaultDatabases::scan_needs(loaded.test_files());

@@ -1,0 +1,17 @@
+@database database/integrity_freelist_trunk_corrupt.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-freelist-trunk-corrupt {
+    PRAGMA integrity_check;
+}
+expect pattern {
+    (?s)^\*\*\* in database main \*\*\*\nFreelist: freelist leaf count too big on page \d+(?:\nPage \d+: never used)*$
+}
+
+test quick-check-freelist-trunk-corrupt {
+    PRAGMA quick_check;
+}
+expect pattern {
+    (?s)^\*\*\* in database main \*\*\*\nFreelist: freelist leaf count too big on page \d+(?:\nPage \d+: never used)*$
+}

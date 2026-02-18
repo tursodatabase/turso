@@ -365,8 +365,8 @@ fn test_integrity_check_freelist_count_mismatch(db: TempDatabase) {
     match result {
         Ok(msg) => {
             assert!(
-                msg.contains("Freelist count mismatch"),
-                "Expected 'Freelist count mismatch' error, got: {msg}"
+                msg.contains("Freelist: size is") && msg.contains("should be"),
+                "Expected SQLite-style freelist size mismatch error, got: {msg}"
             );
         }
         Err(panic_msg) => {

@@ -1,195 +1,590 @@
+use std::num::NonZeroUsize;
+
 use crate::{
-    schema::Schema,
-    types::IndexInfo,
-    vdbe::{
-        builder::ProgramBuilder,
-        insn::{Insn, IntegrityCheckIndex, IntegrityCheckTable},
+    schema::{Index, Schema, Table},
+    translate::{
+        emitter::Resolver,
+        expr::{
+            bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
+            BindingBehavior, ConditionMetadata, NoConstantOptReason,
+        },
+        fkeys::build_index_affinity_string,
+        plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
     },
+    vdbe::{
+        affinity::Affinity,
+        builder::{CursorKey, CursorType, ProgramBuilder},
+        insn::{CmpInsFlags, Insn},
+    },
+    Connection,
 };
-use std::sync::Arc;
+use turso_parser::ast;
 
-use super::emitter::Resolver;
-use super::expr::translate_expr;
-
-/// Maximum number of errors to report with integrity check. If we exceed this number we will short
-/// circuit the procedure and return early to not waste time. SQLite uses 100 as the default.
+/// Maximum number of errors to report with integrity check. If we exceed this number we will
+/// short circuit the procedure and return early to not waste time. SQLite uses 100 as default.
 pub const MAX_INTEGRITY_CHECK_ERRORS: usize = 100;
 
+enum BoundIndexColumn {
+    Column(usize),
+    Expr(Box<ast::Expr>),
+}
+
+struct BoundIntegrityIndex {
+    index: crate::sync::Arc<Index>,
+    cursor_id: usize,
+    expected_count_reg: usize,
+    where_expr: Option<ast::Expr>,
+    columns: Vec<BoundIndexColumn>,
+    unique_nullable: Vec<bool>,
+    affinity: String,
+}
+
 /// Translate PRAGMA integrity_check.
-/// This performs a full integrity check including index consistency validation.
 pub fn translate_integrity_check(
     schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
+    connection: &crate::sync::Arc<Connection>,
+    database_id: usize,
     max_errors: usize,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(schema, program, resolver, max_errors, false)
+    translate_integrity_check_impl(
+        schema,
+        program,
+        resolver,
+        connection,
+        database_id,
+        max_errors,
+        false,
+    )
 }
 
 /// Translate PRAGMA quick_check.
-/// This performs a quick integrity check that skips expensive index consistency validation.
 pub fn translate_quick_check(
     schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
+    connection: &crate::sync::Arc<Connection>,
+    database_id: usize,
     max_errors: usize,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(schema, program, resolver, max_errors, true)
+    translate_integrity_check_impl(
+        schema,
+        program,
+        resolver,
+        connection,
+        database_id,
+        max_errors,
+        true,
+    )
 }
 
-// FIXME: This entire integrity check implementation is architecturally wrong.
-//
-// SQLite generates proper VDBE bytecode for integrity_check: it opens cursors,
-// iterates with Rewind/Next, reads columns with OP_Column (which has a P4 parameter
-// for default values), and uses Found to check index entries. Each of these is a
-// separate instruction that the VM executes.
-//
-// Our implementation instead uses a single monolithic IntegrityCk instruction that
-// does everything internally in execute.rs. This means we can't leverage the existing
-// Column instruction's default value handling, and instead have to hack around it by
-// pre-evaluating default expressions to registers and passing them to the instruction.
-// Also who knows what other hacks we might need to add in the future.
-//
-// The proper fix would be to refactor integrity_check to emit bytecode like SQLite does:
-// - OpenRead cursors for tables and indexes
-// - Rewind/Next loops to iterate
-// - Column instructions with P4 defaults for reading values
-// - Found/NotFound for index lookups
-//
-// This would eliminate the need for the IntegrityCk mega-instruction and make the
-// implementation consistent with the rest of the VDBE.
+fn emit_integrity_result_row(
+    program: &mut ProgramBuilder,
+    remaining_errors_reg: usize,
+    message_reg: usize,
+    had_error_reg: usize,
+) {
+    program.emit_int(1, had_error_reg);
+    program.emit_result_row(message_reg, 1);
 
-/// Internal implementation for both integrity_check and quick_check.
+    let continue_label = program.allocate_label();
+    program.emit_insn(Insn::IfPos {
+        reg: remaining_errors_reg,
+        target_pc: continue_label,
+        decrement_by: 1,
+    });
+    program.emit_insn(Insn::Halt {
+        err_code: 0,
+        description: String::new(),
+    });
+    program.preassign_label_to_next_insn(continue_label);
+}
+
+fn emit_row_missing_from_index_error(
+    program: &mut ProgramBuilder,
+    row_number_reg: usize,
+    scratch_reg: usize,
+    message_reg: usize,
+    index_name: &str,
+    remaining_errors_reg: usize,
+    had_error_reg: usize,
+) {
+    program.emit_string8("row ".to_string(), message_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: row_number_reg,
+        dest: message_reg,
+    });
+    program.emit_string8(" missing from index ".to_string(), scratch_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: scratch_reg,
+        dest: message_reg,
+    });
+    program.emit_string8(index_name.to_string(), scratch_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: scratch_reg,
+        dest: message_reg,
+    });
+    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+}
+
+fn bind_expr_for_table(
+    expr: &ast::Expr,
+    table_references: &mut TableReferences,
+    connection: &crate::sync::Arc<Connection>,
+) -> crate::Result<ast::Expr> {
+    let mut out = expr.clone();
+    bind_and_rewrite_expr(
+        &mut out,
+        Some(table_references),
+        None,
+        connection,
+        BindingBehavior::ResultColumnsNotAllowed,
+    )?;
+    Ok(out)
+}
+
 fn translate_integrity_check_impl(
     schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
+    connection: &crate::sync::Arc<Connection>,
+    database_id: usize,
     max_errors: usize,
     quick: bool,
 ) -> crate::Result<()> {
     let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
-    let mut tables = Vec::with_capacity(schema.tables.len());
 
-    // Collect root pages and table/index metadata for integrity check
     for table in schema.tables.values() {
-        if let crate::schema::Table::BTree(btree_table) = table.as_ref() {
+        if let Table::BTree(btree_table) = table.as_ref() {
             if btree_table.root_page < 0 {
                 continue;
             }
             root_pages.push(btree_table.root_page);
-
-            let mut table_indexes = Vec::new();
             if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
-                for index in indexes.iter() {
+                for index in indexes {
                     if index.root_page > 0 {
                         root_pages.push(index.root_page);
-
-                        // Expression indexes (e.g., CREATE INDEX idx ON t(a + 1)) use
-                        // pos_in_table = usize::MAX as a sentinel to indicate they aren't
-                        // direct column references. Row-index consistency validation
-                        // requires direct column access, so we skip expression indexes.
-                        // Phase 1 (B-tree structure checks) still validates these indexes.
-                        // TODO: Evaluate expression index expressions to enable row-index
-                        // consistency checks for expression indexes as well.
-                        let has_expression_column =
-                            index.columns.iter().any(|c| c.pos_in_table == usize::MAX);
-                        if has_expression_column {
-                            continue;
-                        }
-
-                        let column_positions: Vec<usize> =
-                            index.columns.iter().map(|c| c.pos_in_table).collect();
-
-                        // Allocate contiguous registers for default values of indexed columns.
-                        // For columns added via ALTER TABLE ADD COLUMN with DEFAULT, old rows
-                        // don't physically have these columns, so we need the defaults.
-                        //
-                        // FIXME: This is a hack. SQLite passes defaults via P4 to OP_Column.
-                        // We pre-evaluate them here because our monolithic IntegrityCk doesn't
-                        // use OP_Column internally. See the FIXME comment above.
-                        let default_values_start_reg =
-                            program.alloc_registers(column_positions.len());
-                        for (i, &pos) in column_positions.iter().enumerate() {
-                            let target_reg = default_values_start_reg + i;
-                            let col = &btree_table.columns[pos];
-                            if let Some(default_expr) = col.default.as_ref() {
-                                // Evaluate the default expression to the register.
-                                // Pass None for table references since defaults must be
-                                // constant expressions (no column references allowed).
-                                translate_expr(program, None, default_expr, target_reg, resolver)?;
-                            } else {
-                                // No default specified, use NULL
-                                program.emit_insn(Insn::Null {
-                                    dest: target_reg,
-                                    dest_end: None,
-                                });
-                            }
-                        }
-
-                        table_indexes.push(IntegrityCheckIndex {
-                            name: index.name.clone(),
-                            root_page: index.root_page,
-                            unique: index.unique,
-                            column_positions,
-                            default_values_start_reg,
-                            index_info: Arc::new(IndexInfo::new_from_index(index)),
-                        });
                     }
                 }
             }
-
-            // Get INTEGER PRIMARY KEY column position if it exists (rowid alias).
-            // This column's value is stored as NULL in the record because the actual value is the rowid.
-            let rowid_alias_column_pos = btree_table.get_rowid_alias_column().map(|(pos, _)| pos);
-
-            // Collect NOT NULL columns for constraint validation.
-            // We must exclude the rowid alias column because it's stored as NULL in the record
-            // (the actual value is the rowid, not in the record payload).
-            let not_null_columns: Vec<(usize, String)> = btree_table
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(idx, col)| col.notnull() && Some(*idx) != rowid_alias_column_pos)
-                .map(|(idx, col)| {
-                    let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
-                    (idx, name)
-                })
-                .collect();
-
-            tables.push(IntegrityCheckTable {
-                name: btree_table.name.clone(),
-                root_page: btree_table.root_page,
-                indexes: table_indexes,
-                not_null_columns,
-                rowid_alias_column_pos,
-            });
-        };
+        }
     }
 
-    // Include root pages from tables/indexes that have been dropped but not yet checkpointed.
-    // In MVCC mode, dropped tables' btree pages are not freed until checkpoint, so we need
-    // to check them to avoid "page never used" false positives.
     for &dropped_root in &schema.dropped_root_pages {
         root_pages.push(dropped_root);
     }
 
-    let message_register = program.alloc_register();
+    let remaining_errors_reg = program.alloc_register();
+    program.emit_int((max_errors.saturating_sub(1)) as i64, remaining_errors_reg);
+
+    let had_error_reg = program.alloc_register();
+    program.emit_int(0, had_error_reg);
+
+    let message_reg = program.alloc_register();
+    let scratch_reg = program.alloc_register();
+
     program.emit_insn(Insn::IntegrityCk {
         max_errors,
         roots: root_pages,
-        message_register,
-        quick,
-        tables,
+        message_register: message_reg,
     });
-    program.emit_insn(Insn::ResultRow {
-        start_reg: message_register,
-        count: 1,
+
+    let no_structural_error_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: message_reg,
+        target_pc: no_structural_error_label,
     });
+
+    program.emit_string8("*** in database main ***\n".to_string(), scratch_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: scratch_reg,
+        rhs: message_reg,
+        dest: message_reg,
+    });
+    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+    program.preassign_label_to_next_insn(no_structural_error_label);
+
+    for table in schema.tables.values() {
+        let Table::BTree(btree_table) = table.as_ref() else {
+            continue;
+        };
+
+        if btree_table.root_page <= 0 {
+            continue;
+        }
+
+        let table_ref_id = program.table_reference_counter.next();
+        let table_cursor_id = program.alloc_cursor_id_keyed(
+            CursorKey::table(table_ref_id),
+            CursorType::BTreeTable(btree_table.clone()),
+        );
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: table_cursor_id,
+            root_page: btree_table.root_page,
+            db: database_id,
+        });
+
+        let mut table_references = TableReferences::new(
+            vec![JoinedTable {
+                op: Operation::Scan(Scan::BTreeTable {
+                    iter_dir: IterationDirection::Forwards,
+                    index: None,
+                }),
+                table: Table::BTree(btree_table.clone()),
+                identifier: btree_table.name.clone(),
+                internal_id: table_ref_id,
+                join_info: None,
+                col_used_mask: ColumnUsedMask::default(),
+                column_use_counts: Vec::new(),
+                expression_index_usages: Vec::new(),
+                database_id,
+            }],
+            vec![],
+        );
+
+        let mut bound_indexes = Vec::new();
+        if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
+            for index in indexes {
+                if index.root_page <= 0 {
+                    continue;
+                }
+
+                let cursor_id = program.alloc_cursor_index(None, index)?;
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id,
+                    root_page: index.root_page,
+                    db: database_id,
+                });
+
+                let expected_count_reg = program.alloc_register();
+                program.emit_int(0, expected_count_reg);
+
+                let mut where_expr = None;
+                if let Some(pred) = index.where_clause.as_deref() {
+                    where_expr = Some(bind_expr_for_table(
+                        pred,
+                        &mut table_references,
+                        connection,
+                    )?);
+                }
+
+                let mut columns = Vec::with_capacity(index.columns.len());
+                let mut unique_nullable = Vec::with_capacity(index.columns.len());
+                for col in &index.columns {
+                    if let Some(expr) = col.expr.as_deref() {
+                        columns.push(BoundIndexColumn::Expr(Box::new(bind_expr_for_table(
+                            expr,
+                            &mut table_references,
+                            connection,
+                        )?)));
+                        unique_nullable.push(true);
+                    } else {
+                        columns.push(BoundIndexColumn::Column(col.pos_in_table));
+                        unique_nullable.push(!btree_table.columns[col.pos_in_table].notnull());
+                    }
+                }
+
+                let affinity = if index.columns.iter().any(|c| c.expr.is_some()) {
+                    index
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            if c.expr.is_some() {
+                                Affinity::Blob.aff_mask()
+                            } else {
+                                btree_table.columns[c.pos_in_table].affinity().aff_mask()
+                            }
+                        })
+                        .collect::<String>()
+                } else {
+                    build_index_affinity_string(index, btree_table)
+                };
+
+                bound_indexes.push(BoundIntegrityIndex {
+                    index: index.clone(),
+                    cursor_id,
+                    expected_count_reg,
+                    where_expr,
+                    columns,
+                    unique_nullable,
+                    affinity,
+                });
+            }
+        }
+
+        let mut bound_checks = Vec::with_capacity(btree_table.check_constraints.len());
+        for check in &btree_table.check_constraints {
+            bound_checks.push(bind_expr_for_table(
+                &check.expr,
+                &mut table_references,
+                connection,
+            )?);
+        }
+
+        let not_null_columns: Vec<(usize, String)> = btree_table
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                if col.notnull() && !col.is_rowid_alias() {
+                    Some((
+                        idx,
+                        col.name.clone().unwrap_or_else(|| format!("column{idx}")),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let row_number_reg = program.alloc_register();
+        program.emit_int(0, row_number_reg);
+
+        let table_empty_label = program.allocate_label();
+        let loop_start_label = program.allocate_label();
+
+        program.emit_insn(Insn::Rewind {
+            cursor_id: table_cursor_id,
+            pc_if_empty: table_empty_label,
+        });
+        program.preassign_label_to_next_insn(loop_start_label);
+
+        program.emit_insn(Insn::AddImm {
+            register: row_number_reg,
+            value: 1,
+        });
+
+        for (col_idx, col_name) in &not_null_columns {
+            let col_value_reg = program.alloc_register();
+            program.emit_column_or_rowid(table_cursor_id, *col_idx, col_value_reg);
+
+            let not_null_ok = program.allocate_label();
+            program.emit_insn(Insn::NotNull {
+                reg: col_value_reg,
+                target_pc: not_null_ok,
+            });
+            program.emit_string8(
+                format!("NULL value in {}.{}", btree_table.name, col_name),
+                message_reg,
+            );
+            emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+            program.preassign_label_to_next_insn(not_null_ok);
+        }
+
+        for check_expr in &bound_checks {
+            let check_ok = program.allocate_label();
+            let check_fail = program.allocate_label();
+            translate_condition_expr(
+                program,
+                &table_references,
+                check_expr,
+                ConditionMetadata {
+                    jump_if_condition_is_true: true,
+                    jump_target_when_true: check_ok,
+                    jump_target_when_false: check_fail,
+                    jump_target_when_null: check_ok,
+                },
+                resolver,
+            )?;
+            program.preassign_label_to_next_insn(check_fail);
+            program.emit_string8(
+                format!("CHECK constraint failed in {}", btree_table.name),
+                message_reg,
+            );
+            emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+            program.preassign_label_to_next_insn(check_ok);
+        }
+
+        for bound_index in &bound_indexes {
+            let skip_current_index = program.allocate_label();
+
+            if let Some(where_expr) = bound_index.where_expr.as_ref() {
+                let where_failed = skip_current_index;
+                let where_true_fallthrough = program.allocate_label();
+                translate_condition_expr(
+                    program,
+                    &table_references,
+                    where_expr,
+                    ConditionMetadata {
+                        // For partial indexes, rows that evaluate predicate to FALSE/NULL
+                        // are not part of the index and must be skipped.
+                        jump_if_condition_is_true: false,
+                        jump_target_when_true: where_true_fallthrough,
+                        jump_target_when_false: where_failed,
+                        jump_target_when_null: where_failed,
+                    },
+                    resolver,
+                )?;
+                program.preassign_label_to_next_insn(where_true_fallthrough);
+            }
+
+            program.emit_insn(Insn::AddImm {
+                register: bound_index.expected_count_reg,
+                value: 1,
+            });
+
+            let key_start_reg = program.alloc_registers(bound_index.columns.len() + 1);
+            for (i, col) in bound_index.columns.iter().enumerate() {
+                let target = key_start_reg + i;
+                match col {
+                    BoundIndexColumn::Column(pos) => {
+                        program.emit_column_or_rowid(table_cursor_id, *pos, target);
+                    }
+                    BoundIndexColumn::Expr(expr) => {
+                        translate_expr_no_constant_opt(
+                            program,
+                            Some(&table_references),
+                            expr,
+                            target,
+                            resolver,
+                            NoConstantOptReason::RegisterReuse,
+                        )?;
+                    }
+                }
+            }
+
+            let rowid_reg = key_start_reg + bound_index.columns.len();
+            program.emit_insn(Insn::RowId {
+                cursor_id: table_cursor_id,
+                dest: rowid_reg,
+            });
+
+            if let Some(count) = NonZeroUsize::new(bound_index.columns.len()) {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: key_start_reg,
+                    count,
+                    affinities: bound_index.affinity.clone(),
+                });
+            }
+
+            if !quick {
+                let found_label = program.allocate_label();
+                program.emit_insn(Insn::Found {
+                    cursor_id: bound_index.cursor_id,
+                    target_pc: found_label,
+                    record_reg: key_start_reg,
+                    num_regs: bound_index.columns.len() + 1,
+                });
+                emit_row_missing_from_index_error(
+                    program,
+                    row_number_reg,
+                    scratch_reg,
+                    message_reg,
+                    &bound_index.index.name,
+                    remaining_errors_reg,
+                    had_error_reg,
+                );
+                program.preassign_label_to_next_insn(found_label);
+
+                if bound_index.index.unique {
+                    let unique_ok = program.allocate_label();
+                    for (i, is_nullable) in bound_index.unique_nullable.iter().enumerate() {
+                        if *is_nullable {
+                            program.emit_insn(Insn::IsNull {
+                                reg: key_start_reg + i,
+                                target_pc: unique_ok,
+                            });
+                        }
+                    }
+
+                    let next_exists = program.allocate_label();
+                    program.emit_insn(Insn::Next {
+                        cursor_id: bound_index.cursor_id,
+                        pc_if_next: next_exists,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: unique_ok,
+                    });
+                    program.preassign_label_to_next_insn(next_exists);
+
+                    program.emit_insn(Insn::IdxGT {
+                        cursor_id: bound_index.cursor_id,
+                        start_reg: key_start_reg,
+                        num_regs: bound_index.columns.len(),
+                        target_pc: unique_ok,
+                    });
+                    program.emit_string8(
+                        format!("non-unique entry in index {}", bound_index.index.name),
+                        message_reg,
+                    );
+                    emit_integrity_result_row(
+                        program,
+                        remaining_errors_reg,
+                        message_reg,
+                        had_error_reg,
+                    );
+                    program.preassign_label_to_next_insn(unique_ok);
+                }
+            }
+            program.preassign_label_to_next_insn(skip_current_index);
+        }
+
+        program.emit_insn(Insn::Next {
+            cursor_id: table_cursor_id,
+            pc_if_next: loop_start_label,
+        });
+        program.preassign_label_to_next_insn(table_empty_label);
+
+        for bound_index in &bound_indexes {
+            if bound_index.where_expr.is_none() {
+                let actual_count_reg = program.alloc_register();
+                program.emit_insn(Insn::Count {
+                    cursor_id: bound_index.cursor_id,
+                    target_reg: actual_count_reg,
+                    exact: true,
+                });
+
+                let counts_match = program.allocate_label();
+                program.emit_insn(Insn::Eq {
+                    lhs: actual_count_reg,
+                    rhs: bound_index.expected_count_reg,
+                    target_pc: counts_match,
+                    flags: CmpInsFlags::default(),
+                    collation: None,
+                });
+                program.emit_string8(
+                    format!("wrong # of entries in index {}", bound_index.index.name),
+                    message_reg,
+                );
+                emit_integrity_result_row(
+                    program,
+                    remaining_errors_reg,
+                    message_reg,
+                    had_error_reg,
+                );
+                program.preassign_label_to_next_insn(counts_match);
+            }
+
+            program.emit_insn(Insn::Close {
+                cursor_id: bound_index.cursor_id,
+            });
+        }
+
+        program.emit_insn(Insn::Close {
+            cursor_id: table_cursor_id,
+        });
+    }
+
+    let has_errors_label = program.allocate_label();
+    program.emit_insn(Insn::If {
+        reg: had_error_reg,
+        target_pc: has_errors_label,
+        jump_if_null: false,
+    });
+    program.emit_string8("ok".to_string(), message_reg);
+    program.emit_result_row(message_reg, 1);
+    program.preassign_label_to_next_insn(has_errors_label);
+
     let column_name = if quick {
         "quick_check"
     } else {
         "integrity_check"
     };
     program.add_pragma_result_column(column_name.into());
+
     Ok(())
 }

@@ -1,0 +1,17 @@
+@database database/integrity_overflow_list_length_mismatch.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-overflow-list-length-mismatch {
+    PRAGMA integrity_check;
+}
+expect pattern {
+    (?s)^\*\*\* in database main \*\*\*\n(?:Tree \d+ page \d+ cell \d+: )?overflow list length is \d+ but should be \d+(?:\nPage \d+: never used)*$
+}
+
+test quick-check-overflow-list-length-mismatch {
+    PRAGMA quick_check;
+}
+expect pattern {
+    (?s)^\*\*\* in database main \*\*\*\n(?:Tree \d+ page \d+ cell \d+: )?overflow list length is \d+ but should be \d+(?:\nPage \d+: never used)*$
+}

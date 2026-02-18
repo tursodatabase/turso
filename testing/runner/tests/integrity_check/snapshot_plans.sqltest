@@ -1,0 +1,28 @@
+@database :memory:
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+setup schema {
+    CREATE TABLE t(
+        a INTEGER PRIMARY KEY,
+        b TEXT NOT NULL,
+        c INTEGER CHECK(c > 0),
+        d TEXT
+    );
+    CREATE INDEX idx_t_b ON t(b);
+    CREATE UNIQUE INDEX idx_t_c ON t(c);
+    CREATE INDEX idx_t_expr_partial ON t(lower(d)) WHERE d IS NOT NULL;
+    INSERT INTO t VALUES (1, 'one', 1, 'Alpha');
+    INSERT INTO t VALUES (2, 'two', 2, NULL);
+    INSERT INTO t VALUES (3, 'three', 3, 'Bravo');
+}
+
+@setup schema
+snapshot integrity-check-vdbe {
+    PRAGMA integrity_check;
+}
+
+@setup schema
+snapshot quick-check-vdbe {
+    PRAGMA quick_check;
+}
