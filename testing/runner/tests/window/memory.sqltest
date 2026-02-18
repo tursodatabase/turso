@@ -1,5 +1,41 @@
 @database :memory:
 
+test window-partition-by-duplicate-columns {
+    CREATE TABLE t1 (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t1 VALUES (1, 2, 3);
+    SELECT avg(a) OVER (PARTITION BY b, b, c, c, a ORDER BY c) FROM t1;
+}
+expect {
+    1.0
+}
+expect @js {
+    1
+}
+
+test window-partition-by-duplicate-columns-multi-row {
+    CREATE TABLE t2 (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t2 VALUES (1, 10, 100), (2, 10, 100), (3, 20, 200), (4, 20, 200);
+    SELECT sum(a) OVER (PARTITION BY b, b, c, c ORDER BY a) FROM t2;
+}
+expect {
+    1
+    3
+    3
+    7
+}
+
+test window-partition-by-duplicate-columns-collation {
+    CREATE TABLE t3 (val INTEGER, name TEXT COLLATE NOCASE);
+    INSERT INTO t3 VALUES (1, 'Apple'), (2, 'apple'), (3, 'Banana'), (4, 'banana');
+    SELECT sum(val) OVER (PARTITION BY name, name ORDER BY val) FROM t3;
+}
+expect {
+    1
+    3
+    3
+    7
+}
+
 test window-collate-partition-by {
     CREATE TABLE fruits(name collate nocase);
     INSERT INTO fruits(name) VALUES ('Apple'), ('banana'), ('apple');

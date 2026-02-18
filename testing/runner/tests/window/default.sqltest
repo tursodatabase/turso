@@ -21,7 +21,6 @@ expect {
     Hannah|329
 }
 
-@skip "TURSO is incorrect in how it deduplicates according to SQLite"
 test window-partition-by-duplicate-column {
     SELECT
     first_name,
