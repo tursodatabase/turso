@@ -8817,7 +8817,7 @@ mod tests {
         let do_validate_btree = std::env::var("VALIDATE_BTREE")
             .is_ok_and(|v| v.parse().expect("validate should be bool"));
         let (mut rng, seed) = rng_from_time_or_env();
-        let mut seen = HashSet::default();
+        let mut seen = crate::HashSet::default();
         tracing::info!("super seed: {}", seed);
         let num_columns = 5;
 
@@ -8938,7 +8938,7 @@ mod tests {
         } else {
             rng_from_time_or_env()
         };
-        let mut seen = HashSet::default();
+        let mut seen = crate::HashSet::default();
         tracing::info!("super seed: {}", seed);
         for _ in 0..attempts {
             let (pager, _, _db, conn) = empty_btree();
@@ -9110,7 +9110,7 @@ mod tests {
         } else {
             rng_from_time_or_env()
         };
-        let mut seen = HashSet::default();
+        let mut seen = crate::HashSet::default();
         tracing::info!("super seed: {}", seed);
 
         for _ in 0..attempts {
