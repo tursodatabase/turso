@@ -69,7 +69,8 @@ use crate::vdbe::insn::{
 };
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{
-    bail_parse_error, emit_explain, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable
+    bail_parse_error, emit_explain, Database, DatabaseCatalog, LimboError, Result, RwLock,
+    SymbolTable,
 };
 use crate::{CaptureDataChangesExt, Connection, QueryMode};
 
@@ -122,7 +123,9 @@ pub struct Resolver<'a> {
 
 impl<'a> Resolver<'a> {
     const MAIN_DB: &'static str = "main";
+    const MAIN_DB_BYTES: &'static [u8] = Self::MAIN_DB.as_bytes();
     const TEMP_DB: &'static str = "temp";
+    const TEMP_DB_BYTES: &'static [u8] = Self::TEMP_DB.as_bytes();
 
     const MAIN_DB_ID: usize = 0;
     const TEMP_DB_ID: usize = 1;
@@ -1592,6 +1595,7 @@ fn emit_program_for_delete(
             &plan.result_columns,
             rowid_reg,
             table_cursor_id,
+            resolver,
         )?;
 
         // Continue loop
@@ -1622,6 +1626,7 @@ fn emit_program_for_delete(
             &mut t_ctx,
             &mut plan.table_references,
             &plan.result_columns,
+            resolver,
         )?;
 
         // Clean up and close the main execution loop
@@ -1788,6 +1793,7 @@ fn emit_delete_insns<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     table_references: &mut TableReferences,
     result_columns: &'a [super::plan::ResultSetColumn],
+    resolver: &Resolver,
 ) -> Result<()> {
     // we can either use this obviously safe raw pointer or we can clone it
     let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
@@ -1879,7 +1885,6 @@ fn emit_delete_insns<'a>(
                 program,
                 &t_ctx.resolver,
                 table_references,
-                connection,
                 main_table_cursor_id,
                 column_index,
                 start_reg + reg_offset,
@@ -1906,6 +1911,7 @@ fn emit_delete_insns<'a>(
         main_table_cursor_id,
         iteration_index,
         Some(cursor_id), // Use the cursor_id from the operation for virtual tables
+        resolver,
     )?;
 
     // Delete from the iteration index after deleting from the main table,
@@ -1948,6 +1954,7 @@ fn emit_delete_row_common(
     main_table_cursor_id: usize,
     skip_iteration_index: Option<&Arc<crate::schema::Index>>,
     virtual_table_cursor_id: Option<usize>,
+    resolver: &Resolver,
 ) -> Result<()> {
     let internal_id = unsafe { (*table_reference).internal_id };
     let table_name = unsafe { &*table_reference }.table.get_name();
@@ -2023,7 +2030,7 @@ fn emit_delete_row_common(
         for (index, index_cursor_id) in indexes_to_delete {
             let skip_delete_label = if index.where_clause.is_some() {
                 let where_copy = index
-                    .bind_where_expr(Some(table_references), connection)
+                    .bind_where_expr(Some(table_references), resolver)
                     .expect("where clause to exist");
                 let skip_label = program.allocate_label();
                 let reg = program.alloc_register();
@@ -2051,7 +2058,6 @@ fn emit_delete_row_common(
                     program,
                     &t_ctx.resolver,
                     table_references,
-                    connection,
                     main_table_cursor_id,
                     column_index,
                     start_reg + reg_offset,
@@ -2133,6 +2139,7 @@ fn emit_delete_insns_when_triggers_present(
     result_columns: &[super::plan::ResultSetColumn],
     rowid_reg: usize,
     main_table_cursor_id: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
     // Seek to the rowid and delete it
     let skip_not_found_label = program.allocate_label();
@@ -2242,6 +2249,7 @@ fn emit_delete_insns_when_triggers_present(
         main_table_cursor_id,
         None, // Don't skip any indexes when deleting from RowSet
         None, // Use main_table_cursor_id for virtual tables
+        resolver,
     )?;
 
     // Fire AFTER DELETE triggers
@@ -2548,6 +2556,7 @@ fn emit_program_for_update(
         iteration_cursor_id,
         target_table_cursor_id,
         target_table,
+        resolver,
     )?;
 
     // Close the main loop
@@ -2814,6 +2823,7 @@ fn emit_update_insns<'a>(
     iteration_cursor_id: usize,
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
+    resolver: &Resolver,
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     let internal_id = target_table.internal_id;
@@ -3456,7 +3466,7 @@ fn emit_update_insns<'a>(
             // This means that we need to bind the column references to a copy of the index Expr,
             // so we can emit Insn::Column instructions and refer to the old values.
             let where_clause = index
-                .bind_where_expr(Some(table_references), connection)
+                .bind_where_expr(Some(table_references), resolver)
                 .expect("where clause to exist");
             let old_satisfied_reg = program.alloc_register();
             translate_expr_no_constant_opt(
@@ -3523,7 +3533,6 @@ fn emit_update_insns<'a>(
                 program,
                 &t_ctx.resolver,
                 table_references,
-                connection,
                 target_table_cursor_id,
                 column_index,
                 delete_start_reg + reg_offset,
@@ -3674,7 +3683,6 @@ fn emit_update_insns<'a>(
                                 program,
                                 &t_ctx.resolver,
                                 table_references,
-                                connection,
                                 target_table_cursor_id,
                                 column_index,
                                 other_start_reg + reg_offset,
@@ -3808,7 +3816,6 @@ fn emit_update_insns<'a>(
                                 program,
                                 &t_ctx.resolver,
                                 table_references,
-                                connection,
                                 target_table_cursor_id,
                                 column_index,
                                 other_start_reg + reg_offset,
@@ -4823,7 +4830,6 @@ fn emit_index_column_value_old_image(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table_references: &mut TableReferences,
-    connection: &Arc<Connection>,
     table_cursor_id: usize,
     idx_col: &IndexColumn,
     dest_reg: usize,
@@ -4834,7 +4840,7 @@ fn emit_index_column_value_old_image(
             &mut expr,
             Some(table_references),
             None,
-            connection,
+            resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
         translate_expr_no_constant_opt(

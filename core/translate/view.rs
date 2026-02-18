@@ -255,7 +255,6 @@ pub fn translate_create_view(
     resolver: &Resolver,
     select_stmt: &ast::Select,
     _columns: &[ast::IndexedColumn],
-    connection: Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     if connection.mvcc_enabled() {
@@ -342,7 +341,6 @@ fn create_view_to_str(view_name: &str, select_stmt: &ast::Select) -> String {
 }
 
 pub fn translate_drop_view(
-    connection: &Arc<Connection>,
     resolver: &Resolver,
     view_name: &ast::QualifiedName,
     if_exists: bool,

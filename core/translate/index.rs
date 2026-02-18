@@ -211,7 +211,7 @@ pub fn translate_create_index(
         }],
         vec![],
     );
-    let where_clause = idx.bind_where_expr(Some(&mut table_references), connection);
+    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver);
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
@@ -305,7 +305,6 @@ pub fn translate_create_index(
                 program,
                 resolver,
                 &mut table_references,
-                connection,
                 table_cursor_id,
                 col,
                 start_reg + i,
@@ -402,7 +401,6 @@ pub fn translate_create_index(
                 program,
                 resolver,
                 &mut table_references,
-                connection,
                 table_cursor_id,
                 col,
                 start_reg + i,
@@ -709,7 +707,6 @@ fn emit_index_column_value_from_cursor(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table_references: &mut TableReferences,
-    connection: &Arc<crate::Connection>,
     table_cursor_id: usize,
     idx_col: &IndexColumn,
     dest_reg: usize,
@@ -720,7 +717,7 @@ fn emit_index_column_value_from_cursor(
             &mut expr,
             Some(table_references),
             None,
-            connection,
+            resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
         translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
@@ -768,7 +765,6 @@ pub fn translate_drop_index(
     resolver: &Resolver,
     if_exists: bool,
     program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
     let database_id = resolver.resolve_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());

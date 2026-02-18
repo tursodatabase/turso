@@ -1263,7 +1263,7 @@ pub fn parse_where(
     table_references: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
-    connection: &Arc<crate::Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
@@ -1273,7 +1273,7 @@ pub fn parse_where(
                 &mut expr.expr,
                 Some(table_references),
                 result_columns,
-                connection,
+                resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
@@ -1730,7 +1730,7 @@ fn parse_join(
                         &mut predicate.expr,
                         Some(table_references),
                         None,
-                        connection,
+                        resolver,
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
@@ -1873,13 +1873,13 @@ where
 #[allow(clippy::type_complexity)]
 pub fn parse_limit(
     mut limit: Limit,
-    connection: &crate::sync::Arc<crate::Connection>,
+    resolver: &Resolver,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
     bind_and_rewrite_expr(
         &mut limit.expr,
         None,
         None,
-        connection,
+        resolver,
         BindingBehavior::TryResultColumnsFirst,
     )?;
     if let Some(ref mut off_expr) = limit.offset {
@@ -1887,7 +1887,7 @@ pub fn parse_limit(
             off_expr,
             None,
             None,
-            connection,
+            resolver,
             BindingBehavior::TryResultColumnsFirst,
         )?;
     }

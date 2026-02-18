@@ -1,4 +1,3 @@
-use crate::sync::Arc;
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 
@@ -4503,7 +4502,7 @@ pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
     result_columns: Option<&'a [ResultSetColumn]>,
-    connection: &'a Arc<crate::Connection>,
+    resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
     walk_expr_mut(
@@ -4752,7 +4751,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     let database_id = resolver.resolve_database_id(&qualified_name)?;
 
                     // Get the table from the specified database
-                    let table = connection
+                    let table = resolver
                         .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
                         .ok_or_else(|| {
                             crate::LimboError::ParseError(format!(
@@ -5345,7 +5344,7 @@ pub fn emit_function_call(
 pub fn process_returning_clause(
     returning: &mut [ast::ResultColumn],
     table_references: &mut TableReferences,
-    connection: &crate::sync::Arc<crate::Connection>,
+    resolver: &Resolver<'_>,
 ) -> Result<Vec<ResultSetColumn>> {
     let mut result_columns = Vec::with_capacity(returning.len());
 
@@ -5361,7 +5360,7 @@ pub fn process_returning_clause(
                     expr,
                     Some(table_references),
                     None,
-                    connection,
+                    resolver,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
 

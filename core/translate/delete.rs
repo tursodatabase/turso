@@ -187,7 +187,7 @@ pub fn prepare_delete_plan(
         &mut table_references,
         None,
         &mut where_predicates,
-        connection,
+        resolver,
     )?;
 
     // Plan subqueries in RETURNING expressions before processing
@@ -202,12 +202,11 @@ pub fn prepare_delete_plan(
         connection,
     )?;
 
-    let result_columns =
-        process_returning_clause(&mut returning, &mut table_references, connection)?;
+    let result_columns = process_returning_clause(&mut returning, &mut table_references, resolver)?;
 
     // Parse the LIMIT/OFFSET clause
     let (resolved_limit, resolved_offset) =
-        limit.map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
+        limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
 
     // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
     // This is done in SQLite for all DELETE triggers on the affected table even if the trigger would not have an impact

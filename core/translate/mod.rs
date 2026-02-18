@@ -232,12 +232,7 @@ pub fn translate_inner(
             columns,
             ..
         } => view::translate_create_view(
-            &view_name,
-            resolver,
-            &select,
-            &columns,
-            connection.clone(),
-            program,
+            &view_name, resolver, &select, &columns, program, connection,
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name, select, ..
@@ -283,7 +278,7 @@ pub fn translate_inner(
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program, connection)?,
+        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
@@ -301,7 +296,7 @@ pub fn translate_inner(
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(connection, resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }

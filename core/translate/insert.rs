@@ -293,7 +293,6 @@ pub fn translate_insert(
         resolver,
         &table,
         &mut body,
-        connection,
         on_conflict.unwrap_or(ResolveType::Abort),
     )?;
 
@@ -350,7 +349,7 @@ pub fn translate_insert(
 
     // Process RETURNING clause using shared module
     let mut result_columns =
-        process_returning_clause(&mut returning, &mut table_references, connection)?;
+        process_returning_clause(&mut returning, &mut table_references, resolver)?;
     let has_fks = fk_enabled
         && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name.as_str()))
             || resolver.with_schema(database_id, |s| {
@@ -1360,7 +1359,6 @@ fn bind_insert(
     resolver: &Resolver,
     table: &Table,
     body: &mut InsertBody,
-    connection: &Arc<Connection>,
     on_conflict: ResolveType,
 ) -> Result<BoundInsertResult> {
     let mut values: Vec<Box<Expr>> = vec![];
@@ -1422,7 +1420,7 @@ fn bind_insert(
                                     expr,
                                     None,
                                     None,
-                                    connection,
+                                    resolver,
                                     BindingBehavior::ResultColumnsNotAllowed,
                                 )?;
                             }
@@ -1458,7 +1456,7 @@ fn bind_insert(
                     &mut set.expr,
                     None,
                     None,
-                    connection,
+                    resolver,
                     BindingBehavior::AllowUnboundIdentifiers,
                 )?;
             }
@@ -1467,7 +1465,7 @@ fn bind_insert(
                     where_expr,
                     None,
                     None,
-                    connection,
+                    resolver,
                     BindingBehavior::AllowUnboundIdentifiers,
                 )?;
             }
@@ -2960,7 +2958,7 @@ fn emit_replace_delete_conflicting_row(
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
             let where_copy = index
-                .bind_where_expr(Some(table_references), connection)
+                .bind_where_expr(Some(table_references), resolver)
                 .expect("where clause to exist");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();
@@ -2992,7 +2990,7 @@ fn emit_replace_delete_conflicting_row(
                     &mut expr,
                     Some(table_references),
                     None,
-                    connection,
+                    resolver,
                     BindingBehavior::ResultColumnsNotAllowed,
                 )?;
                 translate_expr_no_constant_opt(
