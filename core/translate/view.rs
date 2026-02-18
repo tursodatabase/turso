@@ -256,6 +256,7 @@ pub fn translate_create_view(
     select_stmt: &ast::Select,
     _columns: &[ast::IndexedColumn],
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
     if connection.mvcc_enabled() {
         return Err(crate::LimboError::ParseError(
