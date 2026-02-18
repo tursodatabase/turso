@@ -58,3 +58,44 @@ expect {
     2
 }
 
+test total-changes-on-delete {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3), (4), (5);
+    delete from temp where t1 > 3;
+    select total_changes();
+}
+expect {
+    7
+}
+
+test total-changes-on-delete-all {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3);
+    delete from temp;
+    select total_changes();
+}
+expect {
+    6
+}
+
+test total-changes-on-delete-no-match {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3);
+    delete from temp where t1 > 100;
+    select total_changes();
+}
+expect {
+    3
+}
+
+test total-changes-mixed-operations {
+    create table temp (t1 integer primary key, t2 text);
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
+    update temp set t2 = 'updated' where t1 <= 2;
+    delete from temp where t1 = 3;
+    select total_changes();
+}
+expect {
+    6
+}
+
