@@ -2362,6 +2362,33 @@ pub fn close_loop(
     Ok(())
 }
 
+/// Build the affinity string for the first `num_regs` columns of `idx` by
+/// looking up each indexed column's declared affinity in the source table.
+/// This mirrors SQLite's `sqlite3IndexAffinityStr()` which is used for the
+/// OP_Affinity opcode before index seeks.
+fn index_column_affinities(idx: &Index, tables: &TableReferences, num_regs: usize) -> String {
+    // Find the source table for this index among the joined tables.
+    let btree = tables
+        .joined_tables()
+        .iter()
+        .find_map(|jt| match &jt.table {
+            Table::BTree(bt) if bt.name == idx.table_name => Some(bt),
+            _ => None,
+        });
+    if let Some(bt) = btree {
+        idx.columns
+            .iter()
+            .take(num_regs)
+            .map(|ic| bt.columns[ic.pos_in_table].affinity().aff_mask())
+            .collect()
+    } else {
+        // Fallback: for ephemeral indexes or subqueries where we cannot resolve
+        // the source table, use BLOB (no-op) affinity for each column.
+        std::iter::repeat_n(affinity::SQLITE_AFF_NONE, num_regs)
+            .collect()
+    }
+}
+
 /// Emits instructions for an index seek. See e.g. [crate::translate::plan::SeekDef]
 /// for more details about the seek definition.
 ///
@@ -2463,19 +2490,32 @@ fn emit_seek(
     }
     let num_regs = seek_def.size(&seek_def.start);
 
-    if is_index {
+    if let Some(idx) = seek_index {
+        // Use index column affinities for the Affinity opcode, matching SQLite's
+        // behavior (sqlite3IndexAffinityStr). The comparison affinity stored in
+        // the seek def is for Eq/Lt/etc. opcodes, but for an index seek the probe
+        // value must be coerced to the *index column's* declared affinity so that
+        // e.g. an integer probe is converted to text before seeking a TEXT index.
+        let affinities: String = index_column_affinities(idx, tables, num_regs);
+        if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+            program.emit_insn(Insn::Affinity {
+                start_reg,
+                count: std::num::NonZeroUsize::new(num_regs).unwrap(),
+                affinities,
+            });
+        }
+    } else if is_index {
+        // Fallback for the (shouldn't-happen) case where is_index is true but
+        // seek_index is None: use the seek-def affinities as before.
         let affinities: String = seek_def
             .iter_affinity(&seek_def.start)
-            .map(|affinity| affinity.aff_mask())
+            .map(|aff| aff.aff_mask())
             .collect();
         if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
             program.emit_insn(Insn::Affinity {
                 start_reg,
                 count: std::num::NonZeroUsize::new(num_regs).unwrap(),
-                affinities: seek_def
-                    .iter_affinity(&seek_def.start)
-                    .map(|affinity| affinity.aff_mask())
-                    .collect(),
+                affinities,
             });
         }
     }
@@ -2599,10 +2639,22 @@ fn emit_seek_termination(
             // Apply affinity to the end key (same as we do for start key).
             // Without this, e.g. BETWEEN '15' AND '35' on a numeric column would
             // compare '35' as a string against numeric values, causing incorrect results.
-            if is_index {
+            // Use index column affinities (matching SQLite's sqlite3IndexAffinityStr)
+            // rather than comparison affinities, so the probe value is coerced to the
+            // index column's declared type.
+            if let Some(idx) = seek_index {
+                let affinities: String = index_column_affinities(idx, tables, num_regs);
+                if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg,
+                        count: std::num::NonZeroUsize::new(num_regs).unwrap(),
+                        affinities,
+                    });
+                }
+            } else if is_index {
                 let affinities: String = seek_def
                     .iter_affinity(&seek_def.end)
-                    .map(|affinity| affinity.aff_mask())
+                    .map(|aff| aff.aff_mask())
                     .collect();
                 if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
                     program.emit_insn(Insn::Affinity {
