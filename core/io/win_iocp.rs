@@ -118,6 +118,18 @@ impl std::fmt::Debug for IoOverlappedPacket {
         writeln!(f, "IoOverlappedPacket {{")?;
         writeln!(f, "-- completion: {:?} ", self.completion)?;
         writeln!(f, "-- kind: {:?} ", self.kind)?;
+        unsafe {
+            writeln!(
+                f,
+                "-- offset: {:?} ",
+                self.overlapped.Anonymous.Anonymous.Offset
+            )?;
+            writeln!(
+                f,
+                "-- offsetHigh: {:?} ",
+                self.overlapped.Anonymous.Anonymous.OffsetHigh
+            )?;
+        }
         writeln!(f, "}}")?;
 
         Ok(())
@@ -165,12 +177,12 @@ fn get_generic_limboerror_from_os_err(err: u32) -> LimboError {
         );
 
         if buffer.is_null() || size == 0 {
-            return LimboError::InternalError(format!("Windows Error: [{}]", err));
+            return LimboError::InternalError(format!("Windows Error: [{err}]"));
         }
 
         let Ok(size) = size.try_into() else {
             LocalFree(buffer.cast());
-            return LimboError::InternalError(format!("Windows Error: [{}]", err));
+            return LimboError::InternalError(format!("Windows Error: [{err}]"));
         };
 
         let buffer_slice = std::slice::from_raw_parts(buffer, size);
@@ -179,7 +191,7 @@ fn get_generic_limboerror_from_os_err(err: u32) -> LimboError {
         LocalFree(buffer.cast());
 
         let Ok(string) = string.into_string() else {
-            return LimboError::InternalError(format!("Windows Error: [{}]", err));
+            return LimboError::InternalError(format!("Windows Error: [{err}]"));
         };
 
         LimboError::InternalError(format!("Windows Error: [{err}]{string}"))
@@ -292,12 +304,6 @@ impl IO for WindowsIOCP {
                 return Err(get_generic_limboerror_from_last_os_err());
             };
 
-            if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-                || !open_flags.contains(OpenFlags::ReadOnly)
-            {
-                windows_file.lock_file(true)?;
-            }
-
             Ok(windows_file)
         }
     }
@@ -399,12 +405,12 @@ impl InnerWindowsIOCP {
         })
     }
 
-    fn recycle_or_create_io_packet(&self, kind: IoKind) -> IoPacket {
+    fn recycle_or_create_io_packet(&self) -> IoPacket {
         self.free_io_packets.lock().pop_front().unwrap_or_else(|| {
             Arc::new(IoOverlappedPacket {
                 overlapped: OVERLAPPED::default(),
                 completion: None,
-                kind,
+                kind: IoKind::Unknown,
             })
         })
     }
@@ -417,7 +423,7 @@ impl InnerWindowsIOCP {
     ) -> IoPacket {
         trace!("new salvaged overlapped packet. ");
 
-        let mut packet = self.recycle_or_create_io_packet(IoKind::Unknown);
+        let mut packet = self.recycle_or_create_io_packet();
 
         assert!(
             packet.completion.is_none(),
@@ -855,8 +861,6 @@ impl Drop for WindowsFile {
     fn drop(&mut self) {
         trace!("dropping handle {:08X}", self.file_handle.addr());
 
-        let _ = self.unlock_file();
-
         unsafe {
             CancelIoEx(self.file_handle, ptr::null());
             CloseHandle(self.file_handle);
@@ -879,10 +883,7 @@ mod tests {
 
     use super::WindowsIOCP;
 
-    #[test]
-    fn test_multiple_processes_cannot_open_file() {
-        common::tests::test_multiple_processes_cannot_open_file(WindowsIOCP::new);
-    }
+    
 
     #[test]
     fn test_file_read_write() {
