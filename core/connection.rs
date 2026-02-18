@@ -235,9 +235,15 @@ impl Connection {
         let sql = sql.as_ref();
         tracing::debug!("Preparing: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let cmd = match parser.next_cmd()? {
+            Some(cmd) => cmd,
+            None => {
+                return Err(LimboError::InvalidArgument(
+                    "The supplied SQL string contains no statements".to_string(),
+                ));
+            }
+        };
         let syms = self.syms.read();
-        let cmd = cmd.expect("Successful parse on nonempty input string should produce a command");
         let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
