@@ -52,6 +52,10 @@ struct Args {
     /// Use full hierarchical tree in the coverage report instead of simplified flat view.
     #[arg(long)]
     full_tree: bool,
+
+    /// Enable experimental MVCC mode.
+    #[arg(long)]
+    mvcc: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -113,6 +117,7 @@ fn run_single(args: &Args) -> Result<()> {
         } else {
             TreeMode::Simplified
         },
+        mvcc: args.mvcc,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);

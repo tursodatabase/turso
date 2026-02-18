@@ -49,6 +49,8 @@ pub struct SimConfig {
     pub coverage: bool,
     /// Coverage report tree mode.
     pub tree_mode: TreeMode,
+    /// Whether to enable experimental MVCC mode.
+    pub mvcc: bool,
 }
 
 impl Default for SimConfig {
@@ -63,6 +65,7 @@ impl Default for SimConfig {
             generator: GeneratorKind::default(),
             coverage: false,
             tree_mode: TreeMode::default(),
+            mvcc: false,
         }
     }
 }
@@ -225,6 +228,13 @@ impl Fuzzer {
             .execute("ATTACH ':memory:' AS aux", [])
             .context("Failed to ATTACH on SQLite")?;
         tracing::info!("Attached ':memory:' AS aux on both connections");
+
+        // Enable MVCC after ATTACH (ATTACH is not supported in MVCC mode)
+        if config.mvcc {
+            turso_conn
+                .execute("PRAGMA journal_mode = 'experimental_mvcc'")
+                .context("Failed to enable MVCC mode")?;
+        }
 
         Ok(Self {
             config,
@@ -427,6 +437,10 @@ impl Fuzzer {
         stats: &mut SimStats,
         executed_sql: &mut Vec<String>,
     ) -> Result<()> {
+        if self.config.mvcc {
+            tracing::info!("Skipping integrity check (not supported with MVCC)");
+            return Ok(());
+        }
         tracing::info!("Running integrity check on both databases...");
 
         let sql = "PRAGMA integrity_check";
@@ -563,6 +577,7 @@ mod tests {
             generator: GeneratorKind::default(),
             coverage: false,
             tree_mode: TreeMode::default(),
+            mvcc: false,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());

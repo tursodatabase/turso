@@ -45,7 +45,7 @@ impl SchemaIntrospector {
     fn get_table_names_turso(conn: &Arc<turso_core::Connection>) -> Result<Vec<String>> {
         let mut tables = Vec::new();
         let mut rows = conn
-            .query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY name")
             .context("Failed to query table names")?
             .context("Expected rows from query")?;
 
@@ -62,7 +62,7 @@ impl SchemaIntrospector {
 
     fn get_table_names_sqlite(conn: &rusqlite::Connection) -> Result<Vec<String>> {
         let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY name")
             .context("Failed to prepare table query")?;
 
         let tables = stmt
@@ -211,7 +211,7 @@ impl SchemaIntrospector {
         for db_name in &attached_dbs {
             builder = builder.database(db_name.clone());
             let query = format!(
-                "SELECT name FROM {db_name}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                "SELECT name FROM {db_name}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY name"
             );
             let mut stmt = conn
                 .prepare(&query)
@@ -307,7 +307,7 @@ impl SchemaIntrospector {
     ) -> Result<Vec<String>> {
         let mut tables = Vec::new();
         let query = format!(
-            "SELECT name FROM {db_name}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            "SELECT name FROM {db_name}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY name"
         );
         let mut rows = conn
             .query(&query)
