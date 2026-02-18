@@ -17,6 +17,28 @@ setup schema {
     INSERT INTO t VALUES (3, 'three', 3, 'Bravo');
 }
 
+setup schema_multi_table {
+    CREATE TABLE t1(
+        a INTEGER PRIMARY KEY,
+        b TEXT NOT NULL
+    );
+    CREATE INDEX idx_t1_b ON t1(b);
+    CREATE UNIQUE INDEX idx_t1_b_u ON t1(b);
+
+    CREATE TABLE t2(
+        x INTEGER PRIMARY KEY,
+        y TEXT NOT NULL,
+        z INTEGER CHECK(z > 0)
+    );
+    CREATE INDEX idx_t2_y ON t2(y);
+    CREATE INDEX idx_t2_expr ON t2(lower(y));
+
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT INTO t1 VALUES (2, 'two');
+    INSERT INTO t2 VALUES (1, 'alpha', 1);
+    INSERT INTO t2 VALUES (2, 'beta', 2);
+}
+
 @setup schema
 snapshot integrity-check-vdbe {
     PRAGMA integrity_check;
@@ -24,5 +46,15 @@ snapshot integrity-check-vdbe {
 
 @setup schema
 snapshot quick-check-vdbe {
+    PRAGMA quick_check;
+}
+
+@setup schema_multi_table
+snapshot integrity-check-multi-table-vdbe {
+    PRAGMA integrity_check;
+}
+
+@setup schema_multi_table
+snapshot quick-check-multi-table-vdbe {
     PRAGMA quick_check;
 }
