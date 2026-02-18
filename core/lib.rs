@@ -1,56 +1,63 @@
 #![allow(clippy::arc_with_non_send_sync)]
 extern crate core;
-mod assert;
+
 pub mod busy;
+#[cfg(feature = "cli_only")]
+pub mod dbpage;
+#[cfg(any(feature = "fuzz", feature = "bench"))]
+pub mod functions;
+pub mod index_method;
+pub mod io;
+#[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
+pub mod json;
+pub mod mvcc;
+#[cfg(any(feature = "fuzz", feature = "bench"))]
+pub mod numeric;
+pub mod schema;
+pub mod state_machine;
+pub mod storage;
+pub mod types;
+#[cfg(any(feature = "fuzz", feature = "bench"))]
+pub mod vdbe;
+pub mod vector;
+
+#[cfg(feature = "cli_only")]
+pub(crate) mod btree_dump;
+pub(crate) mod sync;
+pub(crate) mod thread;
+
+mod assert;
 mod connection;
 mod error;
 mod ext;
 mod fast_lock;
 mod function;
-#[cfg(any(feature = "fuzz", feature = "bench"))]
-pub mod functions;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod functions;
 mod incremental;
-pub mod index_method;
 mod info;
-pub mod io;
-#[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
-pub mod json;
 #[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
 mod json;
-pub mod mvcc;
+#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+mod numeric;
 mod parameters;
 mod pragma;
 mod pseudo;
 mod regexp;
-pub mod schema;
 #[cfg(feature = "series")]
 mod series;
-pub mod state_machine;
 mod statement;
 mod stats;
-pub mod storage;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;
 mod translate;
-pub mod types;
 mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
-#[cfg(any(feature = "fuzz", feature = "bench"))]
-pub mod vdbe;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod vdbe;
-pub mod vector;
 mod vtab;
-
-#[cfg(any(feature = "fuzz", feature = "bench"))]
-pub mod numeric;
-
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod numeric;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
@@ -130,15 +137,6 @@ pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
-
-#[cfg(feature = "cli_only")]
-pub(crate) mod btree_dump;
-
-#[cfg(feature = "cli_only")]
-pub mod dbpage;
-
-pub(crate) mod sync;
-pub(crate) mod thread;
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
