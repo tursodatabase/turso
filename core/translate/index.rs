@@ -65,6 +65,15 @@ pub fn translate_create_index(
         )
     }
 
+    if connection.mvcc_enabled() {
+        if where_clause.is_some() {
+            bail_parse_error!("Partial indexes are not supported in MVCC mode");
+        }
+        if using.is_some() {
+            bail_parse_error!("Custom index modules are not supported in MVCC mode");
+        }
+    }
+
     let original_idx_name = idx_name;
     let database_id = connection.resolve_database_id(&original_idx_name)?;
     let idx_name = normalize_ident(original_idx_name.name.as_str());
@@ -113,6 +122,9 @@ pub fn translate_create_index(
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
     let columns = resolve_sorted_columns(&tbl, &columns)?;
+    if connection.mvcc_enabled() && columns.iter().any(|c| c.expr.is_some()) {
+        bail_parse_error!("Expression indexes are not supported in MVCC mode");
+    }
     if !with_clause.is_empty() && using.is_none() {
         crate::bail_parse_error!(
             "Error: additional parameters are allowed only for custom module indices: '{idx_name}' is not custom module index"

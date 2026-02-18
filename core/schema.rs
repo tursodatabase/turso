@@ -657,10 +657,11 @@ impl Schema {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
             match &state.phase {
                 MakeFromBtreePhase::Init => {
-                    assert!(
-                        mv_cursor.is_none(),
-                        "mvcc not yet supported for make_from_btree"
-                    );
+                    if mv_cursor.is_some() {
+                        return Err(crate::LimboError::ParseError(
+                            "MVCC is not supported for make_from_btree schema recovery".to_string(),
+                        ));
+                    }
 
                     state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
                     pager.begin_read_tx()?;
@@ -1103,7 +1104,9 @@ impl Schema {
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
-                assert!(mv_store.is_none(), "views not yet supported for mvcc");
+                if mv_store.is_some() {
+                    crate::bail_parse_error!("Views are not supported in MVCC mode");
+                }
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
