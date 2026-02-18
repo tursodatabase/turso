@@ -559,6 +559,9 @@ pub fn json_string_to_db_type(
         return Ok(Value::Blob(json.data()));
     }
     let mut json_string = json.to_string()?;
+    if matches!(flag, OutputVariant::String) {
+        return Ok(Value::Text(Text::json(json_string)));
+    }
     match element_type {
         ElementType::ARRAY | ElementType::OBJECT => Ok(Value::Text(Text::json(json_string))),
         ElementType::TEXT | ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW => {
@@ -584,7 +587,7 @@ pub fn json_string_to_db_type(
                     Ok(Value::Text(Text::json(simplified.to_string())))
                 }
                 Ok(float_val) => Ok(Value::from_f64(float_val)),
-                Err(_) => Ok(Value::Null),
+                Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
             }
         }
         ElementType::INT | ElementType::INT5 => {
@@ -595,7 +598,7 @@ pub fn json_string_to_db_type(
                 let res = f64::from_str(&json_string);
                 match res {
                     Ok(num) => Ok(Value::from_f64(num)),
-                    Err(_) => Ok(Value::Null),
+                    Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
                 }
             }
         }
