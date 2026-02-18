@@ -1,13 +1,17 @@
 ---
 source: sorting.sqltest
-expression: "SELECT id, name, price\n    FROM products\n    WHERE price BETWEEN 10 AND 100\n    ORDER BY price;"
+expression: |-
+  SELECT id, name, price
+      FROM products
+      WHERE price BETWEEN 10 AND 100
+      ORDER BY price;
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SEARCH products USING INDEX idx_products_price

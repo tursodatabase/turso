@@ -1,15 +1,19 @@
 ---
 source: indexes.sqltest
-expression: "SELECT o.id, o.order_date, i.quantity\n    FROM orders o\n    JOIN inventory i ON o.id = i.product_id\n    WHERE o.customer_id = 100;"
+expression: |-
+  SELECT o.id, o.order_date, i.quantity
+      FROM orders o
+      JOIN inventory i ON o.id = i.product_id
+      WHERE o.customer_id = 100;
 info:
   statement_type: SELECT
   tables:
-    - inventory
-    - o.id
-    - orders
+  - inventory
+  - o.id
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SEARCH o USING INDEX idx_orders_customer_date

@@ -1,15 +1,27 @@
 ---
 source: aggregation.sqltest
-expression: "SELECT\n        p.category,\n        COUNT(o.order_id) as num_orders,\n        SUM(o.total_amount) as total_revenue,\n        AVG(o.quantity) as avg_quantity_per_order\n    FROM\n        products p\n        LEFT JOIN orders o ON p.product_id = o.product_id\n    GROUP BY\n        p.category\n    ORDER BY\n        total_revenue DESC;"
+expression: |-
+  SELECT
+          p.category,
+          COUNT(o.order_id) as num_orders,
+          SUM(o.total_amount) as total_revenue,
+          AVG(o.quantity) as avg_quantity_per_order
+      FROM
+          products p
+          LEFT JOIN orders o ON p.product_id = o.product_id
+      GROUP BY
+          p.category
+      ORDER BY
+          total_revenue DESC;
 info:
   statement_type: SELECT
   tables:
-    - orders
-    - p.product_id
-    - products
+  - orders
+  - p.product_id
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN products AS p

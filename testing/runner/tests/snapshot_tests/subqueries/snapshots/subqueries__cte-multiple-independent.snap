@@ -110,7 +110,7 @@ addr  opcode            p1  p2  p3  p4            p5  comment
   65    Yield           12  79   0                 0
   66    Copy            18  36   0                 0  r[36]=r[18]
   67    IsNull          36  78   0                 0  if (r[36]==NULL) goto 78
-  68    Affinity        36   1   0                 0  r[36..37] = C
+  68    Affinity        36   1   0                 0  r[36..37] = D
   69    SeekGE           6  78  36                 0  key=[36..36]
   70      IdxGT          6  78  36                 0  key=[36..36]
   71      Column         6   0  31                 0  r[31]=ephemeral_subquery_t8.customer_id

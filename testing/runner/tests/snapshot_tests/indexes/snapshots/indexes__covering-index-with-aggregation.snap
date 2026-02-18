@@ -1,13 +1,17 @@
 ---
 source: indexes.sqltest
-expression: "SELECT warehouse_id, SUM(quantity) as total_qty\n    FROM inventory\n    WHERE warehouse_id = 1\n    GROUP BY warehouse_id;"
+expression: |-
+  SELECT warehouse_id, SUM(quantity) as total_qty
+      FROM inventory
+      WHERE warehouse_id = 1
+      GROUP BY warehouse_id;
 info:
   statement_type: SELECT
   tables:
-    - inventory
+  - inventory
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SEARCH inventory USING INDEX idx_inventory_covering

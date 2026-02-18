@@ -18,8 +18,8 @@ use super::{
     plan::{
         Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, IterationDirection,
         JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery, Operation,
-        QueryDestination, Scan, Search, SeekDef, SeekKeyComponent, SelectPlan, SetOperation,
-        TableReferences, WhereTerm,
+        QueryDestination, Scan, Search, SeekDef, SeekKey, SeekKeyComponent, SelectPlan,
+        SetOperation, TableReferences, WhereTerm,
     },
 };
 use crate::{
@@ -2387,6 +2387,51 @@ pub fn close_loop(
     Ok(())
 }
 
+/// Build the affinity string for an index seek, skipping positions where the
+/// probe expression already has the right type (mirroring SQLite's optimization
+/// via `sqlite3ExprNeedsNoAffinityChange`).
+///
+/// For each seek key position the index column affinity is checked against the
+/// probe expression. If the expression already matches (e.g. a string literal
+/// seeking a TEXT column), NONE is used so OP_Affinity becomes a no-op for that
+/// slot. When every slot is NONE the caller can skip the instruction entirely.
+fn index_seek_affinities(
+    idx: &Index,
+    tables: &TableReferences,
+    seek_def: &SeekDef,
+    seek_key: &SeekKey,
+) -> String {
+    let table = tables
+        .joined_tables()
+        .iter()
+        .find(|jt| jt.table.get_name() == idx.table_name)
+        .expect("index source table not found in table references");
+
+    idx.columns
+        .iter()
+        .zip(seek_def.iter(seek_key))
+        .map(|(ic, key_component)| {
+            // Expression index columns (e.g. CREATE INDEX ON t(a+b)) have no
+            // corresponding table column; their affinity is BLOB/NONE.
+            let col_aff = if ic.expr.is_some() {
+                Affinity::Blob
+            } else {
+                table
+                    .table
+                    .get_column_at(ic.pos_in_table)
+                    .expect("index column position out of bounds")
+                    .affinity()
+            };
+            match key_component {
+                SeekKeyComponent::Expr(expr) if col_aff.expr_needs_no_affinity_change(expr) => {
+                    affinity::SQLITE_AFF_NONE
+                }
+                _ => col_aff.aff_mask(),
+            }
+        })
+        .collect()
+}
+
 /// Emits instructions for an index seek. See e.g. [crate::translate::plan::SeekDef]
 /// for more details about the seek definition.
 ///
@@ -2489,19 +2534,13 @@ fn emit_seek(
     }
     let num_regs = seek_def.size(&seek_def.start);
 
-    if is_index {
-        let affinities: String = seek_def
-            .iter_affinity(&seek_def.start)
-            .map(|affinity| affinity.aff_mask())
-            .collect();
+    if let Some(idx) = seek_index {
+        let affinities = index_seek_affinities(idx, tables, seek_def, &seek_def.start);
         if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
             program.emit_insn(Insn::Affinity {
                 start_reg,
                 count: std::num::NonZeroUsize::new(num_regs).unwrap(),
-                affinities: seek_def
-                    .iter_affinity(&seek_def.start)
-                    .map(|affinity| affinity.aff_mask())
-                    .collect(),
+                affinities,
             });
         }
     }
@@ -2625,11 +2664,8 @@ fn emit_seek_termination(
             // Apply affinity to the end key (same as we do for start key).
             // Without this, e.g. BETWEEN '15' AND '35' on a numeric column would
             // compare '35' as a string against numeric values, causing incorrect results.
-            if is_index {
-                let affinities: String = seek_def
-                    .iter_affinity(&seek_def.end)
-                    .map(|affinity| affinity.aff_mask())
-                    .collect();
+            if let Some(idx) = seek_index {
+                let affinities = index_seek_affinities(idx, tables, seek_def, &seek_def.end);
                 if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
                     program.emit_insn(Insn::Affinity {
                         start_reg,
