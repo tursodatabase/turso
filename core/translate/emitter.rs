@@ -6,6 +6,7 @@ use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
+use turso_macros::match_ignore_ascii_case;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{
@@ -67,7 +68,9 @@ use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
 };
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
-use crate::{bail_parse_error, emit_explain, DatabaseCatalog, Result, RwLock, SymbolTable};
+use crate::{
+    bail_parse_error, emit_explain, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable
+};
 use crate::{CaptureDataChangesExt, Connection, QueryMode};
 
 /// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
@@ -118,6 +121,12 @@ pub struct Resolver<'a> {
 }
 
 impl<'a> Resolver<'a> {
+    const MAIN_DB: &'static str = "main";
+    const TEMP_DB: &'static str = "temp";
+
+    const MAIN_DB_ID: usize = 0;
+    const TEMP_DB_ID: usize = 1;
+
     pub(crate) fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
@@ -181,10 +190,10 @@ impl<'a> Resolver<'a> {
 
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
-        if database_id == 0 {
+        if database_id == Self::MAIN_DB_ID {
             // Main database - use connection's schema which should be kept in sync
             f(self.schema)
-        } else if database_id == 1 {
+        } else if database_id == Self::TEMP_DB_ID {
             // Temp database - uses same schema as main for now, but this will change later.
             f(self.schema)
         } else {
@@ -209,6 +218,41 @@ impl<'a> Resolver<'a> {
 
             f(&schema)
         }
+    }
+
+    /// Resolve database ID from a qualified name
+    pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
+        use crate::util::normalize_ident;
+
+        // Check if this is a qualified name (database.table) or unqualified
+        if let Some(db_name) = &qualified_name.db_name {
+            let db_name_normalized = normalize_ident(db_name.as_str());
+            let name_bytes = db_name_normalized.as_bytes();
+            match_ignore_ascii_case!(match name_bytes {
+                b"main" => Ok(0),
+                b"temp" => Ok(1),
+                _ => {
+                    // Look up attached database
+                    if let Some((idx, _attached_db)) =
+                        self.get_attached_database(&db_name_normalized)
+                    {
+                        Ok(idx)
+                    } else {
+                        Err(LimboError::InvalidArgument(format!(
+                            "no such database: {db_name_normalized}"
+                        )))
+                    }
+                }
+            })
+        } else {
+            // Unqualified table name - use main database
+            Ok(0)
+        }
+    }
+
+    // Get an attached database by alias name
+    pub(crate) fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
+        self.attached_databases.read().get_database_by_name(alias)
     }
 }
 

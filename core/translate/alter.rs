@@ -222,7 +222,7 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
-    let database_id = connection.resolve_database_id(&qualified_name)?;
+    let database_id = resolver.resolve_database_id(&qualified_name)?;
     if database_id >= 2 {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);

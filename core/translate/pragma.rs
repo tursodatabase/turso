@@ -71,7 +71,7 @@ pub fn translate_pragma(
         Err(_) => bail_parse_error!("Not a valid pragma name"),
     };
 
-    let database_id = connection.resolve_database_id(name)?;
+    let database_id = resolver.resolve_database_id(name)?;
 
     let mode = match body {
         None => query_pragma(

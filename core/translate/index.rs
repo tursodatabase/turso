@@ -75,7 +75,7 @@ pub fn translate_create_index(
     }
 
     let original_idx_name = idx_name;
-    let database_id = connection.resolve_database_id(&original_idx_name)?;
+    let database_id = resolver.resolve_database_id(&original_idx_name)?;
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
@@ -770,7 +770,7 @@ pub fn translate_drop_index(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
-    let database_id = connection.resolve_database_id(qualified_name)?;
+    let database_id = resolver.resolve_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts {
         num_cursors: 5,

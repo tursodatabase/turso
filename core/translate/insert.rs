@@ -259,7 +259,7 @@ pub fn translate_insert(
         // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
-    let database_id = connection.resolve_database_id(&tbl_name)?;
+    let database_id = resolver.resolve_database_id(&tbl_name)?;
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,

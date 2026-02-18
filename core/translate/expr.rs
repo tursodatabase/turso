@@ -4749,7 +4749,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         name: tbl_name.clone(),
                         alias: None,
                     };
-                    let database_id = connection.resolve_database_id(&qualified_name)?;
+                    let database_id = resolver.resolve_database_id(&qualified_name)?;
 
                     // Get the table from the specified database
                     let table = connection

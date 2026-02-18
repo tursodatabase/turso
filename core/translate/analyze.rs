@@ -41,7 +41,7 @@ fn resolve_analyze_targets(
 
             // If db_name is specified, resolve to that database
             if let Some(db_name) = &target.db_name {
-                let database_id = connection.resolve_database_id(target)?;
+                let database_id = resolver.resolve_database_id(target)?;
                 let db_normalized = normalize_ident(db_name.as_str());
 
                 // "ANALYZE db.table" — the name part is the table/index

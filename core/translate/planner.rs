@@ -763,7 +763,7 @@ fn parse_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
-    let database_id = connection.resolve_database_id(qualified_name)?;
+    let database_id = resolver.resolve_database_id(qualified_name)?;
     let table_name = &qualified_name.name;
 
     // Check if the FROM clause table is referring to a CTE in the current scope.

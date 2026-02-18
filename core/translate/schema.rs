@@ -181,7 +181,7 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Connection,
 ) -> Result<()> {
-    let database_id = connection.resolve_database_id(&tbl_name)?;
+    let database_id = resolver.resolve_database_id(&tbl_name)?;
     if database_id >= 2 {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
@@ -768,7 +768,7 @@ pub fn translate_drop_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let database_id = connection.resolve_database_id(&tbl_name)?;
+    let database_id = resolver.resolve_database_id(&tbl_name)?;
     let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts {
         num_cursors: 4,

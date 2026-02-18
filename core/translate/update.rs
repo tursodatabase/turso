@@ -208,7 +208,7 @@ pub fn prepare_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
-    let database_id = connection.resolve_database_id(&body.tbl_name)?;
+    let database_id = resolver.resolve_database_id(&body.tbl_name)?;
     let schema = resolver.schema();
     let table_name = &body.tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {

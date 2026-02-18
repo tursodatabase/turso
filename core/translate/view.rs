@@ -29,7 +29,7 @@ pub fn translate_create_materialized_view(
         ));
     }
 
-    let database_id = connection.resolve_database_id(view_name)?;
+    let database_id = resolver.resolve_database_id(view_name)?;
     // The DBSP incremental maintenance runtime (populate_from_table, etc.) assumes
     // the main database pager/schema. Block attached databases until that is fixed.
     if database_id != 0 {
@@ -263,7 +263,7 @@ pub fn translate_create_view(
             "Views are not supported in MVCC mode".to_string(),
         ));
     }
-    let database_id = connection.resolve_database_id(view_name)?;
+    let database_id = resolver.resolve_database_id(view_name)?;
     if database_id >= 2 {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
@@ -348,7 +348,7 @@ pub fn translate_drop_view(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = connection.resolve_database_id(view_name)?;
+    let database_id = resolver.resolve_database_id(view_name)?;
     if database_id >= 2 {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
