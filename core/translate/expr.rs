@@ -30,7 +30,7 @@ use crate::vdbe::{
 };
 use crate::{turso_assert, Numeric, Result, Value};
 
-use super::collate::CollationSeq;
+use super::collate::{get_collseq_from_expr, CollationSeq};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -55,6 +55,38 @@ fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, re
             jump_if_null: true,
         });
     }
+}
+
+fn assert_register_range_allocated(
+    program: &mut ProgramBuilder,
+    start_register: usize,
+    count: usize,
+) -> Result<()> {
+    // Invariant: callers must have pre-allocated [start_register, start_register + count)
+    // before asking expression translation to write a vector into that range.
+    let required_next = start_register + count;
+    let next_free = program.peek_next_register();
+    if required_next <= next_free {
+        Ok(())
+    } else {
+        crate::bail_parse_error!(
+            "insufficient registers allocated for expression vector write (start={start_register}, count={count}, next_free={next_free})"
+        )
+    }
+}
+
+fn supports_row_value_binary_comparison(operator: &ast::Operator) -> bool {
+    matches!(
+        operator,
+        ast::Operator::Equals
+            | ast::Operator::NotEquals
+            | ast::Operator::Less
+            | ast::Operator::LessEquals
+            | ast::Operator::Greater
+            | ast::Operator::GreaterEquals
+            | ast::Operator::Is
+            | ast::Operator::IsNot
+    )
 }
 
 macro_rules! expect_arguments_exact {
@@ -523,8 +555,7 @@ pub fn translate_condition_expr(
                 op,
                 result_reg,
                 resolver,
-                Some(condition_metadata),
-                emit_binary_condition_insn,
+                BinaryEmitMode::Condition(condition_metadata),
             )?;
         }
         ast::Expr::Literal(_)
@@ -672,6 +703,17 @@ pub enum NoConstantOptReason {
     /// so hoisting those register assignments is not safe.
     /// e.g. SELECT COALESCE(1, t.x, NULL) would overwrite 1 with NULL, which is invalid.
     RegisterReuse,
+}
+
+/// Controls how binary expressions are emitted.
+///
+/// This makes scalar and row-valued paths explicit:
+/// - scalar binary expressions use mode to pick either value emission or conditional jump emission
+/// - row-valued binary expressions always emit a value register first, then optionally a conditional jump
+#[derive(Clone, Copy)]
+enum BinaryEmitMode {
+    Value,
+    Condition(ConditionMetadata),
 }
 
 /// Translate an expression into bytecode via [translate_expr()], and forbid any constant values from being hoisted
@@ -921,6 +963,7 @@ pub fn translate_expr(
                     result_reg_start,
                     num_regs,
                 } => {
+                    assert_register_range_allocated(program, target_register, *num_regs)?;
                     program.emit_insn(Insn::Copy {
                         src_reg: *result_reg_start,
                         dst_reg: target_register,
@@ -961,21 +1004,23 @@ pub fn translate_expr(
                     null_value,
                     invert,
                 });
-                Ok(target_register)
-            } else {
-                binary_expr_shared(
-                    program,
-                    referenced_tables,
-                    e1,
-                    e2,
-                    op,
-                    target_register,
-                    resolver,
-                    None,
-                    emit_binary_insn,
-                )?;
-                Ok(target_register)
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
+                return Ok(target_register);
             }
+
+            binary_expr_shared(
+                program,
+                referenced_tables,
+                e1,
+                e2,
+                op,
+                target_register,
+                resolver,
+                BinaryEmitMode::Value,
+            )?;
+            Ok(target_register)
         }
         ast::Expr::Case {
             base,
@@ -2865,20 +2910,15 @@ pub fn translate_expr(
             if exprs.is_empty() {
                 crate::bail_parse_error!("parenthesized expression with no arguments");
             }
-            if exprs.len() == 1 {
+            assert_register_range_allocated(program, target_register, exprs.len())?;
+            for (i, expr) in exprs.iter().enumerate() {
                 translate_expr(
                     program,
                     referenced_tables,
-                    &exprs[0],
-                    target_register,
+                    expr,
+                    target_register + i,
                     resolver,
                 )?;
-            } else {
-                // Parenthesized expressions with multiple arguments are reserved for special cases
-                // like `(a, b) IN ((1, 2), (3, 4))`.
-                crate::bail_parse_error!(
-                    "TODO: parenthesized expression with multiple arguments not yet supported"
-                );
             }
             Ok(target_register)
         }
@@ -3009,19 +3049,101 @@ fn binary_expr_shared(
     op: &ast::Operator,
     target_register: usize,
     resolver: &Resolver,
-    condition_metadata: Option<ConditionMetadata>,
-    emit_fn: impl Fn(
-        &mut ProgramBuilder,
-        &ast::Operator,
-        usize,      // left reg
-        usize,      // right reg
-        usize,      // target reg
-        &ast::Expr, // left expr
-        &ast::Expr, // right expr
-        Option<&TableReferences>,
-        Option<ConditionMetadata>,
-    ) -> Result<()>,
+    emit_mode: BinaryEmitMode,
 ) -> Result<usize> {
+    let lhs_arity = expr_vector_size(e1)?;
+    let rhs_arity = expr_vector_size(e2)?;
+    if lhs_arity != rhs_arity {
+        crate::bail_parse_error!(
+            "all arguments to binary operator {op} must return the same number of values. Got: ({lhs_arity}) {op} ({rhs_arity})"
+        );
+    }
+
+    if lhs_arity == 1 {
+        emit_binary_expr_scalar(
+            program,
+            referenced_tables,
+            e1,
+            e2,
+            op,
+            target_register,
+            resolver,
+            emit_mode,
+        )?;
+        return Ok(target_register);
+    }
+
+    if !supports_row_value_binary_comparison(op) {
+        crate::bail_parse_error!("row value misused");
+    }
+
+    let lhs_reg = program.alloc_registers(lhs_arity);
+    let rhs_reg = program.alloc_registers(lhs_arity);
+    translate_expr(program, referenced_tables, e1, lhs_reg, resolver)?;
+    translate_expr(program, referenced_tables, e2, rhs_reg, resolver)?;
+
+    emit_binary_expr_row_valued(
+        program,
+        op,
+        lhs_reg,
+        rhs_reg,
+        lhs_arity,
+        target_register,
+        e1,
+        e2,
+        referenced_tables,
+    )?;
+
+    if let BinaryEmitMode::Condition(metadata) = emit_mode {
+        emit_cond_jump(program, metadata, target_register);
+    }
+    Ok(target_register)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_binary_expr_scalar(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    op: &ast::Operator,
+    target_register: usize,
+    resolver: &Resolver,
+    emit_mode: BinaryEmitMode,
+) -> Result<usize> {
+    let (emit_fn, condition_metadata) = match emit_mode {
+        BinaryEmitMode::Value => (
+            emit_binary_insn
+                as fn(
+                    &mut ProgramBuilder,
+                    &ast::Operator,
+                    usize,
+                    usize,
+                    usize,
+                    &ast::Expr,
+                    &ast::Expr,
+                    Option<&TableReferences>,
+                    Option<ConditionMetadata>,
+                ) -> Result<()>,
+            None,
+        ),
+        BinaryEmitMode::Condition(metadata) => (
+            emit_binary_condition_insn
+                as fn(
+                    &mut ProgramBuilder,
+                    &ast::Operator,
+                    usize,
+                    usize,
+                    usize,
+                    &ast::Expr,
+                    &ast::Expr,
+                    Option<&TableReferences>,
+                    Option<ConditionMetadata>,
+                ) -> Result<()>,
+            Some(metadata),
+        ),
+    };
+
     // Check if both sides of the expression are equivalent and reuse the same register if so
     if exprs_are_equivalent(e1, e2) {
         let shared_reg = program.alloc_register();
@@ -3094,6 +3216,271 @@ fn binary_expr_shared(
         program.reset_collation();
         Ok(target_register)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_binary_expr_row_valued(
+    program: &mut ProgramBuilder,
+    op: &ast::Operator,
+    lhs_start: usize,
+    rhs_start: usize,
+    arity: usize,
+    target_register: usize,
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: Option<&TableReferences>,
+) -> Result<()> {
+    enum RowOrderingOp {
+        Less,
+        Greater,
+    }
+
+    let mut emit_eq = |result_reg: usize, null_eq: bool| -> Result<()> {
+        let null_seen_reg = if null_eq {
+            None
+        } else {
+            let reg = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: reg,
+            });
+            Some(reg)
+        };
+
+        let done_label = program.allocate_label();
+        for i in 0..arity {
+            let next_label = program.allocate_label();
+            let (affinity, collation) =
+                row_component_affinity_collation(lhs_expr, rhs_expr, i, referenced_tables)?;
+            program.emit_insn(Insn::Eq {
+                lhs: lhs_start + i,
+                rhs: rhs_start + i,
+                target_pc: next_label,
+                flags: if null_eq {
+                    CmpInsFlags::default().null_eq().with_affinity(affinity)
+                } else {
+                    CmpInsFlags::default().with_affinity(affinity)
+                },
+                collation,
+            });
+            if null_eq {
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: result_reg,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: done_label,
+                });
+            } else {
+                let mark_null_label = program.allocate_label();
+                program.emit_insn(Insn::IsNull {
+                    reg: lhs_start + i,
+                    target_pc: mark_null_label,
+                });
+                program.emit_insn(Insn::IsNull {
+                    reg: rhs_start + i,
+                    target_pc: mark_null_label,
+                });
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: result_reg,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: done_label,
+                });
+                program.preassign_label_to_next_insn(mark_null_label);
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: null_seen_reg.expect("null tracking register must exist"),
+                });
+            }
+            program.preassign_label_to_next_insn(next_label);
+        }
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: result_reg,
+        });
+        if !null_eq {
+            let finish_label = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: null_seen_reg.expect("null tracking register must exist"),
+                target_pc: finish_label,
+                jump_if_null: true,
+            });
+            program.emit_insn(Insn::Null {
+                dest: result_reg,
+                dest_end: None,
+            });
+            program.preassign_label_to_next_insn(finish_label);
+        }
+        program.preassign_label_to_next_insn(done_label);
+        Ok(())
+    };
+
+    let emit_order =
+        |program: &mut ProgramBuilder, order_op: RowOrderingOp, include_eq: bool| -> Result<()> {
+            let done_label = program.allocate_label();
+            let null_result_label = program.allocate_label();
+            for i in 0..arity {
+                let next_cmp_label = program.allocate_label();
+                let (aff, collation) =
+                    row_component_affinity_collation(lhs_expr, rhs_expr, i, referenced_tables)?;
+                let lhs = lhs_start + i;
+                let rhs = rhs_start + i;
+                program.emit_insn(Insn::IsNull {
+                    reg: lhs,
+                    target_pc: null_result_label,
+                });
+                program.emit_insn(Insn::IsNull {
+                    reg: rhs,
+                    target_pc: null_result_label,
+                });
+                program.emit_insn(Insn::Eq {
+                    lhs,
+                    rhs,
+                    target_pc: next_cmp_label,
+                    flags: CmpInsFlags::default().with_affinity(aff),
+                    collation,
+                });
+                let true_label = program.allocate_label();
+                match order_op {
+                    RowOrderingOp::Less => {
+                        program.emit_insn(Insn::Lt {
+                            lhs,
+                            rhs,
+                            target_pc: true_label,
+                            flags: CmpInsFlags::default().with_affinity(aff),
+                            collation,
+                        });
+                    }
+                    RowOrderingOp::Greater => {
+                        program.emit_insn(Insn::Gt {
+                            lhs,
+                            rhs,
+                            target_pc: true_label,
+                            flags: CmpInsFlags::default().with_affinity(aff),
+                            collation,
+                        });
+                    }
+                }
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: target_register,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: done_label,
+                });
+                program.preassign_label_to_next_insn(true_label);
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: target_register,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: done_label,
+                });
+                program.preassign_label_to_next_insn(next_cmp_label);
+            }
+            program.emit_insn(Insn::Integer {
+                value: if include_eq { 1 } else { 0 },
+                dest: target_register,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: done_label,
+            });
+            program.preassign_label_to_next_insn(null_result_label);
+            program.emit_insn(Insn::Null {
+                dest: target_register,
+                dest_end: None,
+            });
+            program.preassign_label_to_next_insn(done_label);
+            Ok(())
+        };
+
+    match op {
+        ast::Operator::Equals => emit_eq(target_register, false)?,
+        ast::Operator::NotEquals => {
+            emit_eq(target_register, false)?;
+            invert_boolean_register(program, target_register);
+        }
+        ast::Operator::Is => emit_eq(target_register, true)?,
+        ast::Operator::IsNot => {
+            emit_eq(target_register, true)?;
+            invert_boolean_register(program, target_register);
+        }
+        ast::Operator::Less => emit_order(program, RowOrderingOp::Less, false)?,
+        ast::Operator::LessEquals => emit_order(program, RowOrderingOp::Less, true)?,
+        ast::Operator::Greater => emit_order(program, RowOrderingOp::Greater, false)?,
+        ast::Operator::GreaterEquals => emit_order(program, RowOrderingOp::Greater, true)?,
+        _ => crate::bail_parse_error!("row value misused"),
+    }
+    Ok(())
+}
+
+fn invert_boolean_register(program: &mut ProgramBuilder, target_register: usize) {
+    program.emit_insn(Insn::Not {
+        reg: target_register,
+        dest: target_register,
+    });
+}
+
+fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Option<&Expr>> {
+    match unwrap_parens(expr)? {
+        Expr::Parenthesized(exprs) if exprs.len() > 1 => Ok(exprs.get(idx).map(Box::as_ref)),
+        _ => Ok(None),
+    }
+}
+
+fn row_component_affinity_collation(
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    idx: usize,
+    referenced_tables: Option<&TableReferences>,
+) -> Result<(Affinity, Option<CollationSeq>)> {
+    // If one side is a decomposable row literal and the other is not, still prefer
+    // the component that is available instead of falling back both sides.
+    // TODO: when both sides are non-decomposable row sources (e.g. subquery row-values),
+    // this falls back to whole-expression affinity/collation and cannot distinguish
+    // per-component metadata.
+    let lhs_for_cmp = row_value_component_expr(lhs_expr, idx)?.unwrap_or(lhs_expr);
+    let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?.unwrap_or(rhs_expr);
+    Ok((
+        comparison_affinity(lhs_for_cmp, rhs_for_cmp, referenced_tables),
+        comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables)?,
+    ))
+}
+
+fn explicit_collation(expr: &Expr) -> Result<Option<CollationSeq>> {
+    let mut found = None;
+    walk_expr(expr, &mut |e| -> Result<WalkControl> {
+        if let Expr::Collate(_, seq) = e {
+            if found.is_none() {
+                found = Some(CollationSeq::new(seq.as_str()).unwrap_or_default());
+            }
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
+}
+
+fn comparison_collation(
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: Option<&TableReferences>,
+) -> Result<Option<CollationSeq>> {
+    if let Some(tables) = referenced_tables {
+        let lhs_collation = get_collseq_from_expr(lhs_expr, tables)?;
+        if lhs_collation.is_some() {
+            return Ok(lhs_collation);
+        }
+        return get_collseq_from_expr(rhs_expr, tables);
+    }
+
+    let lhs_collation = explicit_collation(lhs_expr)?;
+    if lhs_collation.is_some() {
+        return Ok(lhs_collation);
+    }
+    explicit_collation(rhs_expr)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3847,6 +4234,11 @@ pub fn as_binary_components(
                     | ast::Operator::IsNot
             ) =>
         {
+            // Row-valued binary comparisons are translated directly in expression codegen.
+            // They are not safe to expose as scalar binary constraints in optimizer paths.
+            if expr_vector_size(lhs)? > 1 || expr_vector_size(rhs)? > 1 {
+                return Ok(None);
+            }
             Ok(Some((lhs.as_ref(), (*operator).into(), rhs.as_ref())))
         }
         ast::Expr::Like { lhs, not, rhs, .. } => Ok(Some((
@@ -5068,6 +5460,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
                 crate::bail_parse_error!(
                     "all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})"
                 );
+            }
+            if evs_left > 1 && !supports_row_value_binary_comparison(operator) {
+                crate::bail_parse_error!("row value misused");
             }
             1
         }
