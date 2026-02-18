@@ -188,20 +188,11 @@ fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
             _ => false,
         }
     } else if ty.eq_ignore_ascii_case("REAL") {
-        match value {
-            Value::Numeric(Numeric::Float(_)) => true,
-            _ => false,
-        }
+        matches!(value, Value::Numeric(Numeric::Float(_)))
     } else if ty.eq_ignore_ascii_case("TEXT") {
-        match value {
-            Value::Text(_) => true,
-            _ => false,
-        }
+        matches!(value, Value::Text(_))
     } else if ty.eq_ignore_ascii_case("BLOB") {
-        match value {
-            Value::Blob(_) => true,
-            _ => false,
-        }
+        matches!(value, Value::Blob(_))
     } else {
         true
     };
