@@ -67,14 +67,23 @@ impl ResultSetColumn {
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
-                let joined_table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
-                if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
-                    if module.covered_columns.contains_key(column) {
-                        return None;
+                if let Some(joined_table_ref) = tables.find_joined_table_by_internal_id(*table) {
+                    if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
+                        if module.covered_columns.contains_key(column) {
+                            return None;
+                        }
                     }
+                    joined_table_ref
+                        .table
+                        .get_column_at(*column)
+                        .unwrap()
+                        .name
+                        .as_deref()
+                } else {
+                    // Column references an outer query table (correlated subquery).
+                    let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
+                    table_ref.get_column_at(*column).unwrap().name.as_deref()
                 }
-                let table_ref = &joined_table_ref.table;
-                table_ref.get_column_at(*column).unwrap().name.as_deref()
             }
             ast::Expr::RowId { table, .. } => {
                 // If there is a rowid alias column, use its name
