@@ -179,6 +179,15 @@ pub enum Property {
     FsyncNoWait {
         query: Query,
     },
+
+    /// CrashAfterWalSyncDoesNotLoseData simulates a power loss after the WAL has been
+    /// successfully synced and verifies that WAL-durable data can be recovered.
+    ///
+    /// this is intended for the simulator's in-memory IO backend only.
+    CrashAfterWalSyncDoesNotLoseData {
+        create: Create,
+        insert: Insert,
+    },
     FaultyQuery {
         query: Query,
     },
@@ -221,7 +230,9 @@ impl Property {
             | Property::DeleteSelect { queries, .. }
             | Property::DropSelect { queries, .. }
             | Property::Queries { queries } => Some(queries),
-            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
+            Property::FsyncNoWait { .. }
+            | Property::CrashAfterWalSyncDoesNotLoseData { .. }
+            | Property::FaultyQuery { .. } => None,
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }

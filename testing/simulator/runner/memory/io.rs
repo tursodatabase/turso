@@ -7,9 +7,9 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Completion, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant};
 
-use crate::runner::SimIO;
 use crate::runner::clock::SimulatorClock;
 use crate::runner::memory::file::MemorySimFile;
+use crate::runner::{DurableIOEvent, SimIO};
 
 /// File descriptor
 pub type Fd = String;
@@ -60,18 +60,30 @@ pub struct Operation {
 }
 
 impl Operation {
-    fn do_operation(self, files: &IndexMap<Fd, Arc<MemorySimFile>>) {
+    fn do_operation(
+        self,
+        files: &IndexMap<Fd, Arc<MemorySimFile>>,
+        durable_events: &RefCell<Vec<DurableIOEvent>>,
+    ) {
         let fd = self.fd;
         match self.op {
             OperationType::Read { completion, offset } => {
                 let file = files.get(fd.as_str()).unwrap();
-                let file_buf = file.buffer.borrow_mut();
+                let data = file.volatile_buffer.borrow();
+
                 let buffer = completion.as_read().buf.clone();
                 let buf_size = {
                     let buf = buffer.as_mut_slice();
                     // TODO: check for sector faults here
-
-                    buf.copy_from_slice(&file_buf[offset..][0..buf.len()]);
+                    let read_end = (offset + buf.len()).min(data.len());
+                    if offset < data.len() {
+                        let available = read_end - offset;
+                        buf[..available].copy_from_slice(&data[offset..read_end]);
+                        // Zero-fill any remaining buffer space
+                        buf[available..].fill(0);
+                    } else {
+                        buf.fill(0);
+                    }
                     buf.len() as i32
                 };
                 completion.complete(buf_size);
@@ -82,34 +94,40 @@ impl Operation {
                 offset,
             } => {
                 let file = files.get(fd.as_str()).unwrap();
-                let buf_size = file.write_buf(buffer.as_slice(), offset);
-                completion.complete(buf_size as i32);
+                file.apply_write_volatile(buffer.as_slice(), offset);
+                completion.complete(buffer.len() as i32);
             }
             OperationType::WriteV {
                 buffers,
                 completion,
                 offset,
             } => {
-                if buffers.is_empty() {
-                    return;
-                }
+                assert!(!buffers.is_empty(), "WriteV called with empty buffers");
                 let file = files.get(fd.as_str()).unwrap();
                 let mut pos = offset;
-                let written = buffers.into_iter().fold(0, |written, buffer| {
-                    let buf_size = file.write_buf(buffer.as_slice(), pos);
-                    pos += buf_size;
-                    written + buf_size
-                });
-                completion.complete(written as i32);
+                let mut total = 0;
+
+                for buffer in buffers {
+                    file.apply_write_volatile(buffer.as_slice(), pos);
+                    pos += buffer.len();
+                    total += buffer.len();
+                }
+
+                completion.complete(total as i32);
             }
             OperationType::Sync { completion, .. } => {
-                // There is no Sync for in memory
+                let file = files.get(fd.as_str()).unwrap();
+                let (prev_durable_size, new_durable_size) = file.flush_pending_to_durable();
+                durable_events.borrow_mut().push(DurableIOEvent::Sync {
+                    file_path: fd.to_string(),
+                    prev_durable_size,
+                    new_durable_size,
+                });
                 completion.complete(0);
             }
             OperationType::Truncate { completion, len } => {
                 let file = files.get(fd.as_str()).unwrap();
-                let mut file_buf = file.buffer.borrow_mut();
-                file_buf.truncate(len);
+                file.apply_truncate_volatile(len);
                 completion.complete(0);
             }
         }
@@ -128,6 +146,8 @@ pub struct MemorySimIO {
     seed: u64,
     latency_probability: u8,
     clock: Arc<SimulatorClock>,
+    /// Events are pushed on sync/truncate, consumed by take_durable_events
+    durable_events: RefCell<Vec<DurableIOEvent>>,
 }
 
 unsafe impl Send for MemorySimIO {}
@@ -156,6 +176,7 @@ impl MemorySimIO {
                 min_tick,
                 max_tick,
             )),
+            durable_events: RefCell::new(Vec::new()),
         }
     }
 }
@@ -198,14 +219,25 @@ impl SimIO for MemorySimIO {
     }
 
     fn persist_files(&self) -> anyhow::Result<()> {
-        let files = self.files.borrow();
-        for (file_path, file) in files.iter() {
-            if file_path.ends_with(".db") || file_path.ends_with("wal") || file_path.ends_with("lg")
-            {
-                std::fs::write(file_path, &*file.buffer.borrow())?;
+        for (path, file) in self.files.borrow().iter() {
+            if path.ends_with(".db") || path.ends_with("wal") || path.ends_with("lg") {
+                std::fs::write(path, &*file.durable_buffer.borrow())?;
             }
         }
         Ok(())
+    }
+
+    fn take_durable_events(&self) -> Vec<DurableIOEvent> {
+        self.durable_events.borrow_mut().drain(..).collect()
+    }
+
+    fn simulate_power_loss(&self) {
+        self.callbacks.lock().clear();
+        self.timeouts.lock().clear();
+
+        for file in self.files.borrow().values() {
+            file.power_loss();
+        }
     }
 }
 
@@ -271,7 +303,7 @@ impl IO for MemorySimIO {
                     completion.abort();
                     continue;
                 }
-                callback.do_operation(&files);
+                callback.do_operation(&files, &self.durable_events);
             } else {
                 timeouts.push(callback);
             }

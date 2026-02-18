@@ -102,8 +102,11 @@ pub(crate) fn execute_interactions(
         let mut last_execution = last_execution.lock().unwrap();
         last_execution.connection_index = connection_index;
         last_execution.interaction_index = state.interaction_pointer;
-        // Execute the interaction for the selected connection
-        match execute_plan(&mut env, &interaction, conn_state) {
+        // Execute the interaction for the selected connection.
+        let exec_result = execute_plan(&mut env, &interaction, conn_state);
+        env.update_durability();
+
+        match exec_result {
             Ok(ExecutionContinuation::NextInteraction) => {
                 state.interaction_pointer += 1;
                 let Some(new_interaction) = plan.next(&mut env) else {
@@ -127,10 +130,10 @@ pub(crate) fn execute_interactions(
                     }
                 }
             }
+            Ok(ExecutionContinuation::Stay) => {}
             Err(err) => {
                 return ExecutionResult::new(history, Some(err));
             }
-            _ => {}
         }
         // Check if the maximum time for the simulation has been reached
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
@@ -288,7 +291,7 @@ pub fn execute_interaction_turso(
 
             if let Err(err) = assumption_result {
                 tracing::warn!("assumption failed: {:?}", err);
-                return Err(err);
+                return Ok(ExecutionContinuation::NextInteractionOutsideThisProperty);
             }
         }
         InteractionType::Fault(_) => {
@@ -416,7 +419,7 @@ fn execute_interaction_rusqlite(
 
             if let Err(err) = assumption_result {
                 tracing::warn!("assumption failed: {:?}", err);
-                return Err(err);
+                return Ok(ExecutionContinuation::NextInteractionOutsideThisProperty);
             }
         }
         InteractionType::Fault(_) => {

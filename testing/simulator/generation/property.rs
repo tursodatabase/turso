@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::SimValue,
+        table::{Column, ColumnType, SimValue, Table as GenTable},
     },
 };
 use strum::IntoEnumIterator;
@@ -32,11 +32,12 @@ use crate::{
     model::{
         Query, QueryCapabilities, QueryDiscriminants, ResultSet,
         interactions::{
-            Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
+            Assertion, Fault, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
         metrics::Remaining,
         property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
     },
+    runner::cli::IoBackend,
     runner::env::SimulatorEnv,
 };
 
@@ -230,7 +231,9 @@ impl Property {
             Property::Queries { .. } => {
                 unreachable!("No extensional querie generation for `Property::Queries`")
             }
-            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {
+            Property::FsyncNoWait { .. }
+            | Property::CrashAfterWalSyncDoesNotLoseData { .. }
+            | Property::FaultyQuery { .. } => {
                 unreachable!("No extensional queries")
             }
             Property::SelectLimit { .. }
@@ -928,6 +931,51 @@ impl Property {
                     InteractionType::FsyncQuery(query.clone()),
                 )]
             }
+            Property::CrashAfterWalSyncDoesNotLoseData { create, insert } => {
+                let table_name = insert.table().to_string();
+                let table_dependency = table_name.clone();
+                let table_name_in_closure = table_name.clone();
+                let expected_row = vec![SimValue(types::Value::Integer(1))];
+                let assumption = InteractionType::Assumption(Assertion::new(
+                    format!("wal is durable for table {table_name}"),
+                    move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        let wal_table = env
+                            .durability
+                            .wal_durable
+                            .iter()
+                            .find(|t| t.name == table_name_in_closure);
+                        match wal_table {
+                            Some(t) if t.rows.contains(&expected_row) => Ok(Ok(())),
+                            Some(_) => Ok(Err(
+                                "wal durable state does not include the expected row".into(),
+                            )),
+                            None => Ok(Err(
+                                "wal durable state does not include the expected table".into(),
+                            )),
+                        }
+                    },
+                    vec![table_dependency],
+                ));
+
+                vec![
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Create(
+                        create.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Begin(
+                        Begin::Immediate,
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Insert(
+                        insert.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Commit(
+                        Commit,
+                    ))),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(InteractionType::Fault(
+                        Fault::PowerLossRecoverAndVerify,
+                    )),
+                ]
+            }
             Property::FaultyQuery { query } => {
                 let query_clone = query.clone();
                 // A fault may not occur as we first signal we want a fault injected,
@@ -1578,6 +1626,40 @@ fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_crash_after_wal_sync_does_not_lose_data<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let mut table_name;
+    loop {
+        table_name = format!("crash_wal_{}", rng.random_range(0..u32::MAX));
+        if !ctx.tables().iter().any(|t| t.name == table_name) {
+            break;
+        }
+    }
+
+    let table = GenTable {
+        name: table_name.clone(),
+        columns: vec![Column {
+            name: "x".to_string(),
+            column_type: ColumnType::Integer,
+            constraints: Vec::new(),
+        }],
+        rows: Vec::new(),
+        indexes: Vec::new(),
+    };
+
+    let create = Create { table };
+    let insert = Insert::Values {
+        table: table_name,
+        values: vec![vec![SimValue(types::Value::Integer(1))]],
+    };
+
+    Property::CrashAfterWalSyncDoesNotLoseData { create, insert }
+}
+
 fn property_faulty_query<R: rand::Rng + ?Sized>(
     rng: &mut R,
     query_distr: &QueryDistribution,
@@ -1614,6 +1696,9 @@ impl PropertyDiscriminants {
                 property_union_all_preserves_cardinality
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
+            PropertyDiscriminants::CrashAfterWalSyncDoesNotLoseData => {
+                property_crash_after_wal_sync_does_not_lose_data
+            }
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
@@ -1710,6 +1795,17 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::CrashAfterWalSyncDoesNotLoseData => {
+                if env.profile.experimental_mvcc
+                    || !env.profile.io.enable
+                    || env.io_backend != IoBackend::Memory
+                    || env.opts.disable_crash_after_wal_sync
+                {
+                    0
+                } else {
+                    1
+                }
+            }
             PropertyDiscriminants::FaultyQuery => {
                 if env.profile.io.enable
                     && env.profile.io.fault.enable
@@ -1759,6 +1855,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::WhereTrueFalseNull => QueryCapabilities::SELECT,
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
+            PropertyDiscriminants::CrashAfterWalSyncDoesNotLoseData => {
+                QueryCapabilities::CREATE.union(QueryCapabilities::INSERT)
+            }
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }

@@ -143,6 +143,12 @@ pub struct SimulatorCLI {
     pub disable_union_all_preserves_cardinality: bool,
     #[clap(long, help = "disable FsyncNoWait Property", default_value_t = true)]
     pub disable_fsync_no_wait: bool,
+    #[clap(
+        long,
+        help = "disable CrashAfterWalSyncDoesNotLoseData Property",
+        default_value_t = false
+    )]
+    pub disable_crash_after_wal_sync: bool,
     #[clap(long, help = "disable FaultyQuery Property")]
     pub disable_faulty_query: bool,
     #[clap(long, help = "disable Reopen-Database fault")]

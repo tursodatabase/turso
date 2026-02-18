@@ -1270,7 +1270,13 @@ enum AllocatePageState {
 #[derive(Clone)]
 enum AllocatePage1State {
     Start,
-    Writing { page: PageRef },
+    Writing {
+        page: PageRef,
+    },
+    Syncing {
+        page: PageRef,
+        completion: Completion,
+    },
     Done,
 }
 
@@ -1432,6 +1438,18 @@ impl Pager {
 
     pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
         self.init_page_1.clone()
+    }
+
+    /// Begin syncing the main database file to disk.
+    ///
+    /// This is used for durability invariants where we must ensure the DB file
+    /// is durable before proceeding (e.g. after writing page 1 during initialization).
+    fn begin_sync_db_file(&self) -> Result<Completion> {
+        sqlite3_ondisk::begin_sync(
+            self.db_file.as_ref(),
+            self.syncing.clone(),
+            self.get_sync_type(),
+        )
     }
 
     /// Read page 1 (the database header page) using the header_ref_state state machine.
@@ -4093,7 +4111,34 @@ impl Pager {
             }
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
-                tracing::trace!("allocate_page1(Writing done)");
+                tracing::trace!("allocate_page1(Writing done, starting sync)");
+                let c = match self.begin_sync_db_file() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        page.unpin();
+                        *self.allocate_page1_state.write() = AllocatePage1State::Done;
+                        return Err(e);
+                    }
+                };
+                *self.allocate_page1_state.write() = AllocatePage1State::Syncing {
+                    page,
+                    completion: c.clone(),
+                };
+                io_yield_one!(c);
+            }
+            AllocatePage1State::Syncing { page, completion } => {
+                if !completion.finished() {
+                    io_yield_one!(completion);
+                }
+                if !completion.succeeded() {
+                    let err = completion
+                        .get_error()
+                        .expect("failed completion must have an error");
+                    page.unpin();
+                    *self.allocate_page1_state.write() = AllocatePage1State::Done;
+                    return Err(err.into());
+                }
+                tracing::trace!("allocate_page1(Syncing done)");
                 let page_key = PageCacheKey::new(page.get().id);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page.clone()).map_err(|e| {
@@ -4112,7 +4157,7 @@ impl Pager {
     pub fn allocating_page1(&self) -> bool {
         matches!(
             *self.allocate_page1_state.read(),
-            AllocatePage1State::Writing { .. }
+            AllocatePage1State::Writing { .. } | AllocatePage1State::Syncing { .. }
         )
     }
 
