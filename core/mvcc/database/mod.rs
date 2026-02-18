@@ -3211,16 +3211,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
-        // Do NOT remove the transaction from `txs` here. register_commit_dependency
-        // treats txs.get() == None as "already committed," so removing an aborted tx
-        // would let a speculative reader skip the abort_now flag and commit after
-        // reading data from a rolled-back transaction. The tx stays with
-        // state=Terminated so the Aborted/Terminated match arm fires correctly.
-        // TODO: GC terminated transactions once no active tx can reference them.
-        //
-        // We still must release the blocking_checkpoint_lock so checkpoints aren't
-        // permanently blocked by the aborted transaction.
-        self.blocking_checkpoint_lock.unlock();
+        // Safe to remove here: rollback_rowid (above) acquired the write lock on
+        // every row version chain in the write set, clearing all TxID references.
+        // Any concurrent reader that held a read lock on one of those chains has
+        // already completed its register_commit_dependency call (it runs under the
+        // read lock), so no future txs.get() for this tx_id can come from a
+        // speculative read path.
+        self.remove_tx(tx_id);
     }
 
     fn rollback_rowid(&self, tx_id: u64, rowid: &RowID) {
