@@ -394,6 +394,7 @@ expect {
 @requires strict "uses STRICT tables"
 test strict-alter-add-column-default-integer-fractional {
     CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
     ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 3.14;
 }
 expect error {
@@ -403,6 +404,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test strict-alter-add-column-default-real-nonnumeric {
     CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
     ALTER TABLE t ADD COLUMN b REAL DEFAULT 'abc';
 }
 expect error {
@@ -412,6 +414,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test strict-alter-add-column-default-text-blob {
     CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
     ALTER TABLE t ADD COLUMN b TEXT DEFAULT X'CAFE';
 }
 expect error {
@@ -421,10 +424,21 @@ expect error {
 @requires strict "uses STRICT tables"
 test strict-alter-add-column-default-blob-text {
     CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
     ALTER TABLE t ADD COLUMN b BLOB DEFAULT 'abc';
 }
 expect error {
     type mismatch on DEFAULT
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-mismatch-empty-table {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 3.14;
+    INSERT INTO t(a) VALUES (1);
+}
+expect error {
+    cannot store REAL value in INTEGER column t.b
 }
 
 test alter-add-column-invalid-collation {

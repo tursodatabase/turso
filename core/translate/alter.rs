@@ -160,61 +160,79 @@ fn apply_affinity_to_value(value: &mut Value, affinity: Affinity) {
     }
 }
 
-fn validate_strict_default_type(column: &Column) -> Result<()> {
+fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
     let Some(default_expr) = column.default.as_ref() else {
-        return Ok(());
+        return Ok(false);
     };
 
     let mut value = eval_constant_default_value(default_expr)?;
     if matches!(value, Value::Null) {
-        return Ok(());
+        return Ok(false);
     }
 
     apply_affinity_to_value(&mut value, column.affinity());
 
     let ty = column.ty_str.as_str();
     if ty.eq_ignore_ascii_case("ANY") {
-        return Ok(());
-    }
-
-    let mismatch = || {
-        Err(LimboError::ParseError(
-            "type mismatch on DEFAULT".to_string(),
-        ))
+        return Ok(false);
     };
 
-    if ty.eq_ignore_ascii_case("INT") || ty.eq_ignore_ascii_case("INTEGER") {
+    let ok = if ty.eq_ignore_ascii_case("INT") || ty.eq_ignore_ascii_case("INTEGER") {
         match value {
-            Value::Numeric(Numeric::Integer(_)) => Ok(()),
+            Value::Numeric(Numeric::Integer(_)) => true,
             Value::Numeric(Numeric::Float(f)) => {
                 let f = f64::from(f);
                 let i = f as i64;
-                if (i as f64) == f {
-                    Ok(())
-                } else {
-                    mismatch()
-                }
+                (i as f64) == f
             }
-            _ => mismatch(),
+            _ => false,
         }
     } else if ty.eq_ignore_ascii_case("REAL") {
         match value {
-            Value::Numeric(Numeric::Float(_)) => Ok(()),
-            _ => mismatch(),
+            Value::Numeric(Numeric::Float(_)) => true,
+            _ => false,
         }
     } else if ty.eq_ignore_ascii_case("TEXT") {
         match value {
-            Value::Text(_) => Ok(()),
-            _ => mismatch(),
+            Value::Text(_) => true,
+            _ => false,
         }
     } else if ty.eq_ignore_ascii_case("BLOB") {
         match value {
-            Value::Blob(_) => Ok(()),
-            _ => mismatch(),
+            Value::Blob(_) => true,
+            _ => false,
         }
     } else {
-        Ok(())
-    }
+        true
+    };
+
+    Ok(!ok)
+}
+
+fn emit_add_column_default_type_validation(
+    program: &mut ProgramBuilder,
+    original_btree: &Arc<crate::schema::BTreeTable>,
+) -> Result<()> {
+    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: check_cursor_id,
+        root_page: original_btree.root_page,
+        db: 0,
+    });
+
+    let skip_check_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: check_cursor_id,
+        pc_if_empty: skip_check_label,
+    });
+
+    program.emit_insn(Insn::Halt {
+        err_code: 1,
+        description: "type mismatch on DEFAULT".to_string(),
+    });
+
+    program.resolve_label(skip_check_label, program.offset());
+    Ok(())
 }
 
 /// Validate CHECK constraints on a newly added column against the column's DEFAULT value.
@@ -681,6 +699,7 @@ pub fn translate_alter_table(
                 ));
             }
 
+            let mut default_type_mismatch = false;
             if btree.is_strict {
                 let ty = column.ty_str.as_str();
                 if ty.is_empty() {
@@ -700,7 +719,7 @@ pub fn translate_alter_table(
                     )));
                 }
 
-                validate_strict_default_type(&column)?;
+                default_type_mismatch = strict_default_type_mismatch(&column)?;
             }
 
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
@@ -857,6 +876,10 @@ pub fn translate_alter_table(
                 });
 
                 program.resolve_label(skip_error_label, program.offset());
+            }
+
+            if default_type_mismatch {
+                emit_add_column_default_type_validation(&mut program, &original_btree)?;
             }
 
             // Validate CHECK constraints against the DEFAULT value for existing rows.
