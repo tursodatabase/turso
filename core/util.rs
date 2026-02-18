@@ -1376,6 +1376,222 @@ impl ViewColumnSchema {
     }
 }
 
+/// Walk all expressions in a SELECT statement, including subqueries.
+pub fn walk_select_expressions<F>(select: &ast::Select, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    walk_select_expressions_inner(select, func)
+}
+
+pub fn validate_aggregate_function_tail(
+    filter_over: &ast::FunctionTail,
+    order_by: &[ast::SortedColumn],
+) -> Result<()> {
+    if filter_over.filter_clause.is_some() {
+        crate::bail_parse_error!("FILTER clause is not supported yet in aggregate functions");
+    }
+
+    if !order_by.is_empty() {
+        crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
+    }
+
+    Ok(())
+}
+
+fn walk_select_expressions_inner<F>(select: &ast::Select, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    if let Some(with_clause) = &select.with {
+        for cte in &with_clause.ctes {
+            walk_select_expressions_inner(&cte.select, func)?;
+        }
+    }
+
+    walk_one_select_expressions(&select.body.select, func)?;
+    for compound in &select.body.compounds {
+        walk_one_select_expressions(&compound.select, func)?;
+    }
+
+    for sorted_col in &select.order_by {
+        walk_expr_with_subqueries(&sorted_col.expr, func)?;
+    }
+
+    if let Some(limit) = &select.limit {
+        walk_expr_with_subqueries(&limit.expr, func)?;
+        if let Some(offset) = &limit.offset {
+            walk_expr_with_subqueries(offset, func)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_one_select_expressions<F>(one_select: &ast::OneSelect, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+            ..
+        } => {
+            for col in columns {
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    walk_expr_with_subqueries(expr, func)?;
+                }
+            }
+
+            if let Some(from_clause) = from {
+                walk_from_clause_expressions(from_clause, func)?;
+            }
+
+            if let Some(where_expr) = where_clause {
+                walk_expr_with_subqueries(where_expr, func)?;
+            }
+
+            if let Some(group_by) = group_by {
+                for expr in &group_by.exprs {
+                    walk_expr_with_subqueries(expr, func)?;
+                }
+                if let Some(having_expr) = &group_by.having {
+                    walk_expr_with_subqueries(having_expr, func)?;
+                }
+            }
+
+            for window_def in window_clause {
+                walk_window_expressions(&window_def.window, func)?;
+            }
+        }
+        ast::OneSelect::Values(values) => {
+            for row in values {
+                for expr in row {
+                    walk_expr_with_subqueries(expr, func)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_from_clause_expressions<F>(from_clause: &ast::FromClause, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    walk_select_table_expressions(&from_clause.select, func)?;
+
+    for join in &from_clause.joins {
+        walk_select_table_expressions(&join.table, func)?;
+
+        if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+            walk_expr_with_subqueries(expr, func)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_select_table_expressions<F>(select_table: &ast::SelectTable, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    match select_table {
+        ast::SelectTable::Select(select, _) => walk_select_expressions_inner(select, func),
+        ast::SelectTable::Sub(from_clause, _) => walk_from_clause_expressions(from_clause, func),
+        ast::SelectTable::TableCall(_, args, _) => {
+            for arg in args {
+                walk_expr_with_subqueries(arg, func)?;
+            }
+            Ok(())
+        }
+        ast::SelectTable::Table(_, _, _) => Ok(()),
+    }
+}
+
+fn walk_window_expressions<F>(window: &ast::Window, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    for expr in &window.partition_by {
+        walk_expr_with_subqueries(expr, func)?;
+    }
+
+    for sorted_col in &window.order_by {
+        walk_expr_with_subqueries(&sorted_col.expr, func)?;
+    }
+
+    if let Some(frame_clause) = &window.frame_clause {
+        walk_frame_bound_expressions(&frame_clause.start, func)?;
+        if let Some(end_bound) = &frame_clause.end {
+            walk_frame_bound_expressions(end_bound, func)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_frame_bound_expressions<F>(bound: &ast::FrameBound, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    match bound {
+        ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
+            walk_expr_with_subqueries(expr, func)
+        }
+        ast::FrameBound::CurrentRow
+        | ast::FrameBound::UnboundedFollowing
+        | ast::FrameBound::UnboundedPreceding => Ok(()),
+    }
+}
+
+fn walk_expr_with_subqueries<F>(expr: &ast::Expr, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    walk_expr(expr, &mut |e| {
+        let control = func(e)?;
+        if matches!(control, WalkControl::Continue) {
+            match e {
+                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                    walk_select_expressions_inner(select, func)?;
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    walk_select_expressions_inner(rhs, func)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(control)
+    })?;
+    Ok(())
+}
+
+pub fn validate_select_for_unsupported_features(select_stmt: &ast::Select) -> Result<()> {
+    walk_select_expressions(select_stmt, &mut |expr| {
+        match expr {
+            ast::Expr::FunctionCall {
+                filter_over,
+                order_by,
+                ..
+            } => {
+                validate_aggregate_function_tail(filter_over, order_by)?;
+            }
+            ast::Expr::FunctionCallStar { filter_over, .. } => {
+                validate_aggregate_function_tail(filter_over, &[])?;
+            }
+            _ => {}
+        }
+
+        Ok(WalkControl::Continue)
+    })
+}
+
 /// Extract column information from a SELECT statement for view creation
 pub fn extract_view_columns(
     select_stmt: &ast::Select,

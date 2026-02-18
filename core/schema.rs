@@ -1127,6 +1127,8 @@ impl Schema {
                             select,
                             ..
                         } => {
+                            crate::util::validate_select_for_unsupported_features(&select)?;
+
                             // Extract actual columns from the SELECT statement
                             let view_column_schema =
                                 crate::util::extract_view_columns(&select, self)?;
