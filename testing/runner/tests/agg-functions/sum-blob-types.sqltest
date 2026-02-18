@@ -65,3 +65,15 @@ expect {
 expect @js {
     real|48
 }
+
+test sum-cast-text-to-blob-returns-real {
+    CREATE TABLE t6 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t6 VALUES (1, '10'), (2, '20'), (3, '30');
+    SELECT typeof(SUM(CAST(val AS BLOB))), SUM(CAST(val AS BLOB)) FROM t6;
+}
+expect {
+    real|60.0
+}
+expect @js {
+    real|60
+}

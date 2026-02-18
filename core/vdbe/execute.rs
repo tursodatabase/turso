@@ -4067,11 +4067,11 @@ fn update_agg_payload(
                 },
                 Value::Text(t) => {
                     let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
-                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
+                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, false);
                 }
                 Value::Blob(b) => {
                     let (parse_result, parsed_number) = try_for_float(&b);
-                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
+                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, true);
                 }
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
@@ -10863,10 +10863,12 @@ fn handle_text_sum(
     sum_state: &mut SumAggState,
     parsed_number: ParsedNumber,
     parse_result: NumericParseResult,
+    force_approx: bool,
 ) {
     // SQLite treats text that only partially parses as numeric (ValidPrefixOnly)
-    // as approximate, so SUM returns real instead of integer.
-    let is_approx = matches!(parse_result, NumericParseResult::ValidPrefixOnly);
+    // as approximate, so SUM returns real instead of integer. Non-integer inputs
+    // (e.g. BLOB) should also force approximate results.
+    let is_approx = force_approx || matches!(parse_result, NumericParseResult::ValidPrefixOnly);
     match parsed_number {
         ParsedNumber::Integer(i) => {
             if is_approx {
