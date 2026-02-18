@@ -113,51 +113,118 @@ impl Constraint {
 
         let (idx, side) = self.where_clause_pos;
         let where_term = &where_clause[idx];
-        let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) else {
-            panic!("Expected a valid binary expression");
-        };
-        let mut affinity = Affinity::Blob;
-        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) && self.table_col_pos.is_some()
-        {
-            affinity = comparison_affinity(lhs, rhs, referenced_tables, None);
-        }
+        if let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) {
+            let mut affinity = Affinity::Blob;
+            if op.as_ast_operator().is_some_and(|op| op.is_comparison())
+                && self.table_col_pos.is_some()
+            {
+                affinity = comparison_affinity(lhs, rhs, referenced_tables, None);
+            }
 
-        if side == BinaryExprSide::Lhs {
-            if affinity.expr_needs_no_affinity_change(lhs) {
-                affinity = Affinity::Blob;
+            if side == BinaryExprSide::Lhs {
+                if affinity.expr_needs_no_affinity_change(lhs) {
+                    affinity = Affinity::Blob;
+                }
+                (
+                    self.operator.as_ast_operator().expect(
+                        "expected an ast operator because as_binary_components returned Some",
+                    ),
+                    lhs.clone(),
+                    affinity,
+                )
+            } else {
+                if affinity.expr_needs_no_affinity_change(rhs) {
+                    affinity = Affinity::Blob;
+                }
+                (
+                    self.operator.as_ast_operator().expect(
+                        "expected an ast operator because as_binary_components returned Some",
+                    ),
+                    rhs.clone(),
+                    affinity,
+                )
             }
-            (
-                self.operator
+        } else if let ast::Expr::Between { lhs, .. } = &where_term.expr {
+            let Some(op) = self.operator.as_ast_operator() else {
+                panic!("Expected comparison operator for BETWEEN constraint");
+            };
+            let original_op = if side == BinaryExprSide::Lhs {
+                opposite_cmp_op(self.operator)
                     .as_ast_operator()
-                    .expect("expected an ast operator because as_binary_components returned Some"),
-                lhs.clone(),
-                affinity,
-            )
+                    .expect("Expected comparison operator for BETWEEN constraint")
+            } else {
+                op
+            };
+            let bound_expr = between_bound_expr(&where_term.expr, original_op)
+                .expect("Expected BETWEEN constraint bound");
+            let mut affinity = Affinity::Blob;
+            if op.is_comparison() && self.table_col_pos.is_some() {
+                affinity = comparison_affinity(lhs, bound_expr, referenced_tables, None);
+            }
+            if side == BinaryExprSide::Lhs {
+                if affinity.expr_needs_no_affinity_change(lhs) {
+                    affinity = Affinity::Blob;
+                }
+                (op, lhs.as_ref().clone(), affinity)
+            } else {
+                if affinity.expr_needs_no_affinity_change(bound_expr) {
+                    affinity = Affinity::Blob;
+                }
+                (op, bound_expr.clone(), affinity)
+            }
         } else {
-            if affinity.expr_needs_no_affinity_change(rhs) {
-                affinity = Affinity::Blob;
-            }
-            (
-                self.operator
-                    .as_ast_operator()
-                    .expect("expected an ast operator because as_binary_components returned Some"),
-                rhs.clone(),
-                affinity,
-            )
+            panic!("Expected binary or BETWEEN constraint expression");
         }
     }
 
     pub fn get_constraining_expr_ref<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
         let (idx, side) = self.where_clause_pos;
         let where_term = &where_clause[idx];
-        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
-            panic!("Expected a valid binary expression");
-        };
-        if side == BinaryExprSide::Lhs {
-            lhs
+        if let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) {
+            if side == BinaryExprSide::Lhs {
+                lhs
+            } else {
+                rhs
+            }
+        } else if let Some(op) = self.operator.as_ast_operator() {
+            between_bound_for_constraint(&where_term.expr, op, side)
+                .expect("Expected binary or BETWEEN constraint expression")
         } else {
-            rhs
+            panic!("Expected binary or BETWEEN constraint expression");
         }
+    }
+}
+
+fn between_bound_for_constraint(
+    expr: &ast::Expr,
+    operator: ast::Operator,
+    side: BinaryExprSide,
+) -> Option<&ast::Expr> {
+    let ast::Expr::Between { lhs, start, end, .. } = expr else {
+        return None;
+    };
+    if side == BinaryExprSide::Lhs {
+        return Some(lhs.as_ref());
+    }
+    between_bound_expr_inner(operator, start, end)
+}
+
+fn between_bound_expr(expr: &ast::Expr, operator: ast::Operator) -> Option<&ast::Expr> {
+    let ast::Expr::Between { start, end, .. } = expr else {
+        return None;
+    };
+    between_bound_expr_inner(operator, start, end)
+}
+
+fn between_bound_expr_inner(
+    operator: ast::Operator,
+    start: &ast::Expr,
+    end: &ast::Expr,
+) -> Option<&ast::Expr> {
+    match operator {
+        ast::Operator::Greater | ast::Operator::GreaterEquals => Some(start),
+        ast::Operator::Less | ast::Operator::LessEquals => Some(end),
+        _ => None,
     }
 }
 
@@ -689,8 +756,10 @@ pub fn constraints_from_where_clause(
                 }
             }
 
-            // Try to extract as binary expression first
-            if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
+            let mut add_constraints_for_binary = |lhs: &ast::Expr,
+                                                  operator: ConstraintOperator,
+                                                  rhs: &ast::Expr|
+             -> Result<()> {
                 // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
                 match lhs {
                     ast::Expr::Column { table, column, .. } => {
@@ -898,6 +967,25 @@ pub fn constraints_from_where_clause(
                     }
                     _ => {}
                 };
+                Ok(())
+            };
+
+            if let ast::Expr::Between {
+                lhs,
+                not,
+                start,
+                end,
+            } = &term.expr
+            {
+                if !*not {
+                    add_constraints_for_binary(lhs, ast::Operator::GreaterEquals.into(), start)?;
+                    add_constraints_for_binary(lhs, ast::Operator::LessEquals.into(), end)?;
+                }
+            }
+
+            // Try to extract as binary expression first
+            if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
+                add_constraints_for_binary(lhs, operator, rhs)?;
             }
 
             // IN expressions are handled separately from binary expressions above because:

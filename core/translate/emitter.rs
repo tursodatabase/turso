@@ -37,9 +37,8 @@ use crate::schema::{
 };
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, rewrite_between_expr,
-    translate_expr_no_constant_opt, walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason,
-    WalkControl,
+    bind_and_rewrite_expr, emit_returning_results, translate_expr_no_constant_opt, walk_expr,
+    walk_expr_mut, BindingBehavior, NoConstantOptReason, WalkControl,
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters, emit_fk_update_parent_actions,
@@ -4834,7 +4833,6 @@ fn rewrite_where_for_update_registers(
     columns_start_reg: usize,
     rowid_reg: usize,
 ) -> Result<WalkControl> {
-    rewrite_between_expr(expr);
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         match e {
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
@@ -4971,7 +4969,6 @@ fn emit_check_constraint_bytecode(
         let expr_result_reg = program.alloc_register();
 
         let mut rewritten_expr = check_constraint.expr.clone();
-        rewrite_between_expr(&mut rewritten_expr);
         if let Some(referenced_tables) = referenced_tables {
             let mut binding_tables = referenced_tables.clone();
             if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {

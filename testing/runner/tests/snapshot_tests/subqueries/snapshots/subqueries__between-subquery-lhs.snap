@@ -1,0 +1,49 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT id
+      FROM products
+      WHERE (SELECT max(id) FROM products) BETWEEN 1 AND 3;
+info:
+  statement_type: SELECT
+  tables:
+  - products
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN products
+`--SCAN products
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4              p5  comment
+   0    Init          0  25   0                   0  Start at 25
+   1    Once         16   0   0                   0  goto 16
+   2    BeginSubrtn   2   0   0                   0  r[2]=NULL
+   3    Null          0   1   0                   0  r[1]=NULL
+   4    Null          0   4   0                   0  r[4]=NULL
+   5    Integer       1   5   0                   0  r[5]=1; LIMIT counter
+   6    IfNot         5  12   0                   0  if !r[5] goto 12
+   7    OpenRead      0   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   8    Rewind        0  12   0                   0  Rewind table products
+   9      RowId       0   6   0                   0  r[6]=products.rowid
+  10      AggStep     0   6   4  max              0  accum=r[4] step(r[6])
+  11    Next          0   9   0                   0
+  12    AggFinal      0   4   0  max              0  accum=r[4]
+  13    Copy          4   3   0                   0  r[3]=r[4]
+  14    Copy          3   1   0                   0  r[1]=r[3]
+  15  Return          2   0   1                   0
+  16  OpenRead        1   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  17  Copy            1   8   0                   0  r[8]=r[1]
+  18  Gt              9   8  24  Binary           0  if r[9]>r[8] goto 24
+  19  Gt              8  10  24  Binary           0  if r[8]>r[10] goto 24
+  20  Rewind          1  24   0                   0  Rewind table products
+  21    RowId         1   7   0                   0  r[7]=products.rowid
+  22    ResultRow     7   1   0                   0  output=r[7]
+  23  Next            1  21   0                   0
+  24  Halt            0   0   0                   0
+  25  Transaction     0   1  11                   0  iDb=0 tx_mode=Read
+  26  Integer         1   9   0                   0  r[9]=1
+  27  Integer         3  10   0                   0  r[10]=3
+  28  Goto            0   1   0                   0

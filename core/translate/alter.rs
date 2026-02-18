@@ -11,7 +11,7 @@ use crate::{
     schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::Resolver,
-        expr::{rewrite_between_expr, translate_expr, walk_expr, walk_expr_mut, WalkControl},
+        expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
     util::{check_expr_references_column, normalize_ident, parse_numeric_literal},
@@ -289,7 +289,6 @@ fn emit_add_column_check_validation(
     // Table has rows -- evaluate each CHECK constraint with the default value substituted.
     for (constraint_name, check_expr) in &check_exprs {
         let mut substituted = (*check_expr).clone();
-        rewrite_between_expr(&mut substituted);
 
         // Replace references to the new column with the default value expression.
         let _ = walk_expr_mut(

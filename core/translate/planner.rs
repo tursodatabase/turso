@@ -1285,9 +1285,8 @@ pub fn parse_where(
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
-        // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
-        // Re-break any ANDs that were created so they become separate WhereTerms for
-        // constraint extraction.
+        // Re-break any ANDs that were created during binding so they become separate
+        // WhereTerms for constraint extraction.
         let mut i = start_idx;
         while i < out_where_clause.len() {
             if matches!(

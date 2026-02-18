@@ -71,6 +71,14 @@ snapshot scalar-subquery-max-price {
     WHERE price > 100;
 }
 
+# Scalar subquery in BETWEEN LHS should be evaluated once
+@setup schema
+snapshot between-subquery-lhs {
+    SELECT id
+    FROM products
+    WHERE (SELECT max(id) FROM products) BETWEEN 1 AND 3;
+}
+
 # Scalar subquery with different table
 @setup schema
 snapshot scalar-subquery-cross-table {

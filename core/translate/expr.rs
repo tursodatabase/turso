@@ -17,7 +17,7 @@ use crate::schema::{Table, Type};
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
 };
-use crate::translate::optimizer::TakeOwnership;
+
 use crate::translate::plan::{Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
@@ -435,8 +435,119 @@ pub fn translate_condition_expr(
         ast::Expr::Raise(_, _) => {
             crate::bail_parse_error!("RAISE in WHERE clause is not supported");
         }
-        ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
+        ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            // Evaluate LHS once into a register, then reuse it for both comparisons.
+            // We keep the original `lhs` expression reference for affinity/collation
+            // computation, since Expr::Register would lose that information.
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
+            let lhs_collation_ctx = program.curr_collation_ctx();
+            program.reset_collation();
+
+            // Evaluate start into a register.
+            let start_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), start, start_reg, resolver)?;
+            let start_collation_ctx = program.curr_collation_ctx();
+            program.reset_collation();
+
+            // Resolve collation for the first comparison (start vs lhs).
+            let lower_collation_ctx = resolve_collation_ctx(start_collation_ctx, lhs_collation_ctx);
+            program.set_collation(lower_collation_ctx);
+
+            if *not {
+                // NOT BETWEEN: start > lhs OR lhs > end
+                // OR short-circuit: if first comparison is true, jump to true label.
+                let jump_target_when_false = program.allocate_label();
+                emit_binary_condition_insn(
+                    program,
+                    &ast::Operator::Greater,
+                    start_reg,
+                    lhs_reg,
+                    0, // target_register unused for condition insn
+                    start,
+                    lhs,
+                    Some(referenced_tables),
+                    Some(ConditionMetadata {
+                        jump_if_condition_is_true: true,
+                        jump_target_when_false,
+                        jump_target_when_null: jump_target_when_false,
+                        ..condition_metadata
+                    }),
+                )?;
+                program.reset_collation();
+                program.preassign_label_to_next_insn(jump_target_when_false);
+
+                // Evaluate end into a register.
+                let end_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), end, end_reg, resolver)?;
+                let end_collation_ctx = program.curr_collation_ctx();
+                program.reset_collation();
+
+                // Resolve collation for the second comparison (lhs vs end).
+                let upper_collation_ctx =
+                    resolve_collation_ctx(lhs_collation_ctx, end_collation_ctx);
+                program.set_collation(upper_collation_ctx);
+
+                emit_binary_condition_insn(
+                    program,
+                    &ast::Operator::Greater,
+                    lhs_reg,
+                    end_reg,
+                    0, // target_register unused for condition insn
+                    lhs,
+                    end,
+                    Some(referenced_tables),
+                    Some(condition_metadata),
+                )?;
+                program.reset_collation();
+            } else {
+                // BETWEEN: start <= lhs AND lhs <= end
+                // AND short-circuit: if first comparison is false, jump to false label.
+                emit_binary_condition_insn(
+                    program,
+                    &ast::Operator::LessEquals,
+                    start_reg,
+                    lhs_reg,
+                    0, // target_register unused for condition insn
+                    start,
+                    lhs,
+                    Some(referenced_tables),
+                    Some(ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        ..condition_metadata
+                    }),
+                )?;
+                program.reset_collation();
+
+                // Evaluate end into a register.
+                let end_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), end, end_reg, resolver)?;
+                let end_collation_ctx = program.curr_collation_ctx();
+                program.reset_collation();
+
+                // Resolve collation for the second comparison (lhs vs end).
+                let upper_collation_ctx =
+                    resolve_collation_ctx(lhs_collation_ctx, end_collation_ctx);
+                program.set_collation(upper_collation_ctx);
+
+                emit_binary_condition_insn(
+                    program,
+                    &ast::Operator::LessEquals,
+                    lhs_reg,
+                    end_reg,
+                    0, // target_register unused for condition insn
+                    lhs,
+                    end,
+                    Some(referenced_tables),
+                    Some(condition_metadata),
+                )?;
+                program.reset_collation();
+            }
         }
         ast::Expr::Variable(_) => {
             crate::bail_parse_error!(
@@ -977,8 +1088,117 @@ pub fn translate_expr(
                 }
             }
         }
-        ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
+        ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            // Evaluate LHS once into a register, then reuse for both comparisons.
+            // We keep the original `lhs` expression reference for affinity/collation
+            // computation, since Expr::Register would lose that information.
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+            let lhs_collation_ctx = program.curr_collation_ctx();
+            program.reset_collation();
+
+            // Evaluate start into a register.
+            let start_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, start, start_reg, resolver)?;
+            let start_collation_ctx = program.curr_collation_ctx();
+            program.reset_collation();
+
+            // Resolve collation for the first comparison (start vs lhs).
+            let lower_collation_ctx = resolve_collation_ctx(start_collation_ctx, lhs_collation_ctx);
+            program.set_collation(lower_collation_ctx);
+
+            // Emit the first comparison into a temp register.
+            let lower_reg = program.alloc_register();
+            if *not {
+                // NOT BETWEEN: start > lhs
+                emit_binary_insn(
+                    program,
+                    &ast::Operator::Greater,
+                    start_reg,
+                    lhs_reg,
+                    lower_reg,
+                    start,
+                    lhs,
+                    referenced_tables,
+                    None,
+                )?;
+            } else {
+                // BETWEEN: start <= lhs
+                emit_binary_insn(
+                    program,
+                    &ast::Operator::LessEquals,
+                    start_reg,
+                    lhs_reg,
+                    lower_reg,
+                    start,
+                    lhs,
+                    referenced_tables,
+                    None,
+                )?;
+            }
+            program.reset_collation();
+
+            // Evaluate end into a register.
+            let end_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, end, end_reg, resolver)?;
+            let end_collation_ctx = program.curr_collation_ctx();
+            program.reset_collation();
+
+            // Resolve collation for the second comparison (lhs vs end).
+            let upper_collation_ctx = resolve_collation_ctx(lhs_collation_ctx, end_collation_ctx);
+            program.set_collation(upper_collation_ctx);
+
+            // Emit the second comparison into a temp register.
+            let upper_reg = program.alloc_register();
+            if *not {
+                // NOT BETWEEN: lhs > end
+                emit_binary_insn(
+                    program,
+                    &ast::Operator::Greater,
+                    lhs_reg,
+                    end_reg,
+                    upper_reg,
+                    lhs,
+                    end,
+                    referenced_tables,
+                    None,
+                )?;
+            } else {
+                // BETWEEN: lhs <= end
+                emit_binary_insn(
+                    program,
+                    &ast::Operator::LessEquals,
+                    lhs_reg,
+                    end_reg,
+                    upper_reg,
+                    lhs,
+                    end,
+                    referenced_tables,
+                    None,
+                )?;
+            }
+            program.reset_collation();
+
+            // Combine results: AND for BETWEEN, OR for NOT BETWEEN.
+            if *not {
+                program.emit_insn(Insn::Or {
+                    lhs: lower_reg,
+                    rhs: upper_reg,
+                    dest: target_register,
+                });
+            } else {
+                program.emit_insn(Insn::And {
+                    lhs: lower_reg,
+                    rhs: upper_reg,
+                    dest: target_register,
+                });
+            }
+            Ok(target_register)
         }
         ast::Expr::Binary(e1, op, e2) => {
             // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE specially.
@@ -3050,6 +3270,24 @@ pub fn translate_expr(
     Ok(target_register)
 }
 
+/// Resolve collation context from two operand collation contexts, following SQLite rules:
+/// 1. Explicit COLLATE takes precedence (left over right).
+/// 2. Column collation takes precedence (left over right).
+/// 3. Otherwise, no specific collation (BINARY).
+fn resolve_collation_ctx(
+    left: Option<(CollationSeq, bool)>,
+    right: Option<(CollationSeq, bool)>,
+) -> Option<(CollationSeq, bool)> {
+    match (left, right) {
+        (Some((c_left, true)), _) => Some((c_left, true)),
+        (_, Some((c_right, true))) => Some((c_right, true)),
+        (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
+        (None, Some((c_right, from_collate_right))) => Some((c_right, from_collate_right)),
+        (Some((c_left, from_collate_left)), Some((_, false))) => Some((c_left, from_collate_left)),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn binary_expr_shared(
     program: &mut ProgramBuilder,
@@ -4538,31 +4776,9 @@ pub fn bind_and_rewrite_expr<'a>(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
-                ast::Expr::Between {
-                    lhs,
-                    not,
-                    start,
-                    end,
-                } => {
-                    let (lower_op, upper_op) = if *not {
-                        (ast::Operator::Greater, ast::Operator::Greater)
-                    } else {
-                        (ast::Operator::LessEquals, ast::Operator::LessEquals)
-                    };
-                    let start = start.take_ownership();
-                    let lhs_v = lhs.take_ownership();
-                    let end = end.take_ownership();
-
-                    let lower =
-                        ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
-                    let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
-
-                    *expr = if *not {
-                        ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
-                    } else {
-                        ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
-                    };
-                }
+                // Between is handled natively in translate_expr/translate_condition_expr,
+                // so no AST rewriting is needed here. The walker will still descend
+                // into Between's children for column binding via walk_expr_mut.
                 Expr::Id(id) => {
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
@@ -4906,39 +5122,6 @@ pub fn bind_and_rewrite_expr<'a>(
         },
     )?;
     Ok(())
-}
-
-/// Rewrite BETWEEN expressions to Binary expressions with AND/OR.
-/// This is a subset of bind_and_rewrite_expr that only handles BETWEEN rewriting.
-pub fn rewrite_between_expr(expr: &mut ast::Expr) {
-    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } = e
-        {
-            let (lower_op, upper_op) = if *not {
-                (ast::Operator::Greater, ast::Operator::Greater)
-            } else {
-                (ast::Operator::LessEquals, ast::Operator::LessEquals)
-            };
-            let start = start.take_ownership();
-            let lhs_v = lhs.take_ownership();
-            let end = end.take_ownership();
-
-            let lower = ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
-            let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
-
-            *e = if *not {
-                ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
-            } else {
-                ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
-            };
-        }
-        Ok(WalkControl::Continue)
-    });
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.

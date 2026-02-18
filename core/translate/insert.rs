@@ -10,8 +10,8 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
-            rewrite_between_expr, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
-            BindingBehavior, NoConstantOptReason, WalkControl,
+            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior,
+            NoConstantOptReason, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
@@ -919,7 +919,6 @@ fn emit_partial_index_check(
         return Ok(None);
     };
     let mut where_for_eval = where_clause.as_ref().clone();
-    rewrite_between_expr(&mut where_for_eval);
     rewrite_partial_index_where(&mut where_for_eval, insertion)?;
     let reg = program.alloc_register();
     translate_expr_no_constant_opt(

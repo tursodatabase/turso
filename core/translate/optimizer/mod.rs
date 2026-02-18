@@ -1551,6 +1551,22 @@ fn optimize_table_access(
                     // so leave cross-table constraints for probe-side evaluation.
                     let defer_cross_table_constraints =
                         hash_join_build_only_tables.contains(&table_idx);
+                    // BETWEEN contributes two range constraints that map back to one WHERE term.
+                    let mut used_constraints_per_term: HashMap<usize, usize> = HashMap::default();
+                    for cref in constraint_refs.iter() {
+                        for constraint_vec_pos in
+                            [cref.eq, cref.lower_bound, cref.upper_bound].into_iter()
+                        {
+                            let Some(constraint_vec_pos) = constraint_vec_pos else {
+                                continue;
+                            };
+                            let constraint =
+                                &constraints_per_table[table_idx].constraints[constraint_vec_pos];
+                            *used_constraints_per_term
+                                .entry(constraint.where_clause_pos.0)
+                                .or_insert(0) += 1;
+                        }
+                    }
                     for cref in constraint_refs.iter() {
                         for constraint_vec_pos in &[cref.eq, cref.lower_bound, cref.upper_bound] {
                             let Some(constraint_vec_pos) = constraint_vec_pos else {
@@ -1559,11 +1575,26 @@ fn optimize_table_access(
                             let constraint =
                                 &constraints_per_table[table_idx].constraints[*constraint_vec_pos];
                             let where_term = &mut where_clause[constraint.where_clause_pos.0];
-                            turso_assert!(
-                                !where_term.consumed,
-                                "trying to consume a where clause term twice",
-                                {"where_term": format!("{where_term:?}")}
-                            );
+                            let is_between = matches!(where_term.expr, ast::Expr::Between { .. });
+                            if where_term.consumed {
+                                if is_between {
+                                    continue;
+                                }
+                                turso_assert!(
+                                    !where_term.consumed,
+                                    "trying to consume a where clause term twice",
+                                    {"where_term": format!("{where_term:?}")}
+                                );
+                            }
+                            if is_between {
+                                let used = used_constraints_per_term
+                                    .get(&constraint.where_clause_pos.0)
+                                    .copied()
+                                    .unwrap_or(0);
+                                if used < 2 {
+                                    continue;
+                                }
+                            }
                             if is_outer_join && where_term.from_outer_join.is_none() {
                                 // Don't consume WHERE terms from outer joins if the where term is not part of the outer join condition. Consider:
                                 // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
@@ -2741,16 +2772,6 @@ fn build_seek_def(
             }
         }
     })
-}
-
-pub trait TakeOwnership {
-    fn take_ownership(&mut self) -> Self;
-}
-
-impl TakeOwnership for ast::Expr {
-    fn take_ownership(&mut self) -> Self {
-        std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
-    }
 }
 
 #[cfg(test)]
