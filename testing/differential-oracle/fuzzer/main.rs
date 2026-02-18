@@ -4,11 +4,13 @@
 //! results against SQLite for generated SQL statements.
 
 use std::io::{IsTerminal, stdin};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use differential_fuzzer::{Fuzzer, GeneratorKind, SimConfig, TreeMode};
 use rand::RngCore;
+use serde::Serialize;
 
 /// SQLancer-style differential testing fuzzer for Turso.
 #[derive(Parser, Debug)]
@@ -65,7 +67,53 @@ enum Commands {
         /// Number of iterations to run (0 for infinite).
         #[arg(default_value_t = 0)]
         iterations: u64,
+
+        /// Collect errors and write a JSON report to this path instead of stopping on first failure.
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
+}
+
+/// A single failure recorded during a loop run.
+#[derive(Debug, Serialize)]
+struct FailureRecord {
+    iteration: u64,
+    seed: u64,
+    error: String,
+    statements_executed: usize,
+    oracle_failures: usize,
+    warnings: usize,
+    config: ConfigRecord,
+}
+
+/// Serializable snapshot of the run configuration.
+#[derive(Debug, Serialize)]
+struct ConfigRecord {
+    num_tables: usize,
+    columns_per_table: usize,
+    num_statements: usize,
+    generator: String,
+    mvcc: bool,
+}
+
+/// Summary written to the JSON report file.
+#[derive(Debug, Serialize)]
+struct LoopReport {
+    total_iterations: u64,
+    total_failures: u64,
+    failures: Vec<FailureRecord>,
+}
+
+impl ConfigRecord {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            num_tables: args.num_tables,
+            columns_per_table: args.columns_per_table,
+            num_statements: args.num_statements,
+            generator: format!("{:?}", args.generator),
+            mvcc: args.mvcc,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -83,26 +131,100 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
 
     match args.command {
-        Some(Commands::Loop { iterations }) => {
+        Some(Commands::Loop {
+            iterations,
+            ref report,
+        }) => {
             let mut iteration = 0u64;
+            let mut failures: Vec<FailureRecord> = Vec::new();
+            let collecting = report.is_some();
+
             loop {
                 args.seed = rand::rng().next_u64();
                 tracing::info!("Iteration {}: seed {}", iteration + 1, args.seed);
-                run_single(&args)?;
+
+                match run_single_inner(&args) {
+                    Ok(stats) if stats.oracle_failures > 0 => {
+                        let record = FailureRecord {
+                            iteration: iteration + 1,
+                            seed: args.seed,
+                            error: format!("{} oracle failure(s) detected", stats.oracle_failures),
+                            statements_executed: stats.statements_executed,
+                            oracle_failures: stats.oracle_failures,
+                            warnings: stats.warnings,
+                            config: ConfigRecord::from_args(&args),
+                        };
+                        tracing::error!(
+                            "Iteration {} failed (seed {}): {}",
+                            iteration + 1,
+                            args.seed,
+                            record.error
+                        );
+                        failures.push(record);
+                        if !collecting {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let record = FailureRecord {
+                            iteration: iteration + 1,
+                            seed: args.seed,
+                            error: format!("{e:#}"),
+                            statements_executed: 0,
+                            oracle_failures: 0,
+                            warnings: 0,
+                            config: ConfigRecord::from_args(&args),
+                        };
+                        tracing::error!(
+                            "Iteration {} errored (seed {}): {e:#}",
+                            iteration + 1,
+                            args.seed
+                        );
+                        failures.push(record);
+                        if !collecting {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                }
 
                 iteration += 1;
                 if iterations > 0 && iteration >= iterations {
-                    tracing::info!("Completed {} iterations successfully", iterations);
+                    tracing::info!("Completed {} iterations", iterations);
                     break;
                 }
             }
+
+            if let Some(path) = report {
+                let report = LoopReport {
+                    total_iterations: iteration,
+                    total_failures: failures.len() as u64,
+                    failures,
+                };
+                let json = serde_json::to_string_pretty(&report)?;
+                std::fs::write(path, &json)?;
+                tracing::info!(
+                    "Wrote report ({} failures / {} iterations) to {}",
+                    report.total_failures,
+                    report.total_iterations,
+                    path.display()
+                );
+                if report.total_failures > 0 {
+                    std::process::exit(1);
+                }
+            } else if !failures.is_empty() {
+                std::process::exit(1);
+            }
+
             Ok(())
         }
         None => run_single(&args),
     }
 }
 
-fn run_single(args: &Args) -> Result<()> {
+/// Run a single fuzzer iteration, returning stats on success.
+/// Does NOT call `process::exit` — the caller decides what to do with failures.
+fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
     let config = SimConfig {
         seed: args.seed,
         num_tables: args.num_tables,
@@ -123,7 +245,6 @@ fn run_single(args: &Args) -> Result<()> {
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
 
     let fuzzer = Fuzzer::new(config)?;
-
     let stats = fuzzer.run()?;
 
     if args.keep_files {
@@ -144,9 +265,13 @@ fn run_single(args: &Args) -> Result<()> {
         }
     }
 
+    Ok(stats)
+}
+
+fn run_single(args: &Args) -> Result<()> {
+    let stats = run_single_inner(args)?;
     if stats.oracle_failures > 0 {
         std::process::exit(1);
     }
-
     Ok(())
 }

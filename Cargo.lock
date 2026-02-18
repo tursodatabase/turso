@@ -1539,6 +1539,7 @@ dependencies = [
  "rand 0.9.2",
  "rand_chacha 0.9.0",
  "rusqlite",
+ "serde",
  "serde_json",
  "sql_gen",
  "sql_gen_prop",
@@ -5187,7 +5188,7 @@ checksum = "d372029cb5195f9ab4e4b9aef550787dce78b124fcaee8d82519925defcd6f0d"
 
 [[package]]
 name = "sql_gen"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "proptest",
