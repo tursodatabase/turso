@@ -641,3 +641,40 @@ expect {
     CHERRY
 }
 
+# =============================================================================
+# COLLATION PROPAGATION THROUGH CONCAT (||)
+# =============================================================================
+# These tests verify that COLLATE specifications propagate through
+# non-comparison operators like concatenation (||), so that the collation
+# is correctly applied to any parent comparison.
+
+test collate_concat_check_constraint_nocase {
+    CREATE TABLE t(name TEXT CHECK((name COLLATE NOCASE || '') <> 'admin'));
+    INSERT INTO t VALUES ('Admin');
+}
+expect error {
+}
+
+test collate_concat_check_constraint_allows_valid {
+    CREATE TABLE t(name TEXT CHECK((name COLLATE NOCASE || '') <> 'admin'));
+    INSERT INTO t VALUES ('bob');
+    SELECT name FROM t;
+}
+expect {
+    bob
+}
+
+test collate_concat_nocase_comparison {
+    SELECT (('Hello' COLLATE NOCASE || '') = 'hello');
+}
+expect {
+    1
+}
+
+test collate_concat_binary_comparison {
+    SELECT (('Hello' COLLATE BINARY || '') = 'hello');
+}
+expect {
+    0
+}
+

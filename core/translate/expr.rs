@@ -3160,7 +3160,9 @@ fn emit_binary_expr_scalar(
             referenced_tables,
             condition_metadata,
         )?;
-        program.reset_collation();
+        if op.is_comparison() {
+            program.reset_collation();
+        }
         Ok(target_register)
     } else {
         let e1_reg = program.alloc_registers(2);
@@ -3213,7 +3215,14 @@ fn emit_binary_expr_scalar(
             referenced_tables,
             condition_metadata,
         )?;
-        program.reset_collation();
+        // Only reset collation for comparison operators, which consume it.
+        // Non-comparison operators (Concat, Add, etc.) must propagate the
+        // collation to the parent expression so that e.g.
+        //   (name COLLATE NOCASE || '') <> 'admin'
+        // correctly applies NOCASE to the Ne comparison.
+        if op.is_comparison() {
+            program.reset_collation();
+        }
         Ok(target_register)
     }
 }
