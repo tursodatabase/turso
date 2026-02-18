@@ -2240,6 +2240,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             clause,
                             defer_clause,
                         } => {
+                            if clause.columns.len() > 1 {
+                                crate::bail_parse_error!(
+                                    "foreign key on {} should reference only one column of table {}",
+                                    name,
+                                    clause.tbl_name.as_str()
+                                );
+                            }
                             let fk = ForeignKey {
                                 parent_table: normalize_ident(clause.tbl_name.as_str()),
                                 parent_columns: clause

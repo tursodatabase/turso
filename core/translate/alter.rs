@@ -585,6 +585,12 @@ pub fn translate_alter_table(
                         clause,
                         defer_clause,
                     } => {
+                        if clause.columns.len() > 1 {
+                            return Err(LimboError::ParseError(format!(
+                                "foreign key on {new_column_name} should reference only one column of table {}",
+                                clause.tbl_name.as_str()
+                            )));
+                        }
                         let fk = ForeignKey {
                             parent_table: normalize_ident(clause.tbl_name.as_str()),
                             parent_columns: clause

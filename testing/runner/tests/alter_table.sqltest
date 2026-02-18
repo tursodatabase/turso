@@ -66,6 +66,14 @@ expect {
     1|0
 }
 
+test alter-table-add-column-invalid-multi-column-fk {
+    CREATE TABLE t(a, c);
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES t(a, c);
+}
+expect error {
+}
+
 test alter-table-add-column-default {
     CREATE TABLE test (a);
     INSERT INTO test VALUES (1), (2), (3);
@@ -355,4 +363,3 @@ test alter-add-column-invalid-collation {
 expect error {
     no such collation sequence: compile_options
 }
-

@@ -14,6 +14,14 @@ expect {
     11|
 }
 
+test fk-column-constraint-multi-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a, c);
+    CREATE TABLE s(a REFERENCES t(a, c));
+}
+expect error {
+}
+
 test fk-insert-child-missing-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
@@ -2441,4 +2449,3 @@ test fk-drop-column-composite-fk-fails {
 }
 expect error {
 }
-
