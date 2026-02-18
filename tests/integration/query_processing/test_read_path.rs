@@ -740,6 +740,46 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 #[turso_macros::test]
+fn test_prepare_rejects_empty_statements(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let empty_inputs = [
+        ";",
+        ";;;",
+        "   ",
+        "\n\t",
+        "-- comment",
+        "/* comment */",
+        "/**/",
+    ];
+
+    for sql in empty_inputs {
+        let Err(err) = conn.prepare(sql) else {
+            panic!("Expected invalid argument error for input: {sql}");
+        };
+        match err {
+            LimboError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("contains no statements"),
+                    "Unexpected error message for input {sql}: {msg}"
+                );
+            }
+            other => panic!("Unexpected error for input {sql}: {other}"),
+        }
+    }
+
+    let invalid_syntax_inputs = ["/* outer /* inner */ still outer */"];
+    for sql in invalid_syntax_inputs {
+        let Err(err) = conn.prepare(sql) else {
+            panic!("Expected parse error for input: {sql}");
+        };
+        match err {
+            LimboError::ParseError(_) | LimboError::LexerError(_) => {}
+            other => panic!("Unexpected error for input {sql}: {other}"),
+        }
+    }
+}
+
+#[turso_macros::test]
 /// Test that we can only join up to 63 tables, and trying to join more should fail with an error instead of panicing.
 fn test_max_joined_tables_limit(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
