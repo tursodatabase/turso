@@ -3309,6 +3309,7 @@ fn emit_update_insns<'a>(
                 connection,
                 or_conflict,
                 skip_row_label,
+                Some(table_references),
             )?;
         }
     }
@@ -4762,6 +4763,7 @@ fn emit_check_constraint_bytecode(
     resolver: &mut Resolver,
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
+    referenced_tables: Option<&TableReferences>,
 ) -> Result<()> {
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
@@ -4771,7 +4773,7 @@ fn emit_check_constraint_bytecode(
 
         translate_expr_no_constant_opt(
             program,
-            None,
+            referenced_tables,
             &rewritten_expr,
             expr_result_reg,
             resolver,
@@ -4845,6 +4847,7 @@ pub(crate) fn emit_check_constraints<'a>(
     connection: &Arc<Connection>,
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
+    referenced_tables: Option<&TableReferences>,
 ) -> Result<()> {
     if connection.check_constraints_ignored() || check_constraints.is_empty() {
         return Ok(());
@@ -4892,6 +4895,7 @@ pub(crate) fn emit_check_constraints<'a>(
         resolver,
         or_conflict,
         skip_row_label,
+        referenced_tables,
     );
 
     // Always restore resolver state, even on error.
