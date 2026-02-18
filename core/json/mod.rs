@@ -19,7 +19,10 @@ use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation,
 use std::borrow::Cow;
 use std::str::FromStr;
 
-const JSONB_OVERLAP_PAYLOAD_MAX: usize = 7;
+// Object/array headers with inline payload size <= 7 are ambiguous with 8-byte scalar blobs:
+// 1-byte header + 7-byte payload == 8 bytes (e.g. INT/FLOAT scalar bytes like `0x7C 12 34 56 78 9A BC DE`
+// It is not JSONB, but it is being recognized as JSONB.
+const JSONB_AMBIGUOUS_PAYLOAD_MAX: usize = 7;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Conv {
@@ -131,17 +134,10 @@ fn is_jsonb_blob(slice: &[u8]) -> bool {
     }
 
     let jsonb = Jsonb::from_raw_data(slice);
-    match header.is_scalar() {
-        Ok(is_scalar) => {
-            // Prevent 64-bit scalar values (e.g., INT, FLOAT) from accidentally matching JSONB Object/Array headers.
-            // ex) 0x7C 12 34 56 78 9A BC DE
-            if is_scalar || payload_size <= JSONB_OVERLAP_PAYLOAD_MAX {
-                jsonb.is_valid()
-            } else {
-                jsonb.element_type().is_ok()
-            }
-        }
-        Err(_) => false,
+    if header.is_scalar() || payload_size <= JSONB_AMBIGUOUS_PAYLOAD_MAX {
+        jsonb.is_valid()
+    } else {
+        jsonb.element_type().is_ok()
     }
 }
 
@@ -1843,7 +1839,7 @@ mod tests {
     #[test]
     fn test_is_jsonb_blob_rejects_scalar_like_overlap_header() {
         let overlapping_scalar = b"|1234567";
-        assert_eq!(overlapping_scalar.len(), JSONB_OVERLAP_PAYLOAD_MAX + 1);
+        assert_eq!(overlapping_scalar.len(), JSONB_AMBIGUOUS_PAYLOAD_MAX + 1);
         assert!(!is_jsonb_blob(overlapping_scalar));
     }
 }
