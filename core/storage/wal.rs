@@ -1688,6 +1688,7 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
 
     fn rollback(&self, rollback_to: Option<RollbackTo>) {
+        let is_savepoint = rollback_to.is_some();
         let (max_frame, last_checksum) = self.with_shared(|shared| {
             let max_frame = rollback_to
                 .as_ref()
@@ -1709,7 +1710,9 @@ impl Wal for WalFile {
         });
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
-        self.reset_internal_states();
+        if !is_savepoint {
+            self.reset_internal_states();
+        }
     }
 
     fn abort_checkpoint(&self) {
@@ -2244,7 +2247,14 @@ impl WalFile {
         })
     }
 
+    /// Reset connection-private WAL state. Releases any held read lock before
+    /// clearing the slot, so that `end_read_tx()` callers never see a stale
+    /// `NO_LOCK_HELD` while a shared lock is still held.
     fn reset_internal_states(&self) {
+        let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
+        if slot != NO_LOCK_HELD {
+            self.with_shared(|shared| shared.read_locks[slot].unlock());
+        }
         self.max_frame_read_lock_index
             .store(NO_LOCK_HELD, Ordering::Release);
         self.ongoing_checkpoint.write().reset();
@@ -4043,5 +4053,101 @@ pub mod test {
 
         assert_eq!(result.wal_checkpoint_backfilled, mx_now - r_snapshot);
         assert!(result.everything_backfilled());
+    }
+
+    #[test]
+    fn test_rollback_releases_read_lock() {
+        let (db, _path) = get_database();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES(1)").unwrap();
+
+        {
+            let pager = conn.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            assert!(
+                wal.holds_read_lock(),
+                "read lock must be held during write tx"
+            );
+        }
+
+        conn.execute("ROLLBACK").unwrap();
+
+        {
+            let pager = conn.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            assert!(
+                !wal.holds_read_lock(),
+                "read lock must be released after ROLLBACK"
+            );
+        }
+    }
+
+    #[test]
+    fn test_savepoint_rollback_preserves_read_lock() {
+        let (db, _path) = get_database();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES(1)").unwrap();
+
+        // Trigger a statement failure that causes savepoint rollback.
+        // A duplicate primary key on the second INSERT will fail the
+        // statement, rolling back to the anonymous savepoint while
+        // keeping the write transaction open.
+        let res = conn.execute("INSERT INTO t VALUES(1)");
+        assert!(res.is_err(), "duplicate PK insert must fail");
+
+        {
+            let pager = conn.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            assert!(
+                wal.holds_read_lock(),
+                "read lock must still be held after savepoint rollback"
+            );
+            assert!(
+                wal.holds_write_lock(),
+                "write lock must still be held after savepoint rollback"
+            );
+        }
+
+        // The transaction should still be usable: commit succeeds and
+        // the first insert is preserved.
+        conn.execute("COMMIT").unwrap();
+
+        let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+        let mut count: i64 = 0;
+        stmt.run_with_row_callback(|row| {
+            count = row.get(0).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 1, "first insert should survive savepoint rollback");
+    }
+
+    #[test]
+    fn test_checkpoint_succeeds_after_rollback() {
+        let (db, _path) = get_database();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 5, 3);
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO test(value) VALUES('rollback_me')")
+            .unwrap();
+        conn.execute("ROLLBACK").unwrap();
+
+        let pager = conn.pager.load();
+        let result = run_checkpoint_until_done(&pager, CheckpointMode::Restart);
+        assert!(
+            result.everything_backfilled(),
+            "checkpoint must succeed after rollback, not return Busy"
+        );
     }
 }
