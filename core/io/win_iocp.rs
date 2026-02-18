@@ -409,9 +409,9 @@ impl InnerWindowsIOCP {
         })
     }
 
-    fn recycle_or_create_io_packet_from_completion(
+    fn build_io_packet(
         &self,
-        completion: Completion,
+        completion: Option<Completion>,
         position: u64,
         kind: IoKind,
     ) -> IoPacket {
@@ -431,7 +431,7 @@ impl InnerWindowsIOCP {
         let high_part = (position >> 32) as u32;
 
         *content = IoOverlappedPacket {
-            completion: Some(completion),
+            completion,
             kind,
             overlapped: OVERLAPPED {
                 Anonymous: OVERLAPPED_0 {
@@ -622,7 +622,7 @@ impl WindowsFile {
         io_function: impl Fn(*mut OVERLAPPED) -> BOOL,
     ) -> Result<(), u32> {
         let mut bytes = 0;
-        let packet_io = self.parent_io.recycle_or_create_io_packet(kind);
+        let packet_io = self.parent_io.build_io_packet(None, 0, kind);
         let overlapped_ptr = Arc::into_raw(packet_io) as *mut OVERLAPPED;
         unsafe {
             let result = io_function(overlapped_ptr);
@@ -655,11 +655,9 @@ impl WindowsFile {
 
         io_function: impl Fn(*mut OVERLAPPED) -> BOOL,
     ) -> Result<Completion> {
-        let packet_io = self.parent_io.recycle_or_create_io_packet_from_completion(
-            completion.clone(),
-            position,
-            kind,
-        );
+        let packet_io = self
+            .parent_io
+            .build_io_packet(Some(completion.clone()), position, kind);
 
         let overlapped_ptr = Arc::into_raw(packet_io.clone()) as *mut OVERLAPPED;
 
