@@ -30,6 +30,7 @@ pub struct TempDatabaseBuilder {
     init_sql: Option<String>,
     enable_mvcc: bool,
     io_uring: bool,
+    enable_views: bool,
 }
 
 struct TestIo {
@@ -105,6 +106,7 @@ impl TempDatabaseBuilder {
             init_sql: None,
             enable_mvcc: false,
             io_uring: false,
+            enable_views: false,
         }
     }
 
@@ -156,10 +158,19 @@ impl TempDatabaseBuilder {
         self
     }
 
+    pub fn with_views(mut self, enable: bool) -> Self {
+        self.enable_views = enable;
+        self
+    }
+
     pub fn build(self) -> TempDatabase {
-        let opts = self
+        let mut opts = self
             .opts
             .unwrap_or_else(|| turso_core::DatabaseOpts::new().with_encryption(true));
+
+        if self.enable_views {
+            opts = opts.with_views(true);
+        }
 
         let flags = self.flags.unwrap_or_default();
 

@@ -1598,3 +1598,83 @@ pub fn test_mvcc_stale_snapshot_after_schema_updated() {
 
     conn1.execute("COMMIT").unwrap();
 }
+
+/// Test materialized view population with enough rows to trigger btree page splits.
+///
+/// This test exposes a bug where the matview code doesn't properly handle
+/// btree operations during page splits, causing rows to be silently lost.
+/// The bug triggers around row 193 with 500-byte content - the matview stops
+/// accepting new rows and freezes at 192.
+///
+/// Key conditions:
+/// - TEXT PRIMARY KEY (not INTEGER)
+/// - 500+ byte content column
+/// - Each INSERT in a separate connection (simulating CLI usage)
+#[turso_macros::test(views)]
+fn test_matview_row_loss_during_btree_split(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create table with TEXT PRIMARY KEY and content column
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE t (id TEXT PRIMARY KEY, title TEXT, content TEXT)",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW v AS SELECT id, title FROM t",
+    )?;
+
+    // Insert 250 rows with 500-byte content
+    // Each insert uses a fresh connection to simulate CLI behavior
+    let content = "x".repeat(500);
+    for i in 1..=250 {
+        let insert_conn = tmp_db.connect_limbo();
+        let insert_sql = format!("INSERT INTO t VALUES ('id{i}', 'title {i}', '{content}')");
+        common::run_query(&tmp_db, &insert_conn, &insert_sql)?;
+    }
+
+    // Check counts with fresh connection
+    let check_conn = tmp_db.connect_limbo();
+
+    let mut table_count = 0i64;
+    match check_conn.query("SELECT COUNT(*) FROM t") {
+        Ok(Some(ref mut rows)) => loop {
+            match rows.step()? {
+                StepResult::Row => {
+                    table_count = rows.row().unwrap().get::<i64>(0).unwrap();
+                }
+                StepResult::IO => rows._io().step()?,
+                StepResult::Done => break,
+                _ => {}
+            }
+        },
+        Ok(None) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    let mut view_count = 0i64;
+    match check_conn.query("SELECT COUNT(*) FROM v") {
+        Ok(Some(ref mut rows)) => loop {
+            match rows.step()? {
+                StepResult::Row => {
+                    view_count = rows.row().unwrap().get::<i64>(0).unwrap();
+                }
+                StepResult::IO => rows._io().step()?,
+                StepResult::Done => break,
+                _ => {}
+            }
+        },
+        Ok(None) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    assert_eq!(
+        table_count, view_count,
+        "Materialized view row count ({view_count}) doesn't match table row count ({table_count}). \
+         Rows were lost during btree page splits.",
+    );
+
+    Ok(())
+}
