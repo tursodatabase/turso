@@ -1,3 +1,4 @@
+use futures::StreamExt;
 use turso::{Builder, Error};
 
 #[tokio::main]
@@ -9,7 +10,7 @@ async fn main() -> Result<(), Error> {
 
     let conn = db.connect()?;
 
-    conn.query("select 1; select 1;", ()).await?;
+    let rows = conn.query("select 1; select 1;", ()).await?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users (email TEXT, age INTEGER)",
@@ -33,16 +34,10 @@ async fn main() -> Result<(), Error> {
 
     let mut rows = stmt.query(["foo@example.com"]).await?;
 
-    let row = rows.next().await?;
-
-    assert!(
-        row.is_some(),
-        "The row that was just inserted hasn't been found"
-    );
-
-    if let Some(row_values) = row {
-        let email = row_values.get_value(0)?;
-        let age = row_values.get_value(1)?;
+    while let Some(row) = rows.next().await {
+        let row = row?;
+        let email = row.get_value(0)?;
+        let age = row.get_value(1)?;
         println!("Row: {email:?} {age:?}");
     }
 

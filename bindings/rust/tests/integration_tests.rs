@@ -40,26 +40,51 @@ async fn test_rows_next() {
     assert_eq!(conn.last_insert_rowid(), 5);
     let mut res = conn.query("SELECT * FROM test", ()).await.unwrap();
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.next_deprecated()
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         1.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.next_deprecated()
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         2.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.next_deprecated()
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         3.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.next_deprecated()
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         4.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.next_deprecated()
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         5.into()
     );
-    assert!(res.next().await.unwrap().is_none());
+    assert!(res.next_deprecated().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -91,11 +116,21 @@ async fn test_cacheflush() {
     let mut res = conn.query("SELECT * FROM asdf", ()).await.unwrap();
 
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.next_deprecated()
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         2.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.next_deprecated()
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         3.into()
     );
 
@@ -113,7 +148,12 @@ async fn test_cacheflush() {
         .unwrap();
 
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.next_deprecated()
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap(),
         1.into()
     );
 
@@ -212,7 +252,7 @@ pub async fn test_execute_batch() {
         .query("SELECT COUNT(*) FROM authors;", ())
         .await
         .unwrap();
-    if let Some(row) = rows.next().await.unwrap() {
+    if let Some(row) = rows.next_deprecated().await.unwrap() {
         assert_eq!(row.get_value(0).unwrap(), Value::Integer(2));
     }
 }
@@ -275,7 +315,7 @@ async fn test_row_get_column_typed() {
         .unwrap();
 
     let mut rows = conn.query("SELECT * FROM v", ()).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
 
     let n: i64 = row.get(0).unwrap();
     let label: String = row.get(1).unwrap();
@@ -296,7 +336,7 @@ async fn test_row_get_conversion_error() {
         .unwrap();
 
     let mut rows = conn.query("SELECT x FROM t", ()).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
 
     // Attempt to convert TEXT into integer (should fail)
     let result: Result<u32, _> = row.get(0);
@@ -325,19 +365,19 @@ async fn test_index() {
         .query("SELECT * FROM users WHERE email = 'a@b.c'", ())
         .await
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
     assert!(row.get::<String>(0).unwrap() == "alice");
     assert!(row.get::<String>(1).unwrap() == "a@b.c");
-    assert!(rows.next().await.unwrap().is_none());
+    assert!(rows.next_deprecated().await.unwrap().is_none());
 
     let mut rows = conn
         .query("SELECT * FROM users WHERE email = 'b@d.e'", ())
         .await
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
     assert!(row.get::<String>(0).unwrap() == "bob");
     assert!(row.get::<String>(1).unwrap() == "b@d.e");
-    assert!(rows.next().await.unwrap().is_none());
+    assert!(rows.next_deprecated().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -439,7 +479,7 @@ async fn test_statement_query_resets_before_execution() {
 
     let mut rows = stmt.query(()).await.unwrap();
     let mut count = 0;
-    while let Some(row) = rows.next().await.unwrap() {
+    while let Some(row) = rows.next_deprecated().await.unwrap() {
         let id: i64 = row.get(0).unwrap();
         assert_eq!(id, count);
         count += 1;
@@ -448,7 +488,7 @@ async fn test_statement_query_resets_before_execution() {
 
     let mut rows = stmt.query(()).await.unwrap();
     let mut count = 0;
-    while let Some(row) = rows.next().await.unwrap() {
+    while let Some(row) = rows.next_deprecated().await.unwrap() {
         let id: i64 = row.get(0).unwrap();
         assert_eq!(id, count);
         count += 1;
@@ -487,7 +527,7 @@ async fn test_encryption() {
             .unwrap();
         let mut row_count = 0;
         let mut rows = conn.query("SELECT * FROM test", ()).await.unwrap();
-        while let Some(row) = rows.next().await.unwrap() {
+        while let Some(row) = rows.next_deprecated().await.unwrap() {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
             assert_eq!(row.get::<String>(1).unwrap(), "secret_data");
             row_count += 1;
@@ -499,7 +539,7 @@ async fn test_encryption() {
             .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
             .await
             .unwrap();
-        while rows.next().await.unwrap().is_some() {}
+        while rows.next_deprecated().await.unwrap().is_some() {}
     }
 
     // 2. Verify data is encrypted on disk
@@ -520,7 +560,7 @@ async fn test_encryption() {
 
         let mut row_count = 0;
         let mut rows = conn.query("SELECT * FROM test", ()).await.unwrap();
-        while let Some(row) = rows.next().await.unwrap() {
+        while let Some(row) = rows.next_deprecated().await.unwrap() {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
             assert_eq!(row.get::<String>(1).unwrap(), "secret_data");
             row_count += 1;
@@ -591,7 +631,7 @@ async fn test_query_without_reset_does_not_panic() {
         for i in (0..stmts.len()).step_by(7) {
             if let Some(Some(stmt)) = stmts.get_mut(i) {
                 if let Ok(mut rows) = stmt.query(()).await {
-                    let _ = rows.next().await;
+                    let _ = rows.next_deprecated().await;
                 }
             }
         }
@@ -612,7 +652,7 @@ async fn test_query_without_reset_does_not_panic() {
         for i in (0..stmts.len()).step_by(5) {
             if let Some(Some(stmt)) = stmts.get_mut(i) {
                 if let Ok(mut rows) = stmt.query(()).await {
-                    let _ = rows.next().await;
+                    let _ = rows.next_deprecated().await;
                 }
             }
         }
@@ -660,7 +700,7 @@ async fn test_row_get_value_out_of_bounds() {
     conn.execute("INSERT INTO t VALUES (1)", ()).await.unwrap();
 
     let mut rows = conn.query("SELECT x FROM t", ()).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
 
     // Valid index works
     assert!(row.get_value(0).is_ok());
@@ -725,7 +765,7 @@ async fn test_insert_returning_partial_consume() {
     let mut rows = stmt.query(()).await.unwrap();
 
     // Only consume first row
-    let first_row = rows.next().await.unwrap().unwrap();
+    let first_row = rows.next_deprecated().await.unwrap().unwrap();
     assert_eq!(first_row.get::<i64>(0).unwrap(), 1);
 
     // Drop the rows iterator without consuming remaining rows
@@ -734,7 +774,13 @@ async fn test_insert_returning_partial_consume() {
 
     // All 3 rows should have been inserted despite only consuming 1 RETURNING value
     let mut count_rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
-    let count: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
+    let count: i64 = count_rows
+        .next_deprecated()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
     assert_eq!(
         count, 3,
         "All 3 rows should be inserted even if RETURNING was partially consumed"
@@ -772,7 +818,7 @@ async fn test_transaction_commit_without_mvcc() {
         .query("SELECT value FROM test WHERE id = 1", ())
         .await
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
     let value: String = row.get(0).unwrap();
     assert_eq!(value, "hello", "Data should be committed");
 }
@@ -799,7 +845,7 @@ async fn test_transaction_with_insert_returning_then_commit() {
         .await
         .unwrap();
     let mut rows = stmt.query(()).await.unwrap();
-    let first = rows.next().await.unwrap().unwrap();
+    let first = rows.next_deprecated().await.unwrap().unwrap();
     assert_eq!(first.get::<i64>(0).unwrap(), 1);
     drop(rows);
     drop(stmt);
@@ -811,7 +857,13 @@ async fn test_transaction_with_insert_returning_then_commit() {
 
     // Verify all 3 rows were inserted
     let mut count_rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
-    let count: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
+    let count: i64 = count_rows
+        .next_deprecated()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
     assert_eq!(count, 3, "All rows should be committed");
 }
 
@@ -836,7 +888,7 @@ async fn test_prepare_cached_basic() {
         .unwrap();
 
     let mut rows = stmt1.query(vec![Value::Integer(1)]).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
     assert_eq!(row.get::<String>(1).unwrap(), "Alice");
     drop(rows);
@@ -849,7 +901,7 @@ async fn test_prepare_cached_basic() {
         .unwrap();
 
     let mut rows = stmt2.query(vec![Value::Integer(1)]).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
     assert_eq!(row.get::<String>(1).unwrap(), "Alice");
 }
@@ -874,7 +926,13 @@ async fn test_prepare_cached_reprepare_on_query_only_change() {
     assert!(err.to_string().to_ascii_lowercase().contains("query_only"));
 
     let mut rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
-    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    let count: i64 = rows
+        .next_deprecated()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
     assert_eq!(count, 0);
 }
 
@@ -1023,14 +1081,14 @@ async fn test_prepare_cached_batch_insert_delete_pattern() {
         .await
         .unwrap();
     let first = rows
-        .next()
+        .next_deprecated()
         .await
         .unwrap()
         .unwrap()
         .get::<String>(0)
         .unwrap();
     assert_eq!(first, "b");
-    assert!(rows.next().await.unwrap().is_none());
+    assert!(rows.next_deprecated().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1066,12 +1124,12 @@ async fn test_prepare_cached_multiple_statements() {
 
     // Query using both cached SELECT statements
     let mut rows = stmt1.query(vec![Value::Integer(1)]).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
     drop(rows);
 
     let mut rows = stmt2.query(vec![Value::Text("test".into())]).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
     assert_eq!(row.get::<String>(1).unwrap(), "test");
 }
 
@@ -1099,20 +1157,20 @@ async fn test_prepare_cached_independent_state() {
 
     // Start iterating with stmt1
     let mut rows1 = stmt1.query(()).await.unwrap();
-    let row1 = rows1.next().await.unwrap().unwrap();
+    let row1 = rows1.next_deprecated().await.unwrap().unwrap();
     assert_eq!(row1.get::<i64>(0).unwrap(), 1);
 
     // Start iterating with stmt2 - should have its own state
     let mut rows2 = stmt2.query(()).await.unwrap();
-    let row2 = rows2.next().await.unwrap().unwrap();
+    let row2 = rows2.next_deprecated().await.unwrap().unwrap();
     assert_eq!(row2.get::<i64>(0).unwrap(), 1);
 
     // Continue with stmt1 - should be at next row
-    let row1 = rows1.next().await.unwrap().unwrap();
+    let row1 = rows1.next_deprecated().await.unwrap().unwrap();
     assert_eq!(row1.get::<i64>(0).unwrap(), 2);
 
     // Continue with stmt2 - should also be at next row (independent state)
-    let row2 = rows2.next().await.unwrap().unwrap();
+    let row2 = rows2.next_deprecated().await.unwrap().unwrap();
     assert_eq!(row2.get::<i64>(0).unwrap(), 2);
 }
 
@@ -1145,7 +1203,7 @@ async fn test_prepare_cached_with_parameters() {
 
     let mut rows = stmt.query(vec![Value::Integer(25)]).await.unwrap();
     let mut names = Vec::new();
-    while let Some(row) = rows.next().await.unwrap() {
+    while let Some(row) = rows.next_deprecated().await.unwrap() {
         names.push(row.get::<String>(0).unwrap());
     }
     assert_eq!(names.len(), 2);
@@ -1156,7 +1214,7 @@ async fn test_prepare_cached_with_parameters() {
     // Reuse cached statement with different parameter
     let mut rows = stmt.query(vec![Value::Integer(30)]).await.unwrap();
     let mut names = Vec::new();
-    while let Some(row) = rows.next().await.unwrap() {
+    while let Some(row) = rows.next_deprecated().await.unwrap() {
         names.push(row.get::<String>(0).unwrap());
     }
     assert_eq!(names.len(), 1);
@@ -1188,7 +1246,7 @@ async fn test_prepare_cached_stress() {
     for i in 0..100 {
         let mut stmt = conn.prepare_cached(select_query).await.unwrap();
         let mut rows = stmt.query(vec![Value::Integer(i)]).await.unwrap();
-        let row = rows.next().await.unwrap().unwrap();
+        let row = rows.next_deprecated().await.unwrap().unwrap();
         assert_eq!(row.get::<String>(0).unwrap(), format!("value_{i}"));
     }
 }
@@ -1213,7 +1271,7 @@ async fn test_prepare_vs_prepare_cached_equivalence() {
     let mut stmt1 = conn.prepare(query).await.unwrap();
     let mut rows1 = stmt1.query(()).await.unwrap();
     let mut results1 = Vec::new();
-    while let Some(row) = rows1.next().await.unwrap() {
+    while let Some(row) = rows1.next_deprecated().await.unwrap() {
         results1.push((row.get::<i64>(0).unwrap(), row.get::<String>(1).unwrap()));
     }
 
@@ -1221,7 +1279,7 @@ async fn test_prepare_vs_prepare_cached_equivalence() {
     let mut stmt2 = conn.prepare_cached(query).await.unwrap();
     let mut rows2 = stmt2.query(()).await.unwrap();
     let mut results2 = Vec::new();
-    while let Some(row) = rows2.next().await.unwrap() {
+    while let Some(row) = rows2.next_deprecated().await.unwrap() {
         results2.push((row.get::<i64>(0).unwrap(), row.get::<String>(1).unwrap()));
     }
 
@@ -1252,16 +1310,16 @@ async fn test_once_not_cleared_on_reset_with_coroutine() {
         .unwrap();
 
     let mut rows = stmt.query(()).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
     let value: i64 = row.get(0).unwrap();
     assert_eq!(value, 1);
-    assert!(rows.next().await.unwrap().is_none());
+    assert!(rows.next_deprecated().await.unwrap().is_none());
     drop(rows);
 
     stmt.reset().unwrap();
 
     let mut rows = stmt.query(()).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
 
     assert_eq!(
         row.get_value(0).unwrap(),
@@ -1295,7 +1353,7 @@ async fn test_experimental_strict_tables() {
 
     // Query the data
     let mut rows = conn.query("SELECT id, name FROM users", ()).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next_deprecated().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
     assert_eq!(row.get::<String>(1).unwrap(), "Alice");
 }
@@ -1322,7 +1380,7 @@ async fn test_strict_tables_without_experimental_flag() {
 async fn collect_ids(conn: &turso::Connection, sql: &str) -> Vec<i64> {
     let mut rows = conn.query(sql, ()).await.unwrap();
     let mut ids = Vec::new();
-    while let Some(row) = rows.next().await.unwrap() {
+    while let Some(row) = rows.next_deprecated().await.unwrap() {
         let id: i64 = row.get(0).unwrap();
         ids.push(id);
     }

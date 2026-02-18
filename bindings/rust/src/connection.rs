@@ -182,7 +182,7 @@ impl Connection {
         let sql = format!("PRAGMA {pragma_name}");
         let mut stmt = self.prepare(&sql).await?;
         let mut rows = stmt.query(()).await?;
-        while let Some(row) = rows.next().await? {
+        while let Some(row) = rows.next_deprecated().await? {
             f(&row)?;
         }
         Ok(())
@@ -198,7 +198,7 @@ impl Connection {
         let mut stmt = self.prepare(&sql).await?;
         let mut rows = stmt.query(()).await?;
         let mut collected = Vec::new();
-        while let Some(row) = rows.next().await? {
+        while let Some(row) = rows.next_deprecated().await? {
             collected.push(row);
         }
         Ok(collected)
