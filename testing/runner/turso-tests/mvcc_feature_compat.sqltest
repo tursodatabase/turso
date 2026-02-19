@@ -1,24 +1,32 @@
 @database :memory:
 
-# Test that incompatible features are properly rejected when MVCC is enabled.
+# Test that incompatible features are properly rejected when MVCC is enabled,
+# and that supported features work correctly.
 # These tests only run against tursodb since MVCC is turso-specific.
 
-test mvcc-rejects-create-view {
+test mvcc-allows-create-view {
     PRAGMA journal_mode = 'experimental_mvcc';
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'hello');
     CREATE VIEW v1 AS SELECT * FROM t1;
+    SELECT * FROM v1;
 }
-expect error {
-    Views are not supported in MVCC mode
+expect {
+    experimental_mvcc
+    1|hello
 }
 
-test mvcc-rejects-partial-index {
+test mvcc-allows-partial-index {
     PRAGMA journal_mode = 'experimental_mvcc';
     CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t2 VALUES (1, 10);
+    INSERT INTO t2 VALUES (2, -5);
     CREATE INDEX idx_partial ON t2(val) WHERE val > 0;
+    SELECT id FROM t2 WHERE val > 0;
 }
-expect error {
-    Partial indexes are not supported in MVCC mode
+expect {
+    experimental_mvcc
+    1
 }
 
 test mvcc-rejects-expression-index {

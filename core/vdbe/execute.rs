@@ -8362,10 +8362,11 @@ pub fn op_page_count(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(PageCount { db, dest }, insn);
     let pager = program.get_pager_from_database_index(db);
-    let mv_store = program.connection.mv_store();
-    let count = match with_header(&pager, mv_store.as_ref(), program, |header| {
-        header.database_size.get()
-    }) {
+    // Always read page count from the pager, not from the MVCC header.
+    // The pager is the authoritative source for page count since it manages
+    // physical page allocation. The MVCC header's database_size may be stale
+    // because page allocations update the pager's header, not the MVCC header.
+    let count = match pager.with_header(|header| header.database_size.get()) {
         Err(_) => 0.into(),
         Ok(IOResult::Done(v)) => v.into(),
         Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
@@ -11144,8 +11145,6 @@ pub(crate) enum OpVacuumIntoSubState {
         dest_insert_stmt: Box<crate::Statement>,
         table_idx: usize,
     },
-    /// Copy meta values (user_version, application_id) from source to destination
-    CopyMetaValues { dest_conn: Arc<Connection> },
     /// Create triggers and views after data copy (to avoid triggers firing during copy)
     PrepareTriggersViews {
         dest_conn: Arc<Connection>,
@@ -11174,9 +11173,6 @@ pub(crate) struct OpVacuumIntoState {
     table_names: Vec<String>,
     /// Column names for the current table being copied
     current_table_columns: Vec<String>,
-    /// Meta values read from source database header
-    source_user_version: i32,
-    source_application_id: i32,
 }
 
 /// VACUUM INTO - create a compacted copy of the database at the specified path.
@@ -11295,6 +11291,13 @@ fn op_vacuum_into_inner(
                 // must be set before page 1 is allocated (before any schema operations)
                 dest_conn.set_reserved_bytes(reserved_space)?;
 
+                // Copy meta values (user_version, application_id) to destination
+                // BEFORE enabling MVCC, so they go directly to the pager/file.
+                // If done after MVCC enablement, the values would only be written
+                // to the in-memory MVCC header and not persisted to disk.
+                dest_conn.execute(format!("PRAGMA user_version = {user_version}"))?;
+                dest_conn.execute(format!("PRAGMA application_id = {application_id}"))?;
+
                 // Enable MVCC on destination if source has it enabled
                 // Must be done before any schema operations to ensure the log file is created
                 if program.connection.db.mvcc_enabled() {
@@ -11322,8 +11325,6 @@ fn op_vacuum_into_inner(
                 let schema_stmt = program.connection.prepare(schema_sql.as_str())?;
 
                 vacuum_state.dest_db = Some(dest_db);
-                vacuum_state.source_user_version = user_version;
-                vacuum_state.source_application_id = application_id;
 
                 vacuum_state.sub_state = OpVacuumIntoSubState::CollectSchemaRows {
                     dest_conn,
@@ -11505,8 +11506,9 @@ fn op_vacuum_into_inner(
                     { "table_idx": table_idx, "table_names_len": table_names_len }
                 );
                 if table_idx == table_names_len {
-                    // Done copying all tables, now copy meta values
-                    vacuum_state.sub_state = OpVacuumIntoSubState::CopyMetaValues { dest_conn };
+                    // Done copying all tables, create triggers and views
+                    vacuum_state.sub_state =
+                        OpVacuumIntoSubState::PrepareTriggersViews { dest_conn, idx: 0 };
                     continue;
                 }
 
@@ -11687,25 +11689,6 @@ fn op_vacuum_into_inner(
                     return Err(LimboError::Busy);
                 }
             },
-
-            OpVacuumIntoSubState::CopyMetaValues { dest_conn } => {
-                // Copy meta values to destination database
-                // Use pragma_update to set user_version and application_id
-                // Note: schema_version is not copied - VACUUM INTO creates a new file so
-                // there's no cache to invalidate. The destination will have its own
-                // schema_version based on the schema operations performed.
-                dest_conn
-                    .pragma_update("user_version", vacuum_state.source_user_version.to_string())?;
-                dest_conn.pragma_update(
-                    "application_id",
-                    vacuum_state.source_application_id.to_string(),
-                )?;
-
-                // Now create triggers and views (after data copy to avoid triggers firing)
-                vacuum_state.sub_state =
-                    OpVacuumIntoSubState::PrepareTriggersViews { dest_conn, idx: 0 };
-                continue;
-            }
 
             OpVacuumIntoSubState::PrepareTriggersViews { dest_conn, idx } => {
                 let schema_rows_len = vacuum_state.schema_rows.len();

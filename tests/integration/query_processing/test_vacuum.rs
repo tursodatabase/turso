@@ -229,8 +229,7 @@ fn test_vacuum_into_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// Test VACUUM INTO with views (simple and complex views with aggregations)
-/// Note: Views are not yet supported with MVCC
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_with_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
@@ -318,8 +317,7 @@ fn test_vacuum_into_with_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
 /// Test VACUUM INTO with triggers (single and multiple).
 /// Verifies that trigger definitions are preserved in the vacuumed database
 /// and that data inserted by triggers during initial inserts is copied correctly.
-/// Note: Triggers are not yet fully supported with MVCC
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
 
@@ -361,7 +359,10 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
     let dest_conn = dest_db.connect_limbo();
 
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    if !tmp_db.enable_mvcc {
+        // MVCC meta table is removed so content won't match
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     let triggers: Vec<(String,)> =
         dest_conn.exec_rows("SELECT name FROM sqlite_schema WHERE type = 'trigger' ORDER BY name");
@@ -410,9 +411,8 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
 }
 
 /// Test VACUUM INTO preserves meta values: user_version, application_id
-/// Note: Some pragmas don't work correctly with MVCC yet
 #[cfg_attr(feature = "checksum", ignore)]
-#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
@@ -430,7 +430,10 @@ fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Resul
     let dest_db1 = TempDatabase::new_with_existent(&dest_path1);
     let dest_conn1 = dest_db1.connect_limbo();
     assert_eq!(run_integrity_check(&dest_conn1), "ok");
-    assert_eq!(source_hash1.hash, compute_dbhash(&dest_db1).hash);
+    if !tmp_db.enable_mvcc {
+        // MVCC meta table is removed so content won't match
+        assert_eq!(source_hash1.hash, compute_dbhash(&dest_db1).hash);
+    }
 
     let uv: Vec<(i64,)> = dest_conn1.exec_rows("PRAGMA user_version");
     assert_eq!(uv, vec![(42,)], "user_version should be 42");
@@ -448,7 +451,10 @@ fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Resul
     let dest_db2 = TempDatabase::new_with_existent(&dest_path2);
     let dest_conn2 = dest_db2.connect_limbo();
     assert_eq!(run_integrity_check(&dest_conn2), "ok");
-    assert_eq!(source_hash2.hash, compute_dbhash(&dest_db2).hash);
+    if !tmp_db.enable_mvcc {
+        // MVCC meta table is removed so content won't match
+        assert_eq!(source_hash2.hash, compute_dbhash(&dest_db2).hash);
+    }
 
     let uv: Vec<(i64,)> = dest_conn2.exec_rows("PRAGMA user_version");
     assert_eq!(uv, vec![(-1,)], "Negative user_version should be preserved");
@@ -923,8 +929,7 @@ fn test_vacuum_into_special_column_names(tmp_db: TempDatabase) -> anyhow::Result
 
 /// Test VACUUM INTO with large blobs that trigger overflow pages
 /// Each 8KiB blob exceeds the 4KiB page size, forcing overflow page usage
-/// Note: page_count pragma doesn't work correctly with MVCC yet
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_large_data_multi_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -940,12 +945,16 @@ fn test_vacuum_into_large_data_multi_page(tmp_db: TempDatabase) -> anyhow::Resul
     }
 
     let source_hash = compute_dbhash(&tmp_db);
-    let page_count: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
-    assert!(
-        page_count[0].0 > 10,
-        "Source should have multiple pages, got: {}",
-        page_count[0].0
-    );
+    if !tmp_db.enable_mvcc {
+        // In MVCC mode, inserts are stored in-memory (MvStore) and not yet
+        // flushed to B-tree pages, so page_count reflects only the schema.
+        let page_count: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
+        assert!(
+            page_count[0].0 > 10,
+            "Source should have multiple pages, got: {}",
+            page_count[0].0
+        );
+    }
 
     let dest_dir = TempDir::new()?;
     let dest_path = dest_dir.path().join("vacuumed_large.db");
@@ -1274,8 +1283,7 @@ fn test_vacuum_into_preserves_reserved_space(tmp_db: TempDatabase) -> anyhow::Re
 
 /// Test VACUUM INTO with partial indexes (CREATE INDEX ... WHERE)
 /// NOTE: There is a bug with partial indexes which fails integrity_check on the destination.
-/// Note: Partial indexes are not supported with MVCC
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute(

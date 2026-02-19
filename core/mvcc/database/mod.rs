@@ -1037,6 +1037,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
                 });
                 if self.write_set.is_empty() {
+                    // Propagate the transaction's header to the global header
+                    // even when there are no row changes. This is needed for
+                    // header-only mutations such as PRAGMA user_version = N.
+                    mvcc_store.global_header.write().replace(*tx.header.read());
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);

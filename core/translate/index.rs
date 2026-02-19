@@ -64,13 +64,8 @@ pub fn translate_create_index(
         )
     }
 
-    if connection.mvcc_enabled() {
-        if where_clause.is_some() {
-            bail_parse_error!("Partial indexes are not supported in MVCC mode");
-        }
-        if using.is_some() {
-            bail_parse_error!("Custom index modules are not supported in MVCC mode");
-        }
+    if connection.mvcc_enabled() && using.is_some() {
+        bail_parse_error!("Custom index modules are not supported in MVCC mode");
     }
 
     let original_idx_name = idx_name;

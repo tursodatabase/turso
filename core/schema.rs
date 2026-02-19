@@ -810,9 +810,6 @@ impl Schema {
                 if index.columns.iter().any(|c| c.expr.is_some()) {
                     crate::bail_parse_error!("Expression indexes are not supported with MVCC");
                 }
-                if index.where_clause.is_some() {
-                    crate::bail_parse_error!("Partial indexes are not supported with MVCC");
-                }
                 if index.index_method.is_some() {
                     crate::bail_parse_error!("Custom index modules are not supported with MVCC");
                 }
@@ -991,7 +988,7 @@ impl Schema {
         dbsp_state_roots: &mut HashMap<String, i64>,
         dbsp_state_index_roots: &mut HashMap<String, i64>,
         materialized_view_info: &mut HashMap<String, (String, i64)>,
-        mv_store: Option<&Arc<MvStore>>,
+        _mv_store: Option<&Arc<MvStore>>,
         enable_triggers: bool,
     ) -> Result<()> {
         match ty {
@@ -1105,9 +1102,6 @@ impl Schema {
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
-                if mv_store.is_some() {
-                    crate::bail_parse_error!("Views are not supported in MVCC mode");
-                }
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
