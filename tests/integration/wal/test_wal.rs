@@ -41,6 +41,29 @@ fn test_wal_checkpoint_result(tmp_db: TempDatabase) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_truncate_checkpoint_not_busy_after_rollback(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x);")?;
+    conn.execute("INSERT INTO t VALUES (randomblob(10 * 4096 + 0));")?;
+    conn.execute("INSERT INTO t VALUES (randomblob(10 * 4096 + 1));")?;
+    conn.execute("INSERT INTO t VALUES (randomblob(10 * 4096 + 2));")?;
+
+    conn.execute("BEGIN;")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+    conn.execute("ROLLBACK;")?;
+
+    let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_eq!(
+        checkpoint,
+        vec![0, 0, 0],
+        "truncate checkpoint should not return busy after rollback"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {

@@ -362,6 +362,16 @@ pub fn op_checkpoint(
         return Err(LimboError::TableLocked);
     }
     let pager = program.get_pager_from_database_index(database);
+    // In autocommit mode, this statement can still hold an implicit read tx.
+    // RESTART/TRUNCATE checkpoint needs to restart WAL and may fail with Busy
+    // if we keep our own statement read slot while checkpointing.
+    if matches!(
+        checkpoint_mode,
+        CheckpointMode::Restart | CheckpointMode::Truncate { .. }
+    ) && pager.holds_read_lock()
+    {
+        pager.end_read_tx();
+    }
     // Re-fetch mv_store from connection to get the latest value.
     // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
     // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "experimental_mvcc"`).
