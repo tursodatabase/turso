@@ -3065,10 +3065,10 @@ impl IndexMethodCursor for FtsCursor {
         // Determine limit based on pattern:
         // - Patterns WITHOUT LIMIT in pattern: fetch all matches (high limit)
         // - Patterns WITH LIMIT: use the captured limit value from values[2]
-        let limit = match pattern_idx {
+        let limit_raw = match pattern_idx {
             // Patterns without LIMIT - fetch all matches
             FTS_PATTERN_MATCH | FTS_PATTERN_COMBINED | FTS_PATTERN_COMBINED_ORDERED => {
-                Self::MAX_NO_LIMIT_RESULT
+                Self::MAX_NO_LIMIT_RESULT as i64
             }
             // Patterns with LIMIT - use captured limit value
             FTS_PATTERN_SCORE
@@ -3077,9 +3077,7 @@ impl IndexMethodCursor for FtsCursor {
             | FTS_PATTERN_COMBINED_ORDERED_LIMIT => {
                 if values.len() > 2 {
                     match &values[2] {
-                        Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => {
-                            *i as usize
-                        }
+                        Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
                         _ => {
                             tracing::debug!(
                                 "FTS query_start: LIMIT value is not an integer, using default 10"
@@ -3121,6 +3119,18 @@ impl IndexMethodCursor for FtsCursor {
         let query = parser
             .parse_query(&query_str)
             .map_err(|e| LimboError::InternalError(format!("FTS parse error: {e}")))?;
+
+        if limit_raw == 0 {
+            self.current_hits.clear();
+            self.hit_pos = 0;
+            return Ok(IOResult::Done(false));
+        }
+
+        let limit = if limit_raw < 0 {
+            Self::MAX_NO_LIMIT_RESULT
+        } else {
+            limit_raw as usize
+        };
 
         let top_docs = searcher
             .search(&query, &tantivy::collector::TopDocs::with_limit(limit))

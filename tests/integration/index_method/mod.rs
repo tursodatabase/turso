@@ -709,6 +709,43 @@ fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {
     }
 }
 
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_limit_zero_and_negative(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")
+        .unwrap();
+
+    conn.execute("INSERT INTO articles VALUES (1, 'hello world', 'this is a test')")
+        .unwrap();
+    conn.execute("INSERT INTO articles VALUES (2, 'another', 'hello again')")
+        .unwrap();
+    conn.execute("INSERT INTO articles VALUES (3, 'no match', 'something else')")
+        .unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT fts_score(title, body, 'hello') as score FROM articles ORDER BY score DESC LIMIT 0",
+    );
+    assert!(rows.is_empty());
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT fts_score(title, body, 'hello') as score FROM articles ORDER BY score DESC LIMIT -1",
+    );
+    assert_eq!(rows.len(), 2);
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT fts_score(title, body, 'hello') as score FROM articles WHERE fts_match(title, body, 'hello') ORDER BY score DESC",
+    );
+    assert_eq!(rows.len(), 2);
+}
+
 /// Test FTS function recognition mode - queries that don't match predefined patterns
 /// but are optimized via fts_match/fts_score function detection.
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
