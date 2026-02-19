@@ -126,10 +126,12 @@ pub fn translate_create_trigger(
     }
 
     // Verify the table exists
-    if resolver.with_schema(database_id, |s| {
-        s.get_table(&normalized_table_name).is_none()
-    }) {
+    let table = resolver.with_schema(database_id, |s| s.get_table(&normalized_table_name));
+    let Some(table) = table else {
         bail_parse_error!("no such table: {}", normalized_table_name);
+    };
+    if table.virtual_table().is_some() {
+        bail_parse_error!("cannot create triggers on virtual tables");
     }
 
     if time

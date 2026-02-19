@@ -216,6 +216,12 @@ pub fn prepare_update_plan(
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
+    if program.trigger.is_some() && table.virtual_table().is_some() {
+        bail_parse_error!(
+            "unsafe use of virtual table \"{}\"",
+            body.tbl_name.name.as_str()
+        );
+    }
     if database_id >= 2 {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);

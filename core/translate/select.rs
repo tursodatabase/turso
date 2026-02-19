@@ -9,7 +9,7 @@ use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
+use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
     break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
     plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
@@ -42,6 +42,11 @@ pub fn translate_select(
         query_destination,
         connection,
     )?;
+    if program.trigger.is_some() {
+        if let Some(virtual_table) = plan_first_virtual_table_name(&select_plan) {
+            crate::bail_parse_error!("unsafe use of virtual table \"{}\"", virtual_table);
+        }
+    }
     optimize_plan(program, &mut select_plan, resolver)?;
     let num_result_cols;
     let opts = match &select_plan {
@@ -83,6 +88,41 @@ pub fn translate_select(
     program.extend(&opts);
     emit_program(connection, resolver, program, select_plan, |_| {})?;
     Ok(num_result_cols)
+}
+
+fn plan_first_virtual_table_name(plan: &Plan) -> Option<String> {
+    match plan {
+        Plan::Select(select_plan) => select_plan_first_virtual_table_name(select_plan),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => select_plan_first_virtual_table_name(right_most).or_else(|| {
+            left.iter()
+                .find_map(|(plan, _)| select_plan_first_virtual_table_name(plan))
+        }),
+        Plan::Delete(_) | Plan::Update(_) => None,
+    }
+}
+
+fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<String> {
+    for joined_table in select_plan.joined_tables() {
+        match &joined_table.table {
+            Table::Virtual(virtual_table) => return Some(virtual_table.name.clone()),
+            Table::FromClauseSubquery(from_clause_subquery) => {
+                if let Some(name) = plan_first_virtual_table_name(&from_clause_subquery.plan) {
+                    return Some(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    for subquery in &select_plan.non_from_clause_subqueries {
+        if let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state {
+            if let Some(name) = select_plan_first_virtual_table_name(plan) {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 pub fn prepare_select_plan(

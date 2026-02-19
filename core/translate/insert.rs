@@ -265,6 +265,9 @@ pub fn translate_insert(
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
+    if program.trigger.is_some() && table.virtual_table().is_some() {
+        crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
+    }
     validate(table_name.as_str(), resolver, &table, connection)?;
 
     let fk_enabled = connection.foreign_keys_enabled();
