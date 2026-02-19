@@ -685,6 +685,13 @@ pub struct BTreeCursor {
     /// Reusable buffer for cell payloads during insert/update operations.
     /// This avoids allocating a new Vec for each write operation.
     reusable_cell_payload: Vec<u8>,
+    /// The btree generation number last seen by this cursor. Used to detect when another
+    /// cursor (e.g. from a trigger subprogram) modified the same btree, invalidating
+    /// this cursor's position. Implements SQLite's saveAllCursors() lazily.
+    last_seen_generation: u64,
+    /// Saved cursor position for re-seeking after btree modification by another cursor.
+    /// Distinct from `context` which is used for self-caused invalidation (e.g. balancing).
+    saved_position: Option<CursorContext>,
 }
 
 crate::assert::assert_send!(BTreeCursor);
@@ -752,6 +759,8 @@ impl BTreeCursor {
             move_to_state: MoveToState::Start,
             skip_advance: false,
             reusable_cell_payload: Vec::new(),
+            last_seen_generation: 0,
+            saved_position: None,
         }
     }
 
@@ -4909,6 +4918,86 @@ impl BTreeCursor {
         self.pager
             .do_allocate_page(page_type, offset, BtreePageAllocMode::Any)
     }
+
+    /// Save the current cursor position for later re-seeking if another cursor modifies
+    /// the same btree (e.g. a trigger subprogram). Also snapshots the current btree generation.
+    ///
+    /// For table cursors: saves the rowid (always available from the cell header).
+    /// For index cursors: saves the full record (may require reading overflow pages).
+    fn save_current_position(&mut self) -> Result<IOResult<()>> {
+        // Snapshot generation first to prevent recursive calls: save_current_position()
+        // may call record() for index cursors, which calls ensure_position_valid().
+        // By updating last_seen_generation first, the ensure_position_valid() check
+        // sees matching generations and becomes a no-op.
+        self.last_seen_generation = self.pager.btree_generation(self.root_page);
+
+        if !self.has_record {
+            self.saved_position = None;
+            return Ok(IOResult::Done(()));
+        }
+
+        let cell_idx = self.stack.current_cell_index();
+        if cell_idx < 0 {
+            self.saved_position = None;
+            return Ok(IOResult::Done(()));
+        }
+
+        let page = self.stack.top_ref();
+        let contents = page.get_contents();
+        let page_type = contents.page_type()?;
+
+        // Also guard against cell_idx being past the end of the page (e.g. after seek_end).
+        if cell_idx as usize >= contents.cell_count() {
+            self.saved_position = None;
+            return Ok(IOResult::Done(()));
+        }
+
+        let key = if page_type.is_table() {
+            let rowid = contents.cell_table_leaf_read_rowid(cell_idx as usize)?;
+            CursorContextKey::TableRowId(rowid)
+        } else {
+            // Index cursor: need the full record for re-seeking.
+            let _ = return_if_io!(self.record());
+            let record = self
+                .reusable_immutable_record
+                .as_ref()
+                .expect("record should be loaded after record() call");
+            CursorContextKey::IndexKeyRowId(record.clone())
+        };
+
+        self.saved_position = Some(CursorContext {
+            key,
+            seek_op: SeekOp::GE { eq_only: true },
+        });
+        Ok(IOResult::Done(()))
+    }
+
+    /// Check if the btree has been modified by another cursor since this cursor was last
+    /// positioned. If so, re-seek to the saved position.
+    ///
+    /// This implements SQLite's saveAllCursors() approach lazily: instead of eagerly saving
+    /// all cursors before every write, each cursor checks on read whether the btree generation
+    /// has changed and re-seeks if needed.
+    fn ensure_position_valid(&mut self) -> Result<IOResult<()>> {
+        let current_gen = self.pager.btree_generation(self.root_page);
+        if current_gen == self.last_seen_generation {
+            return Ok(IOResult::Done(()));
+        }
+        // Btree was modified by another cursor. Re-seek to saved position.
+        if let Some(ctx) = self.saved_position.take() {
+            let seek_key = match ctx.key {
+                CursorContextKey::TableRowId(rowid) => SeekKey::TableRowId(rowid),
+                CursorContextKey::IndexKeyRowId(ref record) => SeekKey::IndexKey(record),
+            };
+            // seek() internally calls save_current_position(), which updates
+            // last_seen_generation and saved_position.
+            return_if_io!(self.seek(seek_key, ctx.seek_op));
+        } else {
+            // No saved position (cursor was at EOF or not positioned).
+            self.last_seen_generation = current_gen;
+        }
+        Ok(IOResult::Done(()))
+    }
 }
 
 impl CursorTrait for BTreeCursor {
@@ -4929,6 +5018,7 @@ impl CursorTrait for BTreeCursor {
                 self.set_has_record(has_record);
                 // If we are positioned at a record, we stop here without advancing.
                 self.read_overflow_state = None;
+                return_if_io!(self.save_current_position());
                 return Ok(IOResult::Done(()));
             }
             // But: if we aren't currently positioned at a record (for example, we are at the end of a page),
@@ -4945,6 +5035,7 @@ impl CursorTrait for BTreeCursor {
                     return_if_io!(self.get_next_record());
                     self.advance_state = AdvanceState::Start;
                     self.read_overflow_state = None;
+                    return_if_io!(self.save_current_position());
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -4958,6 +5049,7 @@ impl CursorTrait for BTreeCursor {
         self.set_has_record(cursor_has_record);
         self.invalidate_record();
         self.read_overflow_state = None;
+        return_if_io!(self.save_current_position());
         Ok(IOResult::Done(()))
     }
 
@@ -4973,6 +5065,7 @@ impl CursorTrait for BTreeCursor {
                     return_if_io!(self.get_prev_record());
                     self.advance_state = AdvanceState::Start;
                     self.read_overflow_state = None;
+                    return_if_io!(self.save_current_position());
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -4985,6 +5078,7 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(None));
         }
         if self.has_record() {
+            return_if_io!(self.ensure_position_valid());
             let page = self.stack.top_ref();
             let contents = page.get_contents();
             let page_type = contents.page_type()?;
@@ -5016,6 +5110,7 @@ impl CursorTrait for BTreeCursor {
         self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
         self.read_overflow_state = None;
+        return_if_io!(self.save_current_position());
         Ok(IOResult::Done(seek_result))
     }
 
@@ -5037,6 +5132,7 @@ impl CursorTrait for BTreeCursor {
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
+        return_if_io!(self.save_current_position());
         Ok(IOResult::Done(seek_result))
     }
 
@@ -5045,6 +5141,7 @@ impl CursorTrait for BTreeCursor {
         if !self.has_record() {
             return Ok(IOResult::Done(None));
         }
+        return_if_io!(self.ensure_position_valid());
         let invalidated = self
             .reusable_immutable_record
             .as_ref()
@@ -5100,6 +5197,9 @@ impl CursorTrait for BTreeCursor {
         if key.maybe_rowid().is_some() {
             self.set_has_record(true);
         }
+        self.pager.increment_btree_generation(self.root_page);
+        // Update our own generation so we don't re-seek due to our own modification.
+        self.last_seen_generation = self.pager.btree_generation(self.root_page);
         Ok(IOResult::Done(()))
     }
 
@@ -5442,6 +5542,8 @@ impl CursorTrait for BTreeCursor {
                             // except we need to retreat, so that the next call to BTreeCursor::next() lands at the next record (because we deleted the current one)
                             self.stack.retreat();
                             self.state = CursorState::None;
+                            self.pager.increment_btree_generation(self.root_page);
+                            self.last_seen_generation = self.pager.btree_generation(self.root_page);
                             return Ok(IOResult::Done(()));
                         }
                     }
@@ -5449,6 +5551,8 @@ impl CursorTrait for BTreeCursor {
                 DeleteState::PostInteriorNodeReplacement => {
                     return_if_io!(self.get_next_record());
                     self.state = CursorState::None;
+                    self.pager.increment_btree_generation(self.root_page);
+                    self.last_seen_generation = self.pager.btree_generation(self.root_page);
                     return Ok(IOResult::Done(()));
                 }
 
@@ -5468,6 +5572,8 @@ impl CursorTrait for BTreeCursor {
                     // a row when deleting rows in a loop.
                     self.skip_advance = true;
                     self.state = CursorState::None;
+                    self.pager.increment_btree_generation(self.root_page);
+                    self.last_seen_generation = self.pager.btree_generation(self.root_page);
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -5506,7 +5612,10 @@ impl CursorTrait for BTreeCursor {
     /// this method only clears the tree’s contents. The root page remains
     /// allocated and is reset to an empty leaf page.
     fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
-        self.destroy_btree_contents(true)
+        let result = return_if_io!(self.destroy_btree_contents(true));
+        self.pager.increment_btree_generation(self.root_page);
+        self.last_seen_generation = self.pager.btree_generation(self.root_page);
+        Ok(IOResult::Done(result))
     }
 
     /// Destroys the entire B-Tree, including the root page.
@@ -5517,7 +5626,10 @@ impl CursorTrait for BTreeCursor {
     /// For cases where the B-Tree should remain allocated but emptied, see [`btree_clear`].
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
-        self.destroy_btree_contents(false)
+        let result = return_if_io!(self.destroy_btree_contents(false));
+        self.pager.increment_btree_generation(self.root_page);
+        self.last_seen_generation = self.pager.btree_generation(self.root_page);
+        Ok(IOResult::Done(result))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
@@ -5656,6 +5768,7 @@ impl CursorTrait for BTreeCursor {
                     return_if_io!(self.get_next_record());
                     self.rewind_state = RewindState::Start;
                     self.read_overflow_state = None;
+                    return_if_io!(self.save_current_position());
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -5751,6 +5864,7 @@ impl CursorTrait for BTreeCursor {
                         self.seek_to_last_state = SeekToLastState::IsEmpty;
                         continue;
                     }
+                    return_if_io!(self.save_current_position());
                     return Ok(IOResult::Done(()));
                 }
                 SeekToLastState::IsEmpty => {

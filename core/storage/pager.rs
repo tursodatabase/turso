@@ -35,6 +35,7 @@ use crate::{
 };
 use arc_swap::ArcSwapOption;
 use roaring::RoaringBitmap;
+use rustc_hash::FxHashMap;
 use std::cell::UnsafeCell;
 use tracing::{instrument, trace, Level};
 
@@ -1236,6 +1237,11 @@ pub struct Pager {
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
     sync_type: AtomicFileSyncType,
+    /// Generation counter per btree root page. Incremented on any btree modification
+    /// (insert, delete, clear). Used by cursors to detect when a btree has been modified
+    /// by another cursor (e.g. from a trigger subprogram) and re-seek to their saved position.
+    /// This implements SQLite's saveAllCursors() approach lazily.
+    btree_generations: RwLock<FxHashMap<i64, u64>>,
 }
 
 assert_send_sync!(Pager);
@@ -1404,6 +1410,7 @@ impl Pager {
             init_page_1,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
+            btree_generations: RwLock::new(FxHashMap::default()),
         })
     }
 
@@ -2668,6 +2675,25 @@ impl Pager {
         }
         page.set_dirty();
         Ok(())
+    }
+
+    /// Get the current btree generation for a given root page.
+    /// Returns 0 if the btree has never been modified.
+    pub fn btree_generation(&self, root_page: i64) -> u64 {
+        self.btree_generations
+            .read()
+            .get(&root_page)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Increment the btree generation for a given root page.
+    /// Called after any btree modification (insert, delete, clear) to signal
+    /// other cursors on the same btree that their position may be stale.
+    pub fn increment_btree_generation(&self, root_page: i64) {
+        let mut gens = self.btree_generations.write();
+        let gen = gens.entry(root_page).or_insert(0);
+        *gen += 1;
     }
 
     pub fn wal_state(&self) -> Result<WalState> {

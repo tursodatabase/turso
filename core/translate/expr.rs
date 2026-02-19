@@ -2575,50 +2575,15 @@ pub fn translate_expr(
                             let is_btree_index = index_cursor_id.is_some_and(|cid| {
                                 program.get_cursor_type(cid).is_some_and(|ct| ct.is_index())
                             });
-                            // FIXME(https://github.com/tursodatabase/turso/issues/4801):
-                            // This is a defensive workaround for cursor desynchronization.
-                            //
-                            // When `use_covering_index` is false, both table AND index cursors
-                            // are open and positioned at the same row. If we read some columns
-                            // from the index cursor and others from the table cursor, we rely
-                            // on both cursors staying synchronized.
-                            //
-                            // The problem: AFTER triggers can INSERT into the same table,
-                            // which modifies the index btree. This repositions or invalidates
-                            // the parent program's index cursor, while the table cursor remains
-                            // at the correct position. Result: we read a mix of data from
-                            // different rows - corruption.
-                            //
-                            // Why does the table cursor not have this problem? Because it's
-                            // explicitly re-sought by rowid (via NotExists instruction) before
-                            // each use. The rowid is stored in a register and used as a stable
-                            // key. The index cursor, by contrast, just trusts its internal
-                            // position (page + cell index) without re-seeking.
-                            //
-                            // Why not check if the table has triggers and allow the optimization
-                            // when there are none? Several reasons:
-                            // 1. ProgramBuilder.trigger indicates if THIS program is a trigger
-                            //    subprogram, not whether the table has triggers.
-                            // 2. In translate_expr(), we lack context about which table is being
-                            //    modified or whether we're even in an UPDATE/INSERT/DELETE.
-                            // 3. Triggers can be recursive (trigger on T inserts into U, whose
-                            //    trigger inserts back into T).
-                            //
-                            // The proper fix is to implement SQLite's `saveAllCursors()` approach:
-                            // before ANY btree write, find all cursors pointing to that btree
-                            // (by root_page) and save their positions. When those cursors are
-                            // next accessed, they re-seek to their saved position. This could
-                            // be done lazily with a generation number per btree - cursors check
-                            // if the generation changed and re-seek if needed. This would
-                            // require a global cursor registry and significant refactoring.
-                            //
-                            // For now, we only read from the index cursor when `use_covering_index`
-                            // is true, meaning only the index cursor exists (no table cursor to
-                            // get out of sync with). This foregoes the optimization of reading
-                            // individual columns from a non-covering index.
+                            // Read from the index cursor if the column is available there.
+                            // This is safe even when triggers modify the same btree because
+                            // BTreeCursor now implements generation-based cursor invalidation:
+                            // each cursor saves its position after positioning, and before any
+                            // read, checks if the btree was modified by another cursor. If so,
+                            // it re-seeks to its saved position automatically.
                             let read_from_index = if is_from_outer_query_scope {
                                 is_btree_index
-                            } else if is_btree_index && use_covering_index {
+                            } else if is_btree_index {
                                 index.as_ref().is_some_and(|idx| {
                                     idx.column_table_pos_to_index_pos(*column).is_some()
                                 })
