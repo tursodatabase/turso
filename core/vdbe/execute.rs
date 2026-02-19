@@ -11834,8 +11834,7 @@ fn op_journal_mode_inner(
 
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc) {
-                    let cdc_info = program.connection.get_capture_data_changes_info();
-                    if cdc_info.is_some() {
+                    if program.connection.get_capture_data_changes_info().is_some() {
                         return Err(LimboError::InternalError(
                             "cannot enable MVCC while CDC is active".to_string(),
                         ));

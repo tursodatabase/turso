@@ -71,7 +71,7 @@ pub fn translate_pragma(
         Err(_) => bail_parse_error!("Not a valid pragma name"),
     };
 
-    let database_id = connection.resolve_database_id(name)?;
+    let database_id = resolver.resolve_database_id(name)?;
 
     let mode = match body {
         None => query_pragma(
@@ -306,7 +306,7 @@ fn update_pragma(
                 ));
             }
 
-            let is_empty = is_database_empty(resolver.schema, &pager)?;
+            let is_empty = is_database_empty(resolver.schema(), &pager)?;
             tracing::debug!(
                 "Checking if database is empty for auto_vacuum pragma: {}",
                 is_empty
@@ -543,7 +543,7 @@ fn query_pragma(
     database_id: usize,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
-    let schema = resolver.schema;
+    let schema = resolver.schema();
     let register = program.alloc_register();
     match pragma {
         PragmaName::ApplicationId => {
@@ -958,7 +958,7 @@ fn query_pragma(
             // we need 6 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(5);
             if let Some(name) = name {
-                connection.with_schema(database_id, |db_schema| {
+                resolver.with_schema(database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&name) {
                         emit_columns_for_table_info(program, table.columns(), base_reg, false);
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&name) {
@@ -986,7 +986,7 @@ fn query_pragma(
             // we need 7 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(6);
             if let Some(name) = name {
-                connection.with_schema(database_id, |db_schema| {
+                resolver.with_schema(database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&name) {
                         emit_columns_for_table_info(program, table.columns(), base_reg, true);
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&name) {

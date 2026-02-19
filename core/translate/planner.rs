@@ -763,7 +763,7 @@ fn parse_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
-    let database_id = connection.resolve_database_id(qualified_name)?;
+    let database_id = resolver.resolve_database_id(qualified_name)?;
     let table_name = &qualified_name.name;
 
     // Check if the FROM clause table is referring to a CTE in the current scope.
@@ -889,7 +889,7 @@ fn parse_table(
     }
 
     // Resolve table using connection's with_schema method
-    let table = connection.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+    let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
         let alias = maybe_alias
@@ -924,7 +924,7 @@ fn parse_table(
     };
 
     let regular_view =
-        connection.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
+        resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery
         view.process()?;
@@ -956,12 +956,12 @@ fn parse_table(
         return result;
     }
 
-    let view = connection.with_schema(database_id, |schema| {
+    let view = resolver.with_schema(database_id, |schema| {
         schema.get_materialized_view(table_name.as_str())
     });
     if let Some(view) = view {
         // First check if the DBSP state table exists with the correct version
-        let has_compatible_state = connection.with_schema(database_id, |schema| {
+        let has_compatible_state = resolver.with_schema(database_id, |schema| {
             schema.has_compatible_dbsp_state_table(table_name.as_str())
         });
 
@@ -1053,7 +1053,7 @@ fn parse_table(
     }
 
     // Check if this is an incompatible view
-    let is_incompatible = connection.with_schema(database_id, |schema| {
+    let is_incompatible = resolver.with_schema(database_id, |schema| {
         schema
             .incompatible_views
             .contains(&normalized_qualified_name)
@@ -1263,7 +1263,7 @@ pub fn parse_where(
     table_references: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
-    connection: &Arc<crate::Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
@@ -1273,7 +1273,7 @@ pub fn parse_where(
                 &mut expr.expr,
                 Some(table_references),
                 result_columns,
-                connection,
+                resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
@@ -1730,7 +1730,7 @@ fn parse_join(
                         &mut predicate.expr,
                         Some(table_references),
                         None,
-                        connection,
+                        resolver,
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
@@ -1873,13 +1873,13 @@ where
 #[allow(clippy::type_complexity)]
 pub fn parse_limit(
     mut limit: Limit,
-    connection: &crate::sync::Arc<crate::Connection>,
+    resolver: &Resolver,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
     bind_and_rewrite_expr(
         &mut limit.expr,
         None,
         None,
-        connection,
+        resolver,
         BindingBehavior::TryResultColumnsFirst,
     )?;
     if let Some(ref mut off_expr) = limit.offset {
@@ -1887,7 +1887,7 @@ pub fn parse_limit(
             off_expr,
             None,
             None,
-            connection,
+            resolver,
             BindingBehavior::TryResultColumnsFirst,
         )?;
     }

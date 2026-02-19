@@ -222,21 +222,21 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
-    let database_id = connection.resolve_database_id(&qualified_name)?;
+    let database_id = resolver.resolve_database_id(&qualified_name)?;
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     program.begin_write_operation();
     let table_name = qualified_name.name.as_str();
-    let schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     validate(&alter_table, table_name)?;
 
-    let table_indexes = connection.with_schema(database_id, |s| {
+    let table_indexes = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect::<Vec<_>>()
     });
 
-    let Some(table) = connection.with_schema(database_id, |s| s.get_table(table_name)) else {
+    let Some(table) = resolver.with_schema(database_id, |s| s.get_table(table_name)) else {
         return Err(LimboError::ParseError(format!(
             "no such table: {table_name}"
         )));
@@ -260,7 +260,7 @@ pub fn translate_alter_table(
     };
 
     // Check if this table has dependent materialized views
-    let dependent_views = connection.with_schema(database_id, |s| {
+    let dependent_views = resolver.with_schema(database_id, |s| {
         s.get_dependent_materialized_views(table_name)
     });
     if !dependent_views.is_empty() {
@@ -346,7 +346,7 @@ pub fn translate_alter_table(
                         }],
                     );
                     let where_copy = index
-                        .bind_where_expr(Some(&mut table_references), connection)
+                        .bind_where_expr(Some(&mut table_references), resolver)
                         .ok_or_else(|| {
                             LimboError::ParseError(
                                 "index where clause unexpectedly missing".to_string(),
@@ -419,7 +419,7 @@ pub fn translate_alter_table(
             // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
 
             // Check if any trigger owned by this table references the column being dropped
-            let triggers_for_table: Vec<_> = connection.with_schema(database_id, |s| {
+            let triggers_for_table: Vec<_> = resolver.with_schema(database_id, |s| {
                 s.get_triggers_for_table(table_name).cloned().collect()
             });
             for trigger in &triggers_for_table {
@@ -798,7 +798,7 @@ pub fn translate_alter_table(
         ast::AlterTableBody::RenameTo(new_name) => {
             let new_name = new_name.as_str();
 
-            if connection.with_schema(database_id, |s| {
+            if resolver.with_schema(database_id, |s| {
                 s.get_table(new_name).is_some()
                     || s.indexes
                         .values()
@@ -810,15 +810,12 @@ pub fn translate_alter_table(
                 )));
             };
 
-            let sqlite_schema =
-                resolver
-                    .schema
-                    .get_btree_table(SQLITE_TABLEID)
-                    .ok_or_else(|| {
-                        LimboError::ParseError(
-                            "sqlite_schema table not found in schema".to_string(),
-                        )
-                    })?;
+            let sqlite_schema = resolver
+                .schema()
+                .get_btree_table(SQLITE_TABLEID)
+                .ok_or_else(|| {
+                    LimboError::ParseError("sqlite_schema table not found in schema".to_string())
+                })?;
 
             let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
 
@@ -986,7 +983,7 @@ pub fn translate_alter_table(
             if rename {
                 // Find all triggers that might reference this column
                 let target_table_name_norm = normalize_ident(table_name);
-                let all_triggers: Vec<_> = connection.with_schema(database_id, |s| {
+                let all_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
                     s.triggers.values().flatten().cloned().collect()
                 });
                 for trigger in &all_triggers {
@@ -996,7 +993,7 @@ pub fn translate_alter_table(
                     // or if trigger commands contain qualified references to the trigger table (e.g., t.x)
                     if trigger_table_name_norm == target_table_name_norm {
                         let column_name_norm = normalize_ident(from);
-                        let trigger_table = connection
+                        let trigger_table = resolver
                             .with_schema(database_id, |s| {
                                 s.get_btree_table(&trigger_table_name_norm)
                             })
@@ -1045,7 +1042,7 @@ pub fn translate_alter_table(
 
                     if trigger_table_name_norm == target_table_name_norm {
                         // Trigger is on the table being renamed - check for references
-                        let trigger_table = connection
+                        let trigger_table = resolver
                             .with_schema(database_id, |s| {
                                 s.get_btree_table(&trigger_table_name_norm)
                             })
@@ -1091,15 +1088,12 @@ pub fn translate_alter_table(
                 }
             }
 
-            let sqlite_schema =
-                resolver
-                    .schema
-                    .get_btree_table(SQLITE_TABLEID)
-                    .ok_or_else(|| {
-                        LimboError::ParseError(
-                            "sqlite_schema table not found in schema".to_string(),
-                        )
-                    })?;
+            let sqlite_schema = resolver
+                .schema()
+                .get_btree_table(SQLITE_TABLEID)
+                .ok_or_else(|| {
+                    LimboError::ParseError("sqlite_schema table not found in schema".to_string())
+                })?;
 
             let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
 
@@ -1234,7 +1228,7 @@ fn translate_rename_virtual_table(
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> Result<()> {
-    let schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_operation();
     let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
     program.emit_insn(Insn::VOpen {
@@ -1248,7 +1242,7 @@ fn translate_rename_virtual_table(
     });
     // Rewrite sqlite_schema entry
     let sqlite_schema = resolver
-        .schema
+        .schema()
         .get_btree_table(SQLITE_TABLEID)
         .ok_or_else(|| {
             LimboError::ParseError("sqlite_schema table not found in schema".to_string())
@@ -2195,7 +2189,7 @@ fn rewrite_trigger_sql_for_column_rename(
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
     let trigger_table = resolver
-        .schema
+        .schema()
         .get_btree_table(&trigger_table_name)
         .ok_or_else(|| {
             LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
@@ -2205,7 +2199,7 @@ fn rewrite_trigger_sql_for_column_rename(
     // We need to check if the column exists in the table being renamed
     let target_table_name = normalize_ident(table_name);
     let target_table = resolver
-        .schema
+        .schema()
         .get_btree_table(&target_table_name)
         .ok_or_else(|| {
             LimboError::ParseError(format!("target table not found: {target_table_name}"))
@@ -2295,7 +2289,7 @@ fn rewrite_expr_for_column_rename(
             let ctx_name_norm = normalize_ident(ctx_name);
             let is_renaming = ctx_name_norm == target_table_name_norm;
             let table = resolver
-                .schema
+                .schema()
                 .get_btree_table(&ctx_name_norm)
                 .ok_or_else(|| {
                     LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))

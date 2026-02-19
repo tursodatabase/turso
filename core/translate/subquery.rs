@@ -375,7 +375,7 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema)?;
+                optimize_select_plan(&mut plan, resolver.schema())?;
                 // EXISTS subqueries are satisfied after at most 1 row has been returned.
                 plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                     "1".to_string(),
@@ -423,7 +423,7 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema)?;
+                optimize_select_plan(&mut plan, resolver.schema())?;
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
@@ -491,7 +491,7 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema)?;
+                optimize_select_plan(&mut plan, resolver.schema())?;
                 // e.g. (x,y) IN (SELECT ...)
                 // or x IN (SELECT ...)
                 let lhs_columns = match unwrap_parens(lhs.as_ref())? {
@@ -1203,7 +1203,7 @@ pub fn emit_from_clause_subquery(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+                resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
@@ -1215,7 +1215,7 @@ pub fn emit_from_clause_subquery(
         Plan::CompoundSelect { .. } => {
             // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
             let plan_clone = plan.clone();
-            let resolver = Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table);
+            let resolver = t_ctx.resolver.fork();
             // emit_program_for_compound_select returns the result column start register
             // for coroutine mode, which is needed by the outer query.
             emit_program_for_compound_select(program, &resolver, plan_clone)?
@@ -1300,7 +1300,7 @@ fn emit_materialized_cte(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+                resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
@@ -1312,7 +1312,7 @@ fn emit_materialized_cte(
         Plan::CompoundSelect { .. } => {
             // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
             let plan_clone = plan.clone();
-            let resolver = Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table);
+            let resolver = t_ctx.resolver.fork();
             emit_program_for_compound_select(program, &resolver, plan_clone)?;
         }
         Plan::Delete(_) | Plan::Update(_) => {
@@ -1387,7 +1387,7 @@ fn emit_indexed_materialized_subquery(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+                resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
@@ -1398,7 +1398,7 @@ fn emit_indexed_materialized_subquery(
         }
         Plan::CompoundSelect { .. } => {
             let plan_clone = plan.clone();
-            let resolver = Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table);
+            let resolver = t_ctx.resolver.fork();
             emit_program_for_compound_select(program, &resolver, plan_clone)?;
         }
         Plan::Delete(_) | Plan::Update(_) => {

@@ -132,7 +132,7 @@ use crate::util::{
 use crate::Result;
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
-    Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
+    LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
@@ -3192,7 +3192,7 @@ impl Index {
     pub fn bind_where_expr(
         &self,
         table_refs: Option<&mut TableReferences>,
-        connection: &Arc<Connection>,
+        resolver: &Resolver,
     ) -> Option<ast::Expr> {
         let Some(where_clause) = &self.where_clause else {
             return None;
@@ -3202,7 +3202,7 @@ impl Index {
             &mut expr,
             table_refs,
             None,
-            connection,
+            resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )
         .ok()?;
