@@ -93,7 +93,8 @@ class Database extends DatabasePromise {
             longPollTimeoutMs: opts.longPollTimeoutMs,
             tracing: opts.tracing,
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
-            remoteEncryption: opts.remoteEncryption?.cipher,
+            remoteEncryptionCipher: opts.remoteEncryption?.cipher,
+            remoteEncryptionKey: opts.remoteEncryption?.key,
             partialSyncOpts: partialSyncOpts
         });
 
