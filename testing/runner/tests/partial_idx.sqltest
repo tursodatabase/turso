@@ -883,3 +883,83 @@ expect {
     1|ab
     2|abcdef
 }
+
+# OR in partial index WHERE clause (issue #5429)
+# The OR expression requires jump_target_when_true to be a real label
+test partial-index-or-where-clause {
+    CREATE TABLE t_or(x INTEGER);
+    INSERT INTO t_or VALUES(0);
+    CREATE INDEX i_or ON t_or(x) WHERE x > 5 OR x < -5;
+    INSERT INTO t_or VALUES(10);
+    INSERT INTO t_or VALUES(-10);
+    INSERT INTO t_or VALUES(3);
+    SELECT x FROM t_or ORDER BY x;
+}
+expect {
+    -10
+    0
+    3
+    10
+}
+
+# NOT BETWEEN in partial index WHERE clause (desugars to OR, issue #5429)
+test partial-index-not-between-existing-rows {
+    CREATE TABLE t_nb(c0 INTEGER);
+    INSERT INTO t_nb VALUES(1);
+    CREATE INDEX i_nb ON t_nb(c0) WHERE c0 NOT BETWEEN 0 AND 0;
+    INSERT INTO t_nb VALUES(5);
+    INSERT INTO t_nb VALUES(-1);
+    INSERT INTO t_nb VALUES(0);
+    SELECT c0 FROM t_nb ORDER BY c0;
+}
+expect {
+    -1
+    0
+    1
+    5
+}
+
+# OR with multiple existing rows that match different sides
+test partial-index-or-multiple-existing {
+    CREATE TABLE t_or2(val INTEGER);
+    INSERT INTO t_or2 VALUES(-10);
+    INSERT INTO t_or2 VALUES(0);
+    INSERT INTO t_or2 VALUES(10);
+    CREATE INDEX i_or2 ON t_or2(val) WHERE val > 5 OR val < -5;
+    SELECT val FROM t_or2 ORDER BY val;
+}
+expect {
+    -10
+    0
+    10
+}
+
+# OR in partial index with UNIQUE constraint
+test partial-index-or-unique {
+    CREATE TABLE t_oru(x INTEGER, y TEXT);
+    INSERT INTO t_oru VALUES(10, 'a');
+    INSERT INTO t_oru VALUES(-10, 'b');
+    INSERT INTO t_oru VALUES(0, 'c');
+    CREATE UNIQUE INDEX i_oru ON t_oru(y) WHERE x > 5 OR x < -5;
+    INSERT INTO t_oru VALUES(20, 'a');
+}
+expect error {
+    UNIQUE constraint failed: t_oru.y
+}
+
+# Complex OR with nested AND in partial index
+test partial-index-or-and-combined {
+    CREATE TABLE t_oa(a INTEGER, b INTEGER);
+    INSERT INTO t_oa VALUES(1, 100);
+    INSERT INTO t_oa VALUES(50, 1);
+    INSERT INTO t_oa VALUES(3, 3);
+    CREATE INDEX i_oa ON t_oa(a) WHERE (a > 10 AND b > 10) OR (a < 2 AND b < 2);
+    INSERT INTO t_oa VALUES(50, 50);
+    SELECT a, b FROM t_oa ORDER BY a;
+}
+expect {
+    1|100
+    3|3
+    50|1
+    50|50
+}
