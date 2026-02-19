@@ -1,0 +1,102 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+    INSERT INTO t VALUES(1,'A',10),(2,'A',20),(3,'B',5),(4,'B',15);
+}
+
+@setup schema
+test delete-correlated-min-per-group {
+    DELETE FROM t WHERE val = (SELECT MIN(d2.val) FROM t d2 WHERE d2.grp = t.grp);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|A|20
+    4|B|15
+}
+
+setup schema2 {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+}
+
+@setup schema2
+test delete-correlated-min-with-condition {
+    DELETE FROM t WHERE val = (SELECT MIN(val) FROM t d2 WHERE d2.id <= t.id);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|20
+    3|30
+}
+
+setup schema3 {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+    INSERT INTO t VALUES(1,'A',10),(2,'B',20),(3,'C',30);
+}
+
+@setup schema3
+test delete-correlated-single-row-groups {
+    DELETE FROM t WHERE val = (SELECT MIN(d2.val) FROM t d2 WHERE d2.grp = t.grp);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+}
+
+setup schema4 {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+    INSERT INTO t VALUES(1,'A',10),(2,'A',20),(3,'B',5),(4,'B',15);
+}
+
+@setup schema4
+test delete-correlated-exists {
+    DELETE FROM t WHERE EXISTS (SELECT 1 FROM t d2 WHERE d2.grp = t.grp AND d2.val < t.val);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|A|10
+    3|B|5
+}
+
+setup schema5 {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+    INSERT INTO t VALUES(1,'A',10),(2,'A',20),(3,'B',5),(4,'B',15);
+}
+
+@setup schema5
+test delete-correlated-in-subquery {
+    DELETE FROM t WHERE id IN (SELECT d2.id FROM t d2 WHERE d2.val = (SELECT MIN(d3.val) FROM t d3 WHERE d3.grp = d2.grp));
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|A|20
+    4|B|15
+}
+
+setup schema6 {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+    INSERT INTO t VALUES(1,'A',10),(2,'A',20),(3,'B',5),(4,'B',15);
+}
+
+@setup schema6
+test delete-correlated-max-per-group {
+    DELETE FROM t WHERE val = (SELECT MAX(d2.val) FROM t d2 WHERE d2.grp = t.grp);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|A|10
+    3|B|5
+}
+
+setup schema7 {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+}
+
+@setup schema7
+test delete-correlated-empty-table {
+    DELETE FROM t WHERE val = (SELECT MIN(d2.val) FROM t d2 WHERE d2.grp = t.grp);
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
