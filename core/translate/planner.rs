@@ -481,6 +481,7 @@ fn plan_cte(
             cte_explicit_columns: vec![],
             cte_id: Some(cte_definitions[ref_idx].cte_id),
             cte_definition_only: false,
+            rowid_referenced: false,
         });
     }
 
@@ -625,6 +626,7 @@ pub fn plan_ctes_as_outer_refs(
             cte_explicit_columns: explicit_columns,
             cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
             cte_definition_only: true,
+            rowid_referenced: false,
         });
     }
 
@@ -699,6 +701,7 @@ fn parse_from_clause_table(
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
                     cte_id: Some(cte_def.cte_id),
                     cte_definition_only: false,
+                    rowid_referenced: false,
                 });
             }
 
@@ -1226,6 +1229,7 @@ pub fn parse_from(
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
                     cte_id: Some(cte_def.cte_id),
                     cte_definition_only: false,
+                    rowid_referenced: false,
                 });
             }
         }

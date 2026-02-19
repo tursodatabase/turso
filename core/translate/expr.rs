@@ -4712,6 +4712,10 @@ pub fn bind_and_rewrite_expr<'a>(
                                 parse_row_id(&normalized_id, tbl_id, || false)?
                             {
                                 *expr = row_id_expr;
+                                // Mark the table's rowid as referenced so correlated
+                                // subquery detection works correctly when a rowid
+                                // reference is the only link to the outer query.
+                                referenced_tables.mark_rowid_referenced(tbl_id);
                                 return Ok(WalkControl::Continue);
                             }
                         }

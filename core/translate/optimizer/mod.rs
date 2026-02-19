@@ -736,6 +736,7 @@ fn add_ephemeral_table_to_update_plan(
                 cte_explicit_columns: vec![],
                 cte_id: None,
                 cte_definition_only: false,
+                rowid_referenced: false,
             });
     }
 
