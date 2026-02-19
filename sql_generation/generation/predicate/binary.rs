@@ -1,6 +1,6 @@
 //! Contains code for generation for [ast::Expr::Binary] Predicate
 
-use turso_parser::ast::{self, Expr};
+use turso_parser::ast::{self, Expr, Name};
 
 use crate::{
     generation::{
@@ -14,6 +14,24 @@ use crate::{
         table::{SimValue, Table, TableContext},
     },
 };
+
+/// Create a qualified column reference expression, handling attached DB prefixes.
+/// For table names like "aux0.t1", produces `DoublyQualified(aux0, t1, col)`.
+/// For plain table names like "t1", produces `Qualified(t1, col)`.
+fn qualified_column_expr(table_name: &str, column_name: &str) -> Expr {
+    if let Some((db, tbl)) = table_name.split_once('.') {
+        Expr::DoublyQualified(
+            Name::from_string(db),
+            Name::from_string(tbl),
+            Name::from_string(column_name),
+        )
+    } else {
+        Expr::Qualified(
+            Name::from_string(table_name),
+            Name::from_string(column_name),
+        )
+    }
+}
 
 impl Predicate {
     /// Produces a true [ast::Expr::Binary] [Predicate] that is true for the provided row in the given table
@@ -49,10 +67,7 @@ impl Predicate {
                     1,
                     Box::new(|_| {
                         Some(Expr::Binary(
-                            Box::new(ast::Expr::Qualified(
-                                ast::Name::from_string(&table_name),
-                                ast::Name::from_string(&column.name),
-                            )),
+                            Box::new(qualified_column_expr(&table_name, &column.name)),
                             ast::Operator::Equals,
                             Box::new(Expr::Literal(value.into())),
                         ))
@@ -66,10 +81,7 @@ impl Predicate {
                             None
                         } else {
                             Some(Expr::Binary(
-                                Box::new(ast::Expr::Qualified(
-                                    ast::Name::from_string(&table_name),
-                                    ast::Name::from_string(&column.name),
-                                )),
+                                Box::new(qualified_column_expr(&table_name, &column.name)),
                                 ast::Operator::NotEquals,
                                 Box::new(Expr::Literal(v.into())),
                             ))
@@ -82,10 +94,7 @@ impl Predicate {
                         let lt_value =
                             LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                         Some(Expr::Binary(
-                            Box::new(ast::Expr::Qualified(
-                                ast::Name::from_string(&table_name),
-                                ast::Name::from_string(&column.name),
-                            )),
+                            Box::new(qualified_column_expr(&table_name, &column.name)),
                             ast::Operator::Greater,
                             Box::new(Expr::Literal(lt_value.into())),
                         ))
@@ -97,10 +106,7 @@ impl Predicate {
                         let gt_value =
                             GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                         Some(Expr::Binary(
-                            Box::new(ast::Expr::Qualified(
-                                ast::Name::from_string(&table_name),
-                                ast::Name::from_string(&column.name),
-                            )),
+                            Box::new(qualified_column_expr(&table_name, &column.name)),
                             ast::Operator::Less,
                             Box::new(Expr::Literal(gt_value.into())),
                         ))
@@ -112,10 +118,7 @@ impl Predicate {
                         // TODO: generation for Like and Glob expressions should be extracted to different module
                         LikeValue::arbitrary_from_maybe(rng, context, value).map(|like| {
                             Expr::Like {
-                                lhs: Box::new(ast::Expr::Qualified(
-                                    ast::Name::from_string(&table_name),
-                                    ast::Name::from_string(&column.name),
-                                )),
+                                lhs: Box::new(qualified_column_expr(&table_name, &column.name)),
                                 not: false, // TODO: also generate this value eventually
                                 op: ast::LikeOperator::Like,
                                 rhs: Box::new(Expr::Literal(like.0.into())),
@@ -162,10 +165,7 @@ impl Predicate {
             vec![
                 Box::new(|_| {
                     Expr::Binary(
-                        Box::new(ast::Expr::Qualified(
-                            ast::Name::from_string(&table_name),
-                            ast::Name::from_string(&column.name),
-                        )),
+                        Box::new(qualified_column_expr(&table_name, &column.name)),
                         ast::Operator::NotEquals,
                         Box::new(Expr::Literal(value.into())),
                     )
@@ -178,10 +178,7 @@ impl Predicate {
                         }
                     };
                     Expr::Binary(
-                        Box::new(ast::Expr::Qualified(
-                            ast::Name::from_string(&table_name),
-                            ast::Name::from_string(&column.name),
-                        )),
+                        Box::new(qualified_column_expr(&table_name, &column.name)),
                         ast::Operator::Equals,
                         Box::new(Expr::Literal(v.into())),
                     )
@@ -190,10 +187,7 @@ impl Predicate {
                     let gt_value =
                         GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                     Expr::Binary(
-                        Box::new(ast::Expr::Qualified(
-                            ast::Name::from_string(&table_name),
-                            ast::Name::from_string(&column.name),
-                        )),
+                        Box::new(qualified_column_expr(&table_name, &column.name)),
                         ast::Operator::Greater,
                         Box::new(Expr::Literal(gt_value.into())),
                     )
@@ -202,10 +196,7 @@ impl Predicate {
                     let lt_value =
                         LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                     Expr::Binary(
-                        Box::new(ast::Expr::Qualified(
-                            ast::Name::from_string(&table_name),
-                            ast::Name::from_string(&column.name),
-                        )),
+                        Box::new(qualified_column_expr(&table_name, &column.name)),
                         ast::Operator::Less,
                         Box::new(Expr::Literal(lt_value.into())),
                     )
@@ -240,10 +231,7 @@ impl SimplePredicate {
             vec![
                 Box::new(|_rng| {
                     Expr::Binary(
-                        Box::new(ast::Expr::Qualified(
-                            ast::Name::from_string(table_name),
-                            ast::Name::from_string(&column.column.name),
-                        )),
+                        Box::new(qualified_column_expr(table_name, &column.column.name)),
                         ast::Operator::Equals,
                         Box::new(Expr::Literal(column_value.into())),
                     )
@@ -256,10 +244,7 @@ impl SimplePredicate {
                     )
                     .0;
                     Expr::Binary(
-                        Box::new(Expr::Qualified(
-                            ast::Name::from_string(table_name),
-                            ast::Name::from_string(&column.column.name),
-                        )),
+                        Box::new(qualified_column_expr(table_name, &column.column.name)),
                         ast::Operator::Greater,
                         Box::new(Expr::Literal(lt_value.into())),
                     )
@@ -272,10 +257,7 @@ impl SimplePredicate {
                     )
                     .0;
                     Expr::Binary(
-                        Box::new(Expr::Qualified(
-                            ast::Name::from_string(table_name),
-                            ast::Name::from_string(&column.column.name),
-                        )),
+                        Box::new(qualified_column_expr(table_name, &column.column.name)),
                         ast::Operator::Less,
                         Box::new(Expr::Literal(gt_value.into())),
                     )
@@ -308,10 +290,7 @@ impl SimplePredicate {
             vec![
                 Box::new(|_rng| {
                     Expr::Binary(
-                        Box::new(Expr::Qualified(
-                            ast::Name::from_string(table_name),
-                            ast::Name::from_string(&column.column.name),
-                        )),
+                        Box::new(qualified_column_expr(table_name, &column.column.name)),
                         ast::Operator::NotEquals,
                         Box::new(Expr::Literal(column_value.into())),
                     )
@@ -324,10 +303,7 @@ impl SimplePredicate {
                     )
                     .0;
                     Expr::Binary(
-                        Box::new(ast::Expr::Qualified(
-                            ast::Name::from_string(table_name),
-                            ast::Name::from_string(&column.column.name),
-                        )),
+                        Box::new(qualified_column_expr(table_name, &column.column.name)),
                         ast::Operator::Greater,
                         Box::new(Expr::Literal(gt_value.into())),
                     )
@@ -340,10 +316,7 @@ impl SimplePredicate {
                     )
                     .0;
                     Expr::Binary(
-                        Box::new(ast::Expr::Qualified(
-                            ast::Name::from_string(table_name),
-                            ast::Name::from_string(&column.column.name),
-                        )),
+                        Box::new(qualified_column_expr(table_name, &column.column.name)),
                         ast::Operator::Less,
                         Box::new(Expr::Literal(lt_value.into())),
                     )

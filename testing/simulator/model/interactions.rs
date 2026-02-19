@@ -787,12 +787,46 @@ impl InteractionType {
             let mut out = Vec::new();
             let mut current_prob = 0.05;
             let mut incr = 0.001;
+
+            // Pre-compute path stems for selective fault injection
+            let main_db_stem = env
+                .get_db_path()
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let aux_db_stems: Vec<(String, String)> = env
+                .attached_dbs
+                .iter()
+                .map(|name| {
+                    let stem = env
+                        .get_aux_db_path(name)
+                        .file_stem()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    (name.clone(), stem)
+                })
+                .collect();
+
             loop {
                 let syncing = env.io.syncing();
-                let inject_fault = env.rng.random_bool(current_prob);
+
+                // Decide faults independently per database
+                let main_fault = env.rng.random_bool(current_prob);
+                let aux_prob = (current_prob * 0.5).min(1.0);
+                let mut fault_pairs: Vec<(&str, bool)> = vec![(&main_db_stem, main_fault)];
+                for (_, stem) in &aux_db_stems {
+                    let aux_fault = env.rng.random_bool(aux_prob);
+                    fault_pairs.push((stem, aux_fault));
+                }
+                let any_fault = fault_pairs.iter().any(|(_, f)| *f);
+
                 // TODO: avoid for now injecting faults when syncing
-                if inject_fault && !syncing {
-                    env.io.inject_fault(true);
+                if any_fault && !syncing {
+                    env.io.inject_fault_selective(&fault_pairs);
                 }
 
                 let row = rows.run_one_step_blocking(
@@ -850,11 +884,17 @@ fn reopen_database(env: &mut SimulatorEnv) {
     // 2. Re-open database
     match env.type_ {
         SimulationType::Differential => {
-            for _ in 0..num_conns {
-                env.connections.push(SimConnection::SQLiteConnection(
-                    rusqlite::Connection::open(env.get_db_path())
-                        .expect("Failed to open SQLite connection"),
-                ));
+            for i in 0..num_conns {
+                let conn = rusqlite::Connection::open(env.get_db_path())
+                    .expect("Failed to open SQLite connection");
+                for name in &env.attached_dbs {
+                    let aux_path = env.get_aux_db_path(name);
+                    conn.execute(&format!("ATTACH '{}' AS {name}", aux_path.display()), [])
+                        .unwrap_or_else(|e| {
+                            panic!("Failed to ATTACH {name} on SQLite reopen (conn {i}): {e}")
+                        });
+                }
+                env.connections.push(SimConnection::SQLiteConnection(conn));
             }
         }
         SimulationType::Default | SimulationType::Doublecheck => {
@@ -863,7 +903,9 @@ fn reopen_database(env: &mut SimulatorEnv) {
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
                 turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new().with_autovacuum(true),
+                turso_core::DatabaseOpts::new()
+                    .with_autovacuum(true)
+                    .with_attach(true),
                 None,
             ) {
                 Ok(db) => db,
@@ -886,10 +928,16 @@ fn reopen_database(env: &mut SimulatorEnv) {
                     .expect("enable mvcc");
             }
 
-            for _ in 0..num_conns {
-                env.connections.push(SimConnection::LimboConnection(
-                    env.db.as_ref().expect("db to be Some").connect().unwrap(),
-                ));
+            for i in 0..num_conns {
+                let conn = env.db.as_ref().expect("db to be Some").connect().unwrap();
+                for name in &env.attached_dbs {
+                    let aux_path = env.get_aux_db_path(name);
+                    conn.execute(format!("ATTACH '{}' AS {name}", aux_path.display()))
+                        .unwrap_or_else(|e| {
+                            panic!("Failed to ATTACH {name} on reopen (conn {i}): {e}")
+                        });
+                }
+                env.connections.push(SimConnection::LimboConnection(conn));
             }
         }
     };

@@ -12,7 +12,7 @@ use crate::util::{OpenMode, OpenOptions};
 use crate::Page;
 use crate::{
     ast, function,
-    io::{MemoryIO, PlatformIO, IO},
+    io::{MemoryIO, IO},
     parse_schema_rows, refresh_analyze_stats, translate,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
@@ -1399,10 +1399,18 @@ impl Connection {
         let db_opts = DatabaseOpts::new()
             .with_views(use_views)
             .with_strict(use_strict);
+        // Select the IO layer for the attached database:
+        // - :memory: databases always get a fresh MemoryIO
+        // - File-based databases reuse the parent's IO when the parent is also
+        //   file-based (important for simulator fault injection and WAL coordination)
+        // - If the parent is :memory: (MemoryIO) but the attached DB is file-based,
+        //   we need a file-capable IO layer since MemoryIO can't read real files
         let io: Arc<dyn IO> = if path.contains(":memory:") {
             Arc::new(MemoryIO::new())
+        } else if self.db.path.starts_with(":memory:") {
+            Database::io_for_path(path)?
         } else {
-            Arc::new(PlatformIO::new()?)
+            self.db.io.clone()
         };
         let main_db_flags = self.db.open_flags;
         let db = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
