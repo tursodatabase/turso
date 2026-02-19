@@ -858,18 +858,18 @@ mod fuzz_tests {
         }
     }
 
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn join_fuzz_unindexed_keys(db: TempDatabase) {
         join_fuzz_inner(db, false, 2000, 200);
     }
 
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn join_fuzz_indexed_keys(db: TempDatabase) {
         join_fuzz_inner(db, true, 2000, 200);
     }
 
     // TODO: Mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn collation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -3512,14 +3512,12 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc index
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn partial_index_mutation_and_upsert_fuzz(db: TempDatabase) {
         index_mutation_upsert_fuzz(db, 1.0, 4);
     }
 
-    // TODO: mvcc fails
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn simple_index_mutation_and_upsert_fuzz(db: TempDatabase) {
         index_mutation_upsert_fuzz(db, 0.0, 4);
     }
@@ -4148,8 +4146,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn ddl_compatibility_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -5383,8 +5380,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn table_logical_expression_fuzz_run(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
@@ -5834,8 +5830,7 @@ mod fuzz_tests {
         Ok(())
     }
 
-    // TODO: mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     /// Tests for correlated and uncorrelated subqueries in SELECT statements (WHERE, SELECT-list, GROUP BY/HAVING).
     pub fn table_subquery_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
