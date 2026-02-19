@@ -58,3 +58,38 @@ expect {
     2
 }
 
+test total-changes-insert-in-transaction {
+    create table t(id integer primary key, val text);
+    begin;
+    insert into t values(1, 'a'), (2, 'b'), (3, 'c');
+    select total_changes();
+    commit;
+}
+expect {
+    3
+}
+
+test total-changes-insert-in-transaction-after-commit {
+    create table t(id integer primary key, val text);
+    begin;
+    insert into t values(1, 'a'), (2, 'b'), (3, 'c');
+    commit;
+    select total_changes();
+}
+expect {
+    3
+}
+
+test total-changes-multiple-stmts-in-transaction {
+    create table t(id integer primary key, val text);
+    insert into t values(1, 'a'), (2, 'b');
+    begin;
+    insert into t values(3, 'c');
+    delete from t where id = 1;
+    select total_changes();
+    commit;
+}
+expect {
+    4
+}
+
