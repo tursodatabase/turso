@@ -140,6 +140,7 @@ pub struct Builder {
     enable_attach: bool,
     enable_strict: bool,
     enable_index_method: bool,
+    enable_materialized_views: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
 }
@@ -154,6 +155,7 @@ impl Builder {
             enable_attach: false,
             enable_strict: false,
             enable_index_method: false,
+            enable_materialized_views: false,
             vfs: None,
             encryption_opts: None,
         }
@@ -189,6 +191,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_materialized_views(mut self, enabled: bool) -> Self {
+        self.enable_materialized_views = enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
         self
@@ -209,6 +216,9 @@ impl Builder {
         }
         if self.enable_index_method {
             features.push("index_method");
+        }
+        if self.enable_materialized_views {
+            features.push("views");
         }
         if features.is_empty() {
             return None;

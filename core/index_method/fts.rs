@@ -1,4 +1,6 @@
 use crate::sync::Arc;
+use crate::turso_assert;
+use crate::turso_debug_assert;
 use crate::{
     index_method::{
         parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
@@ -11,7 +13,6 @@ use crate::{
         pager::Pager,
     },
     translate::collate::CollationSeq,
-    turso_assert,
     types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text},
     vdbe::Register,
     Connection, LimboError, Result, Value,
@@ -981,12 +982,10 @@ impl FileHandle for LazyFileHandle {
             };
 
             // Defensive bounds check - should not be needed if logic is correct
-            debug_assert!(
+            turso_debug_assert!(
                 local_start <= chunk.len() && local_end <= chunk.len(),
-                "chunk slice out of bounds: local_start={}, local_end={}, chunk_len={}",
-                local_start,
-                local_end,
-                chunk.len()
+                "chunk slice out of bounds",
+                { "local_start": local_start, "local_end": local_end, "chunk_len": chunk.len() }
             );
             let local_end = local_end.min(chunk.len());
             let local_start = local_start.min(local_end);
@@ -2468,8 +2467,8 @@ impl Drop for FtsCursor {
         // "dirty pages must be empty for read txn" panic on the next read.
         turso_assert!(
             conn.is_in_write_tx(),
-            "FTS Drop: {} docs remaining: transaction already committed, cannot flush",
-            self.pending_docs_count
+            "FTS Drop: transaction already committed, cannot flush",
+            { "pending_docs_count": self.pending_docs_count }
         );
 
         // Commit any pending writes to Tantivy
@@ -3066,10 +3065,10 @@ impl IndexMethodCursor for FtsCursor {
         // Determine limit based on pattern:
         // - Patterns WITHOUT LIMIT in pattern: fetch all matches (high limit)
         // - Patterns WITH LIMIT: use the captured limit value from values[2]
-        let limit = match pattern_idx {
+        let limit_raw = match pattern_idx {
             // Patterns without LIMIT - fetch all matches
             FTS_PATTERN_MATCH | FTS_PATTERN_COMBINED | FTS_PATTERN_COMBINED_ORDERED => {
-                Self::MAX_NO_LIMIT_RESULT
+                Self::MAX_NO_LIMIT_RESULT as i64
             }
             // Patterns with LIMIT - use captured limit value
             FTS_PATTERN_SCORE
@@ -3078,9 +3077,7 @@ impl IndexMethodCursor for FtsCursor {
             | FTS_PATTERN_COMBINED_ORDERED_LIMIT => {
                 if values.len() > 2 {
                     match &values[2] {
-                        Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => {
-                            *i as usize
-                        }
+                        Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
                         _ => {
                             tracing::debug!(
                                 "FTS query_start: LIMIT value is not an integer, using default 10"
@@ -3122,6 +3119,18 @@ impl IndexMethodCursor for FtsCursor {
         let query = parser
             .parse_query(&query_str)
             .map_err(|e| LimboError::InternalError(format!("FTS parse error: {e}")))?;
+
+        if limit_raw == 0 {
+            self.current_hits.clear();
+            self.hit_pos = 0;
+            return Ok(IOResult::Done(false));
+        }
+
+        let limit = if limit_raw < 0 {
+            Self::MAX_NO_LIMIT_RESULT
+        } else {
+            limit_raw as usize
+        };
 
         let top_docs = searcher
             .search(&query, &tantivy::collector::TopDocs::with_limit(limit))

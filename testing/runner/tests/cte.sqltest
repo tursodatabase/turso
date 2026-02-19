@@ -328,6 +328,295 @@ expect {
 }
 
 # =============================================================================
+# CTE with UPDATE on keyed tables (INTEGER PRIMARY KEY)
+#
+# Keyed tables use an ephemeral table in the optimizer, which replaces
+# table_references. CTE outer query refs must be preserved through that
+# rewrite or they become unresolvable. (issue #5224)
+# =============================================================================
+
+# Direct CTE column reference in SET clause is invalid SQL (issue #5224).
+# SQLite rejects with "no such column: c.v", we reject with "no such table: c".
+test cte-update-direct-ref-keyed {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 2);
+    WITH c(v) AS (SELECT 9) UPDATE t SET a = c.v;
+}
+expect error {
+    no such
+}
+
+# Same on non-keyed table
+test cte-update-direct-ref-nonkeyed {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES(1, 2);
+    WITH c(v) AS (SELECT 9) UPDATE t SET a = c.v;
+}
+expect error {
+    no such
+}
+
+# CTE in WHERE clause on INTEGER PRIMARY KEY table
+test cte-update-keyed-where {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    WITH c AS (SELECT 1 as v) UPDATE t SET b = 99 WHERE a IN (SELECT v FROM c);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|99
+    2|20
+    3|30
+}
+
+# Chained CTEs in WHERE on keyed table
+test cte-update-keyed-chained-where {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    WITH a AS (SELECT 2 as x), b AS (SELECT x FROM a) UPDATE t SET b = b + 100 WHERE a IN (SELECT x FROM b);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    2|120
+    3|30
+}
+
+# CTE with multi-row result in WHERE on keyed table
+test cte-update-keyed-multirow-where {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30), (4, 40);
+    WITH targets AS (SELECT 1 as v UNION ALL SELECT 3) UPDATE t SET b = -b WHERE a IN (SELECT v FROM targets);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|-10
+    2|20
+    3|-30
+    4|40
+}
+
+# CTE with subquery in SET clause on keyed table (updates non-PK column)
+test cte-update-keyed-set-subquery {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 2);
+    WITH c(v) AS (SELECT 42) UPDATE t SET b = (SELECT v FROM c) WHERE a = 1;
+    SELECT * FROM t;
+}
+expect {
+    1|42
+}
+
+# CTE with subquery in SET updating the PRIMARY KEY itself
+test cte-update-keyed-set-pk-subquery {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 2);
+    WITH c(v) AS (SELECT 9) UPDATE t SET a = (SELECT v FROM c) WHERE a = 1;
+    SELECT * FROM t;
+}
+expect {
+    9|2
+}
+
+# CTE used in both SET subquery and WHERE on keyed table
+test cte-update-keyed-set-and-where-subquery {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 2), (3, 4);
+    WITH c AS (SELECT 1 as id, 100 as newval) UPDATE t SET a = (SELECT newval FROM c), b = 0 WHERE a = (SELECT id FROM c);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    3|4
+    100|0
+}
+
+# Multiple CTEs, one in WHERE one in SET subquery, keyed table
+test cte-update-keyed-multiple-ctes-set-where {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 2), (3, 4);
+    WITH x AS (SELECT 1 as id), y AS (SELECT 99 as val) UPDATE t SET b = (SELECT val FROM y) WHERE a IN (SELECT id FROM x);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|99
+    3|4
+}
+
+# CTE with UPDATE + RETURNING on keyed table
+test cte-update-keyed-returning {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 2), (3, 4);
+    WITH c AS (SELECT 1 as v) UPDATE t SET b = b + 50 WHERE a IN (SELECT v FROM c) RETURNING a, b;
+}
+expect {
+    1|52
+}
+
+# CTE updating PK with RETURNING on keyed table
+test cte-update-keyed-pk-returning {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 2);
+    WITH c(v) AS (SELECT 9) UPDATE t SET a = (SELECT v FROM c) WHERE a = 1 RETURNING a, b;
+}
+expect {
+    9|2
+}
+
+# CTE + UPDATE on keyed table with secondary index
+test cte-update-keyed-with-index {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    CREATE INDEX idx_b ON t(b);
+    INSERT INTO t VALUES(1, 10), (2, 20);
+    WITH c AS (SELECT 1 as v) UPDATE t SET b = 99 WHERE a IN (SELECT v FROM c);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|99
+    2|20
+}
+
+# CTE in WHERE + SET + RETURNING with text column on keyed table
+test cte-update-keyed-text-returning {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES(1, 'old'), (2, 'keep');
+    WITH c AS (SELECT 1 as target, 'new' as replacement) UPDATE t SET b = (SELECT replacement FROM c) WHERE a = (SELECT target FROM c) RETURNING *;
+}
+expect {
+    1|new
+}
+
+# CTE referencing the table being updated, used in WHERE on keyed table
+test cte-update-keyed-self-ref-where {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    WITH snapshot AS (SELECT a, b FROM t WHERE b > 15) UPDATE t SET b = 0 WHERE a IN (SELECT a FROM snapshot);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    2|0
+    3|0
+}
+
+# CTE referencing table being updated, used in SET subquery on keyed table
+test cte-update-keyed-self-ref-set {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 100), (2, 200);
+    WITH vals AS (SELECT a, b FROM t WHERE a = 2) UPDATE t SET b = (SELECT b FROM vals) WHERE a = 1;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|200
+    2|200
+}
+
+# CTE with aggregate in SET subquery on keyed table
+test cte-update-keyed-aggregate-set {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    WITH totals AS (SELECT SUM(b) as s FROM t) UPDATE t SET b = (SELECT s FROM totals) WHERE a = 1;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|60
+    2|20
+    3|30
+}
+
+# CTE with LIMIT in WHERE on keyed table
+test cte-update-keyed-limit-where {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    WITH top AS (SELECT a FROM t ORDER BY b DESC LIMIT 2) UPDATE t SET b = 0 WHERE a IN (SELECT a FROM top);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    2|0
+    3|0
+}
+
+# CTE WHERE with no matches on keyed table (updates nothing)
+test cte-update-keyed-no-match {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10), (2, 20);
+    WITH c AS (SELECT 999 as v) UPDATE t SET b = 0 WHERE a IN (SELECT v FROM c);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    2|20
+}
+
+# CTE with empty result set in WHERE on keyed table
+test cte-update-keyed-empty-cte {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10);
+    WITH empty AS (SELECT a FROM t WHERE 0) UPDATE t SET b = 0 WHERE a IN (SELECT a FROM empty);
+    SELECT * FROM t;
+}
+expect {
+    1|10
+}
+
+# CTE setting multiple columns via subqueries on keyed table
+test cte-update-keyed-multi-col-set {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b, c);
+    INSERT INTO t VALUES(1, 'old_b', 'old_c');
+    WITH vals AS (SELECT 'new_b' as b, 'new_c' as c) UPDATE t SET b = (SELECT b FROM vals), c = (SELECT c FROM vals) WHERE a = 1;
+    SELECT * FROM t;
+}
+expect {
+    1|new_b|new_c
+}
+
+# CTE DELETE on keyed table
+test cte-delete-keyed-where {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    WITH c AS (SELECT 2 as v) DELETE FROM t WHERE a IN (SELECT v FROM c);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    3|30
+}
+
+# CTE with UNIQUE constraint (non-PK) table
+test cte-update-unique-where {
+    CREATE TABLE t(a INTEGER, b TEXT UNIQUE);
+    INSERT INTO t VALUES(1, 'x'), (2, 'y');
+    WITH c AS (SELECT 'x' as v) UPDATE t SET a = 99 WHERE b IN (SELECT v FROM c);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    2|y
+    99|x
+}
+
+# CTE UPDATE all rows on keyed table (no WHERE filter)
+test cte-update-keyed-all-rows {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10), (2, 20);
+    WITH c AS (SELECT 0 as v) UPDATE t SET b = (SELECT v FROM c);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|0
+    2|0
+}
+
+# CTE DELETE with RETURNING on keyed table
+test cte-delete-keyed-returning {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    WITH c AS (SELECT 2 as v) DELETE FROM t WHERE a IN (SELECT v FROM c) RETURNING a, b;
+}
+expect {
+    2|20
+}
+
+# =============================================================================
 # Compound SELECT column name propagation to downstream CTEs
 # =============================================================================
 
@@ -628,6 +917,16 @@ expect {
 
 test cte-duplicate-name {
     WITH t AS (SELECT 1), t AS (SELECT 2) SELECT * FROM t;
+}
+expect error {
+    duplicate WITH table name
+}
+
+test cte-duplicate-name-view {
+    CREATE TABLE cte_dup_table(x);
+    CREATE VIEW cte_dup_view AS
+        WITH cte AS (SELECT 1), cte AS (SELECT 2)
+        SELECT * FROM cte_dup_table;
 }
 expect error {
     duplicate WITH table name

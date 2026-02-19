@@ -1,3 +1,4 @@
+use crate::turso_assert;
 use crate::{
     function::MathFunc,
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
@@ -129,7 +130,7 @@ impl ComparisonOp {
         null_eq: bool,
     ) -> bool {
         let (lhs, rhs) = (lhs.as_value_ref(), rhs.as_value_ref());
-        assert!(matches!(lhs, ValueRef::Null) || matches!(rhs, ValueRef::Null));
+        turso_assert!(matches!(lhs, ValueRef::Null) || matches!(rhs, ValueRef::Null));
 
         match self {
             ComparisonOp::Eq => {

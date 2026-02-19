@@ -25,9 +25,8 @@
 //! When `test()` is called with a different batch number than the current `i_batch`, all
 //! values in the fresh list are consolidated into the consolidated set.
 
-use std::collections::BTreeSet;
-
 use crate::turso_assert;
+use std::collections::BTreeSet;
 
 /// The mode of usage for a RowSet.
 /// Test: the rowset will be used for set membership tests.

@@ -477,3 +477,62 @@ expect {
     32|10089|20016|
 }
 
+# Regression test for: https://github.com/tursodatabase/turso/issues/5282
+# JOIN returns zero rows when seeking a TEXT index with integer probe values.
+# The optimizer scans t_int (INTEGER affinity) and seeks idx_text_val (TEXT
+# affinity).  The OP_Affinity before the seek must use the index column's
+# affinity (TEXT) so the integer probe is coerced to text before seeking.
+test join-text-index-integer-probe {
+    CREATE TABLE t_text(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_text_val ON t_text(val);
+    INSERT INTO t_text VALUES (1, '100'), (2, '200');
+    CREATE TABLE t_int(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx_int_val ON t_int(val);
+    INSERT INTO t_int VALUES (10, 100), (20, 200);
+    -- Broken before fix: scans t_int, seeks idx_text_val with integer probes
+    SELECT COUNT(*) FROM t_int i JOIN t_text t ON i.val = t.val;
+}
+expect {
+    2
+}
+
+test join-text-index-integer-probe-reversed {
+    CREATE TABLE t_text(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_text_val ON t_text(val);
+    INSERT INTO t_text VALUES (1, '100'), (2, '200');
+    CREATE TABLE t_int(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx_int_val ON t_int(val);
+    INSERT INTO t_int VALUES (10, 100), (20, 200);
+    -- Reversed scan order (already worked before fix)
+    SELECT COUNT(*) FROM t_text t JOIN t_int i ON t.val = i.val;
+}
+expect {
+    2
+}
+
+test join-text-index-integer-probe-no-index {
+    CREATE TABLE t_text(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t_text VALUES (1, '100'), (2, '200');
+    CREATE TABLE t_int(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t_int VALUES (10, 100), (20, 200);
+    -- Without indexes, should still work
+    SELECT COUNT(*) FROM t_int i JOIN t_text t ON i.val = t.val;
+}
+expect {
+    2
+}
+
+# Range seek on TEXT index with integer probes — exercises the end-key affinity
+# path in emit_seek_termination (same underlying fix as the equality case above).
+test text-index-range-seek-integer-probes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_t_val ON t(val);
+    INSERT INTO t VALUES (1, '50'), (2, '100'), (3, '150'), (4, '200'), (5, '250');
+    SELECT val FROM t WHERE val BETWEEN 100 AND 200 ORDER BY val;
+}
+expect {
+    100
+    150
+    200
+}
+

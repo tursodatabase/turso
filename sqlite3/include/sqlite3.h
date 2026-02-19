@@ -207,7 +207,7 @@ int sqlite_get_table_cb(void *context, int n_column, char **argv, char **colv);
 
 int sqlite3_get_table(sqlite3 *db, const char *sql, char ***paz_result, int *pn_row, int *pn_column, char **pz_err_msg);
 
-void sqlite3_free_table(char ***paz_result);
+void sqlite3_free_table(char **az_result);
 
 void sqlite3_result_null(void *_context);
 

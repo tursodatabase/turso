@@ -265,6 +265,47 @@ expect {
     2
 }
 
+# Regression: UPDATE over expression-indexed predicate must update all matching rows,
+# not just the first one.
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test update-expression-index-json-extract-updates-all-matching-rows {
+    CREATE TABLE t(id INT PRIMARY KEY, j TEXT);
+    CREATE INDEX i ON t(json_extract(j, '$.x'));
+    INSERT INTO t VALUES (1, '{"x":1}'), (2, '{"x":1}'), (3, '{"x":1}'), (4, '{"x":2}');
+
+    UPDATE t SET j = '{"x":99}' WHERE json_extract(j, '$.x') = 1;
+
+    SELECT id, json_extract(j, '$.x') FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|99
+    2|99
+    3|99
+    4|2
+    ok
+}
+
+# Same regression with table alias in UPDATE and qualified column in expression index.
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test update-expression-index-json-extract-updates-all-matching-rows-alias {
+    CREATE TABLE t(id INT PRIMARY KEY, j TEXT);
+    CREATE INDEX i ON t(json_extract(j, '$.x'));
+    INSERT INTO t VALUES (1, '{"x":1}'), (2, '{"x":1}'), (3, '{"x":1}'), (4, '{"x":2}');
+
+    UPDATE t AS x SET j = '{"x":99}' WHERE json_extract(x.j, '$.x') = 1;
+
+    SELECT id, json_extract(j, '$.x') FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|99
+    2|99
+    3|99
+    4|2
+    ok
+}
+
 test update_rowid_alias_index_regression_test {
     CREATE TABLE t (a INTEGER PRIMARY KEY, b);
     CREATE INDEX idx_b ON t (b);
@@ -874,4 +915,32 @@ expect {
     1000|222
     1
     ok
+}
+
+# https://github.com/tursodatabase/turso/issues/5175
+# UPDATE SET with scalar subquery
+test update-set-subquery {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE t2(n INTEGER);
+    INSERT INTO t1 VALUES(1, 10), (2, 20), (3, 30);
+    INSERT INTO t2 VALUES(0);
+    UPDATE t2 SET n = (SELECT max(val) FROM t1);
+    SELECT * FROM t2;
+}
+expect {
+    30
+}
+
+# UPDATE SET with correlated scalar subquery
+test update-set-correlated-subquery {
+    CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, category_id INTEGER);
+    CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT, item_count INTEGER);
+    INSERT INTO items VALUES(1, 'a', 1), (2, 'b', 1), (3, 'c', 2);
+    INSERT INTO categories VALUES(1, 'cat1', 0), (2, 'cat2', 0);
+    UPDATE categories SET item_count = (SELECT count(*) FROM items WHERE items.category_id = categories.id);
+    SELECT id, item_count FROM categories ORDER BY id;
+}
+expect {
+    1|2
+    2|1
 }

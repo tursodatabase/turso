@@ -92,7 +92,7 @@ addr  opcode                           p1   p2  p3  p4                          
   28                  OpenRead          8   10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
   29                  OpenRead          9   11   0  k(3,B,B)                                0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
   30                  Column            4    0  41                                          0  r[41]=lineitem.l_orderkey
-  31                  Affinity         41    1   0                                          0  r[41..42] = C
+  31                  Affinity         41    1   0                                          0  r[41..42] = D
   32                  SeekGE            9   41  41                                          0  key=[41..41]
   33                    IdxGT           9   41  41                                          0  key=[41..41]
   34                    DeferredSeek    9    8   0                                          0
@@ -110,7 +110,7 @@ addr  opcode                           p1   p2  p3  p4                          
   46                OpenRead           10   10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
   47                OpenRead           11   11   0  k(3,B,B)                                0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
   48                Column              4    0  63                                          0  r[63]=lineitem.l_orderkey
-  49                Affinity           63    1   0                                          0  r[63..64] = C
+  49                Affinity           63    1   0                                          0  r[63..64] = D
   50                SeekGE             11   62  63                                          0  key=[63..63]
   51                  IdxGT            11   62  63                                          0  key=[63..63]
   52                  DeferredSeek     11   10   0                                          0

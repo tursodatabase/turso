@@ -1576,24 +1576,51 @@ pub unsafe extern "C" fn sqlite3_get_table(
         return rc;
     }
 
-    let total_results = res.az_result.len();
-    if res.az_result.capacity() > total_results {
-        res.az_result.shrink_to_fit();
+    let n_data = res.az_result.len();
+
+    // Allocate a raw C array with an extra slot at position 0 for the entry count,
+    // following the SQLite convention. sqlite3_free_table will step back to read it.
+    let array = libc::malloc(std::mem::size_of::<*mut ffi::c_char>() * (n_data + 1))
+        as *mut *mut ffi::c_char;
+    if array.is_null() {
+        res.free();
+        return SQLITE_NOMEM;
     }
 
-    *paz_result = res.az_result.as_mut_ptr();
+    // Store entry count at position 0 (matching SQLite's SQLITE_INT_TO_PTR convention)
+    *array = (n_data + 1) as *mut ffi::c_char;
+
+    // Copy string pointers to positions 1..=n_data
+    for (i, &ptr) in res.az_result.iter().enumerate() {
+        *array.add(i + 1) = ptr;
+    }
+
+    // Return pointer past the count slot
+    *paz_result = array.add(1);
     *pn_row = res.n_row as ffi::c_int;
     *pn_column = res.n_column as ffi::c_int;
 
-    std::mem::forget(res);
+    // Drop res without freeing the strings -- they are now owned by the raw array.
+    // Vec<*mut c_char> drop just deallocates the Vec buffer, not the pointed-to strings.
 
     SQLITE_OK
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_free_table(paz_result: *mut *mut *mut ffi::c_char) {
-    let res = &mut *(paz_result as *mut TabResult);
-    res.free();
+pub unsafe extern "C" fn sqlite3_free_table(az_result: *mut *mut ffi::c_char) {
+    if az_result.is_null() {
+        return;
+    }
+    // Step back one slot to read the entry count stored by sqlite3_get_table
+    let array = az_result.sub(1);
+    let n = *array as usize;
+    for i in 1..n {
+        let ptr = *array.add(i);
+        if !ptr.is_null() {
+            sqlite3_free(ptr as *mut _);
+        }
+    }
+    libc::free(array as *mut _);
 }
 
 #[no_mangle]

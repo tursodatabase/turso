@@ -25,6 +25,14 @@ enum SeekState {
         target: i64,
     },
 
+    /// Btree seek returned TryAdvance, now advancing with next()/prev()
+    Advancing {
+        /// The row we are trying to find
+        target: i64,
+        /// The seek operation (determines direction of advance)
+        op: SeekOp,
+    },
+
     /// Seek completed successfully
     Done,
 }
@@ -155,6 +163,67 @@ impl MaterializedViewCursor {
         )]))
     }
 
+    /// Process btree changes: merge with uncommitted, build zset, and determine result.
+    /// Returns the next state action: either Done with a result, or updates seek_state for another iteration.
+    fn process_btree_changes(
+        &mut self,
+        target: i64,
+        target_rowid: i64,
+        op: SeekOp,
+        changes: Vec<(HashableRow, isize)>,
+    ) -> Result<IOResult<()>> {
+        let mut btree_entries = Delta { changes };
+        let changes = self.uncommitted.seek(target, op);
+
+        let uncommitted_entries = Delta { changes };
+        btree_entries.merge(&uncommitted_entries);
+
+        // if empty pre-zset, means nothing was found. Empty post-zset can mean that
+        // we just canceled weights.
+        if btree_entries.is_empty() {
+            self.seek_state = SeekState::Done;
+            return Ok(IOResult::Done(()));
+        }
+
+        let min_seen = btree_entries
+            .changes
+            .first()
+            .expect("cannot be empty, we just tested for it")
+            .0
+            .rowid;
+        let max_seen = btree_entries
+            .changes
+            .last()
+            .expect("cannot be empty, we just tested for it")
+            .0
+            .rowid;
+
+        let zset = RowKeyZSet::from_delta(&btree_entries);
+        let ret = zset.seek(target_rowid, op);
+
+        if !ret.is_empty() {
+            let (row, _) = &ret[0];
+            self.current_row = Some((row.rowid, row.values.clone()));
+            self.seek_state = SeekState::Done;
+            return Ok(IOResult::Done(()));
+        }
+
+        let new_target = match op {
+            SeekOp::GT => Some(max_seen),
+            SeekOp::GE { eq_only: false } => Some(max_seen + 1),
+            SeekOp::LT => Some(min_seen),
+            SeekOp::LE { eq_only: false } => Some(min_seen - 1),
+            SeekOp::LE { eq_only: true } | SeekOp::GE { eq_only: true } => None,
+        };
+
+        if let Some(target) = new_target {
+            self.seek_state = SeekState::Seek { target };
+        } else {
+            self.seek_state = SeekState::Done;
+        }
+        Ok(IOResult::Done(()))
+    }
+
     /// Internal seek implementation that doesn't check preconditions
     fn do_seek(&mut self, target_rowid: i64, op: SeekOp) -> Result<IOResult<SeekResult>> {
         loop {
@@ -171,62 +240,60 @@ impl MaterializedViewCursor {
                     let btree_result =
                         return_if_io!(self.btree_cursor.seek(SeekKey::TableRowId(target), op));
 
-                    let changes = if btree_result == SeekResult::Found {
-                        return_if_io!(self.read_btree_delta_entry())
-                    } else {
-                        Vec::new()
+                    let changes = match btree_result {
+                        SeekResult::Found => return_if_io!(self.read_btree_delta_entry()),
+                        SeekResult::TryAdvance => {
+                            // Transition to Advancing state before calling next/prev.
+                            // This ensures that if next/prev returns IO, we resume in
+                            // Advancing state and don't redundantly call seek again.
+                            self.seek_state = SeekState::Advancing { target, op };
+                            continue;
+                        }
+                        SeekResult::NotFound => Vec::new(),
                     };
 
-                    let mut btree_entries = Delta { changes };
-                    let changes = self.uncommitted.seek(target, op);
+                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
 
-                    let uncommitted_entries = Delta { changes };
-                    btree_entries.merge(&uncommitted_entries);
-
-                    // if empty pre-zset, means nothing was found. Empty post-zset can mean that
-                    // we just canceled weights.
-                    if btree_entries.is_empty() {
-                        self.seek_state = SeekState::Done;
-                        return Ok(IOResult::Done(SeekResult::NotFound));
+                    // Check if we're done or need to continue seeking
+                    if matches!(self.seek_state, SeekState::Done) {
+                        let result = if self.current_row.is_some() {
+                            SeekResult::Found
+                        } else {
+                            SeekResult::NotFound
+                        };
+                        return Ok(IOResult::Done(result));
                     }
+                    // Otherwise state is Seek with new target, loop continues
+                }
+                SeekState::Advancing { target, op } => {
+                    let target = *target;
+                    let op = *op;
 
-                    let min_seen = btree_entries
-                        .changes
-                        .first()
-                        .expect("cannot be empty, we just tested for it")
-                        .0
-                        .rowid;
-                    let max_seen = btree_entries
-                        .changes
-                        .last()
-                        .expect("cannot be empty, we just tested for it")
-                        .0
-                        .rowid;
-
-                    let zset = RowKeyZSet::from_delta(&btree_entries);
-                    let ret = zset.seek(target_rowid, op);
-
-                    if !ret.is_empty() {
-                        let (row, _) = &ret[0];
-                        self.current_row = Some((row.rowid, row.values.clone()));
-                        self.seek_state = SeekState::Done;
-                        return Ok(IOResult::Done(SeekResult::Found));
-                    }
-
-                    let new_target = match op {
-                        SeekOp::GT => Some(max_seen),
-                        SeekOp::GE { eq_only: false } => Some(max_seen + 1),
-                        SeekOp::LT => Some(min_seen),
-                        SeekOp::LE { eq_only: false } => Some(min_seen - 1),
-                        SeekOp::LE { eq_only: true } | SeekOp::GE { eq_only: true } => None,
+                    // Cursor is positioned at the leaf but current entry doesn't match.
+                    // Advance in the appropriate direction to find the next matching entry.
+                    match op {
+                        SeekOp::GT | SeekOp::GE { .. } => {
+                            return_if_io!(self.btree_cursor.next())
+                        }
+                        SeekOp::LT | SeekOp::LE { .. } => {
+                            return_if_io!(self.btree_cursor.prev())
+                        }
                     };
+                    // read_btree_delta_entry handles the case where cursor is at end
+                    let changes = return_if_io!(self.read_btree_delta_entry());
 
-                    if let Some(target) = new_target {
-                        self.seek_state = SeekState::Seek { target };
-                    } else {
-                        self.seek_state = SeekState::Done;
-                        return Ok(IOResult::Done(SeekResult::NotFound));
+                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
+
+                    // Check if we're done or need to continue seeking
+                    if matches!(self.seek_state, SeekState::Done) {
+                        let result = if self.current_row.is_some() {
+                            SeekResult::Found
+                        } else {
+                            SeekResult::NotFound
+                        };
+                        return Ok(IOResult::Done(result));
                     }
+                    // Otherwise state is Seek with new target, loop continues
                 }
                 SeekState::Done => {
                     // We always return before setting the state to done. Meaning if we got here,
@@ -254,6 +321,18 @@ impl MaterializedViewCursor {
     }
 
     pub fn next(&mut self) -> Result<IOResult<bool>> {
+        // If there's a pending seek operation (due to IO), complete it first.
+        // SeekState::Seek or SeekState::Advancing means IO was interrupted mid-seek and we need to resume.
+        // SeekState::Init means cursor was never positioned - don't resume, fall through to check current_row.
+        if matches!(
+            self.seek_state,
+            SeekState::Seek { .. } | SeekState::Advancing { .. }
+        ) {
+            // target is ignored when resuming
+            let result = return_if_io!(self.do_seek(0, SeekOp::GT));
+            return Ok(IOResult::Done(result == SeekResult::Found));
+        }
+
         // If cursor is not positioned (no current_row), return false
         // This matches BTreeCursor behavior when valid_state == Invalid
         let Some((current_rowid, _)) = &self.current_row else {
@@ -1615,5 +1694,290 @@ mod tests {
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
         Ok(())
+    }
+
+    // ===== IO RESUMPTION TEST SUITE =====
+    // These tests verify correct behavior when btree operations return IO (pending)
+
+    mod io_resumption_tests {
+        use super::*;
+        use crate::io::Completion;
+        use crate::storage::btree::{BTreeKey, CursorTrait};
+        use crate::types::{IOCompletions, ImmutableRecord, IndexInfo};
+        use crate::Register;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Mock btree cursor that tracks calls and can simulate IO pending states.
+        /// Used to verify that seek operations aren't redundantly repeated after IO resumption.
+        struct MockBTreeCursor {
+            /// Number of times seek() was called
+            seek_count: AtomicUsize,
+            /// Number of times next() was called
+            next_count: AtomicUsize,
+            /// Number of times prev() was called
+            prev_count: AtomicUsize,
+            /// Current rowid to return
+            current_rowid: Option<i64>,
+            /// Record to return (needs to live for the cursor lifetime)
+            record: ImmutableRecord,
+            /// Index info
+            index_info: Arc<IndexInfo>,
+        }
+
+        impl MockBTreeCursor {
+            fn new() -> Self {
+                // Create a minimal record with rowid=1, value=10, weight=1
+                let record = Self::create_test_record(1, 10, 1);
+                Self {
+                    seek_count: AtomicUsize::new(0),
+                    next_count: AtomicUsize::new(0),
+                    prev_count: AtomicUsize::new(0),
+                    current_rowid: Some(1),
+                    record,
+                    index_info: Arc::new(IndexInfo::default()),
+                }
+            }
+
+            fn create_test_record(rowid: i64, value: i64, weight: i64) -> ImmutableRecord {
+                // Build a binary record with format: [header_size, type1, type2, type3, rowid, value, weight]
+                // For integers, type code is 1 for 1-byte int, 2 for 2-byte, etc.
+                // Using type 6 (8-byte integer) for all values
+                // Header: 4 bytes (header size byte + 3 type bytes)
+                let mut payload = vec![
+                    4u8, // header size
+                    6u8, // type for rowid (8-byte int)
+                    6u8, // type for value (8-byte int)
+                    6u8, // type for weight (8-byte int)
+                ];
+
+                // Data: 3 x 8-byte integers
+                payload.extend_from_slice(&rowid.to_be_bytes());
+                payload.extend_from_slice(&value.to_be_bytes());
+                payload.extend_from_slice(&weight.to_be_bytes());
+
+                ImmutableRecord::from_bin_record(payload)
+            }
+
+            fn get_seek_count(&self) -> usize {
+                self.seek_count.load(Ordering::SeqCst)
+            }
+
+            fn get_prev_count(&self) -> usize {
+                self.prev_count.load(Ordering::SeqCst)
+            }
+        }
+
+        impl CursorTrait for MockBTreeCursor {
+            fn seek(&mut self, _key: SeekKey<'_>, _op: SeekOp) -> Result<IOResult<SeekResult>> {
+                let count = self.seek_count.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // First seek returns TryAdvance
+                    Ok(IOResult::Done(SeekResult::TryAdvance))
+                } else {
+                    // Subsequent seeks return Found to avoid infinite loop
+                    // (The bug is that this second seek happens at all)
+                    Ok(IOResult::Done(SeekResult::Found))
+                }
+            }
+
+            fn seek_unpacked(
+                &mut self,
+                _registers: &[Register],
+                _op: SeekOp,
+            ) -> Result<IOResult<SeekResult>> {
+                // Not used in these tests
+                Ok(IOResult::Done(SeekResult::NotFound))
+            }
+
+            fn next(&mut self) -> Result<IOResult<()>> {
+                let count = self.next_count.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // First call returns IO (pending)
+                    let completion = Completion::new_yield();
+                    Ok(IOResult::IO(IOCompletions::Single(completion)))
+                } else {
+                    // Subsequent calls return Done
+                    Ok(IOResult::Done(()))
+                }
+            }
+
+            fn prev(&mut self) -> Result<IOResult<()>> {
+                let count = self.prev_count.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // First call returns IO (pending)
+                    let completion = Completion::new_yield();
+                    Ok(IOResult::IO(IOCompletions::Single(completion)))
+                } else {
+                    // Subsequent calls return Done
+                    Ok(IOResult::Done(()))
+                }
+            }
+
+            fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
+                Ok(IOResult::Done(self.current_rowid))
+            }
+
+            fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>> {
+                Ok(IOResult::Done(Some(&self.record)))
+            }
+
+            fn last(&mut self) -> Result<IOResult<()>> {
+                Ok(IOResult::Done(()))
+            }
+
+            fn insert(&mut self, _key: &BTreeKey) -> Result<IOResult<()>> {
+                Ok(IOResult::Done(()))
+            }
+
+            fn delete(&mut self) -> Result<IOResult<()>> {
+                Ok(IOResult::Done(()))
+            }
+
+            fn set_null_flag(&mut self, _flag: bool) {}
+
+            fn get_null_flag(&self) -> bool {
+                false
+            }
+
+            fn exists(&mut self, _key: &Value) -> Result<IOResult<bool>> {
+                Ok(IOResult::Done(false))
+            }
+
+            fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
+                Ok(IOResult::Done(None))
+            }
+
+            fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
+                Ok(IOResult::Done(None))
+            }
+
+            fn count(&mut self) -> Result<IOResult<usize>> {
+                Ok(IOResult::Done(0))
+            }
+
+            fn is_empty(&self) -> bool {
+                false
+            }
+
+            fn root_page(&self) -> i64 {
+                1
+            }
+
+            fn rewind(&mut self) -> Result<IOResult<()>> {
+                Ok(IOResult::Done(()))
+            }
+
+            fn has_record(&self) -> bool {
+                true
+            }
+
+            fn set_has_record(&mut self, _has_record: bool) {}
+
+            fn get_index_info(&self) -> &Arc<IndexInfo> {
+                &self.index_info
+            }
+
+            fn seek_end(&mut self) -> Result<IOResult<()>> {
+                Ok(IOResult::Done(()))
+            }
+
+            fn seek_to_last(&mut self, _always_seek: bool) -> Result<IOResult<()>> {
+                Ok(IOResult::Done(()))
+            }
+
+            fn invalidate_record(&mut self) {}
+
+            fn has_rowid(&self) -> bool {
+                true
+            }
+
+            fn get_pager(&self) -> Arc<Pager> {
+                panic!("MockBTreeCursor::get_pager should not be called")
+            }
+
+            fn get_skip_advance(&self) -> bool {
+                false
+            }
+        }
+
+        /// Test that verifies the bug: when btree.next() returns IO after TryAdvance,
+        /// resuming should NOT call btree.seek() again.
+        ///
+        /// Current behavior (BUG): seek is called twice
+        /// Expected behavior: seek should only be called once
+        #[test]
+        fn test_seek_not_repeated_after_io_during_try_advance() -> Result<()> {
+            let conn = create_test_connection()?;
+
+            // Get the view for creating a cursor
+            let view_mutex = conn
+                .schema
+                .read()
+                .get_materialized_view("test_view")
+                .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
+
+            let pager = conn.get_pager();
+            let tx_state = conn.view_transaction_states.get_or_create("test_view");
+
+            // Create mock cursor that returns TryAdvance from seek and IO from next
+            let mock_cursor = MockBTreeCursor::new();
+            let mock_cursor_box: Box<dyn CursorTrait> = Box::new(mock_cursor);
+
+            // Get a reference to the mock to check counts later
+            // We need to use Any::downcast to access the mock's methods
+            let mock_ptr = mock_cursor_box.as_ref() as *const dyn CursorTrait;
+
+            let mut cursor =
+                MaterializedViewCursor::new(mock_cursor_box, view_mutex, pager, tx_state)?;
+
+            // Use LE so that rowid=1 satisfies the condition (1 <= 5)
+            let seek_op = SeekOp::LE { eq_only: false };
+
+            // First call to do_seek - should call btree.seek() which returns TryAdvance,
+            // then btree.prev() which returns IO
+            let result = cursor.do_seek(5, seek_op);
+
+            // Should return IO (pending)
+            assert!(
+                matches!(result, Ok(IOResult::IO(_))),
+                "Expected IO result, got {result:?}"
+            );
+
+            // Check seek was called once
+            let mock_ref: &MockBTreeCursor = unsafe { &*(mock_ptr as *const MockBTreeCursor) };
+            assert_eq!(
+                mock_ref.get_seek_count(),
+                1,
+                "seek should be called exactly once before IO"
+            );
+            // For LE, we call prev() not next()
+            assert_eq!(
+                mock_ref.get_prev_count(),
+                1,
+                "prev should be called once (returned IO)"
+            );
+
+            // Second call to do_seek (simulating resumption after IO completes)
+            // BUG: This will call btree.seek() again, which is wasteful
+            let result = cursor.do_seek(5, seek_op);
+
+            // The result might be Found or some other result
+            assert!(
+                matches!(result, Ok(IOResult::Done(_))),
+                "Expected Done result on resume, got {result:?}"
+            );
+
+            // Check seek count - seek should only be called once
+            // If this fails with seek_count=2, it means the bug exists:
+            // seek is being redundantly called again after IO resumption
+            let final_seek_count = mock_ref.get_seek_count();
+
+            assert_eq!(
+                final_seek_count, 1,
+                "seek should only be called once, but was called {final_seek_count} times (redundant seek after IO during TryAdvance)"
+            );
+
+            Ok(())
+        }
     }
 }

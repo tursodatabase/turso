@@ -2955,3 +2955,26 @@ expect {
     null
 }
 
+# Regression: json_valid() must return 0 for UTF-8 BLOB data that is not valid JSON syntax.
+test json_valid_blob_utf8_non_json_word {
+    SELECT json_valid(x'696e76616c6964');
+}
+expect {
+    0
+}
+
+test json_valid_blob_utf8_non_json_word_with_whitespace {
+    SELECT json_valid(x'2020696e76616c69642020');
+}
+expect {
+    0
+}
+
+# Regression: x'7C31323334353637' starts with '|' (0x7C), which can overlap
+# with JSONB inline header byte patterns, but this is scalar non-JSON bytes.
+test json_valid_blob_header_overlap_scalar_bytes {
+    SELECT json_valid(x'7C31323334353637');
+}
+expect {
+    0
+}

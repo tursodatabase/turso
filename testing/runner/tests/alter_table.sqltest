@@ -66,6 +66,14 @@ expect {
     1|0
 }
 
+test alter-table-add-column-invalid-multi-column-fk {
+    CREATE TABLE t(a, c);
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES t(a, c);
+}
+expect error {
+}
+
 test alter-table-add-column-default {
     CREATE TABLE test (a);
     INSERT INTO test VALUES (1), (2), (3);
@@ -251,7 +259,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3886
-test alter-tbl-rregression {
+test alter-tbl-regression {
     PRAGMA foreign_keys = ON;
     CREATE TABLE p_ren1(id INTEGER PRIMARY KEY);
     CREATE TABLE c_ren1(id INTEGER PRIMARY KEY, pid INTEGER,
@@ -348,6 +356,99 @@ expect {
     1|3.14
 }
 
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-type-mismatch {
+    CREATE TABLE t1(name TEXT) STRICT;
+    INSERT INTO t1 VALUES ('alice'), ('bob');
+    ALTER TABLE t1 ADD COLUMN id INTEGER DEFAULT 'corrupted';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-integer-from-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT '10';
+    INSERT INTO t(a) VALUES (1);
+    SELECT typeof(b), b FROM t;
+}
+expect {
+    integer|10
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-real-from-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT '1.25';
+    INSERT INTO t(a) VALUES (1);
+    SELECT typeof(b), b FROM t;
+}
+expect {
+    real|1.25
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-text-from-integer {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT 123;
+    INSERT INTO t(a) VALUES (1);
+    SELECT typeof(b), b FROM t;
+}
+expect {
+    text|123
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-integer-fractional {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 3.14;
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-real-nonnumeric {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT 'abc';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-text-blob {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT X'CAFE';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-blob-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t(a) VALUES (1);
+    ALTER TABLE t ADD COLUMN b BLOB DEFAULT 'abc';
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-default-mismatch-empty-table {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 3.14;
+    INSERT INTO t(a) VALUES (1);
+}
+expect error {
+    cannot store REAL value in INTEGER column t.b
+}
+
 test alter-add-column-invalid-collation {
     CREATE TABLE t(c1 INTEGER);
     ALTER TABLE t ADD COLUMN c2 INTEGER COLLATE compile_options;
@@ -355,4 +456,3 @@ test alter-add-column-invalid-collation {
 expect error {
     no such collation sequence: compile_options
 }
-

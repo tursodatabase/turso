@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::{turso_assert, turso_assert_greater_than_or_equal, turso_assert_less_than};
 use std::cmp::PartialEq;
 
 use super::{
@@ -480,6 +481,7 @@ fn plan_cte(
             cte_explicit_columns: vec![],
             cte_id: Some(cte_definitions[ref_idx].cte_id),
             cte_definition_only: false,
+            rowid_referenced: false,
         });
     }
 
@@ -610,7 +612,11 @@ pub fn plan_ctes_as_outer_refs(
             }
         };
 
-        // Add CTE as outer query reference so it's available to subqueries
+        // Add CTE as outer query reference so it's available to subqueries.
+        // cte_definition_only = true: the CTE is only for subquery FROM lookup
+        // (e.g. UPDATE t SET b = (SELECT v FROM c)), not for direct column
+        // resolution (e.g. UPDATE t SET b = c.v which SQLite rejects as
+        // "no such column").
         table_references.add_outer_query_reference(OuterQueryReference {
             identifier: cte_name,
             internal_id: joined_table.internal_id,
@@ -619,7 +625,8 @@ pub fn plan_ctes_as_outer_refs(
             cte_select: Some(cte_select_ast),
             cte_explicit_columns: explicit_columns,
             cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
-            cte_definition_only: false,
+            cte_definition_only: true,
+            rowid_referenced: false,
         });
     }
 
@@ -694,6 +701,7 @@ fn parse_from_clause_table(
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
                     cte_id: Some(cte_def.cte_id),
                     cte_definition_only: false,
+                    rowid_referenced: false,
                 });
             }
 
@@ -762,7 +770,7 @@ fn parse_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
-    let database_id = connection.resolve_database_id(qualified_name)?;
+    let database_id = resolver.resolve_database_id(qualified_name)?;
     let table_name = &qualified_name.name;
 
     // Check if the FROM clause table is referring to a CTE in the current scope.
@@ -888,7 +896,7 @@ fn parse_table(
     }
 
     // Resolve table using connection's with_schema method
-    let table = connection.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+    let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
         let alias = maybe_alias
@@ -923,7 +931,7 @@ fn parse_table(
     };
 
     let regular_view =
-        connection.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
+        resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery
         view.process()?;
@@ -955,12 +963,12 @@ fn parse_table(
         return result;
     }
 
-    let view = connection.with_schema(database_id, |schema| {
+    let view = resolver.with_schema(database_id, |schema| {
         schema.get_materialized_view(table_name.as_str())
     });
     if let Some(view) = view {
         // First check if the DBSP state table exists with the correct version
-        let has_compatible_state = connection.with_schema(database_id, |schema| {
+        let has_compatible_state = resolver.with_schema(database_id, |schema| {
             schema.has_compatible_dbsp_state_table(table_name.as_str())
         });
 
@@ -1052,7 +1060,7 @@ fn parse_table(
     }
 
     // Check if this is an incompatible view
-    let is_incompatible = connection.with_schema(database_id, |schema| {
+    let is_incompatible = resolver.with_schema(database_id, |schema| {
         schema
             .incompatible_views
             .contains(&normalized_qualified_name)
@@ -1221,6 +1229,7 @@ pub fn parse_from(
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
                     cte_id: Some(cte_def.cte_id),
                     cte_definition_only: false,
+                    rowid_referenced: false,
                 });
             }
         }
@@ -1262,7 +1271,7 @@ pub fn parse_where(
     table_references: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
-    connection: &Arc<crate::Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
@@ -1272,7 +1281,7 @@ pub fn parse_where(
                 &mut expr.expr,
                 Some(table_references),
                 result_columns,
-                connection,
+                resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
@@ -1379,7 +1388,7 @@ impl TableMask {
 
     /// Creates a new mask that is the same as this one but without the specified table.
     pub fn without_table(&self, table_no: usize) -> Self {
-        assert!(table_no < 127, "table_no must be less than 127");
+        turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
         Self(self.0 ^ (1 << (table_no + 1)))
     }
 
@@ -1393,7 +1402,7 @@ impl TableMask {
     /// Creates a table mask from an iterator of table numbers.
     pub fn from_table_number_iter(iter: impl Iterator<Item = usize>) -> Self {
         iter.fold(Self::new(), |mut mask, table_no| {
-            assert!(table_no < 127, "table_no must be less than 127");
+            turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
             mask.add_table(table_no);
             mask
         })
@@ -1401,13 +1410,13 @@ impl TableMask {
 
     /// Adds a table to the mask.
     pub fn add_table(&mut self, table_no: usize) {
-        assert!(table_no < 127, "table_no must be less than 127");
+        turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
         self.0 |= 1 << (table_no + 1);
     }
 
     /// Returns true if the mask contains the specified table.
     pub fn contains_table(&self, table_no: usize) -> bool {
-        assert!(table_no < 127, "table_no must be less than 127");
+        turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
         self.0 & (1 << (table_no + 1)) != 0
     }
 
@@ -1677,7 +1686,7 @@ fn parse_join(
         );
     }
     let constraint = if natural {
-        assert!(table_references.joined_tables().len() >= 2);
+        turso_assert_greater_than_or_equal!(table_references.joined_tables().len(), 2);
         // NATURAL JOIN is first transformed into a USING join with the common columns
         let mut distinct_names: Vec<ast::Name> = vec![];
         // TODO: O(n^2) maybe not great for large tables or big multiway joins
@@ -1729,7 +1738,7 @@ fn parse_join(
                         &mut predicate.expr,
                         Some(table_references),
                         None,
-                        connection,
+                        resolver,
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
@@ -1740,7 +1749,7 @@ fn parse_join(
                     let name_normalized = normalize_ident(distinct_name.as_str());
                     let cur_table_idx = table_references.joined_tables().len() - 1;
                     let left_tables = &table_references.joined_tables()[..cur_table_idx];
-                    assert!(!left_tables.is_empty());
+                    turso_assert!(!left_tables.is_empty());
                     let right_table = table_references.joined_tables().last().unwrap();
                     let mut left_col = None;
                     for (left_table_idx, left_table) in left_tables.iter().enumerate() {
@@ -1872,13 +1881,13 @@ where
 #[allow(clippy::type_complexity)]
 pub fn parse_limit(
     mut limit: Limit,
-    connection: &crate::sync::Arc<crate::Connection>,
+    resolver: &Resolver,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
     bind_and_rewrite_expr(
         &mut limit.expr,
         None,
         None,
-        connection,
+        resolver,
         BindingBehavior::TryResultColumnsFirst,
     )?;
     if let Some(ref mut off_expr) = limit.offset {
@@ -1886,7 +1895,7 @@ pub fn parse_limit(
             off_expr,
             None,
             None,
-            connection,
+            resolver,
             BindingBehavior::TryResultColumnsFirst,
         )?;
     }

@@ -4,6 +4,7 @@ use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
 };
+use crate::turso_assert;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -13,20 +14,36 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, PlatformIO, IO},
-    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
+    parse_schema_rows, refresh_analyze_stats, translate,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
-    AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesInfo,
-    CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
-    DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
-    LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
-    Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
+    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
+    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
+    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
+    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
+    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
+    Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::Display;
 use std::ops::Deref;
 use tracing::{instrument, Level};
+use turso_macros::AtomicEnum;
+
+#[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TransactionState {
+    Write {
+        schema_did_change: bool,
+    },
+    Read,
+    /// PendingUpgrade remembers what transaction state was before upgrade to write (has_read_txn is true if before transaction were in Read state)
+    /// This is important, because if we failed to initialize write transaction immediatley - we need to end implicitly started read txn (e.g. for simiple INSERT INTO operation)
+    /// But for late upgrade of transaction we should keep read transaction active (e.g. BEGIN; SELECT ...; INSERT INTO ...)
+    PendingUpgrade {
+        has_read_txn: bool,
+    },
+    None,
+}
 
 /// Database connection handle.
 ///
@@ -1423,11 +1440,6 @@ impl Connection {
         Ok(())
     }
 
-    // Get an attached database by alias name
-    pub(crate) fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
-        self.attached_databases.read().get_database_by_name(alias)
-    }
-
     /// List all attached database aliases
     pub fn list_attached_databases(&self) -> Vec<String> {
         self.attached_databases
@@ -1448,34 +1460,12 @@ impl Connection {
             .collect()
     }
 
-    /// Resolve database ID from a qualified name
-    pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
-        use crate::util::normalize_ident;
+    pub(crate) fn database_schemas(&self) -> &RwLock<HashMap<usize, Arc<Schema>>> {
+        &self.database_schemas
+    }
 
-        // Check if this is a qualified name (database.table) or unqualified
-        if let Some(db_name) = &qualified_name.db_name {
-            let db_name_normalized = normalize_ident(db_name.as_str());
-            let name_bytes = db_name_normalized.as_bytes();
-            match_ignore_ascii_case!(match name_bytes {
-                b"main" => Ok(0),
-                b"temp" => Ok(1),
-                _ => {
-                    // Look up attached database
-                    if let Some((idx, _attached_db)) =
-                        self.get_attached_database(&db_name_normalized)
-                    {
-                        Ok(idx)
-                    } else {
-                        Err(LimboError::InvalidArgument(format!(
-                            "no such database: {db_name_normalized}"
-                        )))
-                    }
-                }
-            })
-        } else {
-            // Unqualified table name - use main database
-            Ok(0)
-        }
+    pub(crate) fn attached_databases(&self) -> &RwLock<DatabaseCatalog> {
+        &self.attached_databases
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning

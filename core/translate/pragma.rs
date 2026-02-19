@@ -2,6 +2,7 @@
 //! More info: https://www.sqlite.org/pragma.html.
 
 use crate::sync::Arc;
+use crate::turso_soft_unreachable;
 use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::PragmaName;
@@ -70,7 +71,7 @@ pub fn translate_pragma(
         Err(_) => bail_parse_error!("Not a valid pragma name"),
     };
 
-    let database_id = connection.resolve_database_id(name)?;
+    let database_id = resolver.resolve_database_id(name)?;
 
     let mode = match body {
         None => query_pragma(
@@ -305,7 +306,7 @@ fn update_pragma(
                 ));
             }
 
-            let is_empty = is_database_empty(resolver.schema, &pager)?;
+            let is_empty = is_database_empty(resolver.schema(), &pager)?;
             tracing::debug!(
                 "Checking if database is empty for auto_vacuum pragma: {}",
                 is_empty
@@ -542,7 +543,7 @@ fn query_pragma(
     database_id: usize,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
-    let schema = resolver.schema;
+    let schema = resolver.schema();
     let register = program.alloc_register();
     match pragma {
         PragmaName::ApplicationId => {
@@ -957,7 +958,7 @@ fn query_pragma(
             // we need 6 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(5);
             if let Some(name) = name {
-                connection.with_schema(database_id, |db_schema| {
+                resolver.with_schema(database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&name) {
                         emit_columns_for_table_info(program, table.columns(), base_reg, false);
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&name) {
@@ -985,7 +986,7 @@ fn query_pragma(
             // we need 7 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(6);
             if let Some(name) = name {
-                connection.with_schema(database_id, |db_schema| {
+                resolver.with_schema(database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&name) {
                         emit_columns_for_table_info(program, table.columns(), base_reg, true);
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&name) {
@@ -1062,12 +1063,12 @@ fn query_pragma(
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_integrity_check(schema, program, resolver, max_errors)?;
+            translate_integrity_check(schema, program, resolver, database_id, max_errors)?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_quick_check(schema, program, resolver, max_errors)?;
+            translate_quick_check(schema, program, resolver, database_id, max_errors)?;
             Ok(TransactionMode::Read)
         }
         PragmaName::UnstableCaptureDataChangesConn => {
@@ -1320,6 +1321,7 @@ fn update_cache_size(
             .unwrap_or_default()
             .get() as i64;
         if page_size == 0 {
+            turso_soft_unreachable!("Page size cannot be zero");
             return Err(LimboError::InternalError(
                 "Page size cannot be zero".to_string(),
             ));

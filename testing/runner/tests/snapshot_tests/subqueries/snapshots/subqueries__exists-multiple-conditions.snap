@@ -1,16 +1,25 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT p.id, p.name, p.price\n    FROM products p\n    WHERE EXISTS (\n        SELECT 1\n        FROM order_items oi\n        JOIN orders o ON o.id = oi.order_id\n        WHERE oi.product_id = p.id\n            AND o.order_date >= '2024-01-01'\n    );"
+expression: |-
+  SELECT p.id, p.name, p.price
+      FROM products p
+      WHERE EXISTS (
+          SELECT 1
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+          WHERE oi.product_id = p.id
+              AND o.order_date >= '2024-01-01'
+      );
 info:
   statement_type: SELECT
   tables:
-    - o.id
-    - order_items
-    - orders
-    - products
+  - o.id
+  - order_items
+  - orders
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN products AS p

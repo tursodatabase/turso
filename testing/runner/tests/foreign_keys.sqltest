@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "foreign keys not supported with MVCC"
 
 test fk-basic-ok {
     PRAGMA foreign_keys=ON;
@@ -12,6 +11,14 @@ test fk-basic-ok {
 expect {
     10|1
     11|
+}
+
+test fk-column-constraint-multi-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a, c);
+    CREATE TABLE s(a REFERENCES t(a, c));
+}
+expect error {
 }
 
 test fk-insert-child-missing-parent {
@@ -2442,3 +2449,78 @@ test fk-drop-column-composite-fk-fails {
 expect error {
 }
 
+# No-op UPDATE on NULL FK column with deferred FK should not error (#5410)
+test fk-deferred-noop-update-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(1, NULL);
+    UPDATE c SET pid = pid WHERE id=1;
+    SELECT 'ok';
+    ROLLBACK;
+}
+expect {
+    ok
+}
+
+# No-op UPDATE on non-NULL FK column with deferred FK and valid parent
+test fk-deferred-noop-update-valid-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    BEGIN;
+    INSERT INTO c VALUES(1, 1);
+    UPDATE c SET pid = pid WHERE id=1;
+    SELECT 'ok';
+    ROLLBACK;
+}
+expect {
+    ok
+}
+
+# UPDATE NULL FK column to NULL explicitly with deferred FK
+test fk-deferred-update-null-to-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(1, NULL);
+    UPDATE c SET pid = NULL WHERE id=1;
+    SELECT 'ok';
+    ROLLBACK;
+}
+expect {
+    ok
+}
+
+# Multiple rows with NULL FK, no-op UPDATE should succeed for all
+test fk-deferred-noop-update-null-multi-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(1, NULL);
+    INSERT INTO c VALUES(2, NULL);
+    INSERT INTO c VALUES(3, NULL);
+    UPDATE c SET pid = pid;
+    SELECT count(*) FROM c;
+    ROLLBACK;
+}
+expect {
+    3
+}
+
+# No-op UPDATE on NULL FK with immediate (non-deferred) FK should also succeed
+test fk-immediate-noop-update-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id));
+    INSERT INTO c VALUES(1, NULL);
+    UPDATE c SET pid = pid WHERE id=1;
+    SELECT 'ok';
+}
+expect {
+    ok
+}

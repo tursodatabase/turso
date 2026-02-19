@@ -19,6 +19,7 @@ use crate::{
         select::prepare_select_plan,
     },
     vdbe::{
+        affinity,
         builder::{CursorType, MaterializedCteInfo, ProgramBuilder},
         insn::Insn,
         CursorID,
@@ -199,6 +200,31 @@ pub fn plan_subqueries_from_values(
     Ok(())
 }
 
+/// Compute query plans for subqueries in UPDATE SET clause expressions.
+/// This is used by UPDATE statements where SET clause values contain scalar subqueries.
+/// e.g. `UPDATE t SET col = (SELECT max(id) FROM t2)`
+pub fn plan_subqueries_from_set_clauses(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    set_clauses: &mut [(usize, Box<ast::Expr>)],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        set_clauses.iter_mut().map(|(_, expr)| expr.as_mut()),
+        connection,
+        SubqueryPosition::ResultColumn, // SET clause subqueries are similar to result columns
+    )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries);
+    Ok(())
+}
+
 /// Compute query plans for subqueries in RETURNING expressions.
 /// This is used by INSERT, UPDATE, and DELETE statements with RETURNING clauses.
 /// RETURNING expressions may contain scalar subqueries that need to be planned.
@@ -262,6 +288,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     cte_explicit_columns: vec![],
                     cte_id,
                     cte_definition_only: false,
+                    rowid_referenced: false,
                 }
             })
             .chain(
@@ -277,6 +304,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                         cte_explicit_columns: t.cte_explicit_columns.clone(),
                         cte_id: t.cte_id, // Preserve CTE ID from outer query refs
                         cte_definition_only: t.cte_definition_only,
+                        rowid_referenced: false,
                     }),
             )
             .collect::<Vec<_>>()
@@ -349,7 +377,7 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema)?;
+                optimize_select_plan(&mut plan, resolver.schema())?;
                 // EXISTS subqueries are satisfied after at most 1 row has been returned.
                 plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                     "1".to_string(),
@@ -397,7 +425,7 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema)?;
+                optimize_select_plan(&mut plan, resolver.schema())?;
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
@@ -465,7 +493,7 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema)?;
+                optimize_select_plan(&mut plan, resolver.schema())?;
                 // e.g. (x,y) IN (SELECT ...)
                 // or x IN (SELECT ...)
                 let lhs_columns = match unwrap_parens(lhs.as_ref())? {
@@ -485,11 +513,13 @@ fn get_subquery_parser<'a>(
                     lhs_columns
                         .enumerate()
                         .map(|(i, lhs_expr)| {
-                            let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables));
+                            let lhs_affinity =
+                                get_expr_affinity(lhs_expr, Some(referenced_tables), None);
                             compare_affinity(
                                 &plan.result_columns[i].expr,
                                 lhs_affinity,
                                 Some(&plan.table_references),
+                                None,
                             )
                             .aff_mask()
                         })
@@ -946,18 +976,38 @@ pub fn emit_from_clause_subqueries(
 
                     // If this reference needs a seek index, build it from the dup cursor
                     if let Operation::Search(Search::Seek {
-                        index: Some(index), ..
+                        index: Some(index),
+                        seek_def,
+                        ..
                     }) = &table_reference.op
                     {
                         if !index.ephemeral {
                             panic!("subquery has non-ephemeral index: {}", index.name);
                         }
+                        let dup_affinity_str = {
+                            let num_key_cols = seek_def.size(&seek_def.start);
+                            let total_cols =
+                                index.columns.len() + if index.has_rowid { 1 } else { 0 };
+                            let mut aff: String = seek_def
+                                .iter_affinity(&seek_def.start)
+                                .map(|a| a.aff_mask())
+                                .collect();
+                            for _ in num_key_cols..total_cols {
+                                aff.push(affinity::SQLITE_AFF_NONE);
+                            }
+                            if aff.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+                                Some(Arc::new(aff))
+                            } else {
+                                None
+                            }
+                        };
                         emit_seek_index_from_cursor(
                             program,
                             dup_cursor_id,
                             index,
                             table_reference.internal_id,
                             cte_info.num_columns,
+                            dup_affinity_str.as_ref(),
                         )?;
                     }
 
@@ -984,11 +1034,36 @@ pub fn emit_from_clause_subqueries(
                 }
             }
 
-            let seek_index = match &table_reference.op {
+            let (seek_index, seek_affinity_str) = match &table_reference.op {
                 Operation::Search(Search::Seek {
-                    index: Some(idx), ..
-                }) if idx.ephemeral => Some(idx.clone()),
-                _ => None,
+                    index: Some(idx),
+                    seek_def,
+                    ..
+                }) if idx.ephemeral => {
+                    // Build affinity string for MakeRecord when inserting into the
+                    // ephemeral index. Key columns get the comparison affinity so that
+                    // cross-type seeks work (e.g. integer probe on text CTE values).
+                    // Non-key columns and rowid get NONE (no coercion).
+                    let num_key_cols = seek_def.size(&seek_def.start);
+                    let total_cols = idx.columns.len() + if idx.has_rowid { 1 } else { 0 };
+                    let mut aff: String = seek_def
+                        .iter_affinity(&seek_def.start)
+                        .map(|a| a.aff_mask())
+                        .collect();
+                    for _ in num_key_cols..total_cols {
+                        aff.push(affinity::SQLITE_AFF_NONE);
+                    }
+                    let has_non_none = aff.chars().any(|c| c != affinity::SQLITE_AFF_NONE);
+                    (
+                        Some(idx.clone()),
+                        if has_non_none {
+                            Some(Arc::new(aff))
+                        } else {
+                            None
+                        },
+                    )
+                }
+                _ => (None, None),
             };
 
             // Determine if this CTE/subquery should be materialized:
@@ -1019,6 +1094,7 @@ pub fn emit_from_clause_subqueries(
                         index,
                         table_reference.internal_id,
                         from_clause_subquery.columns.len(),
+                        seek_affinity_str.as_ref(),
                     )?;
                 }
 
@@ -1047,6 +1123,7 @@ pub fn emit_from_clause_subqueries(
                     &index,
                     table_reference.internal_id,
                     from_clause_subquery.columns.len(),
+                    seek_affinity_str,
                 )?;
                 from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
                 program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
@@ -1130,7 +1207,7 @@ pub fn emit_from_clause_subquery(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+                resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
@@ -1142,7 +1219,7 @@ pub fn emit_from_clause_subquery(
         Plan::CompoundSelect { .. } => {
             // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
             let plan_clone = plan.clone();
-            let resolver = Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table);
+            let resolver = t_ctx.resolver.fork();
             // emit_program_for_compound_select returns the result column start register
             // for coroutine mode, which is needed by the outer query.
             emit_program_for_compound_select(program, &resolver, plan_clone)?
@@ -1227,7 +1304,7 @@ fn emit_materialized_cte(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+                resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
@@ -1239,7 +1316,7 @@ fn emit_materialized_cte(
         Plan::CompoundSelect { .. } => {
             // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
             let plan_clone = plan.clone();
-            let resolver = Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table);
+            let resolver = t_ctx.resolver.fork();
             emit_program_for_compound_select(program, &resolver, plan_clone)?;
         }
         Plan::Delete(_) | Plan::Update(_) => {
@@ -1268,6 +1345,7 @@ fn emit_indexed_materialized_subquery(
     index: &Arc<Index>,
     table_internal_id: TableInternalId,
     num_columns: usize,
+    affinity_str: Option<Arc<String>>,
 ) -> Result<usize> {
     // Allocate index cursor using CursorKey::index so main_loop can find it
     let index_cursor_id = program.alloc_cursor_id_keyed(
@@ -1280,7 +1358,7 @@ fn emit_indexed_materialized_subquery(
         *dest = QueryDestination::EphemeralIndex {
             cursor_id: index_cursor_id,
             index: index.clone(),
-            affinity_str: None,
+            affinity_str,
             is_delete: false,
         };
     }
@@ -1313,7 +1391,7 @@ fn emit_indexed_materialized_subquery(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+                resolver: t_ctx.resolver.fork(),
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
@@ -1324,7 +1402,7 @@ fn emit_indexed_materialized_subquery(
         }
         Plan::CompoundSelect { .. } => {
             let plan_clone = plan.clone();
-            let resolver = Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table);
+            let resolver = t_ctx.resolver.fork();
             emit_program_for_compound_select(program, &resolver, plan_clone)?;
         }
         Plan::Delete(_) | Plan::Update(_) => {
@@ -1346,6 +1424,7 @@ fn emit_seek_index_from_cursor(
     index: &Arc<Index>,
     table_internal_id: TableInternalId,
     num_columns: usize,
+    affinity_str: Option<&Arc<String>>,
 ) -> Result<()> {
     // Allocate cursor for the seek index
     let index_cursor_id = program.alloc_cursor_id_keyed(
@@ -1401,14 +1480,15 @@ fn emit_seek_index_from_cursor(
         dest: key_regs_start + index.columns.len(),
     });
 
-    // Make record and insert into index
-    // Pass index name for collation handling
+    // Make record and insert into index.
+    // affinity_str coerces key columns so cross-type seeks work (e.g. integer
+    // probe on text CTE values).
     program.emit_insn(Insn::MakeRecord {
         start_reg: key_regs_start as u16,
         count: num_key_cols as u16,
         dest_reg: record_reg as u16,
         index_name: Some(index.name.clone()),
-        affinity_str: None,
+        affinity_str: affinity_str.map(|s| (**s).clone()),
     });
 
     program.emit_insn(Insn::IdxInsert {

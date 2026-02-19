@@ -1,14 +1,21 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT o.id, o.order_date, o.total_amount\n    FROM orders o\n    WHERE (\n        SELECT count(*)\n        FROM order_items oi\n        WHERE oi.order_id = o.id\n    ) >= 3;"
+expression: |-
+  SELECT o.id, o.order_date, o.total_amount
+      FROM orders o
+      WHERE (
+          SELECT count(*)
+          FROM order_items oi
+          WHERE oi.order_id = o.id
+      ) >= 3;
 info:
   statement_type: SELECT
   tables:
-    - order_items
-    - orders
+  - order_items
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN orders AS o

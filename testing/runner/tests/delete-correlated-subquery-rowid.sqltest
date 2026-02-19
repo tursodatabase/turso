@@ -1,0 +1,79 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE tt(a);
+    INSERT INTO tt VALUES (1);
+    INSERT INTO tt VALUES (2);
+    INSERT INTO tt VALUES (3);
+}
+
+@setup schema
+test delete-correlated-subquery-rowid-basic {
+    DELETE FROM tt WHERE a IN (SELECT a FROM tt tt1 WHERE tt1.rowid = tt.rowid);
+    SELECT * FROM tt;
+}
+expect {
+}
+
+setup partial-schema {
+    CREATE TABLE t2(a);
+    INSERT INTO t2 VALUES (10);
+    INSERT INTO t2 VALUES (20);
+    INSERT INTO t2 VALUES (30);
+    INSERT INTO t2 VALUES (40);
+}
+
+@setup partial-schema
+test delete-correlated-subquery-rowid-partial {
+    DELETE FROM t2 WHERE a IN (SELECT a FROM t2 x WHERE x.rowid = t2.rowid AND t2.rowid <= 2);
+    SELECT a FROM t2 ORDER BY a;
+}
+expect {
+    30
+    40
+}
+
+@setup schema
+test delete-correlated-subquery-underscore-rowid {
+    DELETE FROM tt WHERE a IN (SELECT a FROM tt t1 WHERE t1._rowid_ = tt._rowid_);
+    SELECT * FROM tt;
+}
+expect {
+}
+
+@setup schema
+test delete-correlated-subquery-oid {
+    DELETE FROM tt WHERE a IN (SELECT a FROM tt t1 WHERE t1.oid = tt.oid);
+    SELECT * FROM tt;
+}
+expect {
+}
+
+setup empty-schema {
+    CREATE TABLE t_empty(a);
+}
+
+@setup empty-schema
+test delete-correlated-subquery-empty-table {
+    DELETE FROM t_empty WHERE a IN (SELECT a FROM t_empty t1 WHERE t1.rowid = t_empty.rowid);
+    SELECT count(*) FROM t_empty;
+}
+expect {
+    0
+}
+
+setup null-schema {
+    CREATE TABLE t_null(a);
+    INSERT INTO t_null VALUES (NULL);
+    INSERT INTO t_null VALUES (1);
+    INSERT INTO t_null VALUES (NULL);
+}
+
+@setup null-schema
+test delete-correlated-subquery-with-nulls {
+    DELETE FROM t_null WHERE a IN (SELECT a FROM t_null t1 WHERE t1.rowid = t_null.rowid);
+    SELECT count(*) FROM t_null;
+}
+expect {
+    2
+}

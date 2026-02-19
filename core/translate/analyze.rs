@@ -15,7 +15,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
-    Connection, Result,
+    Result,
 };
 use turso_parser::ast;
 
@@ -32,7 +32,7 @@ type AnalyzeTarget = (Arc<BTreeTable>, Option<Arc<Index>>);
 /// - An index name: analyze just that index
 fn resolve_analyze_targets(
     target_opt: &Option<ast::QualifiedName>,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<(usize, Vec<AnalyzeTarget>)> {
     match target_opt {
         Some(target) => {
@@ -40,12 +40,12 @@ fn resolve_analyze_targets(
 
             // If db_name is specified, resolve to that database
             if let Some(db_name) = &target.db_name {
-                let database_id = connection.resolve_database_id(target)?;
+                let database_id = resolver.resolve_database_id(target)?;
                 let db_normalized = normalize_ident(db_name.as_str());
 
                 // "ANALYZE db.table" — the name part is the table/index
                 // But first check if the name is actually a database name too (shouldn't be with db_name set)
-                let targets = resolve_targets_in_db(&normalized, database_id, connection)?;
+                let targets = resolve_targets_in_db(&normalized, database_id, resolver)?;
                 if targets.is_empty() {
                     bail_parse_error!("no such table or index: {}.{}", db_normalized, normalized);
                 }
@@ -54,18 +54,18 @@ fn resolve_analyze_targets(
 
             // No db_name — check if the name is a database name first
             if normalized.eq_ignore_ascii_case("main") {
-                let targets = collect_all_tables_in_db(0, connection);
+                let targets = collect_all_tables_in_db(0, resolver);
                 return Ok((0, targets));
             }
 
             // Check if it's an attached database name
-            if let Some((db_id, _)) = connection.get_attached_database(&normalized) {
-                let targets = collect_all_tables_in_db(db_id, connection);
+            if let Some((db_id, _)) = resolver.get_attached_database(&normalized) {
+                let targets = collect_all_tables_in_db(db_id, resolver);
                 return Ok((db_id, targets));
             }
 
             // Not a database name — search main schema for table/index
-            let targets = resolve_targets_in_db(&normalized, 0, connection)?;
+            let targets = resolve_targets_in_db(&normalized, 0, resolver)?;
             if targets.is_empty() {
                 bail_parse_error!("no such table or index: {}", target.name);
             }
@@ -73,18 +73,15 @@ fn resolve_analyze_targets(
         }
         None => {
             // ANALYZE with no target — analyze all tables in main
-            let targets = collect_all_tables_in_db(0, connection);
+            let targets = collect_all_tables_in_db(0, resolver);
             Ok((0, targets))
         }
     }
 }
 
 /// Collect all user tables in the given database.
-fn collect_all_tables_in_db(
-    database_id: usize,
-    connection: &Arc<Connection>,
-) -> Vec<AnalyzeTarget> {
-    connection.with_schema(database_id, |schema| {
+fn collect_all_tables_in_db(database_id: usize, resolver: &Resolver) -> Vec<AnalyzeTarget> {
+    resolver.with_schema(database_id, |schema| {
         schema
             .tables
             .iter()
@@ -105,18 +102,18 @@ fn collect_all_tables_in_db(
 fn resolve_targets_in_db(
     name: &str,
     database_id: usize,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<Vec<AnalyzeTarget>> {
     // Try as a table first
     let table_opt: Option<Arc<BTreeTable>> =
-        connection.with_schema(database_id, |s| s.get_btree_table(name));
+        resolver.with_schema(database_id, |s| s.get_btree_table(name));
     if let Some(table) = table_opt {
         return Ok(vec![(table, None)]);
     }
 
     // Try as an index
     let found: Option<(Arc<BTreeTable>, Arc<Index>)> =
-        connection.with_schema(database_id, |schema| {
+        resolver.with_schema(database_id, |schema| {
             for (table_name, indexes) in schema.indexes.iter() {
                 if let Some(index) = indexes
                     .iter()
@@ -140,10 +137,9 @@ pub fn translate_analyze(
     target_opt: Option<ast::QualifiedName>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
 ) -> Result<()> {
     // Resolve the target database and collect analyze targets.
-    let (database_id, analyze_targets) = resolve_analyze_targets(&target_opt, connection)?;
+    let (database_id, analyze_targets) = resolve_analyze_targets(&target_opt, resolver)?;
 
     if analyze_targets.is_empty() {
         return Ok(());
@@ -163,7 +159,7 @@ pub fn translate_analyze(
     let sqlite_stat1_source: RegisterOrLiteral<_>;
 
     let stat1_table: Option<Arc<BTreeTable>> =
-        connection.with_schema(database_id, |s| s.get_btree_table("sqlite_stat1"));
+        resolver.with_schema(database_id, |s| s.get_btree_table("sqlite_stat1"));
     if let Some(sqlite_stat1) = stat1_table {
         sqlite_stat1_btreetable = sqlite_stat1.clone();
         sqlite_stat1_source = RegisterOrLiteral::Literal(sqlite_stat1.root_page);
@@ -194,7 +190,7 @@ pub fn translate_analyze(
         sqlite_stat1_btreetable = Arc::new(BTreeTable::from_sql(sql, 0)?);
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
-        let table = connection
+        let table = resolver
             .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
             .unwrap();
         let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
@@ -225,7 +221,7 @@ pub fn translate_analyze(
         });
 
         // Bump schema cookie so subsequent statements reparse schema.
-        let schema_version = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
         program.emit_insn(Insn::SetCookie {
             db: database_id,
             cookie: Cookie::SchemaVersion,
@@ -406,7 +402,7 @@ pub fn translate_analyze(
         // Emit index stats for this table (or for a single index target).
         let indexes: Vec<Arc<Index>> = match target_index {
             Some(idx) => vec![idx],
-            None => connection.with_schema(database_id, |s| {
+            None => resolver.with_schema(database_id, |s| {
                 s.get_indices(&target_table.name)
                     .filter(|idx| idx.index_method.is_none()) // skip custom for now
                     .cloned()

@@ -587,7 +587,7 @@ fn execute_trigger_commands(
     let db_name = if database_id == 0 {
         None
     } else {
-        connection
+        resolver
             .get_database_name_by_index(database_id)
             .map(ast::Name::exact)
     };
@@ -624,7 +624,7 @@ fn execute_trigger_commands(
             "trigger subprogram",
         )?;
     }
-    subprogram_builder.epilogue(resolver.schema);
+    subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
 
@@ -807,7 +807,14 @@ fn rewrite_trigger_expr_for_when_clause(
                 // Handle NEW.column references
                 if ns.eq_ignore_ascii_case("new") {
                     if let Some(new_regs) = &ctx.new_registers {
-                        if let Some((idx, _)) = table.get_column(&col) {
+                        if let Some((idx, col_def)) = table.get_column(&col) {
+                            if col_def.is_rowid_alias() {
+                                // Rowid alias columns map to the rowid register (last element)
+                                *e = Expr::Register(
+                                    *new_regs.last().expect("NEW registers must be provided"),
+                                );
+                                return Ok(WalkControl::Continue);
+                            }
                             if idx < new_regs.len() {
                                 *e = Expr::Register(new_regs[idx]);
                                 return Ok(WalkControl::Continue);

@@ -23,22 +23,27 @@ pub fn translate_create_materialized_view(
                 .to_string(),
         ));
     }
+    if connection.mvcc_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "Materialized views are not supported in MVCC mode".to_string(),
+        ));
+    }
 
-    let database_id = connection.resolve_database_id(view_name)?;
+    let database_id = resolver.resolve_database_id(view_name)?;
     // The DBSP incremental maintenance runtime (populate_from_table, etc.) assumes
     // the main database pager/schema. Block attached databases until that is fixed.
     if database_id != 0 {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
 
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     // Check if view already exists
-    if connection.with_schema(database_id, |s| {
+    if resolver.with_schema(database_id, |s| {
         s.get_materialized_view(&normalized_view_name).is_some()
     }) {
         return Err(crate::LimboError::ParseError(format!(
@@ -51,7 +56,7 @@ pub fn translate_create_materialized_view(
     // storing invalid view definitions
     use crate::incremental::view::IncrementalView;
     use crate::schema::BTreeTable;
-    let view_column_schema = connection.with_schema(database_id, |s| {
+    let view_column_schema = resolver.with_schema(database_id, |s| {
         IncrementalView::validate_and_extract_columns(select_stmt, s)
     })?;
     let view_columns = view_column_schema.flat_columns();
@@ -133,7 +138,7 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_done_label);
 
     // Open cursor to sqlite_schema table
-    let table = connection.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -223,7 +228,7 @@ pub fn translate_create_materialized_view(
         )),
     });
 
-    let schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -237,7 +242,7 @@ pub fn translate_create_materialized_view(
         cursors: cursor_info,
     });
 
-    program.epilogue(resolver.schema);
+    program.epilogue(resolver.schema());
     Ok(())
 }
 
@@ -250,19 +255,24 @@ pub fn translate_create_view(
     resolver: &Resolver,
     select_stmt: &ast::Select,
     _columns: &[ast::IndexedColumn],
-    connection: Arc<Connection>,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
-    let database_id = connection.resolve_database_id(view_name)?;
+    if connection.mvcc_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "Views are not supported in MVCC mode".to_string(),
+        ));
+    }
+    let database_id = resolver.resolve_database_id(view_name)?;
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
-        connection.with_schema(database_id, |s| s.get_object_type(&normalized_view_name))
+        resolver.with_schema(database_id, |s| s.get_object_type(&normalized_view_name))
     {
         let type_str = match object_type {
             SchemaObjectType::Table => "table",
@@ -275,7 +285,7 @@ pub fn translate_create_view(
     }
 
     // Also check materialized views (not in get_object_type since they're stored differently)
-    if connection.with_schema(database_id, |s| {
+    if resolver.with_schema(database_id, |s| {
         s.get_materialized_view(&normalized_view_name).is_some()
     }) {
         return Err(crate::LimboError::ParseError(format!(
@@ -289,7 +299,7 @@ pub fn translate_create_view(
     let sql = create_view_to_str(&view_name.name.as_ident(), select_stmt);
 
     // Open cursor to sqlite_schema table
-    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -316,7 +326,7 @@ pub fn translate_create_view(
         where_clause: Some(format!("name = '{normalized_view_name}'")),
     });
 
-    let schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -332,21 +342,20 @@ fn create_view_to_str(view_name: &str, select_stmt: &ast::Select) -> String {
 }
 
 pub fn translate_drop_view(
-    connection: &Arc<Connection>,
     resolver: &Resolver,
     view_name: &ast::QualifiedName,
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = connection.resolve_database_id(view_name)?;
+    let database_id = resolver.resolve_database_id(view_name)?;
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     // Check if view exists (either regular or materialized)
-    let (is_regular_view, is_materialized_view) = connection.with_schema(database_id, |s| {
+    let (is_regular_view, is_materialized_view) = resolver.with_schema(database_id, |s| {
         (
             s.get_view(&normalized_view_name).is_some(),
             s.is_materialized_view(&normalized_view_name),
@@ -369,7 +378,7 @@ pub fn translate_drop_view(
     // and also clean up the associated DBSP state table and index
     let dbsp_table_name = if is_materialized_view {
         if let Some(table) =
-            connection.with_schema(database_id, |s| s.get_table(&normalized_view_name))
+            resolver.with_schema(database_id, |s| s.get_table(&normalized_view_name))
         {
             if let Some(btree_table) = table.btree() {
                 // Destroy the btree for the materialized view
@@ -394,7 +403,7 @@ pub fn translate_drop_view(
     // Destroy DBSP state table and index btrees if this is a materialized view
     if let Some(ref dbsp_table_name) = dbsp_table_name {
         // Destroy DBSP indexes first
-        let dbsp_indexes: Vec<_> = connection.with_schema(database_id, |s| {
+        let dbsp_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(dbsp_table_name).cloned().collect()
         });
         for index in &dbsp_indexes {
@@ -408,7 +417,7 @@ pub fn translate_drop_view(
 
         // Destroy DBSP state table btree
         if let Some(dbsp_table) =
-            connection.with_schema(database_id, |s| s.get_table(dbsp_table_name))
+            resolver.with_schema(database_id, |s| s.get_table(dbsp_table_name))
         {
             if let Some(dbsp_btree_table) = dbsp_table.btree() {
                 program.emit_insn(Insn::Destroy {
@@ -422,7 +431,7 @@ pub fn translate_drop_view(
     }
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let schema_table = connection.with_schema(0, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let schema_table = resolver.with_schema(0, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -625,7 +634,7 @@ pub fn translate_drop_view(
     });
 
     // Update schema version (increment schema cookie)
-    let schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     let schema_version_reg = program.alloc_register();
     program.emit_insn(Insn::Integer {
         dest: schema_version_reg,
@@ -638,6 +647,6 @@ pub fn translate_drop_view(
         p5: 1, // update version
     });
 
-    program.epilogue(resolver.schema);
+    program.epilogue(resolver.schema());
     Ok(())
 }

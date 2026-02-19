@@ -1,13 +1,16 @@
 ---
 source: indexes.sqltest
-expression: "SELECT warehouse_id, product_id, quantity\n    FROM inventory\n    WHERE warehouse_id = 1 AND product_id = 500;"
+expression: |-
+  SELECT warehouse_id, product_id, quantity
+      FROM inventory
+      WHERE warehouse_id = 1 AND product_id = 500;
 info:
   statement_type: SELECT
   tables:
-    - inventory
+  - inventory
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SEARCH inventory USING INDEX idx_inventory_covering

@@ -1021,3 +1021,56 @@ expect {
     new_row|1.0
 }
 
+# https://github.com/tursodatabase/turso/issues/5177
+# NEW.rowid_alias in UPDATE trigger WHEN clause should not be NULL
+test trigger-new-rowid-alias-when-clause {
+    CREATE TABLE t_5177 (id INTEGER PRIMARY KEY, val TEXT, counter INTEGER DEFAULT 0);
+    INSERT INTO t_5177 VALUES(1, 'a', 0), (2, 'b', 0), (3, 'c', 0);
+    CREATE TRIGGER tr_5177 AFTER UPDATE ON t_5177 WHEN NEW.id = 2 BEGIN
+      UPDATE t_5177 SET counter = counter + 1 WHERE id = NEW.id;
+    END;
+    UPDATE t_5177 SET val = 'updated' WHERE id = 2;
+    SELECT * FROM t_5177 ORDER BY id;
+}
+expect {
+    1|a|0
+    2|updated|1
+    3|c|0
+}
+
+# NEW.rowid_alias in BEFORE UPDATE trigger WHEN clause
+test trigger-new-rowid-alias-when-clause-before {
+    CREATE TABLE t_5177b (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log_5177b (msg TEXT);
+    INSERT INTO t_5177b VALUES(1, 'a'), (2, 'b');
+    CREATE TRIGGER tr_5177b BEFORE UPDATE ON t_5177b WHEN NEW.id = 1 BEGIN
+      INSERT INTO log_5177b VALUES('triggered for id 1');
+    END;
+    UPDATE t_5177b SET val = 'updated' WHERE id = 1;
+    UPDATE t_5177b SET val = 'updated' WHERE id = 2;
+    SELECT * FROM log_5177b;
+}
+expect {
+    triggered for id 1
+}
+
+# https://github.com/tursodatabase/turso/issues/5175
+# Subquery in trigger body UPDATE SET clause
+test trigger-update-set-subquery {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY);
+    CREATE TABLE counter(n INTEGER);
+    INSERT INTO counter VALUES(0);
+    INSERT INTO t1 VALUES(1);
+    CREATE TRIGGER tr1 AFTER INSERT ON t1 BEGIN
+      UPDATE counter SET n = (SELECT max(id) FROM t1);
+    END;
+    INSERT INTO t1 VALUES(2);
+    SELECT * FROM t1 ORDER BY id;
+    SELECT * FROM counter;
+}
+expect {
+    1
+    2
+    2
+}
+

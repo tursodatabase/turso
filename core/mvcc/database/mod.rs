@@ -30,7 +30,9 @@ use crate::ValueRef;
 use crate::{
     contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Completion,
 };
-use crate::{turso_assert, Numeric};
+use crate::{
+    turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
+};
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
@@ -68,14 +70,14 @@ pub struct MVTableId(i64);
 
 impl MVTableId {
     pub fn new(value: i64) -> Self {
-        assert!(value < 0, "MVCC table IDs are always negative");
+        turso_assert_less_than!(value, 0, "MVCC table IDs are always negative");
         Self(value)
     }
 }
 
 impl From<i64> for MVTableId {
     fn from(value: i64) -> Self {
-        assert!(value < 0, "MVCC table IDs are always negative");
+        turso_assert_less_than!(value, 0, "MVCC table IDs are always negative");
         Self(value)
     }
 }
@@ -564,7 +566,7 @@ impl TransactionState {
             TransactionState::Terminated => 2,
             TransactionState::Committed(ts) => {
                 // We only support 2^62 - 1 timestamps
-                assert!(ts & !Self::TIMESTAMP_MASK == 0);
+                turso_assert_eq!(ts & !Self::TIMESTAMP_MASK, 0);
                 Self::COMMITTED_BIT | ts
             }
         }
@@ -938,7 +940,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         return Err(LimboError::TxTerminated);
                     }
                     _ => {
-                        assert_eq!(tx.state, TransactionState::Active);
+                        turso_assert_eq!(tx.state, TransactionState::Active);
                     }
                 }
 
@@ -1050,6 +1052,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             CommitState::Commit { end_ts } => {
                 if !mvcc_store.is_exclusive_tx(&self.tx_id) && mvcc_store.has_exclusive_tx() {
                     // A non-CONCURRENT transaction is holding the exclusive lock, we must abort.
+                    turso_assert_reachable!("commit aborted due to exclusive tx conflict");
                     return Err(LimboError::WriteWriteConflict);
                 }
                 // Check for rowid conflicts before committing (pure optimistic, first-committer-wins)
@@ -1370,7 +1373,7 @@ impl StateTransition for WriteRowStateMachine {
                         return Ok(TransitionResult::Io(io));
                     }
                 }
-                assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
+                turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
                 self.state = WriteRowState::Insert;
                 Ok(TransitionResult::Continue)
             }
@@ -1928,7 +1931,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
-        assert_eq!(tx.state, TransactionState::Active);
+        turso_assert_eq!(tx.state, TransactionState::Active);
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -2034,7 +2037,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
-        assert_eq!(tx.state, TransactionState::Active);
+        turso_assert_eq!(tx.state, TransactionState::Active);
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -2171,13 +2174,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .get(&tx_id)
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
-                        assert_eq!(tx.state, TransactionState::Active);
+                        turso_assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see,
                         // nor can it conflict with it.
                         if !rv.is_visible_to(tx, &self.txs) {
                             continue;
                         }
                         if is_write_write_conflict(&self.txs, tx, rv) {
+                            turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
                             drop(row_versions_opt);
                             return Err(LimboError::WriteWriteConflict);
@@ -2207,13 +2211,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .get(&tx_id)
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
-                        assert_eq!(tx.state, TransactionState::Active);
+                        turso_assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see,
                         // nor can it conflict with it.
                         if !rv.is_visible_to(tx, &self.txs) {
                             continue;
                         }
                         if is_write_write_conflict(&self.txs, tx, rv) {
+                            turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
                             drop(row_versions_opt);
                             return Err(LimboError::WriteWriteConflict);
@@ -2270,7 +2275,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
-        assert_eq!(tx.state, TransactionState::Active);
+        turso_assert_eq!(tx.state, TransactionState::Active);
         match maybe_index_id {
             Some(index_id) => {
                 let rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
@@ -2818,7 +2823,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
         connection.set_mv_tx(None);
-        assert!(matches!(
+        turso_assert!(matches!(
             tx.state.load(),
             TransactionState::Active | TransactionState::Preparing(_)
         ));
@@ -3082,10 +3087,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn release_exclusive_tx(&self, tx_id: &TxID) {
         tracing::trace!("release_exclusive_tx(tx_id={})", tx_id);
         let prev = self.exclusive_tx.swap(NO_EXCLUSIVE_TX, Ordering::Release);
-        assert_eq!(
-            prev, *tx_id,
-            "Tried to release exclusive lock for tx {tx_id} but it was held by tx {prev}"
-        );
+        turso_assert_eq!(prev, *tx_id, "exclusive lock released by wrong tx", { "expected_tx_id": *tx_id, "actual_tx_id": prev });
     }
 
     /// Generates next unique transaction id
@@ -3844,7 +3846,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 let Some(value) = *entry.value() else {
                                     panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
                                 };
-                                assert!(value == root_page as u64, "Logical log contains root page reference {root_page} that does not match the root page in the table_id_to_rootpage map({value})");
+                                turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
                             }
                         } else if root_page != 0 {
                             return Err(LimboError::Corrupt(format!(
@@ -3855,7 +3857,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         schema_rows.insert(rowid_int, record);
                         needs_schema_rebuild.set(true);
                     } else {
-                        assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
+                        turso_assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
+                        "Logical log contains a row version insert with a table id that does not exist in the table_id_to_rootpage map",
+                        {"table_id": rowid.table_id,
+                            "table_id_to_rootpage_map": format!("{:?}", self.table_id_to_rootpage.iter().collect::<Vec<_>>())
+                        });
                     }
 
                     let version_id = self.get_version_id();
@@ -3885,7 +3891,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     if commit_ts <= replay_cutoff_ts {
                         continue;
                     }
-                    assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map: {}", rowid.table_id);
+                    turso_assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
+                        "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map",
+                        {"rootpage_map": rowid.table_id});
                     if let Some(versions) = self.rows.get(&rowid) {
                         // Row exists in memory — try to find the current (non-ended) version
                         // that was committed before this delete, and mark it as ended. If no

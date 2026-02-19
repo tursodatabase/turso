@@ -1,7 +1,5 @@
 use turso_parser::ast::{Expr, SortOrder};
 
-use std::{borrow::Cow, collections::HashSet, sync::Arc};
-
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     emitter::{
@@ -18,8 +16,8 @@ use super::{
     plan::{
         Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, IterationDirection,
         JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery, Operation,
-        QueryDestination, Scan, Search, SeekDef, SeekKeyComponent, SelectPlan, SetOperation,
-        TableReferences, WhereTerm,
+        QueryDestination, Scan, Search, SeekDef, SeekKey, SeekKeyComponent, SelectPlan,
+        SetOperation, TableReferences, WhereTerm,
     },
 };
 use crate::{
@@ -33,7 +31,7 @@ use crate::{
         subquery::emit_non_from_clause_subquery,
         window::emit_window_loop_source,
     },
-    turso_assert,
+    turso_assert, turso_assert_eq,
     types::SeekOp,
     vdbe::{
         affinity::{self, Affinity},
@@ -44,8 +42,10 @@ use crate::{
         insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
-    Connection, Result,
+    Result,
 };
+use std::{borrow::Cow, collections::HashSet, sync::Arc};
+use turso_macros::turso_assert_some;
 
 // Metadata for handling LEFT JOIN operations
 #[derive(Debug)]
@@ -109,21 +109,21 @@ pub fn init_loop(
     where_clause: &[WhereTerm],
     join_order: &[JoinOrderMember],
     subqueries: &mut [NonFromClauseSubquery],
-    connection: Option<&Arc<Connection>>,
 ) -> Result<()> {
-    assert!(
-        t_ctx.meta_left_joins.len() == tables.joined_tables().len(),
-        "meta_left_joins length does not match tables length"
+    turso_assert_eq!(
+        t_ctx.meta_left_joins.len(),
+        tables.joined_tables().len(),
+        "meta_left_joins length must match tables length"
     );
 
     if matches!(
         &mode,
         OperationMode::INSERT | OperationMode::UPDATE { .. } | OperationMode::DELETE
     ) {
-        assert!(tables.joined_tables().len() == 1);
+        turso_assert_eq!(tables.joined_tables().len(), 1);
         let changed_table = &tables.joined_tables()[0].table;
         let prepared =
-            prepare_cdc_if_necessary(program, t_ctx.resolver.schema, changed_table.get_name())?;
+            prepare_cdc_if_necessary(program, t_ctx.resolver.schema(), changed_table.get_name())?;
         if let Some((cdc_cursor_id, _)) = prepared {
             t_ctx.cdc_cursor_id = Some(cdc_cursor_id);
         }
@@ -131,8 +131,9 @@ pub fn init_loop(
 
     // Initialize distinct aggregates using hash tables
     for agg in aggregates.iter_mut().filter(|agg| agg.is_distinct()) {
-        assert!(
-            agg.args.len() == 1,
+        turso_assert_eq!(
+            agg.args.len(),
+            1,
             "DISTINCT aggregate functions must have exactly one argument"
         );
         let collations = vec![
@@ -174,7 +175,7 @@ pub fn init_loop(
             }
         }
         let (table_cursor_id, index_cursor_id) =
-            table.open_cursors(program, mode.clone(), t_ctx.resolver.schema)?;
+            table.open_cursors(program, mode.clone(), t_ctx.resolver.schema())?;
         match &table.op {
             Operation::Scan(Scan::BTreeTable { index, .. }) => match (&mode, &table.table) {
                 (OperationMode::SELECT, Table::BTree(btree)) => {
@@ -210,18 +211,9 @@ pub fn init_loop(
                         });
                     }
                     // For delete, we need to open all the other indexes too for writing
-                    let indices: Vec<_> = if let Some(conn) = connection {
-                        conn.with_schema(table.database_id, |s| {
-                            s.get_indices(&btree.name).cloned().collect()
-                        })
-                    } else {
-                        t_ctx
-                            .resolver
-                            .schema
-                            .get_indices(&btree.name)
-                            .cloned()
-                            .collect()
-                    };
+                    let indices: Vec<_> = t_ctx.resolver.with_schema(table.database_id, |s| {
+                        s.get_indices(table.table.get_name()).cloned().collect()
+                    });
                     for index in &indices {
                         if table
                             .op
@@ -318,18 +310,10 @@ pub fn init_loop(
                         // For DELETE, we need to open all the indexes for writing
                         // UPDATE opens these in emit_program_for_update() separately
                         if matches!(mode, OperationMode::DELETE) {
-                            let indices: Vec<_> = if let Some(conn) = connection {
-                                conn.with_schema(table.database_id, |s| {
+                            let indices: Vec<_> =
+                                t_ctx.resolver.with_schema(table.database_id, |s| {
                                     s.get_indices(table.table.get_name()).cloned().collect()
-                                })
-                            } else {
-                                t_ctx
-                                    .resolver
-                                    .schema
-                                    .get_indices(table.table.get_name())
-                                    .cloned()
-                                    .collect()
-                            };
+                                });
                             for index in &indices {
                                 if table
                                     .op
@@ -535,7 +519,7 @@ fn emit_hash_build_phase(
     for join_key in hash_join_op.join_keys.iter() {
         let build_expr = join_key.get_build_expr(predicates);
         let probe_expr = join_key.get_probe_expr(predicates);
-        let affinity = comparison_affinity(build_expr, probe_expr, Some(table_references));
+        let affinity = comparison_affinity(build_expr, probe_expr, Some(table_references), None);
         key_affinities.push(affinity.aff_mask());
     }
 
@@ -1680,7 +1664,7 @@ pub fn open_loop(
         )?;
 
         for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
-            assert!(subquery.correlated, "subquery must be correlated");
+            turso_assert!(subquery.correlated, "subquery must be correlated");
             let eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
 
             if eval_at != EvalAt::Loop(join_index) {
@@ -2059,9 +2043,9 @@ fn emit_loop_source<'a>(
             Ok(())
         }
         LoopEmitTarget::QueryResult => {
-            assert!(
+            turso_assert!(
                 plan.aggregates.is_empty(),
-                "We should not get here with aggregates"
+                "QueryResult target should not have aggregates"
             );
             let offset_jump_to = t_ctx
                 .labels_main_loop
@@ -2194,9 +2178,11 @@ pub fn close_loop(
                 // Materialized subqueries with ephemeral indexes are allowed
                 let is_materialized_subquery = matches!(&table.table, Table::FromClauseSubquery(_))
                     && matches!(search, Search::Seek { index: Some(idx), .. } if idx.ephemeral);
-                assert!(
-                    !matches!(table.table, Table::FromClauseSubquery(_))
-                        || is_materialized_subquery,
+                turso_assert_some!(
+                    {
+                        is_from_clause: !matches!(table.table, Table::FromClauseSubquery(_)),
+                        is_materialized_subquery: is_materialized_subquery
+                    },
                     "Subqueries do not support index seeks unless materialized"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
@@ -2387,6 +2373,51 @@ pub fn close_loop(
     Ok(())
 }
 
+/// Build the affinity string for an index seek, skipping positions where the
+/// probe expression already has the right type (mirroring SQLite's optimization
+/// via `sqlite3ExprNeedsNoAffinityChange`).
+///
+/// For each seek key position the index column affinity is checked against the
+/// probe expression. If the expression already matches (e.g. a string literal
+/// seeking a TEXT column), NONE is used so OP_Affinity becomes a no-op for that
+/// slot. When every slot is NONE the caller can skip the instruction entirely.
+fn index_seek_affinities(
+    idx: &Index,
+    tables: &TableReferences,
+    seek_def: &SeekDef,
+    seek_key: &SeekKey,
+) -> String {
+    let table = tables
+        .joined_tables()
+        .iter()
+        .find(|jt| jt.table.get_name() == idx.table_name)
+        .expect("index source table not found in table references");
+
+    idx.columns
+        .iter()
+        .zip(seek_def.iter(seek_key))
+        .map(|(ic, key_component)| {
+            // Expression index columns (e.g. CREATE INDEX ON t(a+b)) have no
+            // corresponding table column; their affinity is BLOB/NONE.
+            let col_aff = if ic.expr.is_some() {
+                Affinity::Blob
+            } else {
+                table
+                    .table
+                    .get_column_at(ic.pos_in_table)
+                    .expect("index column position out of bounds")
+                    .affinity()
+            };
+            match key_component {
+                SeekKeyComponent::Expr(expr) if col_aff.expr_needs_no_affinity_change(expr) => {
+                    affinity::SQLITE_AFF_NONE
+                }
+                _ => col_aff.aff_mask(),
+            }
+        })
+        .collect()
+}
+
 /// Emits instructions for an index seek. See e.g. [crate::translate::plan::SeekDef]
 /// for more details about the seek definition.
 ///
@@ -2489,19 +2520,13 @@ fn emit_seek(
     }
     let num_regs = seek_def.size(&seek_def.start);
 
-    if is_index {
-        let affinities: String = seek_def
-            .iter_affinity(&seek_def.start)
-            .map(|affinity| affinity.aff_mask())
-            .collect();
+    if let Some(idx) = seek_index {
+        let affinities = index_seek_affinities(idx, tables, seek_def, &seek_def.start);
         if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
             program.emit_insn(Insn::Affinity {
                 start_reg,
                 count: std::num::NonZeroUsize::new(num_regs).unwrap(),
-                affinities: seek_def
-                    .iter_affinity(&seek_def.start)
-                    .map(|affinity| affinity.aff_mask())
-                    .collect(),
+                affinities,
             });
         }
     }
@@ -2625,11 +2650,8 @@ fn emit_seek_termination(
             // Apply affinity to the end key (same as we do for start key).
             // Without this, e.g. BETWEEN '15' AND '35' on a numeric column would
             // compare '35' as a string against numeric values, causing incorrect results.
-            if is_index {
-                let affinities: String = seek_def
-                    .iter_affinity(&seek_def.end)
-                    .map(|affinity| affinity.aff_mask())
-                    .collect();
+            if let Some(idx) = seek_index {
+                let affinities = index_seek_affinities(idx, tables, seek_def, &seek_def.end);
                 if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
                     program.emit_insn(Insn::Affinity {
                         start_reg,
@@ -2759,7 +2781,7 @@ fn emit_autoindex(
     num_seek_keys: usize,
     seek_def: &SeekDef,
 ) -> Result<AutoIndexResult> {
-    assert!(index.ephemeral, "Index {} is not ephemeral", index.name);
+    turso_assert!(index.ephemeral, "index must be ephemeral", { "index_name": &index.name });
     let label_ephemeral_build_end = program.allocate_label();
     // Since this typically happens in an inner loop, we only build it once.
     program.emit_insn(Insn::Once {
