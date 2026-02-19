@@ -10971,7 +10971,21 @@ fn op_journal_mode_inner(
                     )?;
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();
+                    // Save change counters before bootstrap so internal writes
+                    // (e.g. INSERT into __turso_internal_mvcc_meta) don't affect
+                    // user-visible total_changes()/changes().
+                    let saved_total_changes =
+                        program.connection.total_changes.load(Ordering::SeqCst);
+                    let saved_last_change = program.connection.last_change.load(Ordering::SeqCst);
                     mv_store.bootstrap(program.connection.clone())?;
+                    program
+                        .connection
+                        .total_changes
+                        .store(saved_total_changes, Ordering::SeqCst);
+                    program
+                        .connection
+                        .last_change
+                        .store(saved_last_change, Ordering::SeqCst);
                 }
 
                 if matches!(new_mode, journal_mode::JournalMode::Wal) {

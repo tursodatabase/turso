@@ -1519,7 +1519,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn root_page(&self) -> i64 {
-        self.table_id.into()
+        self.btree_cursor.root_page()
     }
 
     fn rewind(&mut self) -> Result<IOResult<()>> {
