@@ -297,9 +297,6 @@ pub fn prepare_delete_plan(
 }
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
-/// When a DELETE's WHERE clause contains a subquery that references the table being deleted,
-/// the subquery can see in-flight deletions. To prevent this, we use the RowSet two-pass
-/// approach (collect matching rowids first, then delete) whenever subqueries are present.
 fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
     for pred in predicates {
         let mut found = false;
