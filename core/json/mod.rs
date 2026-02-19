@@ -192,28 +192,24 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             } else {
                 let mut buff = ryu::Buffer::new();
                 let s_ryu = buff.format(float);
-                let mut s = String::with_capacity(s_ryu.len() + 4);
+                let mut s = Cow::Borrowed(s_ryu);
 
                 if let Some(e_idx) = s_ryu.find('e') {
                     // Scientific notation case
+                    s = Cow::Owned(String::with_capacity(s_ryu.len() + 4));
+                    let inner = s.to_mut();
                     let mantissa = &s_ryu[..e_idx];
                     let exponent = &s_ryu[e_idx + 1..];
 
-                    s.push_str(mantissa);
+                    inner.push_str(mantissa);
                     if !mantissa.contains('.') {
-                        s.push_str(".0");
+                        inner.push_str(".0");
                     }
-                    s.push('e');
+                    inner.push('e');
                     if !exponent.starts_with('-') && !exponent.starts_with('+') {
-                        s.push('+');
+                        inner.push('+');
                     }
-                    s.push_str(exponent);
-                } else {
-                    // Standard decimal case
-                    s.push_str(s_ryu);
-                    if !s_ryu.contains('.') && !s_ryu.contains("NaN") {
-                        s.push_str(".0");
-                    }
+                    inner.push_str(exponent);
                 }
 
                 Jsonb::from_str(&s)
