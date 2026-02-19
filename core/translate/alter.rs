@@ -870,7 +870,7 @@ pub fn translate_alter_table(
             }
 
             if default_type_mismatch {
-                emit_add_column_default_type_validation(&mut program, &original_btree)?;
+                emit_add_column_default_type_validation(program, &original_btree)?;
             }
 
             // Validate CHECK constraints against the DEFAULT value for existing rows.
