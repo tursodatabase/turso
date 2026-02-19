@@ -1085,28 +1085,26 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         continue;
                     }
                     // Another transaction's uncommitted version - check their state
-                    let other_tx = mvcc_store.txs.get(&other_tx_id);
-                    if let Some(other_tx) = other_tx {
-                        let other_tx = other_tx.value();
-                        match other_tx.state.load() {
-                            // Other tx already committed = conflict
-                            TransactionState::Committed(_) => {
+                    let other_tx = mvcc_store.txs.get(&other_tx_id).expect("check_version_conflicts txn {other_tx_id} was not found in txn map even though there is version with this TxID");
+                    let other_tx = other_tx.value();
+                    match other_tx.state.load() {
+                        // Other tx already committed = conflict
+                        TransactionState::Committed(_) => {
+                            return Err(LimboError::WriteWriteConflict);
+                        }
+                        // Both preparing - compare end_ts (lower wins)
+                        TransactionState::Preparing(other_end_ts) => {
+                            if other_end_ts < end_ts {
+                                // Other tx has lower end_ts, they win
                                 return Err(LimboError::WriteWriteConflict);
                             }
-                            // Both preparing - compare end_ts (lower wins)
-                            TransactionState::Preparing(other_end_ts) => {
-                                if other_end_ts < end_ts {
-                                    // Other tx has lower end_ts, they win
-                                    return Err(LimboError::WriteWriteConflict);
-                                }
-                                // We have lower end_ts, we win - they'll abort when they validate
-                            }
-                            // Other tx still active - we're already Preparing so we're ahead
-                            // They'll see us in Preparing/Committed when they try to commit
-                            TransactionState::Active => {}
-                            // Other tx aborted - no conflict
-                            TransactionState::Aborted | TransactionState::Terminated => {}
+                            // We have lower end_ts, we win - they'll abort when they validate
                         }
+                        // Other tx still active - we're already Preparing so we're ahead
+                        // They'll see us in Preparing/Committed when they try to commit
+                        TransactionState::Active => {}
+                        // Other tx aborted - no conflict
+                        TransactionState::Aborted | TransactionState::Terminated => {}
                     }
                 }
                 Some(TxTimestampOrID::Timestamp(begin_ts)) => {
