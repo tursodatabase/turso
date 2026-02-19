@@ -1,3 +1,4 @@
+use crate::translate::expression_index::expression_index_column_usage;
 use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
@@ -640,9 +641,20 @@ fn optimize_update_plan(
             break 'requires false;
         };
 
-        plan.set_clauses
-            .iter()
-            .any(|(idx, _)| index.columns.iter().any(|c| c.pos_in_table == *idx))
+        for (set_clause_col_idx, _) in plan.set_clauses.iter() {
+            for c in index.columns.iter() {
+                if let Some(ref expr) = c.expr {
+                    let expr_idx_cols_mask =
+                        expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
+                    if expr_idx_cols_mask.get(*set_clause_col_idx) {
+                        break 'requires true;
+                    }
+                } else if c.pos_in_table == *set_clause_col_idx {
+                    break 'requires true;
+                }
+            }
+        }
+        break 'requires false;
     };
 
     if !requires_ephemeral_table {

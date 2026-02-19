@@ -3436,6 +3436,8 @@ fn emit_update_insns<'a>(
                 .cloned()
                 .collect();
 
+            let check_constraint_tables =
+                TableReferences::new(vec![target_table.as_ref().clone()], vec![]);
             emit_check_constraints(
                 program,
                 &relevant_checks,
@@ -3458,7 +3460,7 @@ fn emit_update_insns<'a>(
                 connection,
                 or_conflict,
                 skip_row_label,
-                Some(table_references),
+                Some(&check_constraint_tables),
             )?;
         }
     }
@@ -4912,12 +4914,28 @@ fn emit_check_constraint_bytecode(
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
+    table_name: &str,
 ) -> Result<()> {
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
 
         let mut rewritten_expr = check_constraint.expr.clone();
         rewrite_between_expr(&mut rewritten_expr);
+        if let Some(referenced_tables) = referenced_tables {
+            let mut binding_tables = referenced_tables.clone();
+            if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
+                // CHECK expressions come from schema SQL and may use the base table name
+                // even when the query references the table through an alias.
+                joined_table.identifier = table_name.to_string();
+            }
+            bind_and_rewrite_expr(
+                &mut rewritten_expr,
+                Some(&mut binding_tables),
+                None,
+                resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+        }
 
         translate_expr_no_constant_opt(
             program,
@@ -5001,6 +5019,7 @@ pub(crate) fn emit_check_constraints<'a>(
         return Ok(());
     }
 
+    let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
     let initial_cache_size = resolver.expr_to_reg_cache.len();
 
     // Map rowid aliases to the actual rowid register.
@@ -5021,7 +5040,7 @@ pub(crate) fn emit_check_constraints<'a>(
     }
 
     // Map each column to its register (both unqualified and qualified forms).
-    for (col_name, register) in column_mappings {
+    for (col_name, register) in column_mappings.iter().copied() {
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
         resolver
             .expr_to_reg_cache
@@ -5035,6 +5054,35 @@ pub(crate) fn emit_check_constraints<'a>(
             .push((Cow::Owned(qualified_expr), register));
     }
 
+    if let Some(joined_table) = referenced_tables.and_then(|tables| tables.joined_tables().first())
+    {
+        resolver.expr_to_reg_cache.push((
+            Cow::Owned(ast::Expr::RowId {
+                database: None,
+                table: joined_table.internal_id,
+            }),
+            rowid_reg,
+        ));
+
+        for (col_name, register) in column_mappings.iter().copied() {
+            if let Some((idx, col)) = joined_table.columns().iter().enumerate().find(|(_, c)| {
+                c.name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
+            }) {
+                resolver.expr_to_reg_cache.push((
+                    Cow::Owned(ast::Expr::Column {
+                        database: None,
+                        table: joined_table.internal_id,
+                        column: idx,
+                        is_rowid_alias: col.is_rowid_alias(),
+                    }),
+                    register,
+                ));
+            }
+        }
+    }
+
     resolver.enable_expr_to_reg_cache();
 
     let result = emit_check_constraint_bytecode(
@@ -5044,6 +5092,7 @@ pub(crate) fn emit_check_constraints<'a>(
         or_conflict,
         skip_row_label,
         referenced_tables,
+        table_name,
     );
 
     // Always restore resolver state, even on error.

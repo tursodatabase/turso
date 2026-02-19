@@ -5106,32 +5106,6 @@ pub fn get_expr_affinity(
             }
             Affinity::Blob
         }
-        // Expr::Id and Expr::Qualified appear in CHECK constraint expressions where
-        // column references haven't been rewritten to Expr::Column. Look up the column
-        // by name in referenced_tables to determine the correct affinity.
-        ast::Expr::Id(name) => {
-            if let Some(tables) = referenced_tables {
-                if let Some(affinity) = find_column_affinity_by_name(tables, name.as_str()) {
-                    return affinity;
-                }
-            }
-            Affinity::Blob
-        }
-        ast::Expr::Qualified(table_name, col_name) => {
-            if let Some(tables) = referenced_tables {
-                if let Some(table) = tables.find_table_by_identifier(table_name.as_str()) {
-                    let normalized = normalize_ident(col_name.as_str());
-                    if let Some(col) = table
-                        .columns()
-                        .iter()
-                        .find(|c| c.name.as_ref() == Some(&normalized))
-                    {
-                        return col.affinity();
-                    }
-                }
-            }
-            Affinity::Blob
-        }
         ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
@@ -5148,22 +5122,6 @@ pub fn get_expr_affinity(
         ast::Expr::Literal(_) => Affinity::Blob, // No affinity!
         _ => Affinity::Blob,                     // This may need to change. For now this works.
     }
-}
-
-/// Look up a column's affinity by name across all tables in the references.
-fn find_column_affinity_by_name(tables: &TableReferences, col_name: &str) -> Option<Affinity> {
-    let normalized = normalize_ident(col_name);
-    for table in tables.joined_tables() {
-        if let Some(col) = table
-            .table
-            .columns()
-            .iter()
-            .find(|c| c.name.as_ref() == Some(&normalized))
-        {
-            return Some(col.affinity());
-        }
-    }
-    None
 }
 
 pub fn comparison_affinity(
