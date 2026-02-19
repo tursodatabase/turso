@@ -258,3 +258,8 @@ expect {
     2|world|2.72
     100|extra|0.0
 }
+expect @js {
+    1|hello|3.14
+    2|world|2.72
+    100|extra|0  
+}
