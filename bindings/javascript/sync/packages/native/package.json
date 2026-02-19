@@ -31,7 +31,8 @@
     "napi-artifacts": "napi artifacts --output-dir .",
     "tsc-build": "npm exec tsc",
     "build": "npm run napi-build && npm run tsc-build",
-    "test": "VITE_TURSO_DB_URL=http://jj--a--a.localhost:8080 vitest --run",
+    "test": "VITE_TURSO_DB_URL=http://jj--a--a.localhost:8080 vitest --run --exclude remote-write.test.ts",
+    "test:remote-write": "vitest --run remote-write.test.ts",
     "prepublishOnly": "npm run napi-dirs && npm run napi-artifacts && napi prepublish -t npm"
   },
   "napi": {
