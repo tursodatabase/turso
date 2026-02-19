@@ -15,6 +15,7 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 turso_core = { workspace = true }
+turso_parser = { workspace = true }
 napi = { version = "3.1.3", default-features = false, features = ["napi6"] }
 napi-derive = { version = "3.1.1", default-features = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

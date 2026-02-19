@@ -498,6 +498,34 @@ impl Database {
         let io = self.inner()?.io.clone();
         Ok(AsyncTask::new(IoLoopTask { io }))
     }
+
+    /// Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback".
+    #[napi(js_name = "classifySql")]
+    pub fn classify_sql(&self, sql: String) -> napi::Result<String> {
+        use turso_parser::{ast::Stmt, parser::Parser};
+        let mut parser = Parser::new(sql.as_bytes());
+        match parser.next_cmd() {
+            Ok(Some(cmd)) => {
+                if cmd.is_explain() {
+                    return Ok("read".to_string());
+                }
+                let category = match cmd.stmt() {
+                    Stmt::Select(..)
+                    | Stmt::Pragma { .. }
+                    | Stmt::Attach { .. }
+                    | Stmt::Detach { .. }
+                    | Stmt::Reindex { .. } => "read",
+                    Stmt::Begin { .. } | Stmt::Savepoint { .. } => "begin",
+                    Stmt::Commit { .. } | Stmt::Release { .. } => "commit",
+                    Stmt::Rollback { .. } => "rollback",
+                    _ => "write",
+                };
+                Ok(category.to_string())
+            }
+            Ok(None) => Ok("read".to_string()),
+            Err(e) => Err(napi::Error::from_reason(format!("classify failed: {e}"))),
+        }
+    }
 }
 
 #[napi]

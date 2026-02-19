@@ -23,6 +23,7 @@
     "test": "echo 'no tests'"
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.5.0-pre.12"
+    "@tursodatabase/database-common": "^0.5.0-pre.12",
+    "@tursodatabase/serverless": "^0.2.2"
   }
 }
