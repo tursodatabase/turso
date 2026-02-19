@@ -1,5 +1,4 @@
-use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
-use crate::translate::expression_index::single_table_column_usage;
+use crate::translate::expression_index::expression_index_column_usage;
 use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
@@ -645,25 +644,10 @@ fn optimize_update_plan(
         for (set_clause_col_idx, _) in plan.set_clauses.iter() {
             for c in index.columns.iter() {
                 if let Some(ref expr) = c.expr {
-                    // Schema expressions are parsed as identifiers. Bind them using the normal
-                    // expression binder so we can reliably detect when an UPDATE touches any
-                    // source column referenced by an expression index key.
-                    let mut bound_expr = expr.as_ref().clone();
-                    let mut binding_table = table_ref.clone();
-                    binding_table.identifier.clone_from(&btree_table.name);
-                    let mut binding_tables = TableReferences::new(vec![binding_table], vec![]);
-                    bind_and_rewrite_expr(
-                        &mut bound_expr,
-                        Some(&mut binding_tables),
-                        None,
-                        resolver,
-                        BindingBehavior::ResultColumnsNotAllowed,
-                    )?;
-
-                    if let Some((_, expr_idx_cols_mask)) = single_table_column_usage(&bound_expr) {
-                        if expr_idx_cols_mask.get(*set_clause_col_idx) {
-                            break 'requires true;
-                        }
+                    let expr_idx_cols_mask =
+                        expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
+                    if expr_idx_cols_mask.get(*set_clause_col_idx) {
+                        break 'requires true;
                     }
                 } else if c.pos_in_table == *set_clause_col_idx {
                     break 'requires true;

@@ -3,7 +3,8 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
+use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
+use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{Operation, Scan};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
@@ -399,52 +400,51 @@ pub fn prepare_update_plan(
     let rowid_alias_used = set_clauses
         .iter()
         .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
+    let target_table_ref = table_references
+        .joined_tables()
+        .first()
+        .expect("UPDATE must have a target table reference");
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes
     } else {
         // otherwise we need to update the indexes whose columns are set in the SET clause,
-        // or if the colunns used in the partial index WHERE clause are being updated
-        indexes
-            .into_iter()
-            .filter_map(|idx| {
-                let mut needs = idx.columns.iter().any(|c| {
-                    c.expr.as_ref().map_or_else(
-                        || updated_cols.contains(&c.pos_in_table),
-                        |expr| {
-                            columns_used_by_index_expr(expr, &table_references, resolver)
-                                .iter()
-                                .any(|cidx| updated_cols.contains(cidx))
-                        },
-                    )
-                });
-
-                if !needs {
-                    if let Some(w) = &idx.where_clause {
-                        let mut where_copy = w.as_ref().clone();
-                        let mut tr =
-                            TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
-                        bind_and_rewrite_expr(
-                            &mut where_copy,
-                            Some(&mut tr),
-                            None,
-                            resolver,
-                            BindingBehavior::ResultColumnsNotAllowed,
-                        )
-                        .ok()?;
-                        let cols_used = collect_cols_used_in_expr(&where_copy);
-                        // if any of the columns used in the partial index WHERE clause is being
-                        // updated, we need to update this index
-                        needs = cols_used.iter().any(|c| updated_cols.contains(c));
+        // or if the columns used in the partial index WHERE clause are being updated.
+        let mut indexes_to_update = Vec::new();
+        for idx in indexes {
+            let mut needs = false;
+            for col in idx.columns.iter() {
+                if let Some(expr) = col.expr.as_ref() {
+                    let cols_used =
+                        expression_index_column_usage(expr.as_ref(), target_table_ref, resolver)?;
+                    if cols_used.iter().any(|cidx| updated_cols.contains(&cidx)) {
+                        needs = true;
+                        break;
                     }
+                } else if updated_cols.contains(&col.pos_in_table) {
+                    needs = true;
+                    break;
                 }
-                if needs {
-                    Some(idx)
-                } else {
-                    None
+            }
+
+            if !needs {
+                if let Some(where_expr) = &idx.where_clause {
+                    let cols_used = expression_index_column_usage(
+                        where_expr.as_ref(),
+                        target_table_ref,
+                        resolver,
+                    )?;
+                    // If any column used in the partial index WHERE clause is being updated,
+                    // this index must be updated as well.
+                    needs = cols_used.iter().any(|cidx| updated_cols.contains(&cidx));
                 }
-            })
-            .collect()
+            }
+
+            if needs {
+                indexes_to_update.push(idx);
+            }
+        }
+        indexes_to_update
     };
 
     Ok(Plan::Update(UpdatePlan {
@@ -477,40 +477,4 @@ fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
         Table::Virtual(_) => Operation::default_scan_for(table),
         _ => unreachable!(),
     }
-}
-
-/// Returns a set of column indices used in the expression.
-/// *Must* be used on an Expr already processed by `bind_and_rewrite_expr`
-fn collect_cols_used_in_expr(expr: &Expr) -> HashSet<usize> {
-    let mut acc = HashSet::default();
-    let _ = walk_expr(expr, &mut |expr| match expr {
-        Expr::Column { column, .. } => {
-            acc.insert(*column);
-            Ok(WalkControl::Continue)
-        }
-        _ => Ok(WalkControl::Continue),
-    });
-    acc
-}
-
-/// Returns a set of column indices used by an index expression.
-fn columns_used_by_index_expr(
-    expr: &Expr,
-    table_references: &TableReferences,
-    resolver: &Resolver,
-) -> HashSet<usize> {
-    let mut expr_copy = expr.clone();
-    let mut tr = TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
-    if bind_and_rewrite_expr(
-        &mut expr_copy,
-        Some(&mut tr),
-        None,
-        resolver,
-        BindingBehavior::ResultColumnsNotAllowed,
-    )
-    .is_err()
-    {
-        return HashSet::default();
-    }
-    collect_cols_used_in_expr(&expr_copy)
 }
