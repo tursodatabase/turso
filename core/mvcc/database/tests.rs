@@ -5806,3 +5806,114 @@ fn test_close_persists_drop_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+/// Two concurrent MVCC transactions inserting into an AUTOINCREMENT table must
+/// both succeed. Before the fix, the second transaction would fail with a
+/// WriteWriteConflict on the sqlite_sequence metadata table.
+#[test]
+fn test_concurrent_autoincrement_inserts() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    // Tx1: begin and insert
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(b) VALUES ('from_tx1')")
+        .unwrap();
+
+    // Tx2: begin and insert (while tx1 is still open)
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t(b) VALUES ('from_tx2')")
+        .unwrap();
+
+    // Both commits must succeed
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Verify both rows are present with distinct, increasing rowids
+    let rows = get_rows(&conn1, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2, "both inserts should be visible");
+    let rowid1 = rows[0][0].as_int().unwrap();
+    let rowid2 = rows[1][0].as_int().unwrap();
+    assert!(rowid1 < rowid2, "rowids must be strictly increasing");
+    assert_eq!(rows[0][1].to_string(), "from_tx1");
+    assert_eq!(rows[1][1].to_string(), "from_tx2");
+}
+
+/// After concurrent autoincrement inserts and a checkpoint, sqlite_sequence
+/// must reflect the true maximum rowid.
+#[test]
+fn test_autoincrement_sqlite_sequence_after_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    // Insert several rows from separate transactions
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("INSERT INTO t(b) VALUES ('row1')").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t(b) VALUES ('row2')").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Force a checkpoint to flush autoincrement entries
+    conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // After checkpoint, sqlite_sequence should have the correct max (2)
+    let rows = get_rows(&conn1, "SELECT seq FROM sqlite_sequence WHERE name = 't'");
+    assert_eq!(rows.len(), 1, "sqlite_sequence should have entry for 't'");
+    let seq = rows[0][0].as_int().unwrap();
+    assert_eq!(seq, 2, "sqlite_sequence should reflect the max rowid");
+
+    // A subsequent insert should get rowid 3
+    conn1.execute("INSERT INTO t(b) VALUES ('row3')").unwrap();
+    let rows = get_rows(&conn1, "SELECT MAX(a) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
+/// Three concurrent transactions all inserting into the same AUTOINCREMENT table
+/// must all succeed and produce unique, increasing rowids.
+#[test]
+fn test_three_concurrent_autoincrement_inserts() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+    let conn3 = db.connect();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("INSERT INTO t(b) VALUES ('tx1')").unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t(b) VALUES ('tx2')").unwrap();
+
+    conn3.execute("BEGIN CONCURRENT").unwrap();
+    conn3.execute("INSERT INTO t(b) VALUES ('tx3')").unwrap();
+
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn3.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 3, "all three inserts should be visible");
+    let ids: Vec<i64> = rows.iter().map(|r| r[0].as_int().unwrap()).collect();
+    assert!(
+        ids[0] < ids[1] && ids[1] < ids[2],
+        "rowids must be strictly increasing: {ids:?}"
+    );
+}

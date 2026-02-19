@@ -6715,6 +6715,39 @@ pub fn op_insert(
         insn
     );
 
+    // In MVCC concurrent transactions, skip sqlite_sequence updates to avoid
+    // write-write conflicts between concurrent autoincrement transactions. The
+    // RowidAllocator correctly tracks the max rowid in memory, and the values are
+    // flushed to the B-tree during checkpoint via the autoincrement_entries tracker.
+    if table_name == SQLITE_SEQUENCE_TABLE_NAME
+        && matches!(
+            program.connection.get_mv_tx(),
+            Some((_, TransactionMode::Concurrent))
+        )
+    {
+        let mv_store_guard = program.connection.mv_store();
+        let mv_store = (*mv_store_guard)
+            .as_ref()
+            .expect("mv_store must exist in concurrent transaction mode");
+        let seq_rowid = match &state.registers[*key_reg].get_value() {
+            Value::Numeric(Numeric::Integer(i)) => *i,
+            v => unreachable!("sqlite_sequence key_reg should be integer, got: {v:?}"),
+        };
+        if let Register::Record(record) = &state.registers[*record_reg] {
+            if let Ok((name_ref, seq_ref)) = record.get_two_values(0, 1) {
+                if let (ValueRef::Text(name), ValueRef::Numeric(Numeric::Integer(seq))) =
+                    (name_ref, seq_ref)
+                {
+                    mv_store.update_autoincrement_entry(name.as_str().to_string(), seq_rowid, seq);
+                }
+            }
+        }
+        state.op_insert_state.sub_state = OpInsertSubState::MaybeCaptureRecord;
+        state.op_insert_state.old_record = None;
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     loop {
         match &state.op_insert_state.sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
@@ -7440,7 +7473,8 @@ fn new_rowid_inner(
                                 // mvcc allocator for table ws initialized, we can set result inmediatly
                                 state.registers[*rowid_reg] =
                                     Register::Value(Value::from_i64(new_rowid));
-                                // FIXME: we probably will need to remove sqlite_sequence from MVCC.
+                                // sqlite_sequence updates are handled separately in MVCC mode
+                                // (skipped during transactions, flushed during checkpoint).
                                 if *prev_largest_reg > 0 {
                                     state.registers[*prev_largest_reg] =
                                         Register::Value(Value::from_i64(prev_rowid.unwrap_or(0)));

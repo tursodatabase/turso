@@ -1614,6 +1614,11 @@ pub struct MvStore<Clock: LogicalClock> {
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
+    /// Tracks autoincrement max values for tables that had inserts during MVCC mode.
+    /// Key: table name, Value: (rowid in sqlite_sequence, max sequence value).
+    /// Updated when sqlite_sequence inserts are skipped in MVCC mode; flushed to
+    /// the B-tree during checkpoint.
+    autoincrement_entries: RwLock<HashMap<String, (i64, i64)>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -1686,6 +1691,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
+            autoincrement_entries: RwLock::new(HashMap::default()),
         }
     }
 
@@ -4090,6 +4096,27 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn is_btree_allocated(&self, table_id: &MVTableId) -> bool {
         let maybe_root_page = self.table_id_to_rootpage.get(table_id);
         maybe_root_page.is_some_and(|entry| entry.value().is_some())
+    }
+
+    /// Update the autoincrement tracker for a table. Only increases the stored max.
+    /// Called when sqlite_sequence inserts are skipped in MVCC mode.
+    pub fn update_autoincrement_entry(&self, table_name: String, seq_rowid: i64, seq: i64) {
+        let mut entries = self.autoincrement_entries.write();
+        entries
+            .entry(table_name)
+            .and_modify(|(existing_rowid, existing_seq)| {
+                if seq > *existing_seq {
+                    *existing_seq = seq;
+                    *existing_rowid = seq_rowid;
+                }
+            })
+            .or_insert((seq_rowid, seq));
+    }
+
+    /// Take all autoincrement entries for checkpoint flushing.
+    pub fn take_autoincrement_entries(&self) -> HashMap<String, (i64, i64)> {
+        let mut entries = self.autoincrement_entries.write();
+        std::mem::take(&mut *entries)
     }
 }
 

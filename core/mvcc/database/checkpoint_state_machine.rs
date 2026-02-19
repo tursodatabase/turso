@@ -4,7 +4,7 @@ use crate::mvcc::database::{
     WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
     SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
-use crate::schema::Index;
+use crate::schema::{Index, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
@@ -127,6 +127,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     sync_mode: SyncMode,
     /// Internal metadata table info for persisting `persistent_tx_ts_max` atomically with pager commit.
     mvcc_meta_table: Option<(MVTableId, usize)>,
+    /// sqlite_sequence table ID, used to skip GC for checkpoint-staged autoincrement entries.
+    seq_table_id: Option<MVTableId>,
     /// File-backed databases must persist replay boundary durably.
     durable_mvcc_metadata: bool,
 }
@@ -190,6 +192,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 table.columns.len(),
             )
         });
+        let seq_table_id = schema
+            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .map(|table| mvstore.get_table_id_from_root_page(table.root_page));
         let durable_mvcc_metadata =
             !connection.db.path.starts_with(":memory:") && mvcc_meta_table.is_some();
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
@@ -220,6 +225,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             update_transaction_state,
             sync_mode,
             mvcc_meta_table,
+            seq_table_id,
             durable_mvcc_metadata,
         }
     }
@@ -609,8 +615,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // have a backing in-memory MVCC version chain. Skip GC for these.
                 assert!(
                     self.mvcc_meta_table
-                        .is_some_and(|(tid, _)| tid == row_id.table_id),
-                    "row {row_id:?} missing from MVCC store but is not an MVCC metadata table row"
+                        .is_some_and(|(tid, _)| tid == row_id.table_id)
+                        || self.seq_table_id.is_some_and(|tid| tid == row_id.table_id),
+                    "row {row_id:?} missing from MVCC store but is not an MVCC metadata or sqlite_sequence table row"
                 );
                 continue;
             };
@@ -696,6 +703,48 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         Ok(())
     }
 
+    /// Flush tracked autoincrement max values to the sqlite_sequence B-tree.
+    /// In MVCC mode, sqlite_sequence inserts are skipped during transactions to avoid
+    /// write-write conflicts. Instead, the values are collected in the MvStore's
+    /// autoincrement_entries tracker and flushed here during checkpoint.
+    fn stage_autoincrement_entries(&mut self) {
+        let entries = self.mvstore.take_autoincrement_entries();
+        if entries.is_empty() {
+            return;
+        }
+        let schema = self.connection.db.clone_schema();
+        let seq_table = match schema.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME) {
+            Some(t) => t,
+            None => return, // sqlite_sequence doesn't exist yet
+        };
+        let table_id = self
+            .mvstore
+            .get_table_id_from_root_page(seq_table.root_page);
+        let num_columns = seq_table.columns.len();
+
+        for (table_name, (seq_rowid, max_seq)) in entries {
+            let record = ImmutableRecord::from_values(
+                &[Value::build_text(table_name), Value::from_i64(max_seq)],
+                2,
+            );
+            let row = Row::new_table_row(
+                RowID::new(table_id, RowKey::Int(seq_rowid)),
+                record.get_payload().to_vec(),
+                num_columns,
+            );
+            self.write_set.push((
+                RowVersion {
+                    id: 0,
+                    begin: Some(TxTimestampOrID::Timestamp(self.durable_txid_max_new)),
+                    end: None,
+                    row,
+                    btree_resident: true,
+                },
+                None,
+            ));
+        }
+    }
+
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::AcquireLock => {
@@ -712,6 +761,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.collect_committed_index_row_versions();
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
                 self.maybe_stage_mvcc_metadata_write()?;
+                self.stage_autoincrement_entries();
 
                 if self.write_set.is_empty() && self.index_write_set.is_empty() {
                     // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
