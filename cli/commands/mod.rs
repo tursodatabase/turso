@@ -3,8 +3,8 @@ pub mod import;
 
 use args::{
     CwdArgs, DbConfigArgs, DbtotxtArgs, EchoArgs, ExitArgs, HeadersArgs, IndexesArgs,
-    LoadExtensionArgs, ManualArgs, NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs, ReadArgs,
-    SchemaArgs, SetOutputArgs, StatsArgs, TablesArgs, TimerArgs,
+    LoadExtensionArgs, ManualArgs, NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs,
+    ParameterArgs, ReadArgs, SchemaArgs, SetOutputArgs, StatsArgs, TablesArgs, TimerArgs,
 };
 use clap::Parser;
 use import::ImportArgs;
@@ -100,6 +100,9 @@ pub enum Command {
     /// Execute SQL statements from a file
     #[command(name = "read", display_name = ".read")]
     Read(ReadArgs),
+    /// Manage SQL parameter bindings
+    #[command(name = "parameter", display_name = ".parameter", alias = "param")]
+    Parameter(ParameterArgs),
     #[command(name = "dbtotxt", display_name = ".dbtotxt")]
     Dbtotxt(DbtotxtArgs),
 }
