@@ -1845,10 +1845,11 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
     found
 }
 
-/// Rewrite column name references in a CHECK constraint expression.
+/// Rewrite column name references; used in e.g. ALTER TABLE RENAME COLUMN
+/// to rewrite references to the old column name to the new column name.
 /// Replaces `Id(old)` and `Name(old)` with `Id(new)`, and updates the
 /// column name in `Qualified(tbl, old)` references.
-pub fn rewrite_check_expr_column_refs(expr: &mut ast::Expr, from: &str, to: &str) {
+pub fn rename_identifiers(expr: &mut ast::Expr, from: &str, to: &str) {
     let from_normalized = normalize_ident(from);
     // The closure is infallible, so walk_expr_mut cannot fail.
     let _ = walk_expr_mut(
@@ -1906,7 +1907,7 @@ pub fn rewrite_column_references_if_needed(
                 rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
             }
             ast::ColumnConstraint::Check(expr) => {
-                rewrite_check_expr_column_refs(expr, from, to);
+                rename_identifiers(expr, from, to);
             }
             _ => {}
         }

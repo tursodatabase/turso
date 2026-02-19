@@ -1,0 +1,80 @@
+@database :memory:
+@skip-file-if mvcc "partial indexes not fully supported in MVCC mode"
+
+# https://github.com/tursodatabase/turso/issues/5432
+
+test rename-column-updates-partial-index-where-clause-sql {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (b) WHERE a = 1;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    SELECT sql FROM sqlite_schema WHERE type = 'index';
+}
+expect {
+    CREATE INDEX idx ON t (b) WHERE a2 = 1
+}
+
+test rename-column-partial-index-delete-no-panic {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (b) WHERE a = 1;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test rename-column-partial-index-delete-with-data {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    CREATE INDEX idx ON t (b) WHERE a = 1;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    DELETE FROM t WHERE a2 = 1;
+    SELECT * FROM t;
+}
+expect {
+    2|y
+}
+
+test rename-column-partial-index-update-integrity {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    CREATE INDEX idx ON t (b) WHERE a = 1;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    UPDATE t SET a2 = 2;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test rename-column-partial-index-complex-where {
+    CREATE TABLE t (a, b, c);
+    CREATE INDEX idx ON t (b) WHERE a > 0 AND c < 10;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    SELECT sql FROM sqlite_schema WHERE type = 'index';
+}
+expect {
+    CREATE INDEX idx ON t (b) WHERE a2 > 0 AND c < 10
+}
+
+test rename-column-partial-index-rename-where-col-only {
+    CREATE TABLE t (a, b, c);
+    CREATE INDEX idx ON t (b) WHERE c = 1;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    SELECT sql FROM sqlite_schema WHERE type = 'index';
+}
+expect {
+    CREATE INDEX idx ON t (b) WHERE c = 1
+}
+
+test rename-column-partial-index-insert-after-rename {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (b) WHERE a = 1;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    INSERT INTO t VALUES (1, 'hello'), (2, 'world');
+    SELECT * FROM t WHERE a2 = 1;
+}
+expect {
+    1|hello
+}
