@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/database-wasm-common",
-  "version": "0.5.0-pre.12",
+  "version": "0.5.0-pre.13",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
