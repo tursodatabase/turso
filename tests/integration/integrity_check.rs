@@ -69,11 +69,13 @@ fn checkpoint_database(conn: &Arc<turso_core::Connection>) {
 fn run_integrity_check_catching_panic(
     conn: &Arc<turso_core::Connection>,
 ) -> Result<String, String> {
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_integrity_check(conn)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_integrity_check_or_error(conn)
+    }));
 
     match result {
-        Ok(msg) => Ok(msg),
+        Ok(Ok(msg)) => Ok(msg),
+        Ok(Err(err_msg)) => Ok(err_msg),
         Err(panic_info) => {
             let panic_msg = panic_info
                 .downcast_ref::<&str>()
@@ -82,6 +84,30 @@ fn run_integrity_check_catching_panic(
                 .unwrap_or_else(|| "unknown panic".to_string());
             Err(panic_msg)
         }
+    }
+}
+
+/// Helper that returns Ok(result_string) or Err(error_string) instead of panicking
+#[cfg(not(feature = "checksum"))]
+fn run_integrity_check_or_error(conn: &Arc<turso_core::Connection>) -> Result<String, String> {
+    match conn.pragma_query("integrity_check") {
+        Ok(rows) => {
+            let msg = rows
+                .into_iter()
+                .filter_map(|row| {
+                    row.into_iter().next().and_then(|v| {
+                        if let Value::Text(text) = v {
+                            Some(text.as_str().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(msg)
+        }
+        Err(e) => Err(format!("{}", e)),
     }
 }
 
@@ -1022,9 +1048,6 @@ fn test_integrity_check_unique_violation(db: TempDatabase) {
 
 /// Test detection of CellOverflowsPage error
 /// Corrupts a cell to extend beyond the page boundary
-///
-/// FIXME: The pager currently panics on this corruption instead of returning
-/// an error. We should handle short reads gracefully instead of panicking.
 #[cfg(not(feature = "checksum"))]
 #[turso_macros::test]
 fn test_integrity_check_cell_overflows_page(db: TempDatabase) {
@@ -1071,11 +1094,7 @@ fn test_integrity_check_cell_overflows_page(db: TempDatabase) {
 
         // Modify the cell to have a very large payload size that would overflow
         // Cell format: payload_size (varint), rowid (varint), payload
-        // We'll corrupt the payload_size to be huge (but valid varint encoding)
         // A 2-byte varint can encode values up to 16383
-        // Setting bytes to [0x80 | 0x7F, 0x7F] = 16383 would overflow most cells
-
-        // Set payload size to a large value that extends beyond page
         // This creates a cell that claims to extend past the page boundary
         page2[cell_ptr] = 0xFF; // First byte of varint (continuation bit set)
         page2[cell_ptr + 1] = 0x7F; // Large payload size
@@ -1091,18 +1110,233 @@ fn test_integrity_check_cell_overflows_page(db: TempDatabase) {
     let result = run_integrity_check_catching_panic(&conn);
     match result {
         Ok(msg) => {
-            // If corruption is detected gracefully, verify the error message
             assert!(
-                msg.contains("extends out of page") || msg.contains("out of range"),
+                msg.contains("extends out of page")
+                    || msg.contains("out of range")
+                    || msg.contains("out of bounds")
+                    || msg.contains("corrupt"),
                 "Expected cell overflow error, got: {msg}"
             );
         }
         Err(panic_msg) => {
-            // The pager panics on this corruption with a slice bounds error
-            assert!(
-                panic_msg.contains("out of range for slice"),
-                "Expected slice bounds panic, got: {panic_msg}"
+            panic!(
+                "Expected integrity_check to return an error for cell overflow, but it panicked: {panic_msg}"
             );
+        }
+    }
+}
+
+// =============================================================================
+// ERROR CASE TESTS: CellPointerOutOfBounds
+// =============================================================================
+
+/// Test that corrupt cell pointers pointing beyond the page do not cause a panic.
+/// Instead, the error should be returned gracefully as a Corrupt error.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_corrupt_cell_pointer_beyond_page(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
+        .unwrap();
+    for i in 0..10 {
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, 'data_{i}');"))
+            .unwrap();
+    }
+
+    checkpoint_database(&conn);
+
+    let result = run_integrity_check(&conn);
+    assert_eq!(result, "ok", "Database should be valid before corruption");
+
+    drop(conn);
+
+    // Corrupt a cell pointer to point beyond the page boundary
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+
+        let mut page2 = [0u8; PAGE_SIZE];
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.read_exact(&mut page2).unwrap();
+
+        let page_type = page2[0];
+        let cell_count = read_u16_be(&page2, 3);
+
+        assert_eq!(page_type, 0x0d, "Expected leaf table page");
+        assert!(cell_count > 0, "Expected at least one cell");
+
+        // Set first cell pointer to point beyond the page (0xFFFF > 4096)
+        write_u16_be(&mut page2, 8, 0xFFFF);
+
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.write_all(&page2).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    let result = run_integrity_check_catching_panic(&conn);
+    match result {
+        Ok(msg) => {
+            assert!(
+                msg != "ok",
+                "Corrupt cell pointer should not pass integrity check"
+            );
+        }
+        Err(panic_msg) => {
+            panic!("Corrupt cell pointer should return an error, not panic: {panic_msg}");
+        }
+    }
+}
+
+/// Test that corrupt cell pointers on interior pages do not cause a panic.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_corrupt_cell_pointer_interior_page(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Insert enough data to create interior pages in the B-tree
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
+        .unwrap();
+    for i in 0..500 {
+        conn.execute(format!(
+            "INSERT INTO t1 VALUES ({}, '{}');",
+            i,
+            "x".repeat(100)
+        ))
+        .unwrap();
+    }
+
+    checkpoint_database(&conn);
+
+    let result = run_integrity_check(&conn);
+    assert_eq!(result, "ok", "Database should be valid before corruption");
+
+    drop(conn);
+
+    // Find an interior table page and corrupt its cell pointer
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+
+        let file_size = file.metadata().unwrap().len();
+        let num_pages = file_size as usize / PAGE_SIZE;
+
+        let mut found_interior_page = None;
+        for page_num in 2..num_pages {
+            let page_offset = (page_num - 1) * PAGE_SIZE;
+            let mut page = [0u8; PAGE_SIZE];
+            file.seek(SeekFrom::Start(page_offset as u64)).unwrap();
+            file.read_exact(&mut page).unwrap();
+
+            // 0x05 = interior table page
+            if page[0] == 0x05 {
+                let cell_count = read_u16_be(&page, 3);
+                if cell_count > 0 {
+                    found_interior_page = Some((page_offset, page));
+                    break;
+                }
+            }
+        }
+
+        let (page_offset, mut page) =
+            found_interior_page.expect("With 500 rows, should have an interior table page");
+
+        // Interior page header is 12 bytes, cell pointer array starts at offset 12
+        // Set first cell pointer to point beyond the page
+        write_u16_be(&mut page, 12, 0xFFFF);
+
+        file.seek(SeekFrom::Start(page_offset as u64)).unwrap();
+        file.write_all(&page).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    let result = run_integrity_check_catching_panic(&conn);
+    match result {
+        Ok(msg) => {
+            assert!(
+                msg != "ok",
+                "Corrupt interior page cell pointer should not pass integrity check"
+            );
+        }
+        Err(panic_msg) => {
+            panic!(
+                "Corrupt interior page cell pointer should return an error, not panic: {panic_msg}"
+            );
+        }
+    }
+}
+
+/// Test that a SELECT on a table with a corrupt cell pointer does not panic.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_select_with_corrupt_cell_pointer_no_panic(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (1, 'hello');").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (2, 'world');").unwrap();
+
+    checkpoint_database(&conn);
+    drop(conn);
+
+    // Corrupt the first cell pointer on page 2 to point beyond the page
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+
+        let mut page2 = [0u8; PAGE_SIZE];
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.read_exact(&mut page2).unwrap();
+
+        assert_eq!(page2[0], 0x0d, "Expected leaf table page");
+
+        // Set first cell pointer to point beyond the page
+        write_u16_be(&mut page2, 8, 0xFFFF);
+
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.write_all(&page2).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    // A SELECT should return an error, not panic
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        conn.execute("SELECT * FROM t1;")
+    }));
+
+    match result {
+        Ok(exec_result) => {
+            // The query should return an error due to corruption
+            assert!(
+                exec_result.is_err(),
+                "SELECT on corrupt page should return an error"
+            );
+        }
+        Err(panic_info) => {
+            let panic_msg = panic_info
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic_info.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            panic!("SELECT on corrupt page should return an error, not panic: {panic_msg}");
         }
     }
 }

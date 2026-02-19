@@ -397,7 +397,10 @@ impl PageInner {
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
-        let (rowid, _) = read_varint(&buf[cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..])?;
+        let (rowid, _) = read_varint(crate::slice_in_bounds_or_corrupt!(
+            buf,
+            cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..
+        ))?;
         Ok(rowid as i64)
     }
 
@@ -411,14 +414,12 @@ impl PageInner {
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
-        // Validate cell pointer is within page bounds (need 4 bytes for u32)
-        if cell_pointer + 4 > buf.len() {
-            return Err(crate::LimboError::Corrupt(format!(
-                "cell pointer {} out of bounds for page size {}",
-                cell_pointer,
-                buf.len()
-            )));
-        }
+        crate::assert_or_bail_corrupt!(
+            cell_pointer + 4 <= buf.len(),
+            "cell pointer {} out of bounds for page size {}",
+            cell_pointer,
+            buf.len()
+        );
         Ok(u32::from_be_bytes([
             buf[cell_pointer],
             buf[cell_pointer + 1],
@@ -435,9 +436,9 @@ impl PageInner {
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         let mut pos = cell_pointer;
-        let (_, nr) = read_varint(&buf[pos..])?;
+        let (_, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
         pos += nr;
-        let (rowid, _) = read_varint(&buf[pos..])?;
+        let (rowid, _) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
         Ok(rowid as i64)
     }
 
@@ -461,11 +462,13 @@ impl PageInner {
         let page_type = self.page_type()?;
         let (payload_size, varint_len, header_skip) = match page_type {
             PageType::IndexInterior => {
-                let (size, len) = read_varint(&buf[cell_offset + 4..])?;
+                let (size, len) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset + 4..))?;
                 (size, len, 4usize)
             }
             PageType::IndexLeaf => {
-                let (size, len) = read_varint(&buf[cell_offset..])?;
+                let (size, len) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset..))?;
                 (size, len, 0usize)
             }
             _ => unreachable!("cell_index_read_payload_ptr called on non-index page"),
@@ -484,25 +487,43 @@ impl PageInner {
 
         let (payload_slice, first_overflow) = if overflows {
             let overflow_ptr_offset = payload_start + local_size - 4;
+            crate::assert_or_bail_corrupt!(
+                overflow_ptr_offset + 4 <= buf.len(),
+                "overflow pointer offset {} out of bounds for page size {}",
+                overflow_ptr_offset,
+                buf.len()
+            );
             let first_overflow_page = u32::from_be_bytes([
                 buf[overflow_ptr_offset],
                 buf[overflow_ptr_offset + 1],
                 buf[overflow_ptr_offset + 2],
                 buf[overflow_ptr_offset + 3],
             ]);
+            let payload_end = payload_start + local_size - 4;
+            crate::assert_or_bail_corrupt!(
+                payload_start < payload_end && payload_end <= buf.len(),
+                "payload range {}..{} out of bounds for page size {}",
+                payload_start,
+                payload_end,
+                buf.len()
+            );
             // SAFETY: valid as long as page is alive
             let slice = unsafe {
-                std::mem::transmute::<&[u8], &'static [u8]>(
-                    &buf[payload_start..payload_start + local_size - 4],
-                )
+                std::mem::transmute::<&[u8], &'static [u8]>(&buf[payload_start..payload_end])
             };
             (slice, Some(first_overflow_page))
         } else {
+            let payload_end = payload_start + payload_size as usize;
+            crate::assert_or_bail_corrupt!(
+                payload_end <= buf.len(),
+                "payload range {}..{} out of bounds for page size {}",
+                payload_start,
+                payload_end,
+                buf.len()
+            );
             // SAFETY: valid as long as page is alive
             let slice = unsafe {
-                std::mem::transmute::<&[u8], &'static [u8]>(
-                    &buf[payload_start..payload_start + payload_size as usize],
-                )
+                std::mem::transmute::<&[u8], &'static [u8]>(&buf[payload_start..payload_end])
             };
             (slice, None)
         };
@@ -540,14 +561,14 @@ impl PageInner {
         let max_local = payload_overflow_threshold_max(page_type, usable_size);
         let min_local = payload_overflow_threshold_min(page_type, usable_size);
         let cell_count = self.cell_count();
-        Ok(self._cell_get_raw_region_faster(
+        self._cell_get_raw_region_faster(
             idx,
             usable_size,
             cell_count,
             max_local,
             min_local,
             page_type,
-        ))
+        )
     }
 
     #[inline]
@@ -559,13 +580,14 @@ impl PageInner {
         max_local: usize,
         min_local: usize,
         page_type: PageType,
-    ) -> (usize, usize) {
+    ) -> crate::Result<(usize, usize)> {
         let buf = self.as_ptr();
         turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
         let len = match page_type {
             PageType::IndexInterior => {
-                let (len_payload, n_payload) = read_varint(&buf[start + 4..]).unwrap();
+                let (len_payload, n_payload) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, start + 4..))?;
                 let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
@@ -579,11 +601,13 @@ impl PageInner {
                 }
             }
             PageType::TableInterior => {
-                let (_, n_rowid) = read_varint(&buf[start + 4..]).unwrap();
+                let (_, n_rowid) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, start + 4..))?;
                 4 + n_rowid
             }
             PageType::IndexLeaf => {
-                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
+                let (len_payload, n_payload) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, start..))?;
                 let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
@@ -601,8 +625,10 @@ impl PageInner {
                 }
             }
             PageType::TableLeaf => {
-                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
-                let (_, n_rowid) = read_varint(&buf[start + n_payload..]).unwrap();
+                let (len_payload, n_payload) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, start..))?;
+                let (_, n_rowid) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, start + n_payload..))?;
                 let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
@@ -620,7 +646,14 @@ impl PageInner {
                 }
             }
         };
-        (start, len)
+        crate::assert_or_bail_corrupt!(
+            start + len <= buf.len(),
+            "cell region {}..{} out of bounds for page size {}",
+            start,
+            start + len,
+            buf.len()
+        );
+        Ok((start, len))
     }
 
     pub fn is_leaf(&self) -> bool {
