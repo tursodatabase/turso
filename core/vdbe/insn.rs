@@ -566,6 +566,7 @@ pub enum Insn {
         db: usize,                // p1
         tx_mode: TransactionMode, // p2
         schema_cookie: u32,       // p3
+        is_explicit_begin: bool,  // p5: true when from explicit BEGIN statement
     },
 
     /// Set database auto-commit mode and potentially rollback.

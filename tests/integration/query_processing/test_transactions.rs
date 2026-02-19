@@ -1472,6 +1472,113 @@ fn test_mvcc_dual_seek_range_operations() {
     );
 }
 
+/// BEGIN CONCURRENT should fail when another connection holds BEGIN EXCLUSIVE.
+#[test]
+fn test_mvcc_begin_blocked_after_begin_exclusive() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_begin_blocked_after_begin_exclusive.db");
+    let conn1 = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    let conn2 = tmp_db.connect_limbo();
+    conn2.execute("BEGIN EXCLUSIVE").unwrap();
+
+    let err = conn1
+        .execute("BEGIN CONCURRENT")
+        .expect_err("BEGIN CONCURRENT should fail when exclusive tx is active");
+    assert!(matches!(err, LimboError::Busy));
+}
+
+/// BEGIN EXCLUSIVE should fail when another connection holds BEGIN CONCURRENT.
+#[test]
+fn test_mvcc_begin_exclusive_blocked_after_begin_concurrent() {
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_begin_exclusive_blocked_after_concurrent.db");
+    let conn1 = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+
+    let err = conn2
+        .execute("BEGIN EXCLUSIVE")
+        .expect_err("BEGIN EXCLUSIVE should fail when concurrent tx is active");
+    assert!(matches!(err, LimboError::Busy));
+}
+
+/// Two BEGIN EXCLUSIVE from different connections should conflict.
+#[test]
+fn test_mvcc_begin_exclusive_blocked_by_another_exclusive() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_begin_exclusive_blocked_by_exclusive.db");
+    let conn1 = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN EXCLUSIVE").unwrap();
+
+    let err = conn2
+        .execute("BEGIN EXCLUSIVE")
+        .expect_err("Second BEGIN EXCLUSIVE should fail");
+    assert!(matches!(err, LimboError::Busy));
+}
+
+/// After an exclusive transaction commits, other connections can begin transactions.
+#[test]
+fn test_mvcc_begin_succeeds_after_exclusive_commits() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_begin_after_exclusive_commits.db");
+    let conn1 = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN EXCLUSIVE").unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+}
+
+/// After an exclusive transaction rolls back, other connections can begin transactions.
+#[test]
+fn test_mvcc_begin_succeeds_after_exclusive_rollback() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_begin_after_exclusive_rollback.db");
+    let conn1 = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN EXCLUSIVE").unwrap();
+    conn1.execute("ROLLBACK").unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+}
+
+/// Implicit auto-commit writes (no explicit BEGIN) should not be blocked by concurrent txs.
+#[test]
+fn test_mvcc_autocommit_write_not_blocked_by_concurrent() {
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_autocommit_write_not_blocked_by_concurrent.db");
+    let conn1 = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+
+    // Auto-commit INSERT on conn2 should succeed despite conn1 having an active CONCURRENT tx.
+    conn2.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+}
+
 #[test]
 fn test_commit_without_mvcc() {
     let tmp_db = TempDatabase::new("test_commit_without_mvcc.db");

@@ -31,6 +31,7 @@ pub fn translate_tx_begin(
                 db: 0,
                 tx_mode: TransactionMode::Write,
                 schema_cookie: schema.schema_version,
+                is_explicit_begin: true,
             });
             // TODO: Emit transaction instruction on temporary tables when we support them.
             program.emit_insn(Insn::AutoCommit {
@@ -43,6 +44,7 @@ pub fn translate_tx_begin(
                 db: 0,
                 tx_mode: TransactionMode::Concurrent,
                 schema_cookie: schema.schema_version,
+                is_explicit_begin: true,
             });
             // TODO: Emit transaction instruction on temporary tables when we support them.
             program.emit_insn(Insn::AutoCommit {

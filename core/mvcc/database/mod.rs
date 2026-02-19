@@ -2677,6 +2677,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
         }
+        if self.has_exclusive_tx() {
+            self.blocking_checkpoint_lock.unlock();
+            return Err(LimboError::Busy);
+        }
         let tx_id = self.get_tx_id();
         let begin_ts = self.get_timestamp();
 
@@ -3055,8 +3059,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Returns true if there is an exclusive transaction ongoing.
     #[inline]
-    fn has_exclusive_tx(&self) -> bool {
+    pub fn has_exclusive_tx(&self) -> bool {
         self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
+    }
+
+    /// Returns true if there are any active transactions.
+    #[inline]
+    pub fn has_active_txs(&self) -> bool {
+        !self.txs.is_empty()
     }
 
     /// Acquires the exclusive transaction lock to the given transaction ID.

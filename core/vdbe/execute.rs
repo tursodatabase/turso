@@ -2193,6 +2193,7 @@ pub fn op_transaction_inner(
             db,
             tx_mode,
             schema_cookie,
+            is_explicit_begin,
         },
         insn
     );
@@ -2284,6 +2285,18 @@ pub fn op_transaction_inner(
                     }
 
                     if !has_existing_mv_tx {
+                        // An explicit BEGIN EXCLUSIVE cannot start if other transactions are active.
+                        if *is_explicit_begin
+                            && *tx_mode == TransactionMode::Write
+                            && mv_store.has_active_txs()
+                        {
+                            if started_read_tx {
+                                pager.end_read_tx();
+                                conn.set_tx_state(TransactionState::None);
+                                state.auto_txn_cleanup = TxnCleanup::None;
+                            }
+                            return Err(LimboError::Busy);
+                        }
                         let tx_id = match tx_mode {
                             TransactionMode::None
                             | TransactionMode::Read

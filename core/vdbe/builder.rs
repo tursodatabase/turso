@@ -1365,6 +1365,7 @@ impl ProgramBuilder {
                     db: 0,
                     tx_mode: self.txn_mode,
                     schema_cookie: schema.schema_version,
+                    is_explicit_begin: false,
                 });
                 // Emit Transaction for each attached database that needs a write
                 for &db_id in &self.write_databases.clone() {
@@ -1378,6 +1379,7 @@ impl ProgramBuilder {
                             db: db_id,
                             tx_mode: self.txn_mode,
                             schema_cookie: cookie,
+                            is_explicit_begin: false,
                         });
                     }
                 }

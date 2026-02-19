@@ -677,7 +677,7 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
-            Insn::Transaction { db, tx_mode, schema_cookie} => (
+            Insn::Transaction { db, tx_mode, schema_cookie, ..} => (
                 "Transaction",
                 *db as i64,
                 *tx_mode as i64,
