@@ -2464,11 +2464,7 @@ mod tests {
             return 0;
         }
         let max_retries = *(data as *const i32);
-        if count < max_retries {
-            1
-        } else {
-            0
-        }
+        if count < max_retries { 1 } else { 0 }
     }
 
     /// Busy handler callback that never retries
@@ -2478,11 +2474,7 @@ mod tests {
 
     /// Busy handler callback that always retries (with safety limit)
     unsafe extern "C" fn busy_handler_always_retry(_data: *mut libc::c_void, count: i32) -> i32 {
-        if count < 1000 {
-            1
-        } else {
-            0
-        }
+        if count < 1000 { 1 } else { 0 }
     }
 
     #[test]
