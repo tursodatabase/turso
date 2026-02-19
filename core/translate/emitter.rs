@@ -2097,12 +2097,13 @@ fn emit_delete_row_common(
         if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
             let cdc_has_before = program.capture_data_changes_info().has_before();
             let before_record_reg = if cdc_has_before {
+                let table_reference = unsafe { &*table_reference };
                 Some(emit_cdc_full_record(
                     program,
-                    unsafe { &*table_reference }.table.columns(),
+                    table_reference.table.columns(),
                     main_table_cursor_id,
                     rowid_reg,
-                    unsafe { &*table_reference }
+                    table_reference
                         .table
                         .btree()
                         .is_some_and(|btree| btree.is_strict),
