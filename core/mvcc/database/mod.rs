@@ -359,9 +359,10 @@ pub enum TxTimestampOrID {
 
 /// Tracks versions created/modified during a savepoint for rollback.
 /// Used for statement-level savepoints in interactive transactions.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum SavepointKind {
     /// Internal savepoint used for statement-level rollback.
+    #[default]
     Statement,
     /// User-visible named savepoint.
     Named {
@@ -371,7 +372,7 @@ enum SavepointKind {
 }
 
 /// Tracks row/index version deltas created inside a single savepoint scope.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Savepoint {
     kind: SavepointKind,
     deferred_fk_violations: isize,
@@ -391,15 +392,7 @@ pub struct Savepoint {
 impl Savepoint {
     /// Creates an internal statement savepoint used for per-statement rollback.
     fn statement() -> Self {
-        Self {
-            kind: SavepointKind::Statement,
-            deferred_fk_violations: 0,
-            created_table_versions: Vec::new(),
-            created_index_versions: Vec::new(),
-            deleted_table_versions: Vec::new(),
-            deleted_index_versions: Vec::new(),
-            newly_added_to_write_set: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Creates a user-visible named savepoint snapshot.
@@ -410,11 +403,7 @@ impl Savepoint {
                 starts_transaction,
             },
             deferred_fk_violations,
-            created_table_versions: Vec::new(),
-            created_index_versions: Vec::new(),
-            deleted_table_versions: Vec::new(),
-            deleted_index_versions: Vec::new(),
-            newly_added_to_write_set: Vec::new(),
+            ..Default::default()
         }
     }
 
