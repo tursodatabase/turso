@@ -2063,6 +2063,179 @@ fn test_rollback() {
     assert_eq!(row5, None);
 }
 
+/// What this test checks: Rolling back an UPDATE on a committed row must not
+/// leak the updated value to concurrent readers (issue #5424).
+/// Why this matters: Violated atomicity — readers see data that was never committed.
+#[test]
+fn test_rollback_update_on_committed_row() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let row_id = RowID {
+        table_id,
+        row_id: RowKey::Int(1),
+    };
+
+    // Step 1: Insert and commit a row.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let original_row = generate_simple_string_row(table_id, 1, "original");
+    db.mvcc_store.insert(tx1, original_row.clone()).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // Step 2: Begin a new transaction, update the row, then rollback.
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+    let ghost_row = generate_simple_string_row(table_id, 1, "ROLLBACK_GHOST");
+    db.mvcc_store.update(tx2, ghost_row).unwrap();
+    db.mvcc_store
+        .rollback_tx(tx2, conn2.pager.load().clone(), &conn2);
+
+    // Step 3: Read from a new transaction — must see original, not the ghost.
+    let conn3 = db.db.connect().unwrap();
+    let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
+    let row = db
+        .mvcc_store
+        .read(tx3, row_id)
+        .unwrap()
+        .expect("committed row should be visible after rollback of update");
+    assert_eq!(
+        row, original_row,
+        "Reader saw rolled-back data instead of the original committed row"
+    );
+}
+
+/// Same as above but run the update+rollback cycle multiple times to check
+/// for accumulated stale version chain entries causing visibility issues.
+#[test]
+fn test_rollback_update_repeated() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let row_id = RowID {
+        table_id,
+        row_id: RowKey::Int(1),
+    };
+
+    // Insert and commit a row.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let original_row = generate_simple_string_row(table_id, 1, "original");
+    db.mvcc_store.insert(tx1, original_row.clone()).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // Repeat update + rollback 100 times.
+    for i in 0..100 {
+        let conn = db.db.connect().unwrap();
+        let tx = db.mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+        let ghost = generate_simple_string_row(table_id, 1, &format!("ghost_{i}"));
+        db.mvcc_store.update(tx, ghost).unwrap();
+        db.mvcc_store
+            .rollback_tx(tx, conn.pager.load().clone(), &conn);
+    }
+
+    // Read — must see original.
+    let conn_reader = db.db.connect().unwrap();
+    let tx_reader = db
+        .mvcc_store
+        .begin_tx(conn_reader.pager.load().clone())
+        .unwrap();
+    let row = db
+        .mvcc_store
+        .read(tx_reader, row_id)
+        .unwrap()
+        .expect("committed row should be visible after repeated rollbacks");
+    assert_eq!(
+        row, original_row,
+        "Reader saw rolled-back data after repeated update+rollback cycles"
+    );
+}
+
+/// What this test checks: Concurrent readers never see rolled-back UPDATE data (issue #5424).
+/// Why this matters: This is the exact scenario from the bug report.
+#[test]
+fn test_rollback_data_leak_concurrent() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let row_id = RowID {
+        table_id,
+        row_id: RowKey::Int(1),
+    };
+
+    // Insert and commit a row.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let original_row = generate_simple_string_row(table_id, 1, "original");
+    db.mvcc_store.insert(tx1, original_row.clone()).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let leak_found = Arc::new(AtomicBool::new(false));
+    let mvcc = db.mvcc_store.clone();
+    let database = db.db;
+
+    let mut handles = vec![];
+
+    // Writer threads: update + rollback in a loop
+    for _ in 0..4 {
+        let mvcc = mvcc.clone();
+        let database = database.clone();
+        let done = done.clone();
+        handles.push(std::thread::spawn(move || {
+            let conn = database.connect().unwrap();
+            while !done.load(Ordering::Relaxed) {
+                let tx = mvcc.begin_tx(conn.pager.load().clone()).unwrap();
+                let ghost = generate_simple_string_row(table_id, 1, "ROLLBACK_GHOST");
+                // Ignore write-write conflicts; just skip this iteration
+                if mvcc.update(tx, ghost).is_ok() {
+                    mvcc.rollback_tx(tx, conn.pager.load().clone(), &conn);
+                } else {
+                    mvcc.rollback_tx(tx, conn.pager.load().clone(), &conn);
+                }
+            }
+        }));
+    }
+
+    // Reader threads: check that we never see rolled-back data
+    for _ in 0..4 {
+        let mvcc = mvcc.clone();
+        let database = database.clone();
+        let done = done.clone();
+        let leak_found = leak_found.clone();
+        let original = original_row.clone();
+        let row_id = row_id.clone();
+        handles.push(std::thread::spawn(move || {
+            let conn = database.connect().unwrap();
+            while !done.load(Ordering::Relaxed) {
+                let tx = mvcc.begin_tx(conn.pager.load().clone()).unwrap();
+                if let Ok(Some(row)) = mvcc.read(tx, row_id.clone()) {
+                    if row != original {
+                        leak_found.store(true, Ordering::Relaxed);
+                        eprintln!("LEAK: reader saw non-original data: {row:?}");
+                    }
+                }
+                mvcc.rollback_tx(tx, conn.pager.load().clone(), &conn);
+            }
+        }));
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    done.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert!(
+        !leak_found.load(Ordering::Relaxed),
+        "Rolled-back transaction data leaked to concurrent readers!"
+    );
+}
+
 /// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
 /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
 #[test]

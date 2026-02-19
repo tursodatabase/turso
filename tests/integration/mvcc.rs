@@ -171,3 +171,180 @@ fn test_stmt_rollback_cleans_write_set_with_index(tmp_db: TempDatabase) -> anyho
 
     Ok(())
 }
+
+/// Sequential test for issue #5424: single-connection rollback + read
+#[turso_macros::test]
+fn test_rollback_data_leak_sequential(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, marker TEXT)")?;
+    conn.execute("INSERT INTO t VALUES(1, 100, 'original')")?;
+    conn.execute("INSERT INTO t VALUES(2, 200, 'original')")?;
+
+    // Update + rollback
+    conn.execute("BEGIN CONCURRENT")?;
+    conn.execute("UPDATE t SET marker = 'ROLLBACK_GHOST' WHERE id = 1")?;
+    conn.execute("UPDATE t SET val = -999 WHERE id = 2")?;
+    conn.execute("ROLLBACK")?;
+
+    // Read on the same connection
+    conn.execute("BEGIN CONCURRENT")?;
+    let mut val: i64 = 0;
+    let mut stmt = conn.prepare("SELECT val FROM t WHERE id = 2")?;
+    stmt.run_with_row_callback(|row| {
+        val = row.get::<i64>(0)?;
+        Ok(())
+    })?;
+    conn.execute("COMMIT")?;
+    assert_eq!(
+        val, 200,
+        "Same-connection reader saw rolled-back val={val} instead of 200"
+    );
+
+    // Read on a different connection
+    let conn2 = tmp_db.connect_limbo();
+    conn2.execute("BEGIN CONCURRENT")?;
+    let mut val2: i64 = 0;
+    let mut stmt2 = conn2.prepare("SELECT val FROM t WHERE id = 2")?;
+    stmt2.run_with_row_callback(|row| {
+        val2 = row.get::<i64>(0)?;
+        Ok(())
+    })?;
+    conn2.execute("COMMIT")?;
+    assert_eq!(
+        val2, 200,
+        "Different-connection reader saw rolled-back val={val2} instead of 200"
+    );
+
+    Ok(())
+}
+
+/// Non-concurrent multi-connection test for issue #5424
+#[turso_macros::test]
+fn test_rollback_data_leak_multi_conn(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, marker TEXT)")?;
+    conn.execute("INSERT INTO t VALUES(1, 100, 'original')")?;
+    conn.execute("INSERT INTO t VALUES(2, 200, 'original')")?;
+
+    // Use a separate connection for writing
+    let writer = tmp_db.connect_limbo();
+    let reader = tmp_db.connect_limbo();
+
+    for i in 0..50 {
+        // Writer: update + rollback
+        writer.execute("BEGIN CONCURRENT")?;
+        writer.execute("UPDATE t SET val = -999 WHERE id = 2")?;
+        writer.execute("ROLLBACK")?;
+
+        // Reader: check
+        reader.execute("BEGIN CONCURRENT")?;
+        let mut val: i64 = 0;
+        let mut stmt = reader.prepare("SELECT val FROM t WHERE id = 2")?;
+        stmt.run_with_row_callback(|row| {
+            val = row.get::<i64>(0)?;
+            Ok(())
+        })?;
+        reader.execute("COMMIT")?;
+
+        assert_eq!(
+            val, 200,
+            "Iteration {i}: reader saw rolled-back val={val} instead of 200"
+        );
+    }
+    Ok(())
+}
+
+/// Regression test for issue #5424: rolled-back UPDATE data visible to concurrent readers.
+/// A committed row is updated and then rolled back; concurrent readers must never see the
+/// rolled-back value.
+#[turso_macros::test]
+fn test_rollback_data_leak(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let tmp_db = Arc::new(tmp_db);
+
+    // Setup: enable MVCC, create table, insert initial rows
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, marker TEXT)")?;
+        conn.execute("INSERT INTO t VALUES(1, 100, 'original')")?;
+        conn.execute("INSERT INTO t VALUES(2, 200, 'original')")?;
+    }
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let leak_found = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut handles = vec![];
+
+    // Writer threads: UPDATE then ROLLBACK in a loop
+    for _ in 0..4 {
+        let tmp_db = tmp_db.clone();
+        let done = done.clone();
+        handles.push(std::thread::spawn(move || {
+            let conn = tmp_db.connect_limbo();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = conn.execute("BEGIN CONCURRENT");
+                let _ = conn.execute("UPDATE t SET marker = 'ROLLBACK_GHOST' WHERE id = 1");
+                let _ = conn.execute("UPDATE t SET val = -999 WHERE id = 2");
+                let _ = conn.execute("ROLLBACK");
+            }
+        }));
+    }
+
+    // Reader threads: check that rolled-back data is never visible
+    for _ in 0..4 {
+        let tmp_db = tmp_db.clone();
+        let done = done.clone();
+        let leak_found = leak_found.clone();
+        handles.push(std::thread::spawn(move || {
+            let conn = tmp_db.connect_limbo();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = conn.execute("BEGIN CONCURRENT");
+
+                // Check marker on row 1
+                let mut stmt = conn.prepare("SELECT marker FROM t WHERE id = 1").unwrap();
+                let mut marker = String::new();
+                let _ = stmt.run_with_row_callback(|row| {
+                    marker = row.get::<String>(0)?;
+                    Ok(())
+                });
+
+                // Check val on row 2
+                let mut stmt2 = conn.prepare("SELECT val FROM t WHERE id = 2").unwrap();
+                let mut val: i64 = 0;
+                let _ = stmt2.run_with_row_callback(|row| {
+                    val = row.get::<i64>(0)?;
+                    Ok(())
+                });
+
+                let _ = conn.execute("COMMIT");
+
+                if marker == "ROLLBACK_GHOST" {
+                    leak_found.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("LEAK: Rolled-back UPDATE visible! marker='ROLLBACK_GHOST' on row 1");
+                }
+                if val == -999 {
+                    leak_found.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("LEAK: Rolled-back UPDATE visible! val=-999 on row 2");
+                }
+            }
+        }));
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert!(
+        !leak_found.load(std::sync::atomic::Ordering::Relaxed),
+        "Rolled-back transaction data leaked to concurrent readers!"
+    );
+    Ok(())
+}
