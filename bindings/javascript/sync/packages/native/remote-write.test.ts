@@ -265,3 +265,75 @@ test('remote write: DDL create index', async () => {
     expect(rows).toEqual([{ value: 'indexed' }]);
     await db.close();
 })
+
+test('remote write: read-only transaction goes remote, not local', async () => {
+    const seed = await connect(localSyncedDbOpts());
+    await seed.exec("CREATE TABLE IF NOT EXISTS rw_read_txn(id INTEGER PRIMARY KEY, value TEXT)");
+    await seed.exec("DELETE FROM rw_read_txn");
+    await seed.exec("INSERT INTO rw_read_txn VALUES (1, 'original')");
+    await seed.push();
+    await seed.close();
+
+    // db1 connects with remote writes — local replica has 'original'
+    const db1 = await connect(remoteWriteOpts());
+    const localRows = await db1.prepare("SELECT value FROM rw_read_txn").all();
+    expect(localRows).toEqual([{ value: 'original' }]);
+
+    // another client updates the remote behind db1's back
+    const db2 = await connect(localSyncedDbOpts());
+    await db2.exec("UPDATE rw_read_txn SET value = 'updated' WHERE id = 1");
+    await db2.push();
+    await db2.close();
+
+    // db1's local replica is stale — outside a txn, reads are local
+    const staleRows = await db1.prepare("SELECT value FROM rw_read_txn").all();
+    expect(staleRows).toEqual([{ value: 'original' }]);
+
+    // inside a transaction, reads should go remote and see 'updated'
+    await db1.exec("BEGIN");
+    const txnRows = await db1.prepare("SELECT value FROM rw_read_txn").all();
+    expect(txnRows[0]).toMatchObject({ value: 'updated' });
+    await db1.exec("COMMIT");
+
+    await db1.close();
+})
+
+test('remote write: insert returning', async () => {
+    const seed = await connect(localSyncedDbOpts());
+    await seed.exec("DROP TABLE IF EXISTS rw_returning");
+    await seed.exec("CREATE TABLE rw_returning(id INTEGER PRIMARY KEY, value TEXT)");
+    await seed.push();
+    await seed.close();
+
+    const db = await connect(remoteWriteOpts());
+    const rows = await db.prepare("INSERT INTO rw_returning(value) VALUES (?) RETURNING id, value").all(['hello']);
+    expect(rows).toMatchObject([{ id: 1, value: 'hello' }]);
+
+    expect(await db.prepare("SELECT * FROM rw_returning").all()).toMatchObject([{ id: 1, value: 'hello' }]);
+
+    const rows2 = await db.prepare("INSERT INTO rw_returning(value) VALUES (?) RETURNING id, value").all(['world']);
+    expect(rows2).toMatchObject([{ id: 2, value: 'world' }]);
+
+    expect(await db.prepare("SELECT * FROM rw_returning").all()).toMatchObject([
+        { id: 1, value: 'hello' },
+        { id: 2, value: 'world' },
+    ]);
+
+    await db.close();
+})
+
+test('remote write: blob round-trip', async () => {
+    const seed = await connect(localSyncedDbOpts());
+    await seed.exec("DROP TABLE IF EXISTS rw_blob");
+    await seed.exec("CREATE TABLE rw_blob(id INTEGER PRIMARY KEY, data BLOB)");
+    await seed.push();
+    await seed.close();
+
+    const db = await connect(remoteWriteOpts());
+    const blob = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0xfd]);
+    await db.prepare("INSERT INTO rw_blob(data) VALUES (?)").run([blob]);
+
+    const rows = await db.prepare("SELECT data FROM rw_blob").all();
+    expect(Buffer.from(rows[0].data)).toEqual(blob);
+    await db.close();
+})
