@@ -10618,13 +10618,11 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                             return true;
                         }
                         Value::Numeric(Numeric::Float(fl)) => {
-                            // For Numeric affinity, try to convert float to int if exact
-                            if affinity == Affinity::Numeric {
-                                return try_float_to_integer_affinity(value, f64::from(fl));
-                            } else {
-                                *value = Value::Numeric(Numeric::Float(fl));
-                                return true;
-                            }
+                            // For both Numeric and Integer affinity, try to convert
+                            // float to int if exact. SQLite treats INTEGER identically
+                            // to NUMERIC here: both enter applyNumericAffinity() with
+                            // bTryForInt=1 (sqlite/src/vdbe.c:403-408).
+                            return try_float_to_integer_affinity(value, f64::from(fl));
                         }
                         other => {
                             *value = other;

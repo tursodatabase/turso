@@ -119,6 +119,13 @@ pub struct Resolver<'a> {
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
     pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize)>,
+    /// Maps register indices to column affinities for expression index evaluation.
+    /// Populated temporarily during UPDATE new-image expression index key computation,
+    /// where column references have been rewritten to Expr::Register and comparison
+    /// operators need the original column affinity. Analogous to SQLite's iSelfTab
+    /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
+    /// than redirecting column reads at codegen time.
+    pub register_affinities: HashMap<usize, Affinity>,
 }
 
 impl<'a> Resolver<'a> {
@@ -141,6 +148,7 @@ impl<'a> Resolver<'a> {
             symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
+            register_affinities: HashMap::default(),
         }
     }
 
@@ -156,6 +164,7 @@ impl<'a> Resolver<'a> {
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
+            register_affinities: HashMap::default(),
         }
     }
 
@@ -3209,6 +3218,24 @@ fn emit_update_insns<'a>(
         }
     }
 
+    // Populate register-to-affinity map for expression index evaluation.
+    // When column references are rewritten to Expr::Register during UPDATE, comparison
+    // operators need the original column affinity. This is set once here and cleared at
+    // the end of the function.
+    {
+        let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+        for (idx, col) in target_table.table.columns().iter().enumerate() {
+            t_ctx
+                .resolver
+                .register_affinities
+                .insert(start + idx, col.affinity());
+        }
+        t_ctx
+            .resolver
+            .register_affinities
+            .insert(rowid_reg, Affinity::Integer);
+    }
+
     // For IGNORE, FAIL, and ROLLBACK modes, we need to do a preflight check for unique
     // constraint violations BEFORE deleting any old index entries. This ensures that:
     // - IGNORE: We can skip the row without corrupting it by partially deleting index entries
@@ -4157,6 +4184,7 @@ fn emit_update_insns<'a>(
         program.preassign_label_to_next_insn(label);
     }
 
+    t_ctx.resolver.register_affinities.clear();
     Ok(())
 }
 
@@ -4879,6 +4907,10 @@ fn emit_index_column_value_new_image(
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
         rewrite_where_for_update_registers(&mut expr, columns, columns_start_reg, rowid_reg)?;
+        // The caller must have populated resolver.register_affinities so that
+        // comparison instructions in the expression get the correct column
+        // affinity even though column references have been rewritten to
+        // Expr::Register.
         translate_expr_no_constant_opt(
             program,
             None,

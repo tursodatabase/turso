@@ -1,0 +1,140 @@
+@database :memory:
+@skip-file-if mvcc "expression indexes are not supported with mvcc"
+
+# Tests for expression index key computation during UPDATE.
+# The expression index key must be computed from post-affinity values
+# so that INSERT and DELETE paths see consistent types.
+# Regression tests for GitHub issue #5428.
+
+# Reproducer 1: CAST expression index with INT affinity column.
+# '0.0' with INT affinity should become Integer(0), so
+# CAST(0 AS TEXT) = '0', not CAST(0.0 AS TEXT) = '0.0'.
+test cast-expr-index-int-affinity {
+    CREATE TABLE t0 (c0 INT);
+    INSERT INTO t0 VALUES (0);
+    CREATE INDEX idx ON t0 (CAST(c0 AS TEXT));
+    UPDATE t0 SET c0 = '0.0';
+    UPDATE t0 SET c0 = 1;
+    SELECT * FROM t0;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# Reproducer 2: Comparison expression index with TEXT affinity column.
+# The comparison c0 = 0 must use TEXT affinity in both OLD and NEW
+# image paths during UPDATE.
+test comparison-expr-index-text-affinity {
+    CREATE TABLE t0 (c0 TEXT);
+    INSERT INTO t0 VALUES ('x');
+    CREATE INDEX i0 ON t0(c0 = 0);
+    UPDATE t0 SET c0 = 0;
+    UPDATE t0 SET c0 = 1;
+    SELECT * FROM t0;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# Multiple sequential updates on CAST expression index.
+test cast-expr-index-multiple-updates {
+    CREATE TABLE t1 (c0 INT);
+    INSERT INTO t1 VALUES (0);
+    CREATE INDEX idx1 ON t1 (CAST(c0 AS TEXT));
+    UPDATE t1 SET c0 = '1.0';
+    UPDATE t1 SET c0 = '2.5';
+    UPDATE t1 SET c0 = 3;
+    SELECT * FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    3
+    ok
+}
+
+# Comparison expression index with NUMERIC affinity.
+test comparison-expr-index-numeric-affinity {
+    CREATE TABLE t2 (c0 NUMERIC);
+    INSERT INTO t2 VALUES (1);
+    CREATE INDEX i2 ON t2 (c0 > 5);
+    UPDATE t2 SET c0 = 10;
+    UPDATE t2 SET c0 = 3;
+    SELECT * FROM t2;
+    PRAGMA integrity_check;
+}
+expect {
+    3
+    ok
+}
+
+# Expression index with INTEGER affinity and float-like text values.
+test expr-index-int-affinity-float-text {
+    CREATE TABLE t3 (c0 INT);
+    INSERT INTO t3 VALUES (0);
+    CREATE INDEX idx3 ON t3 (CAST(c0 AS TEXT));
+    UPDATE t3 SET c0 = '5.0';
+    SELECT CAST(c0 AS TEXT) FROM t3;
+    PRAGMA integrity_check;
+    UPDATE t3 SET c0 = '10.0';
+    SELECT CAST(c0 AS TEXT) FROM t3;
+    PRAGMA integrity_check;
+}
+expect {
+    5
+    ok
+    10
+    ok
+}
+
+# Expression index with NULL values.
+test expr-index-null-values {
+    CREATE TABLE t4 (c0 INT);
+    INSERT INTO t4 VALUES (NULL);
+    CREATE INDEX idx4 ON t4 (CAST(c0 AS TEXT));
+    UPDATE t4 SET c0 = '0.0';
+    UPDATE t4 SET c0 = NULL;
+    SELECT c0 IS NULL FROM t4;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# Multiple rows with expression index.
+test expr-index-multi-row {
+    CREATE TABLE t5 (id INTEGER PRIMARY KEY, c0 INT);
+    INSERT INTO t5 VALUES (1, 10);
+    INSERT INTO t5 VALUES (2, 20);
+    CREATE INDEX idx5 ON t5 (CAST(c0 AS TEXT));
+    UPDATE t5 SET c0 = '30.0' WHERE id = 1;
+    UPDATE t5 SET c0 = '40.0' WHERE id = 2;
+    UPDATE t5 SET c0 = 50 WHERE id = 1;
+    SELECT id, c0 FROM t5 ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|50
+    2|40
+    ok
+}
+
+# Comparison expression index with multiple updates changing truth value.
+test comparison-expr-index-truth-value-changes {
+    CREATE TABLE t6 (c0 TEXT);
+    INSERT INTO t6 VALUES ('hello');
+    CREATE INDEX i6 ON t6 (c0 = 'world');
+    UPDATE t6 SET c0 = 'world';
+    UPDATE t6 SET c0 = 'hello';
+    UPDATE t6 SET c0 = 'world';
+    SELECT * FROM t6;
+    PRAGMA integrity_check;
+}
+expect {
+    world
+    ok
+}

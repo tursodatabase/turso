@@ -519,7 +519,7 @@ fn emit_hash_build_phase(
     for join_key in hash_join_op.join_keys.iter() {
         let build_expr = join_key.get_build_expr(predicates);
         let probe_expr = join_key.get_probe_expr(predicates);
-        let affinity = comparison_affinity(build_expr, probe_expr, Some(table_references));
+        let affinity = comparison_affinity(build_expr, probe_expr, Some(table_references), None);
         key_affinities.push(affinity.aff_mask());
     }
 

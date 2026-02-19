@@ -119,7 +119,7 @@ impl Constraint {
         let mut affinity = Affinity::Blob;
         if op.as_ast_operator().is_some_and(|op| op.is_comparison()) && self.table_col_pos.is_some()
         {
-            affinity = comparison_affinity(lhs, rhs, referenced_tables);
+            affinity = comparison_affinity(lhs, rhs, referenced_tables, None);
         }
 
         if side == BinaryExprSide::Lhs {
@@ -1544,7 +1544,7 @@ fn analyze_binary_term_for_index(
     // Compute the affinity for the constraining expression
     let affinity = if let Some(ast_op) = operator.as_ast_operator() {
         if ast_op.is_comparison() && table_col_pos.is_some() {
-            comparison_affinity(lhs, rhs, Some(table_references))
+            comparison_affinity(lhs, rhs, Some(table_references), None)
         } else {
             Affinity::Blob
         }
