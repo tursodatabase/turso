@@ -2014,9 +2014,16 @@ pub fn halt(
                 .swap(0, Ordering::AcqRel);
             if deferred_violations > 0 {
                 vtab_rollback_all(&program.connection)?;
-                pager.rollback_tx(&program.connection);
-                program.connection.set_tx_state(TransactionState::None);
                 program.connection.auto_commit.store(true, Ordering::SeqCst);
+                if let Some(mv_store) = mv_store.as_ref() {
+                    if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                        mv_store.rollback_tx(tx_id, pager.clone(), &program.connection);
+                    }
+                    pager.end_read_tx();
+                } else {
+                    pager.rollback_tx(&program.connection);
+                }
+                program.connection.set_tx_state(TransactionState::None);
                 return Err(LimboError::ForeignKeyConstraint(
                     "deferred foreign key constraint failed".to_string(),
                 ));

@@ -12,14 +12,6 @@ expect error {
     Views are not supported in MVCC mode
 }
 
-test mvcc-rejects-foreign-keys {
-    PRAGMA journal_mode = 'experimental_mvcc';
-    PRAGMA foreign_keys = ON;
-}
-expect error {
-    Foreign keys are not supported in MVCC mode
-}
-
 test mvcc-rejects-partial-index {
     PRAGMA journal_mode = 'experimental_mvcc';
     CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER);

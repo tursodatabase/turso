@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "foreign keys not supported with MVCC"
 
 test fk-basic-ok {
     PRAGMA foreign_keys=ON;
