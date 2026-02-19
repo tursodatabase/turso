@@ -16,7 +16,6 @@ use crate::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{CmpInsFlags, Insn},
     },
-    Connection,
 };
 use turso_parser::ast;
 
@@ -44,19 +43,10 @@ pub fn translate_integrity_check(
     schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    connection: &crate::sync::Arc<Connection>,
     database_id: usize,
     max_errors: usize,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(
-        schema,
-        program,
-        resolver,
-        connection,
-        database_id,
-        max_errors,
-        false,
-    )
+    translate_integrity_check_impl(schema, program, resolver, database_id, max_errors, false)
 }
 
 /// Translate PRAGMA quick_check.
@@ -64,19 +54,10 @@ pub fn translate_quick_check(
     schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    connection: &crate::sync::Arc<Connection>,
     database_id: usize,
     max_errors: usize,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(
-        schema,
-        program,
-        resolver,
-        connection,
-        database_id,
-        max_errors,
-        true,
-    )
+    translate_integrity_check_impl(schema, program, resolver, database_id, max_errors, true)
 }
 
 fn emit_integrity_result_row(
@@ -134,14 +115,14 @@ fn emit_row_missing_from_index_error(
 fn bind_expr_for_table(
     expr: &ast::Expr,
     table_references: &mut TableReferences,
-    connection: &crate::sync::Arc<Connection>,
+    resolver: &Resolver,
 ) -> crate::Result<ast::Expr> {
     let mut out = expr.clone();
     bind_and_rewrite_expr(
         &mut out,
         Some(table_references),
         None,
-        connection,
+        resolver,
         BindingBehavior::ResultColumnsNotAllowed,
     )?;
     Ok(out)
@@ -151,7 +132,6 @@ fn translate_integrity_check_impl(
     schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    connection: &crate::sync::Arc<Connection>,
     database_id: usize,
     max_errors: usize,
     quick: bool,
@@ -273,11 +253,7 @@ fn translate_integrity_check_impl(
 
                 let mut where_expr = None;
                 if let Some(pred) = index.where_clause.as_deref() {
-                    where_expr = Some(bind_expr_for_table(
-                        pred,
-                        &mut table_references,
-                        connection,
-                    )?);
+                    where_expr = Some(bind_expr_for_table(pred, &mut table_references, resolver)?);
                 }
 
                 let mut columns = Vec::with_capacity(index.columns.len());
@@ -287,7 +263,7 @@ fn translate_integrity_check_impl(
                         columns.push(BoundIndexColumn::Expr(Box::new(bind_expr_for_table(
                             expr,
                             &mut table_references,
-                            connection,
+                            resolver,
                         )?)));
                         unique_nullable.push(true);
                     } else {
@@ -329,7 +305,7 @@ fn translate_integrity_check_impl(
             bound_checks.push(bind_expr_for_table(
                 &check.expr,
                 &mut table_references,
-                connection,
+                resolver,
             )?);
         }
 
