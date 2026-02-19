@@ -656,6 +656,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                 || e_string.contains("has no column named")
                 || e_string.contains("no such column:")
                 || e_string.contains("cannot drop column")
+                || e_string.contains("DDL statements require an exclusive transaction")
         };
         let requires_rollback = |e: &turso::Error| -> bool {
             let e_string = e.to_string();
