@@ -452,6 +452,8 @@ pub struct Transaction {
     /// True when this transaction currently holds the serialized logical-log commit lock.
     pager_commit_lock_held: AtomicBool,
     /// Number of unresolved commit dependencies (must reach 0 before commit).
+    /// i.e the number of transactions this transaction is dependent on and waiting for
+    /// commit or abort.
     /// Hekaton Section 2.7: "A transaction cannot commit until this counter is zero."
     commit_dep_counter: AtomicU64,
     /// Flag: a depended-on transaction aborted; this transaction must abort too.
@@ -1219,8 +1221,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     """
                 **  If you're wondering when a speculative read happens, here you go:
                 **  Case 1: speculative read of TB:
-                    """Expand commentComment on line L983Resolved
-                        If transaction TB is in the Preparing state, it has acquired an end
+                    """If transaction TB is in the Preparing state, it has acquired an end
                         timestamp TS which will be V’s begin timestamp if TB commits.
                         A safe approach in this situation would be to have transaction T
                         wait until transaction TB commits. However, we want to avoid all
@@ -1266,6 +1267,14 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
                 });
                 if self.write_set.is_empty() {
+                    turso_assert!(
+                        tx.commit_dep_set.lock().is_empty(),
+                        "MVCC read only transaction should not have commit dependencies on other txns"
+                    );
+                    // Abort eagerly if requested
+                    if tx.abort_now.load(Ordering::Acquire) {
+                        return Err(LimboError::CommitDependencyAborted);
+                    }
                     // Even read-only transactions must honour commit dependencies.
                     // A SELECT during normal processing may have speculatively read
                     // from a Preparing transaction (Hekaton §2.7), incrementing our
@@ -1331,6 +1340,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .ok_or(LimboError::TxTerminated)?;
                 let tx = tx.value();
 
+                // Eagarly check for abort_now
+                if tx.abort_now.load(Ordering::Acquire) {
+                    return Err(LimboError::CommitDependencyAborted);
+                }
                 // Hekaton Section 2.7: "A transaction cannot commit until this
                 // counter is zero." Deadlock impossible: edges always go from higher
                 // end_ts to lower end_ts, so the wait graph is acyclic.
@@ -1415,16 +1428,20 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                             for row_version in row_versions.iter_mut() {
                                 if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
                                     if id == self.tx_id {
+                                        // New version is valid STARTING FROM committing transaction's end timestamp
+                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                         row_version.begin =
                                             Some(TxTimestampOrID::Timestamp(*end_ts));
                                         mvcc_store.insert_version_raw(
                                             &mut log_record.row_versions,
                                             row_version.clone(),
-                                        );
+                                        ); // FIXME: optimize cloning out
                                     }
                                 }
                                 if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
                                     if id == self.tx_id {
+                                        // Old version is valid UNTIL committing transaction's end timestamp
+                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                         row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
                                         mvcc_store.insert_version_raw(
                                             &mut log_record.row_versions,
@@ -1551,6 +1568,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // Hekaton Section 3.3: "The transaction then processes all outgoing
                 // commit dependencies listed in its CommitDepSet. If it committed, it
                 // decrements the target transaction's CommitDepCounter."
+                // IOW since this txn committed, let's signal waiting transactions.
                 let dependents = std::mem::take(&mut *tx_unlocked.commit_dep_set.lock());
                 for dep_tx_id in dependents {
                     if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
@@ -3035,6 +3053,19 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     pub fn remove_tx(&self, tx_id: TxID) {
+        if let Some(entry) = self.txs.get(&tx_id) {
+            let tx = entry.value();
+            let dep_set = std::mem::take(&mut *tx.commit_dep_set.lock());
+            // Invariant: commit_dep_set must be drained before removing the transaction.
+            // CommitEnd and rollback_tx both drain the commit_dep_set to notify dependencies.
+            // If we remove a transaction with non-empty commit_dep_set, those dependencies will wait
+            // forever (deadlock).
+            turso_assert!(
+                dep_set.is_empty(),
+                "remove_tx({tx_id}): commit_dep_set is not empty ({} would be orphaned)",
+                dep_set.len()
+            );
+        }
         self.txs.remove(&tx_id);
         self.blocking_checkpoint_lock.unlock();
     }
@@ -4743,7 +4774,7 @@ fn register_commit_dependency(
     // commit/abort postprocessing.
     let mut dep_set = depended_on.commit_dep_set.lock();
     match depended_on.state.load() {
-        TransactionState::Preparing(_) | TransactionState::Active => {
+        TransactionState::Preparing(_) => {
             // Increment counter BEFORE pushing to dep_set and BEFORE dropping
             // the lock. This prevents underflow: if we pushed first and
             // released the lock, the depended-on tx could drain the dep_set
@@ -4759,6 +4790,9 @@ fn register_commit_dependency(
                 dependent_tx.tx_id,
                 depended_on_tx_id
             );
+        }
+        TransactionState::Active => {
+            turso_assert!(false, "a txn found dependent on active txn");
         }
         TransactionState::Committed(_) => {
             // Already committed — dependency trivially resolved.
@@ -4844,8 +4878,12 @@ fn is_end_visible(
                 // we speculatively ignore V (treat deletion as committed). Register a
                 // dependency in case TE aborts (then V should have been visible).
                 TransactionState::Preparing(end_ts) => {
+                    turso_assert!(
+                        current_tx.tx_id != other_tx.tx_id,
+                        "a txn is reading itself while preparing"
+                    );
                     let visible = current_tx.begin_ts < end_ts;
-                    if !visible && current_tx.tx_id != other_tx.tx_id {
+                    if !visible {
                         register_commit_dependency(txs, current_tx, rv_end);
                     }
                     visible
