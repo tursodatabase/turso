@@ -1,6 +1,6 @@
 use crate::{
     commands::{
-        args::{EchoMode, HeadersMode, TimerMode},
+        args::{EchoMode, HeadersMode, ParameterArgs, ParameterCommand, TimerMode},
         import::ImportFile,
         Command, CommandParser,
     },
@@ -19,6 +19,7 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
+use std::num::NonZeroUsize;
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, IsTerminal, Write},
@@ -114,6 +115,14 @@ pub struct Limbo {
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
     had_query_error: bool,
+    parameter_bindings: Vec<ParameterBinding>,
+}
+
+#[derive(Clone)]
+struct ParameterBinding {
+    name: Box<str>,
+    index: Option<NonZeroUsize>,
+    value: Value,
 }
 
 struct QueryStatistics {
@@ -276,6 +285,7 @@ impl Limbo {
             rl: None,
             config: Some(config),
             had_query_error: false,
+            parameter_bindings: Vec::new(),
         };
         app.first_run(has_sql, quiet)?;
         Ok((app, guard))
@@ -532,7 +542,10 @@ impl Limbo {
         let conn = self.conn.clone();
         let runner = conn.query_runner(input.as_bytes());
         let had_error_before = self.had_query_error;
-        for output in runner {
+        for mut output in runner {
+            if let Ok(Some(ref mut stmt)) = output {
+                self.apply_parameter_bindings(stmt);
+            }
             if self
                 .print_query_result(input, output, stats.as_mut())
                 .is_err()
@@ -558,6 +571,76 @@ impl Limbo {
                 let _ = self.writeln(output);
             }
         }
+    }
+
+    fn apply_parameter_bindings(&self, stmt: &mut Statement) {
+        for binding in &self.parameter_bindings {
+            if let Some(index) = binding.index {
+                if stmt.parameters().has_slot(index) {
+                    stmt.bind_at(index, binding.value.clone());
+                }
+                continue;
+            }
+
+            if let Some(index) = stmt.parameter_index(&binding.name) {
+                stmt.bind_at(index, binding.value.clone());
+            }
+        }
+    }
+
+    fn handle_parameter_command(&mut self, args: ParameterArgs) -> Result<(), String> {
+        match args.command {
+            ParameterCommand::Set(args) => {
+                validate_parameter_name(&args.name)?;
+                let index = parameter_name_to_index(&args.name);
+                let value = parse_parameter_value(&args.value)?;
+
+                if let Some(existing) = self
+                    .parameter_bindings
+                    .iter_mut()
+                    .find(|binding| binding.name.as_ref() == args.name)
+                {
+                    existing.index = index;
+                    existing.value = value;
+                } else {
+                    self.parameter_bindings.push(ParameterBinding {
+                        name: args.name.into_boxed_str(),
+                        index,
+                        value,
+                    });
+                }
+                Ok(())
+            }
+            ParameterCommand::List => self.list_parameter_bindings(),
+            ParameterCommand::Clear(args) => {
+                if let Some(name) = args.name {
+                    validate_parameter_name(&name)?;
+                    self.parameter_bindings
+                        .retain(|binding| binding.name.as_ref() != name);
+                } else {
+                    self.parameter_bindings.clear();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn list_parameter_bindings(&mut self) -> Result<(), String> {
+        if self.parameter_bindings.is_empty() {
+            return Ok(());
+        }
+
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| "writer is not initialized".to_string())?;
+
+        for binding in &self.parameter_bindings {
+            writer
+                .write_fmt(format_args!("{} = {}\n", binding.name, binding.value))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     fn print_query_performance_stats(&mut self, start: Instant, stats: Option<&QueryStatistics>) {
@@ -677,11 +760,25 @@ impl Limbo {
     }
 
     pub fn handle_dot_command(&mut self, line: &str) {
-        let args: Vec<&str> = line.split_whitespace().collect();
-        if args.is_empty() {
-            return;
-        }
-        match CommandParser::try_parse_from(args) {
+        let first = line.split_whitespace().next();
+        let parse = match first {
+            Some("parameter") | Some("param") => {
+                let args = shlex::split(line).unwrap_or_else(|| {
+                    line.split_whitespace()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                });
+                if args.is_empty() {
+                    return;
+                }
+                CommandParser::try_parse_from(args)
+            }
+            _ => {
+                let args = line.split_whitespace();
+                CommandParser::try_parse_from(args)
+            }
+        };
+        match parse {
             Err(err) => {
                 // Let clap print with Styled Colors instead
                 let _ = err.print();
@@ -817,6 +914,11 @@ impl Limbo {
                 Command::Read(args) => {
                     if let Err(e) = self.read_sql_file(&args.path) {
                         let _ = self.writeln(e.to_string());
+                    }
+                }
+                Command::Parameter(args) => {
+                    if let Err(e) = self.handle_parameter_command(args) {
+                        let _ = self.writeln_fmt(format_args!("Error: {e}"));
                     }
                 }
                 Command::Dbtotxt(args) => {
@@ -2162,6 +2264,101 @@ fn sql_quote_string(s: &str) -> String {
     out.push('\'');
     out
 }
+
+fn validate_parameter_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("parameter name cannot be empty".to_string());
+    }
+
+    match name.as_bytes()[0] {
+        b':' | b'@' | b'$' | b'#' => Ok(()),
+        b'?' => {
+            let Some(rest) = name.strip_prefix('?') else {
+                return Err("invalid parameter name".to_string());
+            };
+            if rest.is_empty() {
+                return Err("parameter name '?N' must include digits".to_string());
+            }
+            if rest.parse::<usize>().ok().filter(|idx| *idx > 0).is_none() {
+                return Err("parameter name '?N' must use an index >= 1".to_string());
+            }
+            Ok(())
+        }
+        _ => Err("parameter name must start with one of ':', '@', '$', '#', '?'".to_string()),
+    }
+}
+
+fn parameter_name_to_index(name: &str) -> Option<NonZeroUsize> {
+    let value = name.strip_prefix('?')?.parse::<usize>().ok()?;
+    value.try_into().ok()
+}
+
+fn parse_parameter_value(value: &str) -> Result<Value, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("null") {
+        return Ok(Value::Null);
+    }
+
+    if let Ok(integer) = value.parse::<i64>() {
+        return Ok(Value::from_i64(integer));
+    }
+
+    if value.contains(['.', 'e', 'E']) {
+        if let Ok(float) = value.parse::<f64>() {
+            return Ok(Value::from_f64(float));
+        }
+    }
+
+    if let Some(hex) = value
+        .strip_prefix("x'")
+        .or_else(|| value.strip_prefix("X'"))
+        .and_then(|stripped| stripped.strip_suffix('\''))
+    {
+        return parse_hex_blob(hex).map(Value::from_blob);
+    }
+
+    if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|stripped| stripped.strip_suffix('\''))
+    {
+        return Ok(Value::build_text(unescape_single_quoted(inner)));
+    }
+
+    Ok(Value::build_text(value.to_owned()))
+}
+
+fn parse_hex_blob(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("hex blob literal must contain an even number of digits".to_string());
+    }
+
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut bytes = hex.as_bytes().iter().copied();
+    while let (Some(hi), Some(lo)) = (bytes.next(), bytes.next()) {
+        let h = decode_hex_nibble(hi)?;
+        let l = decode_hex_nibble(lo)?;
+        out.push((h << 4) | l);
+    }
+    Ok(out)
+}
+
+fn decode_hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(10 + (byte - b'a')),
+        b'A'..=b'F' => Ok(10 + (byte - b'A')),
+        _ => Err("hex blob literal contains non-hex characters".to_string()),
+    }
+}
+
+fn unescape_single_quoted(s: &str) -> String {
+    if !s.contains("''") {
+        return s.to_owned();
+    }
+
+    s.replace("''", "'")
+}
+
 impl Drop for Limbo {
     fn drop(&mut self) {
         self.save_history();

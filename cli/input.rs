@@ -368,6 +368,11 @@ pub const AFTER_HELP_MSG: &str = r#"Usage Examples:
    .manual mcp    # View MCP server documentation
    .man           # List all available manuals
 
+20. To bind parameters for subsequent SQL statements:
+   .parameter set :name alice
+   .parameter list
+   .parameter clear :name
+
 Note:
 - All SQL commands must end with a semicolon (;).
 - Special commands start with a dot (.) and are not required to end with a semicolon."#;
