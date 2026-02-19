@@ -288,6 +288,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     cte_explicit_columns: vec![],
                     cte_id,
                     cte_definition_only: false,
+                    rowid_referenced: false,
                 }
             })
             .chain(
@@ -303,6 +304,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                         cte_explicit_columns: t.cte_explicit_columns.clone(),
                         cte_id: t.cte_id, // Preserve CTE ID from outer query refs
                         cte_definition_only: t.cte_definition_only,
+                        rowid_referenced: false,
                     }),
             )
             .collect::<Vec<_>>()
