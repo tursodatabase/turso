@@ -221,6 +221,9 @@ pub fn prepare_delete_plan(
         })
         .unwrap_or(false);
 
+    // We also use a RowSet for safety when the WHERE clause of the DELETE statement contains any subqueries.
+    // This coarse approach is also what SQLite does; one could do analysis on the subquery and verify that it does not
+    // reference the table being deleted, but falling back to this broader default is certainly safe.
     let needs_rowset = has_delete_triggers || where_clause_has_subquery(&where_predicates);
 
     if needs_rowset {
