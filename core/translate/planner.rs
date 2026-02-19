@@ -611,7 +611,11 @@ pub fn plan_ctes_as_outer_refs(
             }
         };
 
-        // Add CTE as outer query reference so it's available to subqueries
+        // Add CTE as outer query reference so it's available to subqueries.
+        // cte_definition_only = true: the CTE is only for subquery FROM lookup
+        // (e.g. UPDATE t SET b = (SELECT v FROM c)), not for direct column
+        // resolution (e.g. UPDATE t SET b = c.v which SQLite rejects as
+        // "no such column").
         table_references.add_outer_query_reference(OuterQueryReference {
             identifier: cte_name,
             internal_id: joined_table.internal_id,
@@ -620,7 +624,7 @@ pub fn plan_ctes_as_outer_refs(
             cte_select: Some(cte_select_ast),
             cte_explicit_columns: explicit_columns,
             cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
-            cte_definition_only: false,
+            cte_definition_only: true,
         });
     }
 
