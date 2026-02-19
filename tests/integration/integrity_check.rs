@@ -12,7 +12,7 @@ use std::fs::OpenOptions;
 #[cfg(not(feature = "checksum"))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
-use turso_core::Value;
+use turso_core::{Numeric, Value};
 
 /// Default page size
 #[cfg(not(feature = "checksum"))]
@@ -200,6 +200,47 @@ fn test_integrity_check_max_errors(db: TempDatabase) {
         result, "ok",
         "Valid database should pass integrity_check(10)"
     );
+}
+
+// =============================================================================
+// REGRESSION TESTS
+// =============================================================================
+
+/// Regression test for issue #5124:
+/// PRAGMA freelist_count must not mark page 1 dirty outside a write transaction.
+#[turso_macros::test]
+fn test_freelist_count_does_not_dirty_read_txn(db: TempDatabase) {
+    {
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);")
+            .unwrap();
+        for i in 0..200 {
+            conn.execute(format!(
+                "INSERT INTO t VALUES ({i}, '{}');",
+                "x".repeat(200)
+            ))
+            .unwrap();
+        }
+        checkpoint_database(&conn);
+        conn.execute("DELETE FROM t WHERE id > 10;").unwrap();
+        checkpoint_database(&conn);
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    let rows = conn.pragma_query("freelist_count").unwrap();
+    let count = match rows.as_slice() {
+        [row] => match row.as_slice() {
+            [Value::Numeric(Numeric::Integer(count))] => *count,
+            other => panic!("unexpected freelist_count row: {other:?}"),
+        },
+        other => panic!("unexpected freelist_count result: {other:?}"),
+    };
+    assert!(count > 0, "expected freelist_count > 0");
+
+    conn.execute("BEGIN;").unwrap();
+    conn.execute("ROLLBACK;").unwrap();
 }
 
 // =============================================================================
