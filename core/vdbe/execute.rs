@@ -21,7 +21,7 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
-    normalize_ident, rewrite_check_expr_column_refs, rewrite_check_expr_table_refs,
+    normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
     trim_ascii_whitespace,
@@ -6203,7 +6203,7 @@ pub fn op_function(
                                 }
 
                                 if let Some(ref mut wc) = where_clause {
-                                    rewrite_check_expr_column_refs(
+                                    rename_identifiers(
                                         wc,
                                         &rename_from,
                                         column_def.col_name.as_str(),
@@ -6323,7 +6323,7 @@ pub fn op_function(
                                                 );
                                             }
                                             ast::TableConstraint::Check(ref mut expr) => {
-                                                rewrite_check_expr_column_refs(
+                                                rename_identifiers(
                                                     expr,
                                                     &rename_from,
                                                     column_def.col_name.as_str(),
@@ -9901,7 +9901,7 @@ pub fn op_alter_column(
                 }
                 // Update partial index WHERE clause column references
                 if let Some(ref mut wc) = idx.where_clause {
-                    rewrite_check_expr_column_refs(wc, &old_column_name, &new_name);
+                    rename_identifiers(wc, &old_column_name, &new_name);
                 }
             }
         }
@@ -9921,7 +9921,7 @@ pub fn op_alter_column(
         // Update CHECK constraint expressions to reference the new column name
         let old_col_normalized = normalize_ident(&old_column_name);
         for check in &mut btree.check_constraints {
-            rewrite_check_expr_column_refs(&mut check.expr, &old_col_normalized, &new_name);
+            rename_identifiers(&mut check.expr, &old_col_normalized, &new_name);
             if let Some(ref mut col) = check.column {
                 if col.eq_ignore_ascii_case(&old_column_name) {
                     col.clone_from(&new_name);
