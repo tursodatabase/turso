@@ -4342,4 +4342,63 @@ pub mod test {
             "checkpoint must succeed after rollback, not return Busy"
         );
     }
+
+    /// Regression test: rollback calls reset_internal_states(). If that function
+    /// resets max_frame_read_lock_index to NO_LOCK_HELD without actually releasing
+    /// the shared read lock, end_read_tx() becomes a no-op and the lock leaks.
+    /// A leaked read lock permanently blocks Restart/Truncate checkpoints.
+    #[test]
+    fn test_wal_rollback_does_not_leak_read_lock() {
+        let (db, _path) = get_database();
+        let conn1 = db.connect().unwrap();
+        let conn2 = db.connect().unwrap();
+
+        conn1
+            .execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn1, 5, 10);
+
+        // conn2: begin read tx — acquires a shared read lock on a non-zero slot
+        // (non-zero because the WAL has un-checkpointed frames)
+        {
+            let pager = conn2.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            wal.begin_read_tx().unwrap();
+        }
+        assert!(
+            !check_read_lock_slot(&conn2, 0),
+            "conn2 should hold a non-zero read lock slot (WAL has frames)"
+        );
+
+        // conn2: begin write tx, then rollback — triggers reset_internal_states()
+        {
+            let pager = conn2.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            wal.begin_write_tx().unwrap();
+        }
+        {
+            let pager = conn2.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            wal.rollback(None);
+            wal.end_write_tx();
+        }
+
+        // conn2: end read tx — must actually release the shared read lock
+        {
+            let pager = conn2.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            wal.end_read_tx();
+        }
+
+        // If the read lock leaked, this Restart checkpoint will return Busy.
+        let result = {
+            let pager = conn1.pager.load();
+            run_checkpoint_until_done(&pager, CheckpointMode::Restart)
+        };
+        assert!(
+            result.everything_backfilled(),
+            "Restart checkpoint should succeed after conn2 released its read lock, \
+             but it didn't — read lock was leaked by rollback/reset_internal_states"
+        );
+    }
 }
