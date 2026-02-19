@@ -43,6 +43,24 @@ do_execsql_test_in_memory_error_content drop-virtual-table-twice {
     DROP TABLE t;
 } {no such table: t}
 
+do_execsql_test_in_memory_error_content trigger-on-virtual-table {
+    CREATE VIRTUAL TABLE t USING kv_store;
+    CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END;
+} {cannot create triggers on virtual tables}
+
+do_execsql_test_on_specific_db {:memory:} trigger-insert-into-writable-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    CREATE TABLE t1(id TEXT, name TEXT);
+    CREATE TRIGGER trg AFTER INSERT ON t1
+    BEGIN
+        INSERT INTO v(key, value) VALUES (NEW.id, NEW.name);
+    END;
+    INSERT INTO t1 VALUES ('k1', 'v1');
+    INSERT INTO t1 VALUES ('k2', 'v2');
+    SELECT key, value FROM v ORDER BY key;
+} {k1|v1
+k2|v2}
+
 do_execsql_test_on_specific_db {:memory:} select-hidden-column {
     create virtual table t using kv_store;
     insert into t(key, value) values ('k0', 'v0');
