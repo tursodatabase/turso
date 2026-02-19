@@ -423,4 +423,22 @@ mod tests {
         assert!(result.is_error());
         assert!(result.error.unwrap().contains("no such table"));
     }
+
+    #[tokio::test]
+    async fn test_execute_multi_statement_insert_then_select() {
+        let backend = RustBackend::new();
+        let config = DatabaseConfig {
+            location: DatabaseLocation::Memory,
+            readonly: false,
+        };
+        let mut instance = backend.create_database(&config).await.unwrap();
+
+        let result = instance
+            .execute("CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT, col_b TEXT, col_c TEXT, col_d TEXT); INSERT INTO test (col_b, col_d, col_a, col_c) VALUES ('1', '2', '3', '4'); SELECT * FROM test;")
+            .await
+            .unwrap();
+
+        assert!(!result.is_error());
+        assert_eq!(result.rows, vec![vec!["1", "3", "1", "4", "2"]]);
+    }
 }
