@@ -156,6 +156,9 @@ fn translate_integrity_check_impl(
     max_errors: usize,
     quick: bool,
 ) -> crate::Result<()> {
+    // 1) Run low-level btree/freelist/overflow verification first. This mirrors
+    // SQLite's OP_IntegrityCk front-pass and can already emit corruption errors
+    // before any row-by-row semantic checks run.
     let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
 
     for table in schema.tables.values() {
@@ -208,6 +211,11 @@ fn translate_integrity_check_impl(
     emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
     program.preassign_label_to_next_insn(no_structural_error_label);
 
+    // 2) For each ordinary btree table, scan every row and validate:
+    //    - NOT NULL constraints
+    //    - CHECK constraints
+    //    - index membership/uniqueness (integrity_check only)
+    //    - index cardinality cross-checks
     for table in schema.tables.values() {
         let Table::BTree(btree_table) = table.as_ref() else {
             continue;
@@ -422,6 +430,8 @@ fn translate_integrity_check_impl(
                 program.preassign_label_to_next_insn(where_true_fallthrough);
             }
 
+            // Count rows that are expected to appear in this index. For partial
+            // indexes this is only rows where the predicate is true.
             program.emit_insn(Insn::AddImm {
                 register: bound_index.expected_count_reg,
                 value: 1,
@@ -463,6 +473,7 @@ fn translate_integrity_check_impl(
 
             if !quick {
                 let found_label = program.allocate_label();
+                // Verify the table row has a matching index entry (key columns + rowid).
                 program.emit_insn(Insn::Found {
                     cursor_id: bound_index.cursor_id,
                     target_pc: found_label,
@@ -481,6 +492,14 @@ fn translate_integrity_check_impl(
                 program.preassign_label_to_next_insn(found_label);
 
                 if bound_index.index.unique {
+                    // This intentionally runs even after a "missing from index"
+                    // report above. SQLite does the same: a single corrupt row
+                    // can violate multiple invariants and each should be
+                    // independently reportable.
+                    //
+                    // Uniqueness rule matches SQLite:
+                    //   unique key is valid if any key column is NULL, OR
+                    //   the next index entry is strictly greater on key columns.
                     let unique_ok = program.allocate_label();
                     for (i, is_nullable) in bound_index.unique_nullable.iter().enumerate() {
                         if *is_nullable {
