@@ -3716,8 +3716,11 @@ impl Pager {
                         return_if_io!(self.with_header(|header| header.database_size)).get();
                     let page_size = self.get_page_size().unwrap_or_default();
                     let expected = (db_size * page_size.get()) as u64;
-                    if expected >= self.db_file.size()? {
-                        // No DB truncation needed, move to next phase
+                    #[cfg(not(target_family = "wasm"))]
+                    let should_skip_truncate_db_file = expected >= self.db_file.size()?;
+                    #[cfg(target_family = "wasm")]
+                    let should_skip_truncate_db_file = false;
+                    if should_skip_truncate_db_file {
                         let mut state = self.checkpoint_state.write();
                         if sync_mode == crate::SyncMode::Off {
                             // Skip DB sync, proceed to WAL truncation
