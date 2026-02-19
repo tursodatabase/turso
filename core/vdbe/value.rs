@@ -286,8 +286,8 @@ impl Value {
             Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
             _ => {
                 let s = match self {
-                    Value::Text(text) => text.to_string(),
-                    Value::Blob(blob) => String::from_utf8_lossy(blob).to_string(),
+                    Value::Text(text) => std::borrow::Cow::Borrowed(text.as_str()),
+                    Value::Blob(blob) => String::from_utf8_lossy(blob),
                     _ => unreachable!(),
                 };
 
