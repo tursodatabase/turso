@@ -510,8 +510,11 @@ impl Database {
                     return Ok("read".to_string());
                 }
                 let category = match cmd.stmt() {
-                    Stmt::Select(..) | Stmt::Pragma { .. } | Stmt::Attach { .. }
-                    | Stmt::Detach { .. } | Stmt::Reindex { .. } => "read",
+                    Stmt::Select(..)
+                    | Stmt::Pragma { .. }
+                    | Stmt::Attach { .. }
+                    | Stmt::Detach { .. }
+                    | Stmt::Reindex { .. } => "read",
                     Stmt::Begin { .. } | Stmt::Savepoint { .. } => "begin",
                     Stmt::Commit { .. } | Stmt::Release { .. } => "commit",
                     Stmt::Rollback { .. } => "rollback",
