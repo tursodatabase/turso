@@ -1,0 +1,260 @@
+@database :memory:
+
+# Tests for INSERT INTO with CTE + compound SELECT (issue #5425)
+# The bug was that register allocation was incorrect when CTE and compound SELECT
+# were combined inside INSERT, causing garbled data.
+
+# =============================================================================
+# Basic reproducer from issue #5425
+# =============================================================================
+
+test insert-cte-union-all-basic {
+    CREATE TABLE dst(id INTEGER, val TEXT, source TEXT);
+    WITH src(id, val) AS (VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'))
+    INSERT INTO dst
+      SELECT id, val, 'from_cte' FROM src
+      UNION ALL
+      SELECT 10, 'b1', 'literal';
+    SELECT * FROM dst ORDER BY id;
+}
+expect {
+    1|a1|from_cte
+    2|a2|from_cte
+    3|a3|from_cte
+    10|b1|literal
+}
+
+# =============================================================================
+# Verify that SELECT without INSERT still works correctly
+# =============================================================================
+
+test select-cte-union-all-no-insert {
+    WITH src(id, val) AS (VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'))
+    SELECT id, val, 'from_cte' FROM src
+    UNION ALL
+    SELECT 10, 'b1', 'literal';
+}
+expect {
+    1|a1|from_cte
+    2|a2|from_cte
+    3|a3|from_cte
+    10|b1|literal
+}
+
+# =============================================================================
+# CTE with UNION (not UNION ALL) inside INSERT
+# =============================================================================
+
+test insert-cte-union-distinct {
+    CREATE TABLE dst(id INTEGER, val TEXT);
+    WITH src(id, val) AS (VALUES (1, 'a'), (2, 'b'), (1, 'a'))
+    INSERT INTO dst
+      SELECT id, val FROM src
+      UNION
+      SELECT 10, 'c';
+    SELECT * FROM dst ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    10|c
+}
+
+# =============================================================================
+# CTE with EXCEPT inside INSERT
+# =============================================================================
+
+test insert-cte-except {
+    CREATE TABLE dst(x INTEGER);
+    WITH src AS (VALUES (1), (2), (3), (4), (5))
+    INSERT INTO dst
+      SELECT * FROM src
+      EXCEPT
+      SELECT 3;
+    SELECT * FROM dst ORDER BY x;
+}
+expect {
+    1
+    2
+    4
+    5
+}
+
+# =============================================================================
+# CTE with INTERSECT inside INSERT
+# =============================================================================
+
+test insert-cte-intersect {
+    CREATE TABLE dst(x INTEGER);
+    WITH src AS (VALUES (1), (2), (3), (4), (5))
+    INSERT INTO dst
+      SELECT * FROM src
+      INTERSECT
+      SELECT * FROM (VALUES (2), (4));
+    SELECT * FROM dst ORDER BY x;
+}
+expect {
+    2
+    4
+}
+
+# =============================================================================
+# Multiple UNION ALL arms with CTE
+# =============================================================================
+
+test insert-cte-multiple-union-all {
+    CREATE TABLE dst(id INTEGER, val TEXT);
+    WITH src(id, val) AS (VALUES (1, 'a'), (2, 'b'))
+    INSERT INTO dst
+      SELECT id, val FROM src
+      UNION ALL
+      SELECT 10, 'x'
+      UNION ALL
+      SELECT 20, 'y';
+    SELECT * FROM dst ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    10|x
+    20|y
+}
+
+# =============================================================================
+# CTE with NULL values in compound INSERT
+# =============================================================================
+
+test insert-cte-union-all-nulls {
+    CREATE TABLE dst(id INTEGER, val TEXT, extra TEXT);
+    WITH src(id, val) AS (VALUES (1, NULL), (2, 'b'))
+    INSERT INTO dst
+      SELECT id, val, 'cte' FROM src
+      UNION ALL
+      SELECT NULL, 'lit', NULL;
+    SELECT * FROM dst ORDER BY id;
+}
+expect {
+    |lit|
+    1||cte
+    2|b|cte
+}
+
+# =============================================================================
+# Single-row CTE with compound INSERT
+# =============================================================================
+
+test insert-cte-single-row-union-all {
+    CREATE TABLE dst(x INTEGER, y TEXT);
+    WITH src(x) AS (VALUES (1))
+    INSERT INTO dst
+      SELECT x, 'from_cte' FROM src
+      UNION ALL
+      SELECT 2, 'literal';
+    SELECT * FROM dst ORDER BY x;
+}
+expect {
+    1|from_cte
+    2|literal
+}
+
+# =============================================================================
+# Empty CTE (zero rows) with compound INSERT
+# =============================================================================
+
+test insert-cte-empty-union-all {
+    CREATE TABLE dst(x INTEGER, y TEXT);
+    WITH src(x) AS (SELECT 1 WHERE 0)
+    INSERT INTO dst
+      SELECT x, 'cte' FROM src
+      UNION ALL
+      SELECT 99, 'literal';
+    SELECT * FROM dst ORDER BY x;
+}
+expect {
+    99|literal
+}
+
+# =============================================================================
+# Multiple CTEs with compound INSERT
+# =============================================================================
+
+test insert-multiple-ctes-union-all {
+    CREATE TABLE dst(x INTEGER, y TEXT);
+    WITH a(x) AS (VALUES (1), (2)),
+         b(x) AS (VALUES (10), (20))
+    INSERT INTO dst
+      SELECT x, 'a' FROM a
+      UNION ALL
+      SELECT x, 'b' FROM b;
+    SELECT * FROM dst ORDER BY x;
+}
+expect {
+    1|a
+    2|a
+    10|b
+    20|b
+}
+
+# =============================================================================
+# CTE with expressions in SELECT list
+# =============================================================================
+
+test insert-cte-expressions-union-all {
+    CREATE TABLE dst(calc INTEGER, label TEXT);
+    WITH src(x) AS (VALUES (1), (2), (3))
+    INSERT INTO dst
+      SELECT x * 10 + 1, 'expr' FROM src
+      UNION ALL
+      SELECT 99, 'literal';
+    SELECT * FROM dst ORDER BY calc;
+}
+expect {
+    11|expr
+    21|expr
+    31|expr
+    99|literal
+}
+
+# =============================================================================
+# CTE referencing a real table, combined with compound INSERT
+# =============================================================================
+
+setup real-table {
+    CREATE TABLE src_table(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO src_table VALUES (1, 'alice'), (2, 'bob');
+}
+
+@setup real-table
+test insert-cte-from-table-union-all {
+    CREATE TABLE dst(id INTEGER, name TEXT, origin TEXT);
+    WITH src AS (SELECT id, name FROM src_table)
+    INSERT INTO dst
+      SELECT id, name, 'table' FROM src
+      UNION ALL
+      SELECT 99, 'extra', 'literal';
+    SELECT * FROM dst ORDER BY id;
+}
+expect {
+    1|alice|table
+    2|bob|table
+    99|extra|literal
+}
+
+# =============================================================================
+# Verify correct column count and types with integer/text mixing
+# =============================================================================
+
+test insert-cte-union-all-type-mixing {
+    CREATE TABLE dst(a INTEGER, b TEXT, c REAL);
+    WITH src AS (VALUES (1, 'hello', 3.14), (2, 'world', 2.72))
+    INSERT INTO dst
+      SELECT * FROM src
+      UNION ALL
+      SELECT 100, 'extra', 0.0;
+    SELECT * FROM dst ORDER BY a;
+}
+expect {
+    1|hello|3.14
+    2|world|2.72
+    100|extra|0.0
+}
