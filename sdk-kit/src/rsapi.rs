@@ -800,11 +800,8 @@ impl TursoConnection {
                     cached.program.clone(),
                     self.connection.clone(),
                 );
-                let statement = Statement::new(
-                    program,
-                    self.connection.get_pager(),
-                    cached.query_mode,
-                );
+                let statement =
+                    Statement::new(program, self.connection.get_pager(), cached.query_mode);
                 return Ok(Box::new(TursoStatement {
                     concurrent_guard: self.concurrent_guard.clone(),
                     async_io: self.async_io,
