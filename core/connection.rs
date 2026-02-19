@@ -4,6 +4,7 @@ use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
 };
+use crate::turso_assert;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -13,20 +14,36 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, PlatformIO, IO},
-    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
+    parse_schema_rows, refresh_analyze_stats, translate,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
-    AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesInfo,
-    CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
-    DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
-    LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
-    Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
+    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
+    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
+    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
+    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
+    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
+    Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::Display;
 use std::ops::Deref;
 use tracing::{instrument, Level};
+use turso_macros::AtomicEnum;
+
+#[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TransactionState {
+    Write {
+        schema_did_change: bool,
+    },
+    Read,
+    /// PendingUpgrade remembers what transaction state was before upgrade to write (has_read_txn is true if before transaction were in Read state)
+    /// This is important, because if we failed to initialize write transaction immediatley - we need to end implicitly started read txn (e.g. for simiple INSERT INTO operation)
+    /// But for late upgrade of transaction we should keep read transaction active (e.g. BEGIN; SELECT ...; INSERT INTO ...)
+    PendingUpgrade {
+        has_read_txn: bool,
+    },
+    None,
+}
 
 /// Database connection handle.
 ///
@@ -235,9 +252,15 @@ impl Connection {
         let sql = sql.as_ref();
         tracing::debug!("Preparing: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let cmd = match parser.next_cmd()? {
+            Some(cmd) => cmd,
+            None => {
+                return Err(LimboError::InvalidArgument(
+                    "The supplied SQL string contains no statements".to_string(),
+                ));
+            }
+        };
         let syms = self.syms.read();
-        let cmd = cmd.expect("Successful parse on nonempty input string should produce a command");
         let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
@@ -1034,7 +1057,7 @@ impl Connection {
 
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
-        if index == 0 {
+        if index <= 1 {
             self.db.is_readonly()
         } else {
             let db = self.attached_databases.read().get_database_by_index(index);
@@ -1282,6 +1305,34 @@ impl Connection {
         f(schema)
     }
 
+    /// Mutate the schema for a specific database (main or attached).
+    pub(crate) fn with_database_schema_mut<T>(
+        &self,
+        database_id: usize,
+        f: impl FnOnce(&mut Schema) -> T,
+    ) -> T {
+        if database_id < 2 {
+            self.with_schema_mut(f)
+        } else {
+            let db = {
+                let attached_dbs = self.attached_databases.read();
+                let (db, _pager) = attached_dbs
+                    .index_to_data
+                    .get(&database_id)
+                    .expect("Database ID should be valid");
+                db.clone()
+            };
+            let result = {
+                let mut schema_guard = db.schema.lock();
+                let schema = Arc::make_mut(&mut *schema_guard);
+                f(schema)
+            };
+            // Invalidate the cache so with_schema() picks up the new version
+            self.database_schemas.write().remove(&database_id);
+            result
+        }
+    }
+
     pub fn is_db_initialized(&self) -> bool {
         self.db.initialized()
     }
@@ -1291,6 +1342,16 @@ impl Connection {
             self.pager.load().clone()
         } else {
             self.attached_databases.read().get_pager_by_index(index)
+        }
+    }
+
+    /// Get the database name for a given database index.
+    /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
+    pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
+        match index {
+            0 => Some("main".to_string()),
+            1 => Some("temp".to_string()),
+            _ => self.attached_databases.read().get_name_by_index(index),
         }
     }
 
@@ -1341,8 +1402,7 @@ impl Connection {
         } else {
             Arc::new(PlatformIO::new()?)
         };
-        // FIXME: for now, only support read only attach
-        let main_db_flags = self.db.open_flags | OpenFlags::ReadOnly;
+        let main_db_flags = self.db.open_flags;
         let db = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
         let pager = Arc::new(db.init_pager(None)?);
         self.attached_databases.write().insert(alias, (db, pager));
@@ -1364,18 +1424,20 @@ impl Connection {
 
         // Remove from attached databases
         let mut attached_dbs = self.attached_databases.write();
-        if attached_dbs.remove(alias).is_none() {
-            return Err(LimboError::InvalidArgument(format!(
-                "no such database: {alias}"
-            )));
-        }
+        let database_id = match attached_dbs.remove(alias) {
+            Some(id) => id,
+            None => {
+                return Err(LimboError::InvalidArgument(format!(
+                    "no such database: {alias}"
+                )));
+            }
+        };
+
+        // Invalidate the cached schema for this database index so that a future
+        // ATTACH reusing the same index won't see stale schema entries.
+        self.database_schemas.write().remove(&database_id);
 
         Ok(())
-    }
-
-    // Get an attached database by alias name
-    fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
-        self.attached_databases.read().get_database_by_name(alias)
     }
 
     /// List all attached database aliases
@@ -1388,34 +1450,22 @@ impl Connection {
             .collect()
     }
 
-    /// Resolve database ID from a qualified name
-    pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
-        use crate::util::normalize_ident;
+    /// Get all attached database pagers (excludes main/temp databases)
+    pub fn get_all_attached_pagers(&self) -> Vec<Arc<Pager>> {
+        let catalog = self.attached_databases.read();
+        catalog
+            .index_to_data
+            .values()
+            .map(|(_db, pager)| pager.clone())
+            .collect()
+    }
 
-        // Check if this is a qualified name (database.table) or unqualified
-        if let Some(db_name) = &qualified_name.db_name {
-            let db_name_normalized = normalize_ident(db_name.as_str());
-            let name_bytes = db_name_normalized.as_bytes();
-            match_ignore_ascii_case!(match name_bytes {
-                b"main" => Ok(0),
-                b"temp" => Ok(1),
-                _ => {
-                    // Look up attached database
-                    if let Some((idx, _attached_db)) =
-                        self.get_attached_database(&db_name_normalized)
-                    {
-                        Ok(idx)
-                    } else {
-                        Err(LimboError::InvalidArgument(format!(
-                            "no such database: {db_name_normalized}"
-                        )))
-                    }
-                }
-            })
-        } else {
-            // Unqualified table name - use main database
-            Ok(0)
-        }
+    pub(crate) fn database_schemas(&self) -> &RwLock<HashMap<usize, Arc<Schema>>> {
+        &self.database_schemas
+    }
+
+    pub(crate) fn attached_databases(&self) -> &RwLock<DatabaseCatalog> {
+        &self.attached_databases
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning

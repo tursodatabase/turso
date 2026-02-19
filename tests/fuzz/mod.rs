@@ -276,6 +276,20 @@ mod fuzz_tests {
                 rng.random_range(0..3000)
             ));
         }
+        // Add explicit NULL-bearing keys to exercise index ordering and seek/termination logic
+        // around NULLs in each indexed column position.
+        const NULL_KEY_ROWS: usize = 256;
+        for _ in 0..NULL_KEY_ROWS {
+            let y = rng.random_range(0..3000);
+            let z = rng.random_range(0..3000);
+            let x = rng.random_range(0..3000);
+            tuples.push(format!("(NULL, {y}, {z}, {})", rng.random_range(0..3000)));
+            tuples.push(format!("({x}, NULL, {z}, {})", rng.random_range(0..3000)));
+            tuples.push(format!("({x}, {y}, NULL, {})", rng.random_range(0..3000)));
+            tuples.push(format!("(NULL, NULL, {z}, {})", rng.random_range(0..3000)));
+            tuples.push(format!("({x}, NULL, NULL, {})", rng.random_range(0..3000)));
+            tuples.push(format!("(NULL, {y}, NULL, {})", rng.random_range(0..3000)));
+        }
         let insert = format!("INSERT INTO t VALUES {}", tuples.join(", "));
 
         let tmp_dir = TempDir::new().unwrap();
@@ -1003,7 +1017,7 @@ mod fuzz_tests {
     }
 
     // TODO: mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     #[allow(unused_assignments)]
     pub fn fk_deferred_constraints_and_triggers_fuzz(db: TempDatabase) {
         let _ = tracing_subscriber::fmt::try_init();
@@ -1468,8 +1482,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc state mismatch
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn fk_single_pk_mutation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -1771,8 +1784,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc does not work
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn fk_edgecases_fuzzing(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -2132,7 +2144,7 @@ mod fuzz_tests {
     }
 
     // Fuzz test for ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT actions
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn fk_cascade_actions_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -2522,7 +2534,7 @@ mod fuzz_tests {
     }
 
     // Fuzz test for recursive CASCADE (A->B->C chains)
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn fk_recursive_cascade_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -2790,7 +2802,7 @@ mod fuzz_tests {
     }
 
     // TODO: mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn fk_composite_pk_mutation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();

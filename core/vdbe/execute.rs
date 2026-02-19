@@ -264,10 +264,10 @@ pub fn op_drop_index(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(DropIndex { index, db: _ }, insn);
+    load_insn!(DropIndex { index, db }, insn);
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store().is_some();
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         // In MVCC mode, track dropped index root pages so integrity_check knows about them.
         // The btree pages won't be freed until checkpoint, so integrity_check needs to
         // include them to avoid "page never used" false positives.
@@ -344,11 +344,11 @@ pub fn op_checkpoint(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Checkpoint {
-            database: _,
+            database,
             checkpoint_mode,
             dest,
         },
@@ -361,6 +361,7 @@ pub fn op_checkpoint(
         // however.
         return Err(LimboError::TableLocked);
     }
+    let pager = program.get_pager_from_database_index(database);
     // Re-fetch mv_store from connection to get the latest value.
     // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
     // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "experimental_mvcc"`).
@@ -394,11 +395,7 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    let step_result = program.connection.pager.load().checkpoint(
-        *checkpoint_mode,
-        program.connection.get_sync_mode(),
-        true,
-    );
+    let step_result = pager.checkpoint(*checkpoint_mode, program.connection.get_sync_mode(), true);
     match step_result {
         Ok(IOResult::Done(CheckpointResult {
             wal_max_frame,
@@ -420,7 +417,7 @@ pub fn op_checkpoint(
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             tracing::error!("PRAGMA wal_checkpoint failed: {err:?}");
-            program.connection.pager.load().clear_checkpoint_state();
+            pager.clear_checkpoint_state();
             state.registers[*dest] = Register::Value(Value::from_i64(1));
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -2017,9 +2014,16 @@ pub fn halt(
                 .swap(0, Ordering::AcqRel);
             if deferred_violations > 0 {
                 vtab_rollback_all(&program.connection)?;
-                pager.rollback_tx(&program.connection);
-                program.connection.set_tx_state(TransactionState::None);
                 program.connection.auto_commit.store(true, Ordering::SeqCst);
+                if let Some(mv_store) = mv_store.as_ref() {
+                    if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                        mv_store.rollback_tx(tx_id, pager.clone(), &program.connection);
+                    }
+                    pager.end_read_tx();
+                } else {
+                    pager.rollback_tx(&program.connection);
+                }
+                program.connection.set_tx_state(TransactionState::None);
                 return Err(LimboError::ForeignKeyConstraint(
                     "deferred foreign key constraint failed".to_string(),
                 ));
@@ -2046,6 +2050,11 @@ pub fn halt(
         // Apply deferred CDC state after successful statement completion
         if let Some(cdc_info) = state.pending_cdc_info.take() {
             program.connection.set_capture_data_changes_info(cdc_info);
+        }
+        if program.change_cnt_on {
+            program
+                .connection
+                .set_changes(state.n_change.load(Ordering::SeqCst));
         }
         Ok(InsnFunctionStepResult::Done)
     }
@@ -2147,6 +2156,7 @@ pub fn op_halt_if_null(
 #[derive(Debug, Clone, Copy)]
 pub enum OpTransactionState {
     Start,
+    AttachedBeginWriteTx,
     CheckSchemaCookie,
     BeginStatement,
 }
@@ -2198,7 +2208,7 @@ pub fn op_transaction_inner(
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let write = matches!(tx_mode, TransactionMode::Write);
-                if write && conn.db.open_flags.contains(OpenFlags::ReadOnly) {
+                if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
                 }
 
@@ -2326,7 +2336,25 @@ pub fn op_transaction_inner(
                                 .to_string(),
                         ));
                     }
-                    if updated && matches!(current_state, TransactionState::None) {
+                    // For attached databases (db >= 2), always start read+write
+                    // transactions on the attached pager, since the connection-level
+                    // transaction state may already be Write from the main database.
+                    let is_attached = *db >= 2;
+                    if is_attached && matches!(tx_mode, TransactionMode::Write) {
+                        // If the pager already holds a read lock (e.g., after
+                        // SchemaUpdated reprepare), skip to schema cookie check
+                        // since locks persist across reprepare.
+                        if pager.holds_read_lock() {
+                            state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                            continue;
+                        }
+                        pager.begin_read_tx()?;
+                        // Transition to AttachedBeginWriteTx to handle begin_write_tx
+                        // separately, so if it returns IO we don't re-call begin_read_tx
+                        // on re-entry.
+                        state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
+                        continue;
+                    } else if updated && matches!(current_state, TransactionState::None) {
                         turso_assert!(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new read transaction"
@@ -2335,7 +2363,10 @@ pub fn op_transaction_inner(
                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
 
-                    if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
+                    if !is_attached
+                        && updated
+                        && matches!(new_transaction_state, TransactionState::Write { .. })
+                    {
                         turso_assert!(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
@@ -2385,6 +2416,16 @@ pub fn op_transaction_inner(
                 state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                 continue;
             }
+            // 3b. For attached databases, begin the write transaction after
+            // begin_read_tx has already completed in the Start state.
+            OpTransactionState::AttachedBeginWriteTx => {
+                let res = pager.begin_write_tx()?;
+                if let IOResult::IO(io) = res {
+                    return Ok(InsnFunctionStepResult::IO(io));
+                }
+                state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                continue;
+            }
             // 4. Check whether schema has changed if we are actually going to access the database.
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
@@ -2412,7 +2453,10 @@ pub fn op_transaction_inner(
                 state.op_transaction_state = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                if program.needs_stmt_subtransactions.load(Ordering::Relaxed) {
+                // Only begin statement subtransactions for the main database (db 0).
+                // Attached databases (db >= 2) don't manage their own statement
+                // subtransactions; the main pager's end_statement handles cleanup.
+                if *db == 0 && program.needs_stmt_subtransactions.load(Ordering::Relaxed) {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
@@ -2498,6 +2542,10 @@ pub fn op_auto_commit(
                 pager.end_read_tx();
             } else {
                 pager.rollback_tx(&conn);
+            }
+            // Also rollback all attached database pagers
+            for attached_pager in conn.get_all_attached_pagers() {
+                attached_pager.rollback_attached();
             }
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
@@ -3310,13 +3358,41 @@ pub fn seek_internal(
                     let actual_op = if lost_precision {
                         match &temp_value {
                             Value::Numeric(Numeric::Float(f)) => {
-                                let int_key_as_float = int_key as f64;
-                                let c = if int_key_as_float > f64::from(*f) {
-                                    1
-                                } else if int_key_as_float < f64::from(*f) {
+                                let f_val = f64::from(*f);
+                                // When extract_int_value clamped to i64::MAX/MIN,
+                                // the cast `int_key as f64` loses the fact that the
+                                // float is outside the i64 range. Detect this and
+                                // set the comparison result directly.
+                                //
+                                // For i64::MAX: any float > 9223372036854774784.0
+                                // is >= 9223372036854775808.0 (the next f64), which
+                                // exceeds i64::MAX (9223372036854775807). i64::MAX
+                                // is not exactly representable as f64, so the float
+                                // is always strictly greater.
+                                //
+                                // For i64::MIN: -2^63 IS exactly representable as
+                                // f64, so we must distinguish the exact match from
+                                // floats that are strictly less.
+                                let c = if int_key == i64::MAX && f_val > 9223372036854774784.0 {
+                                    // Float exceeds i64::MAX, so int_key < float
                                     -1
+                                } else if int_key == i64::MIN && f_val < -9223372036854774784.0 {
+                                    if f_val == (i64::MIN as f64) {
+                                        // Float is exactly i64::MIN
+                                        0
+                                    } else {
+                                        // Float is below i64::MIN, so int_key > float
+                                        1
+                                    }
                                 } else {
-                                    0
+                                    let int_key_as_float = int_key as f64;
+                                    if int_key_as_float > f_val {
+                                        1
+                                    } else if int_key_as_float < f_val {
+                                        -1
+                                    } else {
+                                        0
+                                    }
                                 };
 
                                 match c.cmp(&0) {
@@ -4031,11 +4107,11 @@ fn update_agg_payload(
                 },
                 Value::Text(t) => {
                     let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
-                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
+                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, false);
                 }
                 Value::Blob(b) => {
                     let (parse_result, parsed_number) = try_for_float(&b);
-                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
+                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, true);
                 }
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
@@ -7898,18 +7974,12 @@ pub fn op_create_btree(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(CreateBtree { db, root, flags }, insn);
 
-    assert_eq!(*db, 0);
-
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
-    }
-    if *db > 0 {
-        // TODO: implement temp databases
-        todo!("temp databases not implemented yet");
     }
     let mv_store = program.connection.mv_store();
 
@@ -7919,6 +7989,7 @@ pub fn op_create_btree(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    let pager = program.get_pager_from_database_index(db);
     // FIXME: handle page cache is full
     let root_page = return_if_io!(pager.btree_create(flags));
     state.registers[*root] = Register::Value(Value::from_i64(root_page as i64));
@@ -7933,7 +8004,6 @@ pub fn op_index_method_create(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IndexMethodCreate { db, cursor_id }, insn);
-    assert_eq!(*db, 0);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -7965,7 +8035,6 @@ pub fn op_index_method_destroy(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IndexMethodDestroy { db, cursor_id }, insn);
-    assert_eq!(*db, 0);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -7997,7 +8066,6 @@ pub fn op_index_method_optimize(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IndexMethodOptimize { db, cursor_id }, insn);
-    assert_eq!(*db, 0);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -8030,7 +8098,7 @@ pub fn op_index_method_query(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IndexMethodQuery {
-            db,
+            db: _,
             cursor_id,
             start_reg,
             count_reg,
@@ -8038,7 +8106,6 @@ pub fn op_index_method_query(
         },
         insn
     );
-    assert_eq!(*db, 0);
     let mv_store = program.connection.mv_store();
     if let Some(_mv_store) = mv_store.as_ref() {
         todo!("MVCC is not supported yet");
@@ -8070,6 +8137,7 @@ pub fn op_destroy(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Destroy {
+            db,
             root,
             former_root_reg,
             is_temp,
@@ -8086,12 +8154,18 @@ pub fn op_destroy(
         return Ok(InsnFunctionStepResult::Step);
     }
 
+    let destroy_pager = if *db > 0 {
+        program.get_pager_from_database_index(db)
+    } else {
+        pager.clone()
+    };
+
     loop {
         match state.op_destroy_state {
             OpDestroyState::CreateCursor => {
                 // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
                 // table btree cursor for both.
-                let cursor = BTreeCursor::new(pager.clone(), *root, 0);
+                let cursor = BTreeCursor::new(destroy_pager.clone(), *root, 0);
                 state.op_destroy_state =
                     OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
             }
@@ -8149,15 +8223,10 @@ pub fn op_drop_table(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropTable { db, table_name, .. }, insn);
-    if *db > 0 {
-        return Err(LimboError::InternalError(
-            "Temporary databases are not implemented".to_string(),
-        ));
-    }
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store().is_some();
     {
-        conn.with_schema_mut(|schema| {
+        conn.with_database_schema_mut(*db, |schema| {
             // In MVCC mode, track dropped root pages so integrity_check knows about them.
             // The btree pages won't be freed until checkpoint, so integrity_check needs
             // to include them to avoid "page never used" false positives.
@@ -8197,14 +8266,10 @@ pub fn op_drop_view(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropView { db, view_name }, insn);
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
     let conn = program.connection.clone();
-    conn.with_schema_mut(|schema| {
-        schema.remove_view(view_name)?;
-        Ok::<(), crate::LimboError>(())
-    })?;
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.remove_view(view_name).ok();
+    });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8215,19 +8280,12 @@ pub fn op_drop_trigger(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        DropTrigger {
-            db: _,
-            trigger_name
-        },
-        insn
-    );
+    load_insn!(DropTrigger { db, trigger_name }, insn);
 
     let conn = program.connection.clone();
-    conn.with_schema_mut(|schema| {
-        schema.remove_trigger(trigger_name)?;
-        Ok::<(), crate::LimboError>(())
-    })?;
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.remove_trigger(trigger_name).ok();
+    });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8292,15 +8350,12 @@ pub fn op_page_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(PageCount { db, dest }, insn);
-    if *db > 0 {
-        // TODO: implement temp databases
-        todo!("temp databases not implemented yet");
-    }
+    let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
-    let count = match with_header(pager, mv_store.as_ref(), program, |header| {
+    let count = match with_header(&pager, mv_store.as_ref(), program, |header| {
         header.database_size.get()
     }) {
         Err(_) => 0.into(),
@@ -8318,13 +8373,7 @@ pub fn op_parse_schema(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        ParseSchema {
-            db: _,
-            where_clause,
-        },
-        insn
-    );
+    load_insn!(ParseSchema { db, where_clause }, insn);
 
     let conn = program.connection.clone();
     // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
@@ -8333,10 +8382,19 @@ pub fn op_parse_schema(
     conn.auto_commit.store(false, Ordering::SeqCst);
 
     let enable_triggers = conn.experimental_triggers_enabled();
+    // For attached databases, qualify the sqlite_schema table with the database name
+    let schema_table = if *db >= 2 {
+        let db_name = conn
+            .get_database_name_by_index(*db)
+            .unwrap_or_else(|| "main".to_string());
+        format!("{db_name}.sqlite_schema")
+    } else {
+        "sqlite_schema".to_string()
+    };
     let maybe_nested_stmt_err = if let Some(where_clause) = where_clause {
-        let stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
+        let stmt = conn.prepare(format!("SELECT * FROM {schema_table} WHERE {where_clause}"))?;
 
-        conn.with_schema_mut(|schema| {
+        conn.with_database_schema_mut(*db, |schema| {
             // TODO: This function below is synchronous, make it async
             let existing_views = schema.incremental_views.clone();
             conn.start_nested();
@@ -8350,9 +8408,9 @@ pub fn op_parse_schema(
             )
         })
     } else {
-        let stmt = conn.prepare("SELECT * FROM sqlite_schema")?;
+        let stmt = conn.prepare(format!("SELECT * FROM {schema_table}"))?;
 
-        conn.with_schema_mut(|schema| {
+        conn.with_database_schema_mut(*db, |schema| {
             // TODO: This function below is synchronous, make it async
             let existing_views = schema.incremental_views.clone();
             conn.start_nested();
@@ -8595,26 +8653,24 @@ pub fn op_read_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ReadCookie { db, dest, cookie }, insn);
-    if *db > 0 {
-        // TODO: implement temp databases
-        todo!("temp databases not implemented yet");
-    }
+    let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
 
-    let cookie_value = match with_header(pager, mv_store.as_ref(), program, |header| match cookie {
-        Cookie::ApplicationId => header.application_id.get().into(),
-        Cookie::UserVersion => header.user_version.get().into(),
-        Cookie::SchemaVersion => header.schema_cookie.get().into(),
-        Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
-        cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
-    }) {
-        Err(_) => 0.into(),
-        Ok(IOResult::Done(v)) => v,
-        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-    };
+    let cookie_value =
+        match with_header(&pager, mv_store.as_ref(), program, |header| match cookie {
+            Cookie::ApplicationId => header.application_id.get().into(),
+            Cookie::UserVersion => header.user_version.get().into(),
+            Cookie::SchemaVersion => header.schema_cookie.get().into(),
+            Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
+            cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
+        }) {
+            Err(_) => 0.into(),
+            Ok(IOResult::Done(v)) => v,
+            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        };
 
     state.registers[*dest] = Register::Value(Value::from_i64(cookie_value));
     state.pc += 1;
@@ -8625,7 +8681,7 @@ pub fn op_set_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SetCookie {
@@ -8636,13 +8692,11 @@ pub fn op_set_cookie(
         },
         insn
     );
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
+    let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
 
     return_if_io!(with_header_mut(
-        pager,
+        &pager,
         mv_store.as_ref(),
         program,
         |header| {
@@ -8656,18 +8710,21 @@ pub fn op_set_cookie(
                     header.incremental_vacuum_enabled = (*value as u32).into()
                 }
                 Cookie::SchemaVersion => {
-                    // we update transaction state to indicate that the schema has changed
-                    match program.connection.get_tx_state() {
-                    TransactionState::Write { .. } => {
-                        program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
-                    },
-                    TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                    TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                    TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
-                }
-                    program
-                        .connection
-                        .with_schema_mut(|schema| schema.schema_version = *value as u32);
+                    // Only mark schema_did_change on connection for main database (db 0).
+                    // Attached databases track their schema independently.
+                    if *db == 0 {
+                        match program.connection.get_tx_state() {
+                            TransactionState::Write { .. } => {
+                                program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
+                            },
+                            TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
+                            TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
+                            TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
+                        }
+                    }
+                    program.connection.with_database_schema_mut(*db, |schema| {
+                        schema.schema_version = *value as u32
+                    });
                     header.schema_cookie = (*value as u32).into();
                 }
                 cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
@@ -9353,168 +9410,42 @@ pub fn op_count(
 }
 
 /// Format integrity check errors into a result string.
-/// Returns "ok" if no errors, otherwise newline-separated error messages.
-fn format_integrity_check_result(errors: &[IntegrityCheckError]) -> String {
+/// Returns NULL when no errors were found.
+fn format_integrity_check_result(errors: &[IntegrityCheckError]) -> Option<String> {
     if errors.is_empty() {
-        "ok".to_string()
+        None
     } else {
-        errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<String>>()
-            .join("\n")
+        Some(
+            errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<String>>()
+                .join("\n"),
+        )
     }
+}
+
+fn has_freelist_error(errors: &[IntegrityCheckError]) -> bool {
+    errors.iter().any(|err| match err {
+        IntegrityCheckError::FreelistTrunkCorrupt { .. }
+        | IntegrityCheckError::FreelistPointerOutOfRange { .. } => true,
+        IntegrityCheckError::PageReferencedMultipleTimes { page_category, .. } => {
+            matches!(
+                page_category,
+                PageCategory::FreeListTrunk | PageCategory::FreePage
+            )
+        }
+        _ => false,
+    })
 }
 
 pub enum OpIntegrityCheckState {
     Start,
-    /// Phase 1: B-tree structural checks
     CheckingBTreeStructure {
         errors: Vec<IntegrityCheckError>,
         current_root_idx: usize,
         state: IntegrityCheckState,
     },
-    /// Phase 2: Index entry count validation (runs for both quick_check and integrity_check)
-    /// Counts rows in each table and entries in each index, then compares.
-    ValidatingIndexCounts {
-        errors: Vec<IntegrityCheckError>,
-        /// Index into the tables list
-        current_table_idx: usize,
-        /// Index into the current table's indexes list
-        current_index_idx: usize,
-        /// Row count for the current table (populated during table scan)
-        table_row_count: usize,
-        /// Entry count for the current index (populated during index scan)
-        index_entry_count: usize,
-        /// State of the current validation sub-phase
-        substate: IndexCountValidationSubstate,
-        /// Cursor used for counting (persisted across I/O yields)
-        cursor: Option<Box<BTreeCursor>>,
-    },
-    /// Phase 3: NOT NULL constraint validation (skipped when quick=true)
-    /// Scans table rows and checks that NOT NULL columns don't contain NULL values.
-    ValidatingNotNull {
-        errors: Vec<IntegrityCheckError>,
-        /// Index into the tables list
-        current_table_idx: usize,
-        /// Cursor used for row scanning (persisted across I/O yields)
-        cursor: Option<Box<BTreeCursor>>,
-        /// State of the current validation sub-phase
-        substate: NotNullValidationSubstate,
-    },
-    /// Phase 4: UNIQUE constraint validation (skipped when quick=true)
-    /// Scans unique indexes and checks for duplicate keys.
-    ValidatingUnique {
-        errors: Vec<IntegrityCheckError>,
-        /// Index into the tables list
-        current_table_idx: usize,
-        /// Index into the current table's indexes list
-        current_index_idx: usize,
-        /// Cursor used for index scanning (persisted across I/O yields)
-        cursor: Option<Box<BTreeCursor>>,
-        /// Previous key values for duplicate detection (None if at start of index or prev had NULL)
-        /// Excludes rowid. Set to None if any value is NULL (NULL != NULL for UNIQUE).
-        previous_key: Option<Vec<Value>>,
-        /// State of the current validation sub-phase
-        substate: UniqueValidationSubstate,
-    },
-    /// Phase 5: Row-index consistency validation (skipped when quick=true)
-    /// For each table row, verifies it has a corresponding entry in each index.
-    ValidatingRowIndexConsistency {
-        errors: Vec<IntegrityCheckError>,
-        /// Index into the tables list
-        current_table_idx: usize,
-        /// Cursor for scanning table rows
-        table_cursor: Option<Box<BTreeCursor>>,
-        /// Cursor for searching in indexes
-        index_cursor: Option<Box<BTreeCursor>>,
-        /// Current row number (1-indexed, for error messages)
-        row_number: usize,
-        /// State of the current validation sub-phase
-        substate: RowIndexValidationSubstate,
-    },
-}
-
-/// Sub-states for index count validation
-#[derive(Debug, Clone)]
-pub enum IndexCountValidationSubstate {
-    /// Starting count validation for a new table
-    StartTable,
-    /// Counting rows in the current table
-    CountingTableRows,
-    /// Starting count validation for a new index
-    StartIndex,
-    /// Counting entries in the current index
-    CountingIndexEntries,
-    /// Comparing counts and moving to next
-    ComparingCounts,
-}
-
-/// Sub-states for NOT NULL constraint validation
-#[derive(Debug, Clone)]
-pub enum NotNullValidationSubstate {
-    /// Starting validation for a new table
-    StartTable,
-    /// Rewinding to the beginning of the table
-    Rewinding,
-    /// Checking columns in the current row
-    CheckingRow,
-    /// Advancing to the next row
-    Advancing,
-}
-
-/// Sub-states for UNIQUE constraint validation
-#[derive(Debug, Clone)]
-pub enum UniqueValidationSubstate {
-    /// Starting validation for a new table
-    StartTable,
-    /// Starting validation for a new index
-    StartIndex,
-    /// Rewinding to the beginning of the index
-    Rewinding,
-    /// Reading current key and comparing with previous
-    CheckingKey,
-    /// Advancing to the next entry
-    Advancing,
-}
-
-/// Sub-states for row-index consistency validation
-#[derive(Debug, Clone)]
-pub enum RowIndexValidationSubstate {
-    /// Starting validation for a new table
-    StartTable,
-    /// Rewinding to the beginning of the table
-    RewindingTable,
-    /// Fetching rowid after rewind/advance succeeded and has_record() is true
-    FetchingRowId,
-    /// Fetching record after rowid was fetched
-    FetchingRecord { rowid: i64 },
-    /// Checking current row against all indexes
-    CheckingRow {
-        /// Current index being checked (0..indexes.len())
-        current_index_idx: usize,
-        /// Cached values from current row (extracted once, used for all indexes)
-        row_values: Vec<Value>,
-        /// Rowid of current row (for building index key)
-        rowid: i64,
-    },
-    /// Searching for row in current index
-    SearchingIndex {
-        current_index_idx: usize,
-        row_values: Vec<Value>,
-        rowid: i64,
-        /// Pre-built key values for the index search (indexed_cols + rowid)
-        key_values: Vec<Value>,
-    },
-    /// Advancing cursor after TryAdvance result from seek
-    /// This happens when seek found a match in an interior node but needs to navigate to leaf
-    AdvancingAfterTryAdvance {
-        current_index_idx: usize,
-        row_values: Vec<Value>,
-        rowid: i64,
-    },
-    /// Advancing to the next row
-    Advancing,
 }
 
 pub fn op_integrity_check(
@@ -9528,11 +9459,10 @@ pub fn op_integrity_check(
             max_errors,
             roots,
             message_register,
-            quick,
-            tables,
         },
         insn
     );
+
     let mv_store = program.connection.mv_store();
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
@@ -9544,7 +9474,7 @@ pub fn op_integrity_check(
             let mut errors = Vec::new();
             let mut integrity_check_state = IntegrityCheckState::new(db_size as usize);
             let mut current_root_idx = 0;
-            // check freelist pages first, if there are any for database
+
             if freelist_trunk_page > 0 {
                 let expected_freelist_count =
                     return_if_io!(with_header(pager, mv_store.as_ref(), program, |header| {
@@ -9560,6 +9490,7 @@ pub fn op_integrity_check(
                 integrity_check_state.start(roots[0], PageCategory::Normal, &mut errors);
                 current_root_idx += 1;
             }
+
             state.op_integrity_check_state = OpIntegrityCheckState::CheckingBTreeStructure {
                 errors,
                 state: integrity_check_state,
@@ -9577,834 +9508,79 @@ pub fn op_integrity_check(
                 pager,
                 mv_store.as_ref()
             ));
+
+            if errors.len() >= *max_errors {
+                errors.truncate(*max_errors);
+                let message = format_integrity_check_result(errors);
+                state.registers[*message_register] = match message {
+                    Some(msg) => Register::Value(Value::build_text(msg)),
+                    None => Register::Value(Value::Null),
+                };
+                state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
             if *current_root_idx < roots.len() {
                 integrity_check_state.start(roots[*current_root_idx], PageCategory::Normal, errors);
                 *current_root_idx += 1;
                 return Ok(InsnFunctionStepResult::Step);
-            } else {
-                if integrity_check_state.freelist_count.actual_count
+            }
+
+            if !has_freelist_error(errors)
+                && integrity_check_state.freelist_count.actual_count
                     != integrity_check_state.freelist_count.expected_count
-                {
-                    errors.push(IntegrityCheckError::FreelistCountMismatch {
-                        actual_count: integrity_check_state.freelist_count.actual_count,
-                        expected_count: integrity_check_state.freelist_count.expected_count,
-                    });
-                }
+            {
+                errors.push(IntegrityCheckError::FreelistCountMismatch {
+                    actual_count: integrity_check_state.freelist_count.actual_count,
+                    expected_count: integrity_check_state.freelist_count.expected_count,
+                });
+            }
 
-                #[cfg(not(feature = "omit_autovacuum"))]
-                {
-                    let auto_vacuum_mode = pager.get_auto_vacuum_mode();
-                    if !matches!(
-                        auto_vacuum_mode,
-                        crate::storage::pager::AutoVacuumMode::None
-                    ) {
-                        tracing::debug!("Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.", auto_vacuum_mode);
-                        let page_size = pager.get_page_size_unchecked().get() as usize;
+            #[cfg(not(feature = "omit_autovacuum"))]
+            let skip_page_never_used = !matches!(
+                pager.get_auto_vacuum_mode(),
+                crate::storage::pager::AutoVacuumMode::None
+            );
+            #[cfg(feature = "omit_autovacuum")]
+            let skip_page_never_used = false;
 
-                        for page_number in 2..=integrity_check_state.db_size {
-                            if crate::storage::pager::ptrmap::is_ptrmap_page(
-                                page_number as u32,
-                                page_size,
-                            ) {
-                                tracing::debug!("Integrity check: Found and marking pointer-map page as visited: page_id={}", page_number);
-
-                                integrity_check_state.start(
-                                    page_number as i64,
-                                    PageCategory::PointerMap,
-                                    errors,
-                                );
-                            }
-                        }
-                    }
-                }
+            if !skip_page_never_used {
                 for page_number in 2..=integrity_check_state.db_size {
                     if !integrity_check_state
                         .page_reference
                         .contains_key(&(page_number as i64))
                     {
-                        // Pending byte page is always never used
                         if pager.pending_byte_page_id() != Some(page_number as u32) {
                             errors.push(IntegrityCheckError::PageNeverUsed {
                                 page_id: page_number as i64,
                             });
                         }
                     } else if pager.pending_byte_page_id() == Some(page_number as u32) {
-                        // Pending byte page is somehow being used
                         errors.push(IntegrityCheckError::PendingBytePageUsed {
                             page_id: page_number as i64,
                         })
                     }
-                }
 
-                // Phase 2: Index count validation (skip for quick_check per SQLite)
-                if !*quick && tables.iter().any(|t| !t.indexes.is_empty()) {
-                    // Transition to index count validation phase
-                    let errors = std::mem::take(errors);
-                    state.op_integrity_check_state = OpIntegrityCheckState::ValidatingIndexCounts {
-                        errors,
-                        current_table_idx: 0,
-                        current_index_idx: 0,
-                        table_row_count: 0,
-                        index_entry_count: 0,
-                        substate: IndexCountValidationSubstate::StartTable,
-                        cursor: None,
-                    };
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-
-                // Phase 3: NOT NULL constraint validation (skip for quick_check per SQLite)
-                if !*quick && tables.iter().any(|t| !t.not_null_columns.is_empty()) {
-                    // Transition to NOT NULL validation phase
-                    let errors = std::mem::take(errors);
-                    state.op_integrity_check_state = OpIntegrityCheckState::ValidatingNotNull {
-                        errors,
-                        current_table_idx: 0,
-                        cursor: None,
-                        substate: NotNullValidationSubstate::StartTable,
-                    };
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-
-                // Phase 4: UNIQUE constraint validation (skip if quick_check)
-                if !*quick
-                    && tables
-                        .iter()
-                        .any(|t| t.indexes.iter().any(|idx| idx.unique))
-                {
-                    let errors = std::mem::take(errors);
-                    state.op_integrity_check_state = OpIntegrityCheckState::ValidatingUnique {
-                        errors,
-                        current_table_idx: 0,
-                        current_index_idx: 0,
-                        cursor: None,
-                        previous_key: None,
-                        substate: UniqueValidationSubstate::StartTable,
-                    };
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-
-                // Finish: generate result message
-                let message = format_integrity_check_result(errors);
-                state.registers[*message_register] = Register::Value(Value::build_text(message));
-                state.op_integrity_check_state = OpIntegrityCheckState::Start;
-                state.pc += 1;
-            }
-        }
-        OpIntegrityCheckState::ValidatingIndexCounts {
-            errors,
-            current_table_idx,
-            current_index_idx,
-            table_row_count,
-            index_entry_count,
-            substate,
-            cursor,
-        } => {
-            loop {
-                match substate {
-                    IndexCountValidationSubstate::StartTable => {
-                        // Skip tables without indexes
-                        while *current_table_idx < tables.len()
-                            && tables[*current_table_idx].indexes.is_empty()
-                        {
-                            *current_table_idx += 1;
-                        }
-
-                        if *current_table_idx >= tables.len() {
-                            // Done with all tables, transition to NOT NULL validation, UNIQUE validation,
-                            // row-index validation, or finish
-
-                            // Phase 3: NOT NULL constraint validation (skip for quick_check)
-                            if !*quick && tables.iter().any(|t| !t.not_null_columns.is_empty()) {
-                                let errors = std::mem::take(errors);
-                                state.op_integrity_check_state =
-                                    OpIntegrityCheckState::ValidatingNotNull {
-                                        errors,
-                                        current_table_idx: 0,
-                                        cursor: None,
-                                        substate: NotNullValidationSubstate::StartTable,
-                                    };
-                                return Ok(InsnFunctionStepResult::Step);
-                            }
-
-                            // Phase 4: UNIQUE constraint validation (skip for quick_check)
-                            if !*quick
-                                && tables
-                                    .iter()
-                                    .any(|t| t.indexes.iter().any(|idx| idx.unique))
-                            {
-                                let errors = std::mem::take(errors);
-                                state.op_integrity_check_state =
-                                    OpIntegrityCheckState::ValidatingUnique {
-                                        errors,
-                                        current_table_idx: 0,
-                                        current_index_idx: 0,
-                                        cursor: None,
-                                        previous_key: None,
-                                        substate: UniqueValidationSubstate::StartTable,
-                                    };
-                                return Ok(InsnFunctionStepResult::Step);
-                            }
-
-                            // Phase 5: Row-index consistency validation (skip if quick_check)
-                            if !*quick && tables.iter().any(|t| !t.indexes.is_empty()) {
-                                let errors = std::mem::take(errors);
-                                state.op_integrity_check_state =
-                                    OpIntegrityCheckState::ValidatingRowIndexConsistency {
-                                        errors,
-                                        current_table_idx: 0,
-                                        table_cursor: None,
-                                        index_cursor: None,
-                                        row_number: 0,
-                                        substate: RowIndexValidationSubstate::StartTable,
-                                    };
-                                return Ok(InsnFunctionStepResult::Step);
-                            }
-
-                            // Finish: generate result message
-                            let message = format_integrity_check_result(errors);
-                            state.registers[*message_register] =
-                                Register::Value(Value::build_text(message));
-                            state.op_integrity_check_state = OpIntegrityCheckState::Start;
-                            state.pc += 1;
-                            return Ok(InsnFunctionStepResult::Step);
-                        }
-
-                        // Create cursor for current table
-                        let table = &tables[*current_table_idx];
-                        *cursor = Some(Box::new(BTreeCursor::new(
-                            pager.clone(),
-                            table.root_page,
-                            0, // num_columns not needed for counting
-                        )));
-                        *substate = IndexCountValidationSubstate::CountingTableRows;
-                    }
-                    IndexCountValidationSubstate::CountingTableRows => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        let count = return_if_io!(btree_cursor.count());
-                        *table_row_count = count;
-                        *cursor = None;
-                        *current_index_idx = 0;
-                        *substate = IndexCountValidationSubstate::StartIndex;
-                    }
-                    IndexCountValidationSubstate::StartIndex => {
-                        let table = &tables[*current_table_idx];
-                        if *current_index_idx >= table.indexes.len() {
-                            // Done with all indexes for this table, move to next table
-                            *current_table_idx += 1;
-                            *substate = IndexCountValidationSubstate::StartTable;
-                            continue;
-                        }
-
-                        // Create cursor for current index
-                        let index = &table.indexes[*current_index_idx];
-                        *cursor = Some(Box::new(BTreeCursor::new(
-                            pager.clone(),
-                            index.root_page,
-                            0, // num_columns not needed for counting
-                        )));
-                        *substate = IndexCountValidationSubstate::CountingIndexEntries;
-                    }
-                    IndexCountValidationSubstate::CountingIndexEntries => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        let count = return_if_io!(btree_cursor.count());
-                        *index_entry_count = count;
-                        *cursor = None;
-                        *substate = IndexCountValidationSubstate::ComparingCounts;
-                    }
-                    IndexCountValidationSubstate::ComparingCounts => {
-                        let table = &tables[*current_table_idx];
-                        let index = &table.indexes[*current_index_idx];
-
-                        if *table_row_count != *index_entry_count {
-                            errors.push(IntegrityCheckError::IndexEntryCountMismatch {
-                                index_name: index.name.clone(),
-                                table_name: table.name.clone(),
-                                index_count: *index_entry_count,
-                                table_count: *table_row_count,
-                            });
-
-                            // Check if we've reached max errors
-                            if errors.len() >= *max_errors {
-                                let message = format_integrity_check_result(errors);
-                                state.registers[*message_register] =
-                                    Register::Value(Value::build_text(message));
-                                state.op_integrity_check_state = OpIntegrityCheckState::Start;
-                                state.pc += 1;
-                                return Ok(InsnFunctionStepResult::Step);
-                            }
-                        }
-
-                        // Move to next index
-                        *current_index_idx += 1;
-                        *substate = IndexCountValidationSubstate::StartIndex;
+                    if errors.len() >= *max_errors {
+                        break;
                     }
                 }
             }
-        }
-        OpIntegrityCheckState::ValidatingNotNull {
-            errors,
-            current_table_idx,
-            cursor,
-            substate,
-        } => {
-            loop {
-                match substate {
-                    NotNullValidationSubstate::StartTable => {
-                        // Skip tables without NOT NULL columns
-                        while *current_table_idx < tables.len()
-                            && tables[*current_table_idx].not_null_columns.is_empty()
-                        {
-                            *current_table_idx += 1;
-                        }
 
-                        if *current_table_idx >= tables.len() {
-                            // Done with all tables, transition to UNIQUE validation, row-index validation, or finish
-
-                            // Phase 4: UNIQUE constraint validation (skip for quick_check)
-                            // Note: We can only be in ValidatingNotNull if quick=false, but check anyway for clarity
-                            if !*quick
-                                && tables
-                                    .iter()
-                                    .any(|t| t.indexes.iter().any(|idx| idx.unique))
-                            {
-                                let errors = std::mem::take(errors);
-                                state.op_integrity_check_state =
-                                    OpIntegrityCheckState::ValidatingUnique {
-                                        errors,
-                                        current_table_idx: 0,
-                                        current_index_idx: 0,
-                                        cursor: None,
-                                        previous_key: None,
-                                        substate: UniqueValidationSubstate::StartTable,
-                                    };
-                                return Ok(InsnFunctionStepResult::Step);
-                            }
-
-                            // Phase 5: Row-index consistency validation (skip if quick_check)
-                            if !*quick && tables.iter().any(|t| !t.indexes.is_empty()) {
-                                let errors = std::mem::take(errors);
-                                state.op_integrity_check_state =
-                                    OpIntegrityCheckState::ValidatingRowIndexConsistency {
-                                        errors,
-                                        current_table_idx: 0,
-                                        table_cursor: None,
-                                        index_cursor: None,
-                                        row_number: 0,
-                                        substate: RowIndexValidationSubstate::StartTable,
-                                    };
-                                return Ok(InsnFunctionStepResult::Step);
-                            }
-
-                            // Finish: generate result message
-                            let message = format_integrity_check_result(errors);
-                            state.registers[*message_register] =
-                                Register::Value(Value::build_text(message));
-                            state.op_integrity_check_state = OpIntegrityCheckState::Start;
-                            state.pc += 1;
-                            return Ok(InsnFunctionStepResult::Step);
-                        }
-
-                        // Create cursor for current table
-                        let table = &tables[*current_table_idx];
-                        *cursor = Some(Box::new(BTreeCursor::new(
-                            pager.clone(),
-                            table.root_page,
-                            0,
-                        )));
-                        *substate = NotNullValidationSubstate::Rewinding;
-                    }
-                    NotNullValidationSubstate::Rewinding => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.rewind());
-                        if !btree_cursor.has_record() {
-                            // Table is empty, move to next table
-                            *cursor = None;
-                            *current_table_idx += 1;
-                            *substate = NotNullValidationSubstate::StartTable;
-                            continue;
-                        }
-                        *substate = NotNullValidationSubstate::CheckingRow;
-                    }
-                    NotNullValidationSubstate::CheckingRow => {
-                        let table = &tables[*current_table_idx];
-                        let btree_cursor = cursor.as_mut().unwrap();
-
-                        // Get rowid for error messages - must exist since has_record() was true
-                        let rowid = return_if_io!(btree_cursor.rowid())
-                            .expect("rowid must exist when has_record() is true");
-
-                        // Get the record and check NOT NULL columns
-                        let record = return_if_io!(btree_cursor.record())
-                            .expect("record must exist when has_record() is true");
-                        let values = record.get_values()?;
-                        for (col_idx, col_name) in &table.not_null_columns {
-                            if *col_idx < values.len() {
-                                let value = &values[*col_idx];
-                                if matches!(value, ValueRef::Null) {
-                                    errors.push(IntegrityCheckError::NotNullViolation {
-                                        table_name: table.name.clone(),
-                                        column_name: col_name.clone(),
-                                        rowid,
-                                    });
-
-                                    // Check if we've reached max errors
-                                    if errors.len() >= *max_errors {
-                                        let message = format_integrity_check_result(errors);
-                                        state.registers[*message_register] =
-                                            Register::Value(Value::build_text(message));
-                                        state.op_integrity_check_state =
-                                            OpIntegrityCheckState::Start;
-                                        state.pc += 1;
-                                        return Ok(InsnFunctionStepResult::Step);
-                                    }
-                                }
-                            }
-                        }
-
-                        *substate = NotNullValidationSubstate::Advancing;
-                    }
-                    NotNullValidationSubstate::Advancing => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.next());
-                        if btree_cursor.has_record() {
-                            *substate = NotNullValidationSubstate::CheckingRow;
-                        } else {
-                            // Done with this table, move to next
-                            *cursor = None;
-                            *current_table_idx += 1;
-                            *substate = NotNullValidationSubstate::StartTable;
-                        }
-                    }
-                }
-            }
-        }
-        OpIntegrityCheckState::ValidatingUnique {
-            errors,
-            current_table_idx,
-            current_index_idx,
-            cursor,
-            previous_key,
-            substate,
-        } => {
-            loop {
-                match substate {
-                    UniqueValidationSubstate::StartTable => {
-                        // Skip tables without unique indexes
-                        while *current_table_idx < tables.len()
-                            && !tables[*current_table_idx]
-                                .indexes
-                                .iter()
-                                .any(|idx| idx.unique)
-                        {
-                            *current_table_idx += 1;
-                        }
-
-                        if *current_table_idx >= tables.len() {
-                            // Done with all tables, transition to row-index validation or finish
-                            // Note: We're in UNIQUE validation, so quick=false is guaranteed,
-                            // but we check anyway for clarity and consistency.
-                            if !*quick && tables.iter().any(|t| !t.indexes.is_empty()) {
-                                let errors = std::mem::take(errors);
-                                state.op_integrity_check_state =
-                                    OpIntegrityCheckState::ValidatingRowIndexConsistency {
-                                        errors,
-                                        current_table_idx: 0,
-                                        table_cursor: None,
-                                        index_cursor: None,
-                                        row_number: 0,
-                                        substate: RowIndexValidationSubstate::StartTable,
-                                    };
-                                return Ok(InsnFunctionStepResult::Step);
-                            }
-
-                            // Finish: generate result message
-                            let message = format_integrity_check_result(errors);
-                            state.registers[*message_register] =
-                                Register::Value(Value::build_text(message));
-                            state.op_integrity_check_state = OpIntegrityCheckState::Start;
-                            state.pc += 1;
-                            return Ok(InsnFunctionStepResult::Step);
-                        }
-
-                        *current_index_idx = 0;
-                        *substate = UniqueValidationSubstate::StartIndex;
-                    }
-                    UniqueValidationSubstate::StartIndex => {
-                        let table = &tables[*current_table_idx];
-
-                        // Find next unique index
-                        while *current_index_idx < table.indexes.len()
-                            && !table.indexes[*current_index_idx].unique
-                        {
-                            *current_index_idx += 1;
-                        }
-
-                        if *current_index_idx >= table.indexes.len() {
-                            // Done with all indexes for this table, move to next table
-                            *current_table_idx += 1;
-                            *substate = UniqueValidationSubstate::StartTable;
-                            continue;
-                        }
-
-                        // Create cursor for current unique index
-                        let index = &table.indexes[*current_index_idx];
-                        *cursor = Some(Box::new(BTreeCursor::new(
-                            pager.clone(),
-                            index.root_page,
-                            0,
-                        )));
-                        *previous_key = None;
-                        *substate = UniqueValidationSubstate::Rewinding;
-                    }
-                    UniqueValidationSubstate::Rewinding => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.rewind());
-                        if !btree_cursor.has_record() {
-                            // Index is empty, move to next index
-                            *cursor = None;
-                            *current_index_idx += 1;
-                            *substate = UniqueValidationSubstate::StartIndex;
-                            continue;
-                        }
-                        *substate = UniqueValidationSubstate::CheckingKey;
-                    }
-                    UniqueValidationSubstate::CheckingKey => {
-                        let table = &tables[*current_table_idx];
-                        let index = &table.indexes[*current_index_idx];
-                        let btree_cursor = cursor.as_mut().unwrap();
-
-                        // Get current record (index key) - must exist since has_record() was true
-                        let record = return_if_io!(btree_cursor.record())
-                            .expect("record must exist when has_record() is true");
-                        let values = record.get_values()?;
-
-                        // For unique indexes, compare all values except the last one (rowid)
-                        // If we have a previous key and the non-rowid portions match, it's a violation
-                        if values.len() > 1 {
-                            // Extract key values (excluding rowid which is the last value)
-                            let key_values: Vec<Value> = values[..values.len() - 1]
-                                .iter()
-                                .map(|v| v.to_owned())
-                                .collect();
-
-                            // Check if any value is NULL - NULLs are never duplicates (NULL != NULL)
-                            let has_null = key_values.iter().any(|v| matches!(v, Value::Null));
-
-                            if !has_null {
-                                // Only compare if current key has no NULLs
-                                if let Some(prev) = previous_key.as_ref() {
-                                    // Compare value-by-value using existing Value comparison
-                                    if key_values.len() == prev.len()
-                                        && key_values.iter().zip(prev.iter()).all(|(a, b)| a == b)
-                                    {
-                                        errors.push(IntegrityCheckError::UniqueViolation {
-                                            index_name: index.name.clone(),
-                                        });
-
-                                        // Check if we've reached max errors
-                                        if errors.len() >= *max_errors {
-                                            let message = format_integrity_check_result(errors);
-                                            state.registers[*message_register] =
-                                                Register::Value(Value::build_text(message));
-                                            state.op_integrity_check_state =
-                                                OpIntegrityCheckState::Start;
-                                            state.pc += 1;
-                                            return Ok(InsnFunctionStepResult::Step);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Store current key for next comparison (None if has NULL)
-                            *previous_key = if has_null { None } else { Some(key_values) };
-                        }
-
-                        *substate = UniqueValidationSubstate::Advancing;
-                    }
-                    UniqueValidationSubstate::Advancing => {
-                        let btree_cursor = cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.next());
-                        if btree_cursor.has_record() {
-                            *substate = UniqueValidationSubstate::CheckingKey;
-                        } else {
-                            // Done with this index, move to next
-                            *cursor = None;
-                            *current_index_idx += 1;
-                            *substate = UniqueValidationSubstate::StartIndex;
-                        }
-                    }
-                }
-            }
-        }
-        OpIntegrityCheckState::ValidatingRowIndexConsistency {
-            errors,
-            current_table_idx,
-            table_cursor,
-            index_cursor,
-            row_number,
-            substate,
-        } => {
-            loop {
-                match substate {
-                    RowIndexValidationSubstate::StartTable => {
-                        // Skip tables without indexes
-                        while *current_table_idx < tables.len()
-                            && tables[*current_table_idx].indexes.is_empty()
-                        {
-                            *current_table_idx += 1;
-                        }
-
-                        if *current_table_idx >= tables.len() {
-                            // Done with all tables, finish
-                            let message = format_integrity_check_result(errors);
-                            state.registers[*message_register] =
-                                Register::Value(Value::build_text(message));
-                            state.op_integrity_check_state = OpIntegrityCheckState::Start;
-                            state.pc += 1;
-                            return Ok(InsnFunctionStepResult::Step);
-                        }
-
-                        // Create cursor for current table
-                        let table = &tables[*current_table_idx];
-                        *table_cursor = Some(Box::new(BTreeCursor::new(
-                            pager.clone(),
-                            table.root_page,
-                            0,
-                        )));
-                        *row_number = 0;
-                        *substate = RowIndexValidationSubstate::RewindingTable;
-                    }
-                    RowIndexValidationSubstate::RewindingTable => {
-                        let btree_cursor = table_cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.rewind());
-                        if !btree_cursor.has_record() {
-                            // Table is empty, move to next table
-                            *table_cursor = None;
-                            *current_table_idx += 1;
-                            *substate = RowIndexValidationSubstate::StartTable;
-                            continue;
-                        }
-                        // Start checking the first row
-                        *row_number = 1;
-                        *substate = RowIndexValidationSubstate::FetchingRowId;
-                        continue;
-                    }
-                    RowIndexValidationSubstate::FetchingRowId => {
-                        let btree_cursor = table_cursor.as_mut().unwrap();
-                        let rowid = return_if_io!(btree_cursor.rowid())
-                            .expect("rowid must exist when has_record() is true");
-                        *substate = RowIndexValidationSubstate::FetchingRecord { rowid };
-                        continue;
-                    }
-                    RowIndexValidationSubstate::FetchingRecord { rowid } => {
-                        let btree_cursor = table_cursor.as_mut().unwrap();
-                        let record = return_if_io!(btree_cursor.record())
-                            .expect("record must exist when has_record() is true");
-                        let row_values =
-                            record.get_values()?.iter().map(|v| v.to_owned()).collect();
-                        let rid = *rowid;
-                        *substate = RowIndexValidationSubstate::CheckingRow {
-                            current_index_idx: 0,
-                            row_values,
-                            rowid: rid,
-                        };
-                    }
-                    RowIndexValidationSubstate::CheckingRow {
-                        current_index_idx,
-                        row_values,
-                        rowid,
-                    } => {
-                        let table = &tables[*current_table_idx];
-
-                        if *current_index_idx >= table.indexes.len() {
-                            // Done with all indexes for this row, advance to next row
-                            *index_cursor = None;
-                            *substate = RowIndexValidationSubstate::Advancing;
-                            continue;
-                        }
-
-                        // Open cursor for this index if not already open
-                        let index = &table.indexes[*current_index_idx];
-                        if index_cursor.is_none() {
-                            let mut cursor = BTreeCursor::new(pager.clone(), index.root_page, 0);
-                            cursor.index_info = Some(index.index_info.clone());
-                            *index_cursor = Some(Box::new(cursor));
-                        }
-
-                        // Build the index key from table row values
-                        // Index key = (indexed_col_values..., rowid)
-                        let mut key_values: Vec<Value> =
-                            Vec::with_capacity(index.column_positions.len() + 1);
-                        for (col_idx, &pos) in index.column_positions.iter().enumerate() {
-                            // For INTEGER PRIMARY KEY columns, the value in the record is NULL
-                            // but the actual value is the rowid
-                            let value = if table.rowid_alias_column_pos == Some(pos) {
-                                Value::from_i64(*rowid)
-                            } else if pos >= row_values.len() {
-                                // Columns added via ALTER TABLE ADD COLUMN: existing rows
-                                // don't have values for these columns. Use the column's
-                                // DEFAULT value from the pre-evaluated register. This is
-                                // NULL if no DEFAULT value is defined for the column.
-                                state.registers[index.default_values_start_reg + col_idx]
-                                    .get_value()
-                                    .clone()
-                            } else {
-                                row_values[pos].clone()
-                            };
-                            key_values.push(value);
-                        }
-                        key_values.push(Value::from_i64(*rowid));
-
-                        // Transition to searching - the actual seek happens in SearchingIndex
-                        let idx = *current_index_idx;
-                        let vals = std::mem::take(row_values);
-                        let rid = *rowid;
-                        *substate = RowIndexValidationSubstate::SearchingIndex {
-                            current_index_idx: idx,
-                            row_values: vals,
-                            rowid: rid,
-                            key_values,
-                        };
-                        continue;
-                    }
-                    RowIndexValidationSubstate::SearchingIndex {
-                        current_index_idx,
-                        row_values,
-                        rowid,
-                        key_values,
-                    } => {
-                        // Build index record for seeking
-                        let index_record =
-                            ImmutableRecord::from_values(key_values.as_slice(), key_values.len());
-
-                        // Search for the key in the index using exact match
-                        let idx_cursor = index_cursor.as_mut().unwrap();
-                        let seek_key = SeekKey::IndexKey(&index_record);
-
-                        let result =
-                            return_if_io!(idx_cursor.seek(seek_key, SeekOp::GE { eq_only: true }));
-
-                        match result {
-                            SeekResult::Found => {
-                                // Found - move to next index
-                                *index_cursor = None;
-                                let idx = *current_index_idx + 1;
-                                let vals = std::mem::take(row_values);
-                                let rid = *rowid;
-                                *substate = RowIndexValidationSubstate::CheckingRow {
-                                    current_index_idx: idx,
-                                    row_values: vals,
-                                    rowid: rid,
-                                };
-                            }
-                            SeekResult::NotFound => {
-                                // Row not found in index
-                                let table = &tables[*current_table_idx];
-                                let index = &table.indexes[*current_index_idx];
-                                errors.push(IntegrityCheckError::RowMissingFromIndex {
-                                    row_number: *row_number,
-                                    index_name: index.name.clone(),
-                                });
-
-                                // Check if we've reached max errors
-                                if errors.len() >= *max_errors {
-                                    let message = format_integrity_check_result(errors);
-                                    state.registers[*message_register] =
-                                        Register::Value(Value::build_text(message));
-                                    state.op_integrity_check_state = OpIntegrityCheckState::Start;
-                                    state.pc += 1;
-                                    return Ok(InsnFunctionStepResult::Step);
-                                }
-
-                                // Move to next index
-                                *index_cursor = None;
-                                let idx = *current_index_idx + 1;
-                                let vals = std::mem::take(row_values);
-                                let rid = *rowid;
-                                *substate = RowIndexValidationSubstate::CheckingRow {
-                                    current_index_idx: idx,
-                                    row_values: vals,
-                                    rowid: rid,
-                                };
-                            }
-                            SeekResult::TryAdvance => {
-                                // Need to advance cursor to reach the leaf entry
-                                // Transition to new state BEFORE calling next() for re-entrancy safety
-                                let idx = *current_index_idx;
-                                let vals = std::mem::take(row_values);
-                                let rid = *rowid;
-                                *substate = RowIndexValidationSubstate::AdvancingAfterTryAdvance {
-                                    current_index_idx: idx,
-                                    row_values: vals,
-                                    rowid: rid,
-                                };
-                                continue;
-                            }
-                        }
-                    }
-                    RowIndexValidationSubstate::AdvancingAfterTryAdvance {
-                        current_index_idx,
-                        row_values,
-                        rowid,
-                    } => {
-                        let idx_cursor = index_cursor.as_mut().unwrap();
-                        return_if_io!(idx_cursor.next());
-
-                        let found = idx_cursor.has_record();
-
-                        if !found {
-                            // Row not found in index
-                            let table = &tables[*current_table_idx];
-                            let index = &table.indexes[*current_index_idx];
-                            errors.push(IntegrityCheckError::RowMissingFromIndex {
-                                row_number: *row_number,
-                                index_name: index.name.clone(),
-                            });
-
-                            // Check if we've reached max errors
-                            if errors.len() >= *max_errors {
-                                let message = format_integrity_check_result(errors);
-                                state.registers[*message_register] =
-                                    Register::Value(Value::build_text(message));
-                                state.op_integrity_check_state = OpIntegrityCheckState::Start;
-                                state.pc += 1;
-                                return Ok(InsnFunctionStepResult::Step);
-                            }
-                        }
-
-                        // Move to next index
-                        *index_cursor = None;
-                        let idx = *current_index_idx + 1;
-                        let vals = std::mem::take(row_values);
-                        let rid = *rowid;
-                        *substate = RowIndexValidationSubstate::CheckingRow {
-                            current_index_idx: idx,
-                            row_values: vals,
-                            rowid: rid,
-                        };
-                    }
-                    RowIndexValidationSubstate::Advancing => {
-                        let btree_cursor = table_cursor.as_mut().unwrap();
-                        return_if_io!(btree_cursor.next());
-                        if btree_cursor.has_record() {
-                            *row_number += 1;
-                            *substate = RowIndexValidationSubstate::FetchingRowId;
-                            continue;
-                        } else {
-                            // Done with this table, move to next
-                            *table_cursor = None;
-                            *current_table_idx += 1;
-                            *substate = RowIndexValidationSubstate::StartTable;
-                        }
-                    }
-                }
-            }
+            errors.truncate(*max_errors);
+            let message = format_integrity_check_result(errors);
+            state.registers[*message_register] = match message {
+                Some(msg) => Register::Value(Value::build_text(msg)),
+                None => Register::Value(Value::Null),
+            };
+            state.op_integrity_check_state = OpIntegrityCheckState::Start;
+            state.pc += 1;
         }
     }
 
     Ok(InsnFunctionStepResult::Step)
 }
-
 pub fn op_cast(
     _program: &Program,
     state: &mut ProgramState,
@@ -10433,14 +9609,14 @@ pub fn op_rename_table(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(RenameTable { from, to }, insn);
+    load_insn!(RenameTable { db, from, to }, insn);
 
     let normalized_from = normalize_ident(from.as_str());
     let normalized_to = normalize_ident(to.as_str());
 
     let conn = program.connection.clone();
 
-    conn.with_schema_mut(|schema| -> crate::Result<()> {
+    conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
@@ -10515,6 +9691,7 @@ pub fn op_drop_column(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         DropColumn {
+            db,
             table,
             column_index
         },
@@ -10525,8 +9702,7 @@ pub fn op_drop_column(
 
     let normalized_table_name = normalize_ident(table.as_str());
 
-    let column_name = {
-        let schema = conn.schema.read();
+    let column_name = conn.with_schema(*db, |schema| {
         let table = schema
             .tables
             .get(&normalized_table_name)
@@ -10538,9 +9714,9 @@ pub fn op_drop_column(
             .as_ref()
             .expect("column being ALTERed should be named")
             .clone()
-    };
+    });
 
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         let table = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -10563,8 +9739,7 @@ pub fn op_drop_column(
         });
     });
 
-    {
-        let schema = conn.schema.read();
+    conn.with_schema(*db, |schema| -> crate::Result<()> {
         if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
             for index in indexes {
                 if index
@@ -10578,11 +9753,12 @@ pub fn op_drop_column(
                 }
             }
         }
-    }
+        Ok(())
+    })?;
 
     // Update index.pos_in_table for all indexes.
     // For example, if the dropped column had index 2, then anything that was indexed on column 3 or higher should be decremented by 1.
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
@@ -10595,8 +9771,7 @@ pub fn op_drop_column(
         }
     });
 
-    {
-        let schema = conn.schema.read();
+    conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {view_name}");
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
@@ -10606,7 +9781,8 @@ pub fn op_drop_column(
                 ))
             })?;
         }
-    }
+        Ok(())
+    })?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10620,6 +9796,7 @@ pub fn op_add_column(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         AddColumn {
+            db,
             table,
             column,
             check_constraints
@@ -10629,7 +9806,7 @@ pub fn op_add_column(
 
     let conn = program.connection.clone();
 
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         let table_ref = schema
             .tables
             .get_mut(table)
@@ -10659,6 +9836,7 @@ pub fn op_alter_column(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         AlterColumn {
+            db,
             table: table_name,
             column_index,
             definition,
@@ -10670,8 +9848,7 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
-    let old_column_name = {
-        let schema = conn.schema.read();
+    let old_column_name = conn.with_schema(*db, |schema| {
         let table = schema
             .tables
             .get(&normalized_table_name)
@@ -10683,11 +9860,11 @@ pub fn op_alter_column(
             .as_ref()
             .expect("column being ALTERed should be named")
             .clone()
-    };
+    });
     let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
 
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         let table_arc = schema
             .tables
             .get_mut(&normalized_table_name)
@@ -10787,25 +9964,27 @@ pub fn op_alter_column(
         }
     });
 
-    let schema = conn.schema.read();
     if *rename {
-        let table = schema
-            .tables
-            .get(&normalized_table_name)
-            .expect("table being ALTERed should be in schema");
-        let _column = table
-            .get_column_at(*column_index)
-            .expect("column being ALTERed should be in schema");
-        for (view_name, view) in schema.views.iter() {
-            let view_select_sql = format!("SELECT * FROM {view_name}");
-            // FIXME: this should rewrite the view to reference the new column name
-            let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
-                LimboError::ParseError(format!(
-                    "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
-                    old_column_name, view.sql,
-                ))
-            })?;
-        }
+        conn.with_schema(*db, |schema| -> crate::Result<()> {
+            let table = schema
+                .tables
+                .get(&normalized_table_name)
+                .expect("table being ALTERed should be in schema");
+            let _column = table
+                .get_column_at(*column_index)
+                .expect("column being ALTERed should be in schema");
+            for (view_name, view) in schema.views.iter() {
+                let view_select_sql = format!("SELECT * FROM {view_name}");
+                // FIXME: this should rewrite the view to reference the new column name
+                let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
+                    LimboError::ParseError(format!(
+                        "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
+                        old_column_name, view.sql,
+                    ))
+                })?;
+            }
+            Ok(())
+        })?;
     }
 
     state.pc += 1;
@@ -10843,10 +10022,12 @@ fn handle_text_sum(
     sum_state: &mut SumAggState,
     parsed_number: ParsedNumber,
     parse_result: NumericParseResult,
+    force_approx: bool,
 ) {
     // SQLite treats text that only partially parses as numeric (ValidPrefixOnly)
-    // as approximate, so SUM returns real instead of integer.
-    let is_approx = matches!(parse_result, NumericParseResult::ValidPrefixOnly);
+    // as approximate, so SUM returns real instead of integer. Non-integer inputs
+    // (e.g. BLOB) should also force approximate results.
+    let is_approx = force_approx || matches!(parse_result, NumericParseResult::ValidPrefixOnly);
     match parsed_number {
         ParsedNumber::Integer(i) => {
             if is_approx {
@@ -11549,19 +10730,14 @@ pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
 }
 
 pub fn op_max_pgcnt(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MaxPgcnt { db, dest, new_max }, insn);
 
-    if *db > 0 {
-        return Err(LimboError::InternalError(
-            "temp/attached databases not implemented yet".to_string(),
-        ));
-    }
-
+    let pager = program.get_pager_from_database_index(db);
     let result_value = if *new_max == 0 {
         // If new_max is 0, just return current maximum without changing it
         pager.get_max_page_count()
@@ -11631,16 +10807,13 @@ fn op_journal_mode_inner(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     use crate::storage::sqlite3_ondisk::begin_write_btree_page;
 
     load_insn!(JournalMode { db, dest, new_mode }, insn);
-    if *db > 0 {
-        return Err(LimboError::InternalError(
-            "temp/attached databases not implemented yet".to_string(),
-        ));
-    }
+    let pager = program.get_pager_from_database_index(db);
+    let pager = &pager;
 
     loop {
         match state.op_journal_mode_state.sub_state {
@@ -11785,8 +10958,7 @@ fn op_journal_mode_inner(
 
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc) {
-                    let cdc_info = program.connection.get_capture_data_changes_info();
-                    if cdc_info.is_some() {
+                    if program.connection.get_capture_data_changes_info().is_some() {
                         return Err(LimboError::InternalError(
                             "cannot enable MVCC while CDC is active".to_string(),
                         ));
@@ -12218,9 +11390,8 @@ fn op_vacuum_into_inner(
                 let schema_rows_len = vacuum_state.schema_rows.len();
                 turso_assert!(
                     idx <= schema_rows_len,
-                    "idx {} incremented past end of schema_rows (len {})",
-                    idx,
-                    schema_rows_len
+                    "idx incremented past end of schema_rows",
+                    { "idx": idx, "schema_rows_len": schema_rows_len }
                 );
                 if idx == schema_rows_len {
                     // Done creating schema, start copying data
@@ -12234,8 +11405,8 @@ fn op_vacuum_into_inner(
                 let row = &vacuum_state.schema_rows[idx];
                 turso_assert!(
                     row.len() == 4,
-                    "schema row should have exactly 4 columns (type, name, tbl_name, sql), got {}",
-                    row.len()
+                    "schema row should have exactly 4 columns (type, name, tbl_name, sql)",
+                    { "row_len": row.len() }
                 );
 
                 // Skip triggers and views - they'll be created after data copy
@@ -12320,9 +11491,8 @@ fn op_vacuum_into_inner(
                 let table_names_len = vacuum_state.table_names.len();
                 turso_assert!(
                     table_idx <= table_names_len,
-                    "table_idx {} incremented past end of table_names (len {})",
-                    table_idx,
-                    table_names_len
+                    "table_idx incremented past end of table_names",
+                    { "table_idx": table_idx, "table_names_len": table_names_len }
                 );
                 if table_idx == table_names_len {
                     // Done copying all tables, now copy meta values
@@ -12531,9 +11701,8 @@ fn op_vacuum_into_inner(
                 let schema_rows_len = vacuum_state.schema_rows.len();
                 turso_assert!(
                     idx <= schema_rows_len,
-                    "idx {} incremented past end of schema_rows (len {})",
-                    idx,
-                    schema_rows_len
+                    "idx incremented past end of schema_rows",
+                    { "idx": idx, "schema_rows_len": schema_rows_len }
                 );
                 if idx == schema_rows_len {
                     // Done creating triggers and views

@@ -27,7 +27,7 @@ impl fmt::Display for DropTableStatement {
 
 /// Generate a DROP TABLE statement for a specific table.
 pub fn drop_table_for_table(table: &TableRef) -> BoxedStrategy<DropTableStatement> {
-    let table_name = table.name.clone();
+    let table_name = table.qualified_name();
 
     any::<bool>()
         .prop_map(move |if_exists| DropTableStatement {
@@ -44,7 +44,7 @@ pub fn drop_table_for_schema(schema: &Schema) -> BoxedStrategy<DropTableStatemen
         "Schema must have at least one table"
     );
 
-    let table_names: Vec<String> = schema.tables.iter().map(|t| t.name.clone()).collect();
+    let table_names: Vec<String> = schema.tables.iter().map(|t| t.qualified_name()).collect();
 
     (proptest::sample::select(table_names), any::<bool>())
         .prop_map(|(table_name, if_exists)| DropTableStatement {

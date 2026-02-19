@@ -19,6 +19,7 @@ use crate::vdbe::insn::{
 };
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Result;
+use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
 use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
@@ -95,7 +96,7 @@ pub fn plan_windows(
 
     if !windows.is_empty() {
         // Sanity check: this should never happen because the syntax disallows combining VALUES with windows
-        assert!(
+        turso_assert!(
             plan.values.is_empty(),
             "VALUES clause with windows is not supported"
         );
@@ -233,9 +234,11 @@ fn prepare_window_subquery(
 
     // Verify that the subquery has the expected database ID.
     // This is required to ensure that assumptions in `rewrite_terminal_expr` are valid.
-    assert_eq!(
-        subquery.database_id, SUBQUERY_DATABASE_ID,
-        "expected subquery database id to be {SUBQUERY_DATABASE_ID}"
+    turso_assert_eq!(
+        subquery.database_id,
+        SUBQUERY_DATABASE_ID,
+        "subquery database id must be SUBQUERY_DATABASE_ID",
+        {"SUBQUERY_DATABASE_ID": SUBQUERY_DATABASE_ID}
     );
 
     outer_plan.window = Some(current_window);
@@ -328,7 +331,7 @@ fn rewrite_expr_referencing_current_window(
     fn normalize_over_clause(filter_over: &mut FunctionTail, window_name: &str) {
         // FILTER clause is not supported yet. Proper checks elsewhere return appropriate
         // error messages, and this ensures that nothing slips through unnoticed.
-        assert!(
+        turso_assert!(
             filter_over.filter_clause.is_none(),
             "FILTER in window functions is not supported"
         );
@@ -354,7 +357,7 @@ fn rewrite_expr_referencing_current_window(
                     resolve_window_and_aggregate_functions(arg, ctx.resolver, aggregates, None)?;
                 rewrite_expr_as_subquery_column(arg, ctx, contains_aggregates);
             }
-            assert!(
+            turso_assert!(
                 order_by.is_empty(),
                 "ORDER BY in window functions is not supported"
             );
@@ -475,7 +478,7 @@ pub fn init_window<'a>(
     order_by: &'a [(Box<Expr>, SortOrder)],
 ) -> crate::Result<()> {
     let joined_tables = &plan.joined_tables();
-    assert_eq!(joined_tables.len(), 1, "expected only one joined table");
+    turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
 
     let src_table = &joined_tables[0];
     let reg_src_columns_start =
@@ -493,7 +496,9 @@ pub fn init_window<'a>(
     let src_columns = src_table.columns().to_vec();
     let src_column_count = src_columns.len();
     let window_name = window.name.clone().expect("window name is missing");
-    let partition_by_len = window.partition_by.len();
+    let partition_by_len = window
+        .deduplicated_partition_by_len
+        .unwrap_or(window.partition_by.len());
     let order_by_len = window.order_by.len();
     let window_function_count = window.functions.len();
 
@@ -615,8 +620,9 @@ fn collect_expressions_referencing_subquery<'a>(
                         }
                     }
                     Expr::Column { column, table, .. } => {
-                        assert_eq!(
-                            table, subquery_id,
+                        turso_assert_eq!(
+                            table,
+                            subquery_id,
                             "only subquery columns can be referenced"
                         );
                         if expressions_referencing_subquery
@@ -704,7 +710,7 @@ fn emit_flush_buffer_if_new_partition(
             program.offset(),
             "compare partition keys to detect new partition",
         );
-        let mut compare_key_info = (0..window.partition_by.len())
+        let mut compare_key_info = (0..partition_by_len)
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
@@ -713,10 +719,18 @@ fn emit_flush_buffer_if_new_partition(
         for (i, c) in compare_key_info
             .iter_mut()
             .enumerate()
-            .take(window.partition_by.len())
+            .take(partition_by_len)
         {
-            let maybe_collation =
-                get_collseq_from_expr(&window.partition_by[i], &plan.table_references)?;
+            // After rewriting, partition_by entries are Expr::Column references to the
+            // subquery. Duplicates reference the same column index, so we find the entry
+            // that references column i (the i-th unique partition column) to get the
+            // correct collation.
+            let expr = window
+                .partition_by
+                .iter()
+                .find(|e| matches!(e, Expr::Column { column, .. } if *column == i))
+                .unwrap_or(&window.partition_by[i]);
+            let maybe_collation = get_collseq_from_expr(expr, &plan.table_references)?;
             c.collation = maybe_collation.unwrap_or_default();
         }
         program.emit_insn(Insn::Compare {

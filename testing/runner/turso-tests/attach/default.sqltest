@@ -1,9 +1,10 @@
 @database :default:
 @database :default-no-rowidalias:
+@skip-file-if mvcc "attach is not supported in mvcc mode"
 
 # Test attach reserved name - main (should fail)
 test attach-reserved-main {
-    ATTACH DATABASE "database/testing_small.db" AS main
+    ATTACH DATABASE ':memory:' AS main
 }
 expect error {
     in use
@@ -11,7 +12,7 @@ expect error {
 
 # Test attach reserved name - temp (should fail)
 test attach-reserved-temp {
-    ATTACH DATABASE "database/testing_small.db" AS temp
+    ATTACH DATABASE ':memory:' AS temp
 }
 expect error {
     in use
@@ -19,8 +20,8 @@ expect error {
 
 # Test attach duplicate database name - arbitrary (should fail)
 test attach-duplicate-name {
-    ATTACH DATABASE "database/testing_small.db" as small;
-    ATTACH DATABASE "database/testing_small.db" as small;
+    ATTACH DATABASE ':memory:' as small;
+    ATTACH DATABASE ':memory:' as small;
 }
 expect error {
     in use
@@ -36,11 +37,10 @@ expect error {
 
 # Test queries after detach (should fail for detached database)
 test query-after-detach {
-    ATTACH DATABASE "database/testing_small.db" as small;
+    ATTACH DATABASE ':memory:' as small;
     DETACH DATABASE small;
     select * from small.sqlite_schema;
 }
 expect error {
     no such
 }
-

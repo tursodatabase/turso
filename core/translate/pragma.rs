@@ -2,6 +2,7 @@
 //! More info: https://www.sqlite.org/pragma.html.
 
 use crate::sync::Arc;
+use crate::turso_soft_unreachable;
 use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::PragmaName;
@@ -70,8 +71,18 @@ pub fn translate_pragma(
         Err(_) => bail_parse_error!("Not a valid pragma name"),
     };
 
+    let database_id = resolver.resolve_database_id(name)?;
+
     let mode = match body {
-        None => query_pragma(pragma, resolver, None, pager, connection, program)?,
+        None => query_pragma(
+            pragma,
+            resolver,
+            None,
+            pager,
+            connection,
+            database_id,
+            program,
+        )?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
             PragmaName::IndexInfo
@@ -82,10 +93,24 @@ pub fn translate_pragma(
             | PragmaName::TableXinfo
             | PragmaName::IntegrityCheck
             | PragmaName::DatabaseList
-            | PragmaName::QuickCheck => {
-                query_pragma(pragma, resolver, Some(*value), pager, connection, program)?
-            }
-            _ => update_pragma(pragma, resolver, *value, pager, connection, program)?,
+            | PragmaName::QuickCheck => query_pragma(
+                pragma,
+                resolver,
+                Some(*value),
+                pager,
+                connection,
+                database_id,
+                program,
+            )?,
+            _ => update_pragma(
+                pragma,
+                resolver,
+                *value,
+                pager,
+                connection,
+                database_id,
+                program,
+            )?,
         },
     };
     match mode {
@@ -110,6 +135,7 @@ fn update_pragma(
     value: ast::Expr,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
+    database_id: usize,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
     let parse_pragma_enabled = |expr: &ast::Expr| -> bool {
@@ -136,7 +162,7 @@ fn update_pragma(
             };
 
             program.emit_insn(Insn::SetCookie {
-                db: 0,
+                db: database_id,
                 cookie: Cookie::ApplicationId,
                 value: app_id_value,
                 p5: 1,
@@ -181,7 +207,7 @@ fn update_pragma(
 
             let result_reg = program.alloc_register();
             program.emit_insn(Insn::JournalMode {
-                db: 0,
+                db: database_id,
                 dest: result_reg,
                 new_mode: Some(mode_str),
             });
@@ -197,6 +223,7 @@ fn update_pragma(
             Some(value),
             pager,
             connection,
+            database_id,
             program,
         ),
         PragmaName::ModuleList => Ok(TransactionMode::None),
@@ -206,6 +233,7 @@ fn update_pragma(
             None,
             pager,
             connection,
+            database_id,
             program,
         ),
         PragmaName::MaxPageCount => {
@@ -218,7 +246,7 @@ fn update_pragma(
 
             let result_reg = program.alloc_register();
             program.emit_insn(Insn::MaxPgcnt {
-                db: 0,
+                db: database_id,
                 dest: result_reg,
                 new_max: max_page_count_value,
             });
@@ -235,7 +263,7 @@ fn update_pragma(
             };
 
             program.emit_insn(Insn::SetCookie {
-                db: 0,
+                db: database_id,
                 cookie: Cookie::UserVersion,
                 value: version_value,
                 p5: 1,
@@ -278,7 +306,7 @@ fn update_pragma(
                 ));
             }
 
-            let is_empty = is_database_empty(resolver.schema, &pager)?;
+            let is_empty = is_database_empty(resolver.schema(), &pager)?;
             tracing::debug!(
                 "Checking if database is empty for auto_vacuum pragma: {}",
                 is_empty
@@ -324,7 +352,7 @@ fn update_pragma(
             }
             let largest_root_page_number_reg = program.alloc_register();
             program.emit_insn(Insn::ReadCookie {
-                db: 0,
+                db: database_id,
                 dest: largest_root_page_number_reg,
                 cookie: Cookie::LargestRootPageNumber,
             });
@@ -340,7 +368,7 @@ fn update_pragma(
             });
             program.resolve_label(set_cookie_label, program.offset());
             program.emit_insn(Insn::SetCookie {
-                db: 0,
+                db: database_id,
                 cookie: Cookie::IncrementalVacuum,
                 value: auto_vacuum_mode - 1,
                 p5: 0,
@@ -381,6 +409,7 @@ fn update_pragma(
             Some(value),
             pager,
             connection,
+            database_id,
             program,
         ),
         PragmaName::FreelistCount => query_pragma(
@@ -389,6 +418,7 @@ fn update_pragma(
             Some(value),
             pager,
             connection,
+            database_id,
             program,
         ),
         PragmaName::EncryptionKey => {
@@ -498,6 +528,7 @@ fn update_pragma(
             Some(value),
             pager,
             connection,
+            database_id,
             program,
         ),
     }
@@ -509,14 +540,15 @@ fn query_pragma(
     value: Option<ast::Expr>,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
+    database_id: usize,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
-    let schema = resolver.schema;
+    let schema = resolver.schema();
     let register = program.alloc_register();
     match pragma {
         PragmaName::ApplicationId => {
             program.emit_insn(Insn::ReadCookie {
-                db: 0,
+                db: database_id,
                 dest: register,
                 cookie: Cookie::ApplicationId,
             });
@@ -582,7 +614,7 @@ fn query_pragma(
         PragmaName::JournalMode => {
             // Use the JournalMode opcode to get the current journal mode
             program.emit_insn(Insn::JournalMode {
-                db: 0,
+                db: database_id,
                 dest: register,
                 new_mode: None,
             });
@@ -608,7 +640,7 @@ fn query_pragma(
 
             program.alloc_registers(2);
             program.emit_insn(Insn::Checkpoint {
-                database: 0,
+                database: database_id,
                 checkpoint_mode: mode,
                 dest: register,
             });
@@ -673,7 +705,7 @@ fn query_pragma(
         }
         PragmaName::PageCount => {
             program.emit_insn(Insn::PageCount {
-                db: 0,
+                db: database_id,
                 dest: register,
             });
             program.emit_result_row(register, 1);
@@ -682,7 +714,7 @@ fn query_pragma(
         }
         PragmaName::MaxPageCount => {
             program.emit_insn(Insn::MaxPgcnt {
-                db: 0,
+                db: database_id,
                 dest: register,
                 new_max: 0, // 0 means just return current max
             });
@@ -926,15 +958,17 @@ fn query_pragma(
             // we need 6 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(5);
             if let Some(name) = name {
-                if let Some(table) = schema.get_table(&name) {
-                    emit_columns_for_table_info(program, table.columns(), base_reg, false);
-                } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
-                    let view = view_mutex.lock();
-                    let flat_columns = view.column_schema.flat_columns();
-                    emit_columns_for_table_info(program, &flat_columns, base_reg, false);
-                } else if let Some(view) = schema.get_view(&name) {
-                    emit_columns_for_table_info(program, &view.columns, base_reg, false);
-                }
+                resolver.with_schema(database_id, |db_schema| {
+                    if let Some(table) = db_schema.get_table(&name) {
+                        emit_columns_for_table_info(program, table.columns(), base_reg, false);
+                    } else if let Some(view_mutex) = db_schema.get_materialized_view(&name) {
+                        let view = view_mutex.lock();
+                        let flat_columns = view.column_schema.flat_columns();
+                        emit_columns_for_table_info(program, &flat_columns, base_reg, false);
+                    } else if let Some(view) = db_schema.get_view(&name) {
+                        emit_columns_for_table_info(program, &view.columns, base_reg, false);
+                    }
+                });
             }
             let col_names = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
             for name in col_names {
@@ -952,15 +986,17 @@ fn query_pragma(
             // we need 7 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(6);
             if let Some(name) = name {
-                if let Some(table) = schema.get_table(&name) {
-                    emit_columns_for_table_info(program, table.columns(), base_reg, true);
-                } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
-                    let view = view_mutex.lock();
-                    let flat_columns = view.column_schema.flat_columns();
-                    emit_columns_for_table_info(program, &flat_columns, base_reg, true);
-                } else if let Some(view) = schema.get_view(&name) {
-                    emit_columns_for_table_info(program, &view.columns, base_reg, true);
-                }
+                resolver.with_schema(database_id, |db_schema| {
+                    if let Some(table) = db_schema.get_table(&name) {
+                        emit_columns_for_table_info(program, table.columns(), base_reg, true);
+                    } else if let Some(view_mutex) = db_schema.get_materialized_view(&name) {
+                        let view = view_mutex.lock();
+                        let flat_columns = view.column_schema.flat_columns();
+                        emit_columns_for_table_info(program, &flat_columns, base_reg, true);
+                    } else if let Some(view) = db_schema.get_view(&name) {
+                        emit_columns_for_table_info(program, &view.columns, base_reg, true);
+                    }
+                });
             }
             let col_names = [
                 "cid",
@@ -978,7 +1014,7 @@ fn query_pragma(
         }
         PragmaName::UserVersion => {
             program.emit_insn(Insn::ReadCookie {
-                db: 0,
+                db: database_id,
                 dest: register,
                 cookie: Cookie::UserVersion,
             });
@@ -988,7 +1024,7 @@ fn query_pragma(
         }
         PragmaName::SchemaVersion => {
             program.emit_insn(Insn::ReadCookie {
-                db: 0,
+                db: database_id,
                 dest: register,
                 cookie: Cookie::SchemaVersion,
             });
@@ -1027,12 +1063,12 @@ fn query_pragma(
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_integrity_check(schema, program, resolver, max_errors)?;
+            translate_integrity_check(schema, program, resolver, database_id, max_errors)?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_quick_check(schema, program, resolver, max_errors)?;
+            translate_quick_check(schema, program, resolver, database_id, max_errors)?;
             Ok(TransactionMode::Read)
         }
         PragmaName::UnstableCaptureDataChangesConn => {
@@ -1285,6 +1321,7 @@ fn update_cache_size(
             .unwrap_or_default()
             .get() as i64;
         if page_size == 0 {
+            turso_soft_unreachable!("Page size cannot be zero");
             return Err(LimboError::InternalError(
                 "Page size cannot be zero".to_string(),
             ));

@@ -1,3 +1,4 @@
+use crate::translate::expression_index::expression_index_column_usage;
 use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
@@ -29,6 +30,7 @@ use crate::{
     },
     LimboError, Result,
 };
+use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint,
     ConstraintOperator, ConstraintRef,
@@ -411,11 +413,16 @@ fn collect_index_method_candidates(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Schema) -> Result<()> {
+pub fn optimize_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    resolver: &Resolver,
+) -> Result<()> {
+    let schema = resolver.schema();
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, schema)?,
         Plan::Delete(plan) => optimize_delete_plan(plan, schema)?,
-        Plan::Update(plan) => optimize_update_plan(program, plan, schema)?,
+        Plan::Update(plan) => optimize_update_plan(program, plan, resolver)?,
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
@@ -553,8 +560,9 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
 fn optimize_update_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
-    schema: &Schema,
+    resolver: &Resolver,
 ) -> Result<()> {
+    let schema = resolver.schema();
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
@@ -595,12 +603,15 @@ fn optimize_update_plan(
 
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
-        if has_relevant_triggers_type_only(
-            schema,
-            TriggerEvent::Update,
-            Some(&updated_cols),
-            btree_table,
-        ) {
+        let database_id = table_ref.database_id;
+        if resolver.with_schema(database_id, |s| {
+            has_relevant_triggers_type_only(
+                s,
+                TriggerEvent::Update,
+                Some(&updated_cols),
+                btree_table,
+            )
+        }) {
             break 'requires true;
         }
 
@@ -630,9 +641,20 @@ fn optimize_update_plan(
             break 'requires false;
         };
 
-        plan.set_clauses
-            .iter()
-            .any(|(idx, _)| index.columns.iter().any(|c| c.pos_in_table == *idx))
+        for (set_clause_col_idx, _) in plan.set_clauses.iter() {
+            for c in index.columns.iter() {
+                if let Some(ref expr) = c.expr {
+                    let expr_idx_cols_mask =
+                        expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
+                    if expr_idx_cols_mask.get(*set_clause_col_idx) {
+                        break 'requires true;
+                    }
+                } else if c.pos_in_table == *set_clause_col_idx {
+                    break 'requires true;
+                }
+            }
+        }
+        break 'requires false;
     };
 
     if !requires_ephemeral_table {
@@ -713,7 +735,14 @@ fn add_ephemeral_table_to_update_plan(
                 cte_select: None,
                 cte_explicit_columns: vec![],
                 cte_id: None,
+                cte_definition_only: false,
             });
+    }
+
+    // Preserve outer query references (e.g. CTEs) from the original plan.
+    for outer_ref in table_references_ephemeral_select.outer_query_refs() {
+        plan.table_references
+            .add_outer_query_reference(outer_ref.clone());
     }
 
     let join_order = table_references_ephemeral_select
@@ -786,6 +815,9 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
                     }
                 }
                 Plan::Delete(_) | Plan::Update(_) => {
+                    turso_soft_unreachable!(
+                        "DELETE/UPDATE plans should not appear in FROM clause subqueries"
+                    );
                     return Err(LimboError::InternalError(
                         "DELETE/UPDATE plans should not appear in FROM clause subqueries"
                             .to_string(),
@@ -1328,7 +1360,7 @@ fn optimize_table_access(
                     pos_by_table[*build_table_idx],
                     pos_by_table[*probe_table_idx],
                 ) {
-                    crate::turso_assert!(
+                    turso_assert!(
                         probe_pos == build_pos + 1,
                         "hash join build/probe tables are not adjacent in join order"
                     );
@@ -1340,7 +1372,7 @@ fn optimize_table_access(
 
         for (build_table_idx, materialize_build_input) in build_tables {
             if probe_tables.contains(&build_table_idx) {
-                crate::turso_assert!(
+                turso_assert!(
                     materialize_build_input,
                     "probe->build chaining requires materialized build input"
                 );
@@ -1526,9 +1558,10 @@ fn optimize_table_access(
                             let constraint =
                                 &constraints_per_table[table_idx].constraints[*constraint_vec_pos];
                             let where_term = &mut where_clause[constraint.where_clause_pos.0];
-                            assert!(
+                            turso_assert!(
                                 !where_term.consumed,
-                                "trying to consume a where clause term twice: {where_term:?}",
+                                "trying to consume a where clause term twice",
+                                {"where_term": format!("{where_term:?}")}
                             );
                             if is_outer_join && where_term.from_outer_join.is_none() {
                                 // Don't consume WHERE terms from outer joins if the where term is not part of the outer join condition. Consider:
@@ -1560,9 +1593,11 @@ fn optimize_table_access(
                             });
                         continue;
                     }
-                    assert!(
-                        constraint_refs.len() == 1,
-                        "expected exactly one constraint for rowid seek, got {constraint_refs:?}"
+                    turso_assert_eq!(
+                        constraint_refs.len(),
+                        1,
+                        "expected exactly one constraint for rowid seek",
+                        {"constraint_refs": format!("{constraint_refs:?}")}
                     );
                     table_references.joined_tables_mut()[table_idx].op =
                         if let Some(eq) = constraint_refs[0].eq {
@@ -2293,7 +2328,7 @@ pub fn build_seek_def_from_constraints(
     where_clause: &[WhereTerm],
     referenced_tables: Option<&TableReferences>,
 ) -> Result<SeekDef> {
-    assert!(
+    turso_assert!(
         !constraint_refs.is_empty(),
         "cannot build seek def from empty list of constraint refs"
     );
@@ -2336,7 +2371,7 @@ fn build_seek_def(
     iter_dir: IterationDirection,
     mut key: Vec<SeekRangeConstraint>,
 ) -> Result<SeekDef> {
-    assert!(!key.is_empty());
+    turso_assert!(!key.is_empty());
     let last = key.last().unwrap();
 
     // if we searching for exact key - emit definition immediately with prefix as a full key
@@ -2360,13 +2395,101 @@ fn build_seek_def(
             },
         });
     }
-    assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
+    turso_assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
 
     // pop last key as we will do some form of range search
     let last = key.pop().unwrap();
-
+    let has_upper_bound_only = last.upper_bound.is_some() && last.lower_bound.is_none();
+    let upper_bound_is_lt_or_le = matches!(
+        last.upper_bound.as_ref().map(|(op, _, _)| op),
+        Some(ast::Operator::Less | ast::Operator::LessEquals)
+    );
     // after that all key components must be equality constraints
-    debug_assert!(key.iter().all(|k| k.eq.is_some()));
+    turso_debug_assert!(key.iter().all(|k| k.eq.is_some()));
+
+    let has_prefix = !key.is_empty();
+    let apply_null_boundaries = |start: &mut SeekKey, end: &mut SeekKey| {
+        // Sometimes we must add an extra NULL to the key on purpose.
+        // We do this so scans over composite indexes match SQLite exactly.
+        let start_is_prefix_only = matches!(start.last_component, SeekKeyComponent::None);
+        let start_has_range_component = matches!(start.last_component, SeekKeyComponent::Expr(_));
+        let end_is_prefix_only = matches!(end.last_component, SeekKeyComponent::None);
+        let end_has_range_component = matches!(end.last_component, SeekKeyComponent::Expr(_));
+        let start_is_forward_ge = matches!(start.op, SeekOp::GE { .. })
+            && matches!(iter_dir, IterationDirection::Forwards);
+        let start_is_backward_le = matches!(start.op, SeekOp::LE { .. })
+            && matches!(iter_dir, IterationDirection::Backwards);
+        let end_is_forward_gt =
+            matches!(end.op, SeekOp::GT) && matches!(iter_dir, IterationDirection::Forwards);
+        let end_is_backward_lt =
+            matches!(end.op, SeekOp::LT) && matches!(iter_dir, IterationDirection::Backwards);
+        // 1) Choose a better starting point.
+        //
+        // Example:
+        //   INDEX(c1, c2 ASC)
+        //   WHERE c1='a' AND c2<=999
+        //
+        // If we start from key [c1='a'], we hit rows where c2 is NULL first.
+        // For this case we want to start right after that NULL boundary.
+        // So we:
+        // - use start key [c1='a', NULL]
+        // - change start op from GE to GT
+        // - for backward scans in the symmetric shape, change LE to LT
+        //
+        // We only do this for "< / <=" ranges that do not also have a lower bound.
+        if has_prefix
+            && start_is_prefix_only
+            && end_has_range_component
+            && start_is_forward_ge
+            && has_upper_bound_only
+            && upper_bound_is_lt_or_le
+        {
+            start.last_component = SeekKeyComponent::Null;
+            start.op = SeekOp::GT;
+        } else if has_prefix
+            && start_is_prefix_only
+            && end_has_range_component
+            && start_is_backward_le
+            && has_upper_bound_only
+            && upper_bound_is_lt_or_le
+        {
+            start.last_component = SeekKeyComponent::Null;
+            start.op = SeekOp::LT;
+        }
+
+        // 2) Choose a better stopping point.
+        //
+        // Example:
+        //   INDEX(c1, c2 DESC)
+        //   WHERE c1='a' AND c2<=999
+        //
+        // The stop check must also respect the NULL boundary for c2.
+        // So we:
+        // - use stop key [c1='a', NULL]
+        // - change end op from GT to GE
+        // - for backward scans, change LT to LE
+        //
+        // Same limit as above: only "< / <=" ranges with no lower bound.
+        if has_prefix
+            && end_is_prefix_only
+            && start_has_range_component
+            && end_is_forward_gt
+            && has_upper_bound_only
+            && upper_bound_is_lt_or_le
+        {
+            end.last_component = SeekKeyComponent::Null;
+            end.op = SeekOp::GE { eq_only: false };
+        } else if has_prefix
+            && end_is_prefix_only
+            && start_has_range_component
+            && end_is_backward_lt
+            && has_upper_bound_only
+            && upper_bound_is_lt_or_le
+        {
+            end.last_component = SeekKeyComponent::Null;
+            end.op = SeekOp::LE { eq_only: false };
+        }
+    };
 
     // For the commented examples below, keep in mind that since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.
     // Also keep in mind that index keys are compared based on the number of columns given, so for example:
@@ -2375,7 +2498,7 @@ fn build_seek_def(
     // - if key is GT(x:10, y:NULL), then (x=10, y=0) is GT because NULL is always LT in index key comparisons.
     Ok(match iter_dir {
         IterationDirection::Forwards => {
-            let (start, end) = match last.sort_order {
+            let (mut start, mut end) = match last.sort_order {
                 SortOrder::Asc => {
                     let start = match last.lower_bound {
                         // Forwards, Asc, GT: (x=10 AND y>20)
@@ -2487,6 +2610,7 @@ fn build_seek_def(
                     (start, end)
                 }
             };
+            apply_null_boundaries(&mut start, &mut end);
             SeekDef {
                 prefix: key,
                 iter_dir,
@@ -2495,7 +2619,7 @@ fn build_seek_def(
             }
         }
         IterationDirection::Backwards => {
-            let (start, end) = match last.sort_order {
+            let (mut start, mut end) = match last.sort_order {
                 SortOrder::Asc => {
                     let start = match last.upper_bound {
                         // Backwards, Asc, LT: (x=10 AND y<30)
@@ -2607,6 +2731,7 @@ fn build_seek_def(
                     (start, end)
                 }
             };
+            apply_null_boundaries(&mut start, &mut end);
             SeekDef {
                 prefix: key,
                 iter_dir,
@@ -2631,11 +2756,17 @@ impl TakeOwnership for ast::Expr {
 mod tests {
     use super::{where_term_is_null_rejecting_for_table, Optimizable};
     use crate::translate::emitter::Resolver;
-    use crate::{schema::Schema, SymbolTable};
+    use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
+    use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
 
-    fn empty_resolver<'a>(schema: &'a Schema, syms: &'a SymbolTable) -> Resolver<'a> {
-        Resolver::new(schema, syms)
+    fn empty_resolver<'a>(
+        schema: &'a Schema,
+        database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
+        attached_databases: &'a RwLock<DatabaseCatalog>,
+        syms: &'a SymbolTable,
+    ) -> Resolver<'a> {
+        Resolver::new(schema, database_schemas, attached_databases, syms)
     }
 
     fn no_tail() -> FunctionTail {
@@ -2659,7 +2790,9 @@ mod tests {
     fn constant_classifier_for_coalesce_with_in_list() {
         let schema = Schema::new();
         let syms = SymbolTable::new();
-        let resolver = empty_resolver(&schema, &syms);
+        let database_schemas = RwLock::new(HashMap::default());
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
 
         let expr = fn_call(
             "coalesce",
@@ -2686,7 +2819,9 @@ mod tests {
     fn constant_classifier_for_quote_of_column() {
         let schema = Schema::new();
         let syms = SymbolTable::new();
-        let resolver = empty_resolver(&schema, &syms);
+        let database_schemas = RwLock::new(HashMap::default());
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
 
         let expr = fn_call(
             "quote",

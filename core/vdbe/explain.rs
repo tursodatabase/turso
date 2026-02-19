@@ -1394,6 +1394,7 @@ pub fn insn_to_row(
                 "".to_string()
             ),
             Insn::Destroy {
+                db,
                 root,
                 former_root_reg,
                 is_temp,
@@ -1405,7 +1406,7 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!(
-                    "root iDb={root} former_root={former_root_reg} is_temp={is_temp}"
+                    "root iDb={db} former_root={former_root_reg} is_temp={is_temp}"
                 ),
             ),
             Insn::ResetSorter { cursor_id } => (
@@ -1814,8 +1815,6 @@ pub fn insn_to_row(
                 max_errors,
                 roots,
                 message_register,
-                quick,
-                tables,
             } => (
                 "IntegrityCk",
                 *max_errors as i64,
@@ -1823,10 +1822,7 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "roots={roots:?} message_register={message_register} quick={quick} tables={}",
-                    tables.len()
-                ),
+                format!("roots={roots:?} message_register={message_register}"),
             ),
             Insn::RowData { cursor_id, dest } => (
                 "RowData",
@@ -1846,7 +1842,7 @@ pub fn insn_to_row(
                 0,
                 format!("affinity(r[{}]={:?})", *reg, affinity),
             ),
-            Insn::RenameTable { from, to } => (
+            Insn::RenameTable { db: _, from, to } => (
                 "RenameTable",
                 0,
                 0,
@@ -1855,7 +1851,7 @@ pub fn insn_to_row(
                 0,
                 format!("rename_table({from}, {to})"),
             ),
-            Insn::DropColumn { table, column_index } => (
+            Insn::DropColumn { db: _, table, column_index } => (
                 "DropColumn",
                 0,
                 0,
@@ -1864,7 +1860,7 @@ pub fn insn_to_row(
                 0,
                 format!("drop_column({table}, {column_index})"),
             ),
-            Insn::AddColumn { table, column, .. } => (
+            Insn::AddColumn { db: _, table, column, .. } => (
                 "AddColumn",
                 0,
                 0,
@@ -1873,7 +1869,7 @@ pub fn insn_to_row(
                 0,
                 format!("add_column({table}, {column:?})"),
             ),
-            Insn::AlterColumn { table, column_index, definition: column, rename } => (
+            Insn::AlterColumn { db: _, table, column_index, definition: column, rename } => (
                 "AlterColumn",
                 0,
                 0,

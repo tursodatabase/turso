@@ -1,3 +1,4 @@
+use crate::turso_assert;
 use crate::{
     function::MathFunc,
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
@@ -129,7 +130,7 @@ impl ComparisonOp {
         null_eq: bool,
     ) -> bool {
         let (lhs, rhs) = (lhs.as_value_ref(), rhs.as_value_ref());
-        assert!(matches!(lhs, ValueRef::Null) || matches!(rhs, ValueRef::Null));
+        turso_assert!(matches!(lhs, ValueRef::Null) || matches!(rhs, ValueRef::Null));
 
         match self {
             ComparisonOp::Eq => {
@@ -916,15 +917,15 @@ impl Value {
     }
 
     pub fn exec_subtract(&self, rhs: &Value) -> Value {
-        (|| (Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?)))().into()
+        (|| Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_multiply(&self, rhs: &Value) -> Value {
-        (|| (Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?)))().into()
+        (|| Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_divide(&self, rhs: &Value) -> Value {
-        (|| (Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?)))().into()
+        (|| Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_bit_and(&self, rhs: &Value) -> Value {

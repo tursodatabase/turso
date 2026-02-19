@@ -1,0 +1,17 @@
+@database database/integrity_not_null_violation.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-not-null-violation {
+    PRAGMA integrity_check;
+}
+expect {
+    NULL value in t.b
+}
+
+test quick-check-not-null-violation {
+    PRAGMA quick_check;
+}
+expect {
+    NULL value in t.b
+}

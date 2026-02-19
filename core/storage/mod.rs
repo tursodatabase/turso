@@ -29,7 +29,7 @@ pub(crate) mod wal;
 
 #[macro_export]
 macro_rules! return_corrupt {
-    ($msg:expr) => {
-        return Err(LimboError::Corrupt($msg.into()));
+    ($($arg:tt)*) => {
+        return Err(LimboError::Corrupt(format!($($arg)*)));
     };
 }

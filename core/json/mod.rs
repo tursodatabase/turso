@@ -19,6 +19,11 @@ use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation,
 use std::borrow::Cow;
 use std::str::FromStr;
 
+// Object/array headers with inline payload size <= 7 are ambiguous with 8-byte scalar blobs:
+// 1-byte header + 7-byte payload == 8 bytes (e.g. INT/FLOAT scalar bytes like `0x7C 12 34 56 78 9A BC DE`
+// It is not JSONB, but it is being recognized as JSONB.
+const JSONB_AMBIGUOUS_PAYLOAD_MAX: usize = 7;
+
 #[derive(Debug, Clone, Copy)]
 pub enum Conv {
     Strict,
@@ -114,6 +119,26 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     let str = std::str::from_utf8(truncated)
         .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
+}
+
+fn is_jsonb_blob(slice: &[u8]) -> bool {
+    let Ok((header, header_offset)) = JsonbHeader::from_slice(0, slice) else {
+        return false;
+    };
+    let payload_size = header.payload_size();
+    let Some(total_expected) = header_offset.checked_add(payload_size) else {
+        return false;
+    };
+    if total_expected != slice.len() {
+        return false;
+    }
+
+    let jsonb = Jsonb::from_raw_data(slice);
+    if header.is_scalar() || payload_size <= JSONB_AMBIGUOUS_PAYLOAD_MAX {
+        jsonb.is_valid()
+    } else {
+        jsonb.element_type().is_ok()
+    }
 }
 
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
@@ -559,6 +584,9 @@ pub fn json_string_to_db_type(
         return Ok(Value::Blob(json.data()));
     }
     let mut json_string = json.to_string()?;
+    if matches!(flag, OutputVariant::String) {
+        return Ok(Value::Text(Text::json(json_string)));
+    }
     match element_type {
         ElementType::ARRAY | ElementType::OBJECT => Ok(Value::Text(Text::json(json_string))),
         ElementType::TEXT | ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW => {
@@ -584,7 +612,7 @@ pub fn json_string_to_db_type(
                     Ok(Value::Text(Text::json(simplified.to_string())))
                 }
                 Ok(float_val) => Ok(Value::from_f64(float_val)),
-                Err(_) => Ok(Value::Null),
+                Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
             }
         }
         ElementType::INT | ElementType::INT5 => {
@@ -595,7 +623,7 @@ pub fn json_string_to_db_type(
                 let res = f64::from_str(&json_string);
                 match res {
                     Ok(num) => Ok(Value::from_f64(num)),
-                    Err(_) => Ok(Value::Null),
+                    Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
                 }
             }
         }
@@ -794,12 +822,26 @@ where
 /// succeeded, and Value::from_i64(0) if it didn't.
 pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
     let json_value = json_value.as_value_ref();
-    if matches!(json_value, ValueRef::Null) {
-        return Value::Null;
+    match json_value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Blob(blob) => {
+            let index = blob
+                .iter()
+                .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                .unwrap_or(blob.len());
+            let slice = &blob[index..];
+            if is_jsonb_blob(slice) {
+                Value::from_i64(0)
+            } else {
+                parse_as_json_text(slice, Conv::Strict)
+                    .map(|_| Value::from_i64(1))
+                    .unwrap_or_else(|_| Value::from_i64(0))
+            }
+        }
+        _ => convert_dbtype_to_jsonb(json_value, Conv::Strict)
+            .map(|_| Value::from_i64(1))
+            .unwrap_or_else(|_| Value::from_i64(0)),
     }
-    convert_dbtype_to_jsonb(json_value, Conv::Strict)
-        .map(|_| Value::from_i64(1))
-        .unwrap_or_else(|_| Value::from_i64(0))
 }
 
 pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
@@ -1795,5 +1837,12 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(result.unwrap().to_text().unwrap(), r#"{"field":"value"}"#,);
+    }
+
+    #[test]
+    fn test_is_jsonb_blob_rejects_scalar_like_overlap_header() {
+        let overlapping_scalar = b"|1234567";
+        assert_eq!(overlapping_scalar.len(), JSONB_AMBIGUOUS_PAYLOAD_MAX + 1);
+        assert!(!is_jsonb_blob(overlapping_scalar));
     }
 }

@@ -599,3 +599,88 @@ test upsert-unresolved-table-in-where {
 expect error {
     .*no such column.*
 }
+
+# CHECK constraints are evaluated on INSERT values BEFORE conflict resolution.
+# Even if a conflict exists and DO UPDATE would produce valid values, the
+# statement fails if INSERT values violate CHECK.
+
+# INSERT violates CHECK, conflict exists, DO UPDATE would be valid -> ERROR
+test upsert-check-insert-violates-check-conflict-exists {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
+    INSERT INTO t VALUES (1, 50, 'one');
+    INSERT INTO t VALUES (1, 200, 'bad') ON CONFLICT(id) DO UPDATE SET val = 70, name = 'fixed';
+}
+expect error {
+    .*CHECK constraint failed.*
+}
+
+# INSERT violates CHECK, no conflict exists -> ERROR
+test upsert-check-insert-violates-check-no-conflict {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
+    INSERT INTO t VALUES (1, 200, 'bad') ON CONFLICT(id) DO UPDATE SET val = 70, name = 'fixed';
+}
+expect error {
+    .*CHECK constraint failed.*
+}
+
+# INSERT valid, conflict exists, DO UPDATE violates CHECK -> ERROR
+test upsert-check-update-violates-check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
+    INSERT INTO t VALUES (1, 50, 'one');
+    INSERT INTO t VALUES (1, 60, 'ok') ON CONFLICT(id) DO UPDATE SET val = 200, name = 'bad_update';
+}
+expect error {
+    .*CHECK constraint failed.*
+}
+
+# INSERT valid, conflict exists, DO UPDATE valid -> SUCCESS
+test upsert-check-all-valid-with-conflict {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
+    INSERT INTO t VALUES (1, 50, 'one');
+    INSERT INTO t VALUES (1, 60, 'two') ON CONFLICT(id) DO UPDATE SET val = 70, name = 'updated';
+    SELECT * FROM t;
+}
+expect {
+    1|70|updated
+}
+
+# INSERT valid, no conflict -> inserts normally
+test upsert-check-valid-insert-no-conflict {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
+    INSERT INTO t VALUES (1, 60, 'ok') ON CONFLICT(id) DO UPDATE SET val = 70, name = 'updated';
+    SELECT * FROM t;
+}
+expect {
+    1|60|ok
+}
+
+# UNIQUE index: INSERT violates CHECK, conflict exists -> ERROR
+test upsert-check-unique-index-insert-violates {
+    CREATE TABLE t(a TEXT UNIQUE, val INTEGER CHECK(val >= 0), tag TEXT);
+    INSERT INTO t VALUES ('key', 10, 'orig');
+    INSERT INTO t VALUES ('key', -5, 'new') ON CONFLICT(a) DO UPDATE SET val = 42, tag = 'updated';
+}
+expect error {
+    .*CHECK constraint failed.*
+}
+
+# DO NOTHING also evaluates CHECK on INSERT values
+test upsert-check-do-nothing-insert-violates {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100));
+    INSERT INTO t VALUES (1, 50);
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO NOTHING;
+}
+expect error {
+    .*CHECK constraint failed.*
+}
+
+# excluded. references with valid values -> SUCCESS
+test upsert-check-excluded-ref-valid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
+    INSERT INTO t VALUES (1, 50, 'one');
+    INSERT INTO t VALUES (1, 80, 'two') ON CONFLICT(id) DO UPDATE SET val = excluded.val, name = excluded.name;
+    SELECT * FROM t;
+}
+expect {
+    1|80|two
+}

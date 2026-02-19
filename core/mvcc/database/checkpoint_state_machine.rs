@@ -13,6 +13,7 @@ use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord};
+use crate::{turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Numeric, Pager, Result, SyncMode,
     TransactionState, Value, ValueRef,
@@ -172,6 +173,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             .values()
             .flatten()
             .map(|index| {
+                turso_assert!(index.root_page != 0, "index root_page must be non-zero");
                 (
                     mvstore.get_table_id_from_root_page(index.root_page),
                     index.clone(),
@@ -179,6 +181,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             })
             .collect();
         let mvcc_meta_table = schema.get_btree_table(MVCC_META_TABLE_NAME).map(|table| {
+            turso_assert!(
+                table.root_page != 0,
+                "mvcc meta table root_page must be non-zero"
+            );
             (
                 mvstore.get_table_id_from_root_page(table.root_page),
                 table.columns.len(),
@@ -805,7 +811,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             let known_root_page = known_root_page
                                 .value()
                                 .expect("Table ID does not have a root page");
-                            assert_eq!(known_root_page, root_page, "MV store root page does not match root page in the sqlite_schema record: {known_root_page} != {root_page}");
+                            turso_assert_eq!(
+                                known_root_page,
+                                root_page,
+                                "checkpoint root page mismatch for BTreeDestroy",
+                                { "known_root_page": known_root_page, "schema_root_page": root_page }
+                            );
                             let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
                                 cursor.clone()
                             } else {
@@ -830,7 +841,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 Some(created_root_page as u64),
                             );
                             // Index struct should already be stored in index_id_to_index from collect_committed_versions
-                            assert!(self.index_id_to_index.contains_key(&index_id), "Index struct for index_id {index_id} must be stored before creating btree");
+                            turso_assert!(
+                                self.index_id_to_index.contains_key(&index_id),
+                                "checkpoint index struct missing before BTreeCreateIndex",
+                                { "index_id": i64::from(index_id) }
+                            );
                         }
                         SpecialWrite::BTreeDestroyIndex {
                             index_id,
@@ -845,9 +860,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             let known_root_page = known_root_page
                                 .value()
                                 .expect("Index ID does not have a root page");
-                            assert_eq!(
-                                known_root_page, root_page,
-                                "MV store root page does not match root page in the sqlite_schema record: {known_root_page} != {root_page}"
+                            turso_assert_eq!(
+                                known_root_page,
+                                root_page,
+                                "checkpoint root page mismatch for BTreeDestroyIndex",
+                                { "known_root_page": known_root_page, "schema_root_page": root_page }
                             );
 
                             let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {

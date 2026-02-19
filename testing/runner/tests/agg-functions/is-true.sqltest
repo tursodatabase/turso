@@ -1,0 +1,14 @@
+@database :memory:
+
+test sum-is-true-ungrouped-and-join {
+    CREATE TABLE t0(c0 INT NOT NULL);
+    CREATE TABLE t1(c0 INT NOT NULL);
+    INSERT INTO t0 VALUES (1), (2);
+    INSERT INTO t1 VALUES (10), (20);
+    SELECT SUM(true IS TRUE) FROM t1;
+    SELECT SUM(true IS TRUE) FROM t1 INNER JOIN t0 ON (true);
+}
+expect {
+    2
+    4
+}

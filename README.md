@@ -404,6 +404,9 @@ List of rewarded cases:
 
 * B-Tree interior cell replacement issue in btrees with depth >=3 ([#2106](https://github.com/tursodatabase/turso/issues/2106))
 * Don't allow autovacuum to be flipped on non-empty databases ([#3830](https://github.com/tursodatabase/turso/pull/3830))
+* Self-insert with nested subquery generates corrupt data ([#3436](https://github.com/tursodatabase/turso/pull/3436))
+* Ptrmap data corruption with pre-initialized autovacuum database ([#3894](https://github.com/tursodatabase/turso/pull/3894))
+* WAL corruption on statement rollback with constraint violation ([#4493](https://github.com/tursodatabase/turso/pull/4493))
 
 More details [here](https://turso.algora.io).
 

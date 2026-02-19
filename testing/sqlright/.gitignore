@@ -1,0 +1,8 @@
+# SQLRight build (cloned repo + compiled binaries)
+/build/
+
+# Fuzzing results
+/results/
+
+# Coverage reports
+/coverage_report/

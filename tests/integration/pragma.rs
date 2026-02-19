@@ -1,4 +1,5 @@
-use crate::common::TempDatabase;
+use crate::common::{limbo_exec_rows, TempDatabase};
+use rusqlite::types::Value as RValue;
 #[cfg(not(target_vendor = "apple"))]
 use turso_core::LimboError;
 use turso_core::{Numeric, StepResult, Value};
@@ -388,4 +389,47 @@ fn test_pragma_cache_size_min_value(db: TempDatabase) {
         panic!("expected integer value");
     };
     assert_eq!(*value, 200);
+}
+
+#[turso_macros::test]
+fn test_pragma_wal_checkpoint_targets_attached_database(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Attach an in-memory database
+    conn.execute("ATTACH ':memory:' AS aux").unwrap();
+
+    // Write to the attached database to generate WAL frames on its pager
+    conn.execute("CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO aux.t1 VALUES(1, 'hello')")
+        .unwrap();
+
+    // Checkpoint the attached database — before the fix, this would target the
+    // main pager instead. The aux pager should have WAL frames, so the returned
+    // frame counts must be non-zero.
+    let rows = limbo_exec_rows(&conn, "PRAGMA aux.wal_checkpoint");
+    assert_eq!(
+        rows.len(),
+        1,
+        "wal_checkpoint should return exactly one row"
+    );
+
+    let row = &rows[0];
+    // row is [busy, log, checkpointed]
+    let RValue::Integer(busy) = &row[0] else {
+        panic!("expected integer for busy flag, got {:?}", row[0]);
+    };
+    let RValue::Integer(log) = &row[1] else {
+        panic!("expected integer for log frames, got {:?}", row[1]);
+    };
+    let RValue::Integer(checkpointed) = &row[2] else {
+        panic!("expected integer for checkpointed frames, got {:?}", row[2]);
+    };
+
+    assert_eq!(*busy, 0, "checkpoint should not be busy");
+    assert!(*log > 0, "aux pager should have WAL frames (got {log})");
+    assert!(
+        *checkpointed > 0,
+        "aux pager should have checkpointed frames (got {checkpointed})"
+    );
 }

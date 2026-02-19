@@ -99,10 +99,10 @@ fn test_newrowid_mvcc_concurrent(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Regression test: statement-level rollback (from FK constraint violation)
-/// must clean up tx.write_set so that commit validation doesn't find stale
-/// entries pointing to pre-existing committed versions and panic with
-/// "there is another row insterted and not updated/deleted from before".
+// Regression test: statement-level rollback (from FK constraint violation)
+// must clean up tx.write_set so that commit validation doesn't find stale
+// entries pointing to pre-existing committed versions and panic with
+// "there is another row insterted and not updated/deleted from before".
 #[turso_macros::test]
 fn test_stmt_rollback_cleans_write_set(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -140,8 +140,8 @@ fn test_stmt_rollback_cleans_write_set(tmp_db: TempDatabase) -> anyhow::Result<(
     Ok(())
 }
 
-/// Same as test_stmt_rollback_cleans_write_set but with an index on the
-/// child table, exercising the index version rollback path as well.
+// Same as test_stmt_rollback_cleans_write_set but with an index on the
+// child table, exercising the index version rollback path as well.
 #[turso_macros::test]
 fn test_stmt_rollback_cleans_write_set_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();

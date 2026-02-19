@@ -1,3 +1,4 @@
+use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
@@ -138,6 +139,10 @@ pub struct ProgramBuilder {
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
+    /// Set of database IDs that need write transactions (for attached databases).
+    write_databases: std::collections::HashSet<usize>,
+    /// Schema cookies for attached databases at prepare time.
+    write_database_cookies: std::collections::HashMap<usize, u32>,
     rollback: bool,
     /// The mode in which the query is being executed.
     query_mode: QueryMode,
@@ -389,6 +394,8 @@ impl ProgramBuilder {
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
             txn_mode: TransactionMode::None,
+            write_databases: std::collections::HashSet::new(),
+            write_database_cookies: std::collections::HashMap::new(),
             rollback: false,
             query_mode,
             current_parent_explain_idx: None,
@@ -640,7 +647,7 @@ impl ProgramBuilder {
     }
 
     pub fn alloc_cursor_id_keyed(&mut self, key: CursorKey, cursor_type: CursorType) -> usize {
-        assert!(
+        turso_assert!(
             !self
                 .cursor_ref
                 .iter()
@@ -686,7 +693,7 @@ impl ProgramBuilder {
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((key, cursor_type));
-        assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
+        turso_assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
         cursor
     }
 
@@ -810,7 +817,7 @@ impl ProgramBuilder {
                 self.current_parent_explain_idx = *p2;
             }
         } else {
-            debug_assert!(self.current_parent_explain_idx.is_none())
+            turso_debug_assert!(self.current_parent_explain_idx.is_none());
         }
     }
 
@@ -918,7 +925,7 @@ impl ProgramBuilder {
     /// reordering the emitted instructions.
     #[inline]
     pub fn preassign_label_to_next_insn(&mut self, label: BranchOffset) {
-        assert!(label.is_label(), "BranchOffset {label:?} is not a label");
+        turso_assert!(label.is_label(), "BranchOffset should be a label", { "label": format!("{:?}", label) });
         self._resolve_label(label, self.offset().sub(1u32), JumpTarget::AfterThisInsn);
     }
 
@@ -934,8 +941,8 @@ impl ProgramBuilder {
     }
 
     fn _resolve_label(&mut self, label: BranchOffset, to_offset: BranchOffset, target: JumpTarget) {
-        assert!(matches!(label, BranchOffset::Label(_)));
-        assert!(matches!(to_offset, BranchOffset::Offset(_)));
+        turso_assert!(matches!(label, BranchOffset::Label(_)));
+        turso_assert!(matches!(to_offset, BranchOffset::Offset(_)));
         let BranchOffset::Label(label_number) = label else {
             unreachable!("Label is not a label");
         };
@@ -1301,10 +1308,17 @@ impl ProgramBuilder {
     }
 
     /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
-    /// TODO: as we currently do not support multiple dbs
-    /// this function just sets a write operation/transaction for the current db
     pub fn begin_write_operation(&mut self) {
         self.txn_mode = TransactionMode::Write;
+        self.write_databases.insert(0);
+    }
+
+    /// Begin a write operation on a specific database (for attached databases).
+    pub fn begin_write_on_database(&mut self, database_id: usize, schema_cookie: u32) {
+        self.txn_mode = TransactionMode::Write;
+        self.write_databases.insert(database_id);
+        self.write_database_cookies
+            .insert(database_id, schema_cookie);
     }
 
     pub fn begin_read_operation(&mut self) {
@@ -1346,11 +1360,27 @@ impl ProgramBuilder {
             self.preassign_label_to_next_insn(self.init_label);
 
             if !matches!(self.txn_mode, TransactionMode::None) {
+                // Emit Transaction for main database (db 0) always
                 self.emit_insn(Insn::Transaction {
                     db: 0,
                     tx_mode: self.txn_mode,
                     schema_cookie: schema.schema_version,
                 });
+                // Emit Transaction for each attached database that needs a write
+                for &db_id in &self.write_databases.clone() {
+                    if db_id >= 2 {
+                        let cookie = self
+                            .write_database_cookies
+                            .get(&db_id)
+                            .copied()
+                            .unwrap_or(0);
+                        self.emit_insn(Insn::Transaction {
+                            db: db_id,
+                            tx_mode: self.txn_mode,
+                            schema_cookie: cookie,
+                        });
+                    }
+                }
             }
 
             if !self.constant_spans.is_empty() {
@@ -1504,6 +1534,7 @@ impl ProgramBuilder {
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
             prepare_context: PrepareContext::from_connection(&connection),
+            write_databases: self.write_databases,
         };
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }

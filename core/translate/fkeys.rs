@@ -34,24 +34,24 @@ pub fn emit_guarded_fk_decrement(
 
 /// Open a read cursor on an index and return its cursor id.
 #[inline]
-pub fn open_read_index(program: &mut ProgramBuilder, idx: &Arc<Index>) -> usize {
+pub fn open_read_index(program: &mut ProgramBuilder, idx: &Arc<Index>, db: usize) -> usize {
     let icur = program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone()));
     program.emit_insn(Insn::OpenRead {
         cursor_id: icur,
         root_page: idx.root_page,
-        db: 0,
+        db,
     });
     icur
 }
 
 /// Open a read cursor on a table and return its cursor id.
 #[inline]
-pub fn open_read_table(program: &mut ProgramBuilder, tbl: &Arc<BTreeTable>) -> usize {
+pub fn open_read_table(program: &mut ProgramBuilder, tbl: &Arc<BTreeTable>, db: usize) -> usize {
     let tcur = program.alloc_cursor_id(CursorType::BTreeTable(tbl.clone()));
     program.emit_insn(Insn::OpenRead {
         cursor_id: tcur,
         root_page: tbl.root_page,
-        db: 0,
+        db,
     });
     tcur
 }
@@ -131,12 +131,13 @@ fn table_scan_match_any<F>(
     child_cols: &[String],
     parent_key_start: usize,
     self_exclude_rowid: Option<usize>,
+    database_id: usize,
     mut on_match: F,
 ) -> Result<()>
 where
     F: FnMut(&mut ProgramBuilder) -> Result<()>,
 {
-    let ccur = open_read_table(program, child_tbl);
+    let ccur = open_read_table(program, child_tbl, database_id);
     let done = program.allocate_label();
     program.emit_insn(Insn::Rewind {
         cursor_id: ccur,
@@ -287,7 +288,6 @@ pub fn stabilize_new_row_for_fk(
 #[allow(clippy::too_many_arguments)]
 pub fn emit_parent_key_change_checks(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     table_btree: &BTreeTable,
     indexes_to_update: impl Iterator<Item = impl AsRef<Index>>,
     cursor_id: usize,
@@ -296,11 +296,13 @@ pub fn emit_parent_key_change_checks(
     rowid_new_reg: usize,
     rowid_set_clause_reg: Option<usize>,
     set_clauses: &[(usize, Box<Expr>)],
+    database_id: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
     let updated_positions: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
-    let incoming = resolver
-        .schema
-        .resolved_fks_referencing(&table_btree.name)?;
+    let incoming = resolver.with_schema(database_id, |s| {
+        s.resolved_fks_referencing(&table_btree.name)
+    })?;
     let affects_pk = incoming
         .iter()
         .any(|r| r.parent_key_may_change(&updated_positions, table_btree));
@@ -314,9 +316,10 @@ pub fn emit_parent_key_change_checks(
         emit_rowid_pk_change_check(
             program,
             &incoming,
-            resolver,
             old_rowid_reg,
             rowid_set_clause_reg.unwrap_or(old_rowid_reg),
+            database_id,
+            resolver,
         )?;
     }
 
@@ -328,9 +331,10 @@ pub fn emit_parent_key_change_checks(
             old_rowid_reg,
             rowid_new_reg,
             &incoming,
-            resolver,
             table_btree,
             index.as_ref(),
+            database_id,
+            resolver,
         )?;
     }
     Ok(())
@@ -340,9 +344,10 @@ pub fn emit_parent_key_change_checks(
 pub fn emit_rowid_pk_change_check(
     program: &mut ProgramBuilder,
     incoming: &[ResolvedFkRef],
-    resolver: &Resolver,
     old_rowid_reg: usize,
     new_rowid_reg: usize,
+    database_id: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
     let skip = program.allocate_label();
     program.emit_insn(Insn::Eq {
@@ -366,7 +371,7 @@ pub fn emit_rowid_pk_change_check(
         extra_amount: 0,
     });
 
-    emit_fk_parent_pk_change_counters(program, incoming, resolver, old_pk, new_pk, 1)?;
+    emit_fk_parent_pk_change_counters(program, incoming, old_pk, new_pk, 1, database_id, resolver)?;
     program.preassign_label_to_next_insn(skip);
     Ok(())
 }
@@ -395,9 +400,10 @@ pub fn emit_parent_index_key_change_checks(
     old_rowid_reg: usize,
     new_rowid_reg: usize,
     incoming: &[ResolvedFkRef],
-    resolver: &Resolver,
     table_btree: &BTreeTable,
     index: &Index,
+    database_id: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
     // Only process FKs that:
     // 1. Reference this specific index (OLD/NEW key vectors are built from this index's columns)
@@ -480,7 +486,15 @@ pub fn emit_parent_index_key_change_checks(
     }
 
     program.preassign_label_to_next_insn(changed);
-    emit_fk_parent_pk_change_counters(program, &matching_fks, resolver, old_key, new_key, idx_len)?;
+    emit_fk_parent_pk_change_counters(
+        program,
+        &matching_fks,
+        old_key,
+        new_key,
+        idx_len,
+        database_id,
+        resolver,
+    )?;
     program.preassign_label_to_next_insn(skip);
     Ok(())
 }
@@ -488,30 +502,34 @@ pub fn emit_parent_index_key_change_checks(
 /// Two-pass parent-side maintenance for UPDATE of a parent key:
 /// 1. Probe child for OLD key, increment deferred counter if any references exist.
 /// 2. Probe child for NEW key, guarded decrement cancels exactly one increment if present
+#[allow(clippy::too_many_arguments)]
 pub fn emit_fk_parent_pk_change_counters(
     program: &mut ProgramBuilder,
     incoming: &[ResolvedFkRef],
-    resolver: &Resolver,
     old_pk_start: usize,
     new_pk_start: usize,
     n_cols: usize,
+    database_id: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
     for fk_ref in incoming {
         emit_fk_parent_key_probe(
             program,
-            resolver,
             fk_ref,
             old_pk_start,
             n_cols,
             ParentProbePass::Old,
+            database_id,
+            resolver,
         )?;
         emit_fk_parent_key_probe(
             program,
-            resolver,
             fk_ref,
             new_pk_start,
             n_cols,
             ParentProbePass::New,
+            database_id,
+            resolver,
         )?;
     }
     Ok(())
@@ -526,13 +544,15 @@ enum ParentProbePass {
 /// Probe the child side for a given parent key
 /// For RESTRICT on OLD pass: emits immediate HALT
 /// For NO ACTION on OLD pass: increments FK violation counter
+#[allow(clippy::too_many_arguments)]
 fn emit_fk_parent_key_probe(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     fk_ref: &ResolvedFkRef,
     parent_key_start: usize,
     n_cols: usize,
     pass: ParentProbePass,
+    database_id: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
     let child_tbl = &fk_ref.child_table;
     let child_cols = &fk_ref.fk.child_columns;
@@ -568,7 +588,10 @@ fn emit_fk_parent_key_probe(
     };
 
     // Prefer exact child index on (child_cols...)
-    let idx = resolver.schema.get_indices(&child_tbl.name).find(|ix| {
+    let indices: Vec<_> = resolver.with_schema(database_id, |s| {
+        s.get_indices(&child_tbl.name).cloned().collect()
+    });
+    let idx = indices.iter().find(|ix| {
         ix.columns.len() == child_cols.len()
             && ix
                 .columns
@@ -578,7 +601,7 @@ fn emit_fk_parent_key_probe(
     });
 
     if let Some(ix) = idx {
-        let icur = open_read_index(program, ix);
+        let icur = open_read_index(program, ix, database_id);
         let probe = copy_with_affinity(program, parent_key_start, n_cols, ix, child_tbl);
 
         // FOUND => on_match; NOT FOUND => no-op
@@ -591,6 +614,7 @@ fn emit_fk_parent_key_probe(
             child_cols,
             parent_key_start,
             None,
+            database_id,
             on_match,
         )?;
     }
@@ -643,13 +667,14 @@ fn build_parent_key(
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_child_update_counters(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     child_tbl: &BTreeTable,
     child_table_name: &str,
     child_cursor_id: usize,
     new_start_reg: usize,
     new_rowid_reg: usize,
     updated_cols: &HashSet<usize>,
+    database_id: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
     // Helper: materialize OLD tuple for this FK; returns (start_reg, ncols) or None if any component is NULL.
     let load_old_tuple =
@@ -682,7 +707,9 @@ pub fn emit_fk_child_update_counters(
             Some((start, n))
         };
 
-    for fk_ref in resolver.schema.resolved_fks_for_child(child_table_name)? {
+    for fk_ref in
+        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
+    {
         // If the child-side FK columns did not change, there is nothing to do.
         if !fk_ref.child_key_changed(updated_cols, child_tbl) {
             continue;
@@ -696,10 +723,9 @@ pub fn emit_fk_child_update_counters(
                 if fk_ref.parent_uses_rowid {
                     // Parent key is rowid: probe parent table by rowid
                     let parent_tbl = resolver
-                        .schema
-                        .get_btree_table(&fk_ref.fk.parent_table)
+                        .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                         .expect("parent btree");
-                    let pcur = open_read_table(program, &parent_tbl);
+                    let pcur = open_read_table(program, &parent_tbl, database_id);
 
                     // first FK col is the rowid value
                     let rid = program.alloc_register();
@@ -733,14 +759,13 @@ pub fn emit_fk_child_update_counters(
                 } else {
                     // Parent key is a unique index: use index probe and guarded decrement on NOT FOUND
                     let parent_tbl = resolver
-                        .schema
-                        .get_btree_table(&fk_ref.fk.parent_table)
+                        .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                         .expect("parent btree");
                     let idx = fk_ref
                         .parent_unique_index
                         .as_ref()
                         .expect("parent unique index required");
-                    let icur = open_read_index(program, idx);
+                    let icur = open_read_index(program, idx, database_id);
 
                     // Copy OLD tuple and apply parent index affinities
                     let probe = copy_with_affinity(program, old_start, ncols, idx, &parent_tbl);
@@ -779,10 +804,9 @@ pub fn emit_fk_child_update_counters(
 
         if fk_ref.parent_uses_rowid {
             let parent_tbl = resolver
-                .schema
-                .get_btree_table(&fk_ref.fk.parent_table)
+                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                 .expect("parent btree");
-            let pcur = open_read_table(program, &parent_tbl);
+            let pcur = open_read_table(program, &parent_tbl, database_id);
 
             // Take the first child column value from NEW image
             let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
@@ -816,14 +840,13 @@ pub fn emit_fk_child_update_counters(
             emit_fk_violation(program, &fk_ref.fk)?;
         } else {
             let parent_tbl = resolver
-                .schema
-                .get_btree_table(&fk_ref.fk.parent_table)
+                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                 .expect("parent btree");
             let idx = fk_ref
                 .parent_unique_index
                 .as_ref()
                 .expect("parent unique index required");
-            let icur = open_read_index(program, idx);
+            let icur = open_read_index(program, idx, database_id);
 
             // Build NEW probe (in FK child column order, aligns with parent index columns)
             let probe = {
@@ -877,14 +900,16 @@ pub fn emit_fk_child_update_counters(
 /// Raises a violation if any child row references the parent key.
 /// For RESTRICT: emits immediate HALT
 /// For NO ACTION: increments FK violation counter (checked at statement/transaction end)
+#[allow(clippy::too_many_arguments)]
 fn emit_fk_delete_parent_existence_check_single(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     fk_ref: &ResolvedFkRef,
     parent_bt: &Arc<BTreeTable>,
     parent_table_name: &str,
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
+    database_id: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
     let is_self_ref = fk_ref
         .child_table
@@ -917,17 +942,17 @@ fn emit_fk_delete_parent_existence_check_single(
 
     let child_cols = &fk_ref.fk.child_columns;
     let child_idx = if !is_self_ref {
-        resolver
-            .schema
-            .get_indices(&fk_ref.child_table.name)
-            .find(|idx| {
-                idx.columns.len() == child_cols.len()
-                    && idx
-                        .columns
-                        .iter()
-                        .zip(child_cols.iter())
-                        .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-            })
+        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
+            s.get_indices(&fk_ref.child_table.name).cloned().collect()
+        });
+        indices.into_iter().find(|idx| {
+            idx.columns.len() == child_cols.len()
+                && idx
+                    .columns
+                    .iter()
+                    .zip(child_cols.iter())
+                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
+        })
     } else {
         None
     };
@@ -942,8 +967,8 @@ fn emit_fk_delete_parent_existence_check_single(
         Ok(())
     };
 
-    if let Some(idx) = child_idx {
-        let icur = open_read_index(program, idx);
+    if let Some(ref idx) = child_idx {
+        let icur = open_read_index(program, idx, database_id);
         let probe = copy_with_affinity(program, parent_key_start, ncols, idx, &fk_ref.child_table);
         index_probe(
             program,
@@ -967,6 +992,7 @@ fn emit_fk_delete_parent_existence_check_single(
             } else {
                 None
             },
+            database_id,
             |p| {
                 emit_violation(p)?;
                 Ok(())
@@ -980,7 +1006,6 @@ fn emit_fk_delete_parent_existence_check_single(
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_update_parent_actions(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     table_btree: &BTreeTable,
     indexes_to_update: impl Iterator<Item = impl AsRef<Index>>,
     cursor_id: usize,
@@ -989,11 +1014,13 @@ pub fn emit_fk_update_parent_actions(
     rowid_new_reg: usize,
     rowid_set_clause_reg: Option<usize>,
     set_clauses: &[(usize, Box<Expr>)],
+    database_id: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
     let updated_positions: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
-    let incoming = resolver
-        .schema
-        .resolved_fks_referencing(&table_btree.name)?;
+    let incoming = resolver.with_schema(database_id, |s| {
+        s.resolved_fks_referencing(&table_btree.name)
+    })?;
     let affects_pk = incoming
         .iter()
         .any(|r| r.parent_key_may_change(&updated_positions, table_btree));
@@ -1028,9 +1055,10 @@ pub fn emit_fk_update_parent_actions(
                         emit_rowid_pk_change_check(
                             program,
                             &[fk_ref.clone()],
-                            resolver,
                             old_rowid_reg,
                             rowid_set_clause_reg.unwrap_or(old_rowid_reg),
+                            database_id,
+                            resolver,
                         )?;
                     }
 
@@ -1042,9 +1070,10 @@ pub fn emit_fk_update_parent_actions(
                             old_rowid_reg,
                             rowid_new_reg,
                             &[fk_ref.clone()],
-                            resolver,
                             table_btree,
                             index.as_ref(),
+                            database_id,
+                            resolver,
                         )?;
                     }
                 }
@@ -1063,9 +1092,10 @@ pub fn emit_fk_update_parent_actions(
             emit_rowid_pk_change_check(
                 program,
                 &incoming,
-                resolver,
                 old_rowid_reg,
                 rowid_set_clause_reg.unwrap_or(old_rowid_reg),
+                database_id,
+                resolver,
             )?;
         }
 
@@ -1077,9 +1107,10 @@ pub fn emit_fk_update_parent_actions(
                 old_rowid_reg,
                 rowid_new_reg,
                 &incoming,
-                resolver,
                 table_btree,
                 index.as_ref(),
+                database_id,
+                resolver,
             )?;
         }
     }
@@ -1248,7 +1279,7 @@ fn emit_fk_action_subprogram(
         connection,
         description,
     )?;
-    subprogram_builder.epilogue(resolver.schema);
+    subprogram_builder.epilogue(resolver.schema());
     let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
 
     // Build params: OLD key register indices, then optionally NEW key register indices
@@ -1281,20 +1312,26 @@ fn emit_fk_action_subprogram(
     Ok(())
 }
 
+/// Build a QualifiedName with db_name set for non-main databases.
+fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedName {
+    QualifiedName {
+        db_name: db_name.map(Name::from_string),
+        name: Name::from_string(table_name),
+        alias: None,
+    }
+}
+
 /// Generate a DELETE statement AST for CASCADE DELETE:
 /// DELETE FROM child_table WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
 fn generate_cascade_delete_stmt(
     child_table: &str,
     child_cols: &[String],
     ctx: &FkSubprogramContext,
+    db_name: Option<&str>,
 ) -> ast::Stmt {
     ast::Stmt::Delete {
         with: None,
-        tbl_name: QualifiedName {
-            db_name: None,
-            name: Name::from_string(child_table),
-            alias: None,
-        },
+        tbl_name: qualified_table_name(child_table, db_name),
         indexed: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
         returning: vec![],
@@ -1309,6 +1346,7 @@ fn generate_set_null_stmt(
     child_table: &str,
     child_cols: &[String],
     ctx: &FkSubprogramContext,
+    db_name: Option<&str>,
 ) -> ast::Stmt {
     // Build SET clause: fk_col1 = NULL, fk_col2 = NULL ...
     let sets: Vec<ast::Set> = child_cols
@@ -1321,11 +1359,7 @@ fn generate_set_null_stmt(
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
-        tbl_name: QualifiedName {
-            db_name: None,
-            name: Name::from_string(child_table),
-            alias: None,
-        },
+        tbl_name: qualified_table_name(child_table, db_name),
         indexed: None,
         sets,
         from: None,
@@ -1342,6 +1376,7 @@ fn generate_set_default_stmt(
     child_table: &BTreeTable,
     child_cols: &[String],
     ctx: &FkSubprogramContext,
+    db_name: Option<&str>,
 ) -> ast::Stmt {
     // Build SET clause: if no default is defined for a column, we use NULL
     let sets: Vec<ast::Set> = child_cols
@@ -1362,11 +1397,7 @@ fn generate_set_default_stmt(
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
-        tbl_name: QualifiedName {
-            db_name: None,
-            name: Name::from_string(&child_table.name),
-            alias: None,
-        },
+        tbl_name: qualified_table_name(&child_table.name, db_name),
         indexed: None,
         sets,
         from: None,
@@ -1383,6 +1414,7 @@ fn generate_cascade_update_stmt(
     child_table: &str,
     child_cols: &[String],
     ctx: &FkSubprogramContext,
+    db_name: Option<&str>,
 ) -> ast::Stmt {
     // Build SET clause
     let sets: Vec<ast::Set> = child_cols
@@ -1403,11 +1435,7 @@ fn generate_cascade_update_stmt(
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
-        tbl_name: QualifiedName {
-            db_name: None,
-            name: Name::from_string(child_table),
-            alias: None,
-        },
+        tbl_name: qualified_table_name(child_table, db_name),
         indexed: None,
         sets,
         from: None,
@@ -1452,10 +1480,21 @@ fn fire_fk_cascade_delete(
     fk_ref: &ResolvedFkRef,
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
+    database_id: usize,
 ) -> Result<()> {
+    let db_name = if database_id > 0 {
+        resolver.get_database_name_by_index(database_id)
+    } else {
+        None
+    };
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
-    let stmt = generate_cascade_delete_stmt(&fk_ref.child_table.name, child_cols, &subprog_ctx);
+    let stmt = generate_cascade_delete_stmt(
+        &fk_ref.child_table.name,
+        child_cols,
+        &subprog_ctx,
+        db_name.as_deref(),
+    );
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -1474,10 +1513,21 @@ fn fire_fk_set_null(
     fk_ref: &ResolvedFkRef,
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
+    database_id: usize,
 ) -> Result<()> {
+    let db_name = if database_id > 0 {
+        resolver.get_database_name_by_index(database_id)
+    } else {
+        None
+    };
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
-    let stmt = generate_set_null_stmt(&fk_ref.child_table.name, child_cols, &subprog_ctx);
+    let stmt = generate_set_null_stmt(
+        &fk_ref.child_table.name,
+        child_cols,
+        &subprog_ctx,
+        db_name.as_deref(),
+    );
     emit_fk_action_subprogram(program, resolver, connection, stmt, ctx, "fk set null")
 }
 
@@ -1489,10 +1539,21 @@ fn fire_fk_set_default(
     fk_ref: &ResolvedFkRef,
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
+    database_id: usize,
 ) -> Result<()> {
+    let db_name = if database_id > 0 {
+        resolver.get_database_name_by_index(database_id)
+    } else {
+        None
+    };
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
-    let stmt = generate_set_default_stmt(&fk_ref.child_table, child_cols, &subprog_ctx);
+    let stmt = generate_set_default_stmt(
+        &fk_ref.child_table,
+        child_cols,
+        &subprog_ctx,
+        db_name.as_deref(),
+    );
     emit_fk_action_subprogram(program, resolver, connection, stmt, ctx, "fk set default")
 }
 
@@ -1504,11 +1565,22 @@ fn fire_fk_cascade_update(
     fk_ref: &ResolvedFkRef,
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
+    database_id: usize,
 ) -> Result<()> {
+    let db_name = if database_id > 0 {
+        resolver.get_database_name_by_index(database_id)
+    } else {
+        None
+    };
     let child_cols = &fk_ref.fk.child_columns;
     // CASCADE UPDATE needs new params for the SET clause
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), true);
-    let stmt = generate_cascade_update_stmt(&fk_ref.child_table.name, child_cols, &subprog_ctx);
+    let stmt = generate_cascade_update_stmt(
+        &fk_ref.child_table.name,
+        child_cols,
+        &subprog_ctx,
+        db_name.as_deref(),
+    );
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -1528,16 +1600,15 @@ pub fn fire_fk_delete_actions(
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
     connection: &Arc<Connection>,
+    database_id: usize,
 ) -> Result<()> {
     let parent_bt = resolver
-        .schema
-        .get_btree_table(parent_table_name)
+        .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
-    for fk_ref in resolver
-        .schema
-        .resolved_fks_referencing(parent_table_name)?
-    {
+    for fk_ref in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_referencing(parent_table_name)
+    })? {
         let parent_cols = get_fk_parent_cols(&fk_ref, &parent_bt);
         let ncols = parent_cols.len();
         let key_regs_start = program.alloc_registers(ncols);
@@ -1558,22 +1629,23 @@ pub fn fire_fk_delete_actions(
             RefAct::NoAction | RefAct::Restrict => {
                 emit_fk_delete_parent_existence_check_single(
                     program,
-                    resolver,
                     &fk_ref,
                     &parent_bt,
                     parent_table_name,
                     parent_cursor_id,
                     parent_rowid_reg,
+                    database_id,
+                    resolver,
                 )?;
             }
             RefAct::Cascade => {
-                fire_fk_cascade_delete(program, resolver, &fk_ref, connection, &ctx)?;
+                fire_fk_cascade_delete(program, resolver, &fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::SetNull => {
-                fire_fk_set_null(program, resolver, &fk_ref, connection, &ctx)?;
+                fire_fk_set_null(program, resolver, &fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::SetDefault => {
-                fire_fk_set_default(program, resolver, &fk_ref, connection, &ctx)?;
+                fire_fk_set_default(program, resolver, &fk_ref, connection, &ctx, database_id)?;
             }
         }
     }
@@ -1594,16 +1666,15 @@ pub fn fire_fk_update_actions(
     new_values_start: usize,
     new_rowid_reg: usize,
     connection: &Arc<Connection>,
+    database_id: usize,
 ) -> Result<()> {
     let parent_bt = resolver
-        .schema
-        .get_btree_table(parent_table_name)
+        .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
-    for fk_ref in resolver
-        .schema
-        .resolved_fks_referencing(parent_table_name)?
-    {
+    for fk_ref in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_referencing(parent_table_name)
+    })? {
         let parent_cols = get_fk_parent_cols(&fk_ref, &parent_bt);
         let ncols = parent_cols.len();
 
@@ -1653,13 +1724,13 @@ pub fn fire_fk_update_actions(
                 // which is called BEFORE the update using the counter-based approach.
             }
             RefAct::Cascade => {
-                fire_fk_cascade_update(program, resolver, &fk_ref, connection, &ctx)?;
+                fire_fk_cascade_update(program, resolver, &fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::SetNull => {
-                fire_fk_set_null(program, resolver, &fk_ref, connection, &ctx)?;
+                fire_fk_set_null(program, resolver, &fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::SetDefault => {
-                fire_fk_set_default(program, resolver, &fk_ref, connection, &ctx)?;
+                fire_fk_set_default(program, resolver, &fk_ref, connection, &ctx, database_id)?;
             }
         }
 
@@ -1686,18 +1757,18 @@ pub fn emit_fk_drop_table_check(
     resolver: &mut Resolver,
     parent_table_name: &str,
     connection: &Arc<Connection>,
+    database_id: usize,
 ) -> Result<()> {
     let parent_tbl = resolver
-        .schema
-        .get_btree_table(parent_table_name)
+        .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| {
             LimboError::InternalError(format!("parent table {parent_table_name} not found"))
         })?;
 
     // Get all FK references to this parent table
-    let fk_refs = resolver
-        .schema
-        .resolved_fks_referencing(parent_table_name)?;
+    let fk_refs = resolver.with_schema(database_id, |s| {
+        s.resolved_fks_referencing(parent_table_name)
+    })?;
 
     if fk_refs.is_empty() {
         return Ok(());
@@ -1725,7 +1796,7 @@ pub fn emit_fk_drop_table_check(
     let rowset_reg = program.alloc_register();
     program.emit_null(rowset_reg, None);
 
-    let parent_cur = open_read_table(program, &parent_tbl);
+    let parent_cur = open_read_table(program, &parent_tbl, database_id);
     let collect_done = program.allocate_label();
 
     program.emit_insn(Insn::Rewind {
@@ -1762,7 +1833,7 @@ pub fn emit_fk_drop_table_check(
     program.emit_insn(Insn::OpenWrite {
         cursor_id: parent_write_cur,
         root_page: parent_tbl.root_page.into(),
-        db: 0,
+        db: database_id,
     });
 
     let rowset_done = program.allocate_label();
@@ -1804,13 +1875,13 @@ pub fn emit_fk_drop_table_check(
 
         match fk_ref.fk.on_delete {
             RefAct::Cascade => {
-                fire_fk_cascade_delete(program, resolver, fk_ref, connection, &ctx)?;
+                fire_fk_cascade_delete(program, resolver, fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::SetNull => {
-                fire_fk_set_null(program, resolver, fk_ref, connection, &ctx)?;
+                fire_fk_set_null(program, resolver, fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::SetDefault => {
-                fire_fk_set_default(program, resolver, fk_ref, connection, &ctx)?;
+                fire_fk_set_default(program, resolver, fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::NoAction | RefAct::Restrict => {
                 // These are handled below in the check_fk_refs loop
@@ -1839,7 +1910,7 @@ pub fn emit_fk_drop_table_check(
         )?;
 
         // Scan child table for matching rows
-        let child_cur = open_read_table(program, child_tbl);
+        let child_cur = open_read_table(program, child_tbl, database_id);
         let child_done = program.allocate_label();
 
         program.emit_insn(Insn::Rewind {

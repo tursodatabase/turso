@@ -11,7 +11,11 @@ pub use backends::{
     BackendError, DatabaseInstance, DefaultDatabaseResolver, QueryResult, SqlBackend,
 };
 pub use comparison::{ComparisonResult, compare};
-pub use generator::{DefaultDatabaseNeeds, DefaultDatabases, GeneratorConfig, generate_database};
+pub use generator::{
+    DefaultDatabaseNeeds, DefaultDatabases, GeneratorConfig,
+    INTEGRITY_FIXTURE_CHECK_CONSTRAINT_VIOLATION_REL_PATH, INTEGRITY_FIXTURE_RELATIVE_PATHS,
+    generate_database, generate_integrity_fixture, generate_integrity_missing_index_entry_fixture,
+};
 pub use output::{Format, OutputFormat, create_output};
 pub use parser::ast::{
     DatabaseConfig, DatabaseLocation, Expectation, SetupRef, SnapshotCase, TestCase, TestFile,

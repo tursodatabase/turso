@@ -1,4 +1,6 @@
 use crate::sync::Arc;
+use crate::turso_assert;
+use crate::turso_debug_assert;
 use crate::{
     index_method::{
         parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
@@ -11,7 +13,6 @@ use crate::{
         pager::Pager,
     },
     translate::collate::CollationSeq,
-    turso_assert,
     types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text},
     vdbe::Register,
     Connection, LimboError, Result, Value,
@@ -284,7 +285,7 @@ struct LruCacheInner<K> {
 
 #[derive(Debug)]
 struct LruCacheEntry {
-    data: Vec<u8>,
+    data: Arc<[u8]>,
     accessed: u64,
 }
 
@@ -312,8 +313,8 @@ impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
         }
     }
 
-    /// Lookup entry, updating access timestamp. Returns cloned data.
-    fn get<Q>(&self, key: &Q) -> Option<Vec<u8>>
+    /// Lookup entry, updating access timestamp. Returns Arc-cloned data.
+    fn get<Q>(&self, key: &Q) -> Option<Arc<[u8]>>
     where
         K: std::borrow::Borrow<Q>,
         Q: Eq + std::hash::Hash + ?Sized,
@@ -323,7 +324,7 @@ impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
         let ts = inner.clock;
         if let Some(entry) = inner.entries.get_mut(key) {
             entry.accessed = ts;
-            Some(entry.data.clone())
+            Some(Arc::clone(&entry.data))
         } else {
             None
         }
@@ -334,7 +335,8 @@ impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
     /// Eviction uses sampling: examines K entries and evicts the one with
     /// the oldest access timestamp. Repeat until under capacity.
     fn put(&self, key: K, value: Vec<u8>) {
-        let size = value.len();
+        let arc_value: Arc<[u8]> = Arc::from(value);
+        let size = arc_value.len();
         let mut inner = self.inner.write();
 
         // Check for existing entry - get old size if present
@@ -345,7 +347,7 @@ impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
             inner.clock += 1;
             let ts = inner.clock;
             let entry = inner.entries.get_mut(&key).expect("entry must exist");
-            entry.data = value;
+            entry.data = arc_value;
             entry.accessed = ts;
             inner.current_size = inner.current_size - old + size;
             return;
@@ -377,7 +379,7 @@ impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
         inner.entries.insert(
             key,
             LruCacheEntry {
-                data: value,
+                data: arc_value,
                 accessed: ts,
             },
         );
@@ -447,7 +449,7 @@ impl LruCache<PathBuf> {
                 (
                     path,
                     LruCacheEntry {
-                        data,
+                        data: Arc::from(data),
                         accessed: i as u64,
                     },
                 )
@@ -656,7 +658,7 @@ impl HybridBTreeDirectory {
         path: &Path,
         start_chunk: usize,
         end_chunk: usize,
-    ) -> std::io::Result<Vec<Vec<u8>>> {
+    ) -> std::io::Result<Vec<Arc<[u8]>>> {
         if start_chunk > end_chunk {
             return Ok(Vec::new());
         }
@@ -810,7 +812,7 @@ impl HybridBTreeDirectory {
                 let cache_key = (path.to_path_buf(), expected_chunk_no as i64);
                 self.chunk_cache.put(cache_key, bytes.clone());
             }
-            chunks.push(bytes);
+            chunks.push(Arc::from(bytes));
 
             // Advance cursor to next record (unless this is the last chunk we need)
             if expected_chunk_no < end_chunk {
@@ -868,8 +870,9 @@ impl HybridBTreeDirectory {
 }
 
 /// Simple in-memory file handle for data already loaded (hot cache, pending writes).
+/// Use `Arc<[u8]>` for zero-copy reads when backed by the hot cache.
 struct InMemoryFileHandle {
-    data: Vec<u8>,
+    data: Arc<[u8]>,
 }
 
 impl std::fmt::Debug for InMemoryFileHandle {
@@ -895,9 +898,9 @@ impl FileHandle for InMemoryFileHandle {
             ));
         }
         if range.start >= range.end {
-            return Ok(OwnedBytes::new(Vec::new()));
+            return Ok(OwnedBytes::empty());
         }
-        Ok(OwnedBytes::new(self.data[range].to_vec()))
+        Ok(OwnedBytes::new(Arc::clone(&self.data)).slice(range))
     }
 }
 
@@ -942,7 +945,7 @@ impl FileHandle for LazyFileHandle {
 
         // Check hot cache first
         if let Some(data) = self.directory.hot_cache.get(&self.path) {
-            return Ok(OwnedBytes::new(data[range].to_vec()));
+            return Ok(OwnedBytes::new(data).slice(range));
         }
 
         // Check pending/flushing writes (data not yet persisted to BTree)
@@ -979,12 +982,10 @@ impl FileHandle for LazyFileHandle {
             };
 
             // Defensive bounds check - should not be needed if logic is correct
-            debug_assert!(
+            turso_debug_assert!(
                 local_start <= chunk.len() && local_end <= chunk.len(),
-                "chunk slice out of bounds: local_start={}, local_end={}, chunk_len={}",
-                local_start,
-                local_end,
-                chunk.len()
+                "chunk slice out of bounds",
+                { "local_start": local_start, "local_end": local_end, "chunk_len": chunk.len() }
             );
             let local_end = local_end.min(chunk.len());
             let local_start = local_start.min(local_end);
@@ -1069,7 +1070,6 @@ impl Directory for HybridBTreeDirectory {
         &self,
         path: &Path,
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
-        // Check hot cache first
         if let Some(data) = self.hot_cache.get(path) {
             return Ok(Arc::new(InMemoryFileHandle { data }));
         }
@@ -1077,7 +1077,9 @@ impl Directory for HybridBTreeDirectory {
         // Check pending writes (files written but not yet flushed to BTree)
         // This is critical for cold files that are immediately read back by Tantivy
         if let Some(data) = self.find_in_pending_writes(path) {
-            return Ok(Arc::new(InMemoryFileHandle { data }));
+            return Ok(Arc::new(InMemoryFileHandle {
+                data: Arc::from(data),
+            }));
         }
 
         // Check catalog for file metadata
@@ -1137,7 +1139,13 @@ impl Directory for HybridBTreeDirectory {
         // 2. Our delete() implementation always returns Ok(()) - it only removes entries
         //    from in-memory structures (hot_cache, catalog, chunk_cache) and queues the
         //    BTree deletion, none of which can fail.
-        let _ = self.delete(path);
+        //
+        // Skip delete for the meta lock file: Tantivy calls open_write on it for every
+        // search query, but it's never cached (can_cache_chunks returns false), never in
+        // hot_cache, and doesn't need BTree deletion, so delete() is pure overhead.
+        if path != Path::new(TANTIVY_META_LOCK_FILE) {
+            let _ = self.delete(path);
+        }
         let writer: Box<dyn TerminatingWrite> = Box::new(HybridWriter {
             path: path.to_path_buf(),
             buffer: Vec::new(),
@@ -1149,7 +1157,7 @@ impl Directory for HybridBTreeDirectory {
     fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
         // Check hot cache first (includes recently written files)
         if let Some(data) = self.hot_cache.get(path) {
-            return Ok(data);
+            return Ok(data.to_vec());
         }
 
         // Check pending writes (files written but not yet flushed to BTree)
@@ -1623,6 +1631,9 @@ fn can_cache_chunks(path: &Path) -> bool {
     path.as_os_str().to_str() != Some(TANTIVY_META_LOCK_FILE)
 }
 
+/// Accumulated file metadata: path -> (chunk_no -> (blob_size, Option<blob_data>))
+type CatalogBuilder = HashMap<i64, (usize, Option<Vec<u8>>)>;
+
 /// State machine for FTS cursor async operations
 #[derive(Debug)]
 enum FtsState {
@@ -1633,10 +1644,9 @@ enum FtsState {
     /// Loading file catalog from BTree (metadata only, not content)
     /// This is the new catalog-first approach for HybridBTreeDirectory
     LoadingCatalog {
-        /// Accumulated file metadata: path -> (chunk_no -> blob_size)
-        /// Using nested HashMap to properly deduplicate by (path, chunk_no) pairs
-        catalog_builder: HashMap<PathBuf, HashMap<i64, usize>>,
-        current_path: Option<String>,
+        /// Hot files capture blob data during scan to avoid a second pass.
+        catalog_builder: HashMap<PathBuf, CatalogBuilder>,
+        current_path: Option<PathBuf>,
     },
     /// Preloading essential files (meta.json and other hot files)
     PreloadingEssentials {
@@ -1734,7 +1744,12 @@ pub struct FtsCursor {
     rowid_field: Field,
     text_fields: Vec<(IndexColumn, Field)>,
     dir_table_name: String,
-    field_weights: HashMap<String, f32>,
+    /// Pre-computed default fields for QueryParser (avoids rebuilding Vec per query)
+    default_fields: Vec<Field>,
+    /// Pre-computed (Field, boost) pairs for QueryParser (avoids re-iterating per query)
+    field_boosts: Vec<(Field, f32)>,
+    /// Cached QueryParser reused across queries (invalidated on commit)
+    cached_parser: Option<tantivy::query::QueryParser>,
     shared_directory_cache: Arc<RwLock<Option<CachedFtsDirectory>>>,
     connection: Option<Arc<Connection>>,
     fts_dir_cursor: Option<BTreeCursor>,
@@ -1770,12 +1785,19 @@ impl FtsCursor {
             crate::schema::TURSO_INTERNAL_PREFIX,
             cfg.index_name
         );
+        let default_fields: Vec<Field> = text_fields.iter().map(|(_, f)| *f).collect();
+        let field_boosts: Vec<(Field, f32)> = text_fields
+            .iter()
+            .filter_map(|(col, field)| field_weights.get(&col.name).map(|&boost| (*field, boost)))
+            .collect();
         Self {
             schema,
             rowid_field,
             text_fields,
             dir_table_name,
-            field_weights,
+            default_fields,
+            field_boosts,
+            cached_parser: None,
             shared_directory_cache,
             connection: None,
             fts_dir_cursor: None,
@@ -1852,7 +1874,6 @@ impl FtsCursor {
 
     /// Create Tantivy index from directory (hybrid or cached)
     fn create_index_from_directory(&mut self) -> Result<()> {
-        // Prefer HybridBTreeDirectory if available
         if let Some(ref hybrid_dir) = self.hybrid_directory {
             let index_exists = hybrid_dir
                 .exists(Path::new(TANTIVY_META_FILE))
@@ -2341,6 +2362,8 @@ impl FtsCursor {
                 .reload()
                 .map_err(|e| LimboError::InternalError(format!("FTS reader reload error: {e}")))?;
             self.searcher = Some(reader.searcher());
+            // Invalidate cached parser since index changed (segments may differ)
+            self.cached_parser = None;
         }
 
         self.pending_docs_count = 0;
@@ -2444,8 +2467,8 @@ impl Drop for FtsCursor {
         // "dirty pages must be empty for read txn" panic on the next read.
         turso_assert!(
             conn.is_in_write_tx(),
-            "FTS Drop: {} docs remaining: transaction already committed, cannot flush",
-            self.pending_docs_count
+            "FTS Drop: transaction already committed, cannot flush",
+            { "pending_docs_count": self.pending_docs_count }
         );
 
         // Commit any pending writes to Tantivy
@@ -2570,9 +2593,7 @@ impl IndexMethodCursor for FtsCursor {
                     // Open BTree cursor (needed for btree_root_page)
                     self.open_cursor(conn)?;
 
-                    // Check for cached directory from attachment - avoids expensive catalog reload
-                    // Note: We only cache the directory (with catalog), not Index/Reader
-                    // Each cursor needs its own Index to handle writes correctly
+                    // Check for cached directory, avoid expensive catalog reload
                     {
                         let cache = self.shared_directory_cache.read();
                         if let Some(ref cached) = *cache {
@@ -2612,19 +2633,35 @@ impl IndexMethodCursor for FtsCursor {
                     })?;
 
                     if !cursor.has_record() {
-                        // Done scanning - build catalog and identify files to preload
+                        // Done scanning: build catalog and assemble hot files in single pass
                         let mut catalog = HashMap::default();
+                        let mut hot_files: HashMap<PathBuf, Vec<u8>> = HashMap::default();
                         let mut files_to_load = Vec::new();
 
                         for (path, chunks) in catalog_builder.drain() {
-                            // Calculate max_chunk and total_size from deduplicated chunks
                             let max_chunk = chunks.keys().max().copied().unwrap_or(0);
-                            let total_size: usize = chunks.values().sum();
+                            let total_size: usize = chunks.values().map(|(size, _)| size).sum();
                             let num_chunks = (max_chunk + 1) as usize;
                             let metadata = FileMetadata::new(&path, total_size, num_chunks);
 
-                            // Queue hot files for preloading
-                            if metadata.category.should_preload() || metadata.category.is_hot() {
+                            if metadata.category.is_hot() {
+                                // Try to assemble from captured blob data
+                                let mut all_captured = true;
+                                let mut assembled = Vec::with_capacity(total_size);
+                                for chunk_no in 0..=(max_chunk) {
+                                    if let Some((_, Some(data))) = chunks.get(&chunk_no) {
+                                        assembled.extend_from_slice(data);
+                                    } else {
+                                        all_captured = false;
+                                        break;
+                                    }
+                                }
+                                if all_captured {
+                                    hot_files.insert(path.clone(), assembled);
+                                } else {
+                                    files_to_load.push(path.clone());
+                                }
+                            } else if metadata.category.should_preload() {
                                 files_to_load.push(path.clone());
                             }
 
@@ -2632,12 +2669,13 @@ impl IndexMethodCursor for FtsCursor {
                         }
 
                         tracing::debug!(
-                            "FTS LoadingCatalog: found {} files, {} to preload",
+                            "FTS LoadingCatalog: found {} files, {} hot assembled, {} to preload",
                             catalog.len(),
+                            hot_files.len(),
                             files_to_load.len()
                         );
 
-                        // Create HybridBTreeDirectory with catalog
+                        // Create HybridBTreeDirectory with catalog and pre-assembled hot files
                         let pager = conn.pager.load().clone();
                         let root_page = self.btree_root_page.ok_or_else(|| {
                             LimboError::InternalError("btree_root_page not set".into())
@@ -2647,14 +2685,14 @@ impl IndexMethodCursor for FtsCursor {
                             pager,
                             root_page,
                             catalog,
-                            HashMap::default(), // Will be filled in PreloadingEssentials
+                            hot_files,
                             DEFAULT_HOT_CACHE_BYTES,
                             DEFAULT_CHUNK_CACHE_BYTES,
                         );
                         self.hybrid_directory = Some(hybrid_dir);
 
                         if files_to_load.is_empty() {
-                            // No files to preload, go directly to CreatingIndex
+                            // All hot files assembled in single pass, skip PreloadingEssentials
                             self.state = FtsState::CreatingIndex;
                         } else {
                             self.state = FtsState::PreloadingEssentials {
@@ -2667,10 +2705,10 @@ impl IndexMethodCursor for FtsCursor {
                         continue;
                     }
 
-                    // Read record metadata (path, chunk_no, blob size estimate)
+                    // Read record metadata and capture hot file blobs in single pass
                     let record = return_if_io!(cursor.record());
                     if let Some(record) = record {
-                        let path = record.get_value_opt(0).and_then(|v| match v {
+                        let path_str = record.get_value_opt(0).and_then(|v| match v {
                             crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
                             _ => None,
                         });
@@ -2680,27 +2718,38 @@ impl IndexMethodCursor for FtsCursor {
                             )) => Some(i),
                             _ => None,
                         });
-                        // Get blob size for estimation (we don't read the full blob)
-                        let blob_size = record
-                            .get_value_opt(2)
-                            .map(|v| match v {
-                                crate::types::ValueRef::Blob(b) => b.len(),
-                                _ => 0,
-                            })
-                            .unwrap_or(0);
 
-                        if let (Some(path_str), Some(chunk_no)) = (path, chunk_no) {
-                            // Track path transition
-                            if current_path.as_ref() != Some(&path_str) {
-                                *current_path = Some(path_str.clone());
-                            }
+                        if let (Some(path_str), Some(chunk_no)) = (path_str, chunk_no) {
+                            // Reuse PathBuf when path hasn't changed (records are BTree-ordered)
+                            let path_buf = if current_path.as_ref().map(|p| p.as_os_str().to_str())
+                                == Some(Some(&path_str))
+                            {
+                                current_path.clone().unwrap()
+                            } else {
+                                let p = PathBuf::from(&path_str);
+                                *current_path = Some(p.clone());
+                                p
+                            };
 
-                            // Update catalog builder - store blob_size per chunk_no
-                            // This properly deduplicates: if same chunk_no appears twice,
-                            // we keep the last one (which should be the newest)
-                            let path_buf = PathBuf::from(&path_str);
+                            // Classify file to decide whether to capture blob data
+                            let category = FileCategory::from_path(&path_buf);
+                            let (blob_size, blob_data) = record
+                                .get_value_opt(2)
+                                .map(|v| match v {
+                                    crate::types::ValueRef::Blob(b) => {
+                                        let size = b.len();
+                                        if category.is_hot() {
+                                            (size, Some(b.to_vec()))
+                                        } else {
+                                            (size, None)
+                                        }
+                                    }
+                                    _ => (0, None),
+                                })
+                                .unwrap_or((0, None));
+
                             let chunks = catalog_builder.entry(path_buf).or_default();
-                            chunks.insert(chunk_no, blob_size);
+                            chunks.insert(chunk_no, (blob_size, blob_data));
                         }
                     }
 
@@ -2814,8 +2863,6 @@ impl IndexMethodCursor for FtsCursor {
                     }
 
                     // Cache the directory for future queries (avoids catalog reload)
-                    // Note: We only cache the directory, not Index/Reader, so each cursor
-                    // gets its own Index for proper write isolation
                     if let Some(ref dir) = self.hybrid_directory {
                         let mut cache = self.shared_directory_cache.write();
                         *cache = Some(CachedFtsDirectory {
@@ -3018,10 +3065,10 @@ impl IndexMethodCursor for FtsCursor {
         // Determine limit based on pattern:
         // - Patterns WITHOUT LIMIT in pattern: fetch all matches (high limit)
         // - Patterns WITH LIMIT: use the captured limit value from values[2]
-        let limit = match pattern_idx {
+        let limit_raw = match pattern_idx {
             // Patterns without LIMIT - fetch all matches
             FTS_PATTERN_MATCH | FTS_PATTERN_COMBINED | FTS_PATTERN_COMBINED_ORDERED => {
-                Self::MAX_NO_LIMIT_RESULT
+                Self::MAX_NO_LIMIT_RESULT as i64
             }
             // Patterns with LIMIT - use captured limit value
             FTS_PATTERN_SCORE
@@ -3030,9 +3077,7 @@ impl IndexMethodCursor for FtsCursor {
             | FTS_PATTERN_COMBINED_ORDERED_LIMIT => {
                 if values.len() > 2 {
                     match &values[2] {
-                        Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => {
-                            *i as usize
-                        }
+                        Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
                         _ => {
                             tracing::debug!(
                                 "FTS query_start: LIMIT value is not an integer, using default 10"
@@ -3056,25 +3101,36 @@ impl IndexMethodCursor for FtsCursor {
             }
         };
 
-        // Build query over all text fields
-        let default_fields: Vec<Field> = self.text_fields.iter().map(|(_, f)| *f).collect();
-        let index = self
-            .index
-            .as_ref()
-            .ok_or_else(|| LimboError::InternalError("FTS index not initialized".into()))?;
-
-        let mut parser = tantivy::query::QueryParser::for_index(index, default_fields);
-
-        // Apply field boosts if configured
-        for (col, field) in &self.text_fields {
-            if let Some(&boost) = self.field_weights.get(&col.name) {
-                parser.set_field_boost(*field, boost);
+        // Reuse cached QueryParser or build one on first query
+        if self.cached_parser.is_none() {
+            let index = self
+                .index
+                .as_ref()
+                .ok_or_else(|| LimboError::InternalError("FTS index not initialized".into()))?;
+            let mut parser =
+                tantivy::query::QueryParser::for_index(index, self.default_fields.clone());
+            for &(field, boost) in &self.field_boosts {
+                parser.set_field_boost(field, boost);
             }
+            self.cached_parser = Some(parser);
         }
+        let parser = self.cached_parser.as_ref().unwrap();
 
         let query = parser
             .parse_query(&query_str)
             .map_err(|e| LimboError::InternalError(format!("FTS parse error: {e}")))?;
+
+        if limit_raw == 0 {
+            self.current_hits.clear();
+            self.hit_pos = 0;
+            return Ok(IOResult::Done(false));
+        }
+
+        let limit = if limit_raw < 0 {
+            Self::MAX_NO_LIMIT_RESULT
+        } else {
+            limit_raw as usize
+        };
 
         let top_docs = searcher
             .search(&query, &tantivy::collector::TopDocs::with_limit(limit))

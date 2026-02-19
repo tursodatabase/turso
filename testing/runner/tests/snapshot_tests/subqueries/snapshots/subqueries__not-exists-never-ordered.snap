@@ -1,14 +1,21 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT p.id, p.name, p.stock\n    FROM products p\n    WHERE NOT EXISTS (\n        SELECT 1\n        FROM order_items oi\n        WHERE oi.product_id = p.id\n    );"
+expression: |-
+  SELECT p.id, p.name, p.stock
+      FROM products p
+      WHERE NOT EXISTS (
+          SELECT 1
+          FROM order_items oi
+          WHERE oi.product_id = p.id
+      );
 info:
   statement_type: SELECT
   tables:
-    - order_items
-    - products
+  - order_items
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN products AS p

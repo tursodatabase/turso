@@ -176,7 +176,11 @@ impl CliDatabaseInstance {
         }
 
         if self.is_sqlite {
-            cmd.arg(format!("file:{}?immutable=1", self.db_path));
+            if self.readonly {
+                cmd.arg(format!("file:{}?immutable=1", self.db_path));
+            } else {
+                cmd.arg(&self.db_path);
+            }
         }
 
         // Only add -q flag for tursodb/turso (not sqlite3 or other CLIs)
@@ -227,32 +231,31 @@ impl CliDatabaseInstance {
             .map_err(|_| BackendError::Timeout(self.timeout))?
             .map_err(|e| BackendError::Execute(format!("failed to read output: {e}")))?;
 
-        // Parse stdout
+        // Parse stdout/stderr and check exit code
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_success = output.status.success();
 
-        // Check for errors in stderr
-        if !stderr.is_empty() && (stderr.contains("Error") || stderr.contains("error")) {
-            return Ok(QueryResult::error(stderr.trim().to_string()));
-        }
+        // Detect errors from output text
+        let has_stderr_error =
+            !stderr.is_empty() && (stderr.contains("Error") || stderr.contains("error"));
+        let has_stdout_error =
+            stdout.contains("× ") || stdout.contains("error:") || stdout.contains("Error:");
 
-        // Check for errors in stdout (tursodb outputs errors like "× Parse error: ...")
-        if stdout.contains("× ") || stdout.contains("error:") || stdout.contains("Error:") {
-            return Ok(QueryResult::error(stdout.trim().to_string()));
-        }
-
-        if !output.status.success() {
-            let stderr = stderr.trim();
-            if !stderr.is_empty() {
-                return Ok(QueryResult::error(stderr.to_string()));
-            }
-            if !stdout.trim().is_empty() {
-                return Ok(QueryResult::error(stdout.trim().to_string()));
-            }
-            return Ok(QueryResult::error(format!(
-                "command exited with status {}",
-                output.status
-            )));
+        if has_stderr_error || has_stdout_error || !exit_success {
+            // Extract the best error message available
+            let error_msg = if has_stderr_error {
+                stderr.trim().to_string()
+            } else if has_stdout_error {
+                stdout.trim().to_string()
+            } else if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else if !stdout.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                format!("command exited with status {}", output.status)
+            };
+            return Ok(QueryResult::error(error_msg));
         }
 
         let mut rows = parse_list_output(&stdout);

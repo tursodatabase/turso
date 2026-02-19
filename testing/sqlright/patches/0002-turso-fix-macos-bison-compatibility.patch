@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Turso <noreply@turso.tech>
+Subject: [PATCH] Fix macOS bison compatibility
+
+The system bison on macOS doesn't support the -Wconflicts-rr flag.
+Remove this warning flag as it's not essential for building.
+
+diff --git a/SQLite/docker/src/parser/Makefile b/SQLite/docker/src/parser/Makefile
+index 0ecbeb0..82deacd 100644
+--- a/SQLite/docker/src/parser/Makefile
++++ b/SQLite/docker/src/parser/Makefile
+@@ -19,7 +19,7 @@ SRCS = bison_parser.cpp flex_lexer.cpp
+ all: $(SRCS:%.cpp=%.o)
+
+ bison_parser.cpp: bison_parser.y
+-	$(BISON) bison_parser.y --output=bison_parser.cpp --defines=bison_parser.h --verbose -Wconflicts-rr # --debug
++	$(BISON) bison_parser.y --output=bison_parser.cpp --defines=bison_parser.h --verbose # --debug
+
+ flex_lexer.cpp: flex_lexer.l
+ 	$(FLEX) flex_lexer.l

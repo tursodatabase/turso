@@ -17,6 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::{turso_assert, turso_assert_ne, turso_debug_assert};
 pub mod affinity;
 pub mod bloom_filter;
 pub mod builder;
@@ -53,7 +54,6 @@ use crate::{
     },
     CipherMode, ValueRef,
 };
-
 use smallvec::SmallVec;
 
 use crate::{
@@ -737,7 +737,7 @@ impl Register {
         match self {
             Register::Value(v) => v,
             Register::Record(r) => {
-                assert!(!r.is_invalidated());
+                turso_assert!(!r.is_invalidated());
                 r.as_blob_value()
             }
             _ => panic!("register holds unexpected value: {self:?}"),
@@ -812,6 +812,8 @@ pub struct PreparedProgram {
     pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
+    /// Set of attached database indices that need write transactions.
+    pub write_databases: std::collections::HashSet<usize>,
 }
 
 #[derive(Clone)]
@@ -947,7 +949,7 @@ impl Program {
     }
 
     fn explain_step(&self, state: &mut ProgramState, pager: Arc<Pager>) -> Result<StepResult> {
-        debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
+        turso_debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.is_closed() {
             // Connection is closed for whatever reason, rollback the transaction.
             let state = self.connection.get_tx_state();
@@ -1097,7 +1099,7 @@ impl Program {
         state: &mut ProgramState,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
-        debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
+        turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
             if self.connection.is_closed() {
                 // Connection is closed for whatever reason, rollback the transaction.
@@ -1290,9 +1292,10 @@ impl Program {
                             let root_page = view.get_root_page();
 
                             // Materialized views should always have storage (root_page != 0)
-                            assert!(
-                                root_page != 0,
-                                "Materialized view '{view_name}' should have a root page"
+                            turso_assert_ne!(
+                                root_page, 0,
+                                "Materialized view should have a root page",
+                                { "view_name": view_name }
                             );
 
                             views.push(view_name);
@@ -1383,73 +1386,94 @@ impl Program {
             // We don't want to commit on nested statements. Let parent handle it.
             return Ok(IOResult::Done(()));
         }
-        if let Some(mv_store) = mv_store {
-            let conn = self.connection.clone();
-            let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
-            if auto_commit {
-                // FIXME: we don't want to commit stuff from other programs.
-                if matches!(program_state.commit_state, CommitState::Ready) {
-                    let Some(tx_id) = conn.get_mv_tx_id() else {
-                        return Ok(IOResult::Done(()));
-                    };
-                    let state_machine = mv_store.commit_tx(tx_id, &conn)?;
-                    program_state.commit_state = CommitState::CommitingMvcc { state_machine };
+        let res = if let Some(mv_store) = mv_store {
+            self.commit_txn_mvcc(pager, program_state, mv_store, rollback)
+        } else {
+            self.commit_txn_wal(pager, program_state, rollback)
+        }?;
+        if !res.is_io() && self.change_cnt_on {
+            self.connection
+                .set_changes(program_state.n_change.load(Ordering::SeqCst));
+        }
+        Ok(res)
+    }
+
+    fn commit_txn_wal(
+        &self,
+        pager: Arc<Pager>,
+        program_state: &mut ProgramState,
+        rollback: bool,
+    ) -> Result<IOResult<()>> {
+        let connection = self.connection.clone();
+        let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
+        let tx_state = connection.get_tx_state();
+        tracing::debug!(
+            "Halt auto_commit {}, commit_state={:?}, tx_state={:?}",
+            auto_commit,
+            program_state.commit_state,
+            tx_state,
+        );
+        if matches!(program_state.commit_state, CommitState::Committing) {
+            let TransactionState::Write { .. } = tx_state else {
+                unreachable!("invalid state for write commit step")
+            };
+            self.step_end_write_txn(&pager, &connection, program_state, rollback)
+        } else if auto_commit {
+            match tx_state {
+                TransactionState::Write { .. } => {
+                    self.step_end_write_txn(&pager, &connection, program_state, rollback)
                 }
-                let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
-                else {
-                    panic!("invalid state for mvcc commit step")
-                };
-                match self.step_end_mvcc_txn(state_machine, mv_store)? {
-                    IOResult::Done(_) => {
-                        assert!(state_machine.is_finalized());
-                        conn.set_mv_tx(None);
-                        conn.set_tx_state(TransactionState::None);
-                        pager.end_read_tx();
-                        program_state.commit_state = CommitState::Ready;
-                        return Ok(IOResult::Done(()));
-                    }
-                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                TransactionState::Read => {
+                    connection.set_tx_state(TransactionState::None);
+                    pager.end_read_tx();
+                    self.end_attached_read_txns(&connection);
+                    Ok(IOResult::Done(()))
+                }
+                TransactionState::None => Ok(IOResult::Done(())),
+                TransactionState::PendingUpgrade { .. } => {
+                    panic!("Unexpected transaction state: {tx_state:?} during auto-commit",)
                 }
             }
-            Ok(IOResult::Done(()))
         } else {
-            let connection = self.connection.clone();
-            let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
-            let tx_state = connection.get_tx_state();
-            tracing::debug!(
-                "Halt auto_commit {}, commit_state={:?}, tx_state={:?}",
-                auto_commit,
-                program_state.commit_state,
-                tx_state,
-            );
-            if matches!(program_state.commit_state, CommitState::Committing) {
-                let TransactionState::Write { .. } = tx_state else {
-                    unreachable!("invalid state for write commit step")
+            Ok(IOResult::Done(()))
+        }
+    }
+
+    fn commit_txn_mvcc(
+        &self,
+        pager: Arc<Pager>,
+        program_state: &mut ProgramState,
+        mv_store: &Arc<MvStore>,
+        _rollback: bool,
+    ) -> Result<IOResult<()>> {
+        let conn = self.connection.clone();
+        let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
+        if auto_commit {
+            // FIXME: we don't want to commit stuff from other programs.
+            if matches!(program_state.commit_state, CommitState::Ready) {
+                let Some(tx_id) = conn.get_mv_tx_id() else {
+                    return Ok(IOResult::Done(()));
                 };
-                self.step_end_write_txn(&pager, &connection, program_state, rollback)
-            } else if auto_commit {
-                match tx_state {
-                    TransactionState::Write { .. } => {
-                        self.step_end_write_txn(&pager, &connection, program_state, rollback)
-                    }
-                    TransactionState::Read => {
-                        connection.set_tx_state(TransactionState::None);
-                        pager.end_read_tx();
-                        Ok(IOResult::Done(()))
-                    }
-                    TransactionState::None => Ok(IOResult::Done(())),
-                    TransactionState::PendingUpgrade { .. } => {
-                        panic!("Unexpected transaction state: {tx_state:?} during auto-commit",)
-                    }
+                let state_machine = mv_store.commit_tx(tx_id, &conn)?;
+                program_state.commit_state = CommitState::CommitingMvcc { state_machine };
+            }
+            let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
+            else {
+                panic!("invalid state for mvcc commit step")
+            };
+            match self.step_end_mvcc_txn(state_machine, mv_store)? {
+                IOResult::Done(_) => {
+                    assert!(state_machine.is_finalized());
+                    conn.set_mv_tx(None);
+                    conn.set_tx_state(TransactionState::None);
+                    pager.end_read_tx();
+                    program_state.commit_state = CommitState::Ready;
+                    return Ok(IOResult::Done(()));
                 }
-            } else {
-                if self.change_cnt_on {
-                    self.connection
-                        .set_changes(program_state.n_change.load(Ordering::SeqCst));
-                }
-                Ok(IOResult::Done(()))
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
+        Ok(IOResult::Done(()))
     }
 
     #[instrument(skip(self, pager, connection, program_state), level = Level::DEBUG)]
@@ -1470,11 +1494,9 @@ impl Program {
         tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
         match txn_finish_result? {
             IOResult::Done(_) => {
-                if self.change_cnt_on {
-                    self.connection
-                        .set_changes(program_state.n_change.load(Ordering::SeqCst));
-                }
                 *commit_state = CommitState::Ready;
+                // Also commit/rollback attached database pagers
+                self.end_attached_write_txns(connection, rollback)?;
             }
             IOResult::IO(io) => {
                 tracing::trace!("Cacheflush IO");
@@ -1483,6 +1505,47 @@ impl Program {
             }
         }
         Ok(IOResult::Done(()))
+    }
+
+    /// End write transactions on all attached databases that were written to.
+    fn end_attached_write_txns(&self, connection: &Connection, rollback: bool) -> Result<()> {
+        for &db_id in &self.prepared.write_databases {
+            if db_id < 2 {
+                continue;
+            }
+            let attached_pager = connection.get_pager_from_database_index(&db_id);
+            if !rollback {
+                // Commit dirty pages to WAL, then end write+read transactions.
+                // We disable auto-checkpoint and avoid pager.commit_tx() since
+                // the checkpoint logic can leave read locks held.
+                match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
+                    Ok(IOResult::Done(_)) => {}
+                    Ok(IOResult::IO(_)) => {
+                        tracing::warn!("attached pager commit_dirty_pages returned IO");
+                    }
+                    Err(e) => {
+                        tracing::warn!("attached pager commit_dirty_pages error: {e}");
+                    }
+                }
+                attached_pager.end_write_tx();
+                attached_pager.end_read_tx();
+                attached_pager.commit_dirty_pages_end();
+            } else {
+                attached_pager.rollback_attached();
+            }
+        }
+        Ok(())
+    }
+
+    /// End read transactions on all attached databases that had transactions started.
+    fn end_attached_read_txns(&self, connection: &Connection) {
+        for &db_id in &self.prepared.write_databases {
+            if db_id < 2 {
+                continue;
+            }
+            let attached_pager = connection.get_pager_from_database_index(&db_id);
+            attached_pager.end_read_tx();
+        }
     }
 
     #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
@@ -1597,6 +1660,10 @@ impl Program {
         } else {
             pager.rollback_tx(&self.connection);
             self.connection.auto_commit.store(true, Ordering::SeqCst);
+        }
+        // Also rollback all attached database pagers that hold write locks
+        for attached_pager in self.connection.get_all_attached_pagers() {
+            attached_pager.rollback_attached();
         }
         self.connection.set_tx_state(TransactionState::None);
     }

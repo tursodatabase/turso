@@ -1,9 +1,11 @@
 @database :memory:
+@skip-file-if mvcc "attach not supported in MVCC mode"
 
-@skip-if mvcc "attach not supported in MVCC mode"
-# Test querying attached file database
+# Test querying attached in-memory database
 test attach-db-query {
-    ATTACH DATABASE "database/testing_small.db" AS small;
+    ATTACH DATABASE ':memory:' AS small;
+    CREATE TABLE small.demo (id INTEGER, value TEXT);
+    INSERT INTO small.demo VALUES (1, 'A'), (2, ''), (3, 'B'), (4, ''), (5, 'C');
     SELECT value FROM small.demo where id = 1;
 }
 expect {
@@ -12,7 +14,7 @@ expect {
 
 # Test detach database
 test detach-database {
-    ATTACH DATABASE "database/testing_small.db" AS small;
+    ATTACH DATABASE ':memory:' AS small;
     DETACH DATABASE small;
     pragma database_list;
 }
@@ -20,7 +22,6 @@ expect {
     0|main|
 }
 
-@skip-if mvcc "attach not supported in MVCC mode"
 # Test attach in-memory database
 test attach-memory-database {
     ATTACH DATABASE ':memory:' AS mem;
@@ -31,10 +32,11 @@ expect {
     2|mem|
 }
 
-@skip-if mvcc "attach not supported in MVCC mode"
 # Test join between main and attached database
 test attach-cross-database-join {
-    ATTACH DATABASE "database/testing_small.db" as small;
+    ATTACH DATABASE ':memory:' as small;
+    CREATE TABLE small.demo (id INTEGER, value TEXT);
+    INSERT INTO small.demo VALUES (1, 'A'), (2, ''), (3, 'B'), (4, ''), (5, 'C');
     create table joiners (id int, otherid int);
     insert into joiners (id, otherid) values (1,1);
     insert into joiners (id, otherid) values (3,3);
@@ -45,12 +47,13 @@ expect {
     B
 }
 
-@skip-if mvcc "attach not supported in MVCC mode"
 # regression test for https://github.com/tursodatabase/turso/issues/3540
 test attach-from-memory-db {
     CREATE TABLE t(a);
     INSERT INTO t SELECT value from generate_series(1,10);
-    ATTACH DATABASE 'database/testing.db' as a;
+    ATTACH DATABASE ':memory:' as a;
+    CREATE TABLE a.products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+    INSERT INTO a.products VALUES (1, 'hat', 79.0);
     SELECT * from a.products, t LIMIT 1;
 }
 expect {

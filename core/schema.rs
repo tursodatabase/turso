@@ -1,16 +1,17 @@
 use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
+use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::turso_assert;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
-use crate::{return_if_io, turso_assert};
 use turso_macros::AtomicEnum;
 
 #[derive(Debug, Clone, AtomicEnum)]
@@ -131,7 +132,7 @@ use crate::util::{
 use crate::Result;
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
-    Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
+    LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
@@ -657,10 +658,11 @@ impl Schema {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
             match &state.phase {
                 MakeFromBtreePhase::Init => {
-                    assert!(
-                        mv_cursor.is_none(),
-                        "mvcc not yet supported for make_from_btree"
-                    );
+                    if mv_cursor.is_some() {
+                        return Err(crate::LimboError::ParseError(
+                            "MVCC is not supported for make_from_btree schema recovery".to_string(),
+                        ));
+                    }
 
                     state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
                     pager.begin_read_tx()?;
@@ -1103,7 +1105,9 @@ impl Schema {
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
-                assert!(mv_store.is_none(), "views not yet supported for mvcc");
+                if mv_store.is_some() {
+                    crate::bail_parse_error!("Views are not supported in MVCC mode");
+                }
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
@@ -1127,6 +1131,8 @@ impl Schema {
                             select,
                             ..
                         } => {
+                            crate::util::validate_select_for_unsupported_features(&select)?;
+
                             // Extract actual columns from the SELECT statement
                             let view_column_schema =
                                 crate::util::extract_view_columns(&select, self)?;
@@ -2240,6 +2246,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             clause,
                             defer_clause,
                         } => {
+                            if clause.columns.len() > 1 {
+                                crate::bail_parse_error!(
+                                    "foreign key on {} should reference only one column of table {}",
+                                    name,
+                                    clause.tbl_name.as_str()
+                                );
+                            }
                             let fk = ForeignKey {
                                 parent_table: normalize_ident(clause.tbl_name.as_str()),
                                 parent_columns: clause
@@ -3179,7 +3192,7 @@ impl Index {
     pub fn bind_where_expr(
         &self,
         table_refs: Option<&mut TableReferences>,
-        connection: &Arc<Connection>,
+        resolver: &Resolver,
     ) -> Option<ast::Expr> {
         let Some(where_clause) = &self.where_clause else {
             return None;
@@ -3189,7 +3202,7 @@ impl Index {
             &mut expr,
             table_refs,
             None,
-            connection,
+            resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )
         .ok()?;

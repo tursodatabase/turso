@@ -255,6 +255,24 @@ expect {
     A|250
 }
 
+@skip-if sqlite "sqlite supports FILTER in aggregate functions"
+test view-rejects-filter-clause {
+    CREATE TABLE t(val INT, status TEXT);
+    CREATE VIEW v AS SELECT SUM(val) FILTER (WHERE status = 'ok') FROM t;
+}
+expect error {
+    FILTER clause is not supported yet in aggregate functions
+}
+
+@skip-if sqlite "sqlite supports ORDER BY in aggregate functions"
+test view-rejects-aggregate-order-by {
+    CREATE TABLE t(val INT);
+    CREATE VIEW v AS SELECT SUM(val ORDER BY val) FROM t;
+}
+expect error {
+    ORDER BY clause is not supported yet in aggregate functions
+}
+
 test view-self-circle-detection {
     CREATE VIEW v AS SELECT * FROM v;
     SELECT * FROM v;
@@ -271,4 +289,3 @@ test view-mutual-circle-detection {
 expect error {
     view v is circularly defined
 }
-

@@ -351,6 +351,34 @@ expect {
     -9e999
 }
 
+test json_extract_malformed_json_1 {
+		SELECT json_extract(X'256162', '$');
+}
+expect error {
+    .*malformed JSON.*
+}
+
+test json_extract_malformed_json_2 {
+		SELECT json_extract(X'45312e652b', '$');
+}
+expect error {
+    .*malformed JSON.*
+}
+
+test json_extract_malformed_json_3 {
+		SELECT json_extract(X'35312e2e31', '$');
+}
+expect error {
+    .*malformed JSON.*
+}
+
+test json_extract_malformed_json_4 {
+		SELECT json_extract(X'266162', '$');
+}
+expect error {
+    .*malformed JSON.*
+}
+
 test json_extract_null {
     SELECT json_extract(null, '$')
 }
@@ -1529,6 +1557,13 @@ expect {
     {"user":{"profile":{"name":"Alice","age":25}}}
 }
 
+test json_set_notation {
+		SELECT json_set(X'45312e652b', '$.x', 3);
+}
+expect {
+		1.e+
+}
+
 test json_set_blob_value {
     SELECT json_set(3906369340027029955, '$.' || char(8) || '' || CAST(zeroblob(27) AS TEXT) || '5!""!!!$.' || char(6) || '62=!""%!!!!!!QQQQQQQQQQ' || char(13) || CAST(zeroblob(3) AS TEXT), x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00');
 }
@@ -1635,6 +1670,13 @@ expect {
 }
 
 # Tests for json_insert() function
+test json_insert_notation {
+		SELECT json_insert(X'45312e652b', '$.a', 1);
+}
+expect {
+		1.e+
+}
+
 test json_insert_new_key_in_nested_object {
     SELECT json_insert('{"a": {"b": {"c": 5}}}', '$.a.b.d', 10);
 }
@@ -2138,6 +2180,12 @@ expect {
 
 test json_remove_root {
     SELECT json_remove('{"a": 1}', '$')
+}
+expect {
+}
+
+test jsonb_remove_root {
+    SELECT jsonb_remove('{"a": 1}', '$');
 }
 expect {
 }
@@ -2907,3 +2955,26 @@ expect {
     null
 }
 
+# Regression: json_valid() must return 0 for UTF-8 BLOB data that is not valid JSON syntax.
+test json_valid_blob_utf8_non_json_word {
+    SELECT json_valid(x'696e76616c6964');
+}
+expect {
+    0
+}
+
+test json_valid_blob_utf8_non_json_word_with_whitespace {
+    SELECT json_valid(x'2020696e76616c69642020');
+}
+expect {
+    0
+}
+
+# Regression: x'7C31323334353637' starts with '|' (0x7C), which can overlap
+# with JSONB inline header byte patterns, but this is scalar non-JSON bytes.
+test json_valid_blob_header_overlap_scalar_bytes {
+    SELECT json_valid(x'7C31323334353637');
+}
+expect {
+    0
+}

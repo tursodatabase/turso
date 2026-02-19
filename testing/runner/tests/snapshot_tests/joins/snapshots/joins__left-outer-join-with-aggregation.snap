@@ -1,15 +1,27 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        c.customer_id,\n        c.name,\n        COUNT(o.order_id) AS order_count,\n        COALESCE(SUM(o.total_amount), 0) AS total_spent\n    FROM\n        customers c\n    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id\n    GROUP BY\n        c.customer_id, c.name\n    ORDER BY\n        total_spent DESC;"
+expression: |-
+  SELECT
+          c.customer_id,
+          c.name,
+          COUNT(o.order_id) AS order_count,
+          COALESCE(SUM(o.total_amount), 0) AS total_spent
+      FROM
+          customers c
+      LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id
+      GROUP BY
+          c.customer_id, c.name
+      ORDER BY
+          total_spent DESC;
 info:
   statement_type: SELECT
   tables:
-    - c.customer_id
-    - customers
-    - orders
+  - c.customer_id
+  - customers
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN customers AS c

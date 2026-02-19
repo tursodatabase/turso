@@ -181,7 +181,16 @@ impl Fuzzer {
 
         // Create Turso in-memory database using MemorySimIO
         let io = Arc::new(MemorySimIO::new(config.seed));
-        let turso_db = Database::open_file(io.clone(), out_dir.join("test.db").to_str().unwrap())?;
+        let mut opts = turso_core::DatabaseOpts::new();
+        opts = opts.with_attach(true);
+
+        let turso_db = Database::open_file_with_flags(
+            io.clone(),
+            out_dir.join("test.db").to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+        )?;
         let turso_conn = turso_db.connect()?;
 
         // Create SQLite in-memory database
@@ -195,6 +204,15 @@ impl Fuzzer {
             rusqlite::Connection::open_in_memory()
         }
         .context("Failed to open SQLite database")?;
+
+        // Attach an in-memory database on both connections
+        turso_conn
+            .execute("ATTACH ':memory:' AS aux")
+            .context("Failed to ATTACH on Turso")?;
+        sqlite_conn
+            .execute("ATTACH ':memory:' AS aux", [])
+            .context("Failed to ATTACH on SQLite")?;
+        tracing::info!("Attached ':memory:' AS aux on both connections");
 
         Ok(Self {
             config,
@@ -345,16 +363,24 @@ impl Fuzzer {
 
     /// Introspect schemas from both databases and verify they match.
     fn introspect_and_verify_schemas(&self) -> Result<Schema> {
-        let turso_schema = SchemaIntrospector::from_turso(&self.turso_conn)
-            .context("Failed to introspect Turso schema")?;
-        let sqlite_schema = SchemaIntrospector::from_sqlite(&self.sqlite_conn)
-            .context("Failed to introspect SQLite schema")?;
+        let (turso_schema, sqlite_schema) = (
+            SchemaIntrospector::from_turso_with_attached(&self.turso_conn)
+                .context("Failed to introspect Turso schema (with attached)")?,
+            SchemaIntrospector::from_sqlite_with_attached(&self.sqlite_conn)
+                .context("Failed to introspect SQLite schema (with attached)")?,
+        );
 
-        // Verify table names match
-        let turso_tables: std::collections::HashSet<_> =
-            turso_schema.tables.iter().map(|t| &t.name).collect();
-        let sqlite_tables: std::collections::HashSet<_> =
-            sqlite_schema.tables.iter().map(|t| &t.name).collect();
+        // Verify table names match (using qualified names to distinguish databases)
+        let turso_tables: std::collections::HashSet<_> = turso_schema
+            .tables
+            .iter()
+            .map(|t| t.qualified_name())
+            .collect();
+        let sqlite_tables: std::collections::HashSet<_> = sqlite_schema
+            .tables
+            .iter()
+            .map(|t| t.qualified_name())
+            .collect();
 
         if turso_tables != sqlite_tables {
             bail!(
@@ -369,7 +395,7 @@ impl Fuzzer {
             let sqlite_table = sqlite_schema
                 .tables
                 .iter()
-                .find(|t| t.name == turso_table.name)
+                .find(|t| t.name == turso_table.name && t.database == turso_table.database)
                 .expect("Table should exist in SQLite schema");
 
             let turso_cols: Vec<_> = turso_table.columns.iter().map(|c| &c.name).collect();
@@ -378,7 +404,7 @@ impl Fuzzer {
             if turso_cols != sqlite_cols {
                 bail!(
                     "Column mismatch in table '{}': Turso has {:?}, SQLite has {:?}",
-                    turso_table.name,
+                    turso_table.qualified_name(),
                     turso_cols,
                     sqlite_cols
                 );

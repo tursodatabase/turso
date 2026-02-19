@@ -90,18 +90,10 @@ main() {
     local platform
     platform="$(detect_platform)"
 
-    local url
-    url="$(get_download_url "$platform")"
-
     local binary_name
     binary_name="$(get_binary_name "$platform")"
 
     local target_binary="$INSTALL_DIR/$binary_name"
-
-    echo "Platform: $platform"
-    echo "SQLite version: $SQLITE_VERSION"
-    echo "Download URL: $url"
-    echo "Install directory: $INSTALL_DIR"
 
     # Check if already installed
     if [ -x "$target_binary" ]; then
@@ -109,6 +101,14 @@ main() {
         "$target_binary" --version
         exit 0
     fi
+
+    local url
+    url="$(get_download_url "$platform")"
+
+    echo "Platform: $platform"
+    echo "SQLite version: $SQLITE_VERSION"
+    echo "Download URL: $url"
+    echo "Install directory: $INSTALL_DIR"
 
     # Create install directory
     mkdir -p "$INSTALL_DIR"
