@@ -59,8 +59,8 @@ run-cli: build
 
 # Run tests with Rust backend (native turso bindings)
 run-rust: build-runner
-	$(TEST_RUNNER) run tests --backend rust $(MVCC_FLAG)
-	$(TEST_RUNNER) run turso-tests --backend rust $(MVCC_FLAG)
+	$(TEST_RUNNER) run tests --backend rust $(MVCC_FLAG) $(ARGS)
+	$(TEST_RUNNER) run turso-tests --backend rust $(MVCC_FLAG) $(ARGS)
 
 # Build JavaScript bindings (requires Node.js and yarn)
 JS_DIR := $(ROOT_DIR)/bindings/javascript
