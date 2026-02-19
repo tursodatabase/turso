@@ -833,7 +833,11 @@ pub fn emit_upsert(
                             || {
                                 table
                                     .get_column_by_name(&c.name)
-                                    .map(|(_, col)| col.affinity().aff_mask())
+                                    .map(|(_, col)| {
+                                        let is_strict =
+                                            table.btree().is_some_and(|btree| btree.is_strict);
+                                        col.affinity_with_strict(is_strict).aff_mask()
+                                    })
                                     .unwrap_or('B')
                             },
                             |_| crate::vdbe::affinity::Affinity::Blob.aff_mask(),
@@ -888,10 +892,11 @@ pub fn emit_upsert(
 
     // Build NEW table payload
     let rec = program.alloc_register();
+    let is_strict = table.btree().is_some_and(|btree| btree.is_strict);
     let affinity_str = table
         .columns()
         .iter()
-        .map(|c| c.affinity().aff_mask())
+        .map(|c| c.affinity_with_strict(is_strict).aff_mask())
         .collect::<String>();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u16(new_start),
@@ -1002,6 +1007,7 @@ pub fn emit_upsert(
                     table.columns(),
                     ctx.cursor_id,
                     ctx.conflict_rowid_reg,
+                    table.btree().is_some_and(|btree| btree.is_strict),
                 ))
             } else {
                 None
@@ -1055,6 +1061,7 @@ pub fn emit_upsert(
                     table.columns(),
                     ctx.cursor_id,
                     ctx.conflict_rowid_reg,
+                    table.btree().is_some_and(|btree| btree.is_strict),
                 ))
             } else {
                 None

@@ -2097,11 +2097,16 @@ fn emit_delete_row_common(
         if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
             let cdc_has_before = program.capture_data_changes_info().has_before();
             let before_record_reg = if cdc_has_before {
+                let table_reference = unsafe { &*table_reference };
                 Some(emit_cdc_full_record(
                     program,
-                    unsafe { &*table_reference }.table.columns(),
+                    table_reference.table.columns(),
                     main_table_cursor_id,
                     rowid_reg,
+                    table_reference
+                        .table
+                        .btree()
+                        .is_some_and(|btree| btree.is_strict),
                 ))
             } else {
                 None
@@ -3235,6 +3240,10 @@ fn emit_update_insns<'a>(
             .register_affinities
             .insert(rowid_reg, Affinity::Integer);
     }
+    let target_is_strict = target_table
+        .table
+        .btree()
+        .is_some_and(|btree| btree.is_strict);
 
     // For IGNORE, FAIL, and ROLLBACK modes, we need to do a preflight check for unique
     // constraint violations BEFORE deleting any old index entries. This ensures that:
@@ -3278,7 +3287,7 @@ fn emit_update_insns<'a>(
                         Affinity::Blob.aff_mask()
                     } else {
                         target_table.table.columns()[ic.pos_in_table]
-                            .affinity()
+                            .affinity_with_strict(target_is_strict)
                             .aff_mask()
                     }
                 })
@@ -3634,7 +3643,7 @@ fn emit_update_insns<'a>(
                     Affinity::Blob.aff_mask()
                 } else {
                     target_table.table.columns()[ic.pos_in_table]
-                        .affinity()
+                        .affinity_with_strict(target_is_strict)
                         .aff_mask()
                 }
             })
@@ -3910,11 +3919,15 @@ fn emit_update_insns<'a>(
 
         let record_reg = program.alloc_register();
 
+        let is_strict = target_table
+            .table
+            .btree()
+            .is_some_and(|btree| btree.is_strict);
         let affinity_str = target_table
             .table
             .columns()
             .iter()
-            .map(|col| col.affinity().aff_mask())
+            .map(|col| col.affinity_with_strict(is_strict).aff_mask())
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
@@ -3959,6 +3972,10 @@ fn emit_update_insns<'a>(
                 target_table.table.columns(),
                 target_table_cursor_id,
                 cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
+                target_table
+                    .table
+                    .btree()
+                    .is_some_and(|btree| btree.is_strict),
             ))
         } else {
             None
@@ -4234,10 +4251,11 @@ pub fn emit_cdc_patch_record(
             dst_reg: columns_reg + rowid_alias_position,
             extra_amount: 0,
         });
+        let is_strict = table.btree().is_some_and(|btree| btree.is_strict);
         let affinity_str = table
             .columns()
             .iter()
-            .map(|col| col.affinity().aff_mask())
+            .map(|col| col.affinity_with_strict(is_strict).aff_mask())
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
@@ -4258,6 +4276,7 @@ pub fn emit_cdc_full_record(
     columns: &[Column],
     table_cursor_id: usize,
     rowid_reg: usize,
+    is_strict: bool,
 ) -> usize {
     let columns_reg = program.alloc_registers(columns.len() + 1);
     for (i, column) in columns.iter().enumerate() {
@@ -4273,7 +4292,7 @@ pub fn emit_cdc_full_record(
     }
     let affinity_str = columns
         .iter()
-        .map(|col| col.affinity().aff_mask())
+        .map(|col| col.affinity_with_strict(is_strict).aff_mask())
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
