@@ -1632,11 +1632,12 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/serverless@portal:../../packages/turso-serverless::locator=root-workspace-0b6124%40workspace%3A.":
-  version: 0.0.0-use.local
-  resolution: "@tursodatabase/serverless@portal:../../packages/turso-serverless::locator=root-workspace-0b6124%40workspace%3A."
+"@tursodatabase/serverless@npm:^0.2.0":
+  version: 0.2.0
+  resolution: "@tursodatabase/serverless@npm:0.2.0"
+  checksum: 10c0/92d8cb67f45ca5fbf386aa46dbcd3190f33170db4ee73455dc766c9bb0772297f0e8b0f5bb28353e4700f92011e11eb38b8aa8f384acb9819c738471a020c1bb
   languageName: node
-  linkType: soft
+  linkType: hard
 
 "@tursodatabase/sync-common@npm:^0.5.0-pre.12, @tursodatabase/sync-common@workspace:sync/packages/common":
   version: 0.0.0-use.local
