@@ -13,8 +13,10 @@
     "packages/wasm",
     "sync/packages/common",
     "sync/packages/native",
-    "sync/packages/wasm",
-    "../../packages/turso-serverless"
+    "sync/packages/wasm"
   ],
+  "resolutions": {
+    "@tursodatabase/serverless": "portal:../../packages/turso-serverless"
+  },
   "version": "0.5.0-pre.12"
 }
