@@ -3062,8 +3062,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             // forever (deadlock).
             turso_assert!(
                 dep_set.is_empty(),
-                "remove_tx({tx_id}): commit_dep_set is not empty ({} would be orphaned)",
-                dep_set.len()
+                "remove_tx({tx_id}): commit_dep_set is not empty",
             );
         }
         self.txs.remove(&tx_id);
