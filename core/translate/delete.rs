@@ -1,7 +1,7 @@
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
-use crate::translate::expr::process_returning_clause;
+use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
     DeletePlan, IterationDirection, JoinOrderMember, Operation, Plan, QueryDestination,
@@ -18,7 +18,7 @@ use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent, With};
 
-use super::plan::{ColumnUsedMask, JoinedTable, TableReferences};
+use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_delete(
@@ -62,7 +62,7 @@ pub fn translate_delete(
     // Plan subqueries in the WHERE clause
     if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
         if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
-            // When using rowset (triggers present), subqueries are in the rowset_plan's WHERE
+            // When using rowset (triggers or subqueries present), subqueries are in the rowset_plan's WHERE
             plan_subqueries_from_select_plan(program, rowset_plan, resolver, connection)?;
         } else {
             // Normal path: subqueries are in the DELETE plan's WHERE
@@ -80,7 +80,7 @@ pub fn translate_delete(
     optimize_plan(program, &mut delete_plan, resolver)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Rewrite the Delete plan after optimization whenever a RowSet is used (DELETE triggers
-        // are present), so the joined table is treated as a plain table scan again.
+        // or subqueries are present), so the joined table is treated as a plain table scan again.
         //
         // RowSets re-seek the base table cursor for every delete, so expressions that reference
         // columns during index maintenance must bind to the table cursor again (not the index we
@@ -224,7 +224,12 @@ pub fn prepare_delete_plan(
         })
         .unwrap_or(false);
 
-    if has_delete_triggers {
+    // We also use a RowSet for safety when the WHERE clause of the DELETE statement contains any subqueries.
+    // This coarse approach is also what SQLite does; one could do analysis on the subquery and verify that it does not
+    // reference the table being deleted, but falling back to this broader default is certainly safe.
+    let needs_rowset = has_delete_triggers || where_clause_has_subquery(&where_predicates);
+
+    if needs_rowset {
         // Create a SelectPlan that materializes rowids into a RowSet
         let rowid_internal_id = table_references
             .joined_tables()
@@ -295,6 +300,30 @@ pub fn prepare_delete_plan(
             non_from_clause_subqueries,
         }))
     }
+}
+
+/// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
+fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
+    for pred in predicates {
+        let mut found = false;
+        let _ = walk_expr(&pred.expr, &mut |e| {
+            if matches!(
+                e,
+                Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
+            ) {
+                found = true;
+            }
+            Ok(if found {
+                WalkControl::SkipChildren
+            } else {
+                WalkControl::Continue
+            })
+        });
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 fn estimate_num_instructions(plan: &DeletePlan) -> usize {
