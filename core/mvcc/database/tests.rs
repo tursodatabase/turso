@@ -1022,8 +1022,8 @@ fn test_checkpoint_truncates_wal_last() {
             );
             assert_eq!(
                 mvcc_store.get_logical_log_file().size().unwrap(),
-                0,
-                "logical log should be truncated to 0"
+                LOG_HDR_SIZE as u64,
+                "logical log should contain only the header after truncation"
             );
         }
 
@@ -1044,9 +1044,216 @@ fn test_checkpoint_truncates_wal_last() {
     assert_eq!(final_wal_len, 0);
     assert_eq!(
         mvcc_store.get_logical_log_file().size().unwrap(),
-        0,
-        "logical log should be truncated to 0 after checkpoint"
+        LOG_HDR_SIZE as u64,
+        "logical log should contain only the header after checkpoint"
     );
+}
+
+/// What this test checks: The blocking checkpoint lock is released before the WAL-to-DB
+/// backfill (CheckpointWal state), so that new transactions can start while the expensive
+/// I/O operations complete.
+/// Why this matters: Holding the lock during WAL backfill + DB fsync blocks all readers
+/// and writers for the entire checkpoint duration.
+#[test]
+fn test_checkpoint_releases_lock_before_wal_backfill() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+    let mut checkpoint_sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+    );
+
+    // Step through until we reach CheckpointWal. At that point the blocking lock
+    // must already be released (ReleaseLock runs before CheckpointWal).
+    let mut reached_checkpoint_wal = false;
+    for _ in 0..50_000 {
+        if checkpoint_sm.state_for_test() == CheckpointState::CheckpointWal {
+            reached_checkpoint_wal = true;
+            // The lock should have been released in the ReleaseLock state.
+            // Verify by acquiring a read lock (which begin_tx does).
+            assert!(
+                mvcc_store.blocking_checkpoint_lock.read(),
+                "blocking_checkpoint_lock should be available for readers at CheckpointWal"
+            );
+            // Release the read lock we just acquired for the assertion.
+            mvcc_store.blocking_checkpoint_lock.unlock();
+            break;
+        }
+
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                panic!("checkpoint finished before reaching CheckpointWal state")
+            }
+        }
+    }
+    assert!(
+        reached_checkpoint_wal,
+        "expected to reach CheckpointWal state"
+    );
+
+    // Finish the rest of the checkpoint (WAL backfill + truncation).
+    let mut finished = false;
+    for _ in 0..50_000 {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(finished, "checkpoint state machine did not finish");
+
+    // Verify data is still correct.
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a");
+}
+
+/// What this test checks: After the checkpoint releases the lock in ReleaseLock state,
+/// new transactions can begin and commit while the WAL backfill is still pending.
+/// Why this matters: This is the core improvement — the expensive WAL I/O no longer
+/// blocks other transactions.
+#[test]
+fn test_checkpoint_allows_new_tx_during_wal_backfill() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'before')").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+    let mut checkpoint_sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+    );
+
+    // Advance to CheckpointWal (lock is released at this point).
+    for _ in 0..50_000 {
+        if checkpoint_sm.state_for_test() == CheckpointState::CheckpointWal {
+            break;
+        }
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                panic!("checkpoint finished before reaching CheckpointWal state")
+            }
+        }
+    }
+    assert_eq!(
+        checkpoint_sm.state_for_test(),
+        CheckpointState::CheckpointWal
+    );
+
+    // With the lock released, a new transaction should be able to begin.
+    // Use begin_tx directly to verify the lock is available.
+    let tx = mvcc_store
+        .begin_tx(conn.pager.load().clone())
+        .expect("begin_tx should succeed while WAL backfill is pending");
+    mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn);
+
+    // Now finish the checkpoint.
+    let mut finished = false;
+    for _ in 0..50_000 {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(finished, "checkpoint state machine did not finish");
+
+    // Verify data is intact after checkpoint with concurrent tx begin.
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "before");
+}
+
+/// What this test checks: The logical log is truncated before the WAL-to-DB backfill
+/// in the new checkpoint ordering, and the WAL is still truncated last.
+/// Why this matters: Recovery relies on the WAL being intact when the logical log is
+/// truncated, and the DB file being durable before the WAL is truncated.
+#[test]
+fn test_checkpoint_log_truncated_before_wal_backfill() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path.as_ref().unwrap().clone();
+    let wal_path = wal_path_for_db(&db_path);
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+    let mut checkpoint_sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+    );
+
+    let mut saw_log_truncated_before_wal_ckpt = false;
+    let mut saw_wal_truncate_after_backfill = false;
+    let mut finished = false;
+    for _ in 0..50_000 {
+        let state = checkpoint_sm.state_for_test();
+
+        if state == CheckpointState::CheckpointWal {
+            // At CheckpointWal, logical log should already be truncated (header-only)
+            assert_eq!(
+                mvcc_store.get_logical_log_file().size().unwrap(),
+                LOG_HDR_SIZE as u64,
+                "logical log should contain only the header before WAL backfill"
+            );
+            // WAL should still exist (backfill hasn't happened yet)
+            let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+            assert!(wal_len > 0, "WAL must still exist before backfill");
+            saw_log_truncated_before_wal_ckpt = true;
+        }
+
+        if state == CheckpointState::TruncateWal {
+            saw_wal_truncate_after_backfill = true;
+        }
+
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+
+    assert!(finished, "checkpoint state machine did not finish");
+    assert!(saw_log_truncated_before_wal_ckpt);
+    assert!(saw_wal_truncate_after_backfill);
+
+    let final_wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+    assert_eq!(final_wal_len, 0);
 }
 
 /// What this test checks: Checkpoint accepts sqlite_schema index-row updates for already-checkpointed indexes
@@ -1266,8 +1473,8 @@ fn test_empty_log_recovery_loads_checkpoint_watermark() {
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         assert_eq!(
             mvcc_store.get_logical_log_file().size().unwrap(),
-            0,
-            "logical log should be truncated to 0 after checkpoint"
+            LOG_HDR_SIZE as u64,
+            "logical log should contain only the header after checkpoint"
         );
         let meta = get_rows(
             &conn,

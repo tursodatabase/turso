@@ -1595,13 +1595,14 @@ pub struct MvStore<Clock: LogicalClock> {
     exclusive_tx: AtomicU64,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,
-    /// MVCC checkpoints are always TRUNCATE, plus they block all other transactions.
-    /// This guarantees that never need to let transactions read from the SQLite WAL.
-    /// In MVCC, the checkpoint procedure is roughly as follows:
+    /// MVCC checkpoints are always TRUNCATE, plus they block all other transactions
+    /// during the write-to-WAL + log-truncation phase. The lock is released before the
+    /// expensive WAL-to-DB backfill so that new transactions can proceed while the
+    /// checkpoint finishes the I/O-heavy portion. The procedure is roughly:
     /// - Take the blocking_checkpoint_lock
     /// - Write everything in the logical log to the pager, and from there commit to the SQLite WAL.
-    /// - Immediately TRUNCATE checkpoint the WAL into the database file.
-    /// - Release the blocking_checkpoint_lock.
+    /// - Truncate logical log, GC, release the blocking_checkpoint_lock.
+    /// - TRUNCATE checkpoint the WAL into the database file (without the lock).
     blocking_checkpoint_lock: Arc<TursoRwLock>,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
