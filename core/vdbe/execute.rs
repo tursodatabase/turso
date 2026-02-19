@@ -6181,7 +6181,7 @@ pub fn op_function(
                                 unique,
                                 if_not_exists,
                                 idx_name,
-                                where_clause,
+                                mut where_clause,
                                 using,
                                 with_clause,
                             } => {
@@ -6200,6 +6200,14 @@ pub fn op_function(
                                         }
                                         _ => {}
                                     }
+                                }
+
+                                if let Some(ref mut wc) = where_clause {
+                                    rewrite_check_expr_column_refs(
+                                        wc,
+                                        &rename_from,
+                                        column_def.col_name.as_str(),
+                                    );
                                 }
 
                                 Some(
@@ -9890,6 +9898,10 @@ pub fn op_alter_column(
                     ) {
                         ic.name.clone_from(&new_name);
                     }
+                }
+                // Update partial index WHERE clause column references
+                if let Some(ref mut wc) = idx.where_clause {
+                    rewrite_check_expr_column_refs(wc, &old_column_name, &new_name);
                 }
             }
         }
