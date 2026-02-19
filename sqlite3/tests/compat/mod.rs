@@ -119,6 +119,15 @@ extern "C" {
         arg: *mut libc::c_void,
     ) -> i32;
     fn sqlite3_busy_timeout(db: *mut sqlite3, ms: i32) -> i32;
+    fn sqlite3_get_table(
+        db: *mut sqlite3,
+        sql: *const libc::c_char,
+        paz_result: *mut *mut *mut libc::c_char,
+        pn_row: *mut libc::c_int,
+        pn_column: *mut libc::c_int,
+        pz_err_msg: *mut *mut libc::c_char,
+    ) -> i32;
+    fn sqlite3_free_table(az_result: *mut *mut libc::c_char);
 }
 
 const SQLITE_OK: i32 = 0;
@@ -2474,6 +2483,134 @@ mod tests {
             );
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_get_table() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // Create and populate a table
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1(id INTEGER, name TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t1 VALUES(1, 'alice')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t1 VALUES(2, 'bob')".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            // Query via sqlite3_get_table
+            let mut result: *mut *mut libc::c_char = ptr::null_mut();
+            let mut n_row: libc::c_int = 0;
+            let mut n_col: libc::c_int = 0;
+            let mut err_msg: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_get_table(
+                    db,
+                    c"SELECT id, name FROM t1 ORDER BY id".as_ptr(),
+                    &mut result,
+                    &mut n_row,
+                    &mut n_col,
+                    &mut err_msg,
+                ),
+                SQLITE_OK
+            );
+
+            assert_eq!(n_row, 2);
+            assert_eq!(n_col, 2);
+
+            // result layout: [col0_name, col1_name, row0_val0, row0_val1, row1_val0, row1_val1]
+            let col0 = std::ffi::CStr::from_ptr(*result.add(0));
+            let col1 = std::ffi::CStr::from_ptr(*result.add(1));
+            assert_eq!(col0.to_str().unwrap(), "id");
+            assert_eq!(col1.to_str().unwrap(), "name");
+
+            let r0v0 = std::ffi::CStr::from_ptr(*result.add(2));
+            let r0v1 = std::ffi::CStr::from_ptr(*result.add(3));
+            assert_eq!(r0v0.to_str().unwrap(), "1");
+            assert_eq!(r0v1.to_str().unwrap(), "alice");
+
+            let r1v0 = std::ffi::CStr::from_ptr(*result.add(4));
+            let r1v1 = std::ffi::CStr::from_ptr(*result.add(5));
+            assert_eq!(r1v0.to_str().unwrap(), "2");
+            assert_eq!(r1v1.to_str().unwrap(), "bob");
+
+            sqlite3_free_table(result);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_get_table_empty_result() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t1(id INTEGER)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let mut result: *mut *mut libc::c_char = ptr::null_mut();
+            let mut n_row: libc::c_int = 0;
+            let mut n_col: libc::c_int = 0;
+            assert_eq!(
+                sqlite3_get_table(
+                    db,
+                    c"SELECT id FROM t1".as_ptr(),
+                    &mut result,
+                    &mut n_row,
+                    &mut n_col,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            assert_eq!(n_row, 0);
+            assert_eq!(n_col, 0);
+
+            sqlite3_free_table(result);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_free_table_null() {
+        unsafe {
+            // Passing null should not crash
+            sqlite3_free_table(ptr::null_mut());
         }
     }
 }
