@@ -96,6 +96,7 @@ jobs:
               export TARGET_CFLAGS="$TARGET_CXXFLAGS"
               yarn workspace @tursodatabase/database-common build
               yarn workspace @tursodatabase/database-wasm-common build
+              npm run --prefix ../../packages/turso-serverless build
               yarn workspace @tursodatabase/sync-common build
               yarn workspace @tursodatabase/sync-wasm build
     name: ${{ matrix.settings.artifact }} - node@20
