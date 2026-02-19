@@ -1647,7 +1647,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn get_pager(&self) -> Arc<Pager> {
-        todo!()
+        self.btree_cursor.get_pager()
     }
 
     fn get_skip_advance(&self) -> bool {

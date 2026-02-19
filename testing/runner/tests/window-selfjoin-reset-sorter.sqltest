@@ -1,0 +1,57 @@
+@database :memory:
+
+# Regression test: ResetSorter on an ephemeral table with OpenDup cursors
+# caused "parent page is a leaf page, expected interior page" corruption error.
+#
+# When a window function uses an ephemeral buffer table (OpenEphemeral + OpenDup),
+# ResetSorter clears the btree via one cursor but the OpenDup cursor retains a
+# stale cached rightmost-page pointer. On the next round of inserts the dup cursor
+# navigates to a freed page, and the subsequent btree balance sees the root
+# (reverted to leaf by clear_btree) as the parent, triggering the corruption error.
+
+setup tables {
+    CREATE TABLE v0 ( c1 TEXT );
+    INSERT INTO v0 ( c1 ) VALUES ('a'),('a'),('a'),('a'),('a'),('a'),('a'),
+      ('b'),('b'),('b'),('b'),('b'),('b');
+}
+
+# The triple self-join produces enough rows (559) to overflow the ephemeral
+# table's root page, triggering btree splits. The window function's ResetSorter
+# then clears the ephemeral table between partitions. Without the fix, the second
+# round of inserts into the dup cursor would hit the corruption.
+@setup tables
+test window-over-triple-selfjoin-select {
+    SELECT * FROM v0 AS a4
+      JOIN v0 AS a5 USING ( c1 ) JOIN v0 AS a6 USING ( c1 )
+      ORDER BY c1, sum ( 1e18 ) OVER ( ORDER BY c1 ) LIMIT 5;
+}
+expect {
+    a
+    a
+    a
+    a
+    a
+}
+
+@setup tables
+test window-over-triple-selfjoin-update {
+    UPDATE v0 SET c1 = c1 + 1e18 WHERE ( SELECT * FROM v0 AS a4
+      JOIN v0 AS a5 USING ( c1 ) JOIN v0 AS a6 USING ( c1 )
+      ORDER BY c1, sum ( 1e18 ) OVER ( ORDER BY c1 ) ) = 0;
+    SELECT * FROM v0;
+}
+expect {
+    a
+    a
+    a
+    a
+    a
+    a
+    a
+    b
+    b
+    b
+    b
+    b
+    b
+}
