@@ -133,6 +133,9 @@ pub fn prepare_delete_plan(
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", tbl_name),
     };
+    if program.trigger.is_some() && table.virtual_table().is_some() {
+        crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
+    }
 
     // Check if this is a materialized view
     if schema.is_materialized_view(&tbl_name) {

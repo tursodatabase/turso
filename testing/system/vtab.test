@@ -74,14 +74,15 @@ set trigger_insert_vtab_sql {
     INSERT INTO t1 VALUES ('k2', 'v2');
     SELECT key, value FROM v ORDER BY key;
 }
-if {$is_turso} {
-    do_execsql_test_on_specific_db {:memory:} trigger-insert-into-writable-vtab \
-        $trigger_insert_vtab_sql {k1|v1
-k2|v2}
-} else {
-    do_execsql_test_in_memory_error_content trigger-insert-into-writable-vtab-unsafe \
-        $trigger_insert_vtab_sql {unsafe use of virtual table}
-}
+do_execsql_test_in_memory_error_content trigger-insert-into-writable-vtab \
+    $trigger_insert_vtab_sql {unsafe use of virtual table}
+
+do_execsql_test_in_memory_error_content trigger-select-from-vtab-unsafe {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    CREATE TABLE t1(id TEXT);
+    CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT key FROM v; END;
+    INSERT INTO t1 VALUES ('k1');
+} {unsafe use of virtual table}
 
 do_execsql_test_on_specific_db {:memory:} select-hidden-column {
     create virtual table t using kv_store;
