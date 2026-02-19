@@ -21,7 +21,6 @@ use crate::translate::plan::{
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
-use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError};
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
@@ -284,6 +283,7 @@ pub fn translate_create_index(
         let mut skip_row_label = None;
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
+            let condition_true_label = program.allocate_label();
             translate_condition_expr(
                 program,
                 &table_references,
@@ -291,11 +291,12 @@ pub fn translate_create_index(
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_false: label,
-                    jump_target_when_true: BranchOffset::Placeholder,
+                    jump_target_when_true: condition_true_label,
                     jump_target_when_null: label,
                 },
                 resolver,
             )?;
+            program.preassign_label_to_next_insn(condition_true_label);
             skip_row_label = Some(label);
         }
 
@@ -380,6 +381,7 @@ pub fn translate_create_index(
         let mut skip_row_label = None;
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
+            let condition_true_label = program.allocate_label();
             translate_condition_expr(
                 program,
                 &table_references,
@@ -387,11 +389,12 @@ pub fn translate_create_index(
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_false: label,
-                    jump_target_when_true: BranchOffset::Placeholder,
+                    jump_target_when_true: condition_true_label,
                     jump_target_when_null: label,
                 },
                 resolver,
             )?;
+            program.preassign_label_to_next_insn(condition_true_label);
             skip_row_label = Some(label);
         }
 
