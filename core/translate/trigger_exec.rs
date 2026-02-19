@@ -120,6 +120,15 @@ struct TriggerSubprogramContext {
     db_name: Option<ast::Name>,
 }
 
+fn variable_from_parameter_index(index: NonZero<usize>) -> Expr {
+    Expr::Variable(ast::Variable::indexed(
+        u32::try_from(index.get())
+            .ok()
+            .and_then(std::num::NonZeroU32::new)
+            .expect("trigger parameter index must fit into NonZeroU32"),
+    ))
+}
+
 impl TriggerSubprogramContext {
     pub fn get_new_param(&self, idx: usize) -> Option<NonZero<usize>> {
         self.new_param_map
@@ -168,20 +177,17 @@ fn rewrite_trigger_expr_for_subprogram(
                         if let Some((idx, col_def)) = table.get_column(&col) {
                             if col_def.is_rowid_alias() {
                                 // Rowid alias columns map to the rowid parameter, not the column register
-                                *e = Expr::Variable(format!(
-                                    "{}",
+                                *e = variable_from_parameter_index(
                                     ctx.get_new_rowid_param()
-                                        .expect("NEW parameters must be provided")
-                                ));
+                                        .expect("NEW parameters must be provided"),
+                                );
                                 return Ok(WalkControl::Continue);
                             }
                             if idx < new_params.len() {
-                                *e = Expr::Variable(format!(
-                                    "{}",
+                                *e = variable_from_parameter_index(
                                     ctx.get_new_param(idx)
-                                        .expect("NEW parameters must be provided")
-                                        .get()
-                                ));
+                                        .expect("NEW parameters must be provided"),
+                                );
                                 return Ok(WalkControl::Continue);
                             } else {
                                 crate::bail_parse_error!("no such column in NEW: {}", col);
@@ -192,11 +198,10 @@ fn rewrite_trigger_expr_for_subprogram(
                             .iter()
                             .any(|s| s.eq_ignore_ascii_case(&col))
                         {
-                            *e = Expr::Variable(format!(
-                                "{}",
+                            *e = variable_from_parameter_index(
                                 ctx.get_new_rowid_param()
-                                    .expect("NEW parameters must be provided")
-                            ));
+                                    .expect("NEW parameters must be provided"),
+                            );
                             return Ok(WalkControl::Continue);
                         }
                         bail_parse_error!("no such column in NEW: {}", col);
@@ -212,12 +217,10 @@ fn rewrite_trigger_expr_for_subprogram(
                     if let Some(old_params) = &ctx.old_param_map {
                         if let Some((idx, _)) = table.get_column(&col) {
                             if idx < old_params.len() {
-                                *e = Expr::Variable(format!(
-                                    "{}",
+                                *e = variable_from_parameter_index(
                                     ctx.get_old_param(idx)
-                                        .expect("OLD parameters must be provided")
-                                        .get()
-                                ));
+                                        .expect("OLD parameters must be provided"),
+                                );
                                 return Ok(WalkControl::Continue);
                             } else {
                                 crate::bail_parse_error!("no such column in OLD: {}", col);
@@ -228,11 +231,10 @@ fn rewrite_trigger_expr_for_subprogram(
                             .iter()
                             .any(|s| s.eq_ignore_ascii_case(&col))
                         {
-                            *e = Expr::Variable(format!(
-                                "{}",
+                            *e = variable_from_parameter_index(
                                 ctx.get_old_rowid_param()
-                                    .expect("OLD parameters must be provided")
-                            ));
+                                    .expect("OLD parameters must be provided"),
+                            );
                             return Ok(WalkControl::Continue);
                         }
                         bail_parse_error!("no such column in OLD: {}", col);
@@ -485,20 +487,17 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if let Some(new_params) = &ctx.new_param_map {
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
                         if col_def.is_rowid_alias() {
-                            *e = Expr::Variable(format!(
-                                "{}",
+                            *e = variable_from_parameter_index(
                                 ctx.get_new_rowid_param()
-                                    .expect("NEW parameters must be provided")
-                            ));
+                                    .expect("NEW parameters must be provided"),
+                            );
                             return Ok(());
                         }
                         if idx < new_params.len() {
-                            *e = Expr::Variable(format!(
-                                "{}",
+                            *e = variable_from_parameter_index(
                                 ctx.get_new_param(idx)
-                                    .expect("NEW parameters must be provided")
-                                    .get()
-                            ));
+                                    .expect("NEW parameters must be provided"),
+                            );
                             return Ok(());
                         } else {
                             crate::bail_parse_error!("no such column in NEW: {}", col);
@@ -509,11 +508,10 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         .iter()
                         .any(|s| s.eq_ignore_ascii_case(&col))
                     {
-                        *e = Expr::Variable(format!(
-                            "{}",
+                        *e = variable_from_parameter_index(
                             ctx.get_new_rowid_param()
-                                .expect("NEW parameters must be provided")
-                        ));
+                                .expect("NEW parameters must be provided"),
+                        );
                         return Ok(());
                     }
                     bail_parse_error!("no such column in NEW: {}", col);
@@ -529,20 +527,17 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if let Some(old_params) = &ctx.old_param_map {
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
                         if col_def.is_rowid_alias() {
-                            *e = Expr::Variable(format!(
-                                "{}",
+                            *e = variable_from_parameter_index(
                                 ctx.get_old_rowid_param()
-                                    .expect("OLD parameters must be provided")
-                            ));
+                                    .expect("OLD parameters must be provided"),
+                            );
                             return Ok(());
                         }
                         if idx < old_params.len() {
-                            *e = Expr::Variable(format!(
-                                "{}",
+                            *e = variable_from_parameter_index(
                                 ctx.get_old_param(idx)
-                                    .expect("OLD parameters must be provided")
-                                    .get()
-                            ));
+                                    .expect("OLD parameters must be provided"),
+                            );
                             return Ok(());
                         } else {
                             crate::bail_parse_error!("no such column in OLD: {}", col)
@@ -553,11 +548,10 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         .iter()
                         .any(|s| s.eq_ignore_ascii_case(&col))
                     {
-                        *e = Expr::Variable(format!(
-                            "{}",
+                        *e = variable_from_parameter_index(
                             ctx.get_old_rowid_param()
-                                .expect("OLD parameters must be provided")
-                        ));
+                                .expect("OLD parameters must be provided"),
+                        );
                         return Ok(());
                     }
                     bail_parse_error!("no such column in OLD: {}", col);

@@ -447,7 +447,10 @@ pub fn try_substitute_parameters(
             }))
         }
         Expr::Variable(var) => {
-            let Ok(var) = var.parse::<i32>() else {
+            if var.name.is_some() {
+                return None;
+            }
+            let Ok(var) = i32::try_from(var.index.get()) else {
                 return None;
             };
             Some(Box::new(parameters.get(&var)?.clone()))
@@ -497,7 +500,10 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
             Some(captured)
         }
         (Expr::Variable(var), expr) => {
-            let Ok(var) = var.parse::<i32>() else {
+            if var.name.is_some() {
+                return None;
+            }
+            let Ok(var) = i32::try_from(var.index.get()) else {
                 return None;
             };
             captured.insert(var, expr.clone());
@@ -766,10 +772,6 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => {
             op1 == op2 && exprs_are_equivalent(expr1, expr2)
         }
-        // Variables that are not bound to a specific value, are treated as NULL
-        // https://sqlite.org/lang_expr.html#varparam
-        (Expr::Variable(var), Expr::Variable(var2)) if var.is_empty() && var2.is_empty() => false,
-        // Named variables can be compared by their name
         (Expr::Variable(val), Expr::Variable(val2)) => val == val2,
         (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => {
             exprs1.len() == exprs2.len()
@@ -1997,7 +1999,7 @@ pub fn rewrite_inline_col_fk_target_if_needed(
 pub mod tests {
     use super::*;
     use crate::schema::Type as SchemaValueType;
-    use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type};
+    use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
 
     #[test]
     fn test_normalize_ident() {
@@ -2007,20 +2009,20 @@ pub mod tests {
     }
 
     #[test]
-    fn test_anonymous_variable_comparison() {
-        let expr1 = Expr::Variable("".to_string());
-        let expr2 = Expr::Variable("".to_string());
-        assert!(!exprs_are_equivalent(&expr1, &expr2));
+    fn test_indexed_variable_comparison() {
+        let expr1 = Expr::Variable(Variable::indexed(1u32.try_into().unwrap()));
+        let expr2 = Expr::Variable(Variable::indexed(1u32.try_into().unwrap()));
+        assert!(exprs_are_equivalent(&expr1, &expr2));
     }
 
     #[test]
     fn test_named_variable_comparison() {
-        let expr1 = Expr::Variable("1".to_string());
-        let expr2 = Expr::Variable("1".to_string());
+        let expr1 = Expr::Variable(Variable::named(":a".to_string(), 1u32.try_into().unwrap()));
+        let expr2 = Expr::Variable(Variable::named(":a".to_string(), 1u32.try_into().unwrap()));
         assert!(exprs_are_equivalent(&expr1, &expr2));
 
-        let expr1 = Expr::Variable("1".to_string());
-        let expr2 = Expr::Variable("2".to_string());
+        let expr1 = Expr::Variable(Variable::named(":a".to_string(), 1u32.try_into().unwrap()));
+        let expr2 = Expr::Variable(Variable::named(":b".to_string(), 2u32.try_into().unwrap()));
         assert!(!exprs_are_equivalent(&expr1, &expr2));
     }
 
