@@ -1,0 +1,17 @@
+@database database/integrity_freelist_count_mismatch.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-freelist-count-mismatch {
+    PRAGMA integrity_check;
+}
+expect pattern {
+    (?s)^\*\*\* in database main \*\*\*\nFreelist: size is \d+ but should be \d+$
+}
+
+test quick-check-freelist-count-mismatch {
+    PRAGMA quick_check;
+}
+expect pattern {
+    (?s)^\*\*\* in database main \*\*\*\nFreelist: size is \d+ but should be \d+$
+}

@@ -176,7 +176,11 @@ impl CliDatabaseInstance {
         }
 
         if self.is_sqlite {
-            cmd.arg(format!("file:{}?immutable=1", self.db_path));
+            if self.readonly {
+                cmd.arg(format!("file:{}?immutable=1", self.db_path));
+            } else {
+                cmd.arg(&self.db_path);
+            }
         }
 
         // Only add -q flag for tursodb/turso (not sqlite3 or other CLIs)
