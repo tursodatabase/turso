@@ -2051,6 +2051,11 @@ pub fn halt(
         if let Some(cdc_info) = state.pending_cdc_info.take() {
             program.connection.set_capture_data_changes_info(cdc_info);
         }
+        if program.change_cnt_on {
+            program
+                .connection
+                .set_changes(state.n_change.load(Ordering::SeqCst));
+        }
         Ok(InsnFunctionStepResult::Done)
     }
 }

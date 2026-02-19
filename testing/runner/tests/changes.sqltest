@@ -149,3 +149,75 @@ expect {
     1
 }
 
+test changes-insert-in-transaction {
+    create table t(id integer primary key, val text);
+    begin;
+    insert into t values(1, 'a'), (2, 'b'), (3, 'c');
+    select changes();
+    commit;
+}
+expect {
+    3
+}
+
+test changes-insert-in-transaction-after-commit {
+    create table t(id integer primary key, val text);
+    begin;
+    insert into t values(1, 'a'), (2, 'b'), (3, 'c');
+    commit;
+    select changes();
+}
+expect {
+    3
+}
+
+test changes-delete-in-transaction {
+    create table t(id integer primary key, val integer);
+    insert into t values(1, 10), (2, 20), (3, 30);
+    begin;
+    delete from t where val > 15;
+    select changes();
+    commit;
+}
+expect {
+    2
+}
+
+test changes-insert-in-transaction-with-prior-data {
+    create table t(id integer primary key, val integer);
+    insert into t values(1, 10), (2, 20), (3, 30);
+    begin;
+    insert into t values(4, 40), (5, 50);
+    select changes();
+    commit;
+}
+expect {
+    2
+}
+
+test changes-update-in-transaction {
+    create table t(id integer primary key, val text);
+    insert into t values(1, 'a'), (2, 'b'), (3, 'c');
+    begin;
+    update t set val = 'z' where id <= 2;
+    select changes();
+    commit;
+}
+expect {
+    2
+}
+
+test changes-multiple-stmts-in-transaction {
+    create table t(id integer primary key, val text);
+    begin;
+    insert into t values(1, 'a'), (2, 'b');
+    select changes();
+    insert into t values(3, 'c');
+    select changes();
+    commit;
+}
+expect {
+    2
+    1
+}
+
