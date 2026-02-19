@@ -48,6 +48,8 @@ pub const INTEGRITY_FIXTURE_NOT_NULL_VIOLATION_REL_PATH: &str =
     "database/integrity_not_null_violation.db";
 pub const INTEGRITY_FIXTURE_NON_UNIQUE_INDEX_ENTRY_REL_PATH: &str =
     "database/integrity_non_unique_index_entry.db";
+pub const INTEGRITY_FIXTURE_MISSING_UNIQUE_INDEX_ENTRY_REL_PATH: &str =
+    "database/integrity_missing_unique_index_entry.db";
 pub const INTEGRITY_FIXTURE_FREELIST_COUNT_MISMATCH_REL_PATH: &str =
     "database/integrity_freelist_count_mismatch.db";
 pub const INTEGRITY_FIXTURE_FREELIST_TRUNK_CORRUPT_REL_PATH: &str =
@@ -63,6 +65,7 @@ pub const INTEGRITY_FIXTURE_RELATIVE_PATHS: &[&str] = &[
     INTEGRITY_FIXTURE_CHECK_CONSTRAINT_VIOLATION_QUICK_REL_PATH,
     INTEGRITY_FIXTURE_NOT_NULL_VIOLATION_REL_PATH,
     INTEGRITY_FIXTURE_NON_UNIQUE_INDEX_ENTRY_REL_PATH,
+    INTEGRITY_FIXTURE_MISSING_UNIQUE_INDEX_ENTRY_REL_PATH,
     INTEGRITY_FIXTURE_FREELIST_COUNT_MISMATCH_REL_PATH,
     INTEGRITY_FIXTURE_FREELIST_TRUNK_CORRUPT_REL_PATH,
     INTEGRITY_FIXTURE_OVERFLOW_LIST_LENGTH_MISMATCH_REL_PATH,
@@ -883,6 +886,57 @@ async fn generate_non_unique_index_entry_fixture(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn generate_missing_unique_index_entry_fixture(db_path: &Path) -> Result<()> {
+    clear_existing_db_and_sidecars(db_path)?;
+
+    let db_path_str = db_path.to_string_lossy().to_string();
+    let db = Builder::new_local(&db_path_str)
+        .build()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create integrity fixture database at '{}'",
+                db_path.display()
+            )
+        })?;
+    let conn = db
+        .connect()
+        .with_context(|| format!("failed to connect to fixture '{}'", db_path.display()))?;
+
+    conn.execute_batch(
+        r#"
+        PRAGMA page_size=4096;
+        CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+        CREATE UNIQUE INDEX idx_u_missing ON t(b);
+        INSERT INTO t VALUES (1,10),(2,20),(3,30);
+        "#,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to initialize fixture '{INTEGRITY_FIXTURE_MISSING_UNIQUE_INDEX_ENTRY_REL_PATH}'"
+        )
+    })?;
+
+    checkpoint_truncate(&conn, INTEGRITY_FIXTURE_MISSING_UNIQUE_INDEX_ENTRY_REL_PATH).await?;
+    let page_size =
+        get_page_size(&conn, INTEGRITY_FIXTURE_MISSING_UNIQUE_INDEX_ENTRY_REL_PATH).await?;
+    let index_root_page = get_root_page(
+        &conn,
+        "idx_u_missing",
+        INTEGRITY_FIXTURE_MISSING_UNIQUE_INDEX_ENTRY_REL_PATH,
+    )
+    .await?;
+    drop(conn);
+    drop(db);
+
+    // Corrupt exactly one key value so the row for b=20 is missing from the
+    // unique index, but no duplicate key is introduced.
+    patch_change_first_index_key_i8(db_path, page_size, index_root_page, 20, 25)?;
+    remove_db_sidecars(db_path)?;
+    Ok(())
+}
+
 async fn generate_freelist_fixture_base(
     db_path: &Path,
     context: &str,
@@ -1080,6 +1134,9 @@ pub async fn generate_integrity_fixture(db_path: &Path, relative_path: &str) -> 
         }
         INTEGRITY_FIXTURE_NON_UNIQUE_INDEX_ENTRY_REL_PATH => {
             generate_non_unique_index_entry_fixture(db_path).await
+        }
+        INTEGRITY_FIXTURE_MISSING_UNIQUE_INDEX_ENTRY_REL_PATH => {
+            generate_missing_unique_index_entry_fixture(db_path).await
         }
         INTEGRITY_FIXTURE_FREELIST_COUNT_MISMATCH_REL_PATH => {
             generate_freelist_count_mismatch_fixture(db_path).await
