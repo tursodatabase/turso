@@ -5,8 +5,8 @@ use crate::{
     translate::{
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_cdc_patch_record, emit_check_constraints, prepare_cdc_if_necessary, OperationMode,
-            Resolver,
+            emit_cdc_patch_record, emit_check_constraints, emit_fk_child_decrement_on_delete,
+            prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
@@ -36,15 +36,9 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, ProgramBuilderOpts},
-        insn::{
-            to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
-        },
+        builder::{CursorKey, CursorType, ProgramBuilder, ProgramBuilderOpts},
+        insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
-    },
-    vdbe::{
-        builder::{CursorType, ProgramBuilder},
-        insn::Insn,
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
 };
@@ -662,7 +656,7 @@ pub fn translate_insert(
     // IGNORE/ROLLBACK). REPLACE inserts eagerly in the preflight phase because it needs
     // to delete-then-insert per index.
     if has_upsert || !on_replace {
-        emit_commit_phase(program, resolver, &insertion, &ctx, connection)?;
+        emit_commit_phase(program, resolver, &insertion, &ctx)?;
     }
 
     if has_fks {
@@ -759,7 +753,6 @@ pub fn translate_insert(
             on_replace,
             resolver,
             database_id,
-            connection,
         )?;
     }
 
@@ -950,7 +943,6 @@ fn emit_commit_phase(
     resolver: &Resolver,
     insertion: &Insertion,
     ctx: &InsertEmitCtx,
-    _connection: &Arc<Connection>,
 ) -> Result<()> {
     let indices: Vec<_> = resolver.with_schema(ctx.database_id, |s| {
         s.get_indices(ctx.table.name.as_str()).cloned().collect()
@@ -2947,6 +2939,17 @@ fn emit_replace_delete_conflicting_row(
             connection,
             ctx.database_id,
         )?;
+        if resolver.schema().has_child_fks(ctx.table.name.as_str()) {
+            emit_fk_child_decrement_on_delete(
+                program,
+                ctx.table.as_ref(),
+                ctx.table.name.as_str(),
+                ctx.cursor_id,
+                ctx.conflict_rowid_reg,
+                ctx.database_id,
+                resolver,
+            )?;
+        }
     }
 
     let table = &ctx.table;
@@ -3327,7 +3330,6 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     force_immediate: bool,
     resolver: &Resolver,
     database_id: usize,
-    _connection: &Arc<Connection>,
 ) -> crate::Result<()> {
     for pref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&parent_table.name)

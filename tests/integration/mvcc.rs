@@ -1,4 +1,4 @@
-use crate::common::TempDatabase;
+use crate::common::{ExecRows, TempDatabase};
 use std::sync::Arc;
 use turso_core::StepResult;
 
@@ -168,6 +168,30 @@ fn test_stmt_rollback_cleans_write_set_with_index(tmp_db: TempDatabase) -> anyho
     assert!(result.is_err(), "DELETE should fail due to FK constraint");
 
     conn2.execute("COMMIT")?;
+    Ok(())
+}
+
+/// Regression test: upgrading an existing MVCC transaction from read->write must not
+/// leak an extra blocking-checkpoint read lock.
+///
+/// Before the fix, this sequence left `blocking_checkpoint_lock` with a stale reader:
+/// BEGIN (deferred) -> read statement (starts tx) -> write statement (upgrade) -> COMMIT.
+/// A following checkpoint then failed with `database is locked`.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_read_to_write_upgrade_does_not_block_checkpoint(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER)")?;
+
+    conn.execute("BEGIN")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![(0,)]);
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("COMMIT")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    conn2.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
     Ok(())
 }

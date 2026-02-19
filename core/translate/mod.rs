@@ -57,7 +57,7 @@ use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize};
 use insert::translate_insert;
-use rollback::translate_rollback;
+use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
 use tracing::{instrument, Level};
@@ -304,12 +304,12 @@ pub fn translate_inner(
         ast::Stmt::Optimize { idx_name } => {
             translate_optimize(idx_name, resolver, program, connection)?
         }
-        ast::Stmt::Release { .. } => bail_parse_error!("RELEASE not supported yet"),
+        ast::Stmt::Release { name } => translate_release(program, name)?,
         ast::Stmt::Rollback {
             tx_name,
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
-        ast::Stmt::Savepoint { .. } => bail_parse_error!("SAVEPOINT not supported yet"),
+        ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
         ast::Stmt::Select(select) => {
             translate_select(
                 select,

@@ -1674,6 +1674,15 @@ pub fn insn_to_row(
                 0,
                 format!("auto_commit={auto_commit}, rollback={rollback}"),
             ),
+            Insn::Savepoint { op, name } => (
+                "Savepoint",
+                0,
+                0,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("op={op:?}, name={name}"),
+            ),
             Insn::OpenEphemeral {
                 cursor_id,
                 is_table,
