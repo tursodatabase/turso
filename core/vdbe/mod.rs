@@ -1467,6 +1467,9 @@ impl Program {
                     conn.set_mv_tx(None);
                     conn.set_tx_state(TransactionState::None);
                     pager.end_read_tx();
+                    // Commit any attached database write transactions that were
+                    // started alongside the MVCC transaction on the main database.
+                    self.end_attached_write_txns(&conn, _rollback)?;
                     program_state.commit_state = CommitState::Ready;
                     return Ok(IOResult::Done(()));
                 }

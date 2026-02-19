@@ -868,6 +868,9 @@ pub fn op_open_read(
 
     let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
+    // Attached databases (db >= 2) don't participate in MVCC, so bypass
+    // the MvStore for them even when the main database has MVCC enabled.
+    let is_attached_db = *db >= 2;
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -889,7 +892,7 @@ pub fn op_open_read(
         .cursor_ref
         .get(*cursor_id)
         .expect("cursor_id should exist in cursor_ref");
-    if program.connection.get_mv_tx_id().is_none() {
+    if program.connection.get_mv_tx_id().is_none() || is_attached_db {
         assert!(
             *root_page >= 0,
             "root page should be non negative when we are not in a MVCC transaction"
@@ -906,21 +909,22 @@ pub fn op_open_read(
     let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
                                         mv_cursor_type: MvccCursorType|
      -> Result<Box<dyn CursorTrait>> {
-        if let Some(tx_id) = program.connection.get_mv_tx_id() {
-            let mv_store = mv_store
-                .as_ref()
-                .expect("mv_store should be Some when MVCC transaction is active")
-                .clone();
-            Ok(Box::new(MvCursor::new(
-                mv_store,
-                tx_id,
-                *root_page,
-                mv_cursor_type,
-                btree_cursor,
-            )?))
-        } else {
-            Ok(btree_cursor)
+        if !is_attached_db {
+            if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                let mv_store = mv_store
+                    .as_ref()
+                    .expect("mv_store should be Some when MVCC transaction is active")
+                    .clone();
+                return Ok(Box::new(MvCursor::new(
+                    mv_store,
+                    tx_id,
+                    *root_page,
+                    mv_cursor_type,
+                    btree_cursor,
+                )?));
+            }
         }
+        Ok(btree_cursor)
     };
 
     match cursor_type {
@@ -2202,7 +2206,13 @@ pub fn op_transaction_inner(
         );
     }
     let pager = program.get_pager_from_database_index(db);
-    let mv_store = program.connection.mv_store();
+    // Attached databases (db >= 2) don't participate in MVCC, so treat
+    // mv_store as None for them to use regular pager transaction paths.
+    let mv_store: Option<Arc<MvStore>> = if *db >= 2 {
+        None
+    } else {
+        (*program.connection.mv_store()).clone()
+    };
     loop {
         match state.op_transaction_state {
             OpTransactionState::Start => {
@@ -7449,14 +7459,9 @@ fn new_rowid_inner(
                             }
                         }
                     } else {
-                        // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
-                        let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
-                            panic!("Expected MvCursor or BTreeCursor in op_new_rowid");
-                        };
-                        turso_assert!(
-                            ephemeral_cursor.pager.wal.is_none(),
-                            "MVCC is enabled but got a non-ephemeral BTreeCursor"
-                        );
+                        // Not an MvCursor - either an ephemeral cursor or a
+                        // cursor on an attached database (which doesn't
+                        // participate in MVCC). Both use the regular path.
                         state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
                             mvcc_already_initialized: false,
                         };
@@ -7833,6 +7838,9 @@ pub fn op_open_write(
     }
     let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
+    // Attached databases (db >= 2) don't participate in MVCC, so bypass
+    // the MvStore for them even when the main database has MVCC enabled.
+    let is_attached_db = *db >= 2;
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -7864,7 +7872,9 @@ pub fn op_open_write(
 
     const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
 
-    if root_page == SQLITE_SCHEMA_ROOT_PAGE {
+    // Only enforce MVCC exclusive transaction for schema changes on the main
+    // database. Attached databases don't participate in MVCC.
+    if root_page == SQLITE_SCHEMA_ROOT_PAGE && !is_attached_db {
         if let Some(mv_store) = mv_store.as_ref() {
             let Some(tx_id) = program.connection.get_mv_tx_id() else {
                 return Err(LimboError::InternalError(
@@ -7901,21 +7911,22 @@ pub fn op_open_write(
         let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<Box<dyn CursorTrait>> {
-            if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let mv_store = mv_store
-                    .as_ref()
-                    .expect("mv_store should be Some when MVCC transaction is active")
-                    .clone();
-                Ok(Box::new(MvCursor::new(
-                    mv_store,
-                    tx_id,
-                    root_page,
-                    mv_cursor_type,
-                    btree_cursor,
-                )?))
-            } else {
-                Ok(btree_cursor)
+            if !is_attached_db {
+                if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                    let mv_store = mv_store
+                        .as_ref()
+                        .expect("mv_store should be Some when MVCC transaction is active")
+                        .clone();
+                    return Ok(Box::new(MvCursor::new(
+                        mv_store,
+                        tx_id,
+                        root_page,
+                        mv_cursor_type,
+                        btree_cursor,
+                    )?));
+                }
             }
+            Ok(btree_cursor)
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
@@ -7989,13 +8000,18 @@ pub fn op_create_btree(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
+    // Attached databases (db >= 2) don't participate in MVCC, so bypass
+    // the MvStore and create a real B-tree page on the attached pager.
     let mv_store = program.connection.mv_store();
+    let is_attached_db = *db >= 2;
 
-    if let Some(mv_store) = mv_store.as_ref() {
-        let root_page = mv_store.get_next_table_id();
-        state.registers[*root] = Register::Value(Value::from_i64(root_page));
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
+    if !is_attached_db {
+        if let Some(mv_store) = mv_store.as_ref() {
+            let root_page = mv_store.get_next_table_id();
+            state.registers[*root] = Register::Value(Value::from_i64(root_page));
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
     let pager = program.get_pager_from_database_index(db);
     // FIXME: handle page cache is full
@@ -8156,7 +8172,9 @@ pub fn op_destroy(
         todo!("temp databases not implemented yet.");
     }
     let mv_store = program.connection.mv_store();
-    if mv_store.is_some() {
+    // Attached databases (db >= 2) don't participate in MVCC, so they
+    // need actual B-tree destruction rather than deferring to checkpoint.
+    if mv_store.is_some() && *db < 2 {
         // MVCC only does pager operations in checkpoint
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -8391,7 +8409,8 @@ pub fn op_parse_schema(
 
     let enable_triggers = conn.experimental_triggers_enabled();
     // For attached databases, qualify the sqlite_schema table with the database name
-    let schema_table = if *db >= 2 {
+    let is_attached_db = *db >= 2;
+    let schema_table = if is_attached_db {
         let db_name = conn
             .get_database_name_by_index(*db)
             .unwrap_or_else(|| "main".to_string());
@@ -8399,6 +8418,13 @@ pub fn op_parse_schema(
     } else {
         "sqlite_schema".to_string()
     };
+    // Attached databases don't participate in MVCC, so don't pass MVCC
+    // transaction info when parsing their schemas.
+    // Save the current mv_tx so we can restore it after parse_schema_rows,
+    // which calls set_mv_tx on the shared connection and would otherwise
+    // overwrite the main DB's in-flight MVCC transaction.
+    let previous_mv_tx = program.connection.get_mv_tx();
+    let mv_tx = if is_attached_db { None } else { previous_mv_tx };
     let maybe_nested_stmt_err = if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!("SELECT * FROM {schema_table} WHERE {where_clause}"))?;
 
@@ -8410,7 +8436,7 @@ pub fn op_parse_schema(
                 stmt,
                 schema,
                 &conn.syms.read(),
-                program.connection.get_mv_tx(),
+                mv_tx,
                 existing_views,
                 enable_triggers,
             )
@@ -8426,7 +8452,7 @@ pub fn op_parse_schema(
                 stmt,
                 schema,
                 &conn.syms.read(),
-                program.connection.get_mv_tx(),
+                mv_tx,
                 existing_views,
                 enable_triggers,
             )
@@ -8435,6 +8461,10 @@ pub fn op_parse_schema(
     conn.end_nested();
     conn.auto_commit
         .store(previous_auto_commit, Ordering::SeqCst);
+    // Restore the outer MVCC transaction that was active before the nested
+    // schema read. parse_schema_rows calls set_mv_tx on the shared connection,
+    // which overwrites any in-flight MVCC transaction from the outer program.
+    conn.set_mv_tx(previous_mv_tx);
     maybe_nested_stmt_err?;
 
     state.pc += 1;

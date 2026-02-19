@@ -1,0 +1,63 @@
+@database :memory:
+
+# Test that ATTACH DATABASE works when MVCC mode is enabled.
+# These tests only run against tursodb since MVCC is turso-specific.
+
+test mvcc-attach-memory {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    ATTACH DATABASE ':memory:' AS aux;
+    PRAGMA database_list;
+}
+expect {
+    0|main|
+    2|aux|
+}
+
+test mvcc-attach-create-and-query {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES (1, 'hello'), (2, 'world');
+    SELECT val FROM aux.t1 WHERE id = 2;
+}
+expect {
+    world
+}
+
+test mvcc-attach-cross-db-join {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    CREATE TABLE main_t (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO main_t VALUES (1, 'alice'), (2, 'bob');
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE TABLE aux.aux_t (id INTEGER PRIMARY KEY, score INTEGER);
+    INSERT INTO aux.aux_t VALUES (1, 100), (2, 200);
+    SELECT m.name, a.score FROM main_t m JOIN aux.aux_t a ON m.id = a.id ORDER BY m.id;
+}
+expect {
+    alice|100
+    bob|200
+}
+
+test mvcc-attach-detach {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    ATTACH DATABASE ':memory:' AS aux;
+    DETACH DATABASE aux;
+    PRAGMA database_list;
+}
+expect {
+    0|main|
+}
+
+test mvcc-attach-multiple {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    ATTACH DATABASE ':memory:' AS db1;
+    ATTACH DATABASE ':memory:' AS db2;
+    CREATE TABLE db1.t (x INTEGER);
+    CREATE TABLE db2.t (x INTEGER);
+    INSERT INTO db1.t VALUES (10);
+    INSERT INTO db2.t VALUES (20);
+    SELECT db1.t.x, db2.t.x FROM db1.t, db2.t;
+}
+expect {
+    10|20
+}

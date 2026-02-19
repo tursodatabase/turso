@@ -1,7 +1,5 @@
 @database :memory:
 
-@skip-file-if mvcc "attach not supported in MVCC mode"
-
 # =============================================================================
 # Basic DDL on attached database
 # =============================================================================
