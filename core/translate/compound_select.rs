@@ -156,6 +156,12 @@ pub fn emit_program_for_compound_select(
     )?;
     program.pop_current_parent_explain();
 
+    // Restore reg_result_cols_start after emit_compound_select, because nested
+    // subqueries (e.g. CTE coroutines) can overwrite program.reg_result_cols_start
+    // with their own result column registers. This mirrors the same fix in
+    // emit_program_for_select_with_inputs.
+    program.reg_result_cols_start = reg_result_cols_start;
+
     Ok(reg_result_cols_start)
 }
 
