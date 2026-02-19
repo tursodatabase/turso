@@ -74,18 +74,12 @@ test sin-radians-30 {
 expect {
     0.5
 }
-expect @js {
-    0.49999999999999994
-}
 
 test cos-radians-60 {
     SELECT cos(radians(60))
 }
 expect {
     0.5
-}
-expect @js {
-    0.5000000000000001
 }
 
 test tan-radians-45 {
