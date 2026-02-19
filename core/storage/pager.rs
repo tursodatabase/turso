@@ -3921,8 +3921,8 @@ impl Pager {
 
     pub fn freepage_list(&self) -> u32 {
         self.io
-            .block(|| HeaderRefMut::from_pager(self))
-            .map(|header_ref| header_ref.borrow_mut().freelist_pages.into())
+            .block(|| HeaderRef::from_pager(self))
+            .map(|header_ref| header_ref.borrow().freelist_pages.get())
             .unwrap_or(0)
     }
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
