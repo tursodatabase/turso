@@ -513,11 +513,13 @@ fn get_subquery_parser<'a>(
                     lhs_columns
                         .enumerate()
                         .map(|(i, lhs_expr)| {
-                            let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables));
+                            let lhs_affinity =
+                                get_expr_affinity(lhs_expr, Some(referenced_tables), None);
                             compare_affinity(
                                 &plan.result_columns[i].expr,
                                 lhs_affinity,
                                 Some(&plan.table_references),
+                                None,
                             )
                             .aff_mask()
                         })

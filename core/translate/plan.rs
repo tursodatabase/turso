@@ -42,7 +42,7 @@ fn infer_type_from_expr(
     expr: &ast::Expr,
     tables: Option<&TableReferences>,
 ) -> (Type, &'static str) {
-    let affinity = get_expr_affinity(expr, tables);
+    let affinity = get_expr_affinity(expr, tables, None);
     match affinity {
         Affinity::Integer => (Type::Integer, "INTEGER"),
         Affinity::Real => (Type::Real, "REAL"),
