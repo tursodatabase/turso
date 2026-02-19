@@ -894,12 +894,14 @@ test partial-index-or-where-clause {
     INSERT INTO t_or VALUES(-10);
     INSERT INTO t_or VALUES(3);
     SELECT x FROM t_or ORDER BY x;
+    PRAGMA integrity_check;
 }
 expect {
     -10
     0
     3
     10
+    ok
 }
 
 # NOT BETWEEN in partial index WHERE clause (desugars to OR, issue #5429)
@@ -911,12 +913,14 @@ test partial-index-not-between-existing-rows {
     INSERT INTO t_nb VALUES(-1);
     INSERT INTO t_nb VALUES(0);
     SELECT c0 FROM t_nb ORDER BY c0;
+    PRAGMA integrity_check;
 }
 expect {
     -1
     0
     1
     5
+    ok
 }
 
 # OR with multiple existing rows that match different sides
@@ -927,11 +931,13 @@ test partial-index-or-multiple-existing {
     INSERT INTO t_or2 VALUES(10);
     CREATE INDEX i_or2 ON t_or2(val) WHERE val > 5 OR val < -5;
     SELECT val FROM t_or2 ORDER BY val;
+    PRAGMA integrity_check;
 }
 expect {
     -10
     0
     10
+    ok
 }
 
 # OR in partial index with UNIQUE constraint
@@ -956,10 +962,12 @@ test partial-index-or-and-combined {
     CREATE INDEX i_oa ON t_oa(a) WHERE (a > 10 AND b > 10) OR (a < 2 AND b < 2);
     INSERT INTO t_oa VALUES(50, 50);
     SELECT a, b FROM t_oa ORDER BY a;
+    PRAGMA integrity_check;
 }
 expect {
     1|100
     3|3
     50|1
     50|50
+    ok
 }
