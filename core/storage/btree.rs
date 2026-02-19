@@ -616,6 +616,10 @@ pub trait CursorTrait: Any + Send + Sync {
     fn has_rowid(&self) -> bool;
     fn get_pager(&self) -> Arc<Pager>;
     fn get_skip_advance(&self) -> bool;
+    /// Invalidate cached navigation state. Must be called on cursors that
+    /// share a btree (e.g. OpenDup cursors) when the btree structure is
+    /// modified by another cursor (e.g. clear_btree via ResetSorter).
+    fn invalidate_btree_cache(&mut self) {}
     // --- end: BTreeCursor specific functions ----
 }
 
@@ -5686,6 +5690,10 @@ impl CursorTrait for BTreeCursor {
     #[inline]
     fn get_skip_advance(&self) -> bool {
         self.skip_advance
+    }
+
+    fn invalidate_btree_cache(&mut self) {
+        self.move_to_right_state.1 = None;
     }
 
     #[inline]

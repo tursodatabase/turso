@@ -8199,6 +8199,27 @@ pub fn op_reset_sorter(
         CursorType::BTreeTable(_) => {
             let cursor = cursor.as_btree_mut();
             return_if_io!(cursor.clear_btree());
+            // FIXME: cuurently we don't have a good way to identify cursors that are
+            // iterating in the same underlying BTree
+
+            // After clearing the btree, invalidate cached navigation state on all
+            // other cursors that share the same underlying btree (e.g. OpenDup cursors).
+            // Without this, dup cursors may use stale cached rightmost-page info and
+            // attempt to insert into freed pages, causing corruption.
+            let cleared_pager = {
+                let cursor = state.get_cursor(*cursor_id);
+                cursor.as_btree_mut().get_pager()
+            };
+            for (i, other_cursor_opt) in state.cursors.iter_mut().enumerate() {
+                if i == *cursor_id {
+                    continue;
+                }
+                if let Some(Cursor::BTree(ref mut btree_cursor)) = other_cursor_opt {
+                    if Arc::ptr_eq(&btree_cursor.get_pager(), &cleared_pager) {
+                        btree_cursor.invalidate_btree_cache();
+                    }
+                }
+            }
         }
         CursorType::Sorter => {
             return Err(LimboError::InternalError(
