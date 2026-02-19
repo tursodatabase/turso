@@ -80,6 +80,7 @@ pub enum WriteRow {
     },
     InsertIndex {
         rowid: i64,
+        needs_seek: bool,
     },
     UpdateExisting {
         rowid: i64,
@@ -189,14 +190,25 @@ impl WriteRow {
                         .table_cursor
                         .seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: true }));
 
-                    // Transition to DeleteIndex to also delete the index entry
-                    *self = WriteRow::DeleteIndex;
                     return_if_io!(cursors.table_cursor.delete());
+                    *self = WriteRow::DeleteIndex;
                 }
                 WriteRow::DeleteIndex => {
-                    // Mark as Done before delete to avoid retry on I/O
+                    // Re-seek the index cursor to ensure it's positioned correctly.
+                    // The cursor position may have been invalidated after I/O yields.
+                    let index_values = index_key.clone();
+                    let index_record =
+                        ImmutableRecord::from_values(&index_values, index_values.len());
+                    let res = return_if_io!(cursors.index_cursor.seek(
+                        SeekKey::IndexKey(&index_record),
+                        SeekOp::GE { eq_only: true }
+                    ));
+
+                    // Only delete if we found the entry (it might have been deleted already)
+                    if matches!(res, SeekResult::Found) {
+                        return_if_io!(cursors.index_cursor.delete());
+                    }
                     *self = WriteRow::Done;
-                    return_if_io!(cursors.index_cursor.delete());
                 }
                 WriteRow::ComputeNewRowId { final_weight } => {
                     // Find the last rowid to compute the next one
@@ -244,11 +256,27 @@ impl WriteRow {
                         ImmutableRecord::from_values(&complete_record, complete_record.len());
                     let btree_key = BTreeKey::new_table_rowid(rowid_val, Some(&immutable_record));
 
-                    // Transition to InsertIndex state after table insertion
-                    *self = WriteRow::InsertIndex { rowid: rowid_val };
                     return_if_io!(cursors.table_cursor.insert(&btree_key));
+                    *self = WriteRow::InsertIndex {
+                        rowid: rowid_val,
+                        needs_seek: true,
+                    };
                 }
-                WriteRow::InsertIndex { rowid } => {
+                WriteRow::InsertIndex { rowid, needs_seek } if *needs_seek => {
+                    // Re-seek the index cursor to ensure it's positioned correctly.
+                    // Cursor position is not preserved across I/O yields.
+                    let mut index_values = index_key.clone();
+                    index_values.push(Value::from_i64(*rowid));
+                    let index_record =
+                        ImmutableRecord::from_values(&index_values, index_values.len());
+
+                    return_if_io!(cursors.index_cursor.seek(
+                        SeekKey::IndexKey(&index_record),
+                        SeekOp::GE { eq_only: false }
+                    ));
+                    *needs_seek = false;
+                }
+                WriteRow::InsertIndex { rowid, .. } => {
                     // For has_rowid indexes, we need to append the rowid to the index key
                     // Use the function parameter index_key directly
                     let mut index_values = index_key.clone();
@@ -259,9 +287,8 @@ impl WriteRow {
                         ImmutableRecord::from_values(&index_values, index_values.len());
                     let index_btree_key = BTreeKey::new_index_key(&index_record);
 
-                    // Mark as Done before index insert to avoid retry on I/O
-                    *self = WriteRow::Done;
                     return_if_io!(cursors.index_cursor.insert(&index_btree_key));
+                    *self = WriteRow::Done;
                 }
                 WriteRow::UpdateExisting {
                     rowid,
@@ -276,10 +303,9 @@ impl WriteRow {
                         ImmutableRecord::from_values(&complete_record, complete_record.len());
                     let btree_key = BTreeKey::new_table_rowid(*rowid, Some(&immutable_record));
 
-                    // Mark as Done before insert to avoid retry on I/O
-                    *self = WriteRow::Done;
                     // BTree insert with existing key will replace the old value
                     return_if_io!(cursors.table_cursor.insert(&btree_key));
+                    *self = WriteRow::Done;
                 }
                 WriteRow::Done => {
                     return Ok(IOResult::Done(()));
@@ -386,17 +412,10 @@ mod tests {
     /// Simulates the scenario where an I/O yield occurs during the table insert
     /// in InsertNew, and the index cursor is left in a stale position.
     ///
-    /// Without the SeekForInsertIndex fix, InsertIndex uses the cursor position
-    /// left over from the GetRecord seek, which may be wrong after an I/O yield.
-    /// With the fix, SeekForInsertIndex re-seeks the index cursor before insert.
-    ///
-    /// This test reproduces the issue by:
-    /// 1. Inserting several entries to populate the B-tree
-    /// 2. For a new entry, manually performing the GetRecord + table insert steps
-    /// 3. Moving the index cursor to a different position (simulating stale state
-    ///    from I/O yield)
-    /// 4. Continuing from the InsertIndex state
-    /// 5. Verifying the index is correct
+    /// Verifies that InsertIndex re-seeks the index cursor before inserting.
+    /// After an I/O yield during the table insert, the index cursor may have been
+    /// repositioned by other operations. The `needs_seek` flag ensures the cursor
+    /// is re-positioned to the correct key before the index insert happens.
     #[test]
     fn test_write_row_stale_index_cursor_after_simulated_io_yield() {
         let (pager, table_root, index_root) = create_test_pager();
@@ -475,7 +494,7 @@ mod tests {
             })
             .unwrap();
 
-        // Step 3: Continue from InsertIndex state (what happens after I/O yield resumes)
+        // Step 3: Resume from InsertIndex with needs_seek=true (the state after InsertNew's table insert).
         let index_key = vec![
             Value::from_i64(op_id),
             Value::from_i64(zset_id),
@@ -487,7 +506,10 @@ mod tests {
             Value::from_i64(new_elem_id),
             Value::Null,
         ];
-        let mut wr = WriteRow::InsertIndex { rowid };
+        let mut wr = WriteRow::InsertIndex {
+            rowid,
+            needs_seek: true,
+        };
         pager
             .io
             .block(|| wr.write_row(&mut cursors, index_key.clone(), record_values.clone(), 1))
