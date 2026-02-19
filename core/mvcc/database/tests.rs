@@ -4066,7 +4066,7 @@ fn txid(v: u64) -> Option<TxTimestampOrID> {
 /// invisible to every transaction and must be removed unconditionally by Rule 1.
 fn test_gc_rule1_aborted_garbage_removed() {
     let mut versions = vec![make_rv(None, None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, u64::MAX, 0);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, u64::MAX, 0);
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
 }
@@ -4081,7 +4081,7 @@ fn test_gc_rule1_aborted_among_live_versions() {
         make_rv(None, None),   // aborted
         make_rv(ts(3), ts(5)), // superseded
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 2, 0);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 2, 0);
     // Only aborted removed; superseded has e=5 > lwm=2 so retained
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 2);
@@ -4102,7 +4102,7 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
         make_rv(ts(3), ts(5)), // superseded, e=5 <= lwm=10
         make_rv(ts(5), None),  // current
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 0);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 0);
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 1);
     assert!(versions[0].end.is_none()); // only current remains
@@ -4116,7 +4116,7 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
 fn test_gc_rule2_superseded_above_lwm_retained() {
     // Superseded version (end=Timestamp(15)) above LWM=10 — must be retained.
     let mut versions = vec![make_rv(ts(3), ts(15)), make_rv(ts(15), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 0);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 0);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
 }
@@ -4133,7 +4133,7 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
     let mut versions = vec![
         make_rv(ts(3), ts(5)), // tombstone (sole version, no current)
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 2);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 2);
     // e=5 > ckpt_max=2, no current → tombstone guard retains it
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -4147,7 +4147,7 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
 fn test_gc_rule2_tombstone_guard_checkpointed() {
     // Tombstone with e <= ckpt_max — deletion is checkpointed, safe to remove.
     let mut versions = vec![make_rv(ts(3), ts(5))];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 5);
     // e=5 <= ckpt_max=5, e=5 <= lwm=10 → removable
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
@@ -4162,7 +4162,7 @@ fn test_gc_rule2_tombstone_guard_checkpointed() {
 fn test_gc_rule3_checkpointed_sole_survivor_removed() {
     // Single current version with b <= ckpt_max and b < lwm.
     let mut versions = vec![make_rv(ts(5), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 5);
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
 }
@@ -4175,7 +4175,7 @@ fn test_gc_rule3_checkpointed_sole_survivor_removed() {
 fn test_gc_rule3_not_checkpointed_retained() {
     // Single current version with b > ckpt_max — B-tree doesn't have it yet.
     let mut versions = vec![make_rv(ts(5), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 3);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 3);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
 }
@@ -4188,7 +4188,7 @@ fn test_gc_rule3_not_checkpointed_retained() {
 fn test_gc_rule3_visible_to_active_tx_retained() {
     // Single current version with b >= lwm — some active tx might need it.
     let mut versions = vec![make_rv(ts(5), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 5, 10);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 5, 10);
     // b=5 is NOT < lwm=5 (strict <), so retained
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -4200,7 +4200,7 @@ fn test_gc_rule3_visible_to_active_tx_retained() {
 /// A current version cannot be removed before checkpoint has persisted it.
 fn test_gc_rule3_current_retained_before_first_checkpoint() {
     let mut versions = vec![make_rv(ts(1), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 0);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 0);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
 }
@@ -4211,7 +4211,7 @@ fn test_gc_rule3_current_retained_before_first_checkpoint() {
 /// Once checkpoint has persisted a sole current version, it becomes GC-eligible.
 fn test_gc_rule3_current_collected_after_checkpoint() {
     let mut versions = vec![make_rv(ts(1), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 5);
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 0);
 }
@@ -4228,7 +4228,7 @@ fn test_gc_rule3_not_sole_survivor() {
     // Both b <= ckpt_max and b < lwm, but there are 2 versions.
     // Rule 2 removes the superseded one (has_current=true), then rule 3 fires
     // on the remaining sole survivor.
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 5);
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
 }
@@ -4241,7 +4241,7 @@ fn test_gc_rule3_not_sole_survivor() {
 fn test_gc_txid_refs_retained() {
     // Versions with TxID (uncommitted) references are never collected.
     let mut versions = vec![make_rv(txid(99), None)];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, u64::MAX, u64::MAX);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, u64::MAX, u64::MAX);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
 }
@@ -4254,7 +4254,7 @@ fn test_gc_txid_refs_retained() {
 fn test_gc_txid_end_retained() {
     // end=TxID means the deletion is uncommitted; rule 2 only matches Timestamp.
     let mut versions = vec![make_rv(ts(3), txid(50))];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, u64::MAX, u64::MAX);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, u64::MAX, u64::MAX);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
 }
@@ -4273,7 +4273,7 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
         make_rv(ts(3), ts(5)), // tombstone: deletion at e=5, not checkpointed (ckpt_max=2)
         make_rv(txid(99), None), // pending insert (uncommitted)
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 2);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 2);
     // Tombstone must be retained: e=5 > ckpt_max=2, and pending insert doesn't count.
     // Only nothing changes (pending insert is not aborted garbage either).
     assert_eq!(dropped, 0);
@@ -4293,7 +4293,7 @@ fn test_gc_rule2_committed_current_disables_tombstone_guard() {
         make_rv(ts(3), ts(5)), // superseded, e=5 <= lwm=10
         make_rv(ts(5), None),  // committed current
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 2);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 2);
     // Superseded removed (has_current=true for committed version), current remains.
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 1);
@@ -4312,12 +4312,12 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
     // Represents a row deleted in MVCC that existed in B-tree before MVCC.
     // Before checkpoint (ckpt_max < e): tombstone must be retained.
     let mut versions = vec![make_rv(None, ts(5))];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, u64::MAX, 3);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, u64::MAX, 3);
     assert_eq!(dropped, 0, "tombstone retained: e=5 > ckpt_max=3");
     assert_eq!(versions.len(), 1);
 
     // After checkpoint (ckpt_max >= e): tombstone is collected.
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, u64::MAX, 5);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, u64::MAX, 5);
     assert_eq!(dropped, 1, "tombstone collected: e=5 <= ckpt_max=5");
     assert_eq!(versions.len(), 0);
 }
@@ -4336,7 +4336,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
         make_rv(ts(3), ts(15)), // e=15 > lwm=10 — retained
         make_rv(ts(15), None),  // current
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 20);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 20);
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
 }
@@ -4347,7 +4347,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
 /// GC on an empty version chain is a no-op. Verifies no panics or off-by-one errors.
 fn test_gc_noop_on_empty() {
     let mut versions: Vec<RowVersion> = vec![];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 5);
     assert_eq!(dropped, 0);
 }
 
@@ -4366,7 +4366,7 @@ fn test_gc_combined_rules() {
         make_rv(ts(3), ts(5)), // superseded, e=5 <= lwm=10 → rule 2
         make_rv(ts(5), None),  // current, b=5 <= ckpt_max=5, b < lwm=10 → rule 3
     ];
-    let dropped = MvStore::<LocalClock>::gc_version_chain(&mut versions, 10, 5);
+    let dropped = MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, 10, 5);
     assert_eq!(dropped, 4);
     assert!(versions.is_empty());
 }
@@ -4424,14 +4424,16 @@ fn test_gc_integration_rollback_creates_aborted_garbage() {
         .get(&RowID::new((-2).into(), RowKey::Int(1)));
     assert!(entry.is_some());
     {
-        let versions = entry.as_ref().unwrap().value().read();
-        assert_eq!(versions.len(), 1);
-        assert!(versions[0].begin.is_none());
-        assert!(versions[0].end.is_none());
+        let chain = entry.as_ref().unwrap().value();
+        assert_eq!(chain.len(), 1);
+        let node = chain.iter().next().unwrap();
+        assert!(node.begin().is_none());
+        assert!(node.end().is_none());
     }
 
     // GC should clean up the version. The SkipMap entry stays (lazy removal
-    // in background GC avoids TOCTOU), but the version vec should be empty.
+    // in background GC avoids TOCTOU), but the version chain should be empty
+    // after compaction (gc_mark marks it, drop_unused_row_versions handles it).
     let dropped = db.mvcc_store.drop_unused_row_versions();
     assert_eq!(dropped, 1);
     let entry = db
@@ -4439,9 +4441,10 @@ fn test_gc_integration_rollback_creates_aborted_garbage() {
         .rows
         .get(&RowID::new((-2).into(), RowKey::Int(1)));
     assert!(entry.is_some(), "SkipMap entry stays (lazy removal)");
-    assert!(
-        entry.unwrap().value().read().is_empty(),
-        "but versions should be empty"
+    assert_eq!(
+        entry.unwrap().value().live_count(),
+        0,
+        "but live versions should be zero"
     );
 }
 
@@ -4492,8 +4495,8 @@ fn test_gc_active_reader_pins_lwm() {
     );
     {
         let entry = db.mvcc_store.rows.get(&row_id).unwrap();
-        let versions = entry.value().read();
-        assert_eq!(versions.len(), 2, "both versions should be retained");
+        let chain = entry.value();
+        assert_eq!(chain.len(), 2, "both versions should be retained");
     }
 
     // T2 still sees the old version.
@@ -4517,8 +4520,8 @@ fn test_gc_active_reader_pins_lwm() {
     );
     {
         let entry = db.mvcc_store.rows.get(&row_id).unwrap();
-        let versions = entry.value().read();
-        assert_eq!(versions.len(), 1, "only current version should remain");
+        let chain = entry.value();
+        assert_eq!(chain.live_count(), 1, "only current version should remain");
     }
 }
 
@@ -4666,7 +4669,7 @@ impl Arbitrary for ArbitraryVersionChain {
 fn prop_gc_never_increases_version_count(chain: ArbitraryVersionChain) -> bool {
     let before = chain.versions.len();
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, chain.lwm, chain.ckpt_max);
     versions.len() <= before
 }
 
@@ -4677,9 +4680,9 @@ fn prop_gc_never_increases_version_count(chain: ArbitraryVersionChain) -> bool {
 #[quickcheck]
 fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
     let mut v1 = chain.versions.clone();
-    MvStore::<LocalClock>::gc_version_chain(&mut v1, chain.lwm, chain.ckpt_max);
+    MvStore::<LocalClock>::gc_version_chain_vec(&mut v1, chain.lwm, chain.ckpt_max);
     let snapshot = v1.clone();
-    MvStore::<LocalClock>::gc_version_chain(&mut v1, chain.lwm, chain.ckpt_max);
+    MvStore::<LocalClock>::gc_version_chain_vec(&mut v1, chain.lwm, chain.ckpt_max);
     // Compare content, not just length — a swap bug would pass a length-only check.
     v1.len() == snapshot.len()
         && v1
@@ -4694,7 +4697,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
 #[quickcheck]
 fn prop_gc_removes_all_aborted_garbage(chain: ArbitraryVersionChain) -> bool {
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, chain.lwm, chain.ckpt_max);
     versions
         .iter()
         .all(|rv| !matches!((&rv.begin, &rv.end), (None, None)))
@@ -4711,7 +4714,7 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
         .filter(|rv| matches!(&rv.begin, Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
         .count();
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, chain.lwm, chain.ckpt_max);
     let txid_begins_after: usize = versions
         .iter()
         .filter(|rv| matches!(&rv.begin, Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
@@ -4732,7 +4735,7 @@ fn prop_gc_retains_txid_ends(chain: ArbitraryVersionChain) -> bool {
         |rv: &&RowVersion| matches!(&rv.end, Some(TxTimestampOrID::TxID(_))) && rv.begin.is_some();
     let txid_ends_before: usize = chain.versions.iter().filter(filter).count();
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, chain.lwm, chain.ckpt_max);
     let txid_ends_after: usize = versions.iter().filter(filter).count();
     txid_ends_after == txid_ends_before
 }
@@ -4753,7 +4756,7 @@ fn prop_gc_current_versions_protected_before_checkpoint(chain: ArbitraryVersionC
         })
         .count();
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, 0);
+    MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, chain.lwm, 0);
     let current_after: usize = versions
         .iter()
         .filter(|rv| {
@@ -4777,7 +4780,7 @@ fn prop_gc_tombstone_guard_preserves_btree_safety(chain: ArbitraryVersionChain) 
     // least one has e > ckpt_max, GC must not empty the chain — removing all
     // versions would let the dual cursor fall through to a stale B-tree row.
     let mut versions = chain.versions.clone();
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, chain.lwm, chain.ckpt_max);
 
     // Check: if pre-GC chain had no committed current version AND had a
     // superseded version with e > ckpt_max, post-GC chain must not be empty.
@@ -4814,7 +4817,7 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
     // - e > lwm (Rule 2 didn't fire — still visible to some reader)
     // - e > ckpt_max (tombstone guard — deletion not yet in B-tree)
     let mut versions = chain.versions;
-    MvStore::<LocalClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
+    MvStore::<LocalClock>::gc_version_chain_vec(&mut versions, chain.lwm, chain.ckpt_max);
 
     let has_committed_current = versions
         .iter()

@@ -1,8 +1,8 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, TxTimestampOrID,
-    WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
-    SQLITE_SCHEMA_MVCC_TABLE_ID,
+    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, RowVersionChain,
+    RowVersionNode, TxTimestampOrID, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
+    MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::schema::Index;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
@@ -239,6 +239,22 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     /// Determine whether the newest valid version of a row should be checkpointed.
     /// Returns the version to checkpoint if it should be checkpointed, otherwise None.
+    fn maybe_get_checkpointable_version_from_chain(
+        &self,
+        chain: &RowVersionChain,
+        table_id: MVTableId,
+    ) -> Option<RowVersion> {
+        // Collect non-garbage versions and reverse to get oldest-first order.
+        let versions: Vec<RowVersion> = chain
+            .iter()
+            .filter(|n| !n.is_garbage())
+            .map(|n| n.to_row_version())
+            .collect::<Vec<_>>();
+        let mut reversed = versions;
+        reversed.reverse();
+        self.maybe_get_checkpointable_version(&reversed, table_id)
+    }
+
     fn maybe_get_checkpointable_version(
         &self,
         versions: &[RowVersion],
@@ -338,19 +354,19 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 continue;
             }
 
-            let row_versions = entry.value().read();
+            let chain = entry.value();
 
-            for version in row_versions.iter() {
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
+            for node in chain.iter() {
+                if let Some(TxTimestampOrID::Timestamp(ts)) = node.begin() {
                     max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                 }
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
+                if let Some(TxTimestampOrID::Timestamp(ts)) = node.end() {
                     max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                 }
             }
 
             if let Some(version) =
-                self.maybe_get_checkpointable_version(&row_versions, key.table_id)
+                self.maybe_get_checkpointable_version_from_chain(chain, key.table_id)
             {
                 let is_delete = version.end.is_some();
 
@@ -511,18 +527,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             let index_rows_map = entry.value();
             for entry in index_rows_map.iter() {
-                let versions = entry.value().read();
+                let chain = entry.value();
 
-                for version in versions.iter() {
-                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
+                for node in chain.iter() {
+                    if let Some(TxTimestampOrID::Timestamp(ts)) = node.begin() {
                         max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                     }
-                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
+                    if let Some(TxTimestampOrID::Timestamp(ts)) = node.end() {
                         max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                     }
                 }
 
-                if let Some(version) = self.maybe_get_checkpointable_version(&versions, index_id) {
+                if let Some(version) =
+                    self.maybe_get_checkpointable_version_from_chain(chain, index_id)
+                {
                     let is_delete = version.end.is_some();
 
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
@@ -589,11 +607,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// Must be called AFTER durable_txid_max is updated and BEFORE the
     /// checkpoint lock is released (no concurrent writers under blocking lock).
     fn gc_checkpointed_versions(&self) {
-        // Safety: entry removal after dropping the version-chain write lock has a
-        // TOCTOU gap — a concurrent writer could insert between the two. This is
-        // only safe because the blocking checkpoint lock prevents concurrent writers.
-        // If we ever move to a non-blocking checkpoint, this must switch to lazy
-        // removal (like background GC) or hold the write lock across the remove().
+        // Safety: entry removal is safe because the blocking checkpoint lock
+        // prevents concurrent writers.
         assert!(
             self.lock_states.blocking_checkpoint_lock_held,
             "gc_checkpointed_versions requires the blocking checkpoint lock"
@@ -614,12 +629,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 );
                 continue;
             };
-            let is_now_empty = {
-                let mut versions = entry.value().write();
-                MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
-                versions.is_empty()
-            };
-            if is_now_empty {
+            let chain = entry.value();
+            chain.gc_mark(lwm, ckpt_max);
+            chain.gc_compact();
+            if chain.is_empty() {
                 self.mvstore.rows.remove(row_id);
             }
         }
@@ -634,14 +647,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 .get(index_id)
                 .expect("index_id from write set must exist in index_rows");
             let inner_map = outer_entry.value();
-            let is_now_empty = {
-                let inner_entry = inner_map
-                    .get(sortable_key)
-                    .expect("index row from write set must exist in inner map");
-                let mut versions = inner_entry.value().write();
-                MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
-                versions.is_empty()
-            };
+            let inner_entry = inner_map
+                .get(sortable_key)
+                .expect("index row from write set must exist in inner map");
+            let chain = inner_entry.value();
+            chain.gc_mark(lwm, ckpt_max);
+            chain.gc_compact();
+            let is_now_empty = chain.is_empty();
+            drop(inner_entry);
             if is_now_empty {
                 inner_map.remove(sortable_key);
             }
@@ -1377,7 +1390,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         .rows
                         .get(&key)
                         .expect("sqlite_schema row not found");
-                    let mut row_versions = sqlite_schema_row.value().write();
+                    let chain = sqlite_schema_row.value();
                     // row_version is a clone of the original with only the root
                     // page column patched, so it shares the same version id. We
                     // must replace the original in-place rather than append,
@@ -1386,13 +1399,18 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     // one of them as ended (it returns after the first match),
                     // leaving the other as a phantom current version that causes
                     // spurious write-write conflicts at commit time.
+                    //
+                    // With lock-free chains we cannot replace a node in-place
+                    // (the row field is immutable). Instead, mark the old node
+                    // as garbage and prepend the patched version.
                     let vid = row_version.id;
-                    if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
-                        *existing = row_version;
-                    } else {
-                        self.mvstore
-                            .insert_version_raw(&mut row_versions, row_version);
+                    for node in chain.iter() {
+                        if node.id == vid {
+                            node.mark_garbage();
+                            break;
+                        }
                     }
+                    chain.prepend(Box::new(RowVersionNode::from_row_version(row_version)));
                 }
 
                 // Patch in-memory schema to do the same
