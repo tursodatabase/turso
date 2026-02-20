@@ -28,7 +28,7 @@ use crate::{
     translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
-    translate::plan::{Window, WindowFunction},
+    translate::plan::{Window, WindowFunction, WindowFunctionKind},
     vdbe::builder::ProgramBuilder,
 };
 use smallvec::SmallVec;
@@ -222,13 +222,27 @@ pub fn resolve_window_and_aggregate_functions(
                             link_with_window(
                                 windows.as_deref_mut(),
                                 expr,
-                                f,
+                                WindowFunctionKind::Agg(f),
                                 over_clause,
                                 distinctness,
                             )?;
                         } else {
                             add_aggregate_if_not_exists(aggs, expr, args, distinctness, f)?;
                             contains_aggregates = true;
+                        }
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Ok(Func::Window(f)) => {
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                expr,
+                                WindowFunctionKind::Window(f),
+                                over_clause,
+                                distinctness,
+                            )?;
+                        } else {
+                            crate::bail_parse_error!("misuse of window function: {}()", f.as_str());
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
@@ -243,7 +257,7 @@ pub fn resolve_window_and_aggregate_functions(
                                     link_with_window(
                                         windows.as_deref_mut(),
                                         expr,
-                                        func,
+                                        WindowFunctionKind::Agg(func),
                                         over_clause,
                                         distinctness,
                                     )?;
@@ -281,7 +295,7 @@ pub fn resolve_window_and_aggregate_functions(
                             link_with_window(
                                 windows.as_deref_mut(),
                                 expr,
-                                f,
+                                WindowFunctionKind::Agg(f),
                                 over_clause,
                                 Distinctness::NonDistinct,
                             )?;
@@ -294,6 +308,20 @@ pub fn resolve_window_and_aggregate_functions(
                                 f,
                             )?;
                             contains_aggregates = true;
+                        }
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Ok(Func::Window(f)) => {
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                expr,
+                                WindowFunctionKind::Window(f),
+                                over_clause,
+                                Distinctness::NonDistinct,
+                            )?;
+                        } else {
+                            crate::bail_parse_error!("misuse of window function: {}()", f.as_str());
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
@@ -350,7 +378,7 @@ pub fn resolve_window_and_aggregate_functions(
 fn link_with_window(
     windows: Option<&mut Vec<Window>>,
     expr: &Expr,
-    func: AggFunc,
+    func: WindowFunctionKind,
     over_clause: &Over,
     distinctness: Distinctness,
 ) -> Result<()> {
@@ -364,7 +392,11 @@ fn link_with_window(
             original_expr: expr.clone(),
         });
     } else {
-        crate::bail_parse_error!("misuse of window function: {}()", func.as_str());
+        let func_name = match &func {
+            WindowFunctionKind::Agg(f) => f.as_str(),
+            WindowFunctionKind::Window(f) => f.as_str(),
+        };
+        crate::bail_parse_error!("misuse of window function: {}()", func_name);
     }
     Ok(())
 }

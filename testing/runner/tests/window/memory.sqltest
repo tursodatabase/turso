@@ -84,3 +84,30 @@ expect {
     3
 }
 
+test window-row-number-partition-order {
+    CREATE TABLE t4 (a INTEGER, b TEXT);
+    INSERT INTO t4 VALUES (1, 'x'), (2, 'x'), (3, 'y'), (4, 'y');
+    SELECT
+    a,
+    b,
+    ROW_NUMBER() OVER (PARTITION BY b ORDER BY a DESC) AS rn
+    FROM t4
+    ORDER BY b, a DESC;
+}
+expect {
+    2|x|1
+    1|x|2
+    4|y|1
+    3|y|2
+}
+
+test window-row-number-no-order {
+    CREATE TABLE t5 (val INTEGER);
+    INSERT INTO t5 VALUES (10), (20), (30);
+    SELECT row_number() OVER () AS rn FROM t5 ORDER BY rn;
+}
+expect {
+    1
+    2
+    3
+}

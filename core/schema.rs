@@ -3578,7 +3578,8 @@ impl Index {
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_deterministic())
+            Func::resolve_function(&n, argc)
+                .is_ok_and(|f| f.is_deterministic() && !matches!(f, Func::Window(..)))
         };
 
         let mut ok = true;

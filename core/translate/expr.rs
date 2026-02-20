@@ -1383,6 +1383,9 @@ pub fn translate_expr(
                         name.as_str()
                     )
                 }
+                Func::Window(_) => {
+                    crate::bail_parse_error!("misuse of window function {}()", name.as_str())
+                }
                 Func::External(_) => {
                     let regs = program.alloc_registers(args_count);
                     for (i, arg_expr) in args.iter().enumerate() {
@@ -2600,6 +2603,9 @@ pub fn translate_expr(
                         },
                         name.as_str()
                     )
+                }
+                Func::Window(_) => {
+                    crate::bail_parse_error!("misuse of window function {}()", name.as_str())
                 }
                 // For functions that need star expansion (json_object, jsonb_object),
                 // expand the * to all columns from the referenced tables as key-value pairs
