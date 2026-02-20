@@ -79,6 +79,8 @@ pub enum LimboError {
     TxTerminated,
     #[error("Write-write conflict")]
     WriteWriteConflict,
+    #[error("Commit dependency aborted")]
+    CommitDependencyAborted,
     #[error("No such transaction ID: {0}")]
     NoSuchTransactionID(String),
     #[error("Null value")]
