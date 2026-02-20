@@ -112,6 +112,39 @@ fn emit_row_missing_from_index_error(
     emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
 }
 
+fn emit_rowid_not_at_end_of_record_error(
+    program: &mut ProgramBuilder,
+    row_number_reg: usize,
+    scratch_reg: usize,
+    message_reg: usize,
+    index_name: &str,
+    remaining_errors_reg: usize,
+    had_error_reg: usize,
+) {
+    program.emit_string8(
+        "rowid not at end-of-record for row ".to_string(),
+        message_reg,
+    );
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: row_number_reg,
+        dest: message_reg,
+    });
+    program.emit_string8(" of index ".to_string(), scratch_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: scratch_reg,
+        dest: message_reg,
+    });
+    program.emit_string8(index_name.to_string(), scratch_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: scratch_reg,
+        dest: message_reg,
+    });
+    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+}
+
 fn bind_expr_for_table(
     expr: &ast::Expr,
     table_references: &mut TableReferences,
@@ -449,6 +482,7 @@ fn translate_integrity_check_impl(
 
             if !quick {
                 let found_label = program.allocate_label();
+                let idx_rowid_ok_label = program.allocate_label();
                 // Verify the table row has a matching index entry (key columns + rowid).
                 program.emit_insn(Insn::Found {
                     cursor_id: bound_index.cursor_id,
@@ -465,7 +499,38 @@ fn translate_integrity_check_impl(
                     remaining_errors_reg,
                     had_error_reg,
                 );
+                // Skip the IdxRowId check when Found failed — the cursor
+                // is not positioned at a valid match.
+                program.emit_insn(Insn::Goto {
+                    target_pc: idx_rowid_ok_label,
+                });
                 program.preassign_label_to_next_insn(found_label);
+
+                // Verify the rowid stored in the index record matches the
+                // table row's rowid. Catches corruption where the rowid
+                // isn't in the expected position at the end of the record.
+                let idx_rowid_reg = program.alloc_register();
+                program.emit_insn(Insn::IdxRowId {
+                    cursor_id: bound_index.cursor_id,
+                    dest: idx_rowid_reg,
+                });
+                program.emit_insn(Insn::Eq {
+                    lhs: idx_rowid_reg,
+                    rhs: rowid_reg,
+                    target_pc: idx_rowid_ok_label,
+                    flags: CmpInsFlags::default(),
+                    collation: None,
+                });
+                emit_rowid_not_at_end_of_record_error(
+                    program,
+                    row_number_reg,
+                    scratch_reg,
+                    message_reg,
+                    &bound_index.index.name,
+                    remaining_errors_reg,
+                    had_error_reg,
+                );
+                program.preassign_label_to_next_insn(idx_rowid_ok_label);
 
                 if bound_index.index.unique {
                     // This intentionally runs even after a "missing from index"
