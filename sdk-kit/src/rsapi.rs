@@ -990,8 +990,7 @@ impl TursoStatement {
         }
 
         Err(TursoError::Error(format!(
-            "named parameter {} not found",
-            name
+            "named parameter {name} not found"
         )))
     }
     /// make one execution step of the statement
