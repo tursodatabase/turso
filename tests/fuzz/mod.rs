@@ -5770,8 +5770,9 @@ mod fuzz_tests {
         );
     }
 
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     #[cfg(feature = "test_helper")]
+    #[serial_test::file_serial]
     pub fn fuzz_pending_byte_database(db: TempDatabase) -> anyhow::Result<()> {
         use core_tester::common::rusqlite_integrity_check;
 
