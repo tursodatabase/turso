@@ -7,9 +7,9 @@
 //!
 //! Related issue: <https://github.com/tursodatabase/turso/issues/2576>
 use core_tester::common::{
-    TempDatabase, limbo_exec_rows, maybe_setup_tracing, rng_from_time_or_env, sqlite_exec_rows,
+    limbo_exec_rows, maybe_setup_tracing, rng_from_time_or_env, sqlite_exec_rows, TempDatabase,
 };
-use rand::{Rng, SeedableRng, seq::SliceRandom};
+use rand::{seq::SliceRandom, Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use tempfile::TempDir;
 
