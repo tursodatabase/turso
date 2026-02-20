@@ -3,6 +3,7 @@ use std::num::NonZeroUsize;
 use crate::{
     schema::{Index, Schema, Table},
     translate::{
+        collate::CollationSeq,
         emitter::Resolver,
         expr::{
             bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
@@ -98,6 +99,69 @@ fn emit_row_missing_from_index_error(
         dest: message_reg,
     });
     program.emit_string8(" missing from index ".to_string(), scratch_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: scratch_reg,
+        dest: message_reg,
+    });
+    program.emit_string8(index_name.to_string(), scratch_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: scratch_reg,
+        dest: message_reg,
+    });
+    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+}
+
+fn emit_rowid_not_at_eor_error(
+    program: &mut ProgramBuilder,
+    row_number_reg: usize,
+    scratch_reg: usize,
+    message_reg: usize,
+    index_name: &str,
+    remaining_errors_reg: usize,
+    had_error_reg: usize,
+) {
+    program.emit_string8(
+        "rowid not at end-of-record for row ".to_string(),
+        message_reg,
+    );
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: row_number_reg,
+        dest: message_reg,
+    });
+    program.emit_string8(" of index ".to_string(), scratch_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: scratch_reg,
+        dest: message_reg,
+    });
+    program.emit_string8(index_name.to_string(), scratch_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: scratch_reg,
+        dest: message_reg,
+    });
+    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+}
+
+fn emit_values_differ_error(
+    program: &mut ProgramBuilder,
+    row_number_reg: usize,
+    scratch_reg: usize,
+    message_reg: usize,
+    index_name: &str,
+    remaining_errors_reg: usize,
+    had_error_reg: usize,
+) {
+    program.emit_string8("row ".to_string(), message_reg);
+    program.emit_insn(Insn::Concat {
+        lhs: message_reg,
+        rhs: row_number_reg,
+        dest: message_reg,
+    });
+    program.emit_string8(" values differ from index ".to_string(), scratch_reg);
     program.emit_insn(Insn::Concat {
         lhs: message_reg,
         rhs: scratch_reg,
@@ -465,14 +529,98 @@ fn translate_integrity_check_impl(
                     remaining_errors_reg,
                     had_error_reg,
                 );
+                // When Found fails, skip the remaining checks for this index
+                // (IdxRowid, values-differ, uniqueness). The cursor position is
+                // indeterminate after a failed Found.
+                program.emit_insn(Insn::Goto {
+                    target_pc: skip_current_index,
+                });
                 program.preassign_label_to_next_insn(found_label);
 
+                // Verify the index entry's rowid matches the table row's rowid.
+                {
+                    let idx_rowid_reg = program.alloc_register();
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id: bound_index.cursor_id,
+                        dest: idx_rowid_reg,
+                    });
+                    let rowid_ok_label = program.allocate_label();
+                    program.emit_insn(Insn::Eq {
+                        lhs: idx_rowid_reg,
+                        rhs: rowid_reg,
+                        target_pc: rowid_ok_label,
+                        flags: CmpInsFlags::default(),
+                        collation: None,
+                    });
+                    emit_rowid_not_at_eor_error(
+                        program,
+                        row_number_reg,
+                        scratch_reg,
+                        message_reg,
+                        &bound_index.index.name,
+                        remaining_errors_reg,
+                        had_error_reg,
+                    );
+                    program.preassign_label_to_next_insn(rowid_ok_label);
+                }
+
+                // For non-binary collation columns, verify the stored index values
+                // match the table values exactly (binary comparison). Found uses the
+                // index's collation, so collation-equivalent but non-identical values
+                // (e.g. "Hello" vs "hello" with NOCASE) wouldn't be caught otherwise.
+                {
+                    let non_binary_cols: Vec<usize> = bound_index
+                        .index
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| {
+                            let coll = c.collation.unwrap_or_default();
+                            !matches!(coll, CollationSeq::Binary)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+
+                    if !non_binary_cols.is_empty() {
+                        let values_ok_label = program.allocate_label();
+                        let values_differ_label = program.allocate_label();
+                        let idx_col_reg = program.alloc_register();
+
+                        for &col_idx in &non_binary_cols {
+                            program.emit_insn(Insn::Column {
+                                cursor_id: bound_index.cursor_id,
+                                column: col_idx,
+                                dest: idx_col_reg,
+                                default: None,
+                            });
+                            program.emit_insn(Insn::Ne {
+                                lhs: idx_col_reg,
+                                rhs: key_start_reg + col_idx,
+                                target_pc: values_differ_label,
+                                flags: CmpInsFlags::default(),
+                                collation: None,
+                            });
+                        }
+                        program.emit_insn(Insn::Goto {
+                            target_pc: values_ok_label,
+                        });
+
+                        program.preassign_label_to_next_insn(values_differ_label);
+                        emit_values_differ_error(
+                            program,
+                            row_number_reg,
+                            scratch_reg,
+                            message_reg,
+                            &bound_index.index.name,
+                            remaining_errors_reg,
+                            had_error_reg,
+                        );
+
+                        program.preassign_label_to_next_insn(values_ok_label);
+                    }
+                }
+
                 if bound_index.index.unique {
-                    // This intentionally runs even after a "missing from index"
-                    // report above. SQLite does the same: a single corrupt row
-                    // can violate multiple invariants and each should be
-                    // independently reportable.
-                    //
                     // Uniqueness rule matches SQLite:
                     //   unique key is valid if any key column is NULL, OR
                     //   the next index entry is strictly greater on key columns.

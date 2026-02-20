@@ -1,0 +1,90 @@
+@database :memory:
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+# Test integrity_check with NOCASE collation index (valid data)
+test integrity-check-nocase-valid {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE, b TEXT);
+    CREATE INDEX idx_nc ON t1(a);
+    INSERT INTO t1 VALUES('Hello', 'world');
+    INSERT INTO t1 VALUES('WORLD', 'hello');
+    INSERT INTO t1 VALUES('MiXeD', 'case');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with NOCASE unique index (valid data)
+test integrity-check-nocase-unique-valid {
+    CREATE TABLE t2(a TEXT COLLATE NOCASE, b INTEGER);
+    CREATE UNIQUE INDEX idx_nc_uniq ON t2(a);
+    INSERT INTO t2 VALUES('alpha', 1);
+    INSERT INTO t2 VALUES('BETA', 2);
+    INSERT INTO t2 VALUES('Gamma', 3);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with RTRIM collation index (valid data)
+test integrity-check-rtrim-valid {
+    CREATE TABLE t3(a TEXT COLLATE RTRIM, b TEXT);
+    CREATE INDEX idx_rt ON t3(a);
+    INSERT INTO t3 VALUES('hello   ', 'world');
+    INSERT INTO t3 VALUES('test', 'data');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with mixed collation multi-column index
+test integrity-check-mixed-collation-valid {
+    CREATE TABLE t4(a TEXT COLLATE NOCASE, b TEXT, c TEXT COLLATE RTRIM);
+    CREATE INDEX idx_mixed ON t4(a, b, c);
+    INSERT INTO t4 VALUES('Hello', 'world', 'test  ');
+    INSERT INTO t4 VALUES('WORLD', 'hello', 'data');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with NOCASE column and NULL values
+test integrity-check-nocase-nulls {
+    CREATE TABLE t5(a TEXT COLLATE NOCASE, b TEXT);
+    CREATE INDEX idx_nc_null ON t5(a);
+    INSERT INTO t5 VALUES(NULL, 'null-a');
+    INSERT INTO t5 VALUES('hello', NULL);
+    INSERT INTO t5 VALUES(NULL, NULL);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test quick_check skips index value verification
+test quick-check-nocase-valid {
+    CREATE TABLE t6(a TEXT COLLATE NOCASE, b TEXT);
+    CREATE INDEX idx_qc ON t6(a);
+    INSERT INTO t6 VALUES('Hello', 'world');
+    PRAGMA quick_check;
+}
+expect {
+    ok
+}
+
+# Test integrity_check with NOCASE on table column inherited by index
+test integrity-check-nocase-inherited {
+    CREATE TABLE t7(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+    CREATE INDEX idx_name ON t7(name);
+    INSERT INTO t7 VALUES(1, 'Alice');
+    INSERT INTO t7 VALUES(2, 'BOB');
+    INSERT INTO t7 VALUES(3, 'charlie');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

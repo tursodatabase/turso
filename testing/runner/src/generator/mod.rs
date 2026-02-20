@@ -56,6 +56,8 @@ pub const INTEGRITY_FIXTURE_FREELIST_TRUNK_CORRUPT_REL_PATH: &str =
     "database/integrity_freelist_trunk_corrupt.db";
 pub const INTEGRITY_FIXTURE_OVERFLOW_LIST_LENGTH_MISMATCH_REL_PATH: &str =
     "database/integrity_overflow_list_length_mismatch.db";
+pub const INTEGRITY_FIXTURE_VALUES_DIFFER_NOCASE_REL_PATH: &str =
+    "database/integrity_values_differ_nocase.db";
 
 pub const INTEGRITY_FIXTURE_RELATIVE_PATHS: &[&str] = &[
     INTEGRITY_FIXTURE_MISSING_INDEX_ENTRY_REL_PATH,
@@ -69,6 +71,7 @@ pub const INTEGRITY_FIXTURE_RELATIVE_PATHS: &[&str] = &[
     INTEGRITY_FIXTURE_FREELIST_COUNT_MISMATCH_REL_PATH,
     INTEGRITY_FIXTURE_FREELIST_TRUNK_CORRUPT_REL_PATH,
     INTEGRITY_FIXTURE_OVERFLOW_LIST_LENGTH_MISMATCH_REL_PATH,
+    INTEGRITY_FIXTURE_VALUES_DIFFER_NOCASE_REL_PATH,
 ];
 
 /// A fake user record
@@ -1077,6 +1080,108 @@ async fn generate_overflow_list_length_mismatch_fixture(db_path: &Path) -> Resul
     Ok(())
 }
 
+/// Uppercase the first text key in the first index cell on the given page.
+/// This creates a NOCASE-equivalent but binary-different index entry, which
+/// `PRAGMA integrity_check` should report as "values differ from index".
+fn patch_uppercase_first_index_text_key(
+    db_path: &Path,
+    page_size: usize,
+    root_page: usize,
+) -> Result<()> {
+    let mut bytes = std::fs::read(db_path)
+        .with_context(|| format!("failed to read fixture '{}'", db_path.display()))?;
+    let page_start = (root_page - 1) * page_size;
+    anyhow::ensure!(
+        bytes.len() > page_start + 8,
+        "fixture too small to patch page {root_page}"
+    );
+
+    let cell_count = u16::from_be_bytes([bytes[page_start + 3], bytes[page_start + 4]]) as usize;
+    anyhow::ensure!(
+        cell_count >= 1,
+        "cannot patch index entry on page {root_page}: no cells"
+    );
+
+    let ptr_array_start = page_start + 8;
+    let first_cell_ptr =
+        u16::from_be_bytes([bytes[ptr_array_start], bytes[ptr_array_start + 1]]) as usize;
+    let cell_start = page_start + first_cell_ptr;
+
+    let (_, payload_varint_len) = parse_sqlite_varint(&bytes, cell_start)?;
+    let payload_start = cell_start + payload_varint_len;
+    let (header_size, header_size_varint_len) = parse_sqlite_varint(&bytes, payload_start)?;
+    let serials_start = payload_start + header_size_varint_len;
+    let (first_serial_type, _) = parse_sqlite_varint(&bytes, serials_start)?;
+
+    // Text serial types are odd numbers >= 13: serial_type = 13 + 2*len
+    anyhow::ensure!(
+        first_serial_type >= 13 && first_serial_type % 2 == 1,
+        "expected text serial type for first index key, got {first_serial_type}"
+    );
+    let text_len = ((first_serial_type - 13) / 2) as usize;
+    anyhow::ensure!(text_len > 0, "text key is empty, cannot uppercase");
+
+    let data_start = payload_start + header_size as usize;
+    for i in 0..text_len {
+        let b = bytes[data_start + i];
+        if b.is_ascii_lowercase() {
+            bytes[data_start + i] = b.to_ascii_uppercase();
+        }
+    }
+
+    std::fs::write(db_path, bytes)
+        .with_context(|| format!("failed to write fixture '{}'", db_path.display()))?;
+    Ok(())
+}
+
+async fn generate_values_differ_nocase_fixture(db_path: &Path) -> Result<()> {
+    clear_existing_db_and_sidecars(db_path)?;
+
+    let db_path_str = db_path.to_string_lossy().to_string();
+    let db = Builder::new_local(&db_path_str)
+        .build()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create integrity fixture database at '{}'",
+                db_path.display()
+            )
+        })?;
+    let conn = db
+        .connect()
+        .with_context(|| format!("failed to connect to fixture '{}'", db_path.display()))?;
+
+    conn.execute_batch(
+        r#"
+        PRAGMA page_size=4096;
+        CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE);
+        CREATE INDEX idx_nc ON t(b);
+        INSERT INTO t VALUES (1,'abc'),(2,'def'),(3,'ghi');
+        "#,
+    )
+    .await
+    .with_context(|| {
+        format!("failed to initialize fixture '{INTEGRITY_FIXTURE_VALUES_DIFFER_NOCASE_REL_PATH}'")
+    })?;
+
+    checkpoint_truncate(&conn, INTEGRITY_FIXTURE_VALUES_DIFFER_NOCASE_REL_PATH).await?;
+    let page_size = get_page_size(&conn, INTEGRITY_FIXTURE_VALUES_DIFFER_NOCASE_REL_PATH).await?;
+    let index_root_page = get_root_page(
+        &conn,
+        "idx_nc",
+        INTEGRITY_FIXTURE_VALUES_DIFFER_NOCASE_REL_PATH,
+    )
+    .await?;
+    drop(conn);
+    drop(db);
+
+    // Uppercase the first index key: "abc" -> "ABC". Found with NOCASE
+    // still matches, but binary comparison detects the mismatch.
+    patch_uppercase_first_index_text_key(db_path, page_size, index_root_page)?;
+    remove_db_sidecars(db_path)?;
+    Ok(())
+}
+
 /// Generate one of the integrity-check parity fixtures identified by its
 /// repository-relative path (e.g. `database/integrity_missing_index_entry.db`).
 pub async fn generate_integrity_fixture(db_path: &Path, relative_path: &str) -> Result<()> {
@@ -1146,6 +1251,9 @@ pub async fn generate_integrity_fixture(db_path: &Path, relative_path: &str) -> 
         }
         INTEGRITY_FIXTURE_OVERFLOW_LIST_LENGTH_MISMATCH_REL_PATH => {
             generate_overflow_list_length_mismatch_fixture(db_path).await
+        }
+        INTEGRITY_FIXTURE_VALUES_DIFFER_NOCASE_REL_PATH => {
+            generate_values_differ_nocase_fixture(db_path).await
         }
         _ => anyhow::bail!("unknown integrity fixture path '{relative_path}'"),
     }
