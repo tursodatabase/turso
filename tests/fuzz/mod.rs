@@ -1,4 +1,5 @@
 pub mod cte;
+pub mod file_format;
 pub mod grammar_generator;
 pub mod journal_mode;
 pub mod orderby_collation;
