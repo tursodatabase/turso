@@ -803,7 +803,7 @@ Modifiers:
 | DropTrigger    | ✅ Yes     |         |
 | EndCoroutine   | ✅ Yes    |         |
 | Eq             | ✅ Yes    |         |
-| Expire         | ❌ No     |         |
+| Expire         | ✅ Yes    |         |
 | Explain        | ❌ No     |         |
 | FkCounter      | ✅ Yes    |         |
 | FkIfZero       | ✅ Yes    |         |

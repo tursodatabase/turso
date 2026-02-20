@@ -415,7 +415,10 @@ pub fn translate_analyze(
     }
 
     // FIXME: Emit LoadAnalysis
-    // FIXME: Emit Expire
+    program.emit_insn(Insn::Expire {
+        current_only: false,
+        allow_finish: false,
+    });
     Ok(())
 }
 

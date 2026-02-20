@@ -1612,6 +1612,18 @@ pub fn insn_to_row(
                 format!("r[{dest}]=(r[{lhs}] || r[{rhs}])"),
             ),
             Insn::Noop => ("Noop", 0, 0, 0, Value::build_text(""), 0, String::new()),
+            Insn::Expire {
+                current_only,
+                allow_finish,
+            } => (
+                "Expire",
+                if *current_only { 1 } else { 0 },
+                if *allow_finish { 1 } else { 0 },
+                0,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
             Insn::PageCount { db, dest } => (
                 "Pagecount",
                 *db as i64,

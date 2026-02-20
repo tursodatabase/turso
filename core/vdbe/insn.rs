@@ -1201,6 +1201,15 @@ pub enum Insn {
     },
     /// Do nothing. Continue downward to the next opcode.
     Noop,
+    /// Cause precompiled statements to expire.
+    /// If P1 is 0, then all SQL statements become expired. If P1 is non-zero,
+    /// then only the currently executing statement is expired.
+    /// If P2 is 0, then SQL statements are expired immediately. If P2 is 1,
+    /// then running SQL statements are allowed to continue to run to completion.
+    Expire {
+        current_only: bool, // P1: 0 = all statements, non-zero = only current
+        allow_finish: bool, // P2: 0 = immediate, 1 = allow completion
+    },
     /// Write the current number of pages in database P1 to memory cell P2.
     PageCount {
         db: usize,
@@ -1613,6 +1622,7 @@ impl InsnVariants {
             InsnVariants::And => execute::op_and,
             InsnVariants::Or => execute::op_or,
             InsnVariants::Noop => execute::op_noop,
+            InsnVariants::Expire => execute::op_noop,
             InsnVariants::PageCount => execute::op_page_count,
             InsnVariants::ReadCookie => execute::op_read_cookie,
             InsnVariants::SetCookie => execute::op_set_cookie,

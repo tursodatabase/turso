@@ -12,7 +12,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode       p1   p2   p3  p4                                               p5  comment
-   0  Init          0  196    0                                                    0  Start at 196
+   0  Init          0  197    0                                                    0  Start at 197
    1  Null          0    1    0                                                    0  r[1]=NULL
    2  CreateBtree   0    2    1                                                    0  r[2]=root iDb=0 flags=1
    3  OpenWrite     0    1    0                                                    0  root=1; iDb=0
@@ -207,24 +207,25 @@ addr  opcode       p1   p2   p3  p4                                             
  192  MakeRecord   95    3   98                                                    0  r[98]=mkrec(r[95..97])
  193  NewRowid      1   99    0                                                    0  r[99]=rowid
  194  Insert        1   98   99  sqlite_stat1                                      0  intkey=r[99] data=r[98]
- 195  Halt          0    0    0                                                    0
- 196  Transaction   0    2    9                                                    0  iDb=0 tx_mode=Write
- 197  String8       0   11    0  products                                          0  r[11]='products'
- 198  String8       0   14    0  products                                          0  r[14]='products'
- 199  String8       0   24    0  products                                          0  r[24]='products'
- 200  String8       0   25    0  idx_products_price                                0  r[25]='idx_products_price'
- 201  String8       0   34    0  products                                          0  r[34]='products'
- 202  String8       0   35    0  idx_products_category                             0  r[35]='idx_products_category'
- 203  String8       0   44    0  products                                          0  r[44]='products'
- 204  String8       0   45    0  idx_products_sku                                  0  r[45]='idx_products_sku'
- 205  String8       0   50    0  inventory                                         0  r[50]='inventory'
- 206  String8       0   53    0  inventory                                         0  r[53]='inventory'
- 207  String8       0   65    0  inventory                                         0  r[65]='inventory'
- 208  String8       0   66    0  idx_inventory_location                            0  r[66]='idx_inventory_location'
- 209  String8       0   71    0  orders                                            0  r[71]='orders'
- 210  String8       0   74    0  orders                                            0  r[74]='orders'
- 211  String8       0   84    0  orders                                            0  r[84]='orders'
- 212  String8       0   85    0  idx_orders_status                                 0  r[85]='idx_orders_status'
- 213  String8       0   95    0  orders                                            0  r[95]='orders'
- 214  String8       0   96    0  idx_orders_customer_date                          0  r[96]='idx_orders_customer_date'
- 215  Goto          0    1    0                                                    0
+ 195  Expire        0    0    0                                                    0
+ 196  Halt          0    0    0                                                    0
+ 197  Transaction   0    2    9                                                    0  iDb=0 tx_mode=Write
+ 198  String8       0   11    0  products                                          0  r[11]='products'
+ 199  String8       0   14    0  products                                          0  r[14]='products'
+ 200  String8       0   24    0  products                                          0  r[24]='products'
+ 201  String8       0   25    0  idx_products_price                                0  r[25]='idx_products_price'
+ 202  String8       0   34    0  products                                          0  r[34]='products'
+ 203  String8       0   35    0  idx_products_category                             0  r[35]='idx_products_category'
+ 204  String8       0   44    0  products                                          0  r[44]='products'
+ 205  String8       0   45    0  idx_products_sku                                  0  r[45]='idx_products_sku'
+ 206  String8       0   50    0  inventory                                         0  r[50]='inventory'
+ 207  String8       0   53    0  inventory                                         0  r[53]='inventory'
+ 208  String8       0   65    0  inventory                                         0  r[65]='inventory'
+ 209  String8       0   66    0  idx_inventory_location                            0  r[66]='idx_inventory_location'
+ 210  String8       0   71    0  orders                                            0  r[71]='orders'
+ 211  String8       0   74    0  orders                                            0  r[74]='orders'
+ 212  String8       0   84    0  orders                                            0  r[84]='orders'
+ 213  String8       0   85    0  idx_orders_status                                 0  r[85]='idx_orders_status'
+ 214  String8       0   95    0  orders                                            0  r[95]='orders'
+ 215  String8       0   96    0  idx_orders_customer_date                          0  r[96]='idx_orders_customer_date'
+ 216  Goto          0    1    0                                                    0

@@ -12,7 +12,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode       p1  p2  p3  p4              p5  comment
-   0  Init          0  42   0                   0  Start at 42
+   0  Init          0  43   0                   0  Start at 43
    1  Null          0   1   0                   0  r[1]=NULL
    2  OpenWrite     0   5   0                   0  root=5; iDb=0
    3  Rewind        0  12   0                   0  Rewind  sqlite_stat1
@@ -53,11 +53,12 @@ addr  opcode       p1  p2  p3  p4              p5  comment
   38  MakeRecord   18   3  21                   0  r[21]=mkrec(r[18..20])
   39  NewRowid      0  22   0                   0  r[22]=rowid
   40  Insert        0  21  22  sqlite_stat1     0  intkey=r[22] data=r[21]
-  41  Halt          0   0   0                   0
-  42  Transaction   0   2   4                   0  iDb=0 tx_mode=Write
-  43  String8       0   3   0  items            0  r[3]='items'
-  44  String8       0   5   0  idx_items_name   0  r[5]='idx_items_name'
-  45  String8       0   8   0  items            0  r[8]='items'
-  46  String8       0  18   0  items            0  r[18]='items'
-  47  String8       0  19   0  idx_items_name   0  r[19]='idx_items_name'
-  48  Goto          0   1   0                   0
+  41  Expire        0   0   0                   0
+  42  Halt          0   0   0                   0
+  43  Transaction   0   2   4                   0  iDb=0 tx_mode=Write
+  44  String8       0   3   0  items            0  r[3]='items'
+  45  String8       0   5   0  idx_items_name   0  r[5]='idx_items_name'
+  46  String8       0   8   0  items            0  r[8]='items'
+  47  String8       0  18   0  items            0  r[18]='items'
+  48  String8       0  19   0  idx_items_name   0  r[19]='idx_items_name'
+  49  Goto          0   1   0                   0

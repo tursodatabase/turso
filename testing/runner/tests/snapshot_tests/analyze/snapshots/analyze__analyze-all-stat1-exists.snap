@@ -12,7 +12,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode       p1  p2  p3  p4                  p5  comment
-   0  Init          0  60   0                       0  Start at 60
+   0  Init          0  61   0                       0  Start at 61
    1  Null          0   1   0                       0  r[1]=NULL
    2  OpenWrite     0   5   0                       0  root=5; iDb=0
    3  Rewind        0  10   0                       0  Rewind  sqlite_stat1
@@ -71,12 +71,13 @@ addr  opcode       p1  p2  p3  p4                  p5  comment
   56  MakeRecord   26   3  29                       0  r[29]=mkrec(r[26..28])
   57  NewRowid      0  30   0                       0  r[30]=rowid
   58  Insert        0  29  30  sqlite_stat1         0  intkey=r[30] data=r[29]
-  59  Halt          0   0   0                       0
-  60  Transaction   0   2   4                       0  iDb=0 tx_mode=Write
-  61  String8       0   3   0  items                0  r[3]='items'
-  62  String8       0   6   0  items                0  r[6]='items'
-  63  String8       0  16   0  items                0  r[16]='items'
-  64  String8       0  17   0  idx_items_category   0  r[17]='idx_items_category'
-  65  String8       0  26   0  items                0  r[26]='items'
-  66  String8       0  27   0  idx_items_name       0  r[27]='idx_items_name'
-  67  Goto          0   1   0                       0
+  59  Expire        0   0   0                       0
+  60  Halt          0   0   0                       0
+  61  Transaction   0   2   4                       0  iDb=0 tx_mode=Write
+  62  String8       0   3   0  items                0  r[3]='items'
+  63  String8       0   6   0  items                0  r[6]='items'
+  64  String8       0  16   0  items                0  r[16]='items'
+  65  String8       0  17   0  idx_items_category   0  r[17]='idx_items_category'
+  66  String8       0  26   0  items                0  r[26]='items'
+  67  String8       0  27   0  idx_items_name       0  r[27]='idx_items_name'
+  68  Goto          0   1   0                       0

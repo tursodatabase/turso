@@ -639,6 +639,10 @@ fn query_pragma(
             };
 
             program.alloc_registers(2);
+            program.emit_insn(Insn::Expire {
+                current_only: true,
+                allow_finish: true,
+            });
             program.emit_insn(Insn::Checkpoint {
                 database: database_id,
                 checkpoint_mode: mode,

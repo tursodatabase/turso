@@ -1,0 +1,65 @@
+@database :memory:
+
+# Test that PRAGMA wal_checkpoint works (Expire opcode is emitted before Checkpoint)
+test wal-checkpoint-basic {
+    PRAGMA wal_checkpoint;
+}
+expect pattern {
+    -?\d+\|-?\d+\|-?\d+
+}
+
+# Test that PRAGMA wal_checkpoint(passive) works with Expire
+test wal-checkpoint-passive {
+    PRAGMA wal_checkpoint(passive);
+}
+expect pattern {
+    -?\d+\|-?\d+\|-?\d+
+}
+
+# Test that Expire opcode does not break subsequent statements
+setup schema {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'hello');
+    INSERT INTO t1 VALUES (2, 'world');
+}
+
+@setup schema
+test select-after-wal-checkpoint {
+    PRAGMA wal_checkpoint;
+    SELECT val FROM t1 ORDER BY id;
+}
+expect pattern {
+    (?s)-?\d+\|-?\d+\|-?\d+\nhello\nworld
+}
+
+# Test that multiple wal_checkpoint calls work (Expire is harmless)
+@setup schema
+test multiple-wal-checkpoints {
+    PRAGMA wal_checkpoint;
+    PRAGMA wal_checkpoint;
+    SELECT count(*) FROM t1;
+}
+expect pattern {
+    (?s)-?\d+\|-?\d+\|-?\d+\n-?\d+\|-?\d+\|-?\d+\n2
+}
+
+# Test that ANALYZE works correctly (emits Expire with P1=0, P2=0)
+@setup schema
+test analyze-with-expire {
+    ANALYZE;
+    SELECT val FROM t1 ORDER BY id;
+}
+expect {
+    hello
+    world
+}
+
+# Test that ANALYZE on a specific table works with Expire
+@setup schema
+test analyze-table-with-expire {
+    ANALYZE t1;
+    SELECT count(*) FROM t1;
+}
+expect {
+    2
+}
