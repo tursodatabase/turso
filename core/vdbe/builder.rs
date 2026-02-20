@@ -1495,12 +1495,12 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn build(
+    pub fn build_prepared_program(
         mut self,
-        connection: Arc<Connection>,
+        prepare_context: PrepareContext,
         change_cnt_on: bool,
         sql: &str,
-    ) -> crate::Result<Program> {
+    ) -> crate::Result<PreparedProgram> {
         self.resolve_labels()?;
 
         self.parameters.list.dedup();
@@ -1533,9 +1533,20 @@ impl ProgramBuilder {
             is_subprogram: self.is_subprogram,
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
-            prepare_context: PrepareContext::from_connection(&connection),
+            prepare_context,
             write_databases: self.write_databases,
         };
+        Ok(prepared)
+    }
+
+    pub fn build(
+        self,
+        connection: Arc<Connection>,
+        change_cnt_on: bool,
+        sql: &str,
+    ) -> crate::Result<Program> {
+        let prepare_context = PrepareContext::from_connection(&connection);
+        let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
 }
