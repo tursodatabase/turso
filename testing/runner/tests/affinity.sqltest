@@ -413,3 +413,24 @@ expect @js {
     real|100000
     real|-100000
 }
+
+# ============================================
+# ANY affinity defaults to NUMERIC
+# ============================================
+test affinity-any-string-integer {
+    CREATE TABLE t1 (c1 ANY);
+    INSERT INTO t1 VALUES ('42');
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    42|integer
+}
+
+test affinity-any-string-real {
+    CREATE TABLE t1 (c1 ANY);
+    INSERT INTO t1 VALUES ('3.14');
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    3.14|real
+}
