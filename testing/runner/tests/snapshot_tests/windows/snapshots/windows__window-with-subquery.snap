@@ -1,0 +1,158 @@
+---
+source: windows.sqltest
+expression: |-
+  SELECT
+          emp_id,
+          name,
+          department,
+          salary,
+          dept_avg,
+          salary - dept_avg AS diff_from_avg,
+          ROW_NUMBER() OVER (ORDER BY salary - dept_avg DESC) AS rank_by_diff
+      FROM (
+          SELECT
+              emp_id,
+              name,
+              department,
+              salary,
+              AVG(salary) OVER (PARTITION BY department) AS dept_avg
+          FROM employees
+      );
+info:
+  statement_type: SELECT
+  tables:
+  - employees
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN window_subquery_0
+   |--SCAN subquery_0
+   |  `--SCAN window_subquery_0
+   |     `--SCAN employees USING INDEX idx_employees_department
+   `--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode              p1   p2  p3  p4                     p5  comment
+   0      Init             0  119   0                          0  Start at 119
+   1      InitCoroutine    1   77   2                          0
+   2      InitCoroutine    2   51   3                          0
+   3      InitCoroutine    3   15   4                          0
+   4      OpenRead         0    2   0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
+   5      OpenRead         1    4   0  k(2,B)                  0  index=idx_employees_department, root=4, iDb=0
+   6      Rewind           1   14   0                          0  Rewind index idx_employees_department
+   7        DeferredSeek   1    0   0                          0
+   8        Column         0    2   4                          0  r[4]=employees.department
+   9        IdxRowId       1    5   0                          0  r[5]=cursor 1 for index idx_employees_department.rowid
+  10        Column         0    1   6                          0  r[6]=employees.name
+  11        Column         0    3   7                          0  r[7]=employees.salary
+  12        Yield          3    0   0                          0
+  13      Next             1    7   0                          0
+  14      EndCoroutine     3    0   0                          0
+  15      OpenEphemeral    2    1   0                          0  cursor=2 is_table=true
+  16      OpenDup          3    2   0                          0  new_cursor=3, original_cursor=2
+  17      Null             0   19   0                          0  r[19]=NULL
+  18      Null             0   20   0                          0  r[20]=NULL
+  19      InitCoroutine    3    0   4                          0
+  20        Yield          3   34   0                          0
+  21        Compare        4   20   1  k(1, Binary)            0  r[4..4]==r[20..20]; compare partition keys to detect new partition
+  22        Jump          23   26  23                          0
+  23        Gosub         21   35   0                          0  ; detected new partition
+  24        Null           0   19   0                          0  r[19]=NULL
+  25        Copy           4   20   0                          0  r[20]=r[4]
+  26        NotNull       19   28   0                          0  r[19]!=NULL -> goto 28
+  27        Null           0   13  13                          0  r[13..13]=NULL; reset accumulator registers
+  28        MakeRecord     4    4  22                          0  r[22]=mkrec(r[4..7])
+  29        NewRowid       3   19   0                          0  r[19]=rowid
+  30        Insert         3   22  19  buffer_table_window_0   0  intkey=r[19] data=r[22]
+  31        Copy           7   23   0                          0  r[23]=r[7]
+  32        AggStep        0   23  13  avg                     0  accum=r[13] step(r[23])
+  33      Goto             0   20   0                          0
+  34      Null             0   21   0                          0  r[21]=NULL; return remaining buffered rows
+  35      Rewind           2   48   0                          0  Rewind  buffer_table_window_0
+  36      AggValue         0   13  14  avg                     0  accum=r[13] dest=r[14]
+  37        Column         2    1  15                          0  r[15]=buffer_table_window_0.emp_id
+  38        Column         2    2  16                          0  r[16]=buffer_table_window_0.name
+  39        Column         2    0  17                          0  r[17]=buffer_table_window_0.department
+  40        Column         2    3  18                          0  r[18]=buffer_table_window_0.salary
+  41        Copy          15    8   0                          0  r[8]=r[15]
+  42        Copy          16    9   0                          0  r[9]=r[16]
+  43        Copy          17   10   0                          0  r[10]=r[17]
+  44        Copy          18   11   0                          0  r[11]=r[18]
+  45        Copy          14   12   0                          0  r[12]=r[14]
+  46        Yield          2    0   0                          0
+  47      Next             2   37   0                          0
+  48      ResetSorter      2    0   0                          0  cursor=2
+  49    Return            21    0   1                          0
+  50    EndCoroutine       2    0   0                          0
+  51    SorterOpen         4    1   0  k(1,-B)                 0  cursor=4
+  52    InitCoroutine      2    0   3                          0
+  53      Yield            2   65   0                          0
+  54      Copy            11   37   0                          0  r[37]=r[11]
+  55      Copy            12   38   0                          0  r[38]=r[12]
+  56      Subtract        37   38  31                          0  r[31]=r[37]-r[38]
+  57      Copy             8   32   0                          0  r[32]=r[8]
+  58      Copy             9   33   0                          0  r[33]=r[9]
+  59      Copy            10   34   0                          0  r[34]=r[10]
+  60      Copy            11   35   0                          0  r[35]=r[11]
+  61      Copy            12   36   0                          0  r[36]=r[12]
+  62      MakeRecord      31    6  30                          0  r[30]=mkrec(r[31..36])
+  63      SorterInsert     4   30   0  0                       0  key=r[30]
+  64    Goto               0   53   0                          0
+  65    OpenPseudo         5   30   6                          0  6 columns in r[30]
+  66    SorterSort         4   76   0                          0
+  67      SorterData       4   30   5                          0  r[30]=data
+  68      Column           5    0  24                          0  r[24]=pseudo.column 0
+  69      Column           5    1  25                          0  r[25]=pseudo.column 1
+  70      Column           5    2  26                          0  r[26]=pseudo.column 2
+  71      Column           5    3  27                          0  r[27]=pseudo.column 3
+  72      Column           5    4  28                          0  r[28]=pseudo.column 4
+  73      Column           5    5  29                          0  r[29]=pseudo.column 5
+  74      Yield            1    0   0                          0
+  75    SorterNext         4   67   0                          0
+  76    EndCoroutine       1    0   0                          0
+  77    OpenEphemeral      6    1   0                          0  cursor=6 is_table=true
+  78    OpenDup            7    6   0                          0  new_cursor=7, original_cursor=6
+  79    Null               0   53   0                          0  r[53]=NULL
+  80    Null               0   54   0                          0  r[54]=NULL
+  81    InitCoroutine      1    0   2                          0
+  82      Yield            1   96   0                          0
+  83      Copy            24   57   0                          0  r[57]=r[24]
+  84      NotNull         53   88   0                          0  r[53]!=NULL -> goto 88
+  85      Copy            57   56   0                          0  r[56]=r[57]; initialize previous peer register for new partition
+  86      Null             0   46  46                          0  r[46..46]=NULL; reset accumulator registers
+  87      Integer          0   54   0                          0  r[54]=0
+  88      Compare         56   57   1  k(1, Binary)            0  r[56..56]==r[57..57]; compare ORDER BY columns to detect peer
+  89      Jump            90   92  90                          0
+  90      Gosub           55   97   0                          0  ; detected non-peer row
+  91      Copy            57   56   0                          0  r[56]=r[57]
+  92      MakeRecord      24    6  58                          0  r[58]=mkrec(r[24..29])
+  93      NewRowid         7   53   0                          0  r[53]=rowid
+  94      Insert           7   58  53  buffer_table_window_0   0  intkey=r[53] data=r[58]
+  95    Goto               0   82   0                          0
+  96    Null               0   55   0                          0  r[55]=NULL; return remaining buffered rows
+  97    Rewind             6  116   0                          0  Rewind  buffer_table_window_0
+  98      Column           6    1  48                          0  r[48]=buffer_table_window_0.emp_id
+  99      Column           6    2  49                          0  r[49]=buffer_table_window_0.name
+ 100      Column           6    3  50                          0  r[50]=buffer_table_window_0.department
+ 101      Column           6    4  51                          0  r[51]=buffer_table_window_0.salary
+ 102      Column           6    5  52                          0  r[52]=buffer_table_window_0.dept_avg
+ 103      AddImm          54    1   0                          0  r[54]=r[54]+1
+ 104      Copy            54   47   0                          0  r[47]=r[54]
+ 105      Copy            48   39   0                          0  r[39]=r[48]
+ 106      Copy            49   40   0                          0  r[40]=r[49]
+ 107      Copy            50   41   0                          0  r[41]=r[50]
+ 108      Copy            51   42   0                          0  r[42]=r[51]
+ 109      Copy            52   43   0                          0  r[43]=r[52]
+ 110      Copy            51   59   0                          0  r[59]=r[51]
+ 111      Copy            52   60   0                          0  r[60]=r[52]
+ 112      Subtract        59   60  44                          0  r[44]=r[59]-r[60]
+ 113      Copy            47   45   0                          0  r[45]=r[47]
+ 114      ResultRow       39    7   0                          0  output=r[39..45]
+ 115    Next               6   98   0                          0
+ 116    ResetSorter        6    0   0                          0  cursor=6
+ 117  Return              55    0   1                          0
+ 118  Halt                 0    0   0                          0
+ 119  Transaction          0    1   7                          0  iDb=0 tx_mode=Read
+ 120  Goto                 0    1   0                          0
