@@ -2,7 +2,7 @@ use turso_parser::ast::SortOrder;
 
 use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
 
-use super::{Insn, InsnReference, Program, Value};
+use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
 
 pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
@@ -13,7 +13,7 @@ pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "d
 pub const EXPLAIN_QUERY_PLAN_COLUMNS_TYPE: [&str; 4] = ["INTEGER", "INTEGER", "INTEGER", "TEXT"];
 
 pub fn insn_to_row(
-    program: &Program,
+    program: &PreparedProgram,
     insn: &Insn,
 ) -> (&'static str, i64, i64, i64, Value, i64, String) {
     let get_table_or_index_name = |cursor_id: usize| {
@@ -2084,7 +2084,7 @@ pub fn insn_to_row(
 }
 
 pub fn insn_to_row_with_comment(
-    program: &Program,
+    program: &PreparedProgram,
     insn: &Insn,
     manual_comment: Option<&str>,
 ) -> (&'static str, i64, i64, i64, Value, i64, String) {
@@ -2101,7 +2101,7 @@ pub fn insn_to_row_with_comment(
 }
 
 pub fn insn_to_str(
-    program: &Program,
+    program: &PreparedProgram,
     addr: InsnReference,
     insn: &Insn,
     indent: String,

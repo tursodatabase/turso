@@ -40,7 +40,6 @@ use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
     vector_distance_dot, vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
-use crate::CdcVersion;
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
@@ -59,8 +58,9 @@ use crate::{
 };
 use crate::{
     get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor,
+    IOExt, MvCursor, QueryMode,
 };
+use crate::{CdcVersion, Statement};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
@@ -2810,6 +2810,7 @@ pub enum OpProgramState {
     /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
     Step {
         is_trigger: bool,
+        statement: Box<Statement>,
     },
 }
 
@@ -2819,7 +2820,7 @@ pub fn op_program(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Program {
@@ -2831,7 +2832,11 @@ pub fn op_program(
     loop {
         match &mut state.op_program_state {
             OpProgramState::Start => {
-                let mut statement = subprogram.write();
+                let mut statement = Statement::new(
+                    Program::from_prepared(subprogram.clone(), program.connection.clone()),
+                    pager.clone(),
+                    QueryMode::Normal,
+                );
                 statement.reset();
 
                 // Check if this is a trigger subprogram - if so, track execution
@@ -2867,12 +2872,17 @@ pub fn op_program(
                     }
                 }
 
-                state.op_program_state = OpProgramState::Step { is_trigger };
+                state.op_program_state = OpProgramState::Step {
+                    is_trigger,
+                    statement: Box::new(statement),
+                };
             }
-            OpProgramState::Step { is_trigger } => {
+            OpProgramState::Step {
+                is_trigger,
+                statement,
+            } => {
                 let is_trigger = *is_trigger;
                 loop {
-                    let mut statement = subprogram.write();
                     let res = statement.step();
                     match res {
                         Ok(step_result) => match step_result {

@@ -1,4 +1,3 @@
-use crate::sync::RwLock;
 use rustc_hash::FxHashSet as HashSet;
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
@@ -12,7 +11,7 @@ use crate::{
         insn::{CmpInsFlags, Insn},
         BranchOffset,
     },
-    Connection, LimboError, Result, Statement, Value,
+    Connection, LimboError, Result, Value,
 };
 use std::{num::NonZero, num::NonZeroUsize, sync::Arc};
 
@@ -1302,14 +1301,9 @@ fn emit_fk_action_subprogram(
         );
     }
 
-    let turso_stmt = Statement::new(
-        built_subprogram,
-        connection.pager.load().clone(),
-        QueryMode::Normal,
-    );
     program.emit_insn(Insn::Program {
         params,
-        program: Arc::new(RwLock::new(turso_stmt)),
+        program: built_subprogram.prepared().clone(),
     });
 
     Ok(())

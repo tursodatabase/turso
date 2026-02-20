@@ -779,15 +779,13 @@ macro_rules! get_cursor {
 /// Tracks the state of explain mode execution, including which subprograms need to be processed.
 #[derive(Default)]
 pub struct ExplainState {
-    /// Program counter positions in the parent program where `Insn::Program` instructions occur.
-    parent_program_pcs: Vec<usize>,
-    /// Index of the subprogram currently being processed, if any.
-    current_subprogram_index: Option<usize>,
-    /// PC value when we started processing the current subprogram, to detect if we need to reset.
-    subprogram_start_pc: Option<usize>,
+    /// Subprograms queued for explain output, processed after the parent program finishes.
+    pending: std::collections::VecDeque<Arc<PreparedProgram>>,
+    /// The subprogram currently being explained, if any.
+    current: Option<Arc<PreparedProgram>>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PreparedProgram {
     pub max_registers: usize,
     // we store original indices because we don't want to create new vec from
@@ -951,9 +949,8 @@ impl Program {
     fn explain_step(&self, state: &mut ProgramState, pager: Arc<Pager>) -> Result<StepResult> {
         turso_debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.is_closed() {
-            // Connection is closed for whatever reason, rollback the transaction.
-            let state = self.connection.get_tx_state();
-            if let TransactionState::Write { .. } = state {
+            let tx_state = self.connection.get_tx_state();
+            if let TransactionState::Write { .. } = tx_state {
                 pager.rollback_tx(&self.connection);
             }
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -963,120 +960,70 @@ impl Program {
             return Ok(StepResult::Interrupt);
         }
 
-        // FIXME: do we need this?
         state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
         let mut explain_state = state.explain_state.write();
 
-        // Check if we're processing a subprogram
-        if let Some(sub_idx) = explain_state.current_subprogram_index {
-            if sub_idx >= explain_state.parent_program_pcs.len() {
-                // All subprograms processed
-                *explain_state = ExplainState::default();
-                return Ok(StepResult::Done);
-            }
-
-            let parent_pc = explain_state.parent_program_pcs[sub_idx];
-            let Insn::Program { program: p, .. } = &self.insns[parent_pc].0 else {
-                panic!("Expected program insn at pc {parent_pc}");
-            };
-            let p = &mut p.write().program;
-
-            let subprogram_insn_count = p.insns.len();
-
-            // Check if the subprogram has already finished (PC is out of bounds)
-            // This can happen if the subprogram finished in a previous call but we're being called again
-            if state.pc as usize >= subprogram_insn_count {
-                // Subprogram is done, move to next one
-                explain_state.subprogram_start_pc = None;
-                if sub_idx + 1 < explain_state.parent_program_pcs.len() {
-                    explain_state.current_subprogram_index = Some(sub_idx + 1);
-                    state.pc = 0;
-                    drop(explain_state);
-                    return self.explain_step(state, pager);
-                } else {
-                    *explain_state = ExplainState::default();
-                    return Ok(StepResult::Done);
+        // Advance to the next subprogram if the current one is finished
+        loop {
+            if let Some(ref current) = explain_state.current {
+                if (state.pc as usize) < current.insns.len() {
+                    break;
                 }
+            } else if (state.pc as usize) < self.insns.len() {
+                break;
             }
-
-            // Reset PC to 0 only when starting a new subprogram (when subprogram_start_pc is None)
-            // Once we've started, let the subprogram manage its own PC through its explain_step
-            if explain_state.subprogram_start_pc.is_none() {
+            // Current program is done, pop next subprogram from queue
+            if let Some(next) = explain_state.pending.pop_front() {
+                explain_state.current = Some(next);
                 state.pc = 0;
-                explain_state.subprogram_start_pc = Some(0);
-            }
-
-            // Process the subprogram - it will handle its own explain_step internally
-            // The subprogram's explain_step will process all its instructions (including any nested subprograms)
-            // and return StepResult::Row for each instruction, then StepResult::Done when finished
-            drop(explain_state);
-            let result = p.step(state, pager.clone(), QueryMode::Explain, None)?;
-            let mut explain_state = state.explain_state.write();
-
-            match result {
-                StepResult::Done => {
-                    // This subprogram is done, move to next one
-                    explain_state.subprogram_start_pc = None; // Clear the start PC marker
-                    if sub_idx + 1 < explain_state.parent_program_pcs.len() {
-                        // Move to next subprogram
-                        explain_state.current_subprogram_index = Some(sub_idx + 1);
-                        // Reset PC to 0 for the next subprogram
-                        state.pc = 0;
-                        // Recursively call to process the next subprogram
-                        drop(explain_state);
-                        return self.explain_step(state, pager);
-                    } else {
-                        // All subprograms done
-                        *explain_state = ExplainState::default();
-                        return Ok(StepResult::Done);
-                    }
-                }
-                StepResult::Row => {
-                    // Output a row from the subprogram
-                    // The subprogram's step already set up the registers with PC starting at 0
-                    // Don't reset subprogram_start_pc - we're still processing this subprogram
-                    drop(explain_state);
-                    return Ok(StepResult::Row);
-                }
-                other => {
-                    drop(explain_state);
-                    return Ok(other);
-                }
-            }
-        }
-
-        // We're processing the parent program
-        if state.pc as usize >= self.insns.len() {
-            // Parent program is done, start processing subprograms
-            if explain_state.parent_program_pcs.is_empty() {
-                // No subprograms to process
-                *explain_state = ExplainState::default();
+            } else {
+                explain_state.current = None;
                 return Ok(StepResult::Done);
             }
-
-            // Start processing the first subprogram
-            explain_state.current_subprogram_index = Some(0);
-            explain_state.subprogram_start_pc = None; // Will be set when we actually start processing
-            state.pc = 0; // Reset PC to 0 for the first subprogram
-            drop(explain_state);
-            return self.explain_step(state, pager);
         }
 
-        let (current_insn, _) = &self.insns[state.pc as usize];
+        let pc = state.pc as usize;
 
-        if matches!(current_insn, Insn::Program { .. }) {
-            explain_state.parent_program_pcs.push(state.pc as usize);
-        }
-        let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_row_with_comment(
-            self,
-            current_insn,
-            self.comments
+        // Explain the current instruction from the active program.
+        // We collect subprograms separately to avoid borrow conflicts with explain_state.
+        let (row, subprogram) = if let Some(ref current) = explain_state.current {
+            let (insn, _) = &current.insns[pc];
+            let sub = if let Insn::Program {
+                program: prepared, ..
+            } = insn
+            {
+                Some(prepared.clone())
+            } else {
+                None
+            };
+            let comment = current
+                .comments
                 .iter()
                 .find(|(offset, _)| *offset == state.pc)
-                .map(|(_, comment)| comment)
-                .copied(),
-        );
+                .map(|(_, c)| *c);
+            (insn_to_row_with_comment(current, insn, comment), sub)
+        } else {
+            let (insn, _) = &self.insns[pc];
+            let sub = if let Insn::Program {
+                program: prepared, ..
+            } = insn
+            {
+                Some(prepared.clone())
+            } else {
+                None
+            };
+            let comment = self
+                .comments
+                .iter()
+                .find(|(offset, _)| *offset == state.pc)
+                .map(|(_, c)| *c);
+            (insn_to_row_with_comment(self, insn, comment), sub)
+        };
+        if let Some(sub) = subprogram {
+            explain_state.pending.push_back(sub);
+        }
+        let (opcode, p1, p2, p3, p4, p5, comment) = row;
 
         state.registers[0] = Register::Value(Value::from_i64(state.pc as i64));
         state.registers[1] = Register::Value(Value::from_text(opcode));
