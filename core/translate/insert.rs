@@ -291,6 +291,7 @@ pub fn translate_insert(
         &table,
         &mut body,
         on_conflict.unwrap_or(ResolveType::Abort),
+        database_id,
     )?;
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
@@ -1359,6 +1360,7 @@ fn bind_insert(
     table: &Table,
     body: &mut InsertBody,
     on_conflict: ResolveType,
+    database_id: usize,
 ) -> Result<BoundInsertResult> {
     let mut values: Vec<Box<Expr>> = vec![];
     let mut upsert: Option<Box<Upsert>> = None;
@@ -1472,7 +1474,9 @@ fn bind_insert(
         let next = upsert_opt.next.take();
         upsert_actions.push((
             // resolve the constrained target for UPSERT in the chain
-            resolve_upsert_target(resolver.schema(), table, &upsert_opt)?,
+            resolver.with_schema(database_id, |s| {
+                resolve_upsert_target(s, table, &upsert_opt)
+            })?,
             program.allocate_label(),
             upsert_opt,
         ));
