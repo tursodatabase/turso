@@ -31,68 +31,70 @@ QUERY PLAN
 `--SEARCH e2 USING INDEX ephemeral_subquery_t4
 
 BYTECODE
-addr  opcode          p1  p2  p3  p4              p5  comment
-   0  Init             0  61   0                   0  Start at 61
-   1  OpenEphemeral    0   1   0                   0  cursor=0 is_table=true
-   2  OpenRead         1   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
-   3  Rewind           1  16   0                   0  Rewind table employees
-   4    Column         1   4   9                   0  r[9]=employees.salary
-   5    RealAffinity   9   0   0                   0
-   6    IsNull         9  15   0                   0  if (r[9]==NULL) goto 15
-   7    RowId          1   5   0                   0  r[5]=employees.rowid
-   8    Column         1   1   6                   0  r[6]=employees.name
-   9    Column         1   3   7                   0  r[7]=employees.department
-  10    Column         1   4   8                   0  r[8]=employees.salary
-  11    RealAffinity   8   0   0                   0
-  12    MakeRecord     5   4  10                   0  r[10]=mkrec(r[5..8]); for
-  13    NewRowid       0  11   0                   0  r[11]=rowid
-  14    Insert         0  10  11                   4  intkey=r[11] data=r[10]
-  15  Next             1   4   0                   0
-  16  OpenDup          2   0   0                   0  new_cursor=2, original_cursor=0
-  17  OpenDup          3   0   0                   0  new_cursor=3, original_cursor=0
-  18  OpenEphemeral    4   0   0                   0  cursor=4 is_table=false
-  19  Rewind           3  32   0                   0  Rewind
-  20    Column         3   0  17                   0  r[17]=.column 0
-  21    Column         3   1  18                   0  r[18]=.column 1
-  22    Column         3   2  19                   0  r[19]=.column 2
-  23    Column         3   3  20                   0  r[20]=.column 3
-  24    Copy          19  21   0                   0  r[21]=r[19]
-  25    Copy          17  22   0                   0  r[22]=r[17]
-  26    Copy          18  23   0                   0  r[23]=r[18]
-  27    Copy          20  24   0                   0  r[24]=r[20]
-  28    RowId          3  25   0                   0  r[25]=.rowid
-  29    MakeRecord    21   5  16                   0  r[16]=mkrec(r[21..25]); for ephemeral_subquery_t4
-  30    IdxInsert      4  16  21                   0  key=r[16]
-  31  Next             3  20   0                   0
-  32  Rewind           2  60   0                   0  Rewind
-  33    Column         2   0  12                   0  r[12]=.column 0
-  34    Column         2   1  13                   0  r[13]=.column 1
-  35    Column         2   2  14                   0  r[14]=.column 2
-  36    Column         2   3  15                   0  r[15]=.column 3
-  37    Copy          14  34   0                   0  r[34]=r[14]
-  38    IsNull        34  59   0                   0  if (r[34]==NULL) goto 59
-  39    Affinity      34   1   0                   0  r[34..35] = B
-  40    SeekGE         4  59  34                   0  key=[34..34]
-  41      IdxGT        4  59  34                   0  key=[34..34]
-  42      Column       4   0  26                   0  r[26]=ephemeral_subquery_t4.department
-  43      Column       4   1  27                   0  r[27]=ephemeral_subquery_t4.id
-  44      Column       4   2  28                   0  r[28]=ephemeral_subquery_t4.name
-  45      Column       4   3  29                   0  r[29]=ephemeral_subquery_t4.salary
-  46      Copy        12  36   0                   0  r[36]=r[12]
-  47      Column       4   1  37                   0  r[37]=ephemeral_subquery_t4.id
-  48      Ge          36  37  58  Binary           0  if r[36]>=r[37] goto 58
-  49      Copy        15  39   0                   0  r[39]=r[15]
-  50      Column       4   3  41                   0  r[41]=ephemeral_subquery_t4.salary
-  51      Multiply    41  42  40                   0  r[40]=r[41]*r[42]
-  52      Le          39  40  58  Binary           0  if r[39]<=r[40] goto 58
-  53      Copy        13  30   0                   0  r[30]=r[13]
-  54      Copy        15  31   0                   0  r[31]=r[15]
-  55      Column       4   2  32                   0  r[32]=ephemeral_subquery_t4.name
-  56      Column       4   3  33                   0  r[33]=ephemeral_subquery_t4.salary
-  57      ResultRow   30   4   0                   0  output=r[30..33]
-  58    Next           4  41   0                   0
-  59  Next             2  33   0                   0
-  60  Halt             0   0   0                   0
-  61  Transaction      0   1  11                   0  iDb=0 tx_mode=Read
-  62  Real             0  42   0  1.5              0  r[42]=1.5
-  63  Goto             0   1   0                   0
+addr  opcode            p1  p2  p3  p4              p5  comment
+   0  Init               0  63   0                   0  Start at 63
+   1  OpenEphemeral      0   1   0                   0  cursor=0 is_table=true
+   2  OpenRead           1   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
+   3  Rewind             1  16   0                   0  Rewind table employees
+   4    Column           1   4   9                   0  r[9]=employees.salary
+   5    RealAffinity     9   0   0                   0
+   6    IsNull           9  15   0                   0  if (r[9]==NULL) goto 15
+   7    RowId            1   5   0                   0  r[5]=employees.rowid
+   8    Column           1   1   6                   0  r[6]=employees.name
+   9    Column           1   3   7                   0  r[7]=employees.department
+  10    Column           1   4   8                   0  r[8]=employees.salary
+  11    RealAffinity     8   0   0                   0
+  12    MakeRecord       5   4  10                   0  r[10]=mkrec(r[5..8]); for
+  13    NewRowid         0  11   0                   0  r[11]=rowid
+  14    Insert           0  10  11                   4  intkey=r[11] data=r[10]
+  15  Next               1   4   0                   0
+  16  OpenDup            2   0   0                   0  new_cursor=2, original_cursor=0
+  17  OpenDup            3   0   0                   0  new_cursor=3, original_cursor=0
+  18  OpenEphemeral      4   0   0                   0  cursor=4 is_table=false
+  19  Rewind             3  32   0                   0  Rewind
+  20    Column           3   0  17                   0  r[17]=.column 0
+  21    Column           3   1  18                   0  r[18]=.column 1
+  22    Column           3   2  19                   0  r[19]=.column 2
+  23    Column           3   3  20                   0  r[20]=.column 3
+  24    Copy            19  21   0                   0  r[21]=r[19]
+  25    Copy            17  22   0                   0  r[22]=r[17]
+  26    Copy            18  23   0                   0  r[23]=r[18]
+  27    Copy            20  24   0                   0  r[24]=r[20]
+  28    RowId            3  25   0                   0  r[25]=.rowid
+  29    MakeRecord      21   5  16                   0  r[16]=mkrec(r[21..25]); for ephemeral_subquery_t4
+  30    IdxInsert        4  16  21                   0  key=r[16]
+  31  Next               3  20   0                   0
+  32  Rewind             2  62   0                   0  Rewind
+  33    Column           2   0  12                   0  r[12]=.column 0
+  34    Column           2   1  13                   0  r[13]=.column 1
+  35    Column           2   2  14                   0  r[14]=.column 2
+  36    Column           2   3  15                   0  r[15]=.column 3
+  37    Copy            14  34   0                   0  r[34]=r[14]
+  38    IsNull          34  61   0                   0  if (r[34]==NULL) goto 61
+  39    Affinity        34   1   0                   0  r[34..35] = B
+  40    SeekGE           4  61  34                   0  key=[34..34]
+  41      IdxGT          4  61  34                   0  key=[34..34]
+  42      Column         4   0  26                   0  r[26]=ephemeral_subquery_t4.department
+  43      Column         4   1  27                   0  r[27]=ephemeral_subquery_t4.id
+  44      Column         4   2  28                   0  r[28]=ephemeral_subquery_t4.name
+  45      Column         4   3  29                   0  r[29]=ephemeral_subquery_t4.salary
+  46      Copy          12  36   0                   0  r[36]=r[12]
+  47      Column         4   1  37                   0  r[37]=ephemeral_subquery_t4.id
+  48      Ge            36  37  60  Binary           0  if r[36]>=r[37] goto 60
+  49      Copy          15  39   0                   0  r[39]=r[15]
+  50      Column         4   3  41                   0  r[41]=ephemeral_subquery_t4.salary
+  51      RealAffinity  41   0   0                   0
+  52      Multiply      41  42  40                   0  r[40]=r[41]*r[42]
+  53      Le            39  40  60  Binary           0  if r[39]<=r[40] goto 60
+  54      Copy          13  30   0                   0  r[30]=r[13]
+  55      Copy          15  31   0                   0  r[31]=r[15]
+  56      Column         4   2  32                   0  r[32]=ephemeral_subquery_t4.name
+  57      Column         4   3  33                   0  r[33]=ephemeral_subquery_t4.salary
+  58      RealAffinity  33   0   0                   0
+  59      ResultRow     30   4   0                   0  output=r[30..33]
+  60    Next             4  41   0                   0
+  61  Next               2  33   0                   0
+  62  Halt               0   0   0                   0
+  63  Transaction        0   1  11                   0  iDb=0 tx_mode=Read
+  64  Real               0  42   0  1.5              0  r[42]=1.5
+  65  Goto               0   1   0                   0
