@@ -391,6 +391,8 @@ pub struct ProgramState {
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
     uses_subjournal: bool,
+    /// Attached pagers that have open savepoints for statement rollback.
+    attached_savepoint_pagers: Vec<Arc<Pager>>,
     pub n_change: AtomicI64,
     pub explain_state: RwLock<ExplainState>,
     /// Pending error to return after FAIL mode commit completes.
@@ -477,6 +479,7 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             uses_subjournal: false,
+            attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
@@ -639,6 +642,8 @@ impl ProgramState {
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
+        // Drain attached pagers upfront so we can clean them up regardless of path.
+        let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
         let result = 'outer: {
             match end_statement {
                 EndStatement::ReleaseSavepoint => {
@@ -648,7 +653,11 @@ impl ProgramState {
                         }
                         Ok(()) // MVCC mode: no pager savepoint to release
                     } else {
-                        pager.release_savepoint()
+                        pager.release_savepoint()?;
+                        for p in &attached_pagers {
+                            p.release_savepoint()?;
+                        }
+                        Ok(())
                     }
                 }
                 EndStatement::RollbackSavepoint => {
@@ -667,6 +676,9 @@ impl ProgramState {
                             Err(err) => break 'outer Err(err),
                             _ => {}
                         }
+                        for p in &attached_pagers {
+                            p.rollback_to_newest_savepoint()?;
+                        }
                     }
                     // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
                     // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
@@ -682,6 +694,9 @@ impl ProgramState {
         if self.uses_subjournal {
             pager.stop_use_subjournal();
             self.uses_subjournal = false;
+        }
+        for p in &attached_pagers {
+            p.stop_use_subjournal();
         }
         result
     }
@@ -1533,9 +1548,7 @@ impl Program {
                         // it again on re-entry will resume correctly.
                         return Ok(IOResult::IO(io));
                     }
-                    Err(e) => {
-                        tracing::warn!("attached pager commit_dirty_pages error: {e}");
-                    }
+                    Err(e) => return Err(e),
                 }
                 // WAL commit succeeded — publish the connection-local schema
                 // changes to the shared Database so other connections can see them.

@@ -2453,15 +2453,27 @@ pub fn op_transaction_inner(
                 state.op_transaction_state = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                // Only begin statement subtransactions for the main database (db 0).
-                // Attached databases (db >= 2) don't manage their own statement
-                // subtransactions; the main pager's end_statement handles cleanup.
                 if *db == 0 && program.needs_stmt_subtransactions.load(Ordering::Relaxed) {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
+                } else if *db >= 2
+                    && matches!(tx_mode, TransactionMode::Write)
+                    && program.needs_stmt_subtransactions.load(Ordering::Relaxed)
+                {
+                    // Open a savepoint on the attached pager for statement rollback.
+                    let db_size =
+                        return_if_io!(pager.with_header(|header| header.database_size.get()));
+                    pager.open_subjournal()?;
+                    pager.try_use_subjournal()?;
+                    let result = pager.open_savepoint(db_size);
+                    if result.is_err() {
+                        pager.stop_use_subjournal();
+                    }
+                    result?;
+                    state.attached_savepoint_pagers.push(pager.clone());
                 }
 
                 state.pc += 1;
