@@ -5979,9 +5979,7 @@ fn overflow_pages_expected_for_cell(
 
 fn index_record_rowid_at_end(payload: &[u8], payload_size: u64) -> Result<Option<bool>> {
     if payload.is_empty() {
-        return Err(LimboError::Corrupt(
-            "Index record payload is empty".into(),
-        ));
+        return Err(LimboError::Corrupt("Index record payload is empty".into()));
     }
 
     let (header_size, header_varint_len) = read_varint(payload)?;
@@ -6014,9 +6012,8 @@ fn index_record_rowid_at_end(payload: &[u8], payload_size: u64) -> Result<Option
         last_serial_type = Some(serial_type);
     }
 
-    let last_serial_type = last_serial_type.ok_or_else(|| {
-        LimboError::Corrupt("Index record has no serial types".into())
-    })?;
+    let last_serial_type = last_serial_type
+        .ok_or_else(|| LimboError::Corrupt("Index record has no serial types".into()))?;
 
     Ok(Some(matches!(
         last_serial_type.kind(),
@@ -6413,8 +6410,8 @@ pub fn integrity_check(
                                 max_intkey,
                                 page_category: PageCategory::Overflow,
                                 overflow_pages_expected: Some(expected_pages),
-                            overflow_pages_seen: 0,
-                        },
+                                overflow_pages_seen: 0,
+                            },
                             page.get().id as i64,
                             errors,
                         );
