@@ -531,6 +531,7 @@ impl EmitWindow {
             has_autoincrement: false,
             foreign_keys: vec![],
             check_constraints: vec![],
+            pk_conflict_clause: None,
         });
         let cursor_buffer_read =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));

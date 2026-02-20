@@ -53,6 +53,7 @@ pub fn emit_program_for_update(
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
+    program.has_statement_conflict = plan.or_conflict.is_some();
 
     let mut t_ctx = TranslateCtx::new(
         program,
@@ -475,7 +476,14 @@ fn emit_update_column_values<'a>(
                         )?;
                     }
                     if table_column.notnull() {
-                        match or_conflict {
+                        let notnull_conflict = if program.has_statement_conflict {
+                            or_conflict
+                        } else {
+                            table_column
+                                .notnull_conflict_clause
+                                .unwrap_or(ResolveType::Abort)
+                        };
+                        match notnull_conflict {
                             ResolveType::Ignore => {
                                 // For IGNORE, skip this row on NOT NULL violation
                                 program.emit_insn(Insn::IsNull {
@@ -1090,10 +1098,19 @@ fn emit_update_insns<'a>(
     // Without this, the per-index loop would interleave constraint checks with IdxDelete/IdxInsert,
     // leaving orphan index entries if a later constraint fails.
     // REPLACE is excluded because it handles conflicts by deleting conflicting rows inline.
-    if matches!(
+    //
+    // Also check per-constraint ON CONFLICT clauses from CREATE TABLE.
+    let needs_preflight = matches!(
         or_conflict,
         ResolveType::Abort | ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback
-    ) {
+    ) || (!program.has_statement_conflict
+        && indexes_to_update.iter().any(|idx| {
+            matches!(
+                idx.on_conflict,
+                Some(ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback)
+            )
+        }));
+    if needs_preflight {
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
         for (index, (idx_cursor_id, _record_reg)) in indexes_to_update.iter().zip(index_cursors) {
             if !index.unique {
@@ -1168,8 +1185,14 @@ fn emit_update_insns<'a>(
                 collation: program.curr_collation(),
             });
 
-            // Conflict with a different row - handle based on conflict resolution mode
-            match or_conflict {
+            // Conflict with a different row - handle based on conflict resolution mode.
+            // Use per-constraint ON CONFLICT when no statement-level OR clause.
+            let idx_conflict = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                index.on_conflict.unwrap_or(ResolveType::Abort)
+            };
+            match idx_conflict {
                 ResolveType::Ignore => {
                     // Skip this row's update and continue with the next row
                     program.emit_insn(Insn::Goto {
@@ -1197,9 +1220,7 @@ fn emit_update_insns<'a>(
                         description_reg: None,
                     });
                 }
-                _ => unreachable!(
-                    "Only ABORT, IGNORE, FAIL, and ROLLBACK should reach preflight check"
-                ),
+                _ => {}
             }
 
             program.preassign_label_to_next_insn(no_conflict_label);
@@ -1226,8 +1247,23 @@ fn emit_update_insns<'a>(
                 target_pc: no_rowid_conflict_label,
             });
 
-            // Conflict found - handle based on conflict resolution mode
-            match or_conflict {
+            // Conflict found - handle based on conflict resolution mode.
+            // Use per-constraint ON CONFLICT when no statement-level OR clause.
+            let pk_conflict = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                target_table
+                    .table
+                    .btree()
+                    .and_then(|bt| {
+                        bt.unique_sets
+                            .iter()
+                            .find(|us| us.is_primary_key)
+                            .and_then(|us| us.conflict_clause)
+                    })
+                    .unwrap_or(ResolveType::Abort)
+            };
+            match pk_conflict {
                 ResolveType::Ignore => {
                     // Skip this row's update and continue with the next row
                     program.emit_insn(Insn::Goto {
@@ -1257,9 +1293,7 @@ fn emit_update_insns<'a>(
                         description_reg: None,
                     });
                 }
-                _ => unreachable!(
-                    "Only ABORT, IGNORE, FAIL, and ROLLBACK should reach preflight check"
-                ),
+                _ => {}
             }
 
             program.preassign_label_to_next_insn(no_rowid_conflict_label);
@@ -1678,7 +1712,12 @@ fn emit_update_insns<'a>(
                 collation: program.curr_collation(),
             });
 
-            match or_conflict {
+            let idx_conflict = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                index.on_conflict.unwrap_or(ResolveType::Abort)
+            };
+            match idx_conflict {
                 ResolveType::Ignore => {
                     // For IGNORE, skip this row's update but continue with other rows
                     program.emit_insn(Insn::Goto {
@@ -1915,8 +1954,23 @@ fn emit_update_insns<'a>(
                 target_pc: record_label,
             });
 
-            // Handle conflict resolution for rowid/primary key conflict
-            match or_conflict {
+            // Handle conflict resolution for rowid/primary key conflict.
+            // Use per-constraint ON CONFLICT when no statement-level OR clause.
+            let pk_conflict = if program.has_statement_conflict {
+                or_conflict
+            } else {
+                target_table
+                    .table
+                    .btree()
+                    .and_then(|bt| {
+                        bt.unique_sets
+                            .iter()
+                            .find(|us| us.is_primary_key)
+                            .and_then(|us| us.conflict_clause)
+                    })
+                    .unwrap_or(ResolveType::Abort)
+            };
+            match pk_conflict {
                 ResolveType::Ignore => {
                     // For IGNORE, skip this row's update but continue with other rows
                     program.emit_insn(Insn::Goto {
