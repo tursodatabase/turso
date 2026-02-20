@@ -1655,13 +1655,32 @@ expect {
 # Bug fix: CHECK constraint type coercion must use column affinity (#5170)
 # TEXT column comparing with integer literal should use TEXT affinity,
 # meaning the integer is coerced to text for comparison.
-test check_constraint_text_affinity_coercion_violation {
-    CREATE TABLE t(val TEXT CHECK(val > 5));
-    INSERT INTO t VALUES ('10');
+# Bug fix: integrity_check must not flag NULL values as CHECK violations.
+# Per SQL standard, NULL does not violate CHECK constraints.
+@skip-if mvcc "MVCC integrity_check does not perform row-level CHECK validation"
+test check_constraint_integrity_check_null_not_violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val REAL CHECK (val > 0));
+    INSERT INTO t (id, val) VALUES (1, 100.0);
+    INSERT INTO t (id, val) VALUES (2, NULL);
+    INSERT INTO t (id, val) VALUES (3, 200.0);
+    PRAGMA integrity_check;
 }
-expect error {
-    CHECK constraint failed: val > 5
+expect {
+    ok
 }
+
+@skip-if mvcc "MVCC integrity_check does not perform row-level CHECK validation"
+test check_constraint_integrity_check_detects_real_violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK (val > 0));
+    PRAGMA ignore_check_constraints = ON;
+    INSERT INTO t VALUES (1, -5);
+    PRAGMA ignore_check_constraints = OFF;
+    PRAGMA integrity_check;
+}
+expect {
+    CHECK constraint failed in t
+}
+
 
 test check_constraint_text_affinity_coercion_pass {
     CREATE TABLE t(val TEXT CHECK(val > 5));

@@ -3823,13 +3823,17 @@ fn emit_binary_condition_insn(
         opposite_op
     };
 
-    // Similarly, we "jump if NULL" only when we intend to jump if the condition is false.
-    let flags = if condition_metadata.jump_if_condition_is_true {
-        CmpInsFlags::default().with_affinity(affinity)
-    } else {
-        CmpInsFlags::default()
-            .with_affinity(affinity)
-            .jump_if_null()
+    // Set the "jump if NULL" flag when the NULL target matches the jump target.
+    // When jump_if_condition_is_true: we jump on true, so set jump_if_null when NULL should also jump (e.g. CHECK constraints in integrity_check).
+    // When !jump_if_condition_is_true: we jump on false, so set jump_if_null when NULL should also jump (standard SQL 3-valued logic).
+    let mut flags = CmpInsFlags::default().with_affinity(affinity);
+    if condition_metadata.jump_if_condition_is_true {
+        if condition_metadata.jump_target_when_null == condition_metadata.jump_target_when_true {
+            flags = flags.jump_if_null()
+        }
+    } else if condition_metadata.jump_target_when_null == condition_metadata.jump_target_when_false
+    {
+        flags = flags.jump_if_null()
     };
 
     let target_pc = if condition_metadata.jump_if_condition_is_true {
