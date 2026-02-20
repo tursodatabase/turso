@@ -166,6 +166,18 @@ impl Drop for Connection {
                 }
             }
 
+            // Also release WAL locks on all attached database pagers
+            for attached_pager in self.get_all_attached_pagers() {
+                if let Some(wal) = &attached_pager.wal {
+                    if wal.holds_write_lock() {
+                        wal.end_write_tx();
+                    }
+                    if wal.holds_read_lock() {
+                        wal.end_read_tx();
+                    }
+                }
+            }
+
             // if connection wasn't properly closed, decrement the connection counter
             self.db
                 .n_connections
@@ -1316,22 +1328,23 @@ impl Connection {
         if database_id < 2 {
             self.with_schema_mut(f)
         } else {
-            let db = {
+            // For attached databases, update a connection-local copy of the schema.
+            // We don't update the shared db.schema until after the WAL commit, so
+            // other connections won't see uncommitted schema changes (which would
+            // cause SchemaUpdated mismatches).
+            let mut schemas = self.database_schemas.write();
+            let schema_arc = schemas.entry(database_id).or_insert_with(|| {
+                // Lazily copy from the shared Database schema
                 let attached_dbs = self.attached_databases.read();
                 let (db, _pager) = attached_dbs
                     .index_to_data
                     .get(&database_id)
                     .expect("Database ID should be valid");
-                db.clone()
-            };
-            let result = {
-                let mut schema_guard = db.schema.lock();
-                let schema = Arc::make_mut(&mut *schema_guard);
-                f(schema)
-            };
-            // Invalidate the cache so with_schema() picks up the new version
-            self.database_schemas.write().remove(&database_id);
-            result
+                let schema = db.schema.lock().clone();
+                schema
+            });
+            let schema = Arc::make_mut(schema_arc);
+            f(schema)
         }
     }
 
@@ -1414,7 +1427,7 @@ impl Connection {
         };
         let main_db_flags = self.db.open_flags;
         let db = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
-        let pager = Arc::new(db.init_pager(None)?);
+        let pager = Arc::new(db._init(None)?);
         self.attached_databases.write().insert(alias, (db, pager));
 
         Ok(())
@@ -1470,8 +1483,31 @@ impl Connection {
             .collect()
     }
 
+    /// Get all attached database (index, pager) pairs (excludes main/temp databases)
+    pub(crate) fn get_all_attached_pagers_with_index(&self) -> Vec<(usize, Arc<Pager>)> {
+        let catalog = self.attached_databases.read();
+        catalog
+            .index_to_data
+            .iter()
+            .map(|(&idx, (_db, pager))| (idx, pager.clone()))
+            .collect()
+    }
+
     pub(crate) fn database_schemas(&self) -> &RwLock<HashMap<usize, Arc<Schema>>> {
         &self.database_schemas
+    }
+
+    /// Publish a connection-local attached DB schema to the shared Database instance.
+    /// Called after the attached pager's WAL commit succeeds, so other connections
+    /// can now see the schema changes.
+    pub(crate) fn publish_attached_schema(&self, database_id: usize) {
+        let mut schemas = self.database_schemas.write();
+        if let Some(local_schema) = schemas.remove(&database_id) {
+            let attached_dbs = self.attached_databases.read();
+            if let Some((db, _pager)) = attached_dbs.index_to_data.get(&database_id) {
+                *db.schema.lock() = local_schema;
+            }
+        }
     }
 
     pub(crate) fn attached_databases(&self) -> &RwLock<DatabaseCatalog> {
@@ -1489,14 +1525,15 @@ impl Connection {
             let schema = self.schema.read();
             f(&schema)
         } else {
-            // Attached database - check cache first, then load from database
-            let mut schemas = self.database_schemas.write();
-
-            if let Some(cached_schema) = schemas.get(&database_id) {
-                return f(cached_schema);
+            // Attached database: prefer the connection-local copy (which may contain
+            // uncommitted schema changes from this connection's transaction), falling
+            // back to the shared Database schema (last committed state).
+            let schemas = self.database_schemas.read();
+            if let Some(local_schema) = schemas.get(&database_id) {
+                return f(local_schema);
             }
+            drop(schemas);
 
-            // Schema not cached, load it lazily from the attached database
             let attached_dbs = self.attached_databases.read();
             let (db, _pager) = attached_dbs
                 .index_to_data
@@ -1504,10 +1541,6 @@ impl Connection {
                 .expect("Database ID should be valid after resolve_database_id");
 
             let schema = db.schema.lock().clone();
-
-            // Cache the schema for future use
-            schemas.insert(database_id, schema.clone());
-
             f(&schema)
         }
     }

@@ -878,7 +878,7 @@ impl Database {
 
     /// Necessary Pager initialization, so that we are prepared to read from Page 1.
     /// For encrypted databases, the encryption key must be provided to properly decrypt page 1.
-    fn _init(&self, encryption_key: Option<&EncryptionKey>) -> Result<Pager> {
+    pub(crate) fn _init(&self, encryption_key: Option<&EncryptionKey>) -> Result<Pager> {
         let pager = self.init_pager(None)?;
         pager.enable_encryption(self.opts.enable_encryption);
 

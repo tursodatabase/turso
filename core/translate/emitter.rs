@@ -200,21 +200,18 @@ impl<'a> Resolver<'a> {
 
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
-        if database_id == Self::MAIN_DB_ID {
-            // Main database - use connection's schema which should be kept in sync
-            f(self.schema)
-        } else if database_id == Self::TEMP_DB_ID {
-            // Temp database - uses same schema as main for now, but this will change later.
+        if database_id == Self::MAIN_DB_ID || database_id == Self::TEMP_DB_ID {
             f(self.schema)
         } else {
-            // Attached database - check cache first, then load from database
-            let mut schemas = self.database_schemas.write();
-
-            if let Some(cached_schema) = schemas.get(&database_id) {
-                return f(cached_schema);
+            // Attached database: prefer the connection-local copy (which may contain
+            // uncommitted schema changes from this connection's transaction), falling
+            // back to the shared Database schema (last committed state).
+            let schemas = self.database_schemas.read();
+            if let Some(local_schema) = schemas.get(&database_id) {
+                return f(local_schema);
             }
+            drop(schemas);
 
-            // Schema not cached, load it lazily from the attached database
             let attached_dbs = self.attached_databases.read();
             let (db, _pager) = attached_dbs
                 .index_to_data
@@ -222,10 +219,6 @@ impl<'a> Resolver<'a> {
                 .expect("Database ID should be valid after resolve_database_id");
 
             let schema = db.schema.lock().clone();
-
-            // Cache the schema for future use
-            schemas.insert(database_id, schema.clone());
-
             f(&schema)
         }
     }

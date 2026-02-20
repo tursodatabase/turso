@@ -2327,24 +2327,33 @@ pub fn op_transaction_inner(
                                 .to_string(),
                         ));
                     }
-                    // For attached databases (db >= 2), always start read+write
+                    // For attached databases (db >= 2), always start read/write
                     // transactions on the attached pager, since the connection-level
-                    // transaction state may already be Write from the main database.
+                    // transaction state may already be Read/Write from the main database.
                     let is_attached = *db >= 2;
-                    if is_attached && matches!(tx_mode, TransactionMode::Write) {
+                    if is_attached {
                         // If the pager already holds a read lock (e.g., after
-                        // SchemaUpdated reprepare), skip to schema cookie check
-                        // since locks persist across reprepare.
+                        // SchemaUpdated reprepare or prior write tx), skip
+                        // locks that are already held.
                         if pager.holds_read_lock() {
+                            if matches!(tx_mode, TransactionMode::Write)
+                                && !pager.holds_write_lock()
+                            {
+                                state.op_transaction_state =
+                                    OpTransactionState::AttachedBeginWriteTx;
+                                continue;
+                            }
                             state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                             continue;
                         }
                         pager.begin_read_tx()?;
-                        // Transition to AttachedBeginWriteTx to handle begin_write_tx
-                        // separately, so if it returns IO we don't re-call begin_read_tx
-                        // on re-entry.
-                        state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
-                        continue;
+                        if matches!(tx_mode, TransactionMode::Write) {
+                            // Transition to AttachedBeginWriteTx to handle begin_write_tx
+                            // separately, so if it returns IO we don't re-call begin_read_tx
+                            // on re-entry.
+                            state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
+                            continue;
+                        }
                     } else if updated && matches!(current_state, TransactionState::None) {
                         turso_assert!(
                             !conn.is_nested_stmt(),

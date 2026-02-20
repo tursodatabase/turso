@@ -170,6 +170,13 @@ pub fn init_loop(
         if !required_tables.contains(&table_index) {
             continue;
         }
+        // Ensure attached databases have a Transaction instruction for read access
+        if table.database_id >= 2 {
+            let schema_cookie = t_ctx
+                .resolver
+                .with_schema(table.database_id, |s| s.schema_version);
+            program.begin_read_on_database(table.database_id, schema_cookie);
+        }
         // Initialize bookkeeping for OUTER JOIN
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {

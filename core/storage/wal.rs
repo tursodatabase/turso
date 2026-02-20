@@ -1267,7 +1267,6 @@ impl Wal for WalFile {
     /// End a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_write_tx(&self) {
-        tracing::debug!("end_write_txn");
         turso_assert!(
             self.write_lock_held
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
