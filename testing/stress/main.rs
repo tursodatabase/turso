@@ -556,7 +556,7 @@ pub fn spawn_log_level_watcher(reload_handle: LogLevelReloadHandle) {
 fn sqlite_integrity_check(
     db_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    assert!(db_path.exists());
+    turso_macros::turso_assert!(db_path.exists(), "database path must exist", { "path": db_path });
     let conn = rusqlite::Connection::open(db_path)?;
     let mut stmt = conn.prepare_cached("SELECT * FROM pragma_integrity_check;")?;
     let mut rows = stmt.query(())?;
@@ -565,7 +565,10 @@ fn sqlite_integrity_check(
     while let Some(row) = rows.next()? {
         result.push(row.get(0)?);
     }
-    assert!(!result.is_empty());
+    turso_macros::turso_assert!(
+        !result.is_empty(),
+        "integrity check result must not be empty"
+    );
     if !result[0].eq_ignore_ascii_case("ok") {
         // Build a list of problems
         result.iter_mut().for_each(|row| *row = format!("- {row}"));
@@ -759,7 +762,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     }
                     Err(e) => {
                         log_sql(&sql_log, thread, stmt, &format!("ERROR(fatal): {e}"));
-                        panic!("Error creating table: {e}");
+                        turso_macros::turso_assert_unreachable!("fatal error creating table", { "thread": thread, "stmt": stmt, "error": e });
                     }
                 }
             }
@@ -840,7 +843,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     Err(e) => match e {
                         turso::Error::Corrupt(e) => {
                             log_sql(&sql_log, thread, &sql, &format!("ERROR(corrupt): {e}"));
-                            panic!("thread#{thread} Error[FATAL] executing query: {e}");
+                            turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
                         }
                         turso::Error::Constraint(e) => {
                             log_sql(&sql_log, thread, &sql, &format!("ERROR(constraint): {e}"));
@@ -876,7 +879,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         }
                         _ => {
                             log_sql(&sql_log, thread, &sql, &format!("ERROR(fatal): {e}"));
-                            panic!("thread#{thread} Error[FATAL] executing query: {e}");
+                            turso_macros::turso_assert_unreachable!("fatal error executing query", { "thread": thread, "error": e, "sql": sql });
                         }
                     },
                 }
@@ -906,13 +909,13 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                                     "PRAGMA integrity_check",
                                     &format!("ERROR: {value:?}"),
                                 );
-                                panic!("thread#{thread} integrity check failed: {value:?}");
+                                turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "value": value });
                             }
                             log_sql(&sql_log, thread, "PRAGMA integrity_check", "OK");
                         }
                         Ok(None) => {
                             log_sql(&sql_log, thread, "PRAGMA integrity_check", "ERROR: no rows");
-                            panic!("thread#{thread} integrity check failed: no rows");
+                            turso_macros::turso_assert_unreachable!("integrity check returned no rows", { "thread": thread });
                         }
                         Err(e) => {
                             log_sql(
@@ -926,7 +929,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     }
                     match res.next().await {
                         Ok(Some(_)) => {
-                            panic!("thread#{thread} integrity check failed: more than 1 row")
+                            turso_macros::turso_assert_unreachable!("integrity check returned more than 1 row", { "thread": thread });
                         }
                         Err(e) => println!("thread#{thread} Error performing integrity check: {e}"),
                         _ => {}

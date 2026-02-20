@@ -6401,12 +6401,14 @@ dependencies = [
  "indicatif",
  "rand 0.9.2",
  "rusqlite",
+ "serde_json",
  "shuttle",
  "tempfile",
  "tokio",
  "tracing-appender",
  "tracing-subscriber",
  "turso",
+ "turso_macros",
 ]
 
 [[package]]
