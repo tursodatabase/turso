@@ -220,6 +220,20 @@ expect {
 # Subqueries with BETWEEN
 # =============================================================================
 
+test subquery-between-lhs-scalar {
+    CREATE TABLE between_lhs_t5 (id INTEGER PRIMARY KEY);
+    INSERT INTO between_lhs_t5 VALUES (1), (2), (3);
+    SELECT id
+    FROM between_lhs_t5
+    WHERE (SELECT max(id) FROM between_lhs_t5) BETWEEN 1 AND 3
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
 test subquery-between-all-subqueries {
     SELECT (SELECT 5) BETWEEN (SELECT 1) AND (SELECT 10);
 }

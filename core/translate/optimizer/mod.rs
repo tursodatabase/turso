@@ -1552,6 +1552,8 @@ fn optimize_table_access(
                     let defer_cross_table_constraints =
                         hash_join_build_only_tables.contains(&table_idx);
                     // BETWEEN contributes two range constraints that map back to one WHERE term.
+                    // Track how many constraints from each term are actually used so we only
+                    // consume the term once (and only when both bounds are used).
                     let mut used_constraints_per_term: HashMap<usize, usize> = HashMap::default();
                     for cref in constraint_refs.iter() {
                         for constraint_vec_pos in
@@ -1591,6 +1593,8 @@ fn optimize_table_access(
                                     .get(&constraint.where_clause_pos.0)
                                     .copied()
                                     .unwrap_or(0);
+                                // Only consume BETWEEN when both bounds are used; otherwise keep the
+                                // predicate so it can be evaluated at runtime.
                                 if used < 2 {
                                     continue;
                                 }

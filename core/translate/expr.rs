@@ -441,22 +441,19 @@ pub fn translate_condition_expr(
             start,
             end,
         } => {
-            // Evaluate LHS once into a register, then reuse it for both comparisons.
-            // We keep the original `lhs` expression reference for affinity/collation
-            // computation, since Expr::Register would lose that information.
-            let lhs_reg = program.alloc_register();
-            translate_expr(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
-            let lhs_collation_ctx = program.curr_collation_ctx();
-            program.reset_collation();
-
-            // Evaluate start into a register.
-            let start_reg = program.alloc_register();
-            translate_expr(program, Some(referenced_tables), start, start_reg, resolver)?;
-            let start_collation_ctx = program.curr_collation_ctx();
-            program.reset_collation();
+            let between_lhs_start = translate_between_lhs_start(
+                program,
+                Some(referenced_tables),
+                lhs,
+                start,
+                resolver,
+            )?;
 
             // Resolve collation for the first comparison (start vs lhs).
-            let lower_collation_ctx = resolve_collation_ctx(start_collation_ctx, lhs_collation_ctx);
+            let lower_collation_ctx = resolve_collation_ctx(
+                between_lhs_start.start_collation_ctx,
+                between_lhs_start.lhs_collation_ctx,
+            );
             program.set_collation(lower_collation_ctx);
 
             if *not {
@@ -466,8 +463,8 @@ pub fn translate_condition_expr(
                 emit_binary_condition_insn(
                     program,
                     &ast::Operator::Greater,
-                    start_reg,
-                    lhs_reg,
+                    between_lhs_start.start_reg,
+                    between_lhs_start.lhs_reg,
                     0, // target_register unused for condition insn
                     start,
                     lhs,
@@ -482,21 +479,18 @@ pub fn translate_condition_expr(
                 program.reset_collation();
                 program.preassign_label_to_next_insn(jump_target_when_false);
 
-                // Evaluate end into a register.
-                let end_reg = program.alloc_register();
-                translate_expr(program, Some(referenced_tables), end, end_reg, resolver)?;
-                let end_collation_ctx = program.curr_collation_ctx();
-                program.reset_collation();
+                let (end_reg, end_collation_ctx) =
+                    translate_between_end(program, Some(referenced_tables), end, resolver)?;
 
                 // Resolve collation for the second comparison (lhs vs end).
                 let upper_collation_ctx =
-                    resolve_collation_ctx(lhs_collation_ctx, end_collation_ctx);
+                    resolve_collation_ctx(between_lhs_start.lhs_collation_ctx, end_collation_ctx);
                 program.set_collation(upper_collation_ctx);
 
                 emit_binary_condition_insn(
                     program,
                     &ast::Operator::Greater,
-                    lhs_reg,
+                    between_lhs_start.lhs_reg,
                     end_reg,
                     0, // target_register unused for condition insn
                     lhs,
@@ -511,8 +505,8 @@ pub fn translate_condition_expr(
                 emit_binary_condition_insn(
                     program,
                     &ast::Operator::LessEquals,
-                    start_reg,
-                    lhs_reg,
+                    between_lhs_start.start_reg,
+                    between_lhs_start.lhs_reg,
                     0, // target_register unused for condition insn
                     start,
                     lhs,
@@ -524,21 +518,18 @@ pub fn translate_condition_expr(
                 )?;
                 program.reset_collation();
 
-                // Evaluate end into a register.
-                let end_reg = program.alloc_register();
-                translate_expr(program, Some(referenced_tables), end, end_reg, resolver)?;
-                let end_collation_ctx = program.curr_collation_ctx();
-                program.reset_collation();
+                let (end_reg, end_collation_ctx) =
+                    translate_between_end(program, Some(referenced_tables), end, resolver)?;
 
                 // Resolve collation for the second comparison (lhs vs end).
                 let upper_collation_ctx =
-                    resolve_collation_ctx(lhs_collation_ctx, end_collation_ctx);
+                    resolve_collation_ctx(between_lhs_start.lhs_collation_ctx, end_collation_ctx);
                 program.set_collation(upper_collation_ctx);
 
                 emit_binary_condition_insn(
                     program,
                     &ast::Operator::LessEquals,
-                    lhs_reg,
+                    between_lhs_start.lhs_reg,
                     end_reg,
                     0, // target_register unused for condition insn
                     lhs,
@@ -1094,22 +1085,14 @@ pub fn translate_expr(
             start,
             end,
         } => {
-            // Evaluate LHS once into a register, then reuse for both comparisons.
-            // We keep the original `lhs` expression reference for affinity/collation
-            // computation, since Expr::Register would lose that information.
-            let lhs_reg = program.alloc_register();
-            translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
-            let lhs_collation_ctx = program.curr_collation_ctx();
-            program.reset_collation();
-
-            // Evaluate start into a register.
-            let start_reg = program.alloc_register();
-            translate_expr(program, referenced_tables, start, start_reg, resolver)?;
-            let start_collation_ctx = program.curr_collation_ctx();
-            program.reset_collation();
+            let between_lhs_start =
+                translate_between_lhs_start(program, referenced_tables, lhs, start, resolver)?;
 
             // Resolve collation for the first comparison (start vs lhs).
-            let lower_collation_ctx = resolve_collation_ctx(start_collation_ctx, lhs_collation_ctx);
+            let lower_collation_ctx = resolve_collation_ctx(
+                between_lhs_start.start_collation_ctx,
+                between_lhs_start.lhs_collation_ctx,
+            );
             program.set_collation(lower_collation_ctx);
 
             // Emit the first comparison into a temp register.
@@ -1119,8 +1102,8 @@ pub fn translate_expr(
                 emit_binary_insn(
                     program,
                     &ast::Operator::Greater,
-                    start_reg,
-                    lhs_reg,
+                    between_lhs_start.start_reg,
+                    between_lhs_start.lhs_reg,
                     lower_reg,
                     start,
                     lhs,
@@ -1132,8 +1115,8 @@ pub fn translate_expr(
                 emit_binary_insn(
                     program,
                     &ast::Operator::LessEquals,
-                    start_reg,
-                    lhs_reg,
+                    between_lhs_start.start_reg,
+                    between_lhs_start.lhs_reg,
                     lower_reg,
                     start,
                     lhs,
@@ -1143,14 +1126,12 @@ pub fn translate_expr(
             }
             program.reset_collation();
 
-            // Evaluate end into a register.
-            let end_reg = program.alloc_register();
-            translate_expr(program, referenced_tables, end, end_reg, resolver)?;
-            let end_collation_ctx = program.curr_collation_ctx();
-            program.reset_collation();
+            let (end_reg, end_collation_ctx) =
+                translate_between_end(program, referenced_tables, end, resolver)?;
 
             // Resolve collation for the second comparison (lhs vs end).
-            let upper_collation_ctx = resolve_collation_ctx(lhs_collation_ctx, end_collation_ctx);
+            let upper_collation_ctx =
+                resolve_collation_ctx(between_lhs_start.lhs_collation_ctx, end_collation_ctx);
             program.set_collation(upper_collation_ctx);
 
             // Emit the second comparison into a temp register.
@@ -1160,7 +1141,7 @@ pub fn translate_expr(
                 emit_binary_insn(
                     program,
                     &ast::Operator::Greater,
-                    lhs_reg,
+                    between_lhs_start.lhs_reg,
                     end_reg,
                     upper_reg,
                     lhs,
@@ -1173,7 +1154,7 @@ pub fn translate_expr(
                 emit_binary_insn(
                     program,
                     &ast::Operator::LessEquals,
-                    lhs_reg,
+                    between_lhs_start.lhs_reg,
                     end_reg,
                     upper_reg,
                     lhs,
@@ -3288,6 +3269,55 @@ fn resolve_collation_ctx(
     }
 }
 
+struct BetweenLhsStart {
+    lhs_reg: usize,
+    start_reg: usize,
+    lhs_collation_ctx: Option<(CollationSeq, bool)>,
+    start_collation_ctx: Option<(CollationSeq, bool)>,
+}
+
+fn translate_between_lhs_start(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    lhs: &ast::Expr,
+    start: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<BetweenLhsStart> {
+    // Evaluate LHS once into a register, then reuse it for both comparisons.
+    // We keep the original `lhs` expression reference for affinity/collation
+    // computation, since Expr::Register would lose that information.
+    let lhs_reg = program.alloc_register();
+    translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+    let lhs_collation_ctx = program.curr_collation_ctx();
+    program.reset_collation();
+
+    // Evaluate start into a register.
+    let start_reg = program.alloc_register();
+    translate_expr(program, referenced_tables, start, start_reg, resolver)?;
+    let start_collation_ctx = program.curr_collation_ctx();
+    program.reset_collation();
+
+    Ok(BetweenLhsStart {
+        lhs_reg,
+        start_reg,
+        lhs_collation_ctx,
+        start_collation_ctx,
+    })
+}
+
+fn translate_between_end(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    end: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<(usize, Option<(CollationSeq, bool)>)> {
+    let end_reg = program.alloc_register();
+    translate_expr(program, referenced_tables, end, end_reg, resolver)?;
+    let end_collation_ctx = program.curr_collation_ctx();
+    program.reset_collation();
+    Ok((end_reg, end_collation_ctx))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn binary_expr_shared(
     program: &mut ProgramBuilder,
@@ -3442,18 +3472,7 @@ fn emit_binary_expr_scalar(
          *
          * 3. Otherwise, the BINARY collating function is used for comparison.
          */
-        let collation_ctx = {
-            match (left_collation_ctx, right_collation_ctx) {
-                (Some((c_left, true)), _) => Some((c_left, true)),
-                (_, Some((c_right, true))) => Some((c_right, true)),
-                (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
-                (None, Some((c_right, from_collate_right))) => Some((c_right, from_collate_right)),
-                (Some((c_left, from_collate_left)), Some((_, false))) => {
-                    Some((c_left, from_collate_left))
-                }
-                _ => None,
-            }
-        };
+        let collation_ctx = resolve_collation_ctx(left_collation_ctx, right_collation_ctx);
         program.set_collation(collation_ctx);
 
         emit_fn(
@@ -4776,9 +4795,6 @@ pub fn bind_and_rewrite_expr<'a>(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
-                // Between is handled natively in translate_expr/translate_condition_expr,
-                // so no AST rewriting is needed here. The walker will still descend
-                // into Between's children for column binding via walk_expr_mut.
                 Expr::Id(id) => {
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
