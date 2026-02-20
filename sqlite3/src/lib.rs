@@ -182,7 +182,7 @@ unsafe fn dispatch_func_bridge(slot_id: usize, argc: i32, argv: *const ExtValue)
     // Build array of *mut c_void each pointing into the argv slice.
     // The C callback reads these via sqlite3_value_* functions.
     let mut arg_ptrs: Vec<*mut ffi::c_void> = (0..argc as usize)
-        .map(|i| argv.add(i) as *const ExtValue as *mut ffi::c_void)
+        .map(|i| argv.add(i) as *mut ffi::c_void)
         .collect();
 
     let mut ctx = SqliteContext {
