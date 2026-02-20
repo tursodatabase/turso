@@ -41,6 +41,11 @@ pub struct Statement {
     busy: bool,
     /// Busy handler state for tracking invocations and timeouts
     busy_handler_state: Option<BusyHandlerState>,
+    /// True once step() has returned Row for a write statement (INSERT/UPDATE/DELETE
+    /// with RETURNING). With ephemeral-buffered RETURNING, the first Row proves all
+    /// DML completed — only the scan-back remains. Used by reset_internal to decide
+    /// commit vs rollback when a statement is abandoned.
+    has_returned_row: bool,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -72,6 +77,7 @@ impl Statement {
             query_mode,
             busy: false,
             busy_handler_state: None,
+            has_returned_row: false,
         }
     }
 
@@ -194,6 +200,16 @@ impl Statement {
                 crate::thread::spin_loop();
             }
             // else: Handler says stop, res stays as Busy
+        }
+
+        // Track when a write statement yields its first Row. With ephemeral-buffered
+        // RETURNING, this proves all DML completed — only the scan-back remains.
+        if matches!(res, Ok(StepResult::Row))
+            && self.query_mode == QueryMode::Normal
+            && self.program.change_cnt_on
+            && !self.program.result_columns.is_empty()
+        {
+            self.has_returned_row = true;
         }
 
         res
@@ -492,41 +508,66 @@ impl Statement {
     }
 
     fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
-        // Run write statements (INSERT/UPDATE/DELETE) to completion if still in progress.
-        // This ensures INSERT...RETURNING and similar statements complete their work
-        // even if not all returned rows were consumed.
-        // Skip for read-only statements (SELECT) as they have no side effects.
-        // Skip if we're already panicking to avoid double-panic in drop handlers.
-        while self.program.change_cnt_on
-            && !std::thread::panicking()
-            && self.state.execution_state.is_running()
-        {
-            match self
-                .program
-                .step(&mut self.state, self.pager.clone(), QueryMode::Normal, None)
+        if !std::thread::panicking() && self.state.execution_state.is_running() {
+            if self.query_mode == QueryMode::Normal
+                && self.program.change_cnt_on
+                && self.has_returned_row
             {
-                Ok(vdbe::StepResult::Done) | Ok(vdbe::StepResult::Row) => continue,
-                Ok(vdbe::StepResult::IO) => {
-                    if let Err(e) = self.pager.io.step() {
-                        tracing::error!("Error running statement to completion: {}", e);
-                        break;
+                // Write statement with RETURNING, user got at least one Row.
+                // With ephemeral-buffered RETURNING, ALL DML completed before any
+                // rows were yielded. The remaining work is just the scan-back
+                // (in-memory) + Halt. Commit the transaction via halt().
+                loop {
+                    match vdbe::execute::halt(&self.program, &mut self.state, &self.pager, 0, "") {
+                        Ok(vdbe::execute::InsnFunctionStepResult::Done) => break,
+                        Ok(vdbe::execute::InsnFunctionStepResult::IO(_)) => {
+                            if let Err(e) = self.pager.io.step() {
+                                tracing::error!("Error committing during statement reset: {}", e);
+                                if let Err(abort_err) =
+                                    self.program.abort(&self.pager, Some(&e), &mut self.state)
+                                {
+                                    tracing::error!(
+                                        "Abort failed during statement reset: {abort_err}"
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Error halting statement during reset: {}", e);
+                            if let Err(abort_err) =
+                                self.program.abort(&self.pager, Some(&e), &mut self.state)
+                            {
+                                tracing::error!("Abort failed during statement reset: {abort_err}");
+                            }
+                            break;
+                        }
+                        _ => break,
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Error running statement to completion: {}", e);
-                    break;
+            } else {
+                // Either a read-only statement, a write statement that never
+                // yielded a Row (DML still in progress or hit Busy/error), or a
+                // write statement without RETURNING. Rollback to avoid committing
+                // partial DML or silently retrying after transient errors (Busy).
+                if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
+                    tracing::error!("Abort failed during statement reset: {abort_err}");
                 }
-                Ok(vdbe::StepResult::Interrupt) | Ok(vdbe::StepResult::Busy) => break,
+            }
+        } else if !std::thread::panicking() {
+            // Statement not running (Done/Failed/Init) — cleanup only.
+            if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
+                tracing::error!("Abort failed during statement reset: {abort_err}");
             }
         }
-        // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
-        if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
-            tracing::error!("Abort failed during statement reset: {abort_err}");
+        if let Some(io) = self.state.io_completions.take() {
+            io.abort();
         }
         self.state.reset(max_registers, max_cursors);
         self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_handler_state = None;
+        self.has_returned_row = false;
     }
 
     pub fn row(&self) -> Option<&Row> {

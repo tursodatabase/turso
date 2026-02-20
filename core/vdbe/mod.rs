@@ -515,6 +515,7 @@ impl ProgramState {
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        self.io_completions = None;
         self.pc = 0;
 
         if let Some(max_cursors) = max_cursors {
