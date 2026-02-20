@@ -1,13 +1,16 @@
 ---
 source: sorting.sqltest
-expression: "SELECT id, name, department\n    FROM employees\n    ORDER BY department DESC;"
+expression: |-
+  SELECT id, name, department
+      FROM employees
+      ORDER BY department DESC;
 info:
   statement_type: SELECT
   tables:
-    - employees
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN employees USING INDEX idx_employees_department

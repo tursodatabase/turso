@@ -86,6 +86,7 @@ use crate::{
 use arc_swap::{ArcSwap, ArcSwapOption};
 use core::str;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+pub use schema::collect_column_refs;
 use schema::Schema;
 use std::{
     fmt::{self},

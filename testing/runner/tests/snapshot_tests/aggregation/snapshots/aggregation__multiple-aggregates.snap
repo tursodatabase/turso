@@ -1,13 +1,26 @@
 ---
 source: aggregation.sqltest
-expression: "SELECT\n        category,\n        COUNT(*) as transaction_count,\n        SUM(amount) as total_amount,\n        AVG(amount) as avg_amount,\n        SUM(quantity) as total_quantity,\n        AVG(quantity) as avg_quantity\n    FROM\n        sales\n    GROUP BY\n        category\n    ORDER BY\n        total_amount DESC;"
+expression: |-
+  SELECT
+          category,
+          COUNT(*) as transaction_count,
+          SUM(amount) as total_amount,
+          AVG(amount) as avg_amount,
+          SUM(quantity) as total_quantity,
+          AVG(quantity) as avg_quantity
+      FROM
+          sales
+      GROUP BY
+          category
+      ORDER BY
+          total_amount DESC;
 info:
   statement_type: SELECT
   tables:
-    - sales
+  - sales
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN sales USING INDEX idx_sales_category

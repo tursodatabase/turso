@@ -518,6 +518,7 @@ pub fn init_window<'a>(
         has_autoincrement: false,
         foreign_keys: vec![],
         check_constraints: vec![],
+        stored_gen_col_order: vec![],
     });
     let cursor_buffer_read = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
     let cursor_buffer_write = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));

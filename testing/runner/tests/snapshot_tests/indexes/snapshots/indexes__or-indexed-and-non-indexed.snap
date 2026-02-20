@@ -1,13 +1,16 @@
 ---
 source: indexes.sqltest
-expression: "SELECT id, event_type, source\n    FROM events\n    WHERE event_type = 'ERROR' OR source = 'auth-service';"
+expression: |-
+  SELECT id, event_type, source
+      FROM events
+      WHERE event_type = 'ERROR' OR source = 'auth-service';
 info:
   statement_type: SELECT
   tables:
-    - events
+  - events
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN events

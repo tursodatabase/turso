@@ -1,13 +1,21 @@
 ---
 source: windows.sqltest
-expression: "SELECT\n        emp_id,\n        name,\n        department,\n        salary,\n        CAST(salary AS REAL) * 100.0 / SUM(salary) OVER () AS pct_of_total,\n        CAST(salary AS REAL) * 100.0 / SUM(salary) OVER (PARTITION BY department) AS pct_of_dept\n    FROM employees;"
+expression: |-
+  SELECT
+          emp_id,
+          name,
+          department,
+          salary,
+          CAST(salary AS REAL) * 100.0 / SUM(salary) OVER () AS pct_of_total,
+          CAST(salary AS REAL) * 100.0 / SUM(salary) OVER (PARTITION BY department) AS pct_of_dept
+      FROM employees;
 info:
   statement_type: SELECT
   tables:
-    - employees
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN window_subquery_0

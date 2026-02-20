@@ -1,13 +1,23 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        e1.name AS employee1,\n        e2.name AS employee2,\n        e1.department\n    FROM\n        employees e1,\n        employees e2\n    WHERE\n        e1.department = e2.department\n        AND e1.employee_id < e2.employee_id;"
+expression: |-
+  SELECT
+          e1.name AS employee1,
+          e2.name AS employee2,
+          e1.department
+      FROM
+          employees e1,
+          employees e2
+      WHERE
+          e1.department = e2.department
+          AND e1.employee_id < e2.employee_id;
 info:
   statement_type: SELECT
   tables:
-    - employees
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN employees AS e1

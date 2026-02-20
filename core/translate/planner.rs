@@ -1006,6 +1006,7 @@ fn parse_table(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            stored_gen_col_order: vec![],
         });
         drop(view_guard);
 

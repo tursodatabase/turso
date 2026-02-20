@@ -1,13 +1,24 @@
 ---
 source: windows.sqltest
-expression: "SELECT\n        sale_id,\n        emp_id,\n        sale_date,\n        amount,\n        SUM(amount) OVER (ORDER BY sale_date) AS running_total,\n        SUM(amount) OVER (\n            PARTITION BY emp_id\n            ORDER BY sale_date\n        ) AS emp_running_total\n    FROM sales;"
+expression: |-
+  SELECT
+          sale_id,
+          emp_id,
+          sale_date,
+          amount,
+          SUM(amount) OVER (ORDER BY sale_date) AS running_total,
+          SUM(amount) OVER (
+              PARTITION BY emp_id
+              ORDER BY sale_date
+          ) AS emp_running_total
+      FROM sales;
 info:
   statement_type: SELECT
   tables:
-    - sales
+  - sales
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN window_subquery_0

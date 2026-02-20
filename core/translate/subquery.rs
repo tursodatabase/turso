@@ -537,6 +537,7 @@ fn get_subquery_parser<'a>(
                         collation: None,
                         default: None,
                         expr: None,
+                        affinity: None,
                     })
                     .collect::<Vec<_>>();
 
@@ -1262,6 +1263,7 @@ fn emit_materialized_cte(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
+        stored_gen_col_order: vec![],
     });
 
     // Allocate cursor for the ephemeral table

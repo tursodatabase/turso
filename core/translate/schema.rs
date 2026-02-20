@@ -138,7 +138,7 @@ fn validate(
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
                     ast::ColumnConstraint::Generated { .. } => {
-                        bail_parse_error!("GENERATED columns are not supported yet");
+                        // Validated in create_table()
                     }
                     ast::ColumnConstraint::NotNull {
                         conflict_clause, ..
@@ -541,7 +541,7 @@ fn collect_autoindexes(
     program: &mut ProgramBuilder,
     tbl_name: &str,
 ) -> Result<Option<Vec<usize>>> {
-    let table = create_table(tbl_name, body, 0)?;
+    let table = create_table(tbl_name, body, 0, None)?;
 
     let mut regs: Vec<usize> = Vec::new();
 
@@ -986,6 +986,7 @@ pub fn translate_drop_table(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            stored_gen_col_order: vec![],
         });
         // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));

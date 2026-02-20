@@ -1,13 +1,13 @@
 ---
 source: indexes.sqltest
-expression: "SELECT id, level, message FROM logs WHERE level = 'ERROR';"
+expression: SELECT id, level, message FROM logs WHERE level = 'ERROR';
 info:
   statement_type: SELECT
   tables:
-    - logs
+  - logs
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN logs

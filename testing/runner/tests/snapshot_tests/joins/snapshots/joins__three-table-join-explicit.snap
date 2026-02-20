@@ -1,19 +1,31 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        c.name AS customer_name,\n        o.order_id,\n        o.order_date,\n        p.name AS product_name,\n        oi.quantity,\n        oi.unit_price\n    FROM\n        customers c\n    INNER JOIN orders o ON c.customer_id = o.customer_id\n    INNER JOIN order_items oi ON o.order_id = oi.order_id\n    INNER JOIN products p ON oi.product_id = p.product_id;"
+expression: |-
+  SELECT
+          c.name AS customer_name,
+          o.order_id,
+          o.order_date,
+          p.name AS product_name,
+          oi.quantity,
+          oi.unit_price
+      FROM
+          customers c
+      INNER JOIN orders o ON c.customer_id = o.customer_id
+      INNER JOIN order_items oi ON o.order_id = oi.order_id
+      INNER JOIN products p ON oi.product_id = p.product_id;
 info:
   statement_type: SELECT
   tables:
-    - c.customer_id
-    - customers
-    - o.order_id
-    - oi.product_id
-    - order_items
-    - orders
-    - products
+  - c.customer_id
+  - customers
+  - o.order_id
+  - oi.product_id
+  - order_items
+  - orders
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)

@@ -1,15 +1,26 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        c.customer_id,\n        c.name,\n        o.order_id,\n        o.total_amount\n    FROM\n        customers c\n    INNER JOIN orders o ON c.customer_id = o.customer_id\n    WHERE\n        o.status = 'completed'\n        AND o.total_amount > 100;"
+expression: |-
+  SELECT
+          c.customer_id,
+          c.name,
+          o.order_id,
+          o.total_amount
+      FROM
+          customers c
+      INNER JOIN orders o ON c.customer_id = o.customer_id
+      WHERE
+          o.status = 'completed'
+          AND o.total_amount > 100;
 info:
   statement_type: SELECT
   tables:
-    - c.customer_id
-    - customers
-    - orders
+  - c.customer_id
+  - customers
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)

@@ -1,15 +1,26 @@
 ---
 source: aggregation.sqltest
-expression: "SELECT\n        p.category,\n        COUNT(DISTINCT o.customer_id) as unique_customers,\n        COUNT(DISTINCT o.order_id) as total_orders\n    FROM\n        products p\n        INNER JOIN orders o ON p.product_id = o.product_id\n    GROUP BY\n        p.category\n    ORDER BY\n        unique_customers DESC;"
+expression: |-
+  SELECT
+          p.category,
+          COUNT(DISTINCT o.customer_id) as unique_customers,
+          COUNT(DISTINCT o.order_id) as total_orders
+      FROM
+          products p
+          INNER JOIN orders o ON p.product_id = o.product_id
+      GROUP BY
+          p.category
+      ORDER BY
+          unique_customers DESC;
 info:
   statement_type: SELECT
   tables:
-    - orders
-    - p.product_id
-    - products
+  - orders
+  - p.product_id
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)

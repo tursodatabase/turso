@@ -1,14 +1,21 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        c.category_id,\n        c.category_name,\n        p.category_name AS parent_category_name\n    FROM\n        categories c\n    LEFT OUTER JOIN categories p ON c.parent_category_id = p.category_id;"
+expression: |-
+  SELECT
+          c.category_id,
+          c.category_name,
+          p.category_name AS parent_category_name
+      FROM
+          categories c
+      LEFT OUTER JOIN categories p ON c.parent_category_id = p.category_id;
 info:
   statement_type: SELECT
   tables:
-    - c.parent_category_id
-    - categories
+  - c.parent_category_id
+  - categories
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN categories AS c

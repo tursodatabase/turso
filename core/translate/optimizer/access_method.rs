@@ -1125,6 +1125,7 @@ fn find_best_access_method_for_subquery(
                 collation: column.collation_opt(),
                 default: column.default.clone(),
                 expr: None,
+                affinity: None,
             });
         }
     }
@@ -1157,6 +1158,7 @@ fn find_best_access_method_for_subquery(
             collation: column.collation_opt(),
             default: column.default.clone(),
             expr: None,
+            affinity: None,
         });
     }
 

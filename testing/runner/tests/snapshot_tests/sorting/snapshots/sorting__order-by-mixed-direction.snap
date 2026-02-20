@@ -1,13 +1,16 @@
 ---
 source: sorting.sqltest
-expression: "SELECT id, name, category, price\n    FROM products\n    ORDER BY category ASC, price DESC;"
+expression: |-
+  SELECT id, name, category, price
+      FROM products
+      ORDER BY category ASC, price DESC;
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN products

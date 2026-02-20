@@ -479,6 +479,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            stored_gen_col_order: vec![],
         }));
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -535,6 +536,7 @@ mod tests {
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
+                stored_gen_col_order: vec![],
             })),
         });
         // Right table t2(id=2)
@@ -569,6 +571,7 @@ mod tests {
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
+                stored_gen_col_order: vec![],
             })),
         });
         table_references
@@ -611,11 +614,13 @@ mod tests {
                         notnull: false,
                         unique: true,
                         hidden: false,
+                        generated_stored: false,
                     },
                 )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
+                stored_gen_col_order: vec![],
             })),
         });
         table_references

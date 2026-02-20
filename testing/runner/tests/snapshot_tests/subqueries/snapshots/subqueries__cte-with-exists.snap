@@ -1,15 +1,26 @@
 ---
 source: subqueries.sqltest
-expression: "WITH recent_orders AS (\n        SELECT id, customer_id\n        FROM orders\n        WHERE order_date >= '2024-01-01'\n    )\n    SELECT c.id, c.name\n    FROM customers c\n    WHERE EXISTS (\n        SELECT 1 FROM recent_orders ro\n        WHERE ro.customer_id = c.id\n    );"
+expression: |-
+  WITH recent_orders AS (
+          SELECT id, customer_id
+          FROM orders
+          WHERE order_date >= '2024-01-01'
+      )
+      SELECT c.id, c.name
+      FROM customers c
+      WHERE EXISTS (
+          SELECT 1 FROM recent_orders ro
+          WHERE ro.customer_id = c.id
+      );
 info:
   statement_type: WITH (CTE)
   tables:
-    - customers
-    - orders
-    - recent_orders
+  - customers
+  - orders
+  - recent_orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN customers AS c

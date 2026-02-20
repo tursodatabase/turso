@@ -1,14 +1,25 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        e1.name AS employee1,\n        e2.name AS employee2,\n        e1.department,\n        e1.salary\n    FROM\n        employees e1\n    INNER JOIN employees e2 ON\n        e1.department = e2.department\n        AND e1.salary = e2.salary\n        AND e1.employee_id < e2.employee_id;"
+expression: |-
+  SELECT
+          e1.name AS employee1,
+          e2.name AS employee2,
+          e1.department,
+          e1.salary
+      FROM
+          employees e1
+      INNER JOIN employees e2 ON
+          e1.department = e2.department
+          AND e1.salary = e2.salary
+          AND e1.employee_id < e2.employee_id;
 info:
   statement_type: SELECT
   tables:
-    - e1.department
-    - employees
+  - e1.department
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN employees AS e1

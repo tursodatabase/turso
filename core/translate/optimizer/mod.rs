@@ -692,6 +692,7 @@ fn add_ephemeral_table_to_update_plan(
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
+        stored_gen_col_order: vec![],
         check_constraints: vec![],
     });
 
@@ -2278,6 +2279,7 @@ fn ephemeral_index_build(
             collation: c.collation_opt(),
             default: c.default.clone(),
             expr: None,
+            affinity: None,
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))

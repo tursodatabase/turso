@@ -1,13 +1,13 @@
 ---
 source: indexes.sqltest
-expression: "SELECT id, sku, name FROM products WHERE category != 'Discontinued';"
+expression: SELECT id, sku, name FROM products WHERE category != 'Discontinued';
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN products

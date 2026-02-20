@@ -1,0 +1,218 @@
+@database :memory:
+
+# ===========================================================================
+# STORED generated columns
+# ===========================================================================
+
+test stored-generated-basic {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED);
+    INSERT INTO t1(a, b) VALUES(1, 2);
+    INSERT INTO t1(a, b) VALUES(10, 20);
+    SELECT a, b, c FROM t1 ORDER BY a;
+}
+expect {
+    1|2|3
+    10|20|30
+}
+
+test stored-generated-shorthand {
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER AS (a * b) STORED);
+    INSERT INTO t2(a, b) VALUES(3, 4);
+    SELECT * FROM t2;
+}
+expect {
+    3|4|12
+}
+
+test stored-generated-string-concat {
+    CREATE TABLE t3(first TEXT, last TEXT, full_name TEXT AS (first || ' ' || last) STORED);
+    INSERT INTO t3(first, last) VALUES('John', 'Doe');
+    INSERT INTO t3(first, last) VALUES('Jane', 'Smith');
+    SELECT full_name FROM t3 ORDER BY first;
+}
+expect {
+    Jane Smith
+    John Doe
+}
+
+test stored-generated-null-propagation {
+    CREATE TABLE t4(a INTEGER, b INTEGER, c INTEGER AS (a + b) STORED);
+    INSERT INTO t4(a, b) VALUES(1, NULL);
+    SELECT a, b, c FROM t4;
+}
+expect {
+    1||
+}
+
+test stored-generated-no-columns-specified {
+    CREATE TABLE t5(a INTEGER, b INTEGER, c INTEGER AS (a + b) STORED);
+    INSERT INTO t5 VALUES(5, 10);
+    SELECT * FROM t5;
+}
+expect {
+    5|10|15
+}
+
+test stored-generated-update {
+    CREATE TABLE t6(a INTEGER, b INTEGER, c INTEGER AS (a + b) STORED);
+    INSERT INTO t6(a, b) VALUES(1, 2);
+    UPDATE t6 SET a = 10;
+    SELECT * FROM t6;
+}
+expect {
+    10|2|12
+}
+
+test stored-generated-update-both {
+    CREATE TABLE t7(a INTEGER, b INTEGER, c INTEGER AS (a + b) STORED);
+    INSERT INTO t7(a, b) VALUES(1, 2);
+    UPDATE t7 SET a = 100, b = 200;
+    SELECT * FROM t7;
+}
+expect {
+    100|200|300
+}
+
+# ===========================================================================
+# VIRTUAL generated columns
+# ===========================================================================
+
+test virtual-generated-basic {
+    CREATE TABLE v1(a INTEGER, b INTEGER, c INTEGER AS (a + b));
+    INSERT INTO v1(a, b) VALUES(1, 2);
+    INSERT INTO v1(a, b) VALUES(10, 20);
+    SELECT a, b, c FROM v1 ORDER BY a;
+}
+expect {
+    1|2|3
+    10|20|30
+}
+
+test virtual-generated-always-keyword {
+    CREATE TABLE v2(a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a * b) VIRTUAL);
+    INSERT INTO v2(a, b) VALUES(5, 6);
+    SELECT * FROM v2;
+}
+expect {
+    5|6|30
+}
+
+test virtual-generated-string-concat {
+    CREATE TABLE v3(first TEXT, last TEXT, full_name TEXT AS (first || ' ' || last));
+    INSERT INTO v3(first, last) VALUES('Alice', 'Wonder');
+    SELECT full_name FROM v3;
+}
+expect {
+    Alice Wonder
+}
+
+test virtual-generated-update {
+    CREATE TABLE v4(a INTEGER, b INTEGER, c INTEGER AS (a + b));
+    INSERT INTO v4(a, b) VALUES(1, 2);
+    UPDATE v4 SET a = 10;
+    SELECT * FROM v4;
+}
+expect {
+    10|2|12
+}
+
+test virtual-generated-no-columns-specified {
+    CREATE TABLE v5(a INTEGER, b INTEGER, c INTEGER AS (a + b));
+    INSERT INTO v5 VALUES(7, 8);
+    SELECT * FROM v5;
+}
+expect {
+    7|8|15
+}
+
+# ===========================================================================
+# Error cases
+# ===========================================================================
+
+test error-insert-into-generated-column {
+    CREATE TABLE e1(a INTEGER, b INTEGER, c INTEGER AS (a + b) STORED);
+    INSERT INTO e1(a, b, c) VALUES(1, 2, 3);
+}
+expect error {
+}
+
+test error-update-generated-column {
+    CREATE TABLE e2(a INTEGER, b INTEGER, c INTEGER AS (a + b) STORED);
+    INSERT INTO e2(a, b) VALUES(1, 2);
+    UPDATE e2 SET c = 99;
+}
+expect error {
+}
+
+# ===========================================================================
+# Multiple generated columns and expressions
+# ===========================================================================
+
+test multiple-generated-columns {
+    CREATE TABLE m1(a INTEGER, b INTEGER, sum INTEGER AS (a + b) STORED, product INTEGER AS (a * b) STORED);
+    INSERT INTO m1(a, b) VALUES(3, 4);
+    SELECT * FROM m1;
+}
+expect {
+    3|4|7|12
+}
+
+test generated-case-expression {
+    CREATE TABLE m2(score INTEGER, grade TEXT AS (CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END) STORED);
+    INSERT INTO m2(score) VALUES(95);
+    INSERT INTO m2(score) VALUES(85);
+    INSERT INTO m2(score) VALUES(70);
+    SELECT * FROM m2 ORDER BY score;
+}
+expect {
+    70|C
+    85|B
+    95|A
+}
+
+test generated-with-where-clause {
+    CREATE TABLE m3(a INTEGER, b INTEGER, c INTEGER AS (a + b) STORED);
+    INSERT INTO m3(a, b) VALUES(1, 2);
+    INSERT INTO m3(a, b) VALUES(3, 4);
+    INSERT INTO m3(a, b) VALUES(5, 6);
+    SELECT * FROM m3 WHERE c > 5 ORDER BY a;
+}
+expect {
+    3|4|7
+    5|6|11
+}
+
+test generated-column-in-order-by {
+    CREATE TABLE m4(a INTEGER, b INTEGER, c INTEGER AS (a + b));
+    INSERT INTO m4(a, b) VALUES(5, 1);
+    INSERT INTO m4(a, b) VALUES(1, 2);
+    INSERT INTO m4(a, b) VALUES(3, 4);
+    SELECT * FROM m4 ORDER BY c;
+}
+expect {
+    1|2|3
+    5|1|6
+    3|4|7
+}
+
+test generated-column-dependent-on-another {
+    CREATE TABLE m5(a INTEGER, b INTEGER AS (a * 2) STORED, c INTEGER AS (b + 1) STORED);
+    INSERT INTO m5(a) VALUES(5);
+    SELECT * FROM m5;
+}
+expect {
+    5|10|11
+}
+
+test virtual-generated-multiple-rows {
+    CREATE TABLE m6(x REAL, doubled REAL AS (x * 2.5), squared REAL AS (x * x));
+    INSERT INTO m6(x) VALUES(1.5);
+    INSERT INTO m6(x) VALUES(2.5);
+    INSERT INTO m6(x) VALUES(3.5);
+    SELECT * FROM m6 ORDER BY x;
+}
+expect {
+    1.5|3.75|2.25
+    2.5|6.25|6.25
+    3.5|8.75|12.25
+}

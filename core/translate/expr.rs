@@ -13,7 +13,7 @@ use crate::function::FtsFunc;
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::schema::{Table, Type};
+use crate::schema::{Column, Table, Type};
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
 };
@@ -38,6 +38,1086 @@ pub struct ConditionMetadata {
     pub jump_target_when_true: BranchOffset,
     pub jump_target_when_false: BranchOffset,
     pub jump_target_when_null: BranchOffset,
+}
+
+// =============================================================================
+// ExprContext: Unified context for expression evaluation across all paths
+// =============================================================================
+
+/// Context for expression evaluation across different code paths.
+pub enum ExprContext<'a> {
+    /// INSERT context - columns resolved from prepared registers via ColMapping.
+    InsertGenerated {
+        col_mappings: &'a [super::insert::ColMapping<'a>],
+        rowid_alias: Option<&'a super::insert::ColMapping<'a>>,
+    },
+
+    /// UPDATE context - columns resolved via HashMap lookup + register offset.
+    UpdateGenerated {
+        registers_start: usize,
+        column_lookup: &'a rustc_hash::FxHashMap<String, usize>,
+        columns: &'a [Column],
+        rowid_reg: Option<usize>,
+    },
+
+    /// Virtual column context in SELECT.
+    VirtualColumn {
+        table: &'a Table,
+        table_ref_id: ast::TableInternalId,
+        referenced_tables: Option<&'a TableReferences>,
+    },
+}
+
+/// RAII guard for virtual column recursion depth.
+const MAX_VIRTUAL_COLUMN_DEPTH: u32 = 100;
+
+thread_local! {
+    static VIRTUAL_COL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct VirtualColumnDepthGuard;
+
+impl VirtualColumnDepthGuard {
+    fn new() -> Result<Self> {
+        VIRTUAL_COL_DEPTH.with(|d| {
+            let cur = d.get();
+            if cur >= MAX_VIRTUAL_COLUMN_DEPTH {
+                crate::bail_parse_error!(
+                    "virtual column evaluation exceeded maximum recursion depth"
+                );
+            }
+            d.set(cur + 1);
+            Ok(VirtualColumnDepthGuard)
+        })
+    }
+}
+
+impl Drop for VirtualColumnDepthGuard {
+    fn drop(&mut self) {
+        VIRTUAL_COL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+impl<'a> ExprContext<'a> {
+    /// Emit code to evaluate a virtual column's expression and apply affinity.
+    pub(crate) fn emit_virtual_column(
+        &self,
+        program: &mut ProgramBuilder,
+        col: &Column,
+        target_reg: usize,
+        resolver: &Resolver,
+    ) -> Result<()> {
+        debug_assert!(col.is_virtual_generated());
+        let _guard = VirtualColumnDepthGuard::new()?;
+        let gen_expr = col
+            .generated
+            .as_ref()
+            .expect("is_virtual_generated() guarantees generated expr exists");
+        translate_expr_with_context(program, self, gen_expr, target_reg, resolver)?;
+        program.emit_insn(Insn::Affinity {
+            start_reg: target_reg,
+            count: std::num::NonZeroUsize::MIN,
+            affinities: col.affinity().aff_mask().to_string(),
+        });
+        Ok(())
+    }
+
+    /// Resolve a column by name and emit code to load its value into target_reg.
+    pub fn resolve_column_by_name(
+        &self,
+        program: &mut ProgramBuilder,
+        name: &str,
+        target_reg: usize,
+        resolver: &Resolver,
+    ) -> Result<()> {
+        let col_name = crate::util::normalize_ident(name);
+
+        match self {
+            ExprContext::InsertGenerated {
+                col_mappings,
+                rowid_alias,
+            } => {
+                let mapping = rowid_alias
+                    .filter(|m| {
+                        m.column
+                            .name
+                            .as_ref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
+                    })
+                    .or_else(|| {
+                        col_mappings.iter().find(|m| {
+                            m.column
+                                .name
+                                .as_ref()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
+                        })
+                    });
+
+                if let Some(mapping) = mapping {
+                    if mapping.column.is_virtual_generated() {
+                        self.emit_virtual_column(program, mapping.column, target_reg, resolver)?;
+                    } else {
+                        program.emit_insn(Insn::Copy {
+                            src_reg: mapping.register,
+                            dst_reg: target_reg,
+                            extra_amount: 0,
+                        });
+                    }
+                    Ok(())
+                } else {
+                    crate::bail_parse_error!("unknown column: {}", name)
+                }
+            }
+
+            ExprContext::UpdateGenerated {
+                registers_start,
+                column_lookup,
+                columns,
+                rowid_reg,
+            } => {
+                if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
+                    if let Some(col) = columns.get(col_idx) {
+                        if col.is_virtual_generated() {
+                            return self.emit_virtual_column(program, col, target_reg, resolver);
+                        }
+                        if let Some(rowid_r) = rowid_reg {
+                            if col.is_rowid_alias() {
+                                program.emit_insn(Insn::Copy {
+                                    src_reg: *rowid_r,
+                                    dst_reg: target_reg,
+                                    extra_amount: 0,
+                                });
+                                return Ok(());
+                            }
+                        }
+                    }
+                    let src_reg = registers_start + col_idx;
+                    program.emit_insn(Insn::Copy {
+                        src_reg,
+                        dst_reg: target_reg,
+                        extra_amount: 0,
+                    });
+                    Ok(())
+                } else {
+                    crate::bail_parse_error!("unknown column: {}", name)
+                }
+            }
+
+            ExprContext::VirtualColumn {
+                table,
+                table_ref_id,
+                referenced_tables,
+            } => {
+                if let Some((col_idx, col)) = table.get_column_by_name(&col_name) {
+                    let col_expr = ast::Expr::Column {
+                        database: None,
+                        table: *table_ref_id,
+                        column: col_idx,
+                        is_rowid_alias: col.is_rowid_alias(),
+                    };
+                    translate_expr(program, *referenced_tables, &col_expr, target_reg, resolver)?;
+                    Ok(())
+                } else {
+                    crate::bail_parse_error!(
+                        "column \"{}\" not found in generated expression",
+                        col_name
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// Translate an expression using the unified context-aware evaluator.
+pub fn translate_expr_with_context(
+    program: &mut ProgramBuilder,
+    context: &ExprContext<'_>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    translate_generated_expr_unified(program, context, expr, target_register, resolver)?;
+    Ok(target_register)
+}
+
+/// Translate expressions for generated column contexts.
+fn translate_generated_expr_unified(
+    program: &mut ProgramBuilder,
+    context: &ExprContext<'_>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    use ast::Expr;
+
+    match expr {
+        Expr::Id(_) | Expr::Qualified(_, _) => {
+            let name = match expr {
+                Expr::Id(n) => n.as_str(),
+                Expr::Qualified(_, n) => n.as_str(),
+                _ => unreachable!(),
+            };
+            context.resolve_column_by_name(program, name, target_register, resolver)
+        }
+
+        Expr::Literal(lit) => translate_literal_unified(program, lit, target_register),
+
+        Expr::Binary(lhs, op, rhs) => {
+            translate_binary_unified(program, context, lhs, op, rhs, target_register, resolver)
+        }
+
+        Expr::Unary(op, operand) => {
+            translate_generated_expr_unified(program, context, operand, target_register, resolver)?;
+            match op {
+                ast::UnaryOperator::Negative => {
+                    let neg_one_reg = program.alloc_register();
+                    program.emit_insn(Insn::Integer {
+                        value: -1,
+                        dest: neg_one_reg,
+                    });
+                    program.emit_insn(Insn::Multiply {
+                        lhs: target_register,
+                        rhs: neg_one_reg,
+                        dest: target_register,
+                    });
+                }
+                ast::UnaryOperator::Positive => {}
+                ast::UnaryOperator::Not => {
+                    program.emit_insn(Insn::Not {
+                        reg: target_register,
+                        dest: target_register,
+                    });
+                }
+                ast::UnaryOperator::BitwiseNot => {
+                    program.emit_insn(Insn::BitNot {
+                        reg: target_register,
+                        dest: target_register,
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        Expr::Parenthesized(inner) => {
+            if inner.len() == 1 {
+                translate_generated_expr_unified(
+                    program,
+                    context,
+                    &inner[0],
+                    target_register,
+                    resolver,
+                )
+            } else {
+                crate::bail_parse_error!(
+                    "multi-value parenthesized expressions not supported in generated columns"
+                )
+            }
+        }
+
+        Expr::FunctionCall { name, args, .. } => translate_function_call_unified(
+            program,
+            context,
+            name.as_str(),
+            args,
+            target_register,
+            resolver,
+        ),
+
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => translate_case_unified(
+            program,
+            context,
+            base.as_deref(),
+            when_then_pairs,
+            else_expr.as_deref(),
+            target_register,
+            resolver,
+        ),
+
+        Expr::Cast { expr, type_name } => {
+            let inner_reg = program.alloc_register();
+            translate_generated_expr_unified(program, context, expr, inner_reg, resolver)?;
+            let affinity = if let Some(type_name) = type_name {
+                Affinity::affinity(&type_name.name)
+            } else {
+                Affinity::Blob
+            };
+            program.emit_insn(Insn::Cast {
+                reg: inner_reg,
+                affinity,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: inner_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+            Ok(())
+        }
+
+        Expr::InList { lhs, rhs, not } => {
+            translate_in_list_unified(program, context, lhs, rhs, *not, target_register, resolver)
+        }
+
+        Expr::Like {
+            lhs,
+            op,
+            rhs,
+            not,
+            escape,
+        } => translate_like_unified(
+            program,
+            context,
+            lhs,
+            op,
+            rhs,
+            *not,
+            escape.as_deref(),
+            target_register,
+            resolver,
+        ),
+
+        Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => translate_between_unified(
+            program,
+            context,
+            lhs,
+            *not,
+            start,
+            end,
+            target_register,
+            resolver,
+        ),
+
+        Expr::Collate(inner, _) => {
+            translate_generated_expr_unified(program, context, inner, target_register, resolver)
+        }
+
+        Expr::IsNull(inner) => {
+            translate_generated_expr_unified(program, context, inner, target_register, resolver)?;
+            let label_true = program.allocate_label();
+            let label_end = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: target_register,
+                target_pc: label_true,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: target_register,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: label_end,
+            });
+            program.preassign_label_to_next_insn(label_true);
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target_register,
+            });
+            program.preassign_label_to_next_insn(label_end);
+            Ok(())
+        }
+
+        Expr::NotNull(inner) => {
+            translate_generated_expr_unified(program, context, inner, target_register, resolver)?;
+            let label_true = program.allocate_label();
+            let label_end = program.allocate_label();
+            program.emit_insn(Insn::NotNull {
+                reg: target_register,
+                target_pc: label_true,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: target_register,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: label_end,
+            });
+            program.preassign_label_to_next_insn(label_true);
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target_register,
+            });
+            program.preassign_label_to_next_insn(label_end);
+            Ok(())
+        }
+
+        _ => {
+            crate::bail_parse_error!("expression type not supported in generated columns")
+        }
+    }
+}
+
+fn translate_literal_unified(
+    program: &mut ProgramBuilder,
+    lit: &ast::Literal,
+    target_register: usize,
+) -> Result<()> {
+    match lit {
+        ast::Literal::Numeric(n) => {
+            if let Ok(i) = n.parse::<i64>() {
+                program.emit_insn(Insn::Integer {
+                    value: i,
+                    dest: target_register,
+                });
+            } else if let Ok(f) = n.parse::<f64>() {
+                program.emit_insn(Insn::Real {
+                    value: f,
+                    dest: target_register,
+                });
+            } else {
+                crate::bail_parse_error!("invalid numeric literal: {}", n);
+            }
+        }
+        ast::Literal::String(s) => {
+            let sanitized = sanitize_string(s);
+            program.emit_insn(Insn::String8 {
+                value: sanitized,
+                dest: target_register,
+            });
+        }
+        ast::Literal::Blob(b) => {
+            let bytes = b
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hex_byte = std::str::from_utf8(pair).unwrap();
+                    u8::from_str_radix(hex_byte, 16).unwrap()
+                })
+                .collect();
+            program.emit_insn(Insn::Blob {
+                value: bytes,
+                dest: target_register,
+            });
+        }
+        ast::Literal::Null => {
+            program.emit_insn(Insn::Null {
+                dest: target_register,
+                dest_end: None,
+            });
+        }
+        ast::Literal::True => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target_register,
+            });
+        }
+        ast::Literal::False => {
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: target_register,
+            });
+        }
+        ast::Literal::CurrentTime | ast::Literal::CurrentDate | ast::Literal::CurrentTimestamp => {
+            crate::bail_parse_error!("time literals in generated expressions not yet supported");
+        }
+        ast::Literal::Keyword(kw) => {
+            crate::bail_parse_error!(
+                "keyword literal '{}' not supported in generated expressions",
+                kw
+            );
+        }
+    }
+    Ok(())
+}
+
+fn translate_binary_unified(
+    program: &mut ProgramBuilder,
+    context: &ExprContext<'_>,
+    lhs: &ast::Expr,
+    op: &ast::Operator,
+    rhs: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let lhs_reg = program.alloc_register();
+    let rhs_reg = program.alloc_register();
+    translate_generated_expr_unified(program, context, lhs, lhs_reg, resolver)?;
+    translate_generated_expr_unified(program, context, rhs, rhs_reg, resolver)?;
+
+    match op {
+        ast::Operator::Add => {
+            program.emit_insn(Insn::Add {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Subtract => {
+            program.emit_insn(Insn::Subtract {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Multiply => {
+            program.emit_insn(Insn::Multiply {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Divide => {
+            program.emit_insn(Insn::Divide {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Modulus => {
+            program.emit_insn(Insn::Remainder {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Concat => {
+            program.emit_insn(Insn::Concat {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::BitwiseAnd => {
+            program.emit_insn(Insn::BitAnd {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::BitwiseOr => {
+            program.emit_insn(Insn::BitOr {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::LeftShift => {
+            program.emit_insn(Insn::ShiftLeft {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::RightShift => {
+            program.emit_insn(Insn::ShiftRight {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::And => {
+            program.emit_insn(Insn::And {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Or => {
+            program.emit_insn(Insn::Or {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                dest: target_register,
+            });
+        }
+        ast::Operator::Equals
+        | ast::Operator::NotEquals
+        | ast::Operator::Less
+        | ast::Operator::LessEquals
+        | ast::Operator::Greater
+        | ast::Operator::GreaterEquals => {
+            let flags = CmpInsFlags::default();
+            let if_true_label = program.allocate_label();
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target_register,
+            });
+            match op {
+                ast::Operator::Equals => program.emit_insn(Insn::Eq {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: if_true_label,
+                    flags,
+                    collation: program.curr_collation(),
+                }),
+                ast::Operator::NotEquals => program.emit_insn(Insn::Ne {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: if_true_label,
+                    flags,
+                    collation: program.curr_collation(),
+                }),
+                ast::Operator::Less => program.emit_insn(Insn::Lt {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: if_true_label,
+                    flags,
+                    collation: program.curr_collation(),
+                }),
+                ast::Operator::LessEquals => program.emit_insn(Insn::Le {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: if_true_label,
+                    flags,
+                    collation: program.curr_collation(),
+                }),
+                ast::Operator::Greater => program.emit_insn(Insn::Gt {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: if_true_label,
+                    flags,
+                    collation: program.curr_collation(),
+                }),
+                ast::Operator::GreaterEquals => program.emit_insn(Insn::Ge {
+                    lhs: lhs_reg,
+                    rhs: rhs_reg,
+                    target_pc: if_true_label,
+                    flags,
+                    collation: program.curr_collation(),
+                }),
+                _ => unreachable!(),
+            }
+            program.emit_insn(Insn::ZeroOrNull {
+                rg1: lhs_reg,
+                rg2: rhs_reg,
+                dest: target_register,
+            });
+            program.preassign_label_to_next_insn(if_true_label);
+        }
+        ast::Operator::Is => {
+            let if_true_label = program.allocate_label();
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target_register,
+            });
+            program.emit_insn(Insn::Eq {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                target_pc: if_true_label,
+                flags: CmpInsFlags::default().null_eq(),
+                collation: program.curr_collation(),
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: target_register,
+            });
+            program.preassign_label_to_next_insn(if_true_label);
+        }
+        ast::Operator::IsNot => {
+            let if_true_label = program.allocate_label();
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target_register,
+            });
+            program.emit_insn(Insn::Ne {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                target_pc: if_true_label,
+                flags: CmpInsFlags::default().null_eq(),
+                collation: program.curr_collation(),
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: target_register,
+            });
+            program.preassign_label_to_next_insn(if_true_label);
+        }
+        _ => {
+            crate::bail_parse_error!("operator {:?} not supported in generated expressions", op);
+        }
+    }
+    Ok(())
+}
+
+fn translate_function_call_unified(
+    program: &mut ProgramBuilder,
+    context: &ExprContext<'_>,
+    name: &str,
+    args: &[Box<ast::Expr>],
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let func_name = normalize_ident(name);
+    let arg_count = args.len();
+
+    // Handle iif specially
+    if func_name == "iif" {
+        if arg_count < 2 {
+            crate::bail_parse_error!("iif requires at least 2 arguments");
+        }
+        let iif_end_label = program.allocate_label();
+        let condition_reg = program.alloc_register();
+        for pair in args.chunks_exact(2) {
+            let next_check_label = program.allocate_label();
+            translate_generated_expr_unified(
+                program,
+                context,
+                pair[0].as_ref(),
+                condition_reg,
+                resolver,
+            )?;
+            program.emit_insn(Insn::IfNot {
+                reg: condition_reg,
+                target_pc: next_check_label,
+                jump_if_null: true,
+            });
+            translate_generated_expr_unified(
+                program,
+                context,
+                pair[1].as_ref(),
+                target_register,
+                resolver,
+            )?;
+            program.emit_insn(Insn::Goto {
+                target_pc: iif_end_label,
+            });
+            program.preassign_label_to_next_insn(next_check_label);
+        }
+        if arg_count % 2 != 0 {
+            translate_generated_expr_unified(
+                program,
+                context,
+                args.last().unwrap().as_ref(),
+                target_register,
+                resolver,
+            )?;
+        } else {
+            program.emit_insn(Insn::Null {
+                dest: target_register,
+                dest_end: None,
+            });
+        }
+        program.preassign_label_to_next_insn(iif_end_label);
+        return Ok(());
+    }
+
+    // Evaluate all arguments
+    let args_start = program.alloc_registers(arg_count.max(1));
+    for (i, arg) in args.iter().enumerate() {
+        translate_generated_expr_unified(program, context, arg.as_ref(), args_start + i, resolver)?;
+    }
+
+    match func_name.as_str() {
+        "coalesce" => {
+            let label_end = program.allocate_label();
+            for i in 0..arg_count {
+                let reg = args_start + i;
+                if i < arg_count - 1 {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                    program.emit_insn(Insn::NotNull {
+                        reg: target_register,
+                        target_pc: label_end,
+                    });
+                } else {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                }
+            }
+            program.preassign_label_to_next_insn(label_end);
+            return Ok(());
+        }
+        "ifnull" => {
+            if arg_count != 2 {
+                crate::bail_parse_error!("ifnull requires exactly 2 arguments");
+            }
+            let label_end = program.allocate_label();
+            program.emit_insn(Insn::Copy {
+                src_reg: args_start,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::NotNull {
+                reg: target_register,
+                target_pc: label_end,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: args_start + 1,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+            program.preassign_label_to_next_insn(label_end);
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let func = Func::resolve_function(&func_name, arg_count)?;
+    let func_ctx = FuncCtx { func, arg_count };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: args_start,
+        dest: target_register,
+        func: func_ctx,
+    });
+    Ok(())
+}
+
+fn translate_case_unified(
+    program: &mut ProgramBuilder,
+    context: &ExprContext<'_>,
+    base: Option<&ast::Expr>,
+    when_then_pairs: &[(Box<ast::Expr>, Box<ast::Expr>)],
+    else_expr: Option<&ast::Expr>,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let label_end = program.allocate_label();
+
+    if let Some(base_expr) = base {
+        let base_reg = program.alloc_register();
+        translate_generated_expr_unified(program, context, base_expr, base_reg, resolver)?;
+        for (when_expr, then_expr) in when_then_pairs {
+            let when_reg = program.alloc_register();
+            translate_generated_expr_unified(
+                program,
+                context,
+                when_expr.as_ref(),
+                when_reg,
+                resolver,
+            )?;
+            let next_when_label = program.allocate_label();
+            program.emit_insn(Insn::Ne {
+                lhs: base_reg,
+                rhs: when_reg,
+                target_pc: next_when_label,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: program.curr_collation(),
+            });
+            translate_generated_expr_unified(
+                program,
+                context,
+                then_expr.as_ref(),
+                target_register,
+                resolver,
+            )?;
+            program.emit_insn(Insn::Goto {
+                target_pc: label_end,
+            });
+            program.preassign_label_to_next_insn(next_when_label);
+        }
+    } else {
+        for (when_expr, then_expr) in when_then_pairs {
+            let when_reg = program.alloc_register();
+            translate_generated_expr_unified(
+                program,
+                context,
+                when_expr.as_ref(),
+                when_reg,
+                resolver,
+            )?;
+            let next_when_label = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: when_reg,
+                target_pc: next_when_label,
+                jump_if_null: true,
+            });
+            translate_generated_expr_unified(
+                program,
+                context,
+                then_expr.as_ref(),
+                target_register,
+                resolver,
+            )?;
+            program.emit_insn(Insn::Goto {
+                target_pc: label_end,
+            });
+            program.preassign_label_to_next_insn(next_when_label);
+        }
+    }
+
+    if let Some(else_e) = else_expr {
+        translate_generated_expr_unified(program, context, else_e, target_register, resolver)?;
+    } else {
+        program.emit_insn(Insn::Null {
+            dest: target_register,
+            dest_end: None,
+        });
+    }
+    program.preassign_label_to_next_insn(label_end);
+    Ok(())
+}
+
+fn translate_in_list_unified(
+    program: &mut ProgramBuilder,
+    context: &ExprContext<'_>,
+    lhs: &ast::Expr,
+    rhs: &[Box<ast::Expr>],
+    not: bool,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let lhs_reg = program.alloc_register();
+    translate_generated_expr_unified(program, context, lhs, lhs_reg, resolver)?;
+    let label_found = program.allocate_label();
+    let label_not_found = program.allocate_label();
+    let label_end = program.allocate_label();
+    for item in rhs {
+        let item_reg = program.alloc_register();
+        translate_generated_expr_unified(program, context, item.as_ref(), item_reg, resolver)?;
+        program.emit_insn(Insn::Eq {
+            lhs: lhs_reg,
+            rhs: item_reg,
+            target_pc: label_found,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+    }
+    program.emit_insn(Insn::Goto {
+        target_pc: label_not_found,
+    });
+    program.preassign_label_to_next_insn(label_found);
+    program.emit_insn(Insn::Integer {
+        value: if not { 0 } else { 1 },
+        dest: target_register,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: label_end,
+    });
+    program.preassign_label_to_next_insn(label_not_found);
+    program.emit_insn(Insn::Integer {
+        value: if not { 1 } else { 0 },
+        dest: target_register,
+    });
+    program.preassign_label_to_next_insn(label_end);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn translate_like_unified(
+    program: &mut ProgramBuilder,
+    context: &ExprContext<'_>,
+    lhs: &ast::Expr,
+    op: &ast::LikeOperator,
+    rhs: &ast::Expr,
+    not: bool,
+    escape: Option<&ast::Expr>,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let func = match op {
+        ast::LikeOperator::Like => ScalarFunc::Like,
+        ast::LikeOperator::Glob => ScalarFunc::Glob,
+        _ => crate::bail_parse_error!("MATCH operator not supported in generated expressions"),
+    };
+    let arg_count = if escape.is_some() { 3 } else { 2 };
+    let args_start = program.alloc_registers(arg_count);
+    translate_generated_expr_unified(program, context, rhs, args_start, resolver)?;
+    translate_generated_expr_unified(program, context, lhs, args_start + 1, resolver)?;
+    if let Some(esc) = escape {
+        translate_generated_expr_unified(program, context, esc, args_start + 2, resolver)?;
+    }
+    let result_reg = if not {
+        program.alloc_register()
+    } else {
+        target_register
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        func: FuncCtx {
+            func: Func::Scalar(func),
+            arg_count,
+        },
+        start_reg: args_start,
+        dest: result_reg,
+    });
+    if not {
+        program.emit_insn(Insn::Not {
+            reg: result_reg,
+            dest: target_register,
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn translate_between_unified(
+    program: &mut ProgramBuilder,
+    context: &ExprContext<'_>,
+    lhs: &ast::Expr,
+    not: bool,
+    start: &ast::Expr,
+    end: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let lhs_reg = program.alloc_register();
+    let start_reg = program.alloc_register();
+    let end_reg = program.alloc_register();
+    translate_generated_expr_unified(program, context, lhs, lhs_reg, resolver)?;
+    translate_generated_expr_unified(program, context, start, start_reg, resolver)?;
+    translate_generated_expr_unified(program, context, end, end_reg, resolver)?;
+    let label_false = program.allocate_label();
+    let label_end = program.allocate_label();
+    if not {
+        let label_true = program.allocate_label();
+        program.emit_insn(Insn::Lt {
+            lhs: lhs_reg,
+            rhs: start_reg,
+            target_pc: label_true,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::Gt {
+            lhs: lhs_reg,
+            rhs: end_reg,
+            target_pc: label_true,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: target_register,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: label_end,
+        });
+        program.preassign_label_to_next_insn(label_true);
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: target_register,
+        });
+    } else {
+        program.emit_insn(Insn::Lt {
+            lhs: lhs_reg,
+            rhs: start_reg,
+            target_pc: label_false,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::Gt {
+            lhs: lhs_reg,
+            rhs: end_reg,
+            target_pc: label_false,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: target_register,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: label_end,
+        });
+        program.preassign_label_to_next_insn(label_false);
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: target_register,
+        });
+    }
+    program.preassign_label_to_next_insn(label_end);
+    Ok(())
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -2648,12 +3728,28 @@ pub fn translate_expr(
                                 *column
                             };
 
-                            program.emit_column_or_rowid(read_cursor, column, target_register);
+                            // Check if this is a virtual generated column that we need to compute
+                            let table_col = table.get_column_at(column);
+                            if !read_from_index
+                                && table_col.is_some_and(|c| c.is_virtual_generated())
+                            {
+                                let ctx = ExprContext::VirtualColumn {
+                                    table,
+                                    table_ref_id: *table_ref_id,
+                                    referenced_tables,
+                                };
+                                let col = table_col.unwrap();
+                                ctx.emit_virtual_column(program, col, target_register, resolver)?;
+                            } else {
+                                program.emit_column_or_rowid(read_cursor, column, target_register);
+                            }
                         }
                         let Some(column) = table.get_column_at(*column) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };
-                        maybe_apply_affinity(column.ty(), target_register, program);
+                        if !column.is_virtual_generated() {
+                            maybe_apply_affinity(column.ty(), target_register, program);
+                        }
                     }
                     Ok(target_register)
                 }

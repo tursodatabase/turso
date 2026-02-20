@@ -2447,6 +2447,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             unique_sets: vec![],
+            stored_gen_col_order: vec![],
         };
         schema
             .add_btree_table(Arc::new(users_table))
@@ -2498,6 +2499,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            stored_gen_col_order: vec![],
         };
         schema
             .add_btree_table(Arc::new(orders_table))
@@ -2545,6 +2547,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            stored_gen_col_order: vec![],
         };
         schema
             .add_btree_table(Arc::new(products_table))

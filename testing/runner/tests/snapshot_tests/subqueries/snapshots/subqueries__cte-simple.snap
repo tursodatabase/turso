@@ -1,14 +1,21 @@
 ---
 source: subqueries.sqltest
-expression: "WITH high_value_products AS (\n        SELECT id, name, price\n        FROM products\n        WHERE price > 100\n    )\n    SELECT * FROM high_value_products\n    ORDER BY price DESC;"
+expression: |-
+  WITH high_value_products AS (
+          SELECT id, name, price
+          FROM products
+          WHERE price > 100
+      )
+      SELECT * FROM high_value_products
+      ORDER BY price DESC;
 info:
   statement_type: WITH (CTE)
   tables:
-    - high_value_products
-    - products
+  - high_value_products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN high_value_products

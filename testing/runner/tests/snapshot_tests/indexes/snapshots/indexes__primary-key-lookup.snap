@@ -1,13 +1,13 @@
 ---
 source: indexes.sqltest
-expression: "SELECT id, sku, name FROM products WHERE id = 42;"
+expression: SELECT id, sku, name FROM products WHERE id = 42;
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SEARCH products USING INTEGER PRIMARY KEY (rowid=?)

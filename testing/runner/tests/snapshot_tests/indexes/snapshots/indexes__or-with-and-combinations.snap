@@ -1,13 +1,17 @@
 ---
 source: indexes.sqltest
-expression: "SELECT id, event_type, severity, source\n    FROM events\n    WHERE (event_type = 'ERROR' AND severity > 5)\n       OR (event_type = 'WARNING' AND severity > 7);"
+expression: |-
+  SELECT id, event_type, severity, source
+      FROM events
+      WHERE (event_type = 'ERROR' AND severity > 5)
+         OR (event_type = 'WARNING' AND severity > 7);
 info:
   statement_type: SELECT
   tables:
-    - events
+  - events
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN events

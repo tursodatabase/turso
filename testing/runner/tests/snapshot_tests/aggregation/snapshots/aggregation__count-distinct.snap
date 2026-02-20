@@ -1,13 +1,23 @@
 ---
 source: aggregation.sqltest
-expression: "SELECT\n        category,\n        COUNT(DISTINCT salesperson_id) as unique_salespeople,\n        COUNT(DISTINCT region) as unique_regions\n    FROM\n        sales\n    GROUP BY\n        category\n    ORDER BY\n        unique_salespeople DESC;"
+expression: |-
+  SELECT
+          category,
+          COUNT(DISTINCT salesperson_id) as unique_salespeople,
+          COUNT(DISTINCT region) as unique_regions
+      FROM
+          sales
+      GROUP BY
+          category
+      ORDER BY
+          unique_salespeople DESC;
 info:
   statement_type: SELECT
   tables:
-    - sales
+  - sales
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN sales USING INDEX idx_sales_category

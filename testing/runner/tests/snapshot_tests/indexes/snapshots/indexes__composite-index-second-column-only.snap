@@ -1,13 +1,16 @@
 ---
 source: indexes.sqltest
-expression: "SELECT id, customer_id, total_amount\n    FROM orders\n    WHERE order_date = '2024-01-15';"
+expression: |-
+  SELECT id, customer_id, total_amount
+      FROM orders
+      WHERE order_date = '2024-01-15';
 info:
   statement_type: SELECT
   tables:
-    - orders
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN orders

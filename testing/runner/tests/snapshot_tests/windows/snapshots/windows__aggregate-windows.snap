@@ -1,13 +1,24 @@
 ---
 source: windows.sqltest
-expression: "SELECT\n        emp_id,\n        name,\n        department,\n        salary,\n        COUNT(*) OVER () AS total_employees,\n        COUNT(*) OVER (PARTITION BY department) AS dept_employees,\n        MIN(salary) OVER (PARTITION BY department) AS dept_min_salary,\n        MAX(salary) OVER (PARTITION BY department) AS dept_max_salary,\n        AVG(salary) OVER (PARTITION BY department) AS dept_avg_salary\n    FROM employees;"
+expression: |-
+  SELECT
+          emp_id,
+          name,
+          department,
+          salary,
+          COUNT(*) OVER () AS total_employees,
+          COUNT(*) OVER (PARTITION BY department) AS dept_employees,
+          MIN(salary) OVER (PARTITION BY department) AS dept_min_salary,
+          MAX(salary) OVER (PARTITION BY department) AS dept_max_salary,
+          AVG(salary) OVER (PARTITION BY department) AS dept_avg_salary
+      FROM employees;
 info:
   statement_type: SELECT
   tables:
-    - employees
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN window_subquery_0

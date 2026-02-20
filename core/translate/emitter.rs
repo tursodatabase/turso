@@ -74,6 +74,56 @@ use crate::{
 };
 use crate::{CaptureDataChangesExt, Connection, QueryMode};
 
+/// Emit a MakeRecord instruction that excludes VIRTUAL generated columns.
+pub(super) fn emit_make_record_without_virtual(
+    program: &mut ProgramBuilder,
+    columns: &[Column],
+    col_start_reg: usize,
+    record_reg: usize,
+    affinity_str: Option<String>,
+) -> usize {
+    let has_virtual = columns.iter().any(|c| c.is_virtual_generated());
+    if !has_virtual {
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(col_start_reg),
+            count: to_u16(columns.len()),
+            dest_reg: to_u16(record_reg),
+            index_name: None,
+            affinity_str,
+        });
+        record_reg
+    } else {
+        let physical_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
+        let phys_start = program.alloc_registers(physical_count);
+        let mut phys_idx = 0;
+        let mut physical_affinities = String::new();
+        for (i, col) in columns.iter().enumerate() {
+            if !col.is_virtual_generated() {
+                program.emit_insn(Insn::Copy {
+                    src_reg: col_start_reg + i,
+                    dst_reg: phys_start + phys_idx,
+                    extra_amount: 0,
+                });
+                physical_affinities.push(col.affinity().aff_mask());
+                phys_idx += 1;
+            }
+        }
+        let aff = if affinity_str.is_some() {
+            Some(physical_affinities)
+        } else {
+            None
+        };
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(phys_start),
+            count: to_u16(physical_count),
+            dest_reg: to_u16(record_reg),
+            index_name: None,
+            affinity_str: aff,
+        });
+        record_reg
+    }
+}
+
 /// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
 /// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).
 /// Non-correlated EXISTS subqueries are evaluated before the loop and their result_reg
@@ -721,6 +771,7 @@ fn emit_materialized_build_inputs(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            stored_gen_col_order: vec![],
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 
@@ -2650,6 +2701,12 @@ fn emit_update_column_values<'a>(
                 if *col_idx == ROWID_SENTINEL {
                     continue;
                 }
+                if table_column.is_generated() {
+                    crate::bail_parse_error!(
+                        "cannot UPDATE generated column \"{}\"",
+                        table_column.name.as_deref().unwrap_or("?")
+                    );
+                }
                 if has_user_provided_rowid
                     && (table_column.primary_key() || table_column.is_rowid_alias())
                     && !is_virtual
@@ -2811,6 +2868,43 @@ fn emit_update_column_values<'a>(
             }
         }
     }
+
+    // Compute STORED generated columns after all regular column values are loaded
+    let stored_gen_col_order = target_table.table.stored_gen_col_order().to_vec();
+    if !stored_gen_col_order.is_empty() {
+        let column_lookup = target_table.table.column_name_to_index_map();
+        let columns = target_table.table.columns();
+        for &gen_idx in &stored_gen_col_order {
+            let col = &columns[gen_idx];
+            if col.is_stored_generated() {
+                let gen_expr = col
+                    .generated
+                    .as_ref()
+                    .expect("stored generated column has expression");
+                let target_reg = start + gen_idx;
+                let context = crate::translate::expr::ExprContext::UpdateGenerated {
+                    registers_start: start,
+                    column_lookup: &column_lookup,
+                    columns,
+                    rowid_reg: None,
+                };
+                crate::translate::expr::translate_expr_with_context(
+                    program,
+                    &context,
+                    gen_expr,
+                    target_reg,
+                    &t_ctx.resolver,
+                )?;
+                // Apply affinity
+                program.emit_insn(Insn::Affinity {
+                    start_reg: target_reg,
+                    count: std::num::NonZeroUsize::MIN,
+                    affinities: col.affinity().aff_mask().to_string(),
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -3930,13 +4024,13 @@ fn emit_update_insns<'a>(
             .map(|col| col.affinity_with_strict(is_strict).aff_mask())
             .collect::<String>();
 
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start),
-            count: to_u16(col_len),
-            dest_reg: to_u16(record_reg),
-            index_name: None,
-            affinity_str: Some(affinity_str),
-        });
+        emit_make_record_without_virtual(
+            program,
+            target_table.table.columns(),
+            start,
+            record_reg,
+            Some(affinity_str),
+        );
 
         if not_exists_check_required {
             program.emit_insn(Insn::NotExists {

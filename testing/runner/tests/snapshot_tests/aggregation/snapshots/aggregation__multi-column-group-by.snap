@@ -1,13 +1,26 @@
 ---
 source: aggregation.sqltest
-expression: "SELECT\n        category,\n        region,\n        SUM(amount) as total_sales,\n        COUNT(*) as num_transactions\n    FROM\n        sales\n    GROUP BY\n        category,\n        region\n    ORDER BY\n        category,\n        region;"
+expression: |-
+  SELECT
+          category,
+          region,
+          SUM(amount) as total_sales,
+          COUNT(*) as num_transactions
+      FROM
+          sales
+      GROUP BY
+          category,
+          region
+      ORDER BY
+          category,
+          region;
 info:
   statement_type: SELECT
   tables:
-    - sales
+  - sales
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN sales USING INDEX idx_sales_category

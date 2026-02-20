@@ -392,6 +392,7 @@ pub fn translate_insert(
         &ctx,
         &values,
         inserting_multiple_rows,
+        &table,
     )?;
 
     // Emit subqueries for RETURNING clause (uncorrelated subqueries are evaluated once)
@@ -636,25 +637,24 @@ pub fn translate_insert(
 
     emit_notnulls(program, &ctx, &insertion, resolver)?;
 
-    // Create and insert the record
-    let affinity_str = insertion
+    // Create and insert the record (excluding VIRTUAL generated columns from disk storage)
+    let columns: Vec<_> = insertion
         .col_mappings
         .iter()
-        .map(|col_mapping| {
-            col_mapping
-                .column
-                .affinity_with_strict(ctx.table.is_strict)
-                .aff_mask()
-        })
+        .map(|cm| cm.column.clone())
+        .collect();
+    let affinity_str = columns
+        .iter()
+        .map(|col| col.affinity_with_strict(ctx.table.is_strict).aff_mask())
         .collect::<String>();
 
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(insertion.first_col_register()),
-        count: to_u16(insertion.col_mappings.len()),
-        dest_reg: to_u16(insertion.record_register()),
-        index_name: None,
-        affinity_str: Some(affinity_str),
-    });
+    super::emitter::emit_make_record_without_virtual(
+        program,
+        &columns,
+        insertion.first_col_register(),
+        insertion.record_register(),
+        Some(affinity_str),
+    );
 
     // Emit deferred index inserts for cases where preflight only checked constraints
     // but didn't insert. This covers UPSERT and non-REPLACE conflict types (ABORT/FAIL/
@@ -1012,6 +1012,7 @@ fn translate_rows_and_open_tables(
     ctx: &InsertEmitCtx,
     values: &[Box<Expr>],
     inserting_multiple_rows: bool,
+    table: &Table,
 ) -> Result<()> {
     if inserting_multiple_rows {
         let select_result_start_reg = program
@@ -1023,6 +1024,7 @@ fn translate_rows_and_open_tables(
             select_result_start_reg,
             resolver,
             &ctx.temp_table_ctx,
+            table,
         )?;
     } else {
         // Single row - populate registers directly
@@ -1032,7 +1034,7 @@ fn translate_rows_and_open_tables(
             db: ctx.database_id,
         });
 
-        translate_rows_single(program, values, insertion, resolver)?;
+        translate_rows_single(program, values, insertion, resolver, table)?;
     }
 
     // Open all the index btrees for writing
@@ -1513,7 +1515,11 @@ fn init_source_emission<'a>(
     database_id: usize,
 ) -> Result<()> {
     let required_column_count = if columns.is_empty() {
-        table.columns().len()
+        table
+            .columns()
+            .iter()
+            .filter(|c| !c.hidden() && !c.is_generated())
+            .count()
     } else {
         columns.len()
     };
@@ -1743,6 +1749,7 @@ pub const ROWID_COLUMN: Column = Column::new(
         notnull: true,
         hidden: false,
         unique: false,
+        generated_stored: false,
     },
 );
 
@@ -1800,6 +1807,14 @@ impl<'a> Insertion<'a> {
                 .as_ref()
                 .is_some_and(|n| n.eq_ignore_ascii_case(name))
         })
+    }
+
+    /// Returns the rowid alias column mapping, if the key is a rowid alias.
+    pub fn rowid_alias_mapping(&self) -> Option<&ColMapping<'a>> {
+        match &self.key {
+            InsertionKey::RowidAlias(mapping) => Some(mapping),
+            _ => None,
+        }
     }
 }
 
@@ -1885,7 +1900,13 @@ fn build_insertion<'a>(
 
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
-        if num_values != table_columns.iter().filter(|c| !c.hidden()).count() {
+        // Hidden and generated columns are excluded from the value count.
+        if num_values
+            != table_columns
+                .iter()
+                .filter(|c| !c.hidden() && !c.is_generated())
+                .count()
+        {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
@@ -1895,8 +1916,8 @@ fn build_insertion<'a>(
         }
         let mut value_idx = 0;
         for (i, col) in table_columns.iter().enumerate() {
-            if col.hidden() {
-                // Hidden columns are not taken into account.
+            if col.hidden() || col.is_generated() {
+                // Hidden and generated columns are not taken into account.
                 continue;
             }
             if col.is_rowid_alias() {
@@ -1916,6 +1937,12 @@ fn build_insertion<'a>(
         for (value_index, column_name) in columns.iter().enumerate() {
             let column_name = normalize_ident(column_name.as_str());
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
+                // Generated columns cannot be explicitly inserted into
+                if col_in_table.is_generated() {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot INSERT into generated column \"{column_name}\""
+                    )));
+                }
                 // Named column
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -1969,6 +1996,7 @@ fn translate_rows_multiple<'short, 'long: 'short>(
     yield_reg: usize,
     resolver: &Resolver,
     temp_table_ctx: &Option<TempTableCtx>,
+    table: &Table,
 ) -> Result<()> {
     if let Some(ref temp_table_ctx) = temp_table_ctx {
         // Rewind loop to read from ephemeral table
@@ -1996,7 +2024,7 @@ fn translate_rows_multiple<'short, 'long: 'short>(
             }
             Ok(())
         };
-    translate_rows_base(program, insertion, translate_value_fn, resolver)
+    translate_rows_base(program, insertion, translate_value_fn, resolver, table)
 }
 /// Populates the column registers with values for a single row
 fn translate_rows_single(
@@ -2004,6 +2032,7 @@ fn translate_rows_single(
     value: &[Box<Expr>],
     insertion: &Insertion,
     resolver: &Resolver,
+    table: &Table,
 ) -> Result<()> {
     let translate_value_fn =
         |prg: &mut ProgramBuilder, value_index: usize, column_register: usize| -> Result<()> {
@@ -2019,7 +2048,7 @@ fn translate_rows_single(
             )?;
             Ok(())
         };
-    translate_rows_base(program, insertion, translate_value_fn, resolver)
+    translate_rows_base(program, insertion, translate_value_fn, resolver, table)
 }
 
 /// Translate the key and the columns of the insertion.
@@ -2032,6 +2061,7 @@ fn translate_rows_base<'short, 'long: 'short>(
     insertion: &'short Insertion<'long>,
     mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
+    table: &Table,
 ) -> Result<()> {
     translate_key(program, insertion, &mut translate_value_fn, resolver)?;
     for col in insertion.col_mappings.iter() {
@@ -2043,6 +2073,29 @@ fn translate_rows_base<'short, 'long: 'short>(
             &mut translate_value_fn,
             resolver,
         )?;
+    }
+
+    // Compute STORED generated column values after all user-provided columns
+    // are loaded into their registers. The order follows the topologically
+    // sorted stored_gen_col_order so that dependencies between generated
+    // columns are satisfied.
+    let columns = table.columns();
+    for &gen_idx in table.stored_gen_col_order() {
+        let col = &columns[gen_idx];
+        if col.is_stored_generated() {
+            let gen_expr = col
+                .generated
+                .as_ref()
+                .expect("stored generated column must have expression");
+            let target_reg = insertion.col_mappings[gen_idx].register;
+            let context = crate::translate::expr::ExprContext::InsertGenerated {
+                col_mappings: &insertion.col_mappings,
+                rowid_alias: insertion.rowid_alias_mapping(),
+            };
+            crate::translate::expr::translate_expr_with_context(
+                program, &context, gen_expr, target_reg, resolver,
+            )?;
+        }
     }
 
     Ok(())
@@ -2095,8 +2148,11 @@ fn translate_column(
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
-    } else if column.hidden() {
+    } else if column.hidden() || column.is_generated() {
         // Emit NULL for not-explicitly-mentioned hidden columns, even ignoring DEFAULT.
+        // Generated columns get a NULL placeholder here; STORED generated columns
+        // will be computed later in translate_rows_base, and VIRTUAL generated
+        // columns are computed on-the-fly during reads.
         program.emit_insn(Insn::Null {
             dest: column_register,
             dest_end: None,
@@ -2492,7 +2548,7 @@ fn translate_virtual_table_insert(
      * */
     let insertion = build_insertion(program, &table, &columns, num_values)?;
 
-    translate_rows_single(program, &value, &insertion, resolver)?;
+    translate_rows_single(program, &value, &insertion, resolver, &table)?;
     let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
 
     program.emit_insn(Insn::VUpdate {

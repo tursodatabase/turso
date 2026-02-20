@@ -1,13 +1,20 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT subq.category_id, subq.avg_price\n    FROM (\n        SELECT category_id, avg(price) AS avg_price\n        FROM products\n        GROUP BY category_id\n    ) AS subq\n    WHERE subq.avg_price > 50;"
+expression: |-
+  SELECT subq.category_id, subq.avg_price
+      FROM (
+          SELECT category_id, avg(price) AS avg_price
+          FROM products
+          GROUP BY category_id
+      ) AS subq
+      WHERE subq.avg_price > 50;
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN subq

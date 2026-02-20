@@ -1,14 +1,25 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        m.name AS manager_name,\n        COUNT(e.employee_id) AS subordinate_count,\n        AVG(e.salary) AS avg_subordinate_salary\n    FROM\n        employees m\n    INNER JOIN employees e ON m.employee_id = e.manager_id\n    GROUP BY\n        m.employee_id, m.name\n    ORDER BY\n        subordinate_count DESC;"
+expression: |-
+  SELECT
+          m.name AS manager_name,
+          COUNT(e.employee_id) AS subordinate_count,
+          AVG(e.salary) AS avg_subordinate_salary
+      FROM
+          employees m
+      INNER JOIN employees e ON m.employee_id = e.manager_id
+      GROUP BY
+          m.employee_id, m.name
+      ORDER BY
+          subordinate_count DESC;
 info:
   statement_type: SELECT
   tables:
-    - employees
-    - m.employee_id
+  - employees
+  - m.employee_id
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SEARCH m USING INTEGER PRIMARY KEY (rowid=?)

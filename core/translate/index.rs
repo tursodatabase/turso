@@ -550,6 +550,7 @@ pub fn resolve_sorted_columns(
                 collation,
                 default: column.default.clone(),
                 expr: None,
+                affinity: None,
             });
             continue;
         }
@@ -563,6 +564,7 @@ pub fn resolve_sorted_columns(
             collation: explicit_collation,
             default: None,
             expr: Some(sc.expr.clone()),
+            affinity: None,
         });
     }
     Ok(resolved)

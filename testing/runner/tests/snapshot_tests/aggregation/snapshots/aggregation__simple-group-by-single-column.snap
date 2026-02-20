@@ -1,13 +1,22 @@
 ---
 source: aggregation.sqltest
-expression: "SELECT\n        category,\n        SUM(amount) as total_sales\n    FROM\n        sales\n    GROUP BY\n        category\n    ORDER BY\n        total_sales DESC;"
+expression: |-
+  SELECT
+          category,
+          SUM(amount) as total_sales
+      FROM
+          sales
+      GROUP BY
+          category
+      ORDER BY
+          total_sales DESC;
 info:
   statement_type: SELECT
   tables:
-    - sales
+  - sales
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN sales USING INDEX idx_sales_category

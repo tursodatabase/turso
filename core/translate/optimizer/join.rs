@@ -1966,6 +1966,7 @@ mod tests {
                 collation: None,
                 default: None,
                 expr: None,
+                affinity: None,
             }],
             unique: true,
             ephemeral: false,
@@ -2054,6 +2055,7 @@ mod tests {
                 collation: None,
                 default: None,
                 expr: None,
+                affinity: None,
             }],
             unique: true,
             ephemeral: false,
@@ -2190,6 +2192,7 @@ mod tests {
                         collation: None,
                         default: None,
                         expr: None,
+                        affinity: None,
                     }],
                     unique: true,
                     ephemeral: false,
@@ -2210,6 +2213,7 @@ mod tests {
                 collation: None,
                 default: None,
                 expr: None,
+                affinity: None,
             }],
             unique: false,
             ephemeral: false,
@@ -2228,6 +2232,7 @@ mod tests {
                 collation: None,
                 default: None,
                 expr: None,
+                affinity: None,
             }],
             unique: false,
             ephemeral: false,
@@ -2713,6 +2718,7 @@ mod tests {
                     collation: None,
                     default: None,
                     expr: None,
+                    affinity: None,
                 },
                 IndexColumn {
                     name: "y".to_string(),
@@ -2721,6 +2727,7 @@ mod tests {
                     collation: None,
                     default: None,
                     expr: None,
+                    affinity: None,
                 },
             ],
             unique: false,
@@ -2822,6 +2829,7 @@ mod tests {
                     collation: None,
                     default: None,
                     expr: None,
+                    affinity: None,
                 },
                 IndexColumn {
                     name: "c2".to_string(),
@@ -2830,6 +2838,7 @@ mod tests {
                     collation: None,
                     default: None,
                     expr: None,
+                    affinity: None,
                 },
                 IndexColumn {
                     name: "c3".to_string(),
@@ -2838,6 +2847,7 @@ mod tests {
                     collation: None,
                     default: None,
                     expr: None,
+                    affinity: None,
                 },
             ],
             unique: false,
@@ -2957,6 +2967,7 @@ mod tests {
                     collation: None,
                     default: None,
                     expr: None,
+                    affinity: None,
                 },
                 IndexColumn {
                     name: "c2".to_string(),
@@ -2965,6 +2976,7 @@ mod tests {
                     collation: None,
                     default: None,
                     expr: None,
+                    affinity: None,
                 },
                 IndexColumn {
                     name: "c3".to_string(),
@@ -2973,6 +2985,7 @@ mod tests {
                     collation: None,
                     default: None,
                     expr: None,
+                    affinity: None,
                 },
             ],
             root_page: 2,
@@ -3139,6 +3152,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            stored_gen_col_order: vec![],
         })
     }
 
@@ -3247,6 +3261,7 @@ mod tests {
                 collation: None,
                 default: None,
                 expr: None,
+                affinity: None,
             }],
             unique: false, // Non-unique index
             ephemeral: false,

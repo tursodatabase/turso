@@ -1,13 +1,20 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT e.id, e.name, e.department, e.salary\n    FROM employees e\n    WHERE e.salary > (\n        SELECT avg(e2.salary)\n        FROM employees e2\n        WHERE e2.department = e.department\n    );"
+expression: |-
+  SELECT e.id, e.name, e.department, e.salary
+      FROM employees e
+      WHERE e.salary > (
+          SELECT avg(e2.salary)
+          FROM employees e2
+          WHERE e2.department = e.department
+      );
 info:
   statement_type: SELECT
   tables:
-    - employees
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN employees AS e
