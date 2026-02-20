@@ -7983,8 +7983,9 @@ pub fn op_open_write(
                 ));
             };
             if !mv_store.is_exclusive_tx(&tx_id) {
-                // Schema changes in MVCC mode require an exclusive transaction
-                return Err(LimboError::TableLocked);
+                return Err(LimboError::TxError(
+                    "DDL statements require an exclusive transaction (use BEGIN instead of BEGIN CONCURRENT)".to_string(),
+                ));
             }
         }
     }
