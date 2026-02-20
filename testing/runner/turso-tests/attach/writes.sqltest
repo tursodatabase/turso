@@ -1,7 +1,5 @@
 @database :memory:
 
-@skip-file-if mvcc "attach not supported in MVCC mode"
-
 # =============================================================================
 # Basic DDL on attached database
 # =============================================================================
@@ -886,6 +884,7 @@ expect {
     5
 }
 
+@skip-if mvcc "non-PK UPDATE on attached DB hangs in MVCC mode"
 test attach-write-index-with-update-and-delete {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, score INTEGER);
@@ -958,6 +957,7 @@ expect {
     2|bob|30
 }
 
+@skip-if mvcc "ALTER TABLE RENAME on attached DB hangs in MVCC mode"
 test attach-write-alter-table-rename {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
@@ -969,6 +969,7 @@ expect {
     1|alice
 }
 
+@skip-if mvcc "ALTER TABLE DROP COLUMN on attached DB hangs in MVCC mode"
 test attach-write-alter-table-drop-column {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, extra TEXT);
@@ -980,6 +981,7 @@ expect {
     1|alice
 }
 
+@skip-if mvcc "ALTER TABLE RENAME COLUMN panics in MVCC mode"
 test attach-write-alter-table-rename-column {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, old_name TEXT);
@@ -995,6 +997,7 @@ expect {
 # CREATE/DROP VIEW on attached database
 # =============================================================================
 
+@skip-if mvcc "views not supported in MVCC mode"
 test attach-write-create-view {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, value INTEGER);
@@ -1007,6 +1010,7 @@ expect {
     bob|20
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
 test attach-write-drop-view {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
@@ -1045,6 +1049,7 @@ expect {
     1000
 }
 
+@skip-if mvcc "PRAGMA user_version on main DB reads back as 0 in MVCC mode"
 test attach-write-pragma-user-version {
     ATTACH ':memory:' AS aux;
     PRAGMA main.user_version = 100;
@@ -1057,6 +1062,7 @@ expect {
     200
 }
 
+@skip-if mvcc "PRAGMA application_id on main DB reads back as 0 in MVCC mode"
 test attach-write-pragma-application-id {
     ATTACH ':memory:' AS aux;
     PRAGMA main.application_id = 111;
@@ -1410,6 +1416,7 @@ test attach-write-cross-db-fk-rejected-reverse {
 expect error {
 }
 
+@skip-if mvcc "full-scan UPDATE on attached DB hangs in MVCC mode"
 test attach-write-update-unique-constraint {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
@@ -1425,6 +1432,7 @@ expect error {
 # CDC (CHANGE DATA CAPTURE) WITH ATTACHED DATABASES
 # =============================================================================
 
+@skip-if mvcc "CDC not supported in MVCC mode"
 test attach-write-cdc-insert {
     CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
     PRAGMA unstable_capture_data_changes_conn('full');
@@ -1437,6 +1445,7 @@ expect {
     t1|1
 }
 
+@skip-if mvcc "CDC not supported in MVCC mode"
 test attach-write-cdc-delete {
     CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
     PRAGMA unstable_capture_data_changes_conn('full');
@@ -1453,6 +1462,7 @@ expect {
     t1|-1
 }
 
+@skip-if mvcc "CDC not supported in MVCC mode"
 test attach-write-cdc-update {
     CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
     PRAGMA unstable_capture_data_changes_conn('full');

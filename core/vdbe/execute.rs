@@ -376,7 +376,12 @@ pub fn op_checkpoint(
     // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
     // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "experimental_mvcc"`).
     let mv_store = program.connection.mv_store();
-    if let Some(mv_store) = mv_store.as_ref() {
+    let mv_store_ref = if *database >= 2 {
+        None
+    } else {
+        mv_store.as_ref()
+    };
+    if let Some(mv_store) = mv_store_ref {
         if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
             return Err(LimboError::InvalidArgument(
                 "Only TRUNCATE checkpoint mode is supported for MVCC".to_string(),
@@ -878,6 +883,8 @@ pub fn op_open_read(
 
     let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
+    // Attached databases (db >= 2) don't use MVCC; skip cursor promotion and root page transforms.
+    let mv_store_ref: Option<&Arc<MvStore>> = if *db >= 2 { None } else { mv_store.as_ref() };
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -899,7 +906,7 @@ pub fn op_open_read(
         .cursor_ref
         .get(*cursor_id)
         .expect("cursor_id should exist in cursor_ref");
-    if program.connection.get_mv_tx_id().is_none() {
+    if mv_store_ref.is_none() {
         assert!(
             *root_page >= 0,
             "root page should be non negative when we are not in a MVCC transaction"
@@ -916,13 +923,9 @@ pub fn op_open_read(
     let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
                                         mv_cursor_type: MvccCursorType|
      -> Result<Box<dyn CursorTrait>> {
-        if let Some(tx_id) = program.connection.get_mv_tx_id() {
-            let mv_store = mv_store
-                .as_ref()
-                .expect("mv_store should be Some when MVCC transaction is active")
-                .clone();
+        if let (Some(tx_id), Some(mv_store)) = (program.connection.get_mv_tx_id(), mv_store_ref) {
             Ok(Box::new(MvCursor::new(
-                mv_store,
+                mv_store.clone(),
                 tx_id,
                 *root_page,
                 mv_cursor_type,
@@ -940,7 +943,7 @@ pub fn op_open_read(
 
             let btree_cursor = Box::new(BTreeCursor::new_table(
                 pager.clone(),
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                maybe_transform_root_page_to_positive(mv_store_ref, *root_page),
                 num_columns,
             ));
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
@@ -969,7 +972,7 @@ pub fn op_open_read(
             // Regular table
             let btree_cursor = Box::new(BTreeCursor::new_table(
                 pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                maybe_transform_root_page_to_positive(mv_store_ref, *root_page),
                 num_columns,
             ));
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
@@ -2193,7 +2196,15 @@ pub fn op_transaction_inner(
         );
     }
     let pager = program.get_pager_from_database_index(db);
-    let mv_store = program.connection.mv_store();
+    // Attached databases (db >= 2) don't participate in MVCC; they use their
+    // own independent pager/WAL, so always take the non-MVCC transaction path.
+    let is_attached = *db >= 2;
+    let mv_store_guard = program.connection.mv_store();
+    let mv_store: Option<&Arc<MvStore>> = if is_attached {
+        None
+    } else {
+        mv_store_guard.as_ref()
+    };
     loop {
         match state.op_transaction_state {
             OpTransactionState::Start => {
@@ -2247,7 +2258,7 @@ pub fn op_transaction_inner(
                 };
 
                 // 2. Start transaction if needed
-                if let Some(mv_store) = mv_store.as_ref() {
+                if let Some(mv_store) = mv_store {
                     let started_read_tx =
                         updated && matches!(current_state, TransactionState::None);
                     if started_read_tx {
@@ -2330,7 +2341,6 @@ pub fn op_transaction_inner(
                     // For attached databases (db >= 2), always start read+write
                     // transactions on the attached pager, since the connection-level
                     // transaction state may already be Write from the main database.
-                    let is_attached = *db >= 2;
                     if is_attached && matches!(tx_mode, TransactionMode::Write) {
                         // If the pager already holds a read lock (e.g., after
                         // SchemaUpdated reprepare), skip to schema cookie check
@@ -2421,7 +2431,7 @@ pub fn op_transaction_inner(
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
             OpTransactionState::CheckSchemaCookie => {
-                let res = get_schema_cookie(&pager, mv_store.as_ref(), program);
+                let res = get_schema_cookie(&pager, mv_store, program);
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {
                         if header_schema_cookie != *schema_cookie {
@@ -7560,14 +7570,9 @@ fn new_rowid_inner(
                             }
                         }
                     } else {
-                        // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
-                        let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
-                            panic!("Expected MvCursor or BTreeCursor in op_new_rowid");
-                        };
-                        turso_assert!(
-                            ephemeral_cursor.pager.wal.is_none(),
-                            "MVCC is enabled but got a non-ephemeral BTreeCursor"
-                        );
+                        // Not an MvCursor - either an ephemeral cursor (no WAL) or
+                        // a cursor on an attached database (which uses its own pager/WAL,
+                        // not MVCC).
                         state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
                             mvcc_already_initialized: false,
                         };
@@ -7944,6 +7949,8 @@ pub fn op_open_write(
     }
     let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
+    // Attached databases (db >= 2) don't use MVCC; skip cursor promotion and root page transforms.
+    let mv_store_ref: Option<&Arc<MvStore>> = if *db >= 2 { None } else { mv_store.as_ref() };
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -7976,7 +7983,7 @@ pub fn op_open_write(
     const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
 
     if root_page == SQLITE_SCHEMA_ROOT_PAGE {
-        if let Some(mv_store) = mv_store.as_ref() {
+        if let Some(mv_store) = mv_store_ref {
             let Some(tx_id) = program.connection.get_mv_tx_id() else {
                 return Err(LimboError::InternalError(
                     "Schema changes in MVCC mode require an exclusive MVCC transaction".to_string(),
@@ -8012,13 +8019,10 @@ pub fn op_open_write(
         let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<Box<dyn CursorTrait>> {
-            if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let mv_store = mv_store
-                    .as_ref()
-                    .expect("mv_store should be Some when MVCC transaction is active")
-                    .clone();
+            if let (Some(tx_id), Some(mv_store)) = (program.connection.get_mv_tx_id(), mv_store_ref)
+            {
                 Ok(Box::new(MvCursor::new(
-                    mv_store,
+                    mv_store.clone(),
                     tx_id,
                     root_page,
                     mv_cursor_type,
@@ -8032,7 +8036,7 @@ pub fn op_open_write(
             let num_columns = index.columns.len();
             let btree_cursor = Box::new(BTreeCursor::new_index(
                 pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                maybe_transform_root_page_to_positive(mv_store_ref, root_page),
                 index.as_ref(),
                 num_columns,
             ));
@@ -8054,7 +8058,7 @@ pub fn op_open_write(
 
             let btree_cursor = Box::new(BTreeCursor::new_table(
                 pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                maybe_transform_root_page_to_positive(mv_store_ref, root_page),
                 num_columns,
             ));
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
@@ -8101,8 +8105,10 @@ pub fn op_create_btree(
         return Err(LimboError::ReadOnly);
     }
     let mv_store = program.connection.mv_store();
+    // Attached databases (db >= 2) don't use MVCC; allocate pages from their own pager.
+    let mv_store_ref: Option<&Arc<MvStore>> = if *db >= 2 { None } else { mv_store.as_ref() };
 
-    if let Some(mv_store) = mv_store.as_ref() {
+    if let Some(mv_store) = mv_store_ref {
         let root_page = mv_store.get_next_table_id();
         state.registers[*root] = Register::Value(Value::from_i64(root_page));
         state.pc += 1;
@@ -8127,7 +8133,9 @@ pub fn op_index_method_create(
         return Err(LimboError::ReadOnly);
     }
     let mv_store = program.connection.mv_store();
-    if let Some(_mv_store) = mv_store.as_ref() {
+    // Attached databases (db >= 2) don't use MVCC.
+    let mv_store_ref: Option<&Arc<MvStore>> = if *db >= 2 { None } else { mv_store.as_ref() };
+    if let Some(_mv_store) = mv_store_ref {
         todo!("MVCC is not supported yet");
     }
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
@@ -8158,7 +8166,9 @@ pub fn op_index_method_destroy(
         return Err(LimboError::ReadOnly);
     }
     let mv_store = program.connection.mv_store();
-    if let Some(_mv_store) = mv_store.as_ref() {
+    // Attached databases (db >= 2) don't use MVCC.
+    let mv_store_ref: Option<&Arc<MvStore>> = if *db >= 2 { None } else { mv_store.as_ref() };
+    if let Some(_mv_store) = mv_store_ref {
         todo!("MVCC is not supported yet");
     }
     if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
@@ -8267,7 +8277,8 @@ pub fn op_destroy(
         todo!("temp databases not implemented yet.");
     }
     let mv_store = program.connection.mv_store();
-    if mv_store.is_some() {
+    let mv_store_ref = if *db >= 2 { None } else { mv_store.as_ref() };
+    if mv_store_ref.is_some() {
         // MVCC only does pager operations in checkpoint
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -8495,7 +8506,9 @@ pub fn op_page_count(
     load_insn!(PageCount { db, dest }, insn);
     let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
-    let count = match with_header(&pager, mv_store.as_ref(), program, |header| {
+    // Attached databases (db >= 2) don't use MVCC; use their own pager header.
+    let mv_store_ref = if *db >= 2 { None } else { mv_store.as_ref() };
+    let count = match with_header(&pager, mv_store_ref, program, |header| {
         header.database_size.get()
     }) {
         Err(_) => 0.into(),
@@ -8798,19 +8811,20 @@ pub fn op_read_cookie(
     load_insn!(ReadCookie { db, dest, cookie }, insn);
     let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
+    // Attached databases (db >= 2) don't use MVCC; use their own pager header.
+    let mv_store_ref = if *db >= 2 { None } else { mv_store.as_ref() };
 
-    let cookie_value =
-        match with_header(&pager, mv_store.as_ref(), program, |header| match cookie {
-            Cookie::ApplicationId => header.application_id.get().into(),
-            Cookie::UserVersion => header.user_version.get().into(),
-            Cookie::SchemaVersion => header.schema_cookie.get().into(),
-            Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
-            cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
-        }) {
-            Err(_) => 0.into(),
-            Ok(IOResult::Done(v)) => v,
-            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-        };
+    let cookie_value = match with_header(&pager, mv_store_ref, program, |header| match cookie {
+        Cookie::ApplicationId => header.application_id.get().into(),
+        Cookie::UserVersion => header.user_version.get().into(),
+        Cookie::SchemaVersion => header.schema_cookie.get().into(),
+        Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
+        cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
+    }) {
+        Err(_) => 0.into(),
+        Ok(IOResult::Done(v)) => v,
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+    };
 
     state.registers[*dest] = Register::Value(Value::from_i64(cookie_value));
     state.pc += 1;
@@ -8834,26 +8848,22 @@ pub fn op_set_cookie(
     );
     let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
+    // Attached databases (db >= 2) don't use MVCC; use their own pager header.
+    let mv_store_ref = if *db >= 2 { None } else { mv_store.as_ref() };
 
-    return_if_io!(with_header_mut(
-        &pager,
-        mv_store.as_ref(),
-        program,
-        |header| {
-            match cookie {
-                Cookie::ApplicationId => header.application_id = (*value).into(),
-                Cookie::UserVersion => header.user_version = (*value).into(),
-                Cookie::LargestRootPageNumber => {
-                    header.vacuum_mode_largest_root_page = (*value as u32).into();
-                }
-                Cookie::IncrementalVacuum => {
-                    header.incremental_vacuum_enabled = (*value as u32).into()
-                }
-                Cookie::SchemaVersion => {
-                    // Only mark schema_did_change on connection for main database (db 0).
-                    // Attached databases track their schema independently.
-                    if *db == 0 {
-                        match program.connection.get_tx_state() {
+    return_if_io!(with_header_mut(&pager, mv_store_ref, program, |header| {
+        match cookie {
+            Cookie::ApplicationId => header.application_id = (*value).into(),
+            Cookie::UserVersion => header.user_version = (*value).into(),
+            Cookie::LargestRootPageNumber => {
+                header.vacuum_mode_largest_root_page = (*value as u32).into();
+            }
+            Cookie::IncrementalVacuum => header.incremental_vacuum_enabled = (*value as u32).into(),
+            Cookie::SchemaVersion => {
+                // Only mark schema_did_change on connection for main database (db 0).
+                // Attached databases track their schema independently.
+                if *db == 0 {
+                    match program.connection.get_tx_state() {
                             TransactionState::Write { .. } => {
                                 program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
                             },
@@ -8861,16 +8871,15 @@ pub fn op_set_cookie(
                             TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
                             TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
                         }
-                    }
-                    program.connection.with_database_schema_mut(*db, |schema| {
-                        schema.schema_version = *value as u32
-                    });
-                    header.schema_cookie = (*value as u32).into();
                 }
-                cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
-            };
-        }
-    ));
+                program
+                    .connection
+                    .with_database_schema_mut(*db, |schema| schema.schema_version = *value as u32);
+                header.schema_cookie = (*value as u32).into();
+            }
+            cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
+        };
+    }));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10962,9 +10971,11 @@ fn op_journal_mode_inner(
             OpJournalModeSubState::Start => {
                 // Read header to get current mode
                 let mv_store = program.connection.mv_store();
-                let header_result = with_header(pager, mv_store.as_ref(), program, |header| {
-                    header.read_version
-                });
+                // Attached databases (db >= 2) don't use MVCC; use their own pager header.
+                let mv_store_ref: Option<&Arc<MvStore>> =
+                    if *db >= 2 { None } else { mv_store.as_ref() };
+                let header_result =
+                    with_header(pager, mv_store_ref, program, |header| header.read_version);
 
                 let prev_mode_raw = return_if_io!(header_result);
 
@@ -11016,7 +11027,10 @@ fn op_journal_mode_inner(
             OpJournalModeSubState::Checkpoint => {
                 // Checkpoint WAL or MVCC before changing mode
                 let mv_store = program.connection.mv_store();
-                if let Some(mv_store) = mv_store.as_ref() {
+                // Attached databases (db >= 2) don't use MVCC.
+                let mv_store_ref: Option<&Arc<MvStore>> =
+                    if *db >= 2 { None } else { mv_store.as_ref() };
+                if let Some(mv_store) = mv_store_ref {
                     // MVCC checkpoint using state machine
                     if state.op_journal_mode_state.checkpoint_sm.is_none() {
                         state.op_journal_mode_state.checkpoint_sm =

@@ -1444,7 +1444,7 @@ impl Program {
         pager: Arc<Pager>,
         program_state: &mut ProgramState,
         mv_store: &Arc<MvStore>,
-        _rollback: bool,
+        rollback: bool,
     ) -> Result<IOResult<()>> {
         let conn = self.connection.clone();
         let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
@@ -1467,6 +1467,9 @@ impl Program {
                     conn.set_mv_tx(None);
                     conn.set_tx_state(TransactionState::None);
                     pager.end_read_tx();
+                    // Also commit/rollback attached database write transactions,
+                    // which use their own pager/WAL independently of MVCC.
+                    self.end_attached_write_txns(&conn, rollback)?;
                     program_state.commit_state = CommitState::Ready;
                     return Ok(IOResult::Done(()));
                 }
