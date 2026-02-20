@@ -475,6 +475,7 @@ pub fn translate_condition_expr(
                         jump_target_when_null: jump_target_when_false,
                         ..condition_metadata
                     }),
+                    Some(resolver),
                 )?;
                 program.reset_collation();
                 program.preassign_label_to_next_insn(jump_target_when_false);
@@ -497,6 +498,7 @@ pub fn translate_condition_expr(
                     end,
                     Some(referenced_tables),
                     Some(condition_metadata),
+                    Some(resolver),
                 )?;
                 program.reset_collation();
             } else {
@@ -515,6 +517,7 @@ pub fn translate_condition_expr(
                         jump_if_condition_is_true: false,
                         ..condition_metadata
                     }),
+                    Some(resolver),
                 )?;
                 program.reset_collation();
 
@@ -536,6 +539,7 @@ pub fn translate_condition_expr(
                     end,
                     Some(referenced_tables),
                     Some(condition_metadata),
+                    Some(resolver),
                 )?;
                 program.reset_collation();
             }
@@ -1109,6 +1113,7 @@ pub fn translate_expr(
                     lhs,
                     referenced_tables,
                     None,
+                    Some(resolver),
                 )?;
             } else {
                 // BETWEEN: start <= lhs
@@ -1122,6 +1127,7 @@ pub fn translate_expr(
                     lhs,
                     referenced_tables,
                     None,
+                    Some(resolver),
                 )?;
             }
             program.reset_collation();
@@ -1148,6 +1154,7 @@ pub fn translate_expr(
                     end,
                     referenced_tables,
                     None,
+                    Some(resolver),
                 )?;
             } else {
                 // BETWEEN: lhs <= end
@@ -1161,6 +1168,7 @@ pub fn translate_expr(
                     end,
                     referenced_tables,
                     None,
+                    Some(resolver),
                 )?;
             }
             program.reset_collation();

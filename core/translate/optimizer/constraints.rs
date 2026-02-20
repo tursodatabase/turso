@@ -200,7 +200,10 @@ fn between_bound_for_constraint(
     operator: ast::Operator,
     side: BinaryExprSide,
 ) -> Option<&ast::Expr> {
-    let ast::Expr::Between { lhs, start, end, .. } = expr else {
+    let ast::Expr::Between {
+        lhs, start, end, ..
+    } = expr
+    else {
         return None;
     };
     if side == BinaryExprSide::Lhs {
@@ -216,11 +219,11 @@ fn between_bound_expr(expr: &ast::Expr, operator: ast::Operator) -> Option<&ast:
     between_bound_expr_inner(operator, start, end)
 }
 
-fn between_bound_expr_inner(
+fn between_bound_expr_inner<'a>(
     operator: ast::Operator,
-    start: &ast::Expr,
-    end: &ast::Expr,
-) -> Option<&ast::Expr> {
+    start: &'a ast::Expr,
+    end: &'a ast::Expr,
+) -> Option<&'a ast::Expr> {
     match operator {
         ast::Operator::Greater | ast::Operator::GreaterEquals => Some(start),
         ast::Operator::Less | ast::Operator::LessEquals => Some(end),
