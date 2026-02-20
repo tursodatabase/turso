@@ -25,7 +25,7 @@ use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::{
     builder::ProgramBuilder,
-    insn::{CmpInsFlags, Insn},
+    insn::{CmpInsFlags, InsertFlags, Insn},
     BranchOffset,
 };
 use crate::{Numeric, Result, Value};
@@ -5423,10 +5423,57 @@ pub fn process_returning_clause(
     Ok(result_columns)
 }
 
+/// Context for buffering RETURNING results into an ephemeral table
+/// instead of yielding them immediately via ResultRow.
+/// When used, the DML loop buffers each result row into the ephemeral table,
+/// and a scan-back loop after the DML loop yields them to the caller.
+pub struct ReturningBufferCtx {
+    /// Cursor ID of the ephemeral table to buffer results into
+    pub cursor_id: usize,
+    /// Number of RETURNING columns (used for scan-back)
+    pub num_columns: usize,
+}
+
+/// Emit the scan-back loop that reads all buffered RETURNING rows from the
+/// ephemeral table and yields them via ResultRow. Called after all DML is complete.
+pub(crate) fn emit_returning_scan_back(program: &mut ProgramBuilder, buf: &ReturningBufferCtx) {
+    let end_label = program.allocate_label();
+    let scan_start = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: buf.cursor_id,
+        pc_if_empty: end_label,
+    });
+    program.preassign_label_to_next_insn(scan_start);
+
+    let result_start_reg = program.alloc_registers(buf.num_columns);
+    for i in 0..buf.num_columns {
+        program.emit_insn(Insn::Column {
+            cursor_id: buf.cursor_id,
+            column: i,
+            dest: result_start_reg + i,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::ResultRow {
+        start_reg: result_start_reg,
+        count: buf.num_columns,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: buf.cursor_id,
+        pc_if_next: scan_start,
+    });
+    program.preassign_label_to_next_insn(end_label);
+}
+
 /// Emit bytecode to evaluate RETURNING expressions and produce result rows.
 /// RETURNING result expressions are otherwise evaluated as normal, but the columns of the target table
 /// are added to [Resolver::expr_to_reg_cache], meaning a reference to e.g tbl.col will effectively
 /// refer to a register where the OLD/NEW value of tbl.col is stored after an INSERT/UPDATE/DELETE.
+///
+/// When `returning_buffer` is `Some`, the results are buffered into an ephemeral table
+/// instead of being yielded immediately. A subsequent call to `emit_returning_scan_back`
+/// will drain the buffer and yield the rows to the caller.
 pub(crate) fn emit_returning_results<'a>(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
@@ -5434,6 +5481,7 @@ pub(crate) fn emit_returning_results<'a>(
     reg_columns_start: usize,
     rowid_reg: usize,
     resolver: &mut Resolver<'a>,
+    returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
     if result_columns.is_empty() {
         return Ok(());
@@ -5492,10 +5540,36 @@ pub(crate) fn emit_returning_results<'a>(
     // must be distinct for each call.
     resolver.expr_to_reg_cache.truncate(cache_len);
 
-    program.emit_insn(Insn::ResultRow {
-        start_reg: result_start_reg,
-        count: result_columns.len(),
-    });
+    if let Some(buf) = returning_buffer {
+        // Buffer into ephemeral table instead of yielding directly.
+        // All DML completes before any RETURNING rows are yielded to the caller.
+        let record_reg = program.alloc_register();
+        let eph_rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: crate::vdbe::insn::to_u16(result_start_reg),
+            count: crate::vdbe::insn::to_u16(result_columns.len()),
+            dest_reg: crate::vdbe::insn::to_u16(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::NewRowid {
+            cursor: buf.cursor_id,
+            rowid_reg: eph_rowid_reg,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: buf.cursor_id,
+            key_reg: eph_rowid_reg,
+            record_reg,
+            flag: InsertFlags::new(),
+            table_name: String::new(),
+        });
+    } else {
+        program.emit_insn(Insn::ResultRow {
+            start_reg: result_start_reg,
+            count: result_columns.len(),
+        });
+    }
 
     Ok(())
 }

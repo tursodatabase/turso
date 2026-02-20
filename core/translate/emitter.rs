@@ -37,9 +37,9 @@ use crate::schema::{
 };
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, rewrite_between_expr,
+    bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back, rewrite_between_expr,
     translate_expr_no_constant_opt, walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason,
-    WalkControl,
+    ReturningBufferCtx, WalkControl,
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters, emit_fk_update_parent_actions,
@@ -1471,6 +1471,27 @@ fn emit_program_for_delete(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
+    // Open an ephemeral table for buffering RETURNING results.
+    // All DML completes before any RETURNING rows are yielded to the caller.
+    let returning_buffer = if !plan.result_columns.is_empty() {
+        let table_ref = plan.table_references.joined_tables().first().unwrap();
+        let btree_table = table_ref
+            .table
+            .btree()
+            .expect("DELETE target must be a BTree table");
+        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: ret_cursor_id,
+            is_table: true,
+        });
+        Some(ReturningBufferCtx {
+            cursor_id: ret_cursor_id,
+            num_columns: plan.result_columns.len(),
+        })
+    } else {
+        None
+    };
+
     init_limit(program, &mut t_ctx, &plan.limit, &None)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
@@ -1611,6 +1632,7 @@ fn emit_program_for_delete(
             rowid_reg,
             table_cursor_id,
             resolver,
+            returning_buffer.as_ref(),
         )?;
 
         // Continue loop
@@ -1642,6 +1664,7 @@ fn emit_program_for_delete(
             &mut plan.table_references,
             &plan.result_columns,
             resolver,
+            returning_buffer.as_ref(),
         )?;
 
         // Clean up and close the main execution loop
@@ -1656,6 +1679,11 @@ fn emit_program_for_delete(
     program.preassign_label_to_next_insn(after_main_loop_label);
     if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
         emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
+    // Emit scan-back loop for buffered RETURNING results.
+    // All DML is complete at this point; now yield the buffered rows to the caller.
+    if let Some(ref buf) = returning_buffer {
+        emit_returning_scan_back(program, buf);
     }
     // Finalize program
     program.result_columns = plan.result_columns;
@@ -1809,6 +1837,7 @@ fn emit_delete_insns<'a>(
     table_references: &mut TableReferences,
     result_columns: &'a [super::plan::ResultSetColumn],
     resolver: &Resolver,
+    returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
     // we can either use this obviously safe raw pointer or we can clone it
     let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
@@ -1927,6 +1956,7 @@ fn emit_delete_insns<'a>(
         iteration_index,
         Some(cursor_id), // Use the cursor_id from the operation for virtual tables
         resolver,
+        returning_buffer,
     )?;
 
     // Delete from the iteration index after deleting from the main table,
@@ -1970,6 +2000,7 @@ fn emit_delete_row_common(
     skip_iteration_index: Option<&Arc<crate::schema::Index>>,
     virtual_table_cursor_id: Option<usize>,
     resolver: &Resolver,
+    returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
     let internal_id = unsafe { (*table_reference).internal_id };
     let table_name = unsafe { &*table_reference }.table.get_name();
@@ -2136,6 +2167,7 @@ fn emit_delete_row_common(
                 columns_start_reg,
                 rowid_reg,
                 &mut t_ctx.resolver,
+                returning_buffer,
             )?;
         }
 
@@ -2161,6 +2193,7 @@ fn emit_delete_insns_when_triggers_present(
     rowid_reg: usize,
     main_table_cursor_id: usize,
     resolver: &Resolver,
+    returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
     // Seek to the rowid and delete it
     let skip_not_found_label = program.allocate_label();
@@ -2271,6 +2304,7 @@ fn emit_delete_insns_when_triggers_present(
         None, // Don't skip any indexes when deleting from RowSet
         None, // Use main_table_cursor_id for virtual tables
         resolver,
+        returning_buffer,
     )?;
 
     // Fire AFTER DELETE triggers
@@ -2345,6 +2379,27 @@ fn emit_program_for_update(
 
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
+
+    // Open an ephemeral table for buffering RETURNING results.
+    // All DML completes before any RETURNING rows are yielded to the caller.
+    let returning_buffer = if plan.returning.as_ref().is_some_and(|r| !r.is_empty()) {
+        let table_ref = plan.table_references.joined_tables().first().unwrap();
+        let btree_table = table_ref
+            .table
+            .btree()
+            .expect("UPDATE target must be a BTree table");
+        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: ret_cursor_id,
+            is_table: true,
+        });
+        Some(ReturningBufferCtx {
+            cursor_id: ret_cursor_id,
+            num_columns: plan.returning.as_ref().unwrap().len(),
+        })
+    } else {
+        None
+    };
 
     init_limit(program, &mut t_ctx, &plan.limit, &plan.offset)?;
 
@@ -2575,6 +2630,7 @@ fn emit_program_for_update(
         target_table_cursor_id,
         target_table,
         resolver,
+        returning_buffer.as_ref(),
     )?;
 
     // Close the main loop
@@ -2589,6 +2645,11 @@ fn emit_program_for_update(
     program.preassign_label_to_next_insn(after_main_loop_label);
     if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
         emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
+    // Emit scan-back loop for buffered RETURNING results.
+    // All DML is complete at this point; now yield the buffered rows to the caller.
+    if let Some(ref buf) = returning_buffer {
+        emit_returning_scan_back(program, buf);
     }
     after(program);
 
@@ -2842,6 +2903,7 @@ fn emit_update_insns<'a>(
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
     resolver: &Resolver,
+    returning_buffer: Option<&ReturningBufferCtx>,
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     let internal_id = target_table.internal_id;
@@ -4098,6 +4160,7 @@ fn emit_update_insns<'a>(
                     start,
                     rowid_set_clause_reg.unwrap_or(beg),
                     &mut t_ctx.resolver,
+                    returning_buffer,
                 )?;
             }
         }

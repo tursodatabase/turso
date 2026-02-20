@@ -1,0 +1,48 @@
+---
+source: returning.sqltest
+expression: DELETE FROM t1 WHERE value > 15.0 RETURNING id, name;
+info:
+  statement_type: DELETE
+  tables:
+  - t1
+  setup_blocks:
+  - schema
+  - data
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode          p1  p2  p3  p4      p5  comment
+   0  Init             0  28   0           0  Start at 28
+   1  OpenEphemeral    0   1   0           0  cursor=0 is_table=true
+   2  OpenWrite        1   2   0           0  root=2; iDb=0
+   3  OpenWrite        2   3   0           0  root=3; iDb=0
+   4  Rewind           1  22   0           0  Rewind table t1
+   5    Column         1   2   2           0  r[2]=t1.value
+   6    RealAffinity   2   0   0           0
+   7    Le             2   3  21  Binary   0  if r[2]<=r[3] goto 21
+   8    RowId          1   4   0           0  r[4]=t1.rowid
+   9    RowId          1   5   0           0  r[5]=t1.rowid
+  10    Column         1   1   6           0  r[6]=t1.name
+  11    Column         1   2   7           0  r[7]=t1.value
+  12    Column         1   1   8           0  r[8]=t1.name
+  13    RowId          1   9   0           0  r[9]=t1.rowid
+  14    IdxDelete      2   8   2           1
+  15    Copy           4  10   0           0  r[10]=r[4]
+  16    Copy           6  11   0           0  r[11]=r[6]
+  17    MakeRecord    10   2  12           0  r[12]=mkrec(r[10..11])
+  18    NewRowid       0  13   0           0  r[13]=rowid
+  19    Insert         0  12  13           0  intkey=r[13] data=r[12]
+  20    Delete         1   0   0  t1       0
+  21  Next             1   5   0           0
+  22  Rewind           0  27   0           0  Rewind  t1
+  23    Column         0   0  14           0  r[14]=t1.id
+  24    Column         0   1  15           0  r[15]=t1.name
+  25    ResultRow     14   2   0           0  output=r[14..15]
+  26  Next             0  23   0           0
+  27  Halt             0   0   0           0
+  28  Transaction      0   2   2           0  iDb=0 tx_mode=Write
+  29  Real             0   3   0  15.0     0  r[3]=15
+  30  Goto             0   1   0           0

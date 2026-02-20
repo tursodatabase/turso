@@ -1,0 +1,69 @@
+---
+source: returning.sqltest
+expression: INSERT INTO t1 VALUES (1, 'alice', 10.0), (2, 'bob', 20.0) RETURNING *;
+info:
+  statement_type: INSERT
+  tables:
+  - t1
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4     p5  comment
+   0  Init              0  51   0          0  Start at 51
+   1  OpenEphemeral     1   1   0          0  cursor=1 is_table=true
+   2  InitCoroutine     2  12   3          0
+   3  Integer           1   3   0          0  r[3]=1
+   4  String8           0   4   0  alice   0  r[4]='alice'
+   5  Real              0   5   0  10.0    0  r[5]=10
+   6  Yield             2   0   0          0
+   7  Integer           2   3   0          0  r[3]=2
+   8  String8           0   4   0  bob     0  r[4]='bob'
+   9  Real              0   5   0  20.0    0  r[5]=20
+  10  Yield             2   0   0          0
+  11  EndCoroutine      2   0   0          0
+  12  OpenWrite         2   2   0          0  root=2; iDb=0
+  13    Yield           2  43   0          0
+  14    Copy            3   6   0          0  r[6]=r[3]
+  15    SoftNull        7   0   0          0
+  16    Copy            4   8   0          0  r[8]=r[4]
+  17    Copy            5   9   0          0  r[9]=r[5]
+  18    OpenWrite       0   3   0          0  root=3; iDb=0
+  19    NotNull         6  21   0          0  r[6]!=NULL -> goto 21
+  20    Goto            0  23   0          0
+  21    MustBeInt       6   0   0          0
+  22    Goto            0  24   0          0
+  23    NewRowid        2   6   0          0  r[6]=rowid
+  24    Affinity        7   3   0          0  r[7..10] = D, B, E
+  25    NotExists       2  27   6          0
+  26    Halt         1555   0   0  t1.id   0
+  27    Copy            8  11   0          0  r[11]=r[8]
+  28    Copy            6  12   0          0  r[12]=r[6]
+  29    MakeRecord      7   3  10          0  r[10]=mkrec(r[7..9])
+  30    Copy            8  13   0          0  r[13]=r[8]
+  31    Copy            6  14   0          0  r[14]=r[6]
+  32    MakeRecord     13   2  15          0  r[15]=mkrec(r[13..14]); for idx_t1_name
+  33    IdxInsert       0  15  13          2  key=r[15]
+  34    Insert          2  10   6  t1      0  intkey=r[6] data=r[10]
+  35    Copy            6  16   0          0  r[16]=r[6]
+  36    Copy            8  17   0          0  r[17]=r[8]
+  37    Copy            9  18   0          0  r[18]=r[9]
+  38    MakeRecord     16   3  19          0  r[19]=mkrec(r[16..18])
+  39    NewRowid        1  20   0          0  r[20]=rowid
+  40    Insert          1  19  20          0  intkey=r[20] data=r[19]
+  41    Goto            0  42   0          0
+  42  Goto              0  13   0          0
+  43  Goto              0  44   0          0
+  44  Rewind            1  50   0          0  Rewind  t1
+  45    Column          1   0  21          0  r[21]=t1.id
+  46    Column          1   1  22          0  r[22]=t1.name
+  47    Column          1   2  23          0  r[23]=t1.value
+  48    ResultRow      21   3   0          0  output=r[21..23]
+  49  Next              1  45   0          0
+  50  Halt              0   0   0          0
+  51  Transaction       0   2   2          0  iDb=0 tx_mode=Write
+  52  Goto              0   1   0          0

@@ -9,9 +9,10 @@ use crate::{
             prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
-            bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
-            rewrite_between_expr, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
-            BindingBehavior, NoConstantOptReason, WalkControl,
+            bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
+            process_returning_clause, rewrite_between_expr, translate_expr,
+            translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior, NoConstantOptReason,
+            ReturningBufferCtx, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
@@ -151,6 +152,10 @@ pub struct InsertEmitCtx<'a> {
     pub autoincrement_meta: Option<AutoincMeta>,
     /// The database index (0 = main, 1 = temp, 2+ = attached)
     pub database_id: usize,
+    /// Ephemeral table for buffering RETURNING results.
+    /// When present, RETURNING rows are buffered into an ephemeral table during the DML loop,
+    /// then scanned back and yielded to the caller after all DML is complete.
+    pub returning_buffer: Option<ReturningBufferCtx>,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -203,6 +208,7 @@ impl<'a> InsertEmitCtx<'a> {
             num_values,
             autoincrement_meta: None,
             database_id,
+            returning_buffer: None,
         })
     }
 }
@@ -364,6 +370,20 @@ pub fn translate_insert(
         database_id,
         connection,
     )?;
+
+    // Open an ephemeral table for buffering RETURNING results.
+    // All DML completes before any RETURNING rows are yielded to the caller.
+    if !result_columns.is_empty() {
+        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone()));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: ret_cursor_id,
+            is_table: true,
+        });
+        ctx.returning_buffer = Some(ReturningBufferCtx {
+            cursor_id: ret_cursor_id,
+            num_columns: result_columns.len(),
+        });
+    }
 
     init_source_emission(
         program,
@@ -829,6 +849,7 @@ pub fn translate_insert(
             insertion.first_col_register(),
             insertion.key_register(),
             resolver,
+            ctx.returning_buffer.as_ref(),
         )?;
     }
     program.emit_insn(Insn::Goto {
@@ -901,6 +922,11 @@ fn emit_epilogue(
     program.preassign_label_to_next_insn(ctx.loop_labels.stmt_epilogue);
     if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
         emit_cdc_autocommit_commit(program, resolver, *cdc_cursor_id)?;
+    }
+    // Emit scan-back loop for buffered RETURNING results.
+    // All DML is complete at this point; now yield the buffered rows to the caller.
+    if let Some(ref buf) = ctx.returning_buffer {
+        emit_returning_scan_back(program, buf);
     }
     program.resolve_label(ctx.halt_label, program.offset());
     Ok(())
