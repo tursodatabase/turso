@@ -1142,6 +1142,7 @@ impl ProgramBuilder {
                     resolve(pc_if_empty, "IndexMethodQuery")?;
                 }
                 Insn::IsNull { reg: _, target_pc } => resolve(target_pc, "IsNull")?,
+                Insn::IsType { target_pc, .. } => resolve(target_pc, "IsType")?,
                 Insn::VNext { pc_if_next, .. } => resolve(pc_if_next, "VNext")?,
                 Insn::VFilter { pc_if_empty, .. } => resolve(pc_if_empty, "VFilter")?,
                 Insn::RowSetRead { pc_if_empty, .. } => resolve(pc_if_empty, "RowSetRead")?,

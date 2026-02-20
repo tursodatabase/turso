@@ -1489,6 +1489,24 @@ pub fn insn_to_row(
                 0,
                 format!("if (r[{}]==NULL) goto {}", reg, target_pc.as_debug_int()),
             ),
+            Insn::IsType {
+                reg,
+                target_pc,
+                type_mask,
+            } => (
+                "IsType",
+                *reg as i64,
+                target_pc.as_debug_int() as i64,
+                *type_mask as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "if type(r[{}])&{:#04x} goto {}",
+                    reg,
+                    type_mask,
+                    target_pc.as_debug_int()
+                ),
+            ),
             Insn::ParseSchema { db, where_clause } => (
                 "ParseSchema",
                 *db as i64,

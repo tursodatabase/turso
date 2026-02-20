@@ -280,7 +280,9 @@ fn translate_integrity_check_impl(
                             if c.expr.is_some() {
                                 Affinity::Blob.aff_mask()
                             } else {
-                                btree_table.columns[c.pos_in_table].affinity().aff_mask()
+                                btree_table.columns[c.pos_in_table]
+                                    .affinity_with_strict(btree_table.is_strict)
+                                    .aff_mask()
                             }
                         })
                         .collect::<String>()
@@ -357,6 +359,49 @@ fn translate_integrity_check_impl(
             );
             emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
             program.preassign_label_to_next_insn(not_null_ok);
+        }
+
+        // STRICT table type checking: verify each column value matches
+        // the declared type. This mirrors SQLite's IsType checks.
+        if btree_table.is_strict {
+            for (col_idx, col) in btree_table.columns.iter().enumerate() {
+                if col.is_rowid_alias() {
+                    continue;
+                }
+                let ty_upper = col.ty_str.to_ascii_uppercase();
+                // Type mask bits: 0x01=INT, 0x02=FLOAT, 0x04=TEXT, 0x08=BLOB, 0x10=NULL
+                let (type_mask, type_label) = match ty_upper.as_str() {
+                    "INTEGER" | "INT" => (0x11, "INTEGER"), // NULL | INTEGER
+                    "TEXT" => (0x14, "TEXT"),               // NULL | TEXT
+                    "REAL" => (0x13, "REAL"),               // NULL | INTEGER | REAL
+                    "BLOB" => (0x18, "BLOB"),               // NULL | BLOB
+                    "ANY" => continue,                      // any type allowed
+                    _ => continue,
+                };
+                let col_value_reg = program.alloc_register();
+                program.emit_column_or_rowid(table_cursor_id, col_idx, col_value_reg);
+                let type_ok = program.allocate_label();
+                program.emit_insn(Insn::IsType {
+                    reg: col_value_reg,
+                    target_pc: type_ok,
+                    type_mask,
+                });
+                let col_name = col
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("column{col_idx}"));
+                program.emit_string8(
+                    format!("non-{type_label} value in {}.{col_name}", btree_table.name),
+                    message_reg,
+                );
+                emit_integrity_result_row(
+                    program,
+                    remaining_errors_reg,
+                    message_reg,
+                    had_error_reg,
+                );
+                program.preassign_label_to_next_insn(type_ok);
+            }
         }
 
         for check_expr in &bound_checks {

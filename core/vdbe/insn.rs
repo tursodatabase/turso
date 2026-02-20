@@ -1097,6 +1097,22 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
+    /// Check if the value in register P1 matches any of the types indicated by
+    /// the bitmask P3. Jump to P2 if the type matches. The type bitmask is:
+    ///   0x01 = INTEGER
+    ///   0x02 = FLOAT
+    ///   0x04 = TEXT
+    ///   0x08 = BLOB
+    ///   0x10 = NULL
+    IsType {
+        /// Source register (P1).
+        reg: usize,
+        /// Jump to this PC if the type matches (P2).
+        target_pc: BranchOffset,
+        /// Bitmask of allowed types (P3).
+        type_mask: u8,
+    },
+
     /// Set the collation sequence for the next function call.
     /// P4 is a pointer to a CollationSeq. If the next call to a user function
     /// or aggregate calls sqlite3GetFuncCollSeq(), this collation sequence will
@@ -1599,6 +1615,7 @@ impl InsnVariants {
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
+            InsnVariants::IsType => execute::op_is_type,
             InsnVariants::CollSeq => execute::op_coll_seq,
             InsnVariants::ParseSchema => execute::op_parse_schema,
             InsnVariants::PopulateMaterializedViews => execute::op_populate_materialized_views,

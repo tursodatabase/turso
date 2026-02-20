@@ -8464,6 +8464,35 @@ pub fn op_is_null(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_is_type(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        IsType {
+            reg,
+            target_pc,
+            type_mask
+        },
+        insn
+    );
+    let type_bit = match state.registers[*reg].get_value() {
+        Value::Null => 0x10,
+        Value::Numeric(Numeric::Integer(_)) => 0x01,
+        Value::Numeric(Numeric::Float(_)) => 0x02,
+        Value::Text(_) => 0x04,
+        Value::Blob(_) => 0x08,
+    };
+    if type_bit & type_mask != 0 {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_coll_seq(
     _program: &Program,
     state: &mut ProgramState,
