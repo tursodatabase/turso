@@ -65,6 +65,12 @@ mod cmath {
     pub fn atan2(x: f64, y: f64) -> f64 {
         x.atan2(y)
     }
+    pub fn degrees(x: f64) -> f64 {
+        x.to_degrees()
+    }
+    pub fn radians(x: f64) -> f64 {
+        x.to_radians()
+    }
 }
 
 // we use exactly same math function as SQLite in tests in order to avoid mismatch in the differential tests due to floating-point precision issues
@@ -92,6 +98,17 @@ mod cmath {
         pub fn atan(x: f64) -> f64;
         pub fn atanh(x: f64) -> f64;
         pub fn atan2(x: f64, y: f64) -> f64;
+    }
+
+    // SQLite's M_PI constant (same value as SQLite's func.c)
+    #[allow(clippy::excessive_precision)]
+    const M_PI: f64 = 3.141592653589793238462643383279502884;
+
+    pub fn degrees(x: f64) -> f64 {
+        x * 180.0 / M_PI
+    }
+    pub fn radians(x: f64) -> f64 {
+        x * M_PI / 180.0
     }
 }
 
@@ -833,13 +850,13 @@ impl Value {
             MathFunc::Ceil | MathFunc::Ceiling => libm::ceil(f),
             MathFunc::Cos => unsafe { cmath::cos(f) },
             MathFunc::Cosh => unsafe { cmath::cosh(f) },
-            MathFunc::Degrees => f.to_degrees(),
+            MathFunc::Degrees => cmath::degrees(f),
             MathFunc::Exp => unsafe { cmath::exp(f) },
             MathFunc::Floor => libm::floor(f),
             MathFunc::Ln => unsafe { cmath::log(f) },
             MathFunc::Log10 => unsafe { cmath::log10(f) },
             MathFunc::Log2 => unsafe { cmath::log2(f) },
-            MathFunc::Radians => f.to_radians(),
+            MathFunc::Radians => cmath::radians(f),
             MathFunc::Sin => unsafe { cmath::sin(f) },
             MathFunc::Sinh => unsafe { cmath::sinh(f) },
             MathFunc::Sqrt => libm::sqrt(f),

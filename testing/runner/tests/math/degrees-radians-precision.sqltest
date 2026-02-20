@@ -1,0 +1,147 @@
+@database :memory:
+
+test degrees-pi {
+    SELECT degrees(pi())
+}
+expect {
+    180.0
+}
+expect @js {
+    180
+}
+
+test degrees-pi-half {
+    SELECT degrees(pi() / 2)
+}
+expect {
+    90.0
+}
+expect @js {
+    90
+}
+
+test degrees-pi-quarter {
+    SELECT degrees(pi() / 4)
+}
+expect {
+    45.0
+}
+expect @js {
+    45
+}
+
+test radians-180 {
+    SELECT radians(180)
+}
+expect {
+    3.14159265358979
+}
+
+test radians-90 {
+    SELECT radians(90)
+}
+expect {
+    1.5707963267949
+}
+
+test radians-45 {
+    SELECT radians(45)
+}
+expect {
+    0.785398163397448
+}
+
+test roundtrip-degrees-radians {
+    SELECT round(degrees(radians(180)), 10)
+}
+expect {
+    180.0
+}
+expect @js {
+    180
+}
+
+test roundtrip-radians-degrees {
+    SELECT round(radians(degrees(pi())), 10)
+}
+expect {
+    3.1415926536
+}
+
+test sin-radians-30 {
+    SELECT sin(radians(30))
+}
+expect {
+    0.5
+}
+
+test cos-radians-60 {
+    SELECT cos(radians(60))
+}
+expect {
+    0.5
+}
+
+test tan-radians-45 {
+    SELECT round(tan(radians(45)), 10)
+}
+expect {
+    1.0
+}
+expect @js {
+    1
+}
+
+test degrees-zero {
+    SELECT degrees(0)
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test radians-zero {
+    SELECT radians(0)
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test degrees-negative-pi {
+    SELECT degrees(-pi())
+}
+expect {
+    -180.0
+}
+expect @js {
+    -180
+}
+
+test radians-negative-180 {
+    SELECT radians(-180)
+}
+expect {
+    -3.14159265358979
+}
+
+test radians-360 {
+    SELECT radians(360)
+}
+expect {
+    6.28318530717959
+}
+
+test degrees-2pi {
+    SELECT degrees(2 * pi())
+}
+expect {
+    360.0
+}
+expect @js {
+    360
+}
