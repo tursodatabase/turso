@@ -1247,3 +1247,103 @@ test cte-alias-scalar-subquery-multiple-ctes {
 expect {
     1|2
 }
+
+# =============================================================================
+# Regression tests for issue #4637 — previously failing CTE cases
+# =============================================================================
+
+# CTE referenced in WHERE IN subquery with real table data
+test cte-where-in-subquery {
+    CREATE TABLE orders(id INT, amount INT);
+    INSERT INTO orders VALUES(1,100),(2,200),(3,150);
+    WITH high_orders AS (SELECT * FROM orders WHERE amount > 100)
+    SELECT * FROM orders WHERE id IN (SELECT id FROM high_orders) ORDER BY id;
+}
+expect {
+    2|200
+    3|150
+}
+
+# Multiple CTEs cross-referenced via scalar subquery
+test cte-cross-ref-scalar-subquery {
+    WITH t1 AS (SELECT 1 as x), t2 AS (SELECT 2 as x)
+    SELECT * FROM t1 WHERE x < (SELECT x FROM t2);
+}
+expect {
+    1
+}
+
+# CTE self-join via explicit JOIN ON
+test cte-self-join {
+    WITH t AS (SELECT 1 as x UNION SELECT 2)
+    SELECT * FROM t JOIN t as t2 ON t.x = t2.x ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+}
+
+# CTE used twice via comma-join with alias
+test cte-comma-join-alias {
+    WITH t AS (SELECT 1 as x) SELECT * FROM t, t as t2;
+}
+expect {
+    1|1
+}
+
+# CTE in scalar subquery alongside FROM reference
+test cte-scalar-and-from-ref {
+    WITH t AS (SELECT 1 as x) SELECT t.x, (SELECT MAX(x) FROM t) as mx FROM t;
+}
+expect {
+    1|1
+}
+
+# CTE in WHERE with DISTINCT and IN subquery
+test cte-where-distinct-in {
+    CREATE TABLE items(id INT, cat TEXT);
+    INSERT INTO items VALUES(1,'a'),(2,'b'),(3,'a');
+    WITH cats AS (SELECT DISTINCT cat FROM items WHERE cat = 'a')
+    SELECT * FROM items WHERE cat IN (SELECT cat FROM cats) ORDER BY id;
+}
+expect {
+    1|a
+    3|a
+}
+
+# CTE referenced three times in cross-join
+test cte-triple-ref {
+    WITH t AS (SELECT 1 as x UNION SELECT 2 UNION SELECT 3)
+    SELECT a.x, b.x, c.x FROM t a, t b, t c WHERE a.x = 1 AND b.x = 2 AND c.x = 3;
+}
+expect {
+    1|2|3
+}
+
+# CTE with LEFT JOIN on self
+test cte-left-join-self {
+    WITH t AS (SELECT 1 as id, 'root' as name UNION SELECT 2, 'child')
+    SELECT a.name, b.name FROM t a LEFT JOIN t b ON a.id <> b.id ORDER BY 1, 2;
+}
+expect {
+    child|root
+    root|child
+}
+
+# CTE in EXISTS subquery
+test cte-exists-self-ref {
+    WITH t AS (SELECT 1 as x) SELECT * FROM t WHERE EXISTS (SELECT 1 FROM t WHERE x = 1);
+}
+expect {
+    1
+}
+
+# CTE in NOT EXISTS subquery
+test cte-not-exists-self-ref {
+    WITH t AS (SELECT 1 as x UNION SELECT 2)
+    SELECT * FROM t WHERE NOT EXISTS (SELECT 1 FROM t WHERE x = 3) ORDER BY 1;
+}
+expect {
+    1
+    2
+}
