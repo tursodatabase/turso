@@ -1074,3 +1074,117 @@ expect {
     2
 }
 
+# https://github.com/tursodatabase/turso/issues/3985
+# NEW.rowid_alias in BEFORE INSERT trigger should be -1 when auto-generated
+test trigger-before-insert-rowid-alias-auto-neg1 {
+    CREATE TABLE t_bi1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log_bi1(new_id INTEGER);
+    CREATE TRIGGER tr_bi1 BEFORE INSERT ON t_bi1
+    BEGIN
+      INSERT INTO log_bi1 VALUES(NEW.id);
+    END;
+    INSERT INTO t_bi1(val) VALUES('hello');
+    SELECT * FROM log_bi1;
+    SELECT * FROM t_bi1;
+}
+expect {
+    -1
+    1|hello
+}
+
+# NEW.rowid_alias is -1 for auto but real value for explicit in BEFORE INSERT
+test trigger-before-insert-rowid-alias-explicit-vs-auto {
+    CREATE TABLE t_bi2(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log_bi2(new_id INTEGER);
+    CREATE TRIGGER tr_bi2 BEFORE INSERT ON t_bi2
+    BEGIN
+      INSERT INTO log_bi2 VALUES(NEW.id);
+    END;
+    INSERT INTO t_bi2(id, val) VALUES(42, 'explicit');
+    INSERT INTO t_bi2(val) VALUES('auto');
+    INSERT INTO t_bi2(id, val) VALUES(100, 'explicit2');
+    SELECT * FROM log_bi2;
+}
+expect {
+    42
+    -1
+    100
+}
+
+# NEW.rowid_alias in BEFORE INSERT used in expression
+test trigger-before-insert-rowid-alias-in-expr {
+    CREATE TABLE t_bi3(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log_bi3(msg TEXT);
+    CREATE TRIGGER tr_bi3 BEFORE INSERT ON t_bi3
+    BEGIN
+      INSERT INTO log_bi3 VALUES('id=' || CAST(NEW.id AS TEXT));
+    END;
+    INSERT INTO t_bi3(val) VALUES('hello');
+    SELECT * FROM log_bi3;
+}
+expect {
+    id=-1
+}
+
+# Multiple auto-generated inserts all get -1 in BEFORE INSERT trigger
+test trigger-before-insert-rowid-alias-multiple {
+    CREATE TABLE t_bi4(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log_bi4(new_id INTEGER);
+    CREATE TRIGGER tr_bi4 BEFORE INSERT ON t_bi4
+    BEGIN
+      INSERT INTO log_bi4 VALUES(NEW.id);
+    END;
+    INSERT INTO t_bi4(val) VALUES('a');
+    INSERT INTO t_bi4(val) VALUES('b');
+    INSERT INTO t_bi4(val) VALUES('c');
+    SELECT * FROM log_bi4;
+    SELECT * FROM t_bi4;
+}
+expect {
+    -1
+    -1
+    -1
+    1|a
+    2|b
+    3|c
+}
+
+# BEFORE INSERT WHEN clause can match on NEW.rowid_alias = -1
+test trigger-before-insert-rowid-alias-when-neg1 {
+    CREATE TABLE t_bi5(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log_bi5(msg TEXT);
+    CREATE TRIGGER tr_bi5 BEFORE INSERT ON t_bi5 WHEN NEW.id = -1
+    BEGIN
+      INSERT INTO log_bi5 VALUES('auto-generated rowid');
+    END;
+    INSERT INTO t_bi5(val) VALUES('auto');
+    INSERT INTO t_bi5(id, val) VALUES(5, 'explicit');
+    SELECT * FROM log_bi5;
+}
+expect {
+    auto-generated rowid
+}
+
+# Explicit NULL for rowid alias in BEFORE INSERT trigger should also get -1
+test trigger-before-insert-rowid-alias-explicit-null {
+    CREATE TABLE t_bi6(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log_bi6(new_id INTEGER);
+    CREATE TRIGGER tr_bi6 BEFORE INSERT ON t_bi6
+    BEGIN
+      INSERT INTO log_bi6 VALUES(NEW.id);
+    END;
+    INSERT INTO t_bi6(id, val) VALUES(NULL, 'null_explicit');
+    INSERT INTO t_bi6(id, val) VALUES(10, 'ten');
+    INSERT INTO t_bi6 VALUES(NULL, 'null_implicit');
+    SELECT * FROM log_bi6;
+    SELECT * FROM t_bi6 ORDER BY id;
+}
+expect {
+    -1
+    10
+    -1
+    1|null_explicit
+    10|ten
+    11|null_implicit
+}
+

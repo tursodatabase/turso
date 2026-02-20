@@ -434,6 +434,37 @@ pub fn translate_insert(
     });
 
     if !relevant_before_triggers.is_empty() {
+        // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
+        // hasn't been assigned yet (i.e., it's NULL). We need to temporarily set the key
+        // register to -1 so the trigger sees the correct value.
+        let saved_key_reg = if has_user_provided_rowid {
+            // User provided a value that might be NULL. Save original value, replace NULL with -1.
+            let save_reg = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: insertion.key_register(),
+                dst_reg: save_reg,
+                extra_amount: 0,
+            });
+            let skip_label = program.allocate_label();
+            program.emit_insn(Insn::NotNull {
+                reg: insertion.key_register(),
+                target_pc: skip_label,
+            });
+            program.emit_insn(Insn::Integer {
+                value: -1,
+                dest: insertion.key_register(),
+            });
+            program.preassign_label_to_next_insn(skip_label);
+            Some(save_reg)
+        } else {
+            // Key is auto-generated, register is uninitialized. Set to -1.
+            program.emit_insn(Insn::Integer {
+                value: -1,
+                dest: insertion.key_register(),
+            });
+            None
+        };
+
         // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
         let new_registers: Vec<usize> = insertion
             .col_mappings
@@ -483,6 +514,16 @@ pub fn translate_insert(
                 connection,
                 database_id,
             )?;
+        }
+
+        // Restore the original key register value so the post-trigger NotNull check
+        // correctly routes NULL keys to NewRowid generation.
+        if let Some(save_reg) = saved_key_reg {
+            program.emit_insn(Insn::Copy {
+                src_reg: save_reg,
+                dst_reg: insertion.key_register(),
+                extra_amount: 0,
+            });
         }
     }
 
