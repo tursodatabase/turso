@@ -411,6 +411,13 @@ expect error {
     no such function
 }
 
+test window-function-without-over {
+    SELECT row_number() FROM products;
+}
+expect error {
+    misuse of window function
+}
+
 test window-scalar-function-star {
     SELECT
     lower(*) OVER (PARTITION BY price)
@@ -764,4 +771,3 @@ expect {
     7
     7
 }
-

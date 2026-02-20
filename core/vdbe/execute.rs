@@ -6677,6 +6677,9 @@ pub fn op_function(
         crate::function::Func::Agg(_) => {
             unreachable!("Aggregate functions should not be handled here")
         }
+        crate::function::Func::Window(_) => {
+            unreachable!("Window functions should not be handled here")
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
