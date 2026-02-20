@@ -3,7 +3,8 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
+use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
+use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{Operation, Scan};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
@@ -90,7 +91,7 @@ pub fn translate_update(
         )?;
     }
 
-    optimize_plan(program, &mut plan, resolver.schema, connection)?;
+    optimize_plan(program, &mut plan, resolver)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -140,7 +141,7 @@ pub fn translate_update_for_schema_change(
         )?;
     }
 
-    optimize_plan(program, &mut plan, resolver.schema, connection)?;
+    optimize_plan(program, &mut plan, resolver)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -208,15 +209,21 @@ pub fn prepare_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
-    let database_id = connection.resolve_database_id(&body.tbl_name)?;
-    let schema = resolver.schema;
+    let database_id = resolver.resolve_database_id(&body.tbl_name)?;
+    let schema = resolver.schema();
     let table_name = &body.tbl_name.name;
-    let table = match connection.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
+    if program.trigger.is_some() && table.virtual_table().is_some() {
+        bail_parse_error!(
+            "unsafe use of virtual table \"{}\"",
+            body.tbl_name.name.as_str()
+        );
+    }
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     validate_update(
@@ -282,7 +289,7 @@ pub fn prepare_update_plan(
             &mut set.expr,
             Some(&mut table_references),
             None,
-            connection,
+            resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
@@ -353,7 +360,7 @@ pub fn prepare_update_plan(
     )?;
 
     let result_columns =
-        process_returning_clause(&mut body.returning, &mut table_references, connection)?;
+        process_returning_clause(&mut body.returning, &mut table_references, resolver)?;
 
     let order_by = body
         .order_by
@@ -363,7 +370,7 @@ pub fn prepare_update_plan(
                 &mut o.expr,
                 Some(&mut table_references),
                 Some(&result_columns),
-                connection,
+                resolver,
                 BindingBehavior::ResultColumnsNotAllowed,
             );
             (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
@@ -382,69 +389,68 @@ pub fn prepare_update_plan(
         &mut table_references,
         Some(&result_columns),
         &mut where_clause,
-        connection,
+        resolver,
     )?;
 
     // Parse the LIMIT/OFFSET clause
     let (limit, offset) = body
         .limit
-        .map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
+        .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.
-    let indexes: Vec<_> = connection.with_schema(database_id, |s| {
+    let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect()
     });
     let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
     let rowid_alias_used = set_clauses
         .iter()
         .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
+    let target_table_ref = table_references
+        .joined_tables()
+        .first()
+        .expect("UPDATE must have a target table reference");
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes
     } else {
         // otherwise we need to update the indexes whose columns are set in the SET clause,
-        // or if the colunns used in the partial index WHERE clause are being updated
-        indexes
-            .into_iter()
-            .filter_map(|idx| {
-                let mut needs = idx.columns.iter().any(|c| {
-                    c.expr.as_ref().map_or_else(
-                        || updated_cols.contains(&c.pos_in_table),
-                        |expr| {
-                            columns_used_by_index_expr(expr, &table_references, connection)
-                                .iter()
-                                .any(|cidx| updated_cols.contains(cidx))
-                        },
-                    )
-                });
-
-                if !needs {
-                    if let Some(w) = &idx.where_clause {
-                        let mut where_copy = w.as_ref().clone();
-                        let mut tr =
-                            TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
-                        bind_and_rewrite_expr(
-                            &mut where_copy,
-                            Some(&mut tr),
-                            None,
-                            connection,
-                            BindingBehavior::ResultColumnsNotAllowed,
-                        )
-                        .ok()?;
-                        let cols_used = collect_cols_used_in_expr(&where_copy);
-                        // if any of the columns used in the partial index WHERE clause is being
-                        // updated, we need to update this index
-                        needs = cols_used.iter().any(|c| updated_cols.contains(c));
+        // or if the columns used in the partial index WHERE clause are being updated.
+        let mut indexes_to_update = Vec::new();
+        for idx in indexes {
+            let mut needs = false;
+            for col in idx.columns.iter() {
+                if let Some(expr) = col.expr.as_ref() {
+                    let cols_used =
+                        expression_index_column_usage(expr.as_ref(), target_table_ref, resolver)?;
+                    if cols_used.iter().any(|cidx| updated_cols.contains(&cidx)) {
+                        needs = true;
+                        break;
                     }
+                } else if updated_cols.contains(&col.pos_in_table) {
+                    needs = true;
+                    break;
                 }
-                if needs {
-                    Some(idx)
-                } else {
-                    None
+            }
+
+            if !needs {
+                if let Some(where_expr) = &idx.where_clause {
+                    let cols_used = expression_index_column_usage(
+                        where_expr.as_ref(),
+                        target_table_ref,
+                        resolver,
+                    )?;
+                    // If any column used in the partial index WHERE clause is being updated,
+                    // this index must be updated as well.
+                    needs = cols_used.iter().any(|cidx| updated_cols.contains(&cidx));
                 }
-            })
-            .collect()
+            }
+
+            if needs {
+                indexes_to_update.push(idx);
+            }
+        }
+        indexes_to_update
     };
 
     Ok(Plan::Update(UpdatePlan {
@@ -477,40 +483,4 @@ fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
         Table::Virtual(_) => Operation::default_scan_for(table),
         _ => unreachable!(),
     }
-}
-
-/// Returns a set of column indices used in the expression.
-/// *Must* be used on an Expr already processed by `bind_and_rewrite_expr`
-fn collect_cols_used_in_expr(expr: &Expr) -> HashSet<usize> {
-    let mut acc = HashSet::default();
-    let _ = walk_expr(expr, &mut |expr| match expr {
-        Expr::Column { column, .. } => {
-            acc.insert(*column);
-            Ok(WalkControl::Continue)
-        }
-        _ => Ok(WalkControl::Continue),
-    });
-    acc
-}
-
-/// Returns a set of column indices used by an index expression.
-fn columns_used_by_index_expr(
-    expr: &Expr,
-    table_references: &TableReferences,
-    connection: &Arc<Connection>,
-) -> HashSet<usize> {
-    let mut expr_copy = expr.clone();
-    let mut tr = TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
-    if bind_and_rewrite_expr(
-        &mut expr_copy,
-        Some(&mut tr),
-        None,
-        connection,
-        BindingBehavior::ResultColumnsNotAllowed,
-    )
-    .is_err()
-    {
-        return HashSet::default();
-    }
-    collect_cols_used_in_expr(&expr_copy)
 }

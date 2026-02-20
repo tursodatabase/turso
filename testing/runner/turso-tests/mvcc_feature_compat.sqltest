@@ -12,14 +12,6 @@ expect error {
     Views are not supported in MVCC mode
 }
 
-test mvcc-rejects-foreign-keys {
-    PRAGMA journal_mode = 'experimental_mvcc';
-    PRAGMA foreign_keys = ON;
-}
-expect error {
-    Foreign keys are not supported in MVCC mode
-}
-
 test mvcc-rejects-partial-index {
     PRAGMA journal_mode = 'experimental_mvcc';
     CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER);
@@ -45,4 +37,59 @@ test mvcc-rejects-cdc {
 }
 expect error {
     CDC is not supported in MVCC mode
+}
+
+# DDL statements inside BEGIN CONCURRENT should produce a clear error message
+# instead of the confusing "database table is locked".
+
+test mvcc-create-table-in-begin-concurrent {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    BEGIN CONCURRENT;
+    CREATE TABLE t5(x);
+}
+expect error {
+    DDL statements require an exclusive transaction
+}
+
+test mvcc-create-index-in-begin-concurrent {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    CREATE TABLE t6(x INTEGER);
+    BEGIN CONCURRENT;
+    CREATE INDEX idx6 ON t6(x);
+}
+expect error {
+    DDL statements require an exclusive transaction
+}
+
+test mvcc-drop-table-in-begin-concurrent {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    CREATE TABLE t7(x);
+    BEGIN CONCURRENT;
+    DROP TABLE t7;
+}
+expect error {
+    DDL statements require an exclusive transaction
+}
+
+test mvcc-alter-table-in-begin-concurrent {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    CREATE TABLE t9(x);
+    BEGIN CONCURRENT;
+    ALTER TABLE t9 ADD COLUMN y;
+}
+expect error {
+    DDL statements require an exclusive transaction
+}
+
+test mvcc-ddl-works-in-exclusive-transaction {
+    PRAGMA journal_mode = 'experimental_mvcc';
+    BEGIN;
+    CREATE TABLE t8(x INTEGER);
+    INSERT INTO t8 VALUES (42);
+    COMMIT;
+    SELECT * FROM t8;
+}
+expect {
+    experimental_mvcc
+    42
 }

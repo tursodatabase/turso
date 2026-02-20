@@ -18,3 +18,4 @@ publish-wasm-next:
 	cp package.json package.native.json
 	cp package.browser.json package.json
 	npm publish --tag next --access public; cp package.native.json package.json
+

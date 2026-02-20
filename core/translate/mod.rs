@@ -57,7 +57,7 @@ use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize};
 use insert::translate_insert;
-use rollback::translate_rollback;
+use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
 use tracing::{instrument, Level};
@@ -97,7 +97,12 @@ pub fn translate(
     );
 
     program.prologue();
-    let mut resolver = Resolver::new(schema, syms);
+    let mut resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        connection.attached_databases(),
+        syms,
+    );
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -159,13 +164,15 @@ pub fn translate_inner(
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
         }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program, connection)?,
+        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
             attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
+        ast::Stmt::Begin { typ, name } => {
+            translate_tx_begin(typ, name, resolver.schema(), program)?
+        }
         ast::Stmt::Commit { name } => {
-            translate_tx_commit(name, resolver.schema, resolver, program)?
+            translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
             translate_create_index(program, connection, resolver, stmt)?;
@@ -225,12 +232,7 @@ pub fn translate_inner(
             columns,
             ..
         } => view::translate_create_view(
-            &view_name,
-            resolver,
-            &select,
-            &columns,
-            connection.clone(),
-            program,
+            &view_name, resolver, &select, &columns, program, connection,
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name, select, ..
@@ -276,7 +278,7 @@ pub fn translate_inner(
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program, connection)?,
+        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
@@ -284,11 +286,17 @@ pub fn translate_inner(
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(connection, &trigger_name, if_exists, program)?,
+        } => trigger::translate_drop_trigger(
+            connection,
+            resolver,
+            &trigger_name,
+            if_exists,
+            program,
+        )?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(connection, resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
@@ -296,12 +304,12 @@ pub fn translate_inner(
         ast::Stmt::Optimize { idx_name } => {
             translate_optimize(idx_name, resolver, program, connection)?
         }
-        ast::Stmt::Release { .. } => bail_parse_error!("RELEASE not supported yet"),
+        ast::Stmt::Release { name } => translate_release(program, name)?,
         ast::Stmt::Rollback {
             tx_name,
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
-        ast::Stmt::Savepoint { .. } => bail_parse_error!("SAVEPOINT not supported yet"),
+        ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
         ast::Stmt::Select(select) => {
             translate_select(
                 select,

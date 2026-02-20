@@ -1,0 +1,94 @@
+@database :memory:
+
+# Tests for REAL affinity preservation when reading CTE/subquery columns
+# through ephemeral auto-indexes during JOINs.
+# Regression tests for https://github.com/tursodatabase/turso/issues/5474
+
+test cte-real-affinity-join-original-issue {
+    WITH cte0 AS (SELECT CAST(('foo' >= -52) AS REAL) AS c0_0),
+         cte1 AS (SELECT c0_0 AS c1_0 FROM cte0),
+         cte2 AS (SELECT c1_0 AS c2_0 FROM cte1),
+         cte3 AS (SELECT t1.c0_0 AS c3_0, t2.c0_0 AS c3_1 FROM cte0 t1, cte0 t2)
+    SELECT t1.c3_0, t2.c0_0
+    FROM cte3 t1 LEFT JOIN cte0 t2 ON t1.c3_0 = t2.c0_0
+    ORDER BY 1, 2;
+}
+expect {
+    1.0|1.0
+}
+expect @js {
+    1|1
+}
+
+test cte-real-affinity-inner-join {
+    WITH cte AS (SELECT CAST(1 AS REAL) AS val)
+    SELECT t2.val, typeof(t2.val)
+    FROM cte t1 JOIN cte t2 ON t1.val = t2.val;
+}
+expect {
+    1.0|real
+}
+expect @js {
+    1|real
+}
+
+test cte-real-affinity-left-join {
+    WITH cte AS (SELECT CAST(1 AS REAL) AS val)
+    SELECT t2.val, typeof(t2.val)
+    FROM cte t1 LEFT JOIN cte t2 ON t1.val = t2.val;
+}
+expect {
+    1.0|real
+}
+expect @js {
+    1|real
+}
+
+test cte-real-affinity-zero {
+    WITH cte AS (SELECT CAST(0 AS REAL) AS val)
+    SELECT t2.val, typeof(t2.val)
+    FROM cte t1 JOIN cte t2 ON t1.val = t2.val;
+}
+expect {
+    0.0|real
+}
+expect @js {
+    0|real
+}
+
+test cte-real-affinity-negative {
+    WITH cte AS (SELECT CAST(-5 AS REAL) AS val)
+    SELECT t2.val, typeof(t2.val)
+    FROM cte t1 JOIN cte t2 ON t1.val = t2.val;
+}
+expect {
+    -5.0|real
+}
+expect @js {
+    -5|real
+}
+
+test cte-real-affinity-multiple-columns {
+    WITH cte AS (SELECT CAST(1 AS REAL) AS a, CAST(2 AS REAL) AS b)
+    SELECT t2.a, typeof(t2.a), t2.b, typeof(t2.b)
+    FROM cte t1 JOIN cte t2 ON t1.a = t2.a;
+}
+expect {
+    1.0|real|2.0|real
+}
+expect @js {
+    1|real|2|real
+}
+
+test subquery-real-affinity-join {
+    SELECT t2.val, typeof(t2.val)
+    FROM (SELECT CAST(1 AS REAL) AS val) t1
+    JOIN (SELECT CAST(1 AS REAL) AS val) t2
+    ON t1.val = t2.val;
+}
+expect {
+    1.0|real
+}
+expect @js {
+    1|real
+}

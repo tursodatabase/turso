@@ -58,6 +58,7 @@ settings.local.json
 
 # Track empty wals for read only databases
 !testing/runner/database/*
+testing/runner/database/integrity_*.db
 
 
 # For simulator redo

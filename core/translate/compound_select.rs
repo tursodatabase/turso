@@ -1,4 +1,4 @@
-use crate::schema::{Index, IndexColumn, Schema};
+use crate::schema::{Index, IndexColumn};
 use crate::sync::Arc;
 use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
@@ -7,7 +7,7 @@ use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
-use crate::{emit_explain, LimboError, QueryMode, SymbolTable};
+use crate::{emit_explain, LimboError, QueryMode};
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
 
@@ -36,8 +36,7 @@ pub fn emit_program_for_compound_select(
     let right_plan = right_most.clone();
     let right_most_ctx = TranslateCtx::new(
         program,
-        resolver.schema,
-        resolver.symbol_table,
+        resolver.fork(),
         right_most.table_references.joined_tables().len(),
     );
 
@@ -149,14 +148,19 @@ pub fn emit_program_for_compound_select(
     emit_compound_select(
         program,
         plan,
-        right_most_ctx.resolver.schema,
-        right_most_ctx.resolver.symbol_table,
+        &right_most_ctx.resolver,
         limit_ctx,
         offset_reg,
         reg_result_cols_start,
         &query_destination,
     )?;
     program.pop_current_parent_explain();
+
+    // Restore reg_result_cols_start after emit_compound_select, because nested
+    // subqueries (e.g. CTE coroutines) can overwrite program.reg_result_cols_start
+    // with their own result column registers. This mirrors the same fix in
+    // emit_program_for_select_with_inputs.
+    program.reg_result_cols_start = reg_result_cols_start;
 
     Ok(reg_result_cols_start)
 }
@@ -167,8 +171,7 @@ pub fn emit_program_for_compound_select(
 fn emit_compound_select(
     program: &mut ProgramBuilder,
     plan: Plan,
-    schema: &Schema,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     limit_ctx: Option<LimitCtx>,
     offset_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
@@ -195,8 +198,7 @@ fn emit_compound_select(
     }
     let mut right_most_ctx = TranslateCtx::new(
         program,
-        schema,
-        syms,
+        resolver.fork(),
         right_most.table_references.joined_tables().len(),
     );
     right_most_ctx.reg_result_cols_start = reg_result_cols_start;
@@ -221,8 +223,7 @@ fn emit_compound_select(
                 emit_compound_select(
                     program,
                     compound_select,
-                    schema,
-                    syms,
+                    resolver,
                     limit_ctx,
                     offset_reg,
                     reg_result_cols_start,
@@ -257,7 +258,7 @@ fn emit_compound_select(
                     } => (cursor_id, index),
                     _ => {
                         new_dedupe_index = true;
-                        create_dedupe_index(program, &plan, &right_most, schema)?
+                        create_dedupe_index(program, &plan, &right_most)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -276,8 +277,7 @@ fn emit_compound_select(
                 emit_compound_select(
                     program,
                     compound_select,
-                    schema,
-                    syms,
+                    resolver,
                     None,
                     None,
                     reg_result_cols_start,
@@ -314,7 +314,7 @@ fn emit_compound_select(
                 let intersect_destination = right_most.query_destination.clone();
 
                 let (left_cursor_id, left_index) =
-                    create_dedupe_index(program, &plan, &right_most, schema)?;
+                    create_dedupe_index(program, &plan, &right_most)?;
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
@@ -323,7 +323,7 @@ fn emit_compound_select(
                 };
 
                 let (right_cursor_id, right_index) =
-                    create_dedupe_index(program, &plan, &right_most, schema)?;
+                    create_dedupe_index(program, &plan, &right_most)?;
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: right_cursor_id,
                     index: right_index,
@@ -340,8 +340,7 @@ fn emit_compound_select(
                 emit_compound_select(
                     program,
                     compound_select,
-                    schema,
-                    syms,
+                    resolver,
                     None,
                     None,
                     reg_result_cols_start,
@@ -370,7 +369,7 @@ fn emit_compound_select(
                     } => (cursor_id, index),
                     _ => {
                         new_index = true;
-                        create_dedupe_index(program, &plan, &right_most, schema)?
+                        create_dedupe_index(program, &plan, &right_most)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -389,8 +388,7 @@ fn emit_compound_select(
                 emit_compound_select(
                     program,
                     compound_select,
-                    schema,
-                    syms,
+                    resolver,
                     None,
                     None,
                     reg_result_cols_start,
@@ -443,7 +441,6 @@ fn create_dedupe_index(
     program: &mut ProgramBuilder,
     left_select: &SelectPlan,
     right_select: &SelectPlan,
-    _schema: &Schema,
 ) -> crate::Result<(usize, Arc<Index>)> {
     let mut dedupe_columns = right_select
         .result_columns

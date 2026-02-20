@@ -1,4 +1,7 @@
-use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
+use crate::translate::emitter::Resolver;
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+};
 use crate::translate::plan::{ColumnUsedMask, JoinedTable, TableReferences};
 use crate::translate::planner::ROWID_STRS;
 use crate::Result;
@@ -78,4 +81,34 @@ pub fn single_table_column_usage(expr: &ast::Expr) -> Option<(TableInternalId, C
     } else {
         None
     }
+}
+
+/// Bind an expression index key expression against the target table and return
+/// the set of referenced columns.
+///
+/// Expression index SQL is stored in schema form and may use the base table
+/// name even when the query uses an alias. We bind using the base table name
+/// to keep dependency analysis stable across aliases.
+pub fn expression_index_column_usage(
+    expr: &ast::Expr,
+    table_reference: &JoinedTable,
+    resolver: &Resolver<'_>,
+) -> Result<ColumnUsedMask> {
+    let mut bound_expr = expr.clone();
+    let mut binding_table = table_reference.clone();
+    if let Some(btree_table) = binding_table.table.btree() {
+        binding_table.identifier.clone_from(&btree_table.name);
+    }
+    let mut binding_tables = TableReferences::new(vec![binding_table], vec![]);
+    bind_and_rewrite_expr(
+        &mut bound_expr,
+        Some(&mut binding_tables),
+        None,
+        resolver,
+        BindingBehavior::ResultColumnsNotAllowed,
+    )?;
+
+    Ok(single_table_column_usage(&bound_expr)
+        .map(|(_, columns_mask)| columns_mask)
+        .unwrap_or_default())
 }

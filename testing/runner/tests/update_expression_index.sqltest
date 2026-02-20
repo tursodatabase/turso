@@ -1,0 +1,369 @@
+@database :memory:
+@skip-file-if mvcc "expression indexes are not supported with mvcc"
+
+# Regression tests for expression index UPDATE correctness.
+# Verifies that UPDATE properly deletes old index entries and inserts new ones.
+# Regression tests for GitHub issue #5149.
+
+# Basic reproducer from the issue: UPDATE should delete old expression index entry.
+test basic-update-deletes-old-entry {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    UPDATE t SET val = 99 WHERE id = 2;
+    PRAGMA integrity_check;
+    SELECT count(*) FROM t WHERE val * 2 = 40;
+    SELECT count(*) FROM t WHERE val * 2 = 198;
+}
+expect {
+    ok
+    0
+    1
+}
+
+# UPDATE via expression index scan (uses ephemeral table path).
+test update-via-expression-index-scan {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    UPDATE t SET val = 99 WHERE val * 2 = 40;
+    SELECT id, val FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|10
+    2|99
+    3|30
+    ok
+}
+
+# UPDATE multiple rows via expression index scan.
+test update-multiple-rows-via-expr-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, 10), (2, 10), (3, 20), (4, 30);
+    UPDATE t SET val = 99 WHERE val * 2 = 20;
+    SELECT id, val FROM t ORDER BY id;
+    SELECT count(*) FROM t WHERE val * 2 = 20;
+    SELECT count(*) FROM t WHERE val * 2 = 198;
+    PRAGMA integrity_check;
+}
+expect {
+    1|99
+    2|99
+    3|20
+    4|30
+    0
+    2
+    ok
+}
+
+# UPDATE on table without explicit INTEGER PRIMARY KEY (implicit rowid).
+test update-implicit-rowid-table {
+    CREATE TABLE t(a TEXT, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES('x', 10), ('y', 20), ('z', 30);
+    UPDATE t SET val = 99 WHERE a = 'y';
+    SELECT count(*) FROM t WHERE val * 2 = 40;
+    SELECT count(*) FROM t WHERE val * 2 = 198;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# Multiple sequential updates on same row.
+test multiple-sequential-updates {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, 10);
+    UPDATE t SET val = 20 WHERE id = 1;
+    UPDATE t SET val = 30 WHERE id = 1;
+    UPDATE t SET val = 40 WHERE id = 1;
+    SELECT count(*) FROM t WHERE val * 2 = 20;
+    SELECT count(*) FROM t WHERE val * 2 = 40;
+    SELECT count(*) FROM t WHERE val * 2 = 60;
+    SELECT count(*) FROM t WHERE val * 2 = 80;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    0
+    0
+    1
+    ok
+}
+
+# UPDATE with self-referencing SET expression (val = val * 3).
+test self-referencing-set-expression {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, 10), (2, 20);
+    UPDATE t SET val = val * 3 WHERE id = 2;
+    SELECT count(*) FROM t WHERE val * 2 = 40;
+    SELECT count(*) FROM t WHERE val * 2 = 120;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# UPDATE with expression index involving multiple columns.
+test multi-column-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX idx ON t(a + b);
+    INSERT INTO t VALUES(1, 10, 20), (2, 30, 40);
+    UPDATE t SET a = 100, b = 200 WHERE id = 2;
+    SELECT count(*) FROM t WHERE a + b = 70;
+    SELECT count(*) FROM t WHERE a + b = 300;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# UPDATE with string concatenation expression index.
+test string-concat-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx ON t(name || '_suffix');
+    INSERT INTO t VALUES(1, 'alice'), (2, 'bob');
+    UPDATE t SET name = 'charlie' WHERE id = 2;
+    SELECT count(*) FROM t WHERE name || '_suffix' = 'bob_suffix';
+    SELECT count(*) FROM t WHERE name || '_suffix' = 'charlie_suffix';
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# UPDATE with CAST expression index.
+test cast-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx ON t(CAST(val AS INTEGER));
+    INSERT INTO t VALUES(1, '100'), (2, '200');
+    UPDATE t SET val = '999' WHERE id = 2;
+    SELECT count(*) FROM t WHERE CAST(val AS INTEGER) = 200;
+    SELECT count(*) FROM t WHERE CAST(val AS INTEGER) = 999;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# UPDATE with NULL values in expression index.
+test null-values-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, NULL), (2, 20);
+    UPDATE t SET val = NULL WHERE id = 2;
+    UPDATE t SET val = 50 WHERE id = 1;
+    SELECT count(*) FROM t WHERE val * 2 = 100;
+    SELECT count(*) FROM t WHERE val IS NULL;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    1
+    ok
+}
+
+# UPDATE all rows with val = val + 1.
+test update-all-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    UPDATE t SET val = val + 1;
+    SELECT id, val FROM t ORDER BY id;
+    SELECT count(*) FROM t WHERE val * 2 = 20;
+    SELECT count(*) FROM t WHERE val * 2 = 22;
+    SELECT count(*) FROM t WHERE val * 2 = 42;
+    SELECT count(*) FROM t WHERE val * 2 = 62;
+    PRAGMA integrity_check;
+}
+expect {
+    1|11
+    2|21
+    3|31
+    0
+    1
+    1
+    1
+    ok
+}
+
+# UPDATE with both regular and expression indexes on same table.
+test mixed-regular-and-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx_reg ON t(val);
+    CREATE INDEX idx_expr ON t(val * 2);
+    INSERT INTO t VALUES(1, 10), (2, 20);
+    UPDATE t SET val = 99 WHERE id = 2;
+    SELECT count(*) FROM t WHERE val = 20;
+    SELECT count(*) FROM t WHERE val = 99;
+    SELECT count(*) FROM t WHERE val * 2 = 40;
+    SELECT count(*) FROM t WHERE val * 2 = 198;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    0
+    1
+    ok
+}
+
+# UPDATE with COALESCE expression index.
+test coalesce-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX idx ON t(COALESCE(a, b));
+    INSERT INTO t VALUES(1, NULL, 100), (2, 50, 200);
+    UPDATE t SET a = 75 WHERE id = 1;
+    SELECT count(*) FROM t WHERE COALESCE(a, b) = 100;
+    SELECT count(*) FROM t WHERE COALESCE(a, b) = 75;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# UPDATE with ABS expression index.
+test abs-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(abs(val));
+    INSERT INTO t VALUES(1, -10), (2, -20), (3, 30);
+    UPDATE t SET val = 5 WHERE id = 2;
+    SELECT count(*) FROM t WHERE abs(val) = 20;
+    SELECT count(*) FROM t WHERE abs(val) = 5;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# UPDATE with subquery in WHERE clause.
+test update-with-subquery-where {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    UPDATE t SET val = 99 WHERE id IN (SELECT id FROM t WHERE val > 15);
+    SELECT id, val FROM t ORDER BY id;
+    SELECT count(*) FROM t WHERE val * 2 = 40;
+    SELECT count(*) FROM t WHERE val * 2 = 60;
+    SELECT count(*) FROM t WHERE val * 2 = 198;
+    PRAGMA integrity_check;
+}
+expect {
+    1|10
+    2|99
+    3|99
+    0
+    0
+    2
+    ok
+}
+
+# UPDATE with SUBSTR expression index.
+test substr-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx ON t(substr(name, 1, 3));
+    INSERT INTO t VALUES(1, 'alice'), (2, 'bob');
+    UPDATE t SET name = 'charlie' WHERE id = 2;
+    SELECT count(*) FROM t WHERE substr(name, 1, 3) = 'bob';
+    SELECT count(*) FROM t WHERE substr(name, 1, 3) = 'cha';
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# UPDATE on column not in expression index (should not touch index).
+test update-unrelated-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX idx ON t(a * 2);
+    INSERT INTO t VALUES(1, 10, 100), (2, 20, 200);
+    UPDATE t SET b = 999 WHERE id = 2;
+    SELECT count(*) FROM t WHERE a * 2 = 40;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# UPDATE with REAL column and CAST expression index.
+test real-column-cast-expression {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val REAL);
+    CREATE INDEX idx ON t(CAST(val AS INTEGER));
+    INSERT INTO t VALUES(1, 10.5), (2, 20.7);
+    UPDATE t SET val = 99.9 WHERE id = 2;
+    SELECT count(*) FROM t WHERE CAST(val AS INTEGER) = 20;
+    SELECT count(*) FROM t WHERE CAST(val AS INTEGER) = 99;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# UPDATE setting value to same value (no-op).
+test update-to-same-value {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, 10), (2, 20);
+    UPDATE t SET val = 20 WHERE id = 2;
+    SELECT count(*) FROM t WHERE val * 2 = 40;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# INSERT OR REPLACE with expression index.
+test insert-or-replace-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, 10), (2, 20);
+    INSERT OR REPLACE INTO t VALUES(2, 99);
+    SELECT count(*) FROM t WHERE val * 2 = 40;
+    SELECT count(*) FROM t WHERE val * 2 = 198;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# Expression index with modulo operator.
+test modulo-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE INDEX idx ON t(val % 10);
+    INSERT INTO t VALUES(1, 15), (2, 25), (3, 35);
+    UPDATE t SET val = val + 1;
+    SELECT count(*) FROM t WHERE val % 10 = 5;
+    SELECT count(*) FROM t WHERE val % 10 = 6;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    3
+    ok
+}

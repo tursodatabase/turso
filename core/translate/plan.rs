@@ -42,7 +42,7 @@ fn infer_type_from_expr(
     expr: &ast::Expr,
     tables: Option<&TableReferences>,
 ) -> (Type, &'static str) {
-    let affinity = get_expr_affinity(expr, tables);
+    let affinity = get_expr_affinity(expr, tables, None);
     match affinity {
         Affinity::Integer => (Type::Integer, "INTEGER"),
         Affinity::Real => (Type::Real, "REAL"),
@@ -81,13 +81,13 @@ impl ResultSetColumn {
                         .as_deref()
                 } else {
                     // Column references an outer query table (correlated subquery).
-                    let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
-                    table_ref.get_column_at(*column).unwrap().name.as_deref()
+                    let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
+                    table_ref.get_column_at(*column)?.name.as_deref()
                 }
             }
             ast::Expr::RowId { table, .. } => {
                 // If there is a rowid alias column, use its name
-                let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
+                let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
                 if let Table::BTree(table) = &table_ref {
                     if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
                         if let Some(name) = &rowid_alias_column.1.name {
@@ -747,6 +747,10 @@ pub struct OuterQueryReference {
     /// has been consumed by a FROM clause (with or without an alias), so
     /// column resolution goes through the joined_table instead.
     pub cte_definition_only: bool,
+    /// Whether the rowid of this table is referenced. Tracked separately from
+    /// col_used_mask because rowid is not a real column and setting a fake
+    /// column index in col_used_mask could mislead covering index decisions.
+    pub rowid_referenced: bool,
 }
 
 impl OuterQueryReference {
@@ -763,7 +767,7 @@ impl OuterQueryReference {
     /// Whether the OuterQueryReference is used by the current query scope.
     /// This is used primarily to determine at what loop depth a subquery should be evaluated.
     pub fn is_used(&self) -> bool {
-        !self.col_used_mask.is_empty()
+        !self.col_used_mask.is_empty() || self.rowid_referenced
     }
 }
 
@@ -1001,6 +1005,16 @@ impl TableReferences {
         } else {
             panic!("table with internal id {internal_id} not found in table references");
         }
+    }
+
+    /// Marks the rowid of a table as referenced. This is tracked separately
+    /// from column usage because rowid is not a real column.
+    pub fn mark_rowid_referenced(&mut self, internal_id: TableInternalId) {
+        if let Some(outer_query_ref) = self.find_outer_query_ref_by_internal_id_mut(internal_id) {
+            outer_query_ref.rowid_referenced = true;
+        }
+        // For joined tables, rowid references don't need special tracking
+        // since correlated subquery detection only looks at outer_query_refs.
     }
 
     pub fn contains_table(&self, table: &Table) -> bool {

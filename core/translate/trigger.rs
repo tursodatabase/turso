@@ -101,9 +101,9 @@ pub fn translate_create_trigger(
         ));
     }
 
-    let database_id = connection.resolve_database_id(&trigger_name)?;
+    let database_id = resolver.resolve_database_id(&trigger_name)?;
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     program.begin_write_operation();
@@ -115,7 +115,7 @@ pub fn translate_create_trigger(
     }
 
     // Check if trigger already exists
-    if connection.with_schema(database_id, |s| {
+    if resolver.with_schema(database_id, |s| {
         s.get_trigger_for_table(&normalized_table_name, &normalized_trigger_name)
             .is_some()
     }) {
@@ -126,10 +126,12 @@ pub fn translate_create_trigger(
     }
 
     // Verify the table exists
-    if connection.with_schema(database_id, |s| {
-        s.get_table(&normalized_table_name).is_none()
-    }) {
+    let table = resolver.with_schema(database_id, |s| s.get_table(&normalized_table_name));
+    let Some(table) = table else {
         bail_parse_error!("no such table: {}", normalized_table_name);
+    };
+    if table.virtual_table().is_some() {
+        bail_parse_error!("cannot create triggers on virtual tables");
     }
 
     if time
@@ -151,7 +153,7 @@ pub fn translate_create_trigger(
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table
-    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -173,7 +175,7 @@ pub fn translate_create_trigger(
     )?;
 
     // Update schema version
-    let schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -193,6 +195,7 @@ pub fn translate_create_trigger(
 /// Translate DROP TRIGGER statement
 pub fn translate_drop_trigger(
     connection: &Arc<Connection>,
+    resolver: &Resolver,
     trigger_name: &ast::QualifiedName,
     if_exists: bool,
     program: &mut ProgramBuilder,
@@ -205,16 +208,16 @@ pub fn translate_drop_trigger(
         ));
     }
 
-    let database_id = connection.resolve_database_id(trigger_name)?;
+    let database_id = resolver.resolve_database_id(trigger_name)?;
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     program.begin_write_operation();
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
 
     // Check if trigger exists
-    if connection.with_schema(database_id, |s| {
+    if resolver.with_schema(database_id, |s| {
         s.get_trigger(&normalized_trigger_name).is_none()
     }) {
         if if_exists {
@@ -231,7 +234,7 @@ pub fn translate_drop_trigger(
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let table = connection.with_schema(0, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = resolver.with_schema(0, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -313,7 +316,7 @@ pub fn translate_drop_trigger(
     program.preassign_label_to_next_insn(rewind_done_label);
 
     // Update schema version
-    let schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,

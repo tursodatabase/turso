@@ -1,4 +1,3 @@
-use crate::sync::Arc;
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 
@@ -257,14 +256,18 @@ macro_rules! expect_arguments_even {
 /// Compute the affinity for an IN expression.
 /// For `x IN (y1, y2, ..., yN)`, the affinity is determined by the LHS expression `x`.
 /// This follows SQLite's `exprINAffinity()` function.
-fn in_expr_affinity(lhs: &ast::Expr, referenced_tables: Option<&TableReferences>) -> Affinity {
+fn in_expr_affinity(
+    lhs: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
+) -> Affinity {
     // For parenthesized expressions (vectors), we take the first element's affinity
     // since scalar IN comparisons only use the first element
     match lhs {
         Expr::Parenthesized(exprs) if !exprs.is_empty() => {
-            get_expr_affinity(&exprs[0], referenced_tables)
+            get_expr_affinity(&exprs[0], referenced_tables, resolver)
         }
-        _ => get_expr_affinity(lhs, referenced_tables),
+        _ => get_expr_affinity(lhs, referenced_tables, resolver),
     }
 }
 
@@ -289,7 +292,7 @@ fn translate_in_list(
 
     // Compute the affinity for the IN comparison based on the LHS expression
     // This follows SQLite's exprINAffinity() approach
-    let affinity = in_expr_affinity(lhs, referenced_tables);
+    let affinity = in_expr_affinity(lhs, referenced_tables, Some(resolver));
     let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
 
     if condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null {
@@ -2673,6 +2676,9 @@ pub fn translate_expr(
                                 dest: target_register,
                                 default: None,
                             });
+                            if let Some(col) = from_clause_subquery.columns.get(*column) {
+                                maybe_apply_affinity(col.ty(), target_register, program);
+                            }
                             return Ok(target_register);
                         }
                     }
@@ -2709,6 +2715,9 @@ pub fn translate_expr(
                                         dest: target_register,
                                         default: None,
                                     });
+                                    if let Some(col) = from_clause_subquery.columns.get(*column) {
+                                        maybe_apply_affinity(col.ty(), target_register, program);
+                                    }
                                     return Ok(target_register);
                                 }
                             }
@@ -3093,6 +3102,7 @@ fn binary_expr_shared(
         e1,
         e2,
         referenced_tables,
+        Some(resolver),
     )?;
 
     if let BinaryEmitMode::Condition(metadata) = emit_mode {
@@ -3125,6 +3135,7 @@ fn emit_binary_expr_scalar(
                     &ast::Expr,
                     Option<&TableReferences>,
                     Option<ConditionMetadata>,
+                    Option<&Resolver>,
                 ) -> Result<()>,
             None,
         ),
@@ -3140,6 +3151,7 @@ fn emit_binary_expr_scalar(
                     &ast::Expr,
                     Option<&TableReferences>,
                     Option<ConditionMetadata>,
+                    Option<&Resolver>,
                 ) -> Result<()>,
             Some(metadata),
         ),
@@ -3160,6 +3172,7 @@ fn emit_binary_expr_scalar(
             e2,
             referenced_tables,
             condition_metadata,
+            Some(resolver),
         )?;
         if op.is_comparison() {
             program.reset_collation();
@@ -3215,6 +3228,7 @@ fn emit_binary_expr_scalar(
             e2,
             referenced_tables,
             condition_metadata,
+            Some(resolver),
         )?;
         // Only reset collation for comparison operators, which consume it.
         // Non-comparison operators (Concat, Add, etc.) must propagate the
@@ -3239,6 +3253,7 @@ fn emit_binary_expr_row_valued(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
 ) -> Result<()> {
     enum RowOrderingOp {
         Less,
@@ -3260,8 +3275,13 @@ fn emit_binary_expr_row_valued(
         let done_label = program.allocate_label();
         for i in 0..arity {
             let next_label = program.allocate_label();
-            let (affinity, collation) =
-                row_component_affinity_collation(lhs_expr, rhs_expr, i, referenced_tables)?;
+            let (affinity, collation) = row_component_affinity_collation(
+                lhs_expr,
+                rhs_expr,
+                i,
+                referenced_tables,
+                resolver,
+            )?;
             program.emit_insn(Insn::Eq {
                 lhs: lhs_start + i,
                 rhs: rhs_start + i,
@@ -3333,8 +3353,13 @@ fn emit_binary_expr_row_valued(
             let null_result_label = program.allocate_label();
             for i in 0..arity {
                 let next_cmp_label = program.allocate_label();
-                let (aff, collation) =
-                    row_component_affinity_collation(lhs_expr, rhs_expr, i, referenced_tables)?;
+                let (aff, collation) = row_component_affinity_collation(
+                    lhs_expr,
+                    rhs_expr,
+                    i,
+                    referenced_tables,
+                    resolver,
+                )?;
                 let lhs = lhs_start + i;
                 let rhs = rhs_start + i;
                 program.emit_insn(Insn::IsNull {
@@ -3445,6 +3470,7 @@ fn row_component_affinity_collation(
     rhs_expr: &Expr,
     idx: usize,
     referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
 ) -> Result<(Affinity, Option<CollationSeq>)> {
     // If one side is a decomposable row literal and the other is not, still prefer
     // the component that is available instead of falling back both sides.
@@ -3454,7 +3480,7 @@ fn row_component_affinity_collation(
     let lhs_for_cmp = row_value_component_expr(lhs_expr, idx)?.unwrap_or(lhs_expr);
     let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?.unwrap_or(rhs_expr);
     Ok((
-        comparison_affinity(lhs_for_cmp, rhs_for_cmp, referenced_tables),
+        comparison_affinity(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver),
         comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables)?,
     ))
 }
@@ -3504,10 +3530,11 @@ fn emit_binary_insn(
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
     _: Option<ConditionMetadata>,
+    resolver: Option<&Resolver>,
 ) -> Result<()> {
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
-        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables);
+        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, resolver);
     }
 
     match op {
@@ -3762,12 +3789,13 @@ fn emit_binary_condition_insn(
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
     condition_metadata: Option<ConditionMetadata>,
+    resolver: Option<&Resolver>,
 ) -> Result<()> {
     let condition_metadata = condition_metadata
         .expect("condition metadata must be provided for emit_binary_insn_conditional");
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
-        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables);
+        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, resolver);
     }
 
     let opposite_op = match op {
@@ -4503,7 +4531,7 @@ pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
     result_columns: Option<&'a [ResultSetColumn]>,
-    connection: &'a Arc<crate::Connection>,
+    resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
     walk_expr_mut(
@@ -4713,6 +4741,10 @@ pub fn bind_and_rewrite_expr<'a>(
                                 parse_row_id(&normalized_id, tbl_id, || false)?
                             {
                                 *expr = row_id_expr;
+                                // Mark the table's rowid as referenced so correlated
+                                // subquery detection works correctly when a rowid
+                                // reference is the only link to the outer query.
+                                referenced_tables.mark_rowid_referenced(tbl_id);
                                 return Ok(WalkControl::Continue);
                             }
                         }
@@ -4749,10 +4781,10 @@ pub fn bind_and_rewrite_expr<'a>(
                         name: tbl_name.clone(),
                         alias: None,
                     };
-                    let database_id = connection.resolve_database_id(&qualified_name)?;
+                    let database_id = resolver.resolve_database_id(&qualified_name)?;
 
                     // Get the table from the specified database
-                    let table = connection
+                    let table = resolver
                         .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
                         .ok_or_else(|| {
                             crate::LimboError::ParseError(format!(
@@ -5095,38 +5127,16 @@ where
 pub fn get_expr_affinity(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
 ) -> Affinity {
     match expr {
         ast::Expr::Column { table, column, .. } => {
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
-                        return col.affinity();
-                    }
-                }
-            }
-            Affinity::Blob
-        }
-        // Expr::Id and Expr::Qualified appear in CHECK constraint expressions where
-        // column references haven't been rewritten to Expr::Column. Look up the column
-        // by name in referenced_tables to determine the correct affinity.
-        ast::Expr::Id(name) => {
-            if let Some(tables) = referenced_tables {
-                if let Some(affinity) = find_column_affinity_by_name(tables, name.as_str()) {
-                    return affinity;
-                }
-            }
-            Affinity::Blob
-        }
-        ast::Expr::Qualified(table_name, col_name) => {
-            if let Some(tables) = referenced_tables {
-                if let Some(table) = tables.find_table_by_identifier(table_name.as_str()) {
-                    let normalized = normalize_ident(col_name.as_str());
-                    if let Some(col) = table
-                        .columns()
-                        .iter()
-                        .find(|c| c.name.as_ref() == Some(&normalized))
-                    {
+                        if let Some(btree) = table_ref.btree() {
+                            return col.affinity_with_strict(btree.is_strict);
+                        }
                         return col.affinity();
                     }
                 }
@@ -5142,39 +5152,35 @@ pub fn get_expr_affinity(
             }
         }
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            get_expr_affinity(exprs.first().unwrap(), referenced_tables)
+            get_expr_affinity(exprs.first().unwrap(), referenced_tables, resolver)
         }
-        ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables),
+        ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables, resolver),
         // Literals have NO affinity in SQLite!
         ast::Expr::Literal(_) => Affinity::Blob, // No affinity!
-        _ => Affinity::Blob,                     // This may need to change. For now this works.
-    }
-}
-
-/// Look up a column's affinity by name across all tables in the references.
-fn find_column_affinity_by_name(tables: &TableReferences, col_name: &str) -> Option<Affinity> {
-    let normalized = normalize_ident(col_name);
-    for table in tables.joined_tables() {
-        if let Some(col) = table
-            .table
-            .columns()
-            .iter()
-            .find(|c| c.name.as_ref() == Some(&normalized))
-        {
-            return Some(col.affinity());
+        ast::Expr::Register(reg) => {
+            // During UPDATE expression index evaluation, column references are
+            // rewritten to Expr::Register. Look up the original column affinity
+            // from the resolver's register_affinities map.
+            if let Some(resolver) = resolver {
+                if let Some(aff) = resolver.register_affinities.get(reg) {
+                    return *aff;
+                }
+            }
+            Affinity::Blob
         }
+        _ => Affinity::Blob, // This may need to change. For now this works.
     }
-    None
 }
 
 pub fn comparison_affinity(
     lhs_expr: &ast::Expr,
     rhs_expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
 ) -> Affinity {
-    let mut aff = get_expr_affinity(lhs_expr, referenced_tables);
+    let mut aff = get_expr_affinity(lhs_expr, referenced_tables, resolver);
 
-    aff = compare_affinity(rhs_expr, aff, referenced_tables);
+    aff = compare_affinity(rhs_expr, aff, referenced_tables, resolver);
 
     // If no affinity determined (both operands are literals), default to BLOB
     if !aff.has_affinity() {
@@ -5188,8 +5194,9 @@ pub fn compare_affinity(
     expr: &ast::Expr,
     other_affinity: Affinity,
     referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
 ) -> Affinity {
-    let expr_affinity = get_expr_affinity(expr, referenced_tables);
+    let expr_affinity = get_expr_affinity(expr, referenced_tables, resolver);
 
     if expr_affinity.has_affinity() && other_affinity.has_affinity() {
         // Both sides have affinity - use numeric if either is numeric
@@ -5345,7 +5352,7 @@ pub fn emit_function_call(
 pub fn process_returning_clause(
     returning: &mut [ast::ResultColumn],
     table_references: &mut TableReferences,
-    connection: &crate::sync::Arc<crate::Connection>,
+    resolver: &Resolver<'_>,
 ) -> Result<Vec<ResultSetColumn>> {
     let mut result_columns = Vec::with_capacity(returning.len());
 
@@ -5361,7 +5368,7 @@ pub fn process_returning_clause(
                     expr,
                     Some(table_references),
                     None,
-                    connection,
+                    resolver,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
 

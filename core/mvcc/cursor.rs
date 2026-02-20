@@ -375,7 +375,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(())
     }
 
-    pub fn start_new_rowid(&mut self) -> Result<IOResult<NextRowidResult>> {
+    pub fn start_new_rowid(
+        &mut self,
+        allow_cached_allocator: bool,
+    ) -> Result<IOResult<NextRowidResult>> {
         tracing::trace!("start_new_rowid");
         let allocator = self.db.get_rowid_allocator(&self.table_id);
         let locked = allocator.lock();
@@ -385,15 +388,21 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         }
 
         self.creating_new_rowid = true;
-        let res = if allocator.is_uninitialized() {
-            NextRowidResult::Uninitialized
-        } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
-            NextRowidResult::Next {
-                new_rowid: next_rowid,
-                prev_rowid: prev_max_rowid,
+        let res = if allow_cached_allocator {
+            if allocator.is_uninitialized() {
+                NextRowidResult::Uninitialized
+            } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
+                NextRowidResult::Next {
+                    new_rowid: next_rowid,
+                    prev_rowid: prev_max_rowid,
+                }
+            } else {
+                NextRowidResult::FindRandom
             }
         } else {
-            NextRowidResult::FindRandom
+            // For non-concurrent transactions, derive from the current visible max rowid.
+            // This avoids rowid drift after savepoint rollbacks and failed statements.
+            NextRowidResult::Uninitialized
         };
         Ok(IOResult::Done(res))
     }
@@ -1324,7 +1333,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             // The btree cursor must be correctly positioned and cannot cause IO to happen
             // because in order to get here, we must have read it already in the VDBE.
             let IOResult::Done(Some(record)) = self.record()? else {
-                crate::bail_corrupt_error!("Btree cursor should have a record when deleting a row that only exists in the btree");
+                crate::bail_corrupt_error!(
+                    "Btree cursor should have a record when deleting a row that only exists in the btree"
+                );
             };
             // All operations below clone values so we can clone it here to circumvent the borrow checker
             let record = record.clone();
@@ -1636,7 +1647,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn get_pager(&self) -> Arc<Pager> {
-        todo!()
+        self.btree_cursor.get_pager()
     }
 
     fn get_skip_advance(&self) -> bool {

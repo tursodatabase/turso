@@ -42,7 +42,7 @@ use crate::{
         insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
-    Connection, Result,
+    Result,
 };
 use std::{borrow::Cow, collections::HashSet, sync::Arc};
 use turso_macros::turso_assert_some;
@@ -109,7 +109,6 @@ pub fn init_loop(
     where_clause: &[WhereTerm],
     join_order: &[JoinOrderMember],
     subqueries: &mut [NonFromClauseSubquery],
-    connection: Option<&Arc<Connection>>,
 ) -> Result<()> {
     turso_assert_eq!(
         t_ctx.meta_left_joins.len(),
@@ -124,7 +123,7 @@ pub fn init_loop(
         turso_assert_eq!(tables.joined_tables().len(), 1);
         let changed_table = &tables.joined_tables()[0].table;
         let prepared =
-            prepare_cdc_if_necessary(program, t_ctx.resolver.schema, changed_table.get_name())?;
+            prepare_cdc_if_necessary(program, t_ctx.resolver.schema(), changed_table.get_name())?;
         if let Some((cdc_cursor_id, _)) = prepared {
             t_ctx.cdc_cursor_id = Some(cdc_cursor_id);
         }
@@ -176,7 +175,7 @@ pub fn init_loop(
             }
         }
         let (table_cursor_id, index_cursor_id) =
-            table.open_cursors(program, mode.clone(), t_ctx.resolver.schema)?;
+            table.open_cursors(program, mode.clone(), t_ctx.resolver.schema())?;
         match &table.op {
             Operation::Scan(Scan::BTreeTable { index, .. }) => match (&mode, &table.table) {
                 (OperationMode::SELECT, Table::BTree(btree)) => {
@@ -212,18 +211,9 @@ pub fn init_loop(
                         });
                     }
                     // For delete, we need to open all the other indexes too for writing
-                    let indices: Vec<_> = if let Some(conn) = connection {
-                        conn.with_schema(table.database_id, |s| {
-                            s.get_indices(&btree.name).cloned().collect()
-                        })
-                    } else {
-                        t_ctx
-                            .resolver
-                            .schema
-                            .get_indices(&btree.name)
-                            .cloned()
-                            .collect()
-                    };
+                    let indices: Vec<_> = t_ctx.resolver.with_schema(table.database_id, |s| {
+                        s.get_indices(table.table.get_name()).cloned().collect()
+                    });
                     for index in &indices {
                         if table
                             .op
@@ -320,18 +310,10 @@ pub fn init_loop(
                         // For DELETE, we need to open all the indexes for writing
                         // UPDATE opens these in emit_program_for_update() separately
                         if matches!(mode, OperationMode::DELETE) {
-                            let indices: Vec<_> = if let Some(conn) = connection {
-                                conn.with_schema(table.database_id, |s| {
+                            let indices: Vec<_> =
+                                t_ctx.resolver.with_schema(table.database_id, |s| {
                                     s.get_indices(table.table.get_name()).cloned().collect()
-                                })
-                            } else {
-                                t_ctx
-                                    .resolver
-                                    .schema
-                                    .get_indices(table.table.get_name())
-                                    .cloned()
-                                    .collect()
-                            };
+                                });
                             for index in &indices {
                                 if table
                                     .op
@@ -537,7 +519,7 @@ fn emit_hash_build_phase(
     for join_key in hash_join_op.join_keys.iter() {
         let build_expr = join_key.get_build_expr(predicates);
         let probe_expr = join_key.get_probe_expr(predicates);
-        let affinity = comparison_affinity(build_expr, probe_expr, Some(table_references));
+        let affinity = comparison_affinity(build_expr, probe_expr, Some(table_references), None);
         key_affinities.push(affinity.aff_mask());
     }
 

@@ -3,6 +3,7 @@ pub mod grammar_generator;
 pub mod journal_mode;
 pub mod orderby_collation;
 pub mod rowid_alias;
+pub mod savepoint;
 pub mod subquery;
 pub mod test_join_optimizer;
 
@@ -237,6 +238,7 @@ mod fuzz_tests {
     pub fn index_scan_compound_key_fuzz(db: TempDatabase) {
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
+        eprintln!("SEED={seed} index_scan_compound_key_fuzz");
 
         let is_mvcc = db.enable_mvcc;
         let opts = db.db_opts;
@@ -361,7 +363,7 @@ mod fuzz_tests {
 
         const ITERATIONS: usize = 10000;
         for i in 0..ITERATIONS {
-            if i % (ITERATIONS / 100) == 0 {
+            if i % (ITERATIONS / 1000) == 0 {
                 println!(
                     "index_scan_compound_key_fuzz: iteration {}/{}",
                     i + 1,
@@ -858,18 +860,18 @@ mod fuzz_tests {
         }
     }
 
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn join_fuzz_unindexed_keys(db: TempDatabase) {
         join_fuzz_inner(db, false, 2000, 200);
     }
 
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn join_fuzz_indexed_keys(db: TempDatabase) {
         join_fuzz_inner(db, true, 2000, 200);
     }
 
     // TODO: Mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn collation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -1017,7 +1019,7 @@ mod fuzz_tests {
     }
 
     // TODO: mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     #[allow(unused_assignments)]
     pub fn fk_deferred_constraints_and_triggers_fuzz(db: TempDatabase) {
         let _ = tracing_subscriber::fmt::try_init();
@@ -1482,8 +1484,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc state mismatch
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn fk_single_pk_mutation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -1785,8 +1786,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc does not work
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn fk_edgecases_fuzzing(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -2146,7 +2146,7 @@ mod fuzz_tests {
     }
 
     // Fuzz test for ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT actions
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn fk_cascade_actions_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -2536,7 +2536,7 @@ mod fuzz_tests {
     }
 
     // Fuzz test for recursive CASCADE (A->B->C chains)
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn fk_recursive_cascade_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -2804,7 +2804,7 @@ mod fuzz_tests {
     }
 
     // TODO: mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn fk_composite_pk_mutation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -3514,14 +3514,12 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc index
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn partial_index_mutation_and_upsert_fuzz(db: TempDatabase) {
         index_mutation_upsert_fuzz(db, 1.0, 4);
     }
 
-    // TODO: mvcc fails
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn simple_index_mutation_and_upsert_fuzz(db: TempDatabase) {
         index_mutation_upsert_fuzz(db, 0.0, 4);
     }
@@ -4150,8 +4148,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn ddl_compatibility_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -5385,8 +5382,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn table_logical_expression_fuzz_run(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
@@ -5774,8 +5770,9 @@ mod fuzz_tests {
         );
     }
 
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     #[cfg(feature = "test_helper")]
+    #[serial_test::file_serial]
     pub fn fuzz_pending_byte_database(db: TempDatabase) -> anyhow::Result<()> {
         use core_tester::common::rusqlite_integrity_check;
 
@@ -5836,8 +5833,7 @@ mod fuzz_tests {
         Ok(())
     }
 
-    // TODO: mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     /// Tests for correlated and uncorrelated subqueries in SELECT statements (WHERE, SELECT-list, GROUP BY/HAVING).
     pub fn table_subquery_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();

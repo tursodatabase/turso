@@ -805,18 +805,31 @@ pub fn read_btree_cell(
     match page_type {
         PageType::IndexInterior => {
             let mut pos = pos;
+            crate::assert_or_bail_corrupt!(
+                pos + 4 <= page.len(),
+                "cell offset {} out of bounds for page size {}",
+                pos,
+                page.len()
+            );
             let left_child_page =
                 u32::from_be_bytes([page[pos], page[pos + 1], page[pos + 2], page[pos + 3]]);
             pos += 4;
-            let (payload_size, nr) = read_varint(&page[pos..])?;
+            let (payload_size, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             pos += nr;
 
             let (overflows, to_read) =
                 payload_overflows(payload_size as usize, max_local, min_local, usable_size);
             let to_read = if overflows { to_read } else { page.len() - pos };
 
+            crate::assert_or_bail_corrupt!(
+                pos + to_read <= page.len(),
+                "payload range {}..{} out of bounds for page size {}",
+                pos,
+                pos + to_read,
+                page.len()
+            );
             let (payload, first_overflow_page) =
-                read_payload(&page[pos..pos + to_read], payload_size as usize);
+                read_payload(&page[pos..pos + to_read], payload_size as usize)?;
             Ok(BTreeCell::IndexInteriorCell(IndexInteriorCell {
                 left_child_page,
                 payload,
@@ -826,10 +839,16 @@ pub fn read_btree_cell(
         }
         PageType::TableInterior => {
             let mut pos = pos;
+            crate::assert_or_bail_corrupt!(
+                pos + 4 <= page.len(),
+                "cell offset {} out of bounds for page size {}",
+                pos,
+                page.len()
+            );
             let left_child_page =
                 u32::from_be_bytes([page[pos], page[pos + 1], page[pos + 2], page[pos + 3]]);
             pos += 4;
-            let (rowid, _) = read_varint(&page[pos..])?;
+            let (rowid, _) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             Ok(BTreeCell::TableInteriorCell(TableInteriorCell {
                 left_child_page,
                 rowid: rowid as i64,
@@ -837,15 +856,22 @@ pub fn read_btree_cell(
         }
         PageType::IndexLeaf => {
             let mut pos = pos;
-            let (payload_size, nr) = read_varint(&page[pos..])?;
+            let (payload_size, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             pos += nr;
 
             let (overflows, to_read) =
                 payload_overflows(payload_size as usize, max_local, min_local, usable_size);
             let to_read = if overflows { to_read } else { page.len() - pos };
 
+            crate::assert_or_bail_corrupt!(
+                pos + to_read <= page.len(),
+                "payload range {}..{} out of bounds for page size {}",
+                pos,
+                pos + to_read,
+                page.len()
+            );
             let (payload, first_overflow_page) =
-                read_payload(&page[pos..pos + to_read], payload_size as usize);
+                read_payload(&page[pos..pos + to_read], payload_size as usize)?;
             Ok(BTreeCell::IndexLeafCell(IndexLeafCell {
                 payload,
                 first_overflow_page,
@@ -854,17 +880,24 @@ pub fn read_btree_cell(
         }
         PageType::TableLeaf => {
             let mut pos = pos;
-            let (payload_size, nr) = read_varint(&page[pos..])?;
+            let (payload_size, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             pos += nr;
-            let (rowid, nr) = read_varint(&page[pos..])?;
+            let (rowid, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             pos += nr;
 
             let (overflows, to_read) =
                 payload_overflows(payload_size as usize, max_local, min_local, usable_size);
             let to_read = if overflows { to_read } else { page.len() - pos };
 
+            crate::assert_or_bail_corrupt!(
+                pos + to_read <= page.len(),
+                "payload range {}..{} out of bounds for page size {}",
+                pos,
+                pos + to_read,
+                page.len()
+            );
             let (payload, first_overflow_page) =
-                read_payload(&page[pos..pos + to_read], payload_size as usize);
+                read_payload(&page[pos..pos + to_read], payload_size as usize)?;
             Ok(BTreeCell::TableLeafCell(TableLeafCell {
                 rowid: rowid as i64,
                 payload,
@@ -878,21 +911,30 @@ pub fn read_btree_cell(
 /// read_payload takes in the unread bytearray with the payload size
 /// and returns the payload on the page, and optionally the first overflow page number.
 #[allow(clippy::readonly_write_lock)]
-fn read_payload(unread: &'static [u8], payload_size: usize) -> (&'static [u8], Option<u32>) {
+fn read_payload(
+    unread: &'static [u8],
+    payload_size: usize,
+) -> Result<(&'static [u8], Option<u32>)> {
     let cell_len = unread.len();
     // We will let overflow be constructed back if needed or requested.
     if payload_size <= cell_len {
         // fit within 1 page
-        (&unread[..payload_size], None)
+        Ok((&unread[..payload_size], None))
     } else {
         // overflow
+        if cell_len < 4 {
+            bail_corrupt_error!(
+                "overflow cell too small: {} bytes, need at least 4",
+                cell_len
+            );
+        }
         let first_overflow_page = u32::from_be_bytes([
             unread[cell_len - 4],
             unread[cell_len - 3],
             unread[cell_len - 2],
             unread[cell_len - 1],
         ]);
-        (&unread[..cell_len - 4], Some(first_overflow_page))
+        Ok((&unread[..cell_len - 4], Some(first_overflow_page)))
     }
 }
 

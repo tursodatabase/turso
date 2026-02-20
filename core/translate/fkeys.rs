@@ -216,7 +216,11 @@ where
 pub fn build_index_affinity_string(idx: &Index, table: &BTreeTable) -> String {
     idx.columns
         .iter()
-        .map(|ic| table.columns[ic.pos_in_table].affinity().aff_mask())
+        .map(|ic| {
+            table.columns[ic.pos_in_table]
+                .affinity_with_strict(table.is_strict)
+                .aff_mask()
+        })
         .collect()
 }
 
@@ -297,10 +301,10 @@ pub fn emit_parent_key_change_checks(
     rowid_set_clause_reg: Option<usize>,
     set_clauses: &[(usize, Box<Expr>)],
     database_id: usize,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     let updated_positions: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
-    let incoming = connection.with_schema(database_id, |s| {
+    let incoming = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&table_btree.name)
     })?;
     let affects_pk = incoming
@@ -319,7 +323,7 @@ pub fn emit_parent_key_change_checks(
             old_rowid_reg,
             rowid_set_clause_reg.unwrap_or(old_rowid_reg),
             database_id,
-            connection,
+            resolver,
         )?;
     }
 
@@ -334,7 +338,7 @@ pub fn emit_parent_key_change_checks(
             table_btree,
             index.as_ref(),
             database_id,
-            connection,
+            resolver,
         )?;
     }
     Ok(())
@@ -347,7 +351,7 @@ pub fn emit_rowid_pk_change_check(
     old_rowid_reg: usize,
     new_rowid_reg: usize,
     database_id: usize,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     let skip = program.allocate_label();
     program.emit_insn(Insn::Eq {
@@ -371,15 +375,7 @@ pub fn emit_rowid_pk_change_check(
         extra_amount: 0,
     });
 
-    emit_fk_parent_pk_change_counters(
-        program,
-        incoming,
-        old_pk,
-        new_pk,
-        1,
-        database_id,
-        connection,
-    )?;
+    emit_fk_parent_pk_change_counters(program, incoming, old_pk, new_pk, 1, database_id, resolver)?;
     program.preassign_label_to_next_insn(skip);
     Ok(())
 }
@@ -411,7 +407,7 @@ pub fn emit_parent_index_key_change_checks(
     table_btree: &BTreeTable,
     index: &Index,
     database_id: usize,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     // Only process FKs that:
     // 1. Reference this specific index (OLD/NEW key vectors are built from this index's columns)
@@ -501,7 +497,7 @@ pub fn emit_parent_index_key_change_checks(
         new_key,
         idx_len,
         database_id,
-        connection,
+        resolver,
     )?;
     program.preassign_label_to_next_insn(skip);
     Ok(())
@@ -510,6 +506,7 @@ pub fn emit_parent_index_key_change_checks(
 /// Two-pass parent-side maintenance for UPDATE of a parent key:
 /// 1. Probe child for OLD key, increment deferred counter if any references exist.
 /// 2. Probe child for NEW key, guarded decrement cancels exactly one increment if present
+#[allow(clippy::too_many_arguments)]
 pub fn emit_fk_parent_pk_change_counters(
     program: &mut ProgramBuilder,
     incoming: &[ResolvedFkRef],
@@ -517,7 +514,7 @@ pub fn emit_fk_parent_pk_change_counters(
     new_pk_start: usize,
     n_cols: usize,
     database_id: usize,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     for fk_ref in incoming {
         emit_fk_parent_key_probe(
@@ -527,7 +524,7 @@ pub fn emit_fk_parent_pk_change_counters(
             n_cols,
             ParentProbePass::Old,
             database_id,
-            connection,
+            resolver,
         )?;
         emit_fk_parent_key_probe(
             program,
@@ -536,7 +533,7 @@ pub fn emit_fk_parent_pk_change_counters(
             n_cols,
             ParentProbePass::New,
             database_id,
-            connection,
+            resolver,
         )?;
     }
     Ok(())
@@ -551,6 +548,7 @@ enum ParentProbePass {
 /// Probe the child side for a given parent key
 /// For RESTRICT on OLD pass: emits immediate HALT
 /// For NO ACTION on OLD pass: increments FK violation counter
+#[allow(clippy::too_many_arguments)]
 fn emit_fk_parent_key_probe(
     program: &mut ProgramBuilder,
     fk_ref: &ResolvedFkRef,
@@ -558,7 +556,7 @@ fn emit_fk_parent_key_probe(
     n_cols: usize,
     pass: ParentProbePass,
     database_id: usize,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     let child_tbl = &fk_ref.child_table;
     let child_cols = &fk_ref.fk.child_columns;
@@ -594,7 +592,7 @@ fn emit_fk_parent_key_probe(
     };
 
     // Prefer exact child index on (child_cols...)
-    let indices: Vec<_> = connection.with_schema(database_id, |s| {
+    let indices: Vec<_> = resolver.with_schema(database_id, |s| {
         s.get_indices(&child_tbl.name).cloned().collect()
     });
     let idx = indices.iter().find(|ix| {
@@ -680,41 +678,37 @@ pub fn emit_fk_child_update_counters(
     new_rowid_reg: usize,
     updated_cols: &HashSet<usize>,
     database_id: usize,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
-    // Helper: materialize OLD tuple for this FK; returns (start_reg, ncols) or None if any component is NULL.
-    let load_old_tuple =
-        |program: &mut ProgramBuilder, fk_cols: &[String]| -> Option<(usize, usize)> {
-            let n = fk_cols.len();
-            let start = program.alloc_registers(n);
-            let null_jmp = program.allocate_label();
+    // Helper: materialize OLD tuple for this FK; returns (start_reg, ncols, null_skip_label).
+    // The null_skip_label is unresolved and must be resolved by the caller after the FK check
+    // block, so that when any OLD column is NULL the entire FK check is skipped.
+    let load_old_tuple = |program: &mut ProgramBuilder,
+                          fk_cols: &[String]|
+     -> Option<(usize, usize, BranchOffset)> {
+        let n = fk_cols.len();
+        let start = program.alloc_registers(n);
+        let null_jmp = program.allocate_label();
 
-            for (k, cname) in fk_cols.iter().enumerate() {
-                let (pos, _col) = match child_tbl.get_column(cname) {
-                    Some(v) => v,
-                    None => {
-                        return None;
-                    }
-                };
-                program.emit_column_or_rowid(child_cursor_id, pos, start + k);
-                program.emit_insn(Insn::IsNull {
-                    reg: start + k,
-                    target_pc: null_jmp,
-                });
-            }
+        for (k, cname) in fk_cols.iter().enumerate() {
+            let (pos, _col) = match child_tbl.get_column(cname) {
+                Some(v) => v,
+                None => {
+                    return None;
+                }
+            };
+            program.emit_column_or_rowid(child_cursor_id, pos, start + k);
+            program.emit_insn(Insn::IsNull {
+                reg: start + k,
+                target_pc: null_jmp,
+            });
+        }
 
-            // No NULLs, proceed
-            let cont = program.allocate_label();
-            program.emit_insn(Insn::Goto { target_pc: cont });
-            // NULL encountered: invalidate tuple by jumping here
-            program.preassign_label_to_next_insn(null_jmp);
-
-            program.preassign_label_to_next_insn(cont);
-            Some((start, n))
-        };
+        Some((start, n, null_jmp))
+    };
 
     for fk_ref in
-        connection.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
+        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
     {
         // If the child-side FK columns did not change, there is nothing to do.
         if !fk_ref.child_key_changed(updated_cols, child_tbl) {
@@ -725,10 +719,10 @@ pub fn emit_fk_child_update_counters(
 
         // Pass 1: OLD tuple handling only for deferred FKs
         if fk_ref.fk.deferred {
-            if let Some((old_start, _)) = load_old_tuple(program, &fk_ref.child_cols) {
+            if let Some((old_start, _, null_skip)) = load_old_tuple(program, &fk_ref.child_cols) {
                 if fk_ref.parent_uses_rowid {
                     // Parent key is rowid: probe parent table by rowid
-                    let parent_tbl = connection
+                    let parent_tbl = resolver
                         .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                         .expect("parent btree");
                     let pcur = open_read_table(program, &parent_tbl, database_id);
@@ -764,7 +758,7 @@ pub fn emit_fk_child_update_counters(
                     program.preassign_label_to_next_insn(join);
                 } else {
                     // Parent key is a unique index: use index probe and guarded decrement on NOT FOUND
-                    let parent_tbl = connection
+                    let parent_tbl = resolver
                         .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                         .expect("parent btree");
                     let idx = fk_ref
@@ -790,6 +784,9 @@ pub fn emit_fk_child_update_counters(
                         },
                     )?;
                 }
+                // Resolve the null skip label after the FK check block so that
+                // when any OLD column is NULL, the entire check is bypassed.
+                program.preassign_label_to_next_insn(null_skip);
             }
         }
 
@@ -809,7 +806,7 @@ pub fn emit_fk_child_update_counters(
         }
 
         if fk_ref.parent_uses_rowid {
-            let parent_tbl = connection
+            let parent_tbl = resolver
                 .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
@@ -845,7 +842,7 @@ pub fn emit_fk_child_update_counters(
             program.emit_insn(Insn::Close { cursor_id: pcur });
             emit_fk_violation(program, &fk_ref.fk)?;
         } else {
-            let parent_tbl = connection
+            let parent_tbl = resolver
                 .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                 .expect("parent btree");
             let idx = fk_ref
@@ -915,7 +912,7 @@ fn emit_fk_delete_parent_existence_check_single(
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
     database_id: usize,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     let is_self_ref = fk_ref
         .child_table
@@ -948,7 +945,7 @@ fn emit_fk_delete_parent_existence_check_single(
 
     let child_cols = &fk_ref.fk.child_columns;
     let child_idx = if !is_self_ref {
-        let indices: Vec<_> = connection.with_schema(database_id, |s| {
+        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(&fk_ref.child_table.name).cloned().collect()
         });
         indices.into_iter().find(|idx| {
@@ -1021,10 +1018,10 @@ pub fn emit_fk_update_parent_actions(
     rowid_set_clause_reg: Option<usize>,
     set_clauses: &[(usize, Box<Expr>)],
     database_id: usize,
-    connection: &Arc<Connection>,
+    resolver: &Resolver,
 ) -> Result<()> {
     let updated_positions: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
-    let incoming = connection.with_schema(database_id, |s| {
+    let incoming = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&table_btree.name)
     })?;
     let affects_pk = incoming
@@ -1064,7 +1061,7 @@ pub fn emit_fk_update_parent_actions(
                             old_rowid_reg,
                             rowid_set_clause_reg.unwrap_or(old_rowid_reg),
                             database_id,
-                            connection,
+                            resolver,
                         )?;
                     }
 
@@ -1079,7 +1076,7 @@ pub fn emit_fk_update_parent_actions(
                             table_btree,
                             index.as_ref(),
                             database_id,
-                            connection,
+                            resolver,
                         )?;
                     }
                 }
@@ -1101,7 +1098,7 @@ pub fn emit_fk_update_parent_actions(
                 old_rowid_reg,
                 rowid_set_clause_reg.unwrap_or(old_rowid_reg),
                 database_id,
-                connection,
+                resolver,
             )?;
         }
 
@@ -1116,7 +1113,7 @@ pub fn emit_fk_update_parent_actions(
                 table_btree,
                 index.as_ref(),
                 database_id,
-                connection,
+                resolver,
             )?;
         }
     }
@@ -1285,7 +1282,7 @@ fn emit_fk_action_subprogram(
         connection,
         description,
     )?;
-    subprogram_builder.epilogue(resolver.schema);
+    subprogram_builder.epilogue(resolver.schema());
     let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
 
     // Build params: OLD key register indices, then optionally NEW key register indices
@@ -1489,7 +1486,7 @@ fn fire_fk_cascade_delete(
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id > 0 {
-        connection.get_database_name_by_index(database_id)
+        resolver.get_database_name_by_index(database_id)
     } else {
         None
     };
@@ -1522,7 +1519,7 @@ fn fire_fk_set_null(
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id > 0 {
-        connection.get_database_name_by_index(database_id)
+        resolver.get_database_name_by_index(database_id)
     } else {
         None
     };
@@ -1548,7 +1545,7 @@ fn fire_fk_set_default(
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id > 0 {
-        connection.get_database_name_by_index(database_id)
+        resolver.get_database_name_by_index(database_id)
     } else {
         None
     };
@@ -1574,7 +1571,7 @@ fn fire_fk_cascade_update(
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id > 0 {
-        connection.get_database_name_by_index(database_id)
+        resolver.get_database_name_by_index(database_id)
     } else {
         None
     };
@@ -1608,11 +1605,11 @@ pub fn fire_fk_delete_actions(
     connection: &Arc<Connection>,
     database_id: usize,
 ) -> Result<()> {
-    let parent_bt = connection
+    let parent_bt = resolver
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
-    for fk_ref in connection.with_schema(database_id, |s| {
+    for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
     })? {
         let parent_cols = get_fk_parent_cols(&fk_ref, &parent_bt);
@@ -1641,7 +1638,7 @@ pub fn fire_fk_delete_actions(
                     parent_cursor_id,
                     parent_rowid_reg,
                     database_id,
-                    connection,
+                    resolver,
                 )?;
             }
             RefAct::Cascade => {
@@ -1674,11 +1671,11 @@ pub fn fire_fk_update_actions(
     connection: &Arc<Connection>,
     database_id: usize,
 ) -> Result<()> {
-    let parent_bt = connection
+    let parent_bt = resolver
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
-    for fk_ref in connection.with_schema(database_id, |s| {
+    for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
     })? {
         let parent_cols = get_fk_parent_cols(&fk_ref, &parent_bt);
@@ -1765,14 +1762,14 @@ pub fn emit_fk_drop_table_check(
     connection: &Arc<Connection>,
     database_id: usize,
 ) -> Result<()> {
-    let parent_tbl = connection
+    let parent_tbl = resolver
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| {
             LimboError::InternalError(format!("parent table {parent_table_name} not found"))
         })?;
 
     // Get all FK references to this parent table
-    let fk_refs = connection.with_schema(database_id, |s| {
+    let fk_refs = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
     })?;
 

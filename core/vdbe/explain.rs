@@ -1674,6 +1674,15 @@ pub fn insn_to_row(
                 0,
                 format!("auto_commit={auto_commit}, rollback={rollback}"),
             ),
+            Insn::Savepoint { op, name } => (
+                "Savepoint",
+                0,
+                0,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("op={op:?}, name={name}"),
+            ),
             Insn::OpenEphemeral {
                 cursor_id,
                 is_table,
@@ -1815,8 +1824,6 @@ pub fn insn_to_row(
                 max_errors,
                 roots,
                 message_register,
-                quick,
-                tables,
             } => (
                 "IntegrityCk",
                 *max_errors as i64,
@@ -1824,10 +1831,7 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "roots={roots:?} message_register={message_register} quick={quick} tables={}",
-                    tables.len()
-                ),
+                format!("roots={roots:?} message_register={message_register}"),
             ),
             Insn::RowData { cursor_id, dest } => (
                 "RowData",

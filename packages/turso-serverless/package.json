@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/serverless",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -30,6 +30,6 @@
   "devDependencies": {
     "@types/node": "^24.0.13",
     "ava": "^6.4.1",
-    "typescript": "^5.8.3"
+    "typescript": "^5.9.2"
   }
 }

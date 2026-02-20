@@ -9,6 +9,7 @@ use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
+use crate::storage::pager::SavepointResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{AtomicBool, AtomicI64};
@@ -358,8 +359,23 @@ pub enum TxTimestampOrID {
 
 /// Tracks versions created/modified during a savepoint for rollback.
 /// Used for statement-level savepoints in interactive transactions.
-#[derive(Default, Debug)]
+#[derive(Debug, Default)]
+enum SavepointKind {
+    /// Internal savepoint used for statement-level rollback.
+    #[default]
+    Statement,
+    /// User-visible named savepoint.
+    Named {
+        name: String,
+        starts_transaction: bool,
+    },
+}
+
+/// Tracks row/index version deltas created inside a single savepoint scope.
+#[derive(Debug, Default)]
 pub struct Savepoint {
+    kind: SavepointKind,
+    deferred_fk_violations: isize,
     /// Versions CREATED during this savepoint (insert operations).
     /// On rollback: these versions are removed from their chains.
     created_table_versions: Vec<(RowID, u64)>,
@@ -371,6 +387,48 @@ pub struct Savepoint {
     /// RowIDs that were NEWLY added to write_set by this savepoint.
     /// On rollback: only these should be removed from write_set.
     newly_added_to_write_set: Vec<RowID>,
+}
+
+impl Savepoint {
+    /// Creates an internal statement savepoint used for per-statement rollback.
+    fn statement() -> Self {
+        Self::default()
+    }
+
+    /// Creates a user-visible named savepoint snapshot.
+    fn named(name: String, starts_transaction: bool, deferred_fk_violations: isize) -> Self {
+        Self {
+            kind: SavepointKind::Named {
+                name,
+                starts_transaction,
+            },
+            deferred_fk_violations,
+            ..Default::default()
+        }
+    }
+
+    /// Merges child savepoint deltas into this savepoint.
+    ///
+    /// Called when releasing nested savepoints so outer rollback still has a full undo set.
+    fn merge_from(&mut self, mut other: Savepoint) {
+        self.created_table_versions
+            .append(&mut other.created_table_versions);
+        self.created_index_versions
+            .append(&mut other.created_index_versions);
+        self.deleted_table_versions
+            .append(&mut other.deleted_table_versions);
+        self.deleted_index_versions
+            .append(&mut other.deleted_index_versions);
+        self.newly_added_to_write_set
+            .append(&mut other.newly_added_to_write_set);
+    }
+}
+
+struct SavepointRollbackResult {
+    /// Savepoints that were rolled back, in the order they were created (oldest to newest).
+    rolledback_savepoints: Vec<Savepoint>,
+    /// Deferred FK counter snapshot captured at the target named savepoint.
+    deferred_fk_violations: isize,
 }
 
 /// Transaction
@@ -393,6 +451,18 @@ pub struct Transaction {
     savepoint_stack: RwLock<Vec<Savepoint>>,
     /// True when this transaction currently holds the serialized logical-log commit lock.
     pager_commit_lock_held: AtomicBool,
+    /// Number of unresolved commit dependencies (must reach 0 before commit).
+    /// i.e the number of transactions this transaction is dependent on and waiting for
+    /// commit or abort.
+    /// Hekaton Section 2.7: "A transaction cannot commit until this counter is zero."
+    commit_dep_counter: AtomicU64,
+    /// Flag: a depended-on transaction aborted; this transaction must abort too.
+    /// Hekaton Section 2.7: "AbortNow that other transactions can set to tell T to abort."
+    abort_now: AtomicBool,
+    /// Transaction IDs that depend on this transaction (notified on commit/abort).
+    /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
+    /// transactions that depend on T."
+    commit_dep_set: Mutex<Vec<TxID>>,
 }
 
 impl Transaction {
@@ -406,6 +476,9 @@ impl Transaction {
             header: RwLock::new(header),
             savepoint_stack: RwLock::new(Vec::new()),
             pager_commit_lock_held: AtomicBool::new(false),
+            commit_dep_counter: AtomicU64::new(0),
+            abort_now: AtomicBool::new(false),
+            commit_dep_set: Mutex::new(Vec::new()),
         }
     }
 
@@ -429,19 +502,141 @@ impl Transaction {
     fn begin_savepoint(&self) {
         let depth = self.savepoint_stack.read().len();
         tracing::debug!("begin_savepoint(tx_id={}, depth={})", self.tx_id, depth);
-        self.savepoint_stack.write().push(Savepoint::default());
+        self.savepoint_stack.write().push(Savepoint::statement());
+    }
+
+    /// Begin a new named savepoint. If `starts_transaction` is true, this savepoint represents the
+    /// beginning of an interactive transaction and will be used to track deferred FK violations
+    /// for that transaction.
+    fn begin_named_savepoint(
+        &self,
+        name: String,
+        starts_transaction: bool,
+        deferred_fk_violations: isize,
+    ) {
+        let depth = self.savepoint_stack.read().len();
+        tracing::debug!(
+            "begin_named_savepoint(tx_id={}, depth={}, name={})",
+            self.tx_id,
+            depth,
+            name
+        );
+        self.savepoint_stack.write().push(Savepoint::named(
+            name,
+            starts_transaction,
+            deferred_fk_violations,
+        ));
     }
 
     /// Release the newest savepoint (statement completed successfully).
     fn release_savepoint(&self) {
         let depth = self.savepoint_stack.read().len();
         tracing::debug!("release_savepoint(tx_id={}, depth={})", self.tx_id, depth);
-        self.savepoint_stack.write().pop();
+        let mut savepoints = self.savepoint_stack.write();
+        if !matches!(
+            savepoints.last().map(|savepoint| &savepoint.kind),
+            Some(SavepointKind::Statement)
+        ) {
+            return;
+        }
+        let savepoint = savepoints.pop().expect("savepoint must exist");
+        if let Some(parent) = savepoints.last_mut() {
+            parent.merge_from(savepoint);
+        }
     }
 
-    /// Pop and return the newest savepoint for rollback.
-    fn pop_savepoint(&self) -> Option<Savepoint> {
-        self.savepoint_stack.write().pop()
+    fn pop_statement_savepoint(&self) -> Option<Savepoint> {
+        let mut savepoints = self.savepoint_stack.write();
+        if !matches!(
+            savepoints.last().map(|savepoint| &savepoint.kind),
+            Some(SavepointKind::Statement)
+        ) {
+            return None;
+        }
+        savepoints.pop()
+    }
+
+    /// Release a named savepoint. If this savepoint starts a transaction, returns
+    /// [SavepointResult::Commit] to indicate the transaction should be committed.
+    fn release_named_savepoint(&self, name: &str) -> SavepointResult {
+        let mut savepoints = self.savepoint_stack.write();
+        let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
+            matches!(
+                savepoint.kind,
+                SavepointKind::Named {
+                    name: ref savepoint_name,
+                    ..
+                } if savepoint_name == name
+            )
+        }) else {
+            return SavepointResult::NotFound;
+        };
+
+        let commits_transaction = if matches!(
+            savepoints[target_idx].kind,
+            SavepointKind::Named {
+                starts_transaction: true,
+                ..
+            }
+        ) && target_idx == 0
+        {
+            SavepointResult::Commit
+        } else {
+            SavepointResult::Release
+        };
+        if matches!(commits_transaction, SavepointResult::Commit) {
+            // Defer mutation until transaction commit succeeds. If commit fails
+            // (e.g. deferred FK violation), savepoints must remain intact.
+            return commits_transaction;
+        }
+
+        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
+        if let Some(parent) = savepoints.last_mut() {
+            for savepoint in drained {
+                parent.merge_from(savepoint);
+            }
+        }
+        commits_transaction
+    }
+
+    /// Find the named savepoint to rollback to and pop all savepoints above it. Returns the rolled
+    /// back savepoints and net change in deferred FK violations for undoing changes to transaction
+    /// state.
+    fn rollback_to_named_savepoint(&self, name: &str) -> Option<SavepointRollbackResult> {
+        let mut savepoints = self.savepoint_stack.write();
+        let target_idx = savepoints.iter().rposition(|savepoint| {
+            matches!(
+                savepoint.kind,
+                SavepointKind::Named {
+                    name: ref savepoint_name,
+                    ..
+                } if savepoint_name == name
+            )
+        })?;
+
+        let target_name = match &savepoints[target_idx].kind {
+            SavepointKind::Named { name, .. } => name.clone(),
+            SavepointKind::Statement => unreachable!("target idx points to named savepoint"),
+        };
+        let starts_transaction = matches!(
+            savepoints[target_idx].kind,
+            SavepointKind::Named {
+                starts_transaction: true,
+                ..
+            }
+        );
+        let deferred_fk_violations = savepoints[target_idx].deferred_fk_violations;
+
+        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
+        savepoints.push(Savepoint::named(
+            target_name,
+            starts_transaction,
+            deferred_fk_violations,
+        ));
+        Some(SavepointRollbackResult {
+            rolledback_savepoints: drained,
+            deferred_fk_violations,
+        })
     }
 
     /// Record a version that was created during the current savepoint.
@@ -643,6 +838,12 @@ pub enum CommitState<Clock: LogicalClock> {
     Commit {
         end_ts: u64,
     },
+    /// Wait for unresolved commit dependencies before postprocessing.
+    /// Hekaton Section 3.2: "If T passes validation, it must wait for outstanding
+    /// commit dependencies to be resolved."
+    WaitForDependencies {
+        end_ts: u64,
+    },
     BeginCommitLogicalLog {
         end_ts: u64,
         log_record: LogRecord,
@@ -675,6 +876,14 @@ pub enum WriteRowState {
 #[derive(Debug)]
 struct CommitCoordinator {
     pager_commit_lock: Arc<TursoRwLock>,
+}
+
+impl CommitCoordinator {
+    fn new() -> Self {
+        Self {
+            pager_commit_lock: Arc::new(TursoRwLock::new()),
+        }
+    }
 }
 
 pub struct CommitStateMachine<Clock: LogicalClock> {
@@ -756,6 +965,10 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
     }
 
+    /// Validates commit-time write-write conflicts for one table row key.
+    ///
+    /// Returns [LimboError::WriteWriteConflict] when another transaction committed or is
+    /// preparing a conflicting version according to first-committer-wins.
     fn check_rowid_for_conflicts(
         &self,
         rowid: &RowID,
@@ -776,6 +989,10 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(())
     }
 
+    /// Validates commit-time write-write conflicts for one index key.
+    ///
+    /// Returns [LimboError::WriteWriteConflict] when another transaction committed or is
+    /// preparing a conflicting index version according to first-committer-wins.
     fn check_index_for_conflicts(
         &self,
         rowid: &RowID,
@@ -833,6 +1050,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(())
     }
 
+    /// Validates a single version chain against the current transaction's commit timestamp.
+    ///
+    /// This enforces snapshot-isolation conflict checks for both:
+    /// 1. versions ended by concurrent commits (`end >= tx.begin_ts`), and
+    /// 2. live versions owned by concurrent transactions (state/ts tie-breaking).
     fn check_version_conflicts(
         &self,
         end_ts: u64,
@@ -863,28 +1085,26 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         continue;
                     }
                     // Another transaction's uncommitted version - check their state
-                    let other_tx = mvcc_store.txs.get(&other_tx_id);
-                    if let Some(other_tx) = other_tx {
-                        let other_tx = other_tx.value();
-                        match other_tx.state.load() {
-                            // Other tx already committed = conflict
-                            TransactionState::Committed(_) => {
+                    let other_tx = mvcc_store.txs.get(&other_tx_id).expect("check_version_conflicts txn {other_tx_id} was not found in txn map even though there is version with this TxID");
+                    let other_tx = other_tx.value();
+                    match other_tx.state.load() {
+                        // Other tx already committed = conflict
+                        TransactionState::Committed(_) => {
+                            return Err(LimboError::WriteWriteConflict);
+                        }
+                        // Both preparing - compare end_ts (lower wins)
+                        TransactionState::Preparing(other_end_ts) => {
+                            if other_end_ts < end_ts {
+                                // Other tx has lower end_ts, they win
                                 return Err(LimboError::WriteWriteConflict);
                             }
-                            // Both preparing - compare end_ts (lower wins)
-                            TransactionState::Preparing(other_end_ts) => {
-                                if other_end_ts < end_ts {
-                                    // Other tx has lower end_ts, they win
-                                    return Err(LimboError::WriteWriteConflict);
-                                }
-                                // We have lower end_ts, we win - they'll abort when they validate
-                            }
-                            // Other tx still active - we're already Preparing so we're ahead
-                            // They'll see us in Preparing/Committed when they try to commit
-                            TransactionState::Active => {}
-                            // Other tx aborted - no conflict
-                            TransactionState::Aborted | TransactionState::Terminated => {}
+                            // We have lower end_ts, we win - they'll abort when they validate
                         }
+                        // Other tx still active - we're already Preparing so we're ahead
+                        // They'll see us in Preparing/Committed when they try to commit
+                        TransactionState::Active => {}
+                        // Other tx aborted - no conflict
+                        TransactionState::Aborted | TransactionState::Terminated => {}
                     }
                 }
                 Some(TxTimestampOrID::Timestamp(begin_ts)) => {
@@ -955,9 +1175,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 tx.state.store(TransactionState::Preparing(end_ts));
                 tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
-
-                /* TODO: The code we have here is sufficient for snapshot isolation.
-                ** In order to implement serializability, we need the following steps:
+                /* In order to implement serializability, we need the following steps:
                 **
                 ** 1. Validate if all read versions are still visible by inspecting the read_set
                 ** 2. Validate if there are no phantoms by walking the scans from scan_set (which we don't even have yet)
@@ -1001,8 +1219,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     """
                 **  If you're wondering when a speculative read happens, here you go:
                 **  Case 1: speculative read of TB:
-                    """
-                        If transaction TB is in the Preparing state, it has acquired an end
+                    """If transaction TB is in the Preparing state, it has acquired an end
                         timestamp TS which will be V’s begin timestamp if TB commits.
                         A safe approach in this situation would be to have transaction T
                         wait until transaction TB commits. However, we want to avoid all
@@ -1029,6 +1246,17 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         only if TE commits.
                     """
                 */
+                /* NOTE: Commit dependencies (Hekaton Section 2.7) are implemented via
+                 ** the register-and-report protocol:
+                 ** - Speculative reads/ignores call register_commit_dependency, which
+                 **   increments CommitDepCounter and adds to CommitDepSet.
+                 ** - WaitForDependencies checks AbortNow and waits for counter == 0.
+                 ** - CommitEnd / rollback_tx drain CommitDepSet, notifying dependents.
+                 **
+                 ** TODO: For full serializability (beyond snapshot isolation), we still need:
+                 ** 1. Validate if all read versions are still visible by inspecting the read_set
+                 ** 2. Validate if there are no phantoms by walking the scans from scan_set
+                 */
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
                 self.write_set
                     .extend(tx.write_set.iter().map(|v| v.value().clone()));
@@ -1037,11 +1265,35 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
                 });
                 if self.write_set.is_empty() {
+                    turso_assert!(
+                        tx.commit_dep_set.lock().is_empty(),
+                        "MVCC read only transaction should not have commit dependencies on other txns"
+                    );
+                    // Abort eagerly if requested
+                    if tx.abort_now.load(Ordering::Acquire) {
+                        return Err(LimboError::CommitDependencyAborted);
+                    }
+                    // Even read-only transactions must honour commit dependencies.
+                    // A SELECT during normal processing may have speculatively read
+                    // from a Preparing transaction (Hekaton §2.7), incrementing our
+                    // CommitDepCounter. We must wait for those to resolve.
+                    if tx.commit_dep_counter.load(Ordering::Acquire) > 0 {
+                        // Unresolved dependencies — skip validation (no writes)
+                        // and go straight to WaitForDependencies.
+                        self.state = CommitState::WaitForDependencies { end_ts };
+                        return Ok(TransitionResult::Continue);
+                    }
+                    // Check abort_now AFTER counter: rollback_tx stores abort_now
+                    // (Release) before fetch_sub (AcqRel). Once counter == 0, all
+                    // decrements have completed and the abort_now flag is visible.
+                    if tx.abort_now.load(Ordering::Acquire) {
+                        return Err(LimboError::CommitDependencyAborted);
+                    }
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
-                        self.commit_coordinator.pager_commit_lock.unlock();
                     }
+                    mvcc_store.unlock_commit_lock_if_held(tx);
                     mvcc_store.remove_tx(self.tx_id);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -1071,7 +1323,62 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
 
-                // Now update timestamps
+                // Validation passed. Wait for commit dependencies before postprocessing.
+                // Hekaton Section 3.2: validation → wait for deps → logging.
+                // Placing the wait BEFORE timestamp updates is critical: if AbortNow is
+                // detected, we haven't converted any TxID→Timestamp yet, so rollback_tx
+                // works correctly (it matches on TxID(self.tx_id)).
+                self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
+                return Ok(TransitionResult::Continue);
+            }
+            CommitState::WaitForDependencies { end_ts } => {
+                let tx = mvcc_store
+                    .txs
+                    .get(&self.tx_id)
+                    .ok_or(LimboError::TxTerminated)?;
+                let tx = tx.value();
+
+                // Eagarly check for abort_now
+                if tx.abort_now.load(Ordering::Acquire) {
+                    return Err(LimboError::CommitDependencyAborted);
+                }
+                // Hekaton Section 2.7: "A transaction cannot commit until this
+                // counter is zero." Deadlock impossible: edges always go from higher
+                // end_ts to lower end_ts, so the wait graph is acyclic.
+                if tx.commit_dep_counter.load(Ordering::Acquire) > 0 {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(
+                        Completion::new_yield(),
+                    )));
+                }
+
+                // Check abort_now AFTER counter reaches 0. Memory ordering:
+                // rollback_tx does abort_now.store(true, Release) BEFORE
+                // counter.fetch_sub(1, AcqRel). Our Acquire load of counter==0
+                // synchronizes-with that fetch_sub, making the abort_now store
+                // visible. Checking in the opposite order (abort_now first) has a
+                // TOCTOU race: an aborting dep can set abort_now and decrement
+                // between our two reads, letting us see (false, 0) and commit.
+                if tx.abort_now.load(Ordering::Acquire) {
+                    return Err(LimboError::CommitDependencyAborted);
+                }
+
+                // Read-only fast path: if write_set is empty, commit without
+                // going through CommitEnd. CommitEnd updates last_committed_tx_ts
+                // which would make a read-only transaction look like a write,
+                // causing spurious Busy errors from acquire_exclusive_tx.
+                if self.write_set.is_empty() {
+                    tx.state.store(TransactionState::Committed(*end_ts));
+                    if mvcc_store.is_exclusive_tx(&self.tx_id) {
+                        mvcc_store.release_exclusive_tx(&self.tx_id);
+                        self.commit_coordinator.pager_commit_lock.unlock();
+                    }
+                    mvcc_store.remove_tx(self.tx_id);
+                    self.finalize(mvcc_store)?;
+                    return Ok(TransitionResult::Done(()));
+                }
+
+                // All dependencies resolved — proceed with timestamp updates
+                // (Hekaton Section 3.3: Postprocessing).
                 let mut log_record = LogRecord::new(*end_ts);
                 for id in &self.write_set {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
@@ -1137,7 +1444,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                         mvcc_store.insert_version_raw(
                                             &mut log_record.row_versions,
                                             row_version.clone(),
-                                        ); // FIXME: optimize cloning out
+                                        );
                                     }
                                 }
                             }
@@ -1148,9 +1455,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 if log_record.row_versions.is_empty() {
                     // Nothing to do, just end commit.
+                    if mvcc_store.is_exclusive_tx(&self.tx_id) {
+                        mvcc_store.unlock_commit_lock_if_held(tx);
+                    }
                     self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 } else {
-                    // We might need to serialize log writes
                     self.state = CommitState::BeginCommitLogicalLog {
                         end_ts: *end_ts,
                         log_record,
@@ -1253,7 +1562,23 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
+
+                // Hekaton Section 3.3: "The transaction then processes all outgoing
+                // commit dependencies listed in its CommitDepSet. If it committed, it
+                // decrements the target transaction's CommitDepCounter."
+                // IOW since this txn committed, let's signal waiting transactions.
+                let dependents = std::mem::take(&mut *tx_unlocked.commit_dep_set.lock());
+                for dep_tx_id in dependents {
+                    if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
+                        dep_tx_entry
+                            .value()
+                            .commit_dep_counter
+                            .fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
+
                 mvcc_store
                     .global_header
                     .write()
@@ -1677,9 +2002,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             clock,
             storage,
             exclusive_tx: AtomicU64::new(NO_EXCLUSIVE_TX),
-            commit_coordinator: Arc::new(CommitCoordinator {
-                pager_commit_lock: Arc::new(TursoRwLock::new()),
-            }),
+            commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             durable_txid_max: AtomicU64::new(0),
@@ -2011,7 +2334,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
             None => {
                 tx.record_created_table_version(id.clone(), version_id);
+                let table_id = id.table_id;
                 self.insert_version(id, row_version);
+                self.invalidate_rowid_allocator(table_id);
             }
         }
         Ok(())
@@ -2234,7 +2559,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         tx.insert_to_write_set(id.clone());
-                        tx.record_deleted_table_version(id, version_id);
+                        tx.record_deleted_table_version(id.clone(), version_id);
+                        self.invalidate_rowid_allocator(id.table_id);
                         return Ok(true);
                     }
                 }
@@ -2624,11 +2950,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
     ) -> Result<TxID> {
-        if !self.blocking_checkpoint_lock.read() {
+        // Existing transactions already hold one blocking-checkpoint read guard
+        // from begin_tx(). When upgrading read->write, do not acquire another one.
+        let acquires_checkpoint_guard = maybe_existing_tx_id.is_none();
+        if acquires_checkpoint_guard && !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
         }
-        let unlock = || self.blocking_checkpoint_lock.unlock();
+        let unlock_checkpoint_guard = || {
+            if acquires_checkpoint_guard {
+                self.blocking_checkpoint_lock.unlock();
+            }
+        };
         let tx_id = maybe_existing_tx_id.unwrap_or_else(|| self.get_tx_id());
         let begin_ts = if let Some(tx_id) = maybe_existing_tx_id {
             self.txs
@@ -2640,21 +2973,49 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.get_timestamp()
         };
 
-        self.acquire_exclusive_tx(&tx_id)
-            .inspect_err(|_| unlock())?;
+        let already_exclusive = self.is_exclusive_tx(&tx_id);
+        if !already_exclusive {
+            self.acquire_exclusive_tx(&tx_id)
+                .inspect_err(|_| unlock_checkpoint_guard())?;
+        }
 
-        let locked = self.commit_coordinator.pager_commit_lock.write();
-        if !locked {
-            tracing::debug!(
-                "begin_exclusive_tx: tx_id={} failed with Busy on pager_commit_lock",
-                tx_id
-            );
-            self.release_exclusive_tx(&tx_id);
-            unlock();
-            return Err(LimboError::Busy);
+        let already_holds_commit_lock = maybe_existing_tx_id
+            .and_then(|existing_tx_id| self.txs.get(&existing_tx_id))
+            .is_some_and(|tx| tx.value().pager_commit_lock_held.load(Ordering::Acquire));
+
+        if !already_holds_commit_lock {
+            let locked = self.commit_coordinator.pager_commit_lock.write();
+            if !locked {
+                tracing::debug!(
+                    "begin_exclusive_tx: tx_id={} failed with Busy on pager_commit_lock",
+                    tx_id
+                );
+                if !already_exclusive {
+                    self.release_exclusive_tx(&tx_id);
+                }
+                unlock_checkpoint_guard();
+                return Err(LimboError::Busy);
+            }
         }
 
         let header = self.get_new_transaction_database_header(&pager);
+
+        if let Some(existing_tx_id) = maybe_existing_tx_id {
+            let tx = self
+                .txs
+                .get(&existing_tx_id)
+                .ok_or_else(|| LimboError::NoSuchTransactionID(existing_tx_id.to_string()))?;
+            tx.value()
+                .pager_commit_lock_held
+                .store(true, Ordering::Release);
+            *tx.value().header.write() = header;
+            tracing::trace!(
+                "begin_exclusive_tx(tx_id={}) - upgraded existing transaction",
+                tx_id
+            );
+            tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
+            return Ok(tx_id);
+        }
 
         let tx = Transaction::new(tx_id, begin_ts, header);
         tx.pager_commit_lock_held.store(true, Ordering::Release);
@@ -2690,6 +3051,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     pub fn remove_tx(&self, tx_id: TxID) {
+        if let Some(entry) = self.txs.get(&tx_id) {
+            let tx = entry.value();
+            let dep_set = std::mem::take(&mut *tx.commit_dep_set.lock());
+            // Invariant: commit_dep_set must be drained before removing the transaction.
+            // CommitEnd and rollback_tx both drain the commit_dep_set to notify dependencies.
+            // If we remove a transaction with non-empty commit_dep_set, those dependencies will wait
+            // forever (deadlock).
+            turso_assert!(
+                dep_set.is_empty(),
+                "remove_tx({tx_id}): commit_dep_set is not empty"
+            );
+        }
         self.txs.remove(&tx_id);
         self.blocking_checkpoint_lock.unlock();
     }
@@ -2831,13 +3204,31 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tracing::trace!("abort(tx_id={})", tx_id);
         self.unlock_commit_lock_if_held(tx);
 
+        // Hekaton Section 3.3: "If it aborted, it forces the dependent transactions
+        // to also abort by setting their AbortNow flags."
+        let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
+        for dep_tx_id in dependents {
+            if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
+                let dep_tx = dep_tx_entry.value();
+                dep_tx.abort_now.store(true, Ordering::Release);
+                dep_tx.commit_dep_counter.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
         if self.is_exclusive_tx(&tx_id) {
             self.release_exclusive_tx(&tx_id);
         }
 
+        let mut touched_table_ids = BTreeSet::new();
         for rowid in &tx.write_set {
             let rowid = rowid.value();
             self.rollback_rowid(tx_id, rowid);
+            if rowid.row_id.is_int_key() {
+                touched_table_ids.insert(rowid.table_id);
+            }
+        }
+        for table_id in touched_table_ids {
+            self.invalidate_rowid_allocator(table_id);
         }
 
         if connection.schema.read().schema_version > connection.db.schema.lock().schema_version {
@@ -2848,8 +3239,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
-        // FIXME: verify that we can already remove the transaction here!
-        // Maybe it's fine for snapshot isolation, but too early for serializable?
+        // Safe to remove here: rollback_rowid (above) acquired the write lock on
+        // every row version chain in the write set, clearing all TxID references.
+        // Any concurrent reader that held a read lock on one of those chains has
+        // already completed its register_commit_dependency call (it runs under the
+        // read lock), so no future txs.get() for this tx_id can come from a
+        // speculative read path.
         self.remove_tx(tx_id);
     }
 
@@ -2901,6 +3296,24 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tx.value().begin_savepoint();
     }
 
+    /// Begin a user-visible named savepoint inside an existing transaction.
+    ///
+    /// `starts_transaction` is true when the savepoint was opened in autocommit mode and therefore
+    /// releasing the root savepoint should commit the transaction.
+    pub fn begin_named_savepoint(
+        &self,
+        tx_id: TxID,
+        name: String,
+        starts_transaction: bool,
+        deferred_fk_violations: isize,
+    ) {
+        let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
+            panic!("Transaction {tx_id} not found while beginning named savepoint")
+        });
+        tx.value()
+            .begin_named_savepoint(name, starts_transaction, deferred_fk_violations);
+    }
+
     /// Release the newest savepoint for the transaction.
     /// This should be called when a statement completes successfully.
     /// Silently returns if the transaction doesn't exist (e.g., already committed).
@@ -2911,6 +3324,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // If transaction doesn't exist, it was already committed - nothing to release
     }
 
+    /// Releases a named savepoint and nested savepoints above it.
+    ///
+    /// Returns [SavepointResult::Commit] when releasing the root savepoint should commit the
+    /// transaction.
+    pub fn release_named_savepoint(&self, tx_id: TxID, name: &str) -> Result<SavepointResult> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .unwrap_or_else(|| panic!("Transaction {tx_id} not found while releasing savepoint"));
+        Ok(tx.value().release_named_savepoint(name))
+    }
+
     /// Rolls back a savepoint within a transaction.
     /// Returns true if a savepoint was rolled back, false if no savepoint was active.
     pub fn rollback_first_savepoint(&self, tx_id: u64) -> Result<bool> {
@@ -2919,124 +3344,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         });
 
         let tx = tx.value();
-        let savepoint = tx.pop_savepoint();
+        let savepoint = tx.pop_statement_savepoint();
 
         if let Some(savepoint) = savepoint {
-            tracing::debug!("rollback_savepoint(tx_id={}, created_table={}, created_index={}, deleted_table={}, deleted_index={})",
-                tx_id,
-                savepoint.created_table_versions.len(),
-                savepoint.created_index_versions.len(),
-                savepoint.deleted_table_versions.len(),
-                savepoint.deleted_index_versions.len());
-
-            // Collect table rowids affected by this savepoint for write set cleanup.
-            let mut affected_table_rowids: BTreeSet<RowID> = BTreeSet::new();
-
-            // Remove created table versions
-            for (rowid, version_id) in &savepoint.created_table_versions {
-                if let Some(entry) = self.rows.get(rowid) {
-                    let mut versions = entry.value().write();
-                    versions.retain(|rv| rv.id != *version_id);
-                    tracing::debug!("rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
-                        rowid.table_id, rowid.row_id, version_id);
-                }
-                affected_table_rowids.insert(rowid.clone());
-            }
-
-            // Remove created index versions
-            for ((table_id, key), version_id) in &savepoint.created_index_versions {
-                if let Some(index) = self.index_rows.get(table_id) {
-                    if let Some(entry) = index.value().get(key) {
-                        let mut versions = entry.value().write();
-                        versions.retain(|rv| rv.id != *version_id);
-                        tracing::debug!(
-                            "rollback_savepoint: removed index version(table_id={}, version_id={})",
-                            table_id,
-                            version_id
-                        );
-                    }
-                }
-            }
-
-            // Restore deleted table versions (clear end timestamp)
-            for (rowid, version_id) in &savepoint.deleted_table_versions {
-                if let Some(entry) = self.rows.get(rowid) {
-                    let mut versions = entry.value().write();
-                    for rv in versions.iter_mut() {
-                        if rv.id == *version_id {
-                            rv.end = None;
-                            tracing::debug!("rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
-                                rowid.table_id, rowid.row_id, version_id);
-                            break;
-                        }
-                    }
-                }
-                affected_table_rowids.insert(rowid.clone());
-            }
-
-            // Restore deleted index versions
-            for ((table_id, key), version_id) in &savepoint.deleted_index_versions {
-                if let Some(index) = self.index_rows.get(table_id) {
-                    if let Some(entry) = index.value().get(key) {
-                        let mut versions = entry.value().write();
-                        for rv in versions.iter_mut() {
-                            if rv.id == *version_id {
-                                rv.end = None;
-                                tracing::debug!("rollback_savepoint: restored index version(table_id={}, version_id={})",
-                                    table_id, version_id);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Clean up write set: remove rowids that no longer have any
-            // version belonging to this transaction. Without this, commit
-            // validation would find stale write set entries pointing to
-            // pre-existing committed versions and panic.
-            for rowid in &affected_table_rowids {
-                let has_tx_version = if let Some(entry) = self.rows.get(rowid) {
-                    let versions = entry.value().read();
-                    versions.iter().any(|rv| {
-                        matches!(rv.begin, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
-                            || matches!(rv.end, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
-                    })
-                } else {
-                    false
-                };
-                if !has_tx_version {
-                    tx.write_set.remove(rowid);
-                }
-            }
-
-            // Same cleanup for index rowids that were newly added by this savepoint.
-            for rowid in &savepoint.newly_added_to_write_set {
-                if rowid.row_id.is_int_key() {
-                    // Table rowids are already handled above via affected_table_rowids.
-                    continue;
-                }
-                let RowKey::Record(ref record) = rowid.row_id else {
-                    unreachable!()
-                };
-                let has_tx_version = if let Some(index) = self.index_rows.get(&rowid.table_id) {
-                    if let Some(entry) = index.value().get(record) {
-                        let versions = entry.value().read();
-                        versions.iter().any(|rv| {
-                            matches!(rv.begin, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
-                                || matches!(rv.end, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
-                        })
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if !has_tx_version {
-                    tx.write_set.remove(rowid);
-                }
-            }
-
+            self.rollback_savepoint_changes(tx_id, savepoint);
             Ok(true)
         } else {
             tracing::debug!(
@@ -3044,6 +3355,180 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 tx_id
             );
             Ok(false)
+        }
+    }
+
+    /// Rolls back to the newest matching named savepoint while keeping that savepoint active.
+    ///
+    /// Returns the deferred FK snapshot stored on the named savepoint, or `None` if no matching
+    /// savepoint exists.
+    pub fn rollback_to_named_savepoint(&self, tx_id: TxID, name: &str) -> Result<Option<isize>> {
+        let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
+            panic!("Transaction {tx_id} not found while rolling back named savepoint")
+        });
+        let Some(SavepointRollbackResult {
+            rolledback_savepoints,
+            deferred_fk_violations,
+        }) = tx.value().rollback_to_named_savepoint(name)
+        else {
+            return Ok(None);
+        };
+
+        for savepoint in rolledback_savepoints.into_iter().rev() {
+            self.rollback_savepoint_changes(tx_id, savepoint);
+        }
+
+        Ok(Some(deferred_fk_violations))
+    }
+
+    fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint) {
+        let Savepoint {
+            created_table_versions,
+            created_index_versions,
+            deleted_table_versions,
+            deleted_index_versions,
+            newly_added_to_write_set,
+            ..
+        } = savepoint;
+
+        tracing::debug!(
+            "rollback_savepoint(tx_id={}, created_table={}, created_index={}, deleted_table={}, deleted_index={})",
+            tx_id,
+            created_table_versions.len(),
+            created_index_versions.len(),
+            deleted_table_versions.len(),
+            deleted_index_versions.len()
+        );
+
+        let mut touched_rowids = BTreeSet::new();
+
+        for (rowid, version_id) in created_table_versions {
+            touched_rowids.insert(rowid.clone());
+            if let Some(entry) = self.rows.get(&rowid) {
+                let mut versions = entry.value().write();
+                versions.retain(|rv| rv.id != version_id);
+                tracing::debug!(
+                    "rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
+                    rowid.table_id,
+                    rowid.row_id,
+                    version_id
+                );
+            }
+        }
+
+        for ((table_id, key), version_id) in created_index_versions {
+            if let Some(index) = self.index_rows.get(&table_id) {
+                if let Some(entry) = index.value().get(&key) {
+                    let mut versions = entry.value().write();
+                    versions.retain(|rv| rv.id != version_id);
+                    tracing::debug!(
+                        "rollback_savepoint: removed index version(table_id={}, version_id={})",
+                        table_id,
+                        version_id
+                    );
+                }
+            }
+        }
+
+        for (rowid, version_id) in deleted_table_versions {
+            touched_rowids.insert(rowid.clone());
+            if let Some(entry) = self.rows.get(&rowid) {
+                let mut versions = entry.value().write();
+                for rv in versions.iter_mut() {
+                    if rv.id == version_id {
+                        rv.end = None;
+                        tracing::debug!(
+                            "rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
+                            rowid.table_id,
+                            rowid.row_id,
+                            version_id
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        for ((table_id, key), version_id) in deleted_index_versions {
+            if let Some(index) = self.index_rows.get(&table_id) {
+                if let Some(entry) = index.value().get(&key) {
+                    let mut versions = entry.value().write();
+                    for rv in versions.iter_mut() {
+                        if rv.id == version_id {
+                            rv.end = None;
+                            tracing::debug!(
+                                "rollback_savepoint: restored index version(table_id={}, version_id={})",
+                                table_id,
+                                version_id
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        touched_rowids.extend(newly_added_to_write_set);
+        self.remove_rolled_back_rows_from_write_set(tx_id, touched_rowids.clone());
+        // A statement may reserve a rowid and then abort before a table-version is recorded
+        // (e.g. uniqueness/FK failures). Invalidate all allocators so aborted reservations
+        // never leak into future rowid choices.
+        self.invalidate_all_rowid_allocators();
+    }
+
+    fn row_has_uncommitted_version_for_tx(&self, rowid: &RowID, tx_id: TxID) -> bool {
+        if rowid.row_id.is_int_key() {
+            let Some(entry) = self.rows.get(rowid) else {
+                return false;
+            };
+            let versions = entry.value().read();
+            return versions.iter().any(|rv| {
+                rv.begin == Some(TxTimestampOrID::TxID(tx_id))
+                    || rv.end == Some(TxTimestampOrID::TxID(tx_id))
+            });
+        }
+
+        let RowKey::Record(ref record) = rowid.row_id else {
+            return false;
+        };
+        let Some(index) = self.index_rows.get(&rowid.table_id) else {
+            return false;
+        };
+        let Some(entry) = index.value().get(record) else {
+            return false;
+        };
+        let versions = entry.value().read();
+        versions.iter().any(|rv| {
+            rv.begin == Some(TxTimestampOrID::TxID(tx_id))
+                || rv.end == Some(TxTimestampOrID::TxID(tx_id))
+        })
+    }
+
+    fn remove_rolled_back_rows_from_write_set(&self, tx_id: TxID, rowids: BTreeSet<RowID>) {
+        if rowids.is_empty() {
+            return;
+        }
+        let Some(tx) = self.txs.get(&tx_id) else {
+            return;
+        };
+        let tx = tx.value();
+        for rowid in rowids {
+            if self.row_has_uncommitted_version_for_tx(&rowid, tx_id) {
+                continue;
+            }
+            tx.write_set.remove(&rowid);
+        }
+    }
+
+    fn invalidate_all_rowid_allocators(&self) {
+        for allocator in self.table_id_to_last_rowid.read().values() {
+            allocator.invalidate();
+        }
+    }
+
+    fn invalidate_rowid_allocator(&self, table_id: MVTableId) {
+        if let Some(allocator) = self.table_id_to_last_rowid.read().get(&table_id) {
+            allocator.invalidate();
         }
     }
 
@@ -3061,6 +3546,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
+        if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
+            // Re-entrant upgrade attempt for the same transaction.
+            return Ok(());
+        }
         if let Some(tx) = self.txs.get(tx_id) {
             let tx = tx.value();
             if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
@@ -3320,7 +3809,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 if versions[i].row.id == row_version.row.id
                     && matches!(
                         (&versions[i].begin, &row_version.begin),
-                        (Some(existing), Some(new)) if existing == new
+                        (
+                            Some(TxTimestampOrID::Timestamp(existing)),
+                            Some(TxTimestampOrID::Timestamp(new))
+                        ) if existing == new
                     )
                 {
                     versions[i] = row_version;
@@ -4153,6 +4645,10 @@ impl RowidAllocator {
         self.initialized.store(true, Ordering::SeqCst);
     }
 
+    pub fn invalidate(&self) {
+        self.initialized.store(false, Ordering::SeqCst);
+    }
+
     pub fn lock(&self) -> bool {
         self.lock.write()
     }
@@ -4252,21 +4748,96 @@ impl RowVersion {
     }
 }
 
+/// Hekaton Section 2.7 — register-and-report protocol:
+/// "To take a commit dependency on a transaction T2, T1 increments its
+/// CommitDepCounter and adds its transaction ID to T2's CommitDepSet."
+///
+/// The lock on `commit_dep_set` serializes with the drain in commit/abort
+/// resolution, preventing the race where we push an entry after the drain.
+fn register_commit_dependency(
+    txs: &SkipMap<TxID, Transaction>,
+    dependent_tx: &Transaction,
+    depended_on_tx_id: TxID,
+) {
+    let Some(depended_on) = txs.get(&depended_on_tx_id) else {
+        // Transaction was already committed and removed from the map
+        // (CommitEnd calls remove_tx after setting Committed and draining
+        // CommitDepSet). Dependency is trivially resolved.
+        return;
+    };
+    let depended_on = depended_on.value();
+
+    // Hold lock while checking state to serialize with the drain in
+    // commit/abort postprocessing.
+    let mut dep_set = depended_on.commit_dep_set.lock();
+    match depended_on.state.load() {
+        TransactionState::Preparing(_) => {
+            // Increment counter BEFORE pushing to dep_set and BEFORE dropping
+            // the lock. This prevents underflow: if we pushed first and
+            // released the lock, the depended-on tx could drain the dep_set
+            // and call fetch_sub before we increment, wrapping the counter
+            // from 0 to u64::MAX.
+            dependent_tx
+                .commit_dep_counter
+                .fetch_add(1, Ordering::AcqRel);
+            dep_set.push(dependent_tx.tx_id);
+            drop(dep_set);
+            tracing::trace!(
+                "register_commit_dependency: tx {} depends on tx {}",
+                dependent_tx.tx_id,
+                depended_on_tx_id
+            );
+        }
+        TransactionState::Active => {
+            turso_assert!(false, "a txn found dependent on active txn");
+        }
+        TransactionState::Committed(_) => {
+            // Already committed — dependency trivially resolved.
+        }
+        TransactionState::Aborted | TransactionState::Terminated => {
+            // Already aborted — cascade abort to dependent.
+            drop(dep_set);
+            dependent_tx.abort_now.store(true, Ordering::Release);
+            tracing::trace!(
+                "register_commit_dependency: tx {} must abort (dep tx {} aborted)",
+                dependent_tx.tx_id,
+                depended_on_tx_id
+            );
+        }
+    }
+}
+
 fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &RowVersion) -> bool {
     match rv.begin {
         Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => tx.begin_ts >= rv_begin_ts,
         Some(TxTimestampOrID::TxID(rv_begin)) => {
-            let tb = txs
-                .get(&rv_begin)
-                .unwrap_or_else(|| panic!("transaction {rv_begin:?} should exist in txs map"));
-            let tb = tb.value();
+            let Some(tb_entry) = txs.get(&rv_begin) else {
+                // Transaction was removed from the map after converting its TxID refs
+                // to Timestamps. The begin field should have been updated but we still
+                // see the stale TxID. Conservative: not visible.
+                return false;
+            };
+            let tb = tb_entry.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
-                TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
+                TransactionState::Preparing(end_ts) => {
+                    // Hekaton Table 1 / Section 2.5: speculative read of TB.
+                    // If begin_ts >= end_ts, the version would be visible once TB
+                    // commits. Speculatively return true and register a dependency.
+                    // Fixes partial commit visibility (Bug #8).
+                    if tx.begin_ts >= end_ts && tx.tx_id != tb.tx_id {
+                        register_commit_dependency(txs, tx, rv_begin);
+                        true
+                    } else {
+                        false
+                    }
+                }
                 TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
                 TransactionState::Aborted => false,
                 TransactionState::Terminated => {
-                    tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
+                    tracing::debug!(
+                        "TODO: should reread rv's end field - it should have updated the timestamp in the row version by now"
+                    );
                     false
                 }
             };
@@ -4289,17 +4860,31 @@ fn is_end_visible(
     match row_version.end {
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
-            let other_tx = txs
-                .get(&rv_end)
-                .unwrap_or_else(|| panic!("Transaction {rv_end} not found"));
-            let other_tx = other_tx.value();
+            let Some(other_tx_entry) = txs.get(&rv_end) else {
+                // Transaction was removed after converting its TxID refs to Timestamps.
+                // The end field should have been updated. Conservative: visible (row not deleted).
+                return true;
+            };
+            let other_tx = other_tx_entry.value();
             let visible = match other_tx.state.load() {
                 // V's sharp mind discovered an issue with the hekaton paper which basically states that a
                 // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
                 // Source: https://avi.im/blag/2023/hekaton-paper-typo/
                 TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                // Table 2 (Hekaton): If TS > RT, V is visible. If TS < RT, T speculatively ignores V.
-                TransactionState::Preparing(end_ts) => current_tx.begin_ts < end_ts,
+                // Hekaton Table 2: speculative ignore of TE. If end_ts <= begin_ts,
+                // we speculatively ignore V (treat deletion as committed). Register a
+                // dependency in case TE aborts (then V should have been visible).
+                TransactionState::Preparing(end_ts) => {
+                    turso_assert!(
+                        current_tx.tx_id != other_tx.tx_id,
+                        "a txn is reading itself while preparing"
+                    );
+                    let visible = current_tx.begin_ts < end_ts;
+                    if !visible {
+                        register_commit_dependency(txs, current_tx, rv_end);
+                    }
+                    visible
+                }
                 TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
                 TransactionState::Aborted => true,
                 // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
@@ -4322,6 +4907,10 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
         match self {
             Self::Initial => write!(f, "Initial"),
             Self::Commit { end_ts } => f.debug_struct("Commit").field("end_ts", end_ts).finish(),
+            Self::WaitForDependencies { end_ts } => f
+                .debug_struct("WaitForDependencies")
+                .field("end_ts", end_ts)
+                .finish(),
             Self::BeginCommitLogicalLog { end_ts, log_record } => f
                 .debug_struct("BeginCommitLogicalLog")
                 .field("end_ts", end_ts)

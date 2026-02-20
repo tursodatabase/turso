@@ -181,9 +181,9 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Connection,
 ) -> Result<()> {
-    let database_id = connection.resolve_database_id(&tbl_name)?;
+    let database_id = resolver.resolve_database_id(&tbl_name)?;
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
@@ -213,7 +213,7 @@ pub fn translate_create_table(
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
-        connection.with_schema(database_id, |s| s.get_object_type(&normalized_tbl_name))
+        resolver.with_schema(database_id, |s| s.get_object_type(&normalized_tbl_name))
     {
         match object_type {
             // IF NOT EXISTS suppresses errors for table/view conflicts
@@ -267,7 +267,7 @@ pub fn translate_create_table(
         }
     }
 
-    let schema_master_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let schema_master_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
     program.emit_insn(Insn::OpenWrite {
@@ -275,10 +275,10 @@ pub fn translate_create_table(
         root_page: 1i64.into(),
         db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
 
     let created_sequence_table = if has_autoincrement
-        && connection.with_schema(database_id, |s| {
+        && resolver.with_schema(database_id, |s| {
             s.get_table(SQLITE_SEQUENCE_TABLE_NAME).is_none()
         }) {
         let seq_table_root_reg = program.alloc_register();
@@ -355,7 +355,7 @@ pub fn translate_create_table(
         }
     }
 
-    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -363,7 +363,7 @@ pub fn translate_create_table(
         db: database_id,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
 
     emit_schema_entry(
         program,
@@ -399,7 +399,7 @@ pub fn translate_create_table(
     }
 
     program.resolve_label(parse_schema_label, program.offset());
-    let schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -660,7 +660,7 @@ pub fn translate_create_virtual_table(
     if !vtab_module.module_kind.eq(&VTabKind::VirtualTable) {
         bail_parse_error!("module {} is not a virtual table", module_name_str);
     };
-    if resolver.schema.get_table(&table_name).is_some() {
+    if resolver.schema().get_table(&table_name).is_some() {
         if *if_not_exists {
             return Ok(());
         }
@@ -702,7 +702,7 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -710,7 +710,7 @@ pub fn translate_create_virtual_table(
         db: 0,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
     let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
     emit_schema_entry(
         program,
@@ -727,7 +727,7 @@ pub fn translate_create_virtual_table(
     program.emit_insn(Insn::SetCookie {
         db: 0,
         cookie: Cookie::SchemaVersion,
-        value: resolver.schema.schema_version as i32 + 1,
+        value: resolver.schema().schema_version as i32 + 1,
         p5: 0,
     });
     let parse_schema_where_clause = format!("tbl_name = '{table_name}' AND type != 'trigger'");
@@ -753,7 +753,7 @@ fn validate_drop_table(
         bail_parse_error!("Cannot drop system table {}", tbl_name);
     }
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
-    if resolver.schema.is_materialized_view(tbl_name) {
+    if resolver.schema().is_materialized_view(tbl_name) {
         bail_parse_error!(
             "Cannot DROP TABLE on materialized view {tbl_name}. Use DROP VIEW instead.",
         );
@@ -768,7 +768,7 @@ pub fn translate_drop_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let database_id = connection.resolve_database_id(&tbl_name)?;
+    let database_id = resolver.resolve_database_id(&tbl_name)?;
     let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts {
         num_cursors: 4,
@@ -778,11 +778,11 @@ pub fn translate_drop_table(
     program.extend(&opts);
 
     if database_id >= 2 {
-        let schema_cookie = connection.with_schema(database_id, |s| s.schema_version);
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
 
-    let Some(table) = connection.with_schema(database_id, |s| s.get_table(name)) else {
+    let Some(table) = resolver.with_schema(database_id, |s| s.get_table(name)) else {
         if if_exists {
             return Ok(());
         }
@@ -792,11 +792,11 @@ pub fn translate_drop_table(
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()
-        && connection.with_schema(database_id, |s| s.any_resolved_fks_referencing(name))
+        && resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(name))
     {
         emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
     }
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
 
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
@@ -807,7 +807,7 @@ pub fn translate_drop_table(
     program.mark_last_insn_constant();
     let row_id_reg = program.alloc_register(); //  r5
 
-    let schema_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id_0 = program.alloc_cursor_id(
         //  cursor 0
         CursorType::BTreeTable(schema_table.clone()),
@@ -867,6 +867,7 @@ pub fn translate_drop_table(
                 &schema_table.columns,
                 sqlite_schema_cursor_id_0,
                 row_id_reg,
+                schema_table.is_strict,
             ))
         } else {
             None
@@ -902,7 +903,7 @@ pub fn translate_drop_table(
     }
 
     //  2. Destroy the indices within a loop
-    let indices = resolver.schema.get_indices(tbl_name.name.as_str());
+    let indices = resolver.schema().get_indices(tbl_name.name.as_str());
     for index in indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
             // Index methods without backing btree need special destroy handling
@@ -1121,7 +1122,7 @@ pub fn translate_drop_table(
 
     // if drops table, sequence table should reset.
     if let Some(seq_table) = resolver
-        .schema
+        .schema()
         .get_table(SQLITE_SEQUENCE_TABLE_NAME)
         .and_then(|t| t.btree())
     {
@@ -1175,7 +1176,7 @@ pub fn translate_drop_table(
 
     // Clean up turso_cdc_version entry for the dropped table (if version table exists)
     if let Some(version_table) = resolver
-        .schema
+        .schema()
         .get_table(crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME)
         .and_then(|t| t.btree())
     {
@@ -1234,7 +1235,7 @@ pub fn translate_drop_table(
         table_name: tbl_name.name.as_str().to_string(),
     });
 
-    let current_schema_version = connection.with_schema(database_id, |s| s.schema_version);
+    let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,

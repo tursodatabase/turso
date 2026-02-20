@@ -46,10 +46,6 @@ impl Subjournal {
         self.in_use.load(Ordering::SeqCst)
     }
 
-    pub fn size(&self) -> Result<u64> {
-        self.file.size()
-    }
-
     pub fn write_page(
         &self,
         offset: u64,

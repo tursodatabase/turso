@@ -1602,7 +1602,7 @@ impl CaptureDataChangesExt for Option<CaptureDataChangesInfo> {
 }
 
 // Optimized for fast get() operations and supports unlimited attached databases.
-struct DatabaseCatalog {
+pub(crate) struct DatabaseCatalog {
     name_to_index: HashMap<String, usize>,
     allocated: Vec<u64>,
     index_to_data: HashMap<usize, (Arc<Database>, Arc<Pager>)>,
@@ -1610,7 +1610,7 @@ struct DatabaseCatalog {
 
 #[allow(unused)]
 impl DatabaseCatalog {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             name_to_index: HashMap::default(),
             index_to_data: HashMap::default(),

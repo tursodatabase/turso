@@ -132,7 +132,7 @@ use crate::util::{
 use crate::Result;
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
-    Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
+    LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
@@ -940,6 +940,23 @@ impl Schema {
             // Look up the DBSP state index root (may not exist for older schemas)
             let dbsp_state_index_root =
                 dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
+
+            // Register the DBSP state index so integrity check can account for its pages.
+            if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
+                use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                use crate::incremental::operator::create_dbsp_state_index;
+                let mut index = create_dbsp_state_index(dbsp_state_index_root);
+                let dbsp_table_name =
+                    format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+                index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
+                index.table_name = dbsp_table_name;
+                if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
+                    if !e.to_string().contains("already exists") {
+                        return Err(e);
+                    }
+                }
+            }
+
             // Create the IncrementalView with all root pages
             let incremental_view = IncrementalView::from_sql(
                 &sql,
@@ -2592,6 +2609,13 @@ impl Column {
     pub fn affinity(&self) -> Affinity {
         Affinity::affinity(&self.ty_str)
     }
+    pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
+        if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
+            Affinity::Blob
+        } else {
+            Affinity::affinity(&self.ty_str)
+        }
+    }
     pub fn new_default_text(
         name: Option<String>,
         ty_str: String,
@@ -3192,7 +3216,7 @@ impl Index {
     pub fn bind_where_expr(
         &self,
         table_refs: Option<&mut TableReferences>,
-        connection: &Arc<Connection>,
+        resolver: &Resolver,
     ) -> Option<ast::Expr> {
         let Some(where_clause) = &self.where_clause else {
             return None;
@@ -3202,7 +3226,7 @@ impl Index {
             &mut expr,
             table_refs,
             None,
-            connection,
+            resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )
         .ok()?;

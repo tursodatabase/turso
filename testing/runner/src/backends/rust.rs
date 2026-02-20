@@ -55,7 +55,7 @@ impl SqlBackend for RustBackend {
     }
 
     fn capabilities(&self) -> HashSet<Capability> {
-        HashSet::from_iter([Capability::Trigger])
+        HashSet::from_iter([Capability::Trigger, Capability::MaterializedViews])
     }
 
     fn supports_snapshots(&self) -> bool {
@@ -95,6 +95,7 @@ impl SqlBackend for RustBackend {
             .experimental_triggers(true)
             .experimental_attach(true)
             .experimental_index_method(true)
+            .experimental_materialized_views(true)
             .build()
             .await
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;

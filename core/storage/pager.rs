@@ -17,7 +17,7 @@ use crate::storage::{
     wal::{CheckpointResult, RollbackTo, Wal, IOV_MAX},
 };
 use crate::sync::atomic::{
-    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
@@ -397,7 +397,10 @@ impl PageInner {
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
-        let (rowid, _) = read_varint(&buf[cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..])?;
+        let (rowid, _) = read_varint(crate::slice_in_bounds_or_corrupt!(
+            buf,
+            cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..
+        ))?;
         Ok(rowid as i64)
     }
 
@@ -411,14 +414,12 @@ impl PageInner {
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
-        // Validate cell pointer is within page bounds (need 4 bytes for u32)
-        if cell_pointer + 4 > buf.len() {
-            return Err(crate::LimboError::Corrupt(format!(
-                "cell pointer {} out of bounds for page size {}",
-                cell_pointer,
-                buf.len()
-            )));
-        }
+        crate::assert_or_bail_corrupt!(
+            cell_pointer + 4 <= buf.len(),
+            "cell pointer {} out of bounds for page size {}",
+            cell_pointer,
+            buf.len()
+        );
         Ok(u32::from_be_bytes([
             buf[cell_pointer],
             buf[cell_pointer + 1],
@@ -435,9 +436,9 @@ impl PageInner {
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         let mut pos = cell_pointer;
-        let (_, nr) = read_varint(&buf[pos..])?;
+        let (_, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
         pos += nr;
-        let (rowid, _) = read_varint(&buf[pos..])?;
+        let (rowid, _) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
         Ok(rowid as i64)
     }
 
@@ -461,11 +462,13 @@ impl PageInner {
         let page_type = self.page_type()?;
         let (payload_size, varint_len, header_skip) = match page_type {
             PageType::IndexInterior => {
-                let (size, len) = read_varint(&buf[cell_offset + 4..])?;
+                let (size, len) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset + 4..))?;
                 (size, len, 4usize)
             }
             PageType::IndexLeaf => {
-                let (size, len) = read_varint(&buf[cell_offset..])?;
+                let (size, len) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset..))?;
                 (size, len, 0usize)
             }
             _ => unreachable!("cell_index_read_payload_ptr called on non-index page"),
@@ -484,25 +487,43 @@ impl PageInner {
 
         let (payload_slice, first_overflow) = if overflows {
             let overflow_ptr_offset = payload_start + local_size - 4;
+            crate::assert_or_bail_corrupt!(
+                overflow_ptr_offset + 4 <= buf.len(),
+                "overflow pointer offset {} out of bounds for page size {}",
+                overflow_ptr_offset,
+                buf.len()
+            );
             let first_overflow_page = u32::from_be_bytes([
                 buf[overflow_ptr_offset],
                 buf[overflow_ptr_offset + 1],
                 buf[overflow_ptr_offset + 2],
                 buf[overflow_ptr_offset + 3],
             ]);
+            let payload_end = payload_start + local_size - 4;
+            crate::assert_or_bail_corrupt!(
+                payload_start < payload_end && payload_end <= buf.len(),
+                "payload range {}..{} out of bounds for page size {}",
+                payload_start,
+                payload_end,
+                buf.len()
+            );
             // SAFETY: valid as long as page is alive
             let slice = unsafe {
-                std::mem::transmute::<&[u8], &'static [u8]>(
-                    &buf[payload_start..payload_start + local_size - 4],
-                )
+                std::mem::transmute::<&[u8], &'static [u8]>(&buf[payload_start..payload_end])
             };
             (slice, Some(first_overflow_page))
         } else {
+            let payload_end = payload_start + payload_size as usize;
+            crate::assert_or_bail_corrupt!(
+                payload_end <= buf.len(),
+                "payload range {}..{} out of bounds for page size {}",
+                payload_start,
+                payload_end,
+                buf.len()
+            );
             // SAFETY: valid as long as page is alive
             let slice = unsafe {
-                std::mem::transmute::<&[u8], &'static [u8]>(
-                    &buf[payload_start..payload_start + payload_size as usize],
-                )
+                std::mem::transmute::<&[u8], &'static [u8]>(&buf[payload_start..payload_end])
             };
             (slice, None)
         };
@@ -540,14 +561,14 @@ impl PageInner {
         let max_local = payload_overflow_threshold_max(page_type, usable_size);
         let min_local = payload_overflow_threshold_min(page_type, usable_size);
         let cell_count = self.cell_count();
-        Ok(self._cell_get_raw_region_faster(
+        self._cell_get_raw_region_faster(
             idx,
             usable_size,
             cell_count,
             max_local,
             min_local,
             page_type,
-        ))
+        )
     }
 
     #[inline]
@@ -559,13 +580,14 @@ impl PageInner {
         max_local: usize,
         min_local: usize,
         page_type: PageType,
-    ) -> (usize, usize) {
+    ) -> crate::Result<(usize, usize)> {
         let buf = self.as_ptr();
         turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
         let len = match page_type {
             PageType::IndexInterior => {
-                let (len_payload, n_payload) = read_varint(&buf[start + 4..]).unwrap();
+                let (len_payload, n_payload) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, start + 4..))?;
                 let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
@@ -579,11 +601,13 @@ impl PageInner {
                 }
             }
             PageType::TableInterior => {
-                let (_, n_rowid) = read_varint(&buf[start + 4..]).unwrap();
+                let (_, n_rowid) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, start + 4..))?;
                 4 + n_rowid
             }
             PageType::IndexLeaf => {
-                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
+                let (len_payload, n_payload) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, start..))?;
                 let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
@@ -601,8 +625,10 @@ impl PageInner {
                 }
             }
             PageType::TableLeaf => {
-                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
-                let (_, n_rowid) = read_varint(&buf[start + n_payload..]).unwrap();
+                let (len_payload, n_payload) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, start..))?;
+                let (_, n_rowid) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, start + n_payload..))?;
                 let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
@@ -620,7 +646,14 @@ impl PageInner {
                 }
             }
         };
-        (start, len)
+        crate::assert_or_bail_corrupt!(
+            start + len <= buf.len(),
+            "cell region {}..{} out of bounds for page size {}",
+            start,
+            start + len,
+            buf.len()
+        );
+        Ok((start, len))
     }
 
     pub fn is_leaf(&self) -> bool {
@@ -1134,7 +1167,37 @@ enum BtreeCreateVacuumFullState {
     PtrMapPut { allocated_page_id: u32 },
 }
 
-pub struct Savepoint {
+#[derive(Debug, Clone)]
+enum SavepointKind {
+    Statement,
+    Named {
+        name: String,
+        starts_transaction: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SavepointResult {
+    /// Releasing the named savepoint should commit the surrounding transaction.
+    Commit,
+    /// The named savepoint was released without committing the transaction.
+    Release,
+    /// No matching named savepoint exists.
+    NotFound,
+}
+
+#[derive(Debug, Clone)]
+struct SavepointSnapshot {
+    kind: SavepointKind,
+    start_offset: u64,
+    db_size: u32,
+    wal_max_frame: u64,
+    wal_checksum: (u32, u32),
+    deferred_fk_violations: isize,
+}
+
+struct Savepoint {
+    kind: SavepointKind,
     /// Start offset of this savepoint in the subjournal.
     start_offset: AtomicU64,
     /// Current write offset in the subjournal.
@@ -1150,22 +1213,28 @@ pub struct Savepoint {
     wal_max_frame: AtomicU64,
     /// WAL checksum at the start of the savepoint.
     wal_checksum: RwLock<(u32, u32)>,
+    /// Deferred FK counter value at the start of this savepoint.
+    deferred_fk_violations: AtomicIsize,
 }
 
 impl Savepoint {
-    pub fn new(
+    fn new(
+        kind: SavepointKind,
         subjournal_offset: u64,
         db_size: u32,
         wal_max_frame: u64,
         wal_checksum: (u32, u32),
+        deferred_fk_violations: isize,
     ) -> Self {
         Self {
+            kind,
             start_offset: AtomicU64::new(subjournal_offset),
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(db_size),
             wal_max_frame: AtomicU64::new(wal_max_frame),
             wal_checksum: RwLock::new(wal_checksum),
+            deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
         }
     }
 
@@ -1175,6 +1244,42 @@ impl Savepoint {
 
     pub fn has_dirty_page(&self, page_num: u32) -> bool {
         self.page_bitmap.read().contains(page_num)
+    }
+
+    fn start_offset(&self) -> u64 {
+        self.start_offset.load(Ordering::Acquire)
+    }
+
+    fn write_offset(&self) -> u64 {
+        self.write_offset.load(Ordering::Acquire)
+    }
+
+    fn set_write_offset(&self, offset: u64) {
+        self.write_offset.store(offset, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> SavepointSnapshot {
+        SavepointSnapshot {
+            kind: self.kind.clone(),
+            start_offset: self.start_offset(),
+            db_size: self.db_size.load(Ordering::Acquire),
+            wal_max_frame: self.wal_max_frame.load(Ordering::Acquire),
+            wal_checksum: *self.wal_checksum.read(),
+            deferred_fk_violations: self.deferred_fk_violations.load(Ordering::Acquire),
+        }
+    }
+
+    fn from_snapshot(snapshot: SavepointSnapshot) -> Self {
+        Self {
+            kind: snapshot.kind,
+            start_offset: AtomicU64::new(snapshot.start_offset),
+            write_offset: AtomicU64::new(snapshot.start_offset),
+            page_bitmap: RwLock::new(RoaringBitmap::new()),
+            db_size: AtomicU32::new(snapshot.db_size),
+            wal_max_frame: AtomicU64::new(snapshot.wal_max_frame),
+            wal_checksum: RwLock::new(snapshot.wal_checksum),
+            deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
+        }
     }
 }
 
@@ -1606,48 +1711,104 @@ impl Pager {
     }
 
     pub fn open_savepoint(&self, db_size: u32) -> Result<()> {
-        let subjournal_offset = {
-            let subjournal = self.subjournal.read();
-            let subjournal = subjournal.as_ref().expect("subjournal must be opened");
-            subjournal.size()?
-        };
-        // Currently as we only have anonymous savepoints opened at the start of a statement,
-        // the subjournal offset should always be 0 as we should only have max 1 savepoint
-        // opened at any given time.
-        turso_assert!(subjournal_offset == 0, "subjournal offset should be 0");
-        let (wal_max_frame, wal_checksum) = if let Some(wal) = &self.wal {
-            (wal.get_max_frame(), wal.get_last_checksum())
-        } else {
-            (0, (0, 0))
-        };
-        let savepoint = Savepoint::new(subjournal_offset, db_size, wal_max_frame, wal_checksum);
-        let mut savepoints = self.savepoints.write();
-        turso_assert!(
-            savepoints.is_empty(),
-            "savepoints should be empty",
-            { "savepoints_count": savepoints.len() }
-        );
-        savepoints.push(savepoint);
-        Ok(())
+        self.open_savepoint_with_kind(SavepointKind::Statement, db_size, 0)
     }
 
     /// Release i.e. commit the current savepoint. This basically just means removing it.
     pub fn release_savepoint(&self) -> Result<()> {
         let mut savepoints = self.savepoints.write();
-        let Some(savepoint) = savepoints.pop() else {
+        if !matches!(
+            savepoints.last().map(|savepoint| &savepoint.kind),
+            Some(SavepointKind::Statement)
+        ) {
             return Ok(());
         };
-        let subjournal = self.subjournal.read();
-        let Some(subjournal) = subjournal.as_ref() else {
-            return Ok(());
-        };
-        let start_offset = savepoint.start_offset.load(Ordering::SeqCst);
-        // Same reason as in open_savepoint, the start offset should always be 0 as we should only have max 1 savepoint
-        // opened at any given time.
-        turso_assert!(start_offset == 0, "start offset should be 0");
-        let c = subjournal.truncate(start_offset)?;
-        turso_assert!(c.succeeded(), "memory IO should complete immediately");
+        let savepoint = savepoints.pop().expect("savepoint must exist");
+        if let Some(parent) = savepoints.last() {
+            parent.set_write_offset(savepoint.write_offset());
+        } else {
+            let subjournal = self.subjournal.read();
+            let Some(subjournal) = subjournal.as_ref() else {
+                return Ok(());
+            };
+            let c = subjournal.truncate(0)?;
+            turso_assert!(c.succeeded(), "memory IO should complete immediately");
+        }
         Ok(())
+    }
+
+    /// Opens a named savepoint and captures rollback metadata for the current transaction state.
+    ///
+    /// If `starts_transaction` is true, releasing this savepoint at the root depth commits the
+    /// transaction.
+    pub fn open_named_savepoint(
+        &self,
+        name: String,
+        db_size: u32,
+        starts_transaction: bool,
+        deferred_fk_violations: isize,
+    ) -> Result<()> {
+        self.open_savepoint_with_kind(
+            SavepointKind::Named {
+                name,
+                starts_transaction,
+            },
+            db_size,
+            deferred_fk_violations,
+        )
+    }
+
+    /// Releases the newest matching named savepoint and all nested savepoints opened after it.
+    pub fn release_named_savepoint(&self, name: &str) -> Result<SavepointResult> {
+        let mut savepoints = self.savepoints.write();
+        let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
+            matches!(
+                savepoint.kind,
+                SavepointKind::Named {
+                    name: ref savepoint_name,
+                    ..
+                } if savepoint_name == name
+            )
+        }) else {
+            return Ok(SavepointResult::NotFound);
+        };
+
+        let result = if matches!(
+            savepoints[target_idx].kind,
+            SavepointKind::Named {
+                starts_transaction: true,
+                ..
+            }
+        ) && target_idx == 0
+        {
+            SavepointResult::Commit
+        } else {
+            SavepointResult::Release
+        };
+        if matches!(result, SavepointResult::Commit) {
+            // Defer mutation until transaction commit succeeds. If commit fails
+            // (e.g. deferred FK violation), savepoints must remain intact.
+            return Ok(result);
+        }
+        let journal_end_offset = savepoints
+            .last()
+            .map(|savepoint| savepoint.write_offset())
+            .unwrap_or(0);
+
+        savepoints.truncate(target_idx);
+
+        if let Some(parent) = savepoints.last() {
+            parent.set_write_offset(journal_end_offset);
+        } else {
+            let subjournal = self.subjournal.read();
+            let Some(subjournal) = subjournal.as_ref() else {
+                return Ok(result);
+            };
+            let c = subjournal.truncate(0)?;
+            assert!(c.succeeded(), "memory IO should complete immediately");
+        }
+
+        Ok(result)
     }
 
     pub fn clear_savepoints(&self) -> Result<()> {
@@ -1664,43 +1825,126 @@ impl Pager {
     /// Rollback to the newest savepoint. This basically just means reading the subjournal from the start offset
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
     pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
+        let mut savepoints = self.savepoints.write();
+        if !matches!(
+            savepoints.last().map(|savepoint| &savepoint.kind),
+            Some(SavepointKind::Statement)
+        ) {
+            return Ok(false);
+        }
+        let savepoint = savepoints.pop().expect("savepoint must exist");
+        let journal_end_offset = savepoint.write_offset();
+        let savepoint = savepoint.snapshot();
+
+        self.rollback_to_snapshot(&savepoint, journal_end_offset)?;
+
+        if let Some(parent) = savepoints.last() {
+            parent.set_write_offset(savepoint.start_offset);
+        }
+
+        Ok(true)
+    }
+
+    /// Rollback to the newest matching named savepoint while keeping the named savepoint active.
+    ///
+    /// Returns deferred FK counter snapshot for the rolled-back savepoint.
+    pub fn rollback_to_named_savepoint(&self, name: &str) -> Result<Option<isize>> {
+        let target = {
+            let savepoints = self.savepoints.read();
+            let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
+                matches!(
+                    savepoint.kind,
+                    SavepointKind::Named {
+                        name: ref savepoint_name,
+                        ..
+                    } if savepoint_name == name
+                )
+            }) else {
+                return Ok(None);
+            };
+            let journal_end_offset = savepoints
+                .last()
+                .map(|savepoint| savepoint.write_offset())
+                .unwrap_or_else(|| savepoints[target_idx].write_offset());
+            (
+                target_idx,
+                savepoints[target_idx].snapshot(),
+                journal_end_offset,
+            )
+        };
+
+        self.rollback_to_snapshot(&target.1, target.2)?;
+
+        let mut savepoints = self.savepoints.write();
+        let deferred_fk_violations = target.1.deferred_fk_violations;
+        savepoints.truncate(target.0);
+        if let Some(parent) = savepoints.last() {
+            parent.set_write_offset(target.1.start_offset);
+        }
+        savepoints.push(Savepoint::from_snapshot(target.1));
+
+        Ok(Some(deferred_fk_violations))
+    }
+
+    fn open_savepoint_with_kind(
+        &self,
+        kind: SavepointKind,
+        db_size: u32,
+        deferred_fk_violations: isize,
+    ) -> Result<()> {
+        let subjournal_offset = self
+            .savepoints
+            .read()
+            .last()
+            .map(|savepoint| savepoint.write_offset())
+            .unwrap_or(0);
+        let (wal_max_frame, wal_checksum) = if let Some(wal) = &self.wal {
+            (wal.get_max_frame(), wal.get_last_checksum())
+        } else {
+            (0, (0, 0))
+        };
+        let savepoint = Savepoint::new(
+            kind,
+            subjournal_offset,
+            db_size,
+            wal_max_frame,
+            wal_checksum,
+            deferred_fk_violations,
+        );
+        self.savepoints.write().push(savepoint);
+        Ok(())
+    }
+
+    fn rollback_to_snapshot(
+        &self,
+        savepoint: &SavepointSnapshot,
+        journal_end_offset: u64,
+    ) -> Result<()> {
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
-            return Ok(false);
+            return Ok(());
         };
-        let mut savepoints = self.savepoints.write();
-        let Some(savepoint) = savepoints.pop() else {
-            return Ok(false);
-        };
-        let journal_start_offset = savepoint.start_offset.load(Ordering::SeqCst);
+
+        let journal_start_offset = savepoint.start_offset;
+        let db_size = savepoint.db_size;
 
         let mut rollback_bitset = RoaringBitmap::new();
-
-        // Read the subjournal starting from start offset, first reading 4 bytes to get page id, then if rollback_bitset already has the page, skip reading the page
-        // and just advance the offset. otherwise read the page and add the page id to the rollback_bitset + put the page image into the page cache
         let mut current_offset = journal_start_offset;
         let page_size = self.page_size.load(Ordering::SeqCst) as u64;
-        let journal_end_offset = savepoint.write_offset.load(Ordering::SeqCst);
-        let db_size = savepoint.db_size.load(Ordering::SeqCst);
-
         let mut dirty_pages = self.dirty_pages.write();
 
         while current_offset < journal_end_offset {
-            // Read 4 bytes for page id
             let page_id_buffer = Arc::new(self.buffer_pool.allocate(4));
             let c = subjournal.read_page_number(current_offset, page_id_buffer.clone())?;
             turso_assert!(c.succeeded(), "memory IO should complete immediately");
             let page_id = u32::from_be_bytes(page_id_buffer.as_slice()[0..4].try_into().unwrap());
             current_offset += 4;
 
-            // Check if we've already rolled back this page or if the page is beyond the database size at the start of the savepoint
-            let already_rolled_back = rollback_bitset.contains(page_id);
-            if already_rolled_back {
+            if rollback_bitset.contains(page_id) {
                 current_offset += page_size;
                 continue;
             }
-            let page_wont_exist_after_rollback = page_id > db_size;
-            if page_wont_exist_after_rollback {
+            if page_id > db_size {
                 dirty_pages.remove(page_id);
                 if let Some(page) = self
                     .page_cache
@@ -1715,7 +1959,6 @@ impl Pager {
                 continue;
             }
 
-            // Read the page data
             let page_buffer = Arc::new(self.buffer_pool.allocate(page_size as usize));
             let page = Arc::new(Page::new(page_id as i64));
             let c = subjournal.read_page(
@@ -1726,11 +1969,7 @@ impl Pager {
             )?;
             turso_assert!(c.succeeded(), "memory IO should complete immediately");
             current_offset += page_size;
-
-            // Add page to rollback bitset
             rollback_bitset.insert(page_id);
-
-            // Put the page image into the page cache
             self.upsert_page_in_cache(page_id as usize, page, false)?;
         }
 
@@ -1743,15 +1982,13 @@ impl Pager {
         self.page_cache.write().truncate(db_size as usize)?;
 
         if let Some(wal) = &self.wal {
-            let wal_max_frame = savepoint.wal_max_frame.load(Ordering::SeqCst);
-            let wal_checksum = *savepoint.wal_checksum.read();
             wal.rollback(Some(RollbackTo {
-                frame: wal_max_frame,
-                checksum: wal_checksum,
+                frame: savepoint.wal_max_frame,
+                checksum: savepoint.wal_checksum,
             }));
         }
 
-        Ok(true)
+        Ok(())
     }
 
     #[cfg(feature = "test_helper")]
@@ -2333,6 +2570,7 @@ impl Pager {
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
+            self.clear_savepoints()?;
             return Ok(IOResult::Done(()));
         };
 
@@ -2367,6 +2605,7 @@ impl Pager {
                             self.cleanup_after_auto_checkpoint_failure();
                         }
                     }
+                    self.clear_savepoints()?;
                     return Ok(IOResult::Done(()));
                 }
                 _ => {
@@ -2394,6 +2633,7 @@ impl Pager {
 
                     if self.commit_info.read().state != CommitState::AutoCheckpoint {
                         complete_commit();
+                        self.clear_savepoints()?;
                         return Ok(IOResult::Done(()));
                     }
                 }
@@ -3716,8 +3956,19 @@ impl Pager {
                         return_if_io!(self.with_header(|header| header.database_size)).get();
                     let page_size = self.get_page_size().unwrap_or_default();
                     let expected = (db_size * page_size.get()) as u64;
-                    if expected >= self.db_file.size()? {
-                        // No DB truncation needed, move to next phase
+                    let should_skip_db_truncate = match self.db_file.size() {
+                        Ok(current_size) => expected >= current_size,
+                        Err(err) => {
+                            // e.g. file.size() is not supported in web worker environment, so we should
+                            // skip the truncate if we can't check the size.
+                            tracing::debug!(
+                                "checkpoint(TRUNCATE): db_file.size unavailable, skipping db truncate pre-check: {err}"
+                            );
+                            true
+                        }
+                    };
+                    if should_skip_db_truncate {
+                        // No DB truncation needed (or unsupported size pre-check), move to next phase.
                         let mut state = self.checkpoint_state.write();
                         if sync_mode == crate::SyncMode::Off {
                             // Skip DB sync, proceed to WAL truncation
@@ -3921,8 +4172,8 @@ impl Pager {
 
     pub fn freepage_list(&self) -> u32 {
         self.io
-            .block(|| HeaderRefMut::from_pager(self))
-            .map(|header_ref| header_ref.borrow_mut().freelist_pages.into())
+            .block(|| HeaderRef::from_pager(self))
+            .map(|header_ref| header_ref.borrow().freelist_pages.get())
             .unwrap_or(0)
     }
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.

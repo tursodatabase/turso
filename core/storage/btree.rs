@@ -616,6 +616,10 @@ pub trait CursorTrait: Any + Send + Sync {
     fn has_rowid(&self) -> bool;
     fn get_pager(&self) -> Arc<Pager>;
     fn get_skip_advance(&self) -> bool;
+    /// Invalidate cached navigation state. Must be called on cursors that
+    /// share a btree (e.g. OpenDup cursors) when the btree structure is
+    /// modified by another cursor (e.g. clear_btree via ResetSorter).
+    fn invalidate_btree_cache(&mut self) {}
     // --- end: BTreeCursor specific functions ----
 }
 
@@ -2953,7 +2957,7 @@ impl BTreeCursor {
                                     parent_max_local,
                                     parent_min_local,
                                     parent_page_type,
-                                );
+                                )?;
                             let buf = parent_contents.as_ptr();
                             &buf[cell_start..cell_start + cell_len]
                         };
@@ -3042,7 +3046,7 @@ impl BTreeCursor {
                                     max_local,
                                     min_local,
                                     page_type,
-                                );
+                                )?;
                             let buf = old_page_contents.as_ptr();
                             let cell_buf = &mut buf[cell_start..cell_start + cell_len];
                             // TODO(pere): make this reference and not copy
@@ -5688,6 +5692,10 @@ impl CursorTrait for BTreeCursor {
         self.skip_advance
     }
 
+    fn invalidate_btree_cache(&mut self) {
+        self.move_to_right_state.1 = None;
+    }
+
     #[inline]
     fn has_record(&self) -> bool {
         self.has_record
@@ -5825,9 +5833,7 @@ pub enum IntegrityCheckError {
         references: Vec<i64>,
         page_category: PageCategory,
     },
-    #[error(
-        "Freelist count mismatch. actual_count={actual_count}, expected_count={expected_count}"
-    )]
+    #[error("Freelist: size is {actual_count} but should be {expected_count}")]
     FreelistCountMismatch {
         actual_count: usize,
         expected_count: usize,
@@ -5836,36 +5842,16 @@ pub enum IntegrityCheckError {
     PageNeverUsed { page_id: i64 },
     #[error("Pending byte page {page_id} is being used")]
     PendingBytePageUsed { page_id: i64 },
-    #[error(
-        "Freelist trunk page {page_id} has invalid pointer count {page_pointers} (max {max_pointers})"
-    )]
+    #[error("Freelist: freelist leaf count too big on page {page_id}")]
     FreelistTrunkCorrupt {
         page_id: i64,
         page_pointers: u32,
         max_pointers: usize,
     },
-    #[error("Freelist page pointer out of range: page {page_id} points to {pointer}")]
+    #[error("Freelist: invalid page number {pointer}")]
     FreelistPointerOutOfRange { page_id: i64, pointer: i64 },
-    #[error("wrong # of entries in index {index_name}")]
-    IndexEntryCountMismatch {
-        index_name: String,
-        table_name: String,
-        index_count: usize,
-        table_count: usize,
-    },
-    #[error("NULL value in {table_name}.{column_name}")]
-    NotNullViolation {
-        table_name: String,
-        column_name: String,
-        rowid: i64,
-    },
-    #[error("non-unique entry in index {index_name}")]
-    UniqueViolation { index_name: String },
-    #[error("row {row_number} missing from index {index_name}")]
-    RowMissingFromIndex {
-        row_number: usize,
-        index_name: String,
-    },
+    #[error("overflow list length is {got} but should be {expected}")]
+    OverflowListLengthMismatch { got: usize, expected: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5874,8 +5860,6 @@ pub enum PageCategory {
     Overflow,
     FreeListTrunk,
     FreePage,
-    #[cfg(not(feature = "omit_autovacuum"))]
-    PointerMap,
 }
 
 #[derive(Clone)]
@@ -5890,6 +5874,8 @@ struct IntegrityCheckPageEntry {
     level: usize,
     max_intkey: i64,
     page_category: PageCategory,
+    overflow_pages_expected: Option<usize>,
+    overflow_pages_seen: usize,
 }
 pub struct IntegrityCheckState {
     page_stack: Vec<IntegrityCheckPageEntry>,
@@ -5938,6 +5924,8 @@ impl IntegrityCheckState {
                 level: 0,
                 max_intkey: i64::MAX,
                 page_category,
+                overflow_pages_expected: None,
+                overflow_pages_seen: 0,
             },
             0,
             errors,
@@ -5968,6 +5956,20 @@ impl std::fmt::Debug for IntegrityCheckState {
             .field("first_leaf_level", &self.first_leaf_level)
             .finish()
     }
+}
+
+fn overflow_pages_expected_for_cell(
+    payload_size: u64,
+    local_payload_size: usize,
+    usable_space: usize,
+) -> usize {
+    let payload_size = usize::try_from(payload_size).unwrap_or(usize::MAX);
+    let remaining_payload = payload_size.saturating_sub(local_payload_size);
+    if remaining_payload == 0 {
+        return 0;
+    }
+    let overflow_page_payload = usable_space.saturating_sub(4).max(1);
+    remaining_payload.div_ceil(overflow_page_payload)
 }
 
 /// Perform integrity check on a whole table/index. We check for:
@@ -6014,6 +6016,8 @@ pub fn integrity_check(
             page_category,
             level,
             max_intkey,
+            overflow_pages_expected,
+            overflow_pages_seen,
         }) = state.page_stack.last().cloned()
         else {
             return Ok(IOResult::Done(()));
@@ -6061,6 +6065,8 @@ pub fn integrity_check(
                         level,
                         max_intkey,
                         page_category: PageCategory::FreeListTrunk,
+                        overflow_pages_expected: None,
+                        overflow_pages_seen: 0,
                     },
                     page.get().id as i64,
                     errors,
@@ -6122,6 +6128,8 @@ pub fn integrity_check(
                         level,
                         max_intkey,
                         page_category: PageCategory::FreePage,
+                        overflow_pages_expected: None,
+                        overflow_pages_seen: 0,
                     },
                     page.get().id as i64,
                     errors,
@@ -6134,6 +6142,7 @@ pub fn integrity_check(
             continue;
         }
         if page_category == PageCategory::Overflow {
+            let overflow_pages_seen = overflow_pages_seen.saturating_add(1);
             let next_overflow_page = contents.read_u32_no_offset(0);
             if next_overflow_page != 0 {
                 state.push_page(
@@ -6142,10 +6151,19 @@ pub fn integrity_check(
                         level,
                         max_intkey,
                         page_category: PageCategory::Overflow,
+                        overflow_pages_expected,
+                        overflow_pages_seen,
                     },
                     page.get().id as i64,
                     errors,
                 );
+            } else if let Some(expected) = overflow_pages_expected {
+                if overflow_pages_seen != expected {
+                    errors.push(IntegrityCheckError::OverflowListLengthMismatch {
+                        got: overflow_pages_seen,
+                        expected,
+                    });
+                }
             }
             continue;
         }
@@ -6196,6 +6214,8 @@ pub fn integrity_check(
                             level: level + 1,
                             max_intkey: table_interior_cell.rowid,
                             page_category: PageCategory::Normal,
+                            overflow_pages_expected: None,
+                            overflow_pages_seen: 0,
                         },
                         page.get().id as i64,
                         errors,
@@ -6239,12 +6259,19 @@ pub fn integrity_check(
                     }
                     next_rowid = rowid;
                     if let Some(first_overflow_page) = table_leaf_cell.first_overflow_page {
+                        let expected_pages = overflow_pages_expected_for_cell(
+                            table_leaf_cell.payload_size,
+                            table_leaf_cell.payload.len(),
+                            usable_space,
+                        );
                         state.push_page(
                             IntegrityCheckPageEntry {
                                 page_idx: first_overflow_page as i64,
                                 level,
                                 max_intkey,
                                 page_category: PageCategory::Overflow,
+                                overflow_pages_expected: Some(expected_pages),
+                                overflow_pages_seen: 0,
                             },
                             page.get().id as i64,
                             errors,
@@ -6258,17 +6285,26 @@ pub fn integrity_check(
                             level: level + 1,
                             max_intkey, // we don't care about intkey in non-table pages
                             page_category: PageCategory::Normal,
+                            overflow_pages_expected: None,
+                            overflow_pages_seen: 0,
                         },
                         page.get().id as i64,
                         errors,
                     );
                     if let Some(first_overflow_page) = index_interior_cell.first_overflow_page {
+                        let expected_pages = overflow_pages_expected_for_cell(
+                            index_interior_cell.payload_size,
+                            index_interior_cell.payload.len(),
+                            usable_space,
+                        );
                         state.push_page(
                             IntegrityCheckPageEntry {
                                 page_idx: first_overflow_page as i64,
                                 level,
                                 max_intkey,
                                 page_category: PageCategory::Overflow,
+                                overflow_pages_expected: Some(expected_pages),
+                                overflow_pages_seen: 0,
                             },
                             page.get().id as i64,
                             errors,
@@ -6289,12 +6325,19 @@ pub fn integrity_check(
                         state.first_leaf_level = Some(level);
                     }
                     if let Some(first_overflow_page) = index_leaf_cell.first_overflow_page {
+                        let expected_pages = overflow_pages_expected_for_cell(
+                            index_leaf_cell.payload_size,
+                            index_leaf_cell.payload.len(),
+                            usable_space,
+                        );
                         state.push_page(
                             IntegrityCheckPageEntry {
                                 page_idx: first_overflow_page as i64,
                                 level,
                                 max_intkey,
                                 page_category: PageCategory::Overflow,
+                                overflow_pages_expected: Some(expected_pages),
+                                overflow_pages_seen: 0,
                             },
                             page.get().id as i64,
                             errors,
@@ -6311,6 +6354,8 @@ pub fn integrity_check(
                     level: level + 1,
                     max_intkey,
                     page_category: PageCategory::Normal,
+                    overflow_pages_expected: None,
+                    overflow_pages_seen: 0,
                 },
                 page.get().id as i64,
                 errors,
@@ -7646,7 +7691,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
             max_local,
             min_local,
             page_type,
-        );
+        )?;
 
         if pc > last_offset {
             is_physically_sorted = false;
@@ -8817,7 +8862,7 @@ mod tests {
         let do_validate_btree = std::env::var("VALIDATE_BTREE")
             .is_ok_and(|v| v.parse().expect("validate should be bool"));
         let (mut rng, seed) = rng_from_time_or_env();
-        let mut seen = HashSet::default();
+        let mut seen = crate::HashSet::default();
         tracing::info!("super seed: {}", seed);
         let num_columns = 5;
 
@@ -8938,7 +8983,7 @@ mod tests {
         } else {
             rng_from_time_or_env()
         };
-        let mut seen = HashSet::default();
+        let mut seen = crate::HashSet::default();
         tracing::info!("super seed: {}", seed);
         for _ in 0..attempts {
             let (pager, _, _db, conn) = empty_btree();
@@ -9110,7 +9155,7 @@ mod tests {
         } else {
             rng_from_time_or_env()
         };
-        let mut seen = HashSet::default();
+        let mut seen = crate::HashSet::default();
         tracing::info!("super seed: {}", seed);
 
         for _ in 0..attempts {

@@ -1153,6 +1153,22 @@ impl IncrementalView {
             "populate_from_table should only be called for materialized views with root_page"
         );
 
+        // Mark as nested for the duration of this call to prevent inner queries from
+        // committing the outer transaction's dirty pages. We increment on every entry
+        // and decrement on every exit (including IO yields and errors) so re-entrant
+        // calls keep the counter balanced.
+        conn.start_nested();
+        let result = self.populate_from_table_inner(conn, pager, _btree_cursor);
+        conn.end_nested();
+        result
+    }
+
+    fn populate_from_table_inner(
+        &mut self,
+        conn: &crate::sync::Arc<crate::Connection>,
+        pager: &crate::sync::Arc<crate::Pager>,
+        _btree_cursor: &mut dyn CursorTrait,
+    ) -> crate::Result<IOResult<()>> {
         'outer: loop {
             match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
                 PopulateState::Start => {
@@ -1183,13 +1199,13 @@ impl IncrementalView {
                     }
 
                     let query = queries[current_idx].clone();
-                    // Create a new connection for reading to avoid transaction conflicts
-                    // This allows us to read from tables while the parent transaction is writing the view
-                    // The statement holds a reference to this connection, keeping it alive
-                    let read_conn = conn.db.connect()?;
+                    // Use the parent connection directly for reading.
+                    // We need to use the same connection that has the uncommitted schema changes.
+                    // Creating a new connection would cause schema version mismatch issues because
+                    // the new connection's schema cookie check would fail (database file has old version).
 
-                    // Prepare the statement using the read connection
-                    let stmt = read_conn.prepare(&query)?;
+                    // Prepare the statement using the parent connection
+                    let stmt = conn.prepare(&query)?;
 
                     self.populate_state = PopulateState::ProcessingOneTable {
                         queries,

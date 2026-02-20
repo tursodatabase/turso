@@ -1081,7 +1081,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core_tester"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1091,6 +1091,7 @@ dependencies = [
  "rand 0.9.2",
  "rand_chacha 0.9.0",
  "rusqlite",
+ "serial_test",
  "similar-asserts",
  "sql_generation",
  "tempfile",
@@ -1527,7 +1528,7 @@ checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "differential-fuzzer"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -1960,6 +1961,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "fslock"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04412b8935272e3a9bae6f48c7bfff74c2911f60525404edfdd28e49884c3bfb"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -2975,7 +2986,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_completion"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -2983,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_crypto"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -2996,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_csv"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "csv",
  "mimalloc",
@@ -3006,7 +3017,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_fuzzy"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3014,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ipaddr"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "ipnetwork",
  "mimalloc",
@@ -3023,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_percentile"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3031,7 +3042,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_regexp"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "mimalloc",
  "regex",
@@ -3040,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sim"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "anyhow",
  "bitflags 2.9.4",
@@ -3078,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite_test_ext"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "cc",
 ]
@@ -4096,7 +4107,7 @@ dependencies = [
 
 [[package]]
 name = "py-turso"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -4758,6 +4769,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scc"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46e6f046b7fef48e2660c57ed794263155d713de679057f2d0c169bfc6e756cc"
+dependencies = [
+ "sdd",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4827,6 +4847,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "sdd"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "security-framework"
@@ -4942,6 +4968,33 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "serial_test"
+version = "3.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d0b343e184fc3b7bb44dff0705fffcf4b3756ba6aff420dddd8b24ca145e555"
+dependencies = [
+ "fslock",
+ "futures-executor",
+ "futures-util",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "scc",
+ "serial_test_derive",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "3.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f50427f258fb77356e4cd4aa0e87e2bd2c66dbcee41dc405282cae2bfc26c83"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
 ]
 
 [[package]]
@@ -5133,7 +5186,7 @@ checksum = "d372029cb5195f9ab4e4b9aef550787dce78b124fcaee8d82519925defcd6f0d"
 
 [[package]]
 name = "sql_gen_prop"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "proptest",
@@ -5143,7 +5196,7 @@ dependencies = [
 
 [[package]]
 name = "sql_generation"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "anyhow",
@@ -6075,7 +6128,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turso"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6099,7 +6152,7 @@ dependencies = [
 
 [[package]]
 name = "turso-dbhash"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "clap",
  "hex",
@@ -6110,14 +6163,14 @@ dependencies = [
 
 [[package]]
 name = "turso-dotnet"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "turso_core",
 ]
 
 [[package]]
 name = "turso-java"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "jni",
  "thiserror 2.0.16",
@@ -6126,7 +6179,7 @@ dependencies = [
 
 [[package]]
 name = "turso_cli"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6167,7 +6220,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "aegis",
  "aes",
@@ -6242,7 +6295,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "chrono",
  "getrandom 0.3.2",
@@ -6251,7 +6304,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext_tests"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "env_logger",
  "lazy_static",
@@ -6262,7 +6315,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6271,7 +6324,7 @@ dependencies = [
 
 [[package]]
 name = "turso_node"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "chrono",
  "napi",
@@ -6280,11 +6333,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso_core",
+ "turso_parser",
 ]
 
 [[package]]
 name = "turso_parser"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "bitflags 2.9.4",
  "codspeed-criterion-compat",
@@ -6302,7 +6356,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -6317,7 +6371,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6326,7 +6380,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sqlite3"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "env_logger",
  "libc",
@@ -6339,7 +6393,7 @@ dependencies = [
 
 [[package]]
 name = "turso_stress"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "antithesis_sdk",
  "clap",
@@ -6357,7 +6411,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6384,7 +6438,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_js"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "genawaiter",
  "napi",
@@ -6399,7 +6453,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -6416,7 +6470,7 @@ dependencies = [
 
 [[package]]
 name = "turso_whopper"
-version = "0.5.0-pre.12"
+version = "0.5.0-pre.13"
 dependencies = [
  "anyhow",
  "clap",

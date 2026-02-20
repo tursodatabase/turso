@@ -25,42 +25,6 @@ use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::SortOrder;
 
-/// Metadata for a table during integrity check, used for constraint validation.
-#[derive(Debug, Clone)]
-pub struct IntegrityCheckTable {
-    /// Table name (for error messages)
-    pub name: String,
-    /// Root page of the table's B-tree
-    pub root_page: i64,
-    /// Indexes on this table
-    pub indexes: Vec<IntegrityCheckIndex>,
-    /// Columns with NOT NULL constraint (column index, column name)
-    pub not_null_columns: Vec<(usize, String)>,
-    /// Position of INTEGER PRIMARY KEY column if it exists (rowid alias).
-    /// This column's value is stored as NULL in the record; the rowid should be used instead.
-    pub rowid_alias_column_pos: Option<usize>,
-}
-
-/// Metadata for an index during integrity check.
-#[derive(Debug, Clone)]
-pub struct IntegrityCheckIndex {
-    /// Index name (for error messages)
-    pub name: String,
-    /// Root page of the index's B-tree
-    pub root_page: i64,
-    /// Whether this is a UNIQUE index
-    pub unique: bool,
-    /// Column positions in the table (for building index keys from table rows)
-    pub column_positions: Vec<usize>,
-    /// Starting register containing default values for indexed columns.
-    /// Used for columns added via ALTER TABLE ADD COLUMN with DEFAULT - old rows
-    /// don't physically have these columns, so we use these pre-evaluated defaults.
-    /// The registers are contiguous: [default_values_start_reg..default_values_start_reg + column_positions.len())
-    pub default_values_start_reg: usize,
-    /// Index info for cursor operations (sort order, collation, etc)
-    pub index_info: std::sync::Arc<crate::types::IndexInfo>,
-}
-
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CmpInsFlags(usize);
@@ -193,6 +157,13 @@ impl InsertFlags {
 pub enum RegisterOrLiteral<T: Copy + std::fmt::Display> {
     Register(usize),
     Literal(T),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SavepointOp {
+    Begin,
+    Release,
+    RollbackTo,
 }
 
 impl From<PageIdx> for RegisterOrLiteral<PageIdx> {
@@ -608,6 +579,12 @@ pub enum Insn {
     AutoCommit {
         auto_commit: bool,
         rollback: bool,
+    },
+
+    /// Execute a named savepoint operation.
+    Savepoint {
+        op: SavepointOp,
+        name: String,
     },
 
     /// Branch to the given PC.
@@ -1306,21 +1283,15 @@ pub enum Insn {
         exact: bool,
     },
 
-    /// Do an analysis of the currently open database. Store in register (P1+1) the text of an error message describing any problems.
-    /// If no problems are found, store a NULL in register (P1+1).
-    /// The register (P1) contains one less than the maximum number of allowed errors.
-    /// At most reg(P1) errors will be reported. In other words, the analysis stops as soon as reg(P1) errors are seen.
-    /// Reg(P1) is updated with the number of errors remaining. The root page numbers of all tables in the database are integers
-    /// stored in P4_INTARRAY argument. If P5 is not zero, the check is done on the auxiliary database file, not the main database file. This opcode is used to implement the integrity_check pragma.
+    /// Perform low-level btree/freelist structural integrity checks.
+    /// Writes NULL to `message_register` when no structural problem is found,
+    /// otherwise writes a textual error summary.
+    /// Higher-level semantic checks (row/index consistency, constraints, etc.)
+    /// are emitted as normal VDBE bytecode in translation.
     IntegrityCk {
         max_errors: usize,
         roots: Vec<i64>,
         message_register: usize,
-        /// If true, this is a quick_check that skips expensive index consistency validation.
-        /// If false, this is a full integrity_check.
-        quick: bool,
-        /// Table metadata for index count validation (only used when quick=false)
-        tables: Vec<IntegrityCheckTable>,
     },
     RenameTable {
         db: usize,
@@ -1563,6 +1534,7 @@ impl InsnVariants {
             InsnVariants::HaltIfNull => execute::op_halt_if_null,
             InsnVariants::Transaction => execute::op_transaction,
             InsnVariants::AutoCommit => execute::op_auto_commit,
+            InsnVariants::Savepoint => execute::op_savepoint,
             InsnVariants::Goto => execute::op_goto,
             InsnVariants::Gosub => execute::op_gosub,
             InsnVariants::Return => execute::op_return,

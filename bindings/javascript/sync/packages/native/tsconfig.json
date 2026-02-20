@@ -17,5 +17,8 @@
   },
   "include": [
     "*"
+  ],
+  "exclude": [
+    "*.test.ts"
   ]
 }

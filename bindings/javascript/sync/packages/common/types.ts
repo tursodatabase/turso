@@ -111,6 +111,13 @@ export interface DatabaseOpts {
      */
     tracing?: 'error' | 'warn' | 'info' | 'debug' | 'trace',
     /**
+     * When enabled, write statements execute on remote server instead of locally.
+     * After each write (or transaction commit), changes are pulled for read-your-writes consistency.
+     * Requires `url`. All explicit transactions go to remote.
+     * WARNING: This feature is EXPERIMENTAL
+     */
+    remoteWritesExperimental?: boolean;
+    /**
      * optional parameter to enable partial sync for the database
      * WARNING: This feature is EXPERIMENTAL
      */
