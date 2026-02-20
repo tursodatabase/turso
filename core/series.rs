@@ -170,6 +170,8 @@ impl VTabCursor for GenerateSeriesCursor {
         let mut start = -1;
         let mut stop = -1;
         let mut step = 1;
+        // SQLite default for stop when it is omitted
+        const DEFAULT_STOP_OMITTED: i64 = u32::MAX as i64;
 
         if let Some((_, idx_num)) = idx_info {
             let mut arg_idx = 0;
@@ -181,6 +183,8 @@ impl VTabCursor for GenerateSeriesCursor {
             if idx_num & 2 != 0 {
                 stop = extract_arg_integer!(args, arg_idx, i64::MAX);
                 arg_idx += 1;
+            } else {
+                stop = DEFAULT_STOP_OMITTED;
             }
             if idx_num & 4 != 0 {
                 step = args
