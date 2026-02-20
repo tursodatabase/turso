@@ -486,6 +486,7 @@ fn create_dedupe_index(
         has_rowid: false,
         where_clause: None,
         index_method: None,
+        on_conflict: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(dedupe_index.clone()));
     program.emit_insn(Insn::OpenEphemeral {

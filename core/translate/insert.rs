@@ -129,6 +129,8 @@ pub struct InsertEmitCtx<'a> {
     pub temp_table_ctx: Option<TempTableCtx>,
     /// on conflict, default to ABORT
     pub on_conflict: ResolveType,
+    /// The original statement-level ON CONFLICT clause (None = no explicit clause)
+    pub statement_on_conflict: Option<ResolveType>,
     /// Arity of the insert values
     pub num_values: usize,
     /// The yield register, if a coroutine is used to yield multiple rows
@@ -193,6 +195,7 @@ impl<'a> InsertEmitCtx<'a> {
             idx_cursors,
             temp_table_ctx,
             on_conflict: on_conflict.unwrap_or(ResolveType::Abort),
+            statement_on_conflict: on_conflict,
             yield_reg_opt: None,
             conflict_rowid_reg: program.alloc_register(),
             cursor_id: 0, // set later in emit_source_emission
@@ -618,10 +621,28 @@ pub fn translate_insert(
     // `commit` phase, because in UPSERT mode we might need to skip the actual insertion, as we can
     // have a naked ON CONFLICT DO NOTHING, so if we eagerly insert any indexes, we could insert
     // invalid index entries before we hit a conflict down the line.
-    let on_replace = matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty();
+    //
+    // REPLACE (whether statement-level OR REPLACE or constraint-level ON CONFLICT REPLACE)
+    // inserts eagerly in preflight because it needs to delete-then-insert per index.
+    let any_constraint_replace = ctx.statement_on_conflict.is_none()
+        && upsert_actions.is_empty()
+        && (ctx.table.pk_conflict_clause == Some(ResolveType::Replace)
+            || ctx
+                .table
+                .unique_sets
+                .iter()
+                .any(|us| us.conflict_clause == Some(ResolveType::Replace))
+            || resolver.with_schema(ctx.database_id, |schema| {
+                schema
+                    .get_indices(ctx.table.name.as_str())
+                    .any(|idx| idx.on_conflict == Some(ResolveType::Replace))
+            }));
+    let on_replace = (matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty())
+        || any_constraint_replace;
     let mut preflight_ctx = PreflightCtx {
         upsert_actions: &upsert_actions,
         on_replace,
+        effective_on_conflict: ctx.on_conflict,
         connection,
         table_references: &mut table_references,
     };
@@ -677,11 +698,11 @@ pub fn translate_insert(
     }
 
     let mut insert_flags = InsertFlags::new();
-    let on_replace = matches!(ctx.on_conflict, ResolveType::Replace);
 
-    // For the case of OR REPLACE, we need to force a seek on the insert, as we may have
-    // already deleted the conflicting row and the cursor is not guaranteed to be positioned.
-    if on_replace {
+    // For REPLACE (statement-level or constraint-level), we need to force a seek on the
+    // insert, as we may have already deleted the conflicting row and the cursor is not
+    // guaranteed to be positioned.
+    if matches!(ctx.on_conflict, ResolveType::Replace) || any_constraint_replace {
         insert_flags = insert_flags.require_seek();
     }
     program.emit_insn(Insn::Insert {
@@ -1251,8 +1272,6 @@ fn emit_notnulls(
     insertion: &Insertion,
     resolver: &Resolver,
 ) -> Result<()> {
-    let on_replace = matches!(ctx.on_conflict, ResolveType::Replace);
-    let on_ignore = matches!(ctx.on_conflict, ResolveType::Ignore);
     for column_mapping in insertion
         .col_mappings
         .iter()
@@ -1262,6 +1281,19 @@ fn emit_notnulls(
         if column_mapping.column.is_rowid_alias() {
             continue;
         }
+
+        // Compute effective conflict for this NOT NULL constraint:
+        // Statement-level OR clause overrides; otherwise use column's clause.
+        let effective = if ctx.statement_on_conflict.is_some() {
+            ctx.on_conflict
+        } else {
+            column_mapping
+                .column
+                .notnull_conflict_clause
+                .unwrap_or(ResolveType::Abort)
+        };
+        let on_replace = matches!(effective, ResolveType::Replace);
+        let on_ignore = matches!(effective, ResolveType::Ignore);
 
         // If a NOT NULL constraint violation occurs, the REPLACE conflict resolution replaces the NULL value with the default value for that column,
         // or if the column has no default value, then the ABORT algorithm is used
@@ -1289,7 +1321,7 @@ fn emit_notnulls(
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
         }
 
-        // For INSERT OR IGNORE, skip to the next row if NULL
+        // For IGNORE, skip to the next row if NULL
         if on_ignore {
             program.emit_insn(Insn::IsNull {
                 reg: column_mapping.register,
@@ -1743,6 +1775,7 @@ pub const ROWID_COLUMN: Column = Column::new(
         notnull: true,
         hidden: false,
         unique: false,
+        notnull_conflict_clause: None,
     },
 );
 
@@ -2164,6 +2197,13 @@ fn emit_pk_uniqueness_check(
             });
             break 'emit_halt;
         }
+        if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            // IGNORE: skip this row entirely on PK conflict
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
+            });
+            break 'emit_halt;
+        }
         if let Some(position) = position.or(upsert_catch_all) {
             // PK conflict: the conflicting rowid is exactly the attempted key
             program.emit_insn(Insn::Copy {
@@ -2372,8 +2412,13 @@ fn emit_unique_index_check(
                 preflight.table_references,
             )?;
             program.emit_insn(Insn::Goto { target_pc: ok });
+        } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            // IGNORE: skip this row entirely on unique conflict.
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
+            });
         } else {
-            // ABORT/FAIL/IGNORE/ROLLBACK: halt on conflict.
+            // ABORT/FAIL/ROLLBACK: halt on conflict.
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(ctx.table.name.as_str(), index),
@@ -2423,6 +2468,28 @@ fn emit_preflight_constraint_checks(
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
     for (constraint, position) in &constraints.constraints_to_check {
+        // Compute per-constraint effective conflict resolution:
+        // Statement-level OR clause overrides; otherwise use constraint's clause.
+        let effective = if ctx.statement_on_conflict.is_some() {
+            ctx.on_conflict
+        } else {
+            match constraint {
+                ResolvedUpsertTarget::PrimaryKey => {
+                    // Use pk_conflict_clause from BTreeTable, which is preserved
+                    // even for rowid-alias PKs (whose UniqueSet is removed).
+                    ctx.table.pk_conflict_clause.unwrap_or(ResolveType::Abort)
+                }
+                ResolvedUpsertTarget::Index(index) => {
+                    index.on_conflict.unwrap_or(ResolveType::Abort)
+                }
+                ResolvedUpsertTarget::CatchAll => unreachable!(),
+            }
+        };
+        let effective_on_replace =
+            matches!(effective, ResolveType::Replace) && preflight.upsert_actions.is_empty();
+        preflight.on_replace = effective_on_replace;
+        preflight.effective_on_conflict = effective;
+
         match constraint {
             ResolvedUpsertTarget::PrimaryKey => {
                 emit_pk_uniqueness_check(
@@ -2793,8 +2860,12 @@ struct ConstraintsToCheck {
 struct PreflightCtx<'a, 'b> {
     /// UPSERT action handlers (target, label, upsert clause)
     upsert_actions: &'a [(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
-    /// Whether ON CONFLICT REPLACE is active (without UPSERT)
+    /// Whether ON CONFLICT REPLACE is active globally (without UPSERT).
+    /// This is true when the statement has INSERT OR REPLACE (applies to all constraints).
     on_replace: bool,
+    /// The effective conflict resolution for the current constraint being checked.
+    /// Updated per-constraint in emit_preflight_constraint_checks.
+    effective_on_conflict: ResolveType,
     /// Database connection for FK checks
     connection: &'a Arc<Connection>,
     /// Table references for expression evaluation

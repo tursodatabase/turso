@@ -140,16 +140,6 @@ fn validate(
                     ast::ColumnConstraint::Generated { .. } => {
                         bail_parse_error!("GENERATED columns are not supported yet");
                     }
-                    ast::ColumnConstraint::NotNull {
-                        conflict_clause, ..
-                    }
-                    | ast::ColumnConstraint::PrimaryKey {
-                        conflict_clause, ..
-                    } if conflict_clause.is_some() => {
-                        bail_parse_error!(
-                            "ON CONFLICT clauses are not supported yet in column definitions"
-                        );
-                    }
                     _ => {}
                 }
             }
@@ -986,6 +976,7 @@ pub fn translate_drop_table(
             unique_sets: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
+            pk_conflict_clause: None,
         });
         // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));

@@ -1,0 +1,233 @@
+@database :memory:
+
+# Tests for ON CONFLICT clause in column and table constraint definitions.
+# https://github.com/tursodatabase/turso/issues/5339
+
+# ---- Column-level PRIMARY KEY ON CONFLICT ----
+
+setup pk-replace {
+    CREATE TABLE t_pk_replace(x PRIMARY KEY ON CONFLICT REPLACE, y);
+    INSERT INTO t_pk_replace VALUES(1, 'first');
+    INSERT INTO t_pk_replace VALUES(2, 'second');
+}
+
+@setup pk-replace
+test pk-on-conflict-replace {
+    INSERT INTO t_pk_replace VALUES(1, 'replaced');
+    SELECT * FROM t_pk_replace ORDER BY x;
+}
+expect {
+    1|replaced
+    2|second
+}
+
+setup pk-ignore {
+    CREATE TABLE t_pk_ignore(x PRIMARY KEY ON CONFLICT IGNORE, y);
+    INSERT INTO t_pk_ignore VALUES(1, 'first');
+    INSERT INTO t_pk_ignore VALUES(2, 'second');
+}
+
+@setup pk-ignore
+test pk-on-conflict-ignore {
+    INSERT INTO t_pk_ignore VALUES(1, 'ignored');
+    SELECT * FROM t_pk_ignore ORDER BY x;
+}
+expect {
+    1|first
+    2|second
+}
+
+setup pk-abort {
+    CREATE TABLE t_pk_abort(x PRIMARY KEY ON CONFLICT ABORT, y);
+    INSERT INTO t_pk_abort VALUES(1, 'first');
+}
+
+@setup pk-abort
+test pk-on-conflict-abort {
+    INSERT INTO t_pk_abort VALUES(1, 'abort');
+}
+expect error {
+}
+
+setup pk-fail {
+    CREATE TABLE t_pk_fail(x PRIMARY KEY ON CONFLICT FAIL, y);
+    INSERT INTO t_pk_fail VALUES(1, 'first');
+}
+
+@setup pk-fail
+test pk-on-conflict-fail {
+    INSERT INTO t_pk_fail VALUES(1, 'fail');
+}
+expect error {
+}
+
+setup pk-rollback {
+    CREATE TABLE t_pk_rollback(x PRIMARY KEY ON CONFLICT ROLLBACK, y);
+    INSERT INTO t_pk_rollback VALUES(1, 'first');
+}
+
+@setup pk-rollback
+test pk-on-conflict-rollback {
+    INSERT INTO t_pk_rollback VALUES(1, 'rollback');
+}
+expect error {
+}
+
+# ---- Column-level UNIQUE ON CONFLICT ----
+
+setup uniq-replace {
+    CREATE TABLE t_uniq_replace(x, y UNIQUE ON CONFLICT REPLACE);
+    INSERT INTO t_uniq_replace VALUES('a', 1);
+    INSERT INTO t_uniq_replace VALUES('b', 2);
+}
+
+@setup uniq-replace
+test unique-on-conflict-replace {
+    INSERT INTO t_uniq_replace VALUES('c', 1);
+    SELECT * FROM t_uniq_replace ORDER BY y;
+}
+expect {
+    c|1
+    b|2
+}
+
+setup uniq-ignore {
+    CREATE TABLE t_uniq_ignore(x, y UNIQUE ON CONFLICT IGNORE);
+    INSERT INTO t_uniq_ignore VALUES('a', 1);
+    INSERT INTO t_uniq_ignore VALUES('b', 2);
+}
+
+@setup uniq-ignore
+test unique-on-conflict-ignore {
+    INSERT INTO t_uniq_ignore VALUES('c', 1);
+    SELECT * FROM t_uniq_ignore ORDER BY y;
+}
+expect {
+    a|1
+    b|2
+}
+
+# ---- Table-level PRIMARY KEY ON CONFLICT ----
+
+setup tbl-pk-replace {
+    CREATE TABLE t_tbl_pk_replace(x, y, PRIMARY KEY(x) ON CONFLICT REPLACE);
+    INSERT INTO t_tbl_pk_replace VALUES(1, 'first');
+    INSERT INTO t_tbl_pk_replace VALUES(2, 'second');
+}
+
+@setup tbl-pk-replace
+test table-pk-on-conflict-replace {
+    INSERT INTO t_tbl_pk_replace VALUES(1, 'replaced');
+    SELECT * FROM t_tbl_pk_replace ORDER BY x;
+}
+expect {
+    1|replaced
+    2|second
+}
+
+# ---- Table-level UNIQUE ON CONFLICT ----
+
+setup tbl-uniq-ignore {
+    CREATE TABLE t_tbl_uniq_ignore(x, y, UNIQUE(y) ON CONFLICT IGNORE);
+    INSERT INTO t_tbl_uniq_ignore VALUES('a', 1);
+    INSERT INTO t_tbl_uniq_ignore VALUES('b', 2);
+}
+
+@setup tbl-uniq-ignore
+test table-unique-on-conflict-ignore {
+    INSERT INTO t_tbl_uniq_ignore VALUES('c', 1);
+    SELECT * FROM t_tbl_uniq_ignore ORDER BY y;
+}
+expect {
+    a|1
+    b|2
+}
+
+# ---- NOT NULL ON CONFLICT ----
+
+setup nn-ignore {
+    CREATE TABLE t_nn_ignore(x, y NOT NULL ON CONFLICT IGNORE);
+    INSERT INTO t_nn_ignore VALUES('a', 1);
+}
+
+@setup nn-ignore
+test notnull-on-conflict-ignore {
+    INSERT INTO t_nn_ignore VALUES('b', NULL);
+    SELECT * FROM t_nn_ignore;
+}
+expect {
+    a|1
+}
+
+setup nn-replace {
+    CREATE TABLE t_nn_replace(x, y NOT NULL ON CONFLICT REPLACE DEFAULT 99);
+}
+
+@setup nn-replace
+test notnull-on-conflict-replace-with-default {
+    INSERT INTO t_nn_replace VALUES('a', NULL);
+    SELECT * FROM t_nn_replace;
+}
+expect {
+    a|99
+}
+
+# ---- Statement-level OR overrides constraint-level ----
+
+setup stmt-override {
+    CREATE TABLE t_override(x PRIMARY KEY ON CONFLICT REPLACE, y);
+    INSERT INTO t_override VALUES(1, 'first');
+}
+
+@setup stmt-override
+test statement-or-overrides-constraint {
+    INSERT OR ABORT INTO t_override VALUES(1, 'abort');
+}
+expect error {
+}
+
+setup stmt-override2 {
+    CREATE TABLE t_override2(x PRIMARY KEY ON CONFLICT ABORT, y);
+    INSERT INTO t_override2 VALUES(1, 'first');
+}
+
+@setup stmt-override2
+test statement-or-ignore-overrides-abort {
+    INSERT OR IGNORE INTO t_override2 VALUES(1, 'ignored');
+    SELECT * FROM t_override2;
+}
+expect {
+    1|first
+}
+
+# ---- INTEGER PRIMARY KEY (rowid alias) ON CONFLICT ----
+
+setup rowid-replace {
+    CREATE TABLE t_rowid_replace(x INTEGER PRIMARY KEY ON CONFLICT REPLACE, y);
+    INSERT INTO t_rowid_replace VALUES(1, 'first');
+    INSERT INTO t_rowid_replace VALUES(2, 'second');
+}
+
+@setup rowid-replace
+test rowid-pk-on-conflict-replace {
+    INSERT INTO t_rowid_replace VALUES(1, 'replaced');
+    SELECT * FROM t_rowid_replace ORDER BY x;
+}
+expect {
+    1|replaced
+    2|second
+}
+
+setup rowid-ignore {
+    CREATE TABLE t_rowid_ignore(x INTEGER PRIMARY KEY ON CONFLICT IGNORE, y);
+    INSERT INTO t_rowid_ignore VALUES(1, 'first');
+}
+
+@setup rowid-ignore
+test rowid-pk-on-conflict-ignore {
+    INSERT INTO t_rowid_ignore VALUES(1, 'ignored');
+    SELECT * FROM t_rowid_ignore;
+}
+expect {
+    1|first
+}
