@@ -2957,7 +2957,7 @@ impl BTreeCursor {
                                     parent_max_local,
                                     parent_min_local,
                                     parent_page_type,
-                                );
+                                )?;
                             let buf = parent_contents.as_ptr();
                             &buf[cell_start..cell_start + cell_len]
                         };
@@ -3046,7 +3046,7 @@ impl BTreeCursor {
                                     max_local,
                                     min_local,
                                     page_type,
-                                );
+                                )?;
                             let buf = old_page_contents.as_ptr();
                             let cell_buf = &mut buf[cell_start..cell_start + cell_len];
                             // TODO(pere): make this reference and not copy
@@ -7691,7 +7691,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
             max_local,
             min_local,
             page_type,
-        );
+        )?;
 
         if pc > last_offset {
             is_physically_sorted = false;

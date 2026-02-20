@@ -180,6 +180,35 @@ macro_rules! bail_corrupt_error {
     };
 }
 
+/// Bounds-checked buffer slicing that returns `LimboError::Corrupt` on out-of-bounds.
+///
+/// Accepts any range expression: `buf, pos..`, `buf, start..end`, etc.
+#[macro_export]
+macro_rules! slice_in_bounds_or_corrupt {
+    ($buf:expr, $range:expr) => {
+        $buf.get($range).ok_or_else(|| {
+            $crate::error::cold_return($crate::error::LimboError::Corrupt(format!(
+                "range {:?} out of bounds for buffer size {}",
+                $range,
+                $buf.len()
+            )))
+        })?
+    };
+}
+
+/// Asserts a condition or bails with `LimboError::Corrupt`.
+///
+/// Usage:
+///   `assert_or_bail_corrupt!(condition, "message {}", arg)`
+#[macro_export]
+macro_rules! assert_or_bail_corrupt {
+    ($cond:expr, $($arg:tt)*) => {
+        if !($cond) {
+            $crate::bail_corrupt_error!($($arg)*);
+        }
+    };
+}
+
 #[macro_export]
 macro_rules! bail_constraint_error {
     ($($arg:tt)*) => {
