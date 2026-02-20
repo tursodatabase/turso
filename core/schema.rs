@@ -940,6 +940,23 @@ impl Schema {
             // Look up the DBSP state index root (may not exist for older schemas)
             let dbsp_state_index_root =
                 dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
+
+            // Register the DBSP state index so integrity check can account for its pages.
+            if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
+                use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                use crate::incremental::operator::create_dbsp_state_index;
+                let mut index = create_dbsp_state_index(dbsp_state_index_root);
+                let dbsp_table_name =
+                    format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+                index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
+                index.table_name = dbsp_table_name;
+                if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
+                    if !e.to_string().contains("already exists") {
+                        return Err(e);
+                    }
+                }
+            }
+
             // Create the IncrementalView with all root pages
             let incremental_view = IncrementalView::from_sql(
                 &sql,
