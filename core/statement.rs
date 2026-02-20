@@ -289,15 +289,22 @@ impl Statement {
         // with the stale schema cookie, causing an infinite SchemaUpdated loop.
         // SchemaUpdated can occur at different points in the Transaction opcode,
         // so the attached pager may or may not hold locks at this point.
-        for &db_id in &self.program.prepared.write_databases {
-            if db_id >= 2 {
-                let pager = conn.get_pager_from_database_index(&db_id);
-                // Discard any connection-local schema changes for this attached DB
-                // so the re-translate reads the committed schema.
-                conn.database_schemas().write().remove(&db_id);
-                if pager.holds_read_lock() {
-                    pager.rollback_attached();
-                }
+        let attached_db_ids: Vec<usize> = self
+            .program
+            .prepared
+            .write_databases
+            .iter()
+            .chain(self.program.prepared.read_databases.iter())
+            .filter(|&&id| id >= 2)
+            .copied()
+            .collect();
+        for db_id in attached_db_ids {
+            let pager = conn.get_pager_from_database_index(&db_id);
+            // Discard any connection-local schema changes for this attached DB
+            // so the re-translate reads the committed schema.
+            conn.database_schemas().write().remove(&db_id);
+            if pager.holds_read_lock() {
+                pager.rollback_attached();
             }
         }
 
