@@ -2676,6 +2676,9 @@ pub fn translate_expr(
                                 dest: target_register,
                                 default: None,
                             });
+                            if let Some(col) = from_clause_subquery.columns.get(*column) {
+                                maybe_apply_affinity(col.ty(), target_register, program);
+                            }
                             return Ok(target_register);
                         }
                     }
@@ -2712,6 +2715,9 @@ pub fn translate_expr(
                                         dest: target_register,
                                         default: None,
                                     });
+                                    if let Some(col) = from_clause_subquery.columns.get(*column) {
+                                        maybe_apply_affinity(col.ty(), target_register, program);
+                                    }
                                     return Ok(target_register);
                                 }
                             }
