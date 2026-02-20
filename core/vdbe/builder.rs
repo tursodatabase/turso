@@ -925,7 +925,7 @@ impl ProgramBuilder {
     /// reordering the emitted instructions.
     #[inline]
     pub fn preassign_label_to_next_insn(&mut self, label: BranchOffset) {
-        turso_assert!(label.is_label(), "BranchOffset should be a label", { "label": format!("{:?}", label) });
+        turso_assert!(label.is_label(), "BranchOffset should be a label", { "label": label });
         self._resolve_label(label, self.offset().sub(1u32), JumpTarget::AfterThisInsn);
     }
 
