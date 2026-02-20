@@ -21,6 +21,24 @@ set script_dir [file dirname [file dirname [file dirname [file normalize [info s
 set limbo_sqlite3 [file join $script_dir "scripts" "limbo-sqlite3"]
 set test_db "test.db"
 
+# Try to load the native TCL extension (libturso_tcl).
+# When present it provides a real in-process sqlite3 command backed by the
+# Turso engine, giving accurate errorcode / changes / func semantics.
+# Fall back to the subprocess shim when the library is absent or fails to load.
+set use_native 0
+foreach _native_candidate [list \
+    [file join $script_dir "bindings" "tcl" "libturso_tcl.so"] \
+    [file join $script_dir "bindings" "tcl" "libturso_tcl.dylib"]] {
+  if {[file exists $_native_candidate]} {
+    if {![catch {load $_native_candidate Tursotcl} _native_load_err]} {
+      set use_native 1
+      break
+    }
+  }
+}
+catch {unset _native_candidate}
+catch {unset _native_load_err}
+
 # Database connection state
 set db_handle ""
 set session_sql_file "session_[pid].sql"
@@ -28,24 +46,30 @@ set session_initialized 0
 
 # Create or reset test database
 proc reset_db {} {
-  global test_db limbo_sqlite3
+  global test_db limbo_sqlite3 use_native
   file delete -force $test_db
-  file delete -force "${test_db}-journal"  
+  file delete -force "${test_db}-journal"
   file delete -force "${test_db}-wal"
-  
-  # Initialize the database by creating a simple table and dropping it
-  # This ensures the database file exists and has proper headers
-  catch {
-    set temp_file "init_db_[pid].sql"
-    set fd [open $temp_file w]
-    puts $fd "CREATE TABLE IF NOT EXISTS _init_table(x); DROP TABLE IF EXISTS _init_table;"
-    close $fd
-    exec $limbo_sqlite3 $test_db < $temp_file 2>/dev/null
-    file delete -force $temp_file
+
+  if {$use_native} {
+    # Native mode: close any existing handle then open via native module.
+    if {[llength [info commands db]] > 0} {
+      catch {db close}
+    }
+    sqlite3 db $test_db
+  } else {
+    # Subprocess mode: initialise the database file via the CLI shim.
+    catch {
+      set temp_file "init_db_[pid].sql"
+      set fd [open $temp_file w]
+      puts $fd "CREATE TABLE IF NOT EXISTS _init_table(x); DROP TABLE IF EXISTS _init_table;"
+      close $fd
+      exec $limbo_sqlite3 $test_db < $temp_file 2>/dev/null
+      file delete -force $temp_file
+    }
+    # Create the database connection using our sqlite3 command simulation
+    sqlite3 db $test_db
   }
-  
-  # Create the database connection using our sqlite3 command simulation
-  sqlite3 db $test_db
 }
 
 # Open database connection (simulate TCL sqlite3 interface)
@@ -239,7 +263,9 @@ proc exec_sql {sql {db_name ""}} {
   return $all_output
 }
 
-# Simulate sqlite3 db eval interface
+# Simulate sqlite3 db eval interface (subprocess shim).
+# Skipped when the native module is loaded – it already registered the real command.
+if {!$use_native} {
 proc sqlite3 {handle db_file} {
   global db_handle test_db
   set db_handle $handle
@@ -483,12 +509,19 @@ proc sqlite3 {handle db_file} {
     }
   }
 }
+} ;# end if {!$use_native}
 
 # Execute SQL and return results
 proc execsql {sql {db db}} {
-  # For our external approach, ignore the db parameter
+  global use_native
+  if {$use_native} {
+    # Native mode: db eval returns a flat list of all column values across all rows.
+    return [$db eval $sql]
+  }
+
+  # Subprocess shim mode.
   set output [exec_sql $sql]
-  
+
   # Convert output to TCL list format
   set lines [split $output "\n"]
   set result [list]
@@ -519,8 +552,20 @@ proc db_one {sql {db db}} {
 # Execute SQL and return results with column names
 # Format: column1 value1 column2 value2 ... (alternating for each row)
 proc execsql2 {sql {db db}} {
-  global limbo_sqlite3 test_db
-  
+  global limbo_sqlite3 test_db use_native
+
+  if {$use_native} {
+    # Native mode: use the array-script form of db eval to capture column names.
+    set result {}
+    $db eval $sql row {
+      foreach col $row(*) {
+        lappend result $col $row($col)
+      }
+    }
+    return $result
+  }
+
+  # Subprocess shim mode.
   # Use .headers on to get column names from the CLI
   if {[catch {exec echo ".mode list\n.headers on\n$sql" | $limbo_sqlite3 $test_db 2>/dev/null} output]} {
     # Fall back to execsql if there's an error
