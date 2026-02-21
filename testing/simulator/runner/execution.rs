@@ -357,6 +357,7 @@ fn execute_interaction_rusqlite(
     stack: &mut Vec<ResultSet>,
 ) -> turso_core::Result<ExecutionContinuation> {
     tracing::info!("");
+    let attached_dbs = env.attached_dbs.clone();
     let SimConnection::SQLiteConnection(conn) = &mut env.connections[interaction.connection_index]
     else {
         unreachable!()
@@ -364,7 +365,7 @@ fn execute_interaction_rusqlite(
     match &interaction.interaction {
         InteractionType::Query(query) => {
             tracing::debug!("{}", interaction);
-            let raw_result = execute_query_rusqlite(conn, query);
+            let raw_result = execute_query_rusqlite(conn, query, &attached_dbs);
 
             let is_constraint_error = matches!(
                 &raw_result,
@@ -440,10 +441,23 @@ fn execute_interaction_rusqlite(
 fn execute_query_rusqlite(
     connection: &rusqlite::Connection,
     query: &Query,
+    attached_dbs: &[String],
 ) -> rusqlite::Result<Vec<Vec<SimValue>>> {
     // https://sqlite.org/forum/forumpost/9fe5d047f0
-    // Due to a bug in sqlite, we need to execute this query to clear the internal stmt cache so that schema changes become visible always to other connections
+    // Due to a bug in sqlite, we need to execute this query to clear the internal stmt cache so that schema changes become visible always to other connections.
+    // We must do this for the main database AND all attached databases, otherwise
+    // schema changes (e.g. DROP COLUMN) on attached databases won't be visible to
+    // other connections that have the old schema cached.
     connection.query_one("SELECT * FROM pragma_user_version()", (), |_| Ok(()))?;
+    for db_name in attached_dbs {
+        // Force SQLite to re-read the attached database's schema by querying
+        // its sqlite_master table. This ensures schema changes (e.g. DROP COLUMN)
+        // made by other connections are visible.
+        let _ = connection.execute(
+            &format!("SELECT sql FROM {db_name}.sqlite_master LIMIT 1"),
+            (),
+        );
+    }
     match query {
         Query::Select(select) => {
             let mut stmt = connection.prepare(select.to_string().as_str())?;
