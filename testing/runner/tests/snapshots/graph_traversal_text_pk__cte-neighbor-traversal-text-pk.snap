@@ -1,0 +1,32 @@
+---
+source: graph_traversal_text_pk.sqltest
+expression: |-
+  WITH seed_articles AS (
+          SELECT a.id
+          FROM article a
+          WHERE a.id IN ('a01', 'a02', 'a03')
+      )
+      SELECT s.id AS seed_id,
+             l.kind,
+             l.source_id,
+             l.target_id,
+             a.id AS neighbor_id,
+             a.title AS neighbor_title
+      FROM link l
+      JOIN article a ON (l.source_id = a.id OR l.target_id = a.id)
+      JOIN seed_articles s ON (l.source_id = s.id OR l.target_id = s.id) AND a.id != s.id;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - article
+  - link
+  - seed_articles
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN seed_articles AS s
+|  `--SCAN article AS a USING COVERING INDEX sqlite_autoindex_article_1
+|--MULTI-INDEX OR l (idx_link_source, idx_link_target)
+`--MULTI-INDEX OR a (sqlite_autoindex_article_1, sqlite_autoindex_article_1)
