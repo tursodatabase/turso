@@ -2504,7 +2504,12 @@ pub fn op_auto_commit(
     let had_autocommit = conn.auto_commit.load(Ordering::SeqCst); // true, not in tx
 
     // Drive any multi-step commit/rollback that's already in progress.
-    if matches!(state.commit_state, CommitState::Committing) {
+    // This handles both main DB commits (Committing) and attached DB commits
+    // (CommittingAttached) that yielded on IO and need re-entry.
+    if matches!(
+        state.commit_state,
+        CommitState::Committing | CommitState::CommittingAttached
+    ) {
         let res = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
             .map(Into::into);
@@ -2533,7 +2538,6 @@ pub fn op_auto_commit(
     let requested_rollback = *rollback;
     let changed = requested_autocommit != had_autocommit;
     let is_txn_end_eq = changed && requested_autocommit;
-
     // what the requested operation is
     let is_begin_req = had_autocommit && !requested_autocommit && !requested_rollback;
     let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
