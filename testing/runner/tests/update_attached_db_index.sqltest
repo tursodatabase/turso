@@ -1,0 +1,84 @@
+@database :memory:
+@skip-file-if mvcc "attach is not supported for mvcc"
+
+# Regression test for a bug where UPDATE on an attached database table with
+# a UNIQUE index would panic when the rowid (INTEGER PRIMARY KEY) was modified.
+# The ephemeral table code path incorrectly used the main database ID (db=0)
+# instead of the attached database ID when opening index cursors, causing an
+# index seek to land on a table page in the wrong database.
+
+test update-attached-db-rowid-change-with-unique-index {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val REAL UNIQUE, data INTEGER);
+    INSERT INTO aux.t1 VALUES (1, 10.0, 100);
+    INSERT INTO aux.t1 VALUES (2, 20.0, 200);
+    INSERT INTO aux.t1 VALUES (3, 30.0, 300);
+    UPDATE aux.t1 SET id = 10, data = 999 WHERE id = 1;
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    2|20.0|200
+    3|30.0|300
+    10|10.0|999
+}
+expect @js {
+    2|20|200
+    3|30|300
+    10|10|999
+}
+
+test update-attached-db-rowid-with-where-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val REAL UNIQUE, data INTEGER);
+    INSERT INTO aux.t1 VALUES (1, 10.0, 100);
+    INSERT INTO aux.t1 VALUES (2, 20.0, 200);
+    INSERT INTO aux.t1 VALUES (3, 30.0, 300);
+    CREATE TABLE main_tbl (x INTEGER);
+    INSERT INTO main_tbl VALUES (1);
+    UPDATE aux.t1 SET id = 20, data = 555 WHERE id = 3 AND NOT EXISTS (SELECT x FROM main_tbl WHERE x > 10);
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|10.0|100
+    2|20.0|200
+    20|30.0|555
+}
+expect @js {
+    1|10|100
+    2|20|200
+    20|30|555
+}
+
+test update-attached-db-integrity-after-rowid-change {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val REAL UNIQUE, data INTEGER);
+    INSERT INTO aux.t1 VALUES (1, 10.0, 100);
+    INSERT INTO aux.t1 VALUES (2, 20.0, 200);
+    INSERT INTO aux.t1 VALUES (3, 30.0, 300);
+    UPDATE aux.t1 SET id = 10, data = 999 WHERE id = 1;
+    UPDATE aux.t1 SET id = 20, data = 888 WHERE id = 2;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test update-attached-db-non-rowid-column {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val REAL UNIQUE, data INTEGER);
+    INSERT INTO aux.t1 VALUES (1, 10.0, 100);
+    INSERT INTO aux.t1 VALUES (2, 20.0, 200);
+    UPDATE aux.t1 SET val = 99.0 WHERE id = 1;
+    SELECT * FROM aux.t1 ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|99.0|100
+    2|20.0|200
+    ok
+}
+expect @js {
+    1|99|100
+    2|20|200
+    ok
+}
