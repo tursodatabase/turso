@@ -14,7 +14,10 @@ use crate::{
         expr::{rewrite_between_expr, translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
-    util::{check_expr_references_column, normalize_ident, parse_numeric_literal},
+    util::{
+        check_expr_references_column, normalize_ident, parse_numeric_literal,
+        rewrite_view_sql_for_column_rename,
+    },
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
@@ -1123,6 +1126,7 @@ pub fn translate_alter_table(
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
             let mut triggers_to_rewrite: Vec<(String, String)> = Vec::new();
+            let mut views_to_rewrite: Vec<(String, String)> = Vec::new();
             if rename {
                 // Find all triggers that might reference this column
                 let target_table_name_norm = normalize_ident(table_name);
@@ -1231,6 +1235,32 @@ pub fn translate_alter_table(
                 }
             }
 
+            if rename {
+                let target_db_name = resolver
+                    .get_database_name_by_index(database_id)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "unknown database id {database_id} during ALTER TABLE"
+                        ))
+                    })?;
+                views_to_rewrite = resolver.with_schema(database_id, |s| -> Result<_> {
+                    let mut rewrites = Vec::new();
+                    for (view_name, view) in s.views.iter() {
+                        if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                            &view.sql,
+                            s,
+                            table_name,
+                            &target_db_name,
+                            from,
+                            col_name,
+                        )? {
+                            rewrites.push((view_name.clone(), rewritten.sql));
+                        }
+                    }
+                    Ok(rewrites)
+                })?;
+            }
+
             let sqlite_schema = resolver
                 .schema()
                 .get_btree_table(SQLITE_TABLEID)
@@ -1330,6 +1360,39 @@ pub fn translate_alter_table(
                 let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
                     return Err(LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}",
+                    )));
+                };
+
+                translate_update_for_schema_change(
+                    update,
+                    resolver,
+                    program,
+                    connection,
+                    input,
+                    |_program| {},
+                )?;
+            }
+
+            // Update view SQL for renamed columns
+            for (view_name, new_sql) in views_to_rewrite {
+                let escaped_sql = new_sql.replace('\'', "''");
+                let update_stmt = format!(
+                    r#"
+                        UPDATE {SQLITE_TABLEID}
+                        SET sql = '{escaped_sql}'
+                        WHERE name = '{view_name}' COLLATE NOCASE AND type = 'view'
+                    "#,
+                );
+
+                let mut parser = Parser::new(update_stmt.as_bytes());
+                let cmd = parser.next_cmd().map_err(|e| {
+                    LimboError::ParseError(format!(
+                        "failed to parse view update SQL for {view_name}: {e}"
+                    ))
+                })?;
+                let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
+                    return Err(LimboError::ParseError(format!(
+                        "failed to parse view update SQL for {view_name}",
                     )));
                 };
 

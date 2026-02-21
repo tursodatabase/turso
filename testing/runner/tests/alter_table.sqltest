@@ -20,6 +20,93 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+test alter-table-rename-column-view {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT a, c FROM t
+}
+
+test alter-table-rename-column-view-qualified {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT t.a, t.b FROM t;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT t.a, t.c FROM t
+}
+
+test alter-table-rename-column-view-star {
+    CREATE TABLE t (a INT, b TEXT);
+    CREATE VIEW v AS SELECT * FROM t;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    PRAGMA table_info(v);
+}
+expect {
+    0|a|INT|0||0
+    1|c|TEXT|0||0
+}
+
+test alter-table-rename-column-view-on-view {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v1 AS SELECT a, b FROM t;
+    CREATE VIEW v2 AS SELECT b FROM v1;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v1';
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v2';
+}
+expect {
+    CREATE VIEW v1 AS SELECT a, c FROM t
+    CREATE VIEW v2 AS SELECT c FROM v1
+}
+
+test alter-table-rename-column-view-subquery {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.b = 1);
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.c = 1)
+}
+
+test alter-table-rename-column-view-correlated-subquery {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 WHERE t.b = 1);
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 WHERE t.c = 1)
+}
+
+test alter-table-rename-column-view-correlated-outer-shadow {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (b);
+    CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE b = 1);
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE c = 1)
+}
+
+test alter-table-rename-column-view-attached-db-qualified {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t (a, b);
+    CREATE TABLE aux.t (a, b);
+    CREATE VIEW v AS SELECT a, b FROM aux.t;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT a, b FROM aux.t
+}
+
 # https://github.com/tursodatabase/turso/issues/5246
 test alter-table-rename-column-case-insensitive {
     CREATE TABLE t (a INT);

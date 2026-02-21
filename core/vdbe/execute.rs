@@ -24,7 +24,7 @@ use crate::util::{
     normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
-    trim_ascii_whitespace,
+    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -10005,6 +10005,33 @@ pub fn op_alter_column(
     let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
 
+    let view_rewrites = if *rename {
+        let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
+            LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
+        })?;
+        conn.with_schema(
+            *db,
+            |schema| -> crate::Result<Vec<(String, RewrittenView)>> {
+                let mut rewrites = Vec::new();
+                for (view_name, view) in schema.views.iter() {
+                    if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                        &view.sql,
+                        schema,
+                        table_name.as_str(),
+                        &target_db_name,
+                        &old_column_name,
+                        &new_name,
+                    )? {
+                        rewrites.push((view_name.clone(), rewritten));
+                    }
+                }
+                Ok(rewrites)
+            },
+        )?
+    } else {
+        Vec::new()
+    };
+
     conn.with_database_schema_mut(*db, |schema| {
         let table_arc = schema
             .tables
@@ -10110,6 +10137,19 @@ pub fn op_alter_column(
     });
 
     if *rename {
+        let rewrites = view_rewrites;
+        conn.with_database_schema_mut(*db, move |schema| -> crate::Result<()> {
+            for (view_name, rewritten) in rewrites {
+                if let Some(view_arc) = schema.views.get_mut(&view_name) {
+                    let view = Arc::make_mut(view_arc);
+                    view.sql = rewritten.sql;
+                    view.select_stmt = rewritten.select_stmt;
+                    view.columns = rewritten.columns;
+                }
+            }
+            Ok(())
+        })?;
+
         conn.with_schema(*db, |schema| -> crate::Result<()> {
             let table = schema
                 .tables
@@ -10120,7 +10160,6 @@ pub fn op_alter_column(
                 .expect("column being ALTERed should be in schema");
             for (view_name, view) in schema.views.iter() {
                 let view_select_sql = format!("SELECT * FROM {view_name}");
-                // FIXME: this should rewrite the view to reference the new column name
                 let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                     LimboError::ParseError(format!(
                         "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
