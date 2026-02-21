@@ -2454,9 +2454,9 @@ fn emit_program_for_update(
     )?;
 
     // Prepare index cursors
-    // Use target_table.database_id instead of plan.table_references because when the UPDATE
-    // uses an ephemeral table, plan.table_references.first() points to the ephemeral scratch
-    // table (db=0) rather than the actual target table (which may be in an attached database).
+    // Use target_table.database_id because in the PrebuiltEphemeralTable case,
+    // plan.table_references contains the ephemeral table (database_id=0),
+    // not the actual target table.
     let target_database_id = target_table.database_id;
     let mut index_cursors = Vec::with_capacity(plan.indexes_to_update.len());
     for index in &plan.indexes_to_update {

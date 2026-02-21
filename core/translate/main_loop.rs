@@ -265,15 +265,21 @@ pub fn init_loop(
                             program.emit_insn(Insn::OpenWrite {
                                 cursor_id: target_table_cursor_id,
                                 root_page: target_table.btree().unwrap().root_page.into(),
-                                db: table.database_id,
+                                db: target_table.database_id,
                             });
                         }
                     }
+                    let write_db_id = match &update_mode {
+                        UpdateRowSource::PrebuiltEphemeralTable { target_table, .. } => {
+                            target_table.database_id
+                        }
+                        _ => table.database_id,
+                    };
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: index_cursor_id,
                             root_page: index.as_ref().unwrap().root_page.into(),
-                            db: table.database_id,
+                            db: write_db_id,
                         });
                     }
                 }
