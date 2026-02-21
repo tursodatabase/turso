@@ -398,11 +398,21 @@ fn test_left_join_ordering() {
             limbo_exec_rows(&conn, &format!("INSERT INTO t{i} VALUES (1, 1, 'v{i}')"));
         }
 
-        // Randomly choose LEFT or INNER join for each position
+        // Randomly choose LEFT or INNER join for each position.
+        // In this chain pattern (each table references only its predecessor),
+        // a LEFT JOIN at position i is simplified to INNER when any subsequent
+        // position j > i is an INNER JOIN (the null-rejection cascades backwards).
+        // Only LEFT JOINs where ALL subsequent positions are also LEFT JOINs survive.
+        // So we generate join types, then compute which LEFT JOINs survive.
         let mut left_join_positions = Vec::new();
         let joins: Vec<String> = (2..=num_tables)
             .map(|i| {
-                let is_left = rng.random_bool(0.5);
+                // Bias towards LEFT JOIN at the end so some survive simplification
+                let is_left = if i > num_tables - 3 {
+                    true
+                } else {
+                    rng.random_bool(0.5)
+                };
                 if is_left {
                     left_join_positions.push(i);
                 }
@@ -415,8 +425,19 @@ fn test_left_join_ordering() {
         let eqp_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
         let plan_order = extract_table_order(&eqp_rows);
 
-        // Invariant: LEFT JOIN RHS must appear after its LHS
-        for &i in &left_join_positions {
+        // A LEFT JOIN at position i in this chain pattern gets simplified to INNER
+        // when any subsequent position j > i is an INNER JOIN, because the null-rejection
+        // cascades backwards. Only LEFT JOINs where ALL subsequent positions are also
+        // LEFT JOINs survive simplification and must preserve LHS-before-RHS ordering.
+        let left_set: std::collections::HashSet<usize> =
+            left_join_positions.iter().copied().collect();
+        let surviving_left_joins: Vec<usize> = left_join_positions
+            .iter()
+            .copied()
+            .filter(|&i| (i + 1..=num_tables).all(|j| left_set.contains(&j)))
+            .collect();
+
+        for &i in &surviving_left_joins {
             let lhs = format!("t{}", i - 1);
             let rhs = format!("t{i}");
             let lhs_pos = plan_order.iter().position(|t| t == &lhs);
@@ -424,7 +445,8 @@ fn test_left_join_ordering() {
             assert!(
                 lhs_pos < rhs_pos,
                 "LEFT JOIN invariant violated: {lhs} must come before {rhs} in plan.\n\
-                 Plan order: {plan_order:?}\nLeft joins at: {left_join_positions:?}\nSeed: {seed}"
+                 Plan order: {plan_order:?}\nSurviving left joins: {surviving_left_joins:?}\n\
+                 All left joins: {left_join_positions:?}\nSeed: {seed}"
             );
         }
 
