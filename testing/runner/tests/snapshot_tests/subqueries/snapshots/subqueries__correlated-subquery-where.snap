@@ -18,7 +18,8 @@ info:
 ---
 QUERY PLAN
 |--SCAN products AS p
-`--SEARCH p2 USING INDEX idx_products_category
+`--CORRELATED SCALAR SUBQUERY 1
+   `--SEARCH p2 USING INDEX idx_products_category
 
 BYTECODE
 addr  opcode              p1  p2  p3  p4              p5  comment

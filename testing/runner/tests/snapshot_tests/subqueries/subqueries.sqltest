@@ -117,7 +117,7 @@ snapshot exists-multiple-conditions {
 
 # NOT EXISTS - find customers without orders
 @setup schema
-snapshot not-exists-no-orders {
+snapshot-eqp not-exists-no-orders {
     SELECT c.id, c.name, c.email
     FROM customers c
     WHERE NOT EXISTS (
@@ -129,7 +129,7 @@ snapshot not-exists-no-orders {
 
 # NOT EXISTS - products never ordered
 @setup schema
-snapshot not-exists-never-ordered {
+snapshot-eqp not-exists-never-ordered {
     SELECT p.id, p.name, p.stock
     FROM products p
     WHERE NOT EXISTS (
@@ -145,7 +145,7 @@ snapshot not-exists-never-ordered {
 
 # IN with subquery - simple case
 @setup schema
-snapshot in-subquery-simple {
+snapshot-eqp in-subquery-simple {
     SELECT id, name, price
     FROM products
     WHERE category_id IN (
@@ -170,7 +170,7 @@ snapshot in-subquery-aggregation {
 
 # NOT IN subquery
 @setup schema
-snapshot not-in-subquery {
+snapshot-eqp not-in-subquery {
     SELECT id, name, department
     FROM employees
     WHERE id NOT IN (
@@ -226,7 +226,7 @@ snapshot correlated-subquery-count {
 
 # Simple derived table
 @setup schema
-snapshot derived-table-simple {
+snapshot-eqp derived-table-simple {
     SELECT subq.category_id, subq.avg_price
     FROM (
         SELECT category_id, avg(price) AS avg_price
@@ -275,7 +275,7 @@ snapshot derived-table-nested {
 
 # Simple CTE - basic usage
 @setup schema
-snapshot cte-simple {
+snapshot-eqp cte-simple {
     WITH high_value_products AS (
         SELECT id, name, price
         FROM products
@@ -287,7 +287,7 @@ snapshot cte-simple {
 
 # CTE with aggregation
 @setup schema
-snapshot cte-aggregation {
+snapshot-eqp cte-aggregation {
     WITH category_stats AS (
         SELECT
             category_id,
@@ -309,7 +309,7 @@ snapshot cte-aggregation {
 
 # Multiple CTEs - chained definitions
 @setup schema
-snapshot cte-multiple-chained {
+snapshot-eqp cte-multiple-chained {
     WITH
     active_customers AS (
         SELECT id, name
@@ -402,7 +402,7 @@ snapshot cte-referenced-multiple-times {
 
 # CTE used in self-join
 @setup schema
-snapshot cte-self-join {
+snapshot-eqp cte-self-join {
     WITH employee_salaries AS (
         SELECT id, name, department, salary
         FROM employees
@@ -441,7 +441,7 @@ snapshot cte-in-subquery-and-main {
 
 # CTE with EXISTS
 @setup schema
-snapshot cte-with-exists {
+snapshot-eqp cte-with-exists {
     WITH recent_orders AS (
         SELECT id, customer_id
         FROM orders

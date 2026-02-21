@@ -25,9 +25,11 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN orders USING INDEX idx_orders_customer
-|--SCAN order_totals
-|--SCAN order_totals
+|--SCALAR SUBQUERY 1
+|  |--SCAN orders USING INDEX idx_orders_customer
+|  `--SCAN order_totals
+|--SCALAR SUBQUERY 2
+|  `--SCAN order_totals
 |--SCAN customers AS c
 `--SEARCH ot USING INDEX ephemeral_subquery_t5
 

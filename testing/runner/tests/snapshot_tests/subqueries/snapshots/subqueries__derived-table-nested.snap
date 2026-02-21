@@ -28,7 +28,7 @@ QUERY PLAN
 |  |--SCAN customers AS c
 |  `--SEARCH stats USING INDEX ephemeral_subquery_t3
 |     `--SCAN orders USING INDEX idx_orders_customer
-`--USE TEMP B-TREE FOR ORDER BY
+`--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode                    p1  p2  p3  p4            p5  comment

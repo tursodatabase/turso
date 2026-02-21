@@ -40,13 +40,13 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SEARCH tpd USING INDEX ephemeral_subquery_t7
-|  |--SEARCH tp USING INDEX ephemeral_subquery_t5
-|  |  `--SCAN product_sales
-|  |     `--SCAN order_items AS oi USING INDEX idx_order_items_product
-|  `--SCAN products AS p
 |--SCAN categories AS c
-`--USE TEMP B-TREE FOR ORDER BY
+|--SEARCH tpd USING INDEX ephemeral_subquery_t7
+|  |--SCAN products AS p
+|  `--SEARCH tp USING INDEX ephemeral_subquery_t5
+|     `--SCAN product_sales
+|        `--SCAN order_items AS oi USING INDEX idx_order_items_product
+`--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode                    p1   p2  p3  p4              p5  comment
