@@ -15,7 +15,27 @@ env:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 45 # FIXME: make this run faster
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bench: benchmark
+            features: "--features bench"
+          - bench: mvcc_benchmark
+            features: "--features bench"
+          - bench: json_benchmark
+            features: "--features bench"
+          - bench: sql_functions
+            features: "--features bench"
+          - bench: hash_spill_benchmark
+            features: "--features bench"
+          - bench: write_perf_benchmark
+            features: "--features bench"
+          - bench: fts_benchmark
+            features: "--features bench"
+          - bench: parser_benchmark
+            features: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -23,15 +43,23 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - uses: useblacksmith/setup-node@v5
+      - name: Bench ${{ matrix.bench }}
+        run: cargo bench --bench ${{ matrix.bench }} ${{ matrix.features }} 2>&1 | tee output.txt
+      - uses: actions/upload-artifact@v4
         with:
-          node-version: 20
-      #     cache: 'npm'
-      # - name: Install dependencies
-      #   run: npm install && npm run build
+          name: bench-output-${{ matrix.bench }}
+          path: output.txt
 
-      - name: Bench
-        run: make bench-exclude-tpc-h  2>&1 | tee output.txt
+  bench-report:
+    runs-on: ubuntu-latest
+    needs: bench
+    if: always() && !cancelled()
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-output-*
+      - name: Merge outputs
+        run: cat bench-output-*/output.txt > output.txt
       - name: Analyze benchmark result with Nyrkiö
         uses: nyrkio/change-detection@HEAD
         with:
