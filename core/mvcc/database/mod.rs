@@ -3256,6 +3256,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(state_machine)
     }
 
+    /// Returns true if the transaction can be rolled back (Active or Preparing).
+    pub fn is_tx_rollbackable(&self, tx_id: TxID) -> bool {
+        self.txs.get(&tx_id).is_some_and(|tx| {
+            matches!(
+                tx.value().state.load(),
+                TransactionState::Active | TransactionState::Preparing(_)
+            )
+        })
+    }
+
     /// Rolls back a transaction with the specified ID.
     ///
     /// This function rolls back a transaction with the specified `tx_id` by
@@ -3264,13 +3274,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to abort.
-    pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection) {
+    /// * `db` - The database index this transaction belongs to.
+    pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection, db: usize) {
         let tx_unlocked = self
             .txs
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
-        connection.set_mv_tx(None);
+        connection.set_mv_tx_for_db(db, None);
         turso_assert!(matches!(
             tx.state.load(),
             TransactionState::Active | TransactionState::Preparing(_)

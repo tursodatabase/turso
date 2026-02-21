@@ -1279,6 +1279,7 @@ impl Database {
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
             mv_tx: RwLock::new(None),
+            attached_mv_txs: RwLock::new(HashMap::default()),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),

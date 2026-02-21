@@ -1,6 +1,5 @@
 @database :memory:
 
-@skip-file-if mvcc "attach not supported in MVCC mode"
 
 # =============================================================================
 # Basic DDL on attached database
@@ -995,6 +994,7 @@ expect {
 # CREATE/DROP VIEW on attached database
 # =============================================================================
 
+@skip-if mvcc "views not supported in MVCC mode"
 test attach-write-create-view {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, value INTEGER);
@@ -1007,6 +1007,7 @@ expect {
     bob|20
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
 test attach-write-drop-view {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);
@@ -1425,6 +1426,7 @@ expect error {
 # CDC (CHANGE DATA CAPTURE) WITH ATTACHED DATABASES
 # =============================================================================
 
+@skip-if mvcc "CDC not supported in MVCC mode"
 test attach-write-cdc-insert {
     CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
     PRAGMA capture_data_changes_conn('full');
@@ -1437,6 +1439,7 @@ expect {
     t1|1
 }
 
+@skip-if mvcc "CDC not supported in MVCC mode"
 test attach-write-cdc-delete {
     CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
     PRAGMA capture_data_changes_conn('full');
@@ -1453,6 +1456,7 @@ expect {
     t1|-1
 }
 
+@skip-if mvcc "CDC not supported in MVCC mode"
 test attach-write-cdc-update {
     CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
     PRAGMA capture_data_changes_conn('full');
