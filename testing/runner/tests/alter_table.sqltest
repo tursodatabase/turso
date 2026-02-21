@@ -51,6 +51,8 @@ expect {
     1|c|TEXT|0||0
 }
 
+# SQLite does not rewrite dependent views (view-on-view) on RENAME COLUMN.
+@skip-if sqlite "sqlite does not rewrite dependent views on RENAME COLUMN"
 test alter-table-rename-column-view-on-view {
     CREATE TABLE t (a, b);
     CREATE VIEW v1 AS SELECT a, b FROM t;
@@ -95,6 +97,7 @@ expect {
     CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE c = 1)
 }
 
+@skip-if sqlite "sqlite views cannot reference attached databases"
 test alter-table-rename-column-view-attached-db-qualified {
     ATTACH ':memory:' AS aux;
     CREATE TABLE t (a, b);
