@@ -1688,8 +1688,13 @@ impl Program {
             self.connection.auto_commit.store(true, Ordering::SeqCst);
         }
         // Also rollback all attached database pagers that hold write locks
-        for attached_pager in self.connection.get_all_attached_pagers() {
-            attached_pager.rollback_attached();
+        // and discard connection-local schema changes.
+        {
+            let attached_pagers = self.connection.get_all_attached_pagers_with_index();
+            for (db_id, attached_pager) in attached_pagers {
+                self.connection.database_schemas().write().remove(&db_id);
+                attached_pager.rollback_attached();
+            }
         }
         self.connection.set_tx_state(TransactionState::None);
     }

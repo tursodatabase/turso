@@ -2559,9 +2559,15 @@ pub fn op_auto_commit(
             } else {
                 pager.rollback_tx(&conn);
             }
-            // Also rollback all attached database pagers
-            for attached_pager in conn.get_all_attached_pagers() {
-                attached_pager.rollback_attached();
+            // Also rollback all attached database pagers and discard
+            // any connection-local schema changes so post-rollback queries
+            // see the committed (pre-transaction) schema.
+            {
+                let attached_pagers = conn.get_all_attached_pagers_with_index();
+                for (db_id, attached_pager) in attached_pagers {
+                    conn.database_schemas().write().remove(&db_id);
+                    attached_pager.rollback_attached();
+                }
             }
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
