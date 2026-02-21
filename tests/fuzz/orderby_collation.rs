@@ -6,9 +6,8 @@
 
 #[cfg(test)]
 mod tests {
-    use core_tester::common::{
-        limbo_exec_rows, maybe_setup_tracing, rng_from_time_or_env, sqlite_exec_rows, TempDatabase,
-    };
+    use crate::helpers;
+    use core_tester::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
     use rand::Rng;
     use rusqlite::types::Value;
 
@@ -112,13 +111,8 @@ mod tests {
     /// if the optimizer incorrectly uses an index whose collation doesn't match the ORDER BY collation, results will be wrong.
     #[turso_macros::test(mvcc)]
     pub fn orderby_collation_vs_index_fuzz(db: TempDatabase) {
-        maybe_setup_tracing();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("orderby_collation_vs_index_fuzz seed: {seed}");
-
-        let opts = db.db_opts;
-        let flags = db.db_flags;
-        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+        let (mut rng, seed) = helpers::init_fuzz_test_tracing("orderby_collation_vs_index_fuzz");
+        let builder = helpers::builder_from_db(&db);
 
         // Generate table+index combinations with different collations
         let mut schema_variants: Vec<(String, String)> = Vec::new();
@@ -148,13 +142,7 @@ mod tests {
 
         const ITERS: usize = 500;
         for iter in 0..ITERS {
-            if iter % (ITERS / 10).max(1) == 0 {
-                println!(
-                    "orderby_collation_vs_index_fuzz: iteration {}/{}",
-                    iter + 1,
-                    ITERS
-                );
-            }
+            helpers::log_progress("orderby_collation_vs_index_fuzz", iter, ITERS, 10);
 
             // Pick a random schema variant
             let (table_ddl, index_ddl) =
@@ -220,23 +208,12 @@ mod tests {
     /// Test multi-column ORDER BY where some columns match index collation and some don't.
     #[turso_macros::test(mvcc)]
     pub fn orderby_multicolumn_collation_fuzz(db: TempDatabase) {
-        maybe_setup_tracing();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("orderby_multicolumn_collation_fuzz seed: {seed}");
-
-        let opts = db.db_opts;
-        let flags = db.db_flags;
-        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+        let (mut rng, seed) = helpers::init_fuzz_test_tracing("orderby_multicolumn_collation_fuzz");
+        let builder = helpers::builder_from_db(&db);
 
         const ITERS: usize = 100;
         for iter in 0..ITERS {
-            if iter % (ITERS / 10).max(1) == 0 {
-                println!(
-                    "orderby_multicolumn_collation_fuzz: iteration {}/{}",
-                    iter + 1,
-                    ITERS
-                );
-            }
+            helpers::log_progress("orderby_multicolumn_collation_fuzz", iter, ITERS, 10);
 
             // Random collations for each column
             let col1_table_coll = COLLATIONS[rng.random_range(0..COLLATIONS.len())];
@@ -319,23 +296,12 @@ mod tests {
     /// the index should not be used for ordering.
     #[turso_macros::test(mvcc)]
     pub fn orderby_implicit_collation_fuzz(db: TempDatabase) {
-        maybe_setup_tracing();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("orderby_implicit_collation_fuzz seed: {seed}");
-
-        let opts = db.db_opts;
-        let flags = db.db_flags;
-        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+        let (mut rng, seed) = helpers::init_fuzz_test_tracing("orderby_implicit_collation_fuzz");
+        let builder = helpers::builder_from_db(&db);
 
         const ITERS: usize = 100;
         for iter in 0..ITERS {
-            if iter % (ITERS / 10).max(1) == 0 {
-                println!(
-                    "orderby_implicit_collation_fuzz: iteration {}/{}",
-                    iter + 1,
-                    ITERS
-                );
-            }
+            helpers::log_progress("orderby_implicit_collation_fuzz", iter, ITERS, 10);
 
             // Column has one collation, index has another
             let col_collation = COLLATIONS[rng.random_range(0..COLLATIONS.len())];
@@ -391,23 +357,13 @@ mod tests {
     /// the one that matches ORDER BY collation (if any).
     #[turso_macros::test(mvcc)]
     pub fn orderby_multiple_indexes_collation_fuzz(db: TempDatabase) {
-        maybe_setup_tracing();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("orderby_multiple_indexes_collation_fuzz seed: {seed}");
-
-        let opts = db.db_opts;
-        let flags = db.db_flags;
-        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+        let (mut rng, seed) =
+            helpers::init_fuzz_test_tracing("orderby_multiple_indexes_collation_fuzz");
+        let builder = helpers::builder_from_db(&db);
 
         const ITERS: usize = 100;
         for iter in 0..ITERS {
-            if iter % (ITERS / 10).max(1) == 0 {
-                println!(
-                    "orderby_multiple_indexes_collation_fuzz: iteration {}/{}",
-                    iter + 1,
-                    ITERS
-                );
-            }
+            helpers::log_progress("orderby_multiple_indexes_collation_fuzz", iter, ITERS, 10);
 
             // Create table with multiple indexes, each with different collation
             let table_ddl = "CREATE TABLE t (c1 TEXT, c2 INTEGER)";
@@ -468,23 +424,12 @@ mod tests {
     /// for the WHERE clause but still need to sort for ORDER BY if collations don't match.
     #[turso_macros::test(mvcc)]
     pub fn orderby_with_where_collation_fuzz(db: TempDatabase) {
-        maybe_setup_tracing();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("orderby_with_where_collation_fuzz seed: {seed}");
-
-        let opts = db.db_opts;
-        let flags = db.db_flags;
-        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+        let (mut rng, seed) = helpers::init_fuzz_test_tracing("orderby_with_where_collation_fuzz");
+        let builder = helpers::builder_from_db(&db);
 
         const ITERS: usize = 100;
         for iter in 0..ITERS {
-            if iter % (ITERS / 10).max(1) == 0 {
-                println!(
-                    "orderby_with_where_collation_fuzz: iteration {}/{}",
-                    iter + 1,
-                    ITERS
-                );
-            }
+            helpers::log_progress("orderby_with_where_collation_fuzz", iter, ITERS, 10);
 
             let col_collation = COLLATIONS[rng.random_range(0..COLLATIONS.len())];
             let idx_collation = COLLATIONS[rng.random_range(0..COLLATIONS.len())];

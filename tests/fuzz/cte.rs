@@ -13,9 +13,9 @@ mod cte_tests {
     use rand_chacha::ChaCha8Rng;
     use rusqlite::params;
 
+    use crate::helpers;
     use core_tester::common::{
-        limbo_exec_rows, limbo_exec_rows_fallible, rng_from_time_or_env, sqlite_exec_rows,
-        TempDatabase,
+        limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase,
     };
 
     /// Simple expressions that can be used in CTEs
@@ -108,19 +108,12 @@ mod cte_tests {
 
     #[turso_macros::test]
     pub fn cte_dml_scenario(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("cte_dml_scenario seed: {seed}");
-
-        let opts = db.db_opts;
-        let flags = db.db_flags;
-        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+        let (mut rng, seed) = helpers::init_fuzz_test("cte_dml_scenario");
+        let builder = helpers::builder_from_db(&db);
 
         const ITERATIONS: usize = 100;
         for i in 0..ITERATIONS {
-            if i % 25 == 0 {
-                println!("cte_dml_scenario iteration {}/{}", i + 1, ITERATIONS);
-            }
+            helpers::log_progress("cte_dml_scenario", i, ITERATIONS, 4);
 
             // Create fresh databases for each iteration
             let limbo_db = builder.clone().build();
@@ -171,14 +164,12 @@ mod cte_tests {
             let limbo_result = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, &query);
             let sqlite_result = sqlite_conn.execute(&query, params![]);
 
-            match (&limbo_result, &sqlite_result) {
-                (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
-                _ => {
-                    panic!(
-                        "CTE DML outcome mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
-                    );
-                }
-            }
+            helpers::assert_outcome_parity(
+                &sqlite_result,
+                &limbo_result,
+                &query,
+                &format!("CTE DML outcome mismatch!\nseed: {seed}"),
+            );
 
             // Verify final state matches
             let verify_query = "SELECT id, val FROM t ORDER BY id";
@@ -194,9 +185,7 @@ mod cte_tests {
 
     #[turso_macros::test]
     pub fn cte_quoted_names_scenario(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("cte_quoted_names_scenario seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("cte_quoted_names_scenario");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -222,13 +211,7 @@ mod cte_tests {
 
         const ITERATIONS: usize = 200;
         for i in 0..ITERATIONS {
-            if i % 50 == 0 {
-                println!(
-                    "cte_quoted_names_scenario iteration {}/{}",
-                    i + 1,
-                    ITERATIONS
-                );
-            }
+            helpers::log_progress("cte_quoted_names_scenario", i, ITERATIONS, 4);
 
             let cte_name = QUOTED_NAMES[rng.random_range(0..QUOTED_NAMES.len())];
             let col_name = QUOTED_COLS[rng.random_range(0..QUOTED_COLS.len())];
@@ -252,9 +235,7 @@ mod cte_tests {
     /// aggregates on CTE joins, multiple references with different operations.
     #[turso_macros::test]
     pub fn cte_feature_interaction_scenario(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("cte_feature_interaction_scenario seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("cte_feature_interaction_scenario");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -263,13 +244,7 @@ mod cte_tests {
 
         const ITERATIONS: usize = 200;
         for i in 0..ITERATIONS {
-            if i % 100 == 0 {
-                println!(
-                    "cte_feature_interaction_scenario iteration {}/{}",
-                    i + 1,
-                    ITERATIONS
-                );
-            }
+            helpers::log_progress("cte_feature_interaction_scenario", i, ITERATIONS, 2);
 
             let scenario = rng.random_range(0..17);
             let query = match scenario {
@@ -546,23 +521,12 @@ mod cte_tests {
     /// Tests CTEs with persistent tables and indexes to exercise query planner paths.
     #[turso_macros::test]
     pub fn cte_with_real_tables_scenario(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("cte_with_real_tables_scenario seed: {seed}");
-
-        let opts = db.db_opts;
-        let flags = db.db_flags;
-        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+        let (mut rng, seed) = helpers::init_fuzz_test("cte_with_real_tables_scenario");
+        let builder = helpers::builder_from_db(&db);
 
         const ITERATIONS: usize = 100;
         for i in 0..ITERATIONS {
-            if i % 25 == 0 {
-                println!(
-                    "cte_with_real_tables_scenario iteration {}/{}",
-                    i + 1,
-                    ITERATIONS
-                );
-            }
+            helpers::log_progress("cte_with_real_tables_scenario", i, ITERATIONS, 4);
 
             let limbo_db = builder.clone().build();
             let sqlite_db = builder.clone().build();
@@ -713,22 +677,14 @@ mod cte_tests {
     /// Comprehensive CTE fuzz test combining multiple features in each query.
     #[turso_macros::test]
     pub fn cte_comprehensive_scenario(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("cte_comprehensive_scenario seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("cte_comprehensive_scenario");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         const ITERATIONS: usize = 200;
         for i in 0..ITERATIONS {
-            if i % 100 == 0 {
-                println!(
-                    "cte_comprehensive_scenario iteration {}/{}",
-                    i + 1,
-                    ITERATIONS
-                );
-            }
+            helpers::log_progress("cte_comprehensive_scenario", i, ITERATIONS, 2);
 
             // Generate 2-4 CTEs with various body types
             let num_ctes = rng.random_range(2..=4);
@@ -1646,8 +1602,7 @@ mod cte_tests {
     /// RNG-driven CTE fuzzer that generates truly random CTE queries
     #[turso_macros::test]
     pub fn cte_fuzz(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
+        let (mut rng, seed) = helpers::init_fuzz_test("cte_fuzz");
         let verbose = std::env::var("VERBOSE").is_ok();
         println!("cte_fuzz seed: {seed}");
 
@@ -1656,9 +1611,7 @@ mod cte_tests {
 
         const ITERATIONS: usize = 100;
         for i in 0..ITERATIONS {
-            if i % 100 == 0 {
-                println!("cte_fuzz iteration {}/{}", i + 1, ITERATIONS);
-            }
+            helpers::log_progress("cte_fuzz", i, ITERATIONS, 1);
 
             // Decide number of CTEs (1-5)
             let num_ctes = rng.random_range(1..=5);
