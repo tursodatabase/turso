@@ -1,12 +1,10 @@
+use super::helpers;
 use core_tester::common::{
-    limbo_exec_rows, maybe_setup_tracing, rng_from_time_or_env, sqlite_exec_rows, ExecRows,
-    TempDatabase, TempDatabaseBuilder,
+    limbo_exec_rows, maybe_setup_tracing, ExecRows, TempDatabase, TempDatabaseBuilder,
 };
 use rand::distr::weighted::WeightedIndex;
 use rand::distr::Distribution;
 use rand::Rng;
-use rand_chacha::ChaCha8Rng;
-use rusqlite::params;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -210,9 +208,7 @@ fn journal_mode_update_then_delete_btree_resident() {
 /// and constantly checks if the data is exactly the same as in SQLite
 #[turso_macros::test(mvcc)]
 pub fn journal_mode_fuzz(db: TempDatabase) {
-    maybe_setup_tracing();
-    let (mut rng, seed) = rng_from_time_or_env();
-    println!("journal_mode_fuzz seed: {seed}");
+    let (mut rng, seed) = helpers::init_fuzz_test_tracing("journal_mode_fuzz");
 
     let iterations = std::env::var("FUZZ_ITERATIONS")
         .ok()
@@ -318,7 +314,7 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
                     (id, "data", "count")
                 };
 
-                let text_val = generate_random_text(&mut rng);
+                let text_val = helpers::generate_random_text(&mut rng, 19);
                 let num_val = rng.random_range(-1000..1000);
 
                 let stmt = format!(
@@ -328,7 +324,12 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
                 if verbose {
                     println!("[{iter}] INSERT {table} id={id} (mode: {current_mode})");
                 }
-                execute_on_both(&limbo_conn, &sqlite_conn, &stmt, seed, iter);
+                helpers::execute_on_both(
+                    &limbo_conn,
+                    &sqlite_conn,
+                    &stmt,
+                    &format!("Seed: {seed}\nIteration: {iter}"),
+                );
             }
             Action::Update => {
                 let table = if rng.random_bool(0.5) { "t1" } else { "t2" };
@@ -340,7 +341,7 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
 
                 if max_id > 1 {
                     let id = rng.random_range(1..max_id);
-                    let new_text = generate_random_text(&mut rng);
+                    let new_text = helpers::generate_random_text(&mut rng, 19);
                     let new_num = rng.random_range(-1000..1000);
 
                     let stmt = format!(
@@ -350,7 +351,12 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
                     if verbose {
                         println!("[{iter}] UPDATE {table} id={id} (mode: {current_mode})");
                     }
-                    execute_on_both(&limbo_conn, &sqlite_conn, &stmt, seed, iter);
+                    helpers::execute_on_both(
+                        &limbo_conn,
+                        &sqlite_conn,
+                        &stmt,
+                        &format!("Seed: {seed}\nIteration: {iter}"),
+                    );
                 }
             }
             Action::Delete => {
@@ -368,7 +374,12 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
                     if verbose {
                         println!("[{iter}] DELETE {table} id={id} (mode: {current_mode})");
                     }
-                    execute_on_both(&limbo_conn, &sqlite_conn, &stmt, seed, iter);
+                    helpers::execute_on_both(
+                        &limbo_conn,
+                        &sqlite_conn,
+                        &stmt,
+                        &format!("Seed: {seed}\nIteration: {iter}"),
+                    );
                 }
             }
             Action::SwitchMode => {
@@ -392,7 +403,15 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
         }
 
         // Verify data consistency after each operation
-        verify_tables_match(&limbo_conn, &sqlite_conn, seed, iter);
+        helpers::verify_tables_match(
+            &limbo_conn,
+            &sqlite_conn,
+            &[
+                ("t1", "SELECT id, val, num FROM t1 ORDER BY id"),
+                ("t2", "SELECT id, data, count FROM t2 ORDER BY id"),
+            ],
+            &format!("Seed: {seed}\nIteration: {iter}"),
+        );
     }
 
     println!("journal_mode_fuzz completed successfully after {iterations} iterations");
@@ -404,72 +423,4 @@ fn get_limbo_journal_mode(conn: &Arc<turso_core::Connection>) -> String {
         .expect("PRAGMA journal_mode query should not fail");
     assert!(!result.is_empty(), "jounral mode result cannot be empty");
     result[0][0].to_string()
-}
-
-fn generate_random_text(rng: &mut ChaCha8Rng) -> String {
-    let len = rng.random_range(1..20);
-    let chars: Vec<char> = (0..len)
-        .map(|_| {
-            let c = rng.random_range(b'a'..=b'z');
-            c as char
-        })
-        .collect();
-    chars.into_iter().collect()
-}
-
-fn execute_on_both(
-    limbo_conn: &Arc<turso_core::Connection>,
-    sqlite_conn: &rusqlite::Connection,
-    stmt: &str,
-    seed: u64,
-    iter: usize,
-) {
-    // Execute on SQLite
-    if let Err(e) = sqlite_conn.execute(stmt, params![]) {
-        panic!(
-            "SQLite execution failed!\nSeed: {seed}\nIteration: {iter}\nStatement: {stmt}\nError: {e}"
-        );
-    }
-
-    // Execute on Limbo
-    if let Err(e) = limbo_conn.execute(stmt) {
-        panic!(
-            "Limbo execution failed!\nSeed: {seed}\nIteration: {iter}\nStatement: {stmt}\nError: {e}"
-        );
-    }
-}
-
-fn verify_tables_match(
-    limbo_conn: &Arc<turso_core::Connection>,
-    sqlite_conn: &rusqlite::Connection,
-    seed: u64,
-    iter: usize,
-) {
-    // Check t1
-    let query_t1 = "SELECT id, val, num FROM t1 ORDER BY id";
-    let limbo_rows_t1 = limbo_exec_rows(limbo_conn, query_t1);
-    let sqlite_rows_t1 = sqlite_exec_rows(sqlite_conn, query_t1);
-
-    similar_asserts::assert_eq!(
-        Turso: limbo_rows_t1,
-        Sqlite: sqlite_rows_t1,
-        "TABLE t1 MISMATCH!\nSeed: {seed}\nIteration: {iter}\n\
-            Turso ({} rows)\nSQLite ({} rows)",
-        limbo_rows_t1.len(),
-        sqlite_rows_t1.len(),
-    );
-
-    // Check t2
-    let query_t2 = "SELECT id, data, count FROM t2 ORDER BY id";
-    let limbo_rows_t2 = limbo_exec_rows(limbo_conn, query_t2);
-    let sqlite_rows_t2 = sqlite_exec_rows(sqlite_conn, query_t2);
-
-    similar_asserts::assert_eq!(
-        Turso: limbo_rows_t2,
-        Sqlite: sqlite_rows_t2,
-        "TABLE t2 MISMATCH!\nSeed: {seed}\nIteration: {iter}\n\
-            Turso ({} rows)\nSQLite ({} rows)",
-        limbo_rows_t2.len(),
-        sqlite_rows_t2.len(),
-    );
 }

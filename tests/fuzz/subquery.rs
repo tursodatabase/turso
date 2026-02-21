@@ -9,9 +9,8 @@ mod subquery_tests {
     use rand::Rng;
     use rand_chacha::ChaCha8Rng;
 
-    use core_tester::common::{
-        limbo_exec_rows, rng_from_time_or_env, sqlite_exec_rows, TempDatabase,
-    };
+    use crate::helpers;
+    use core_tester::common::TempDatabase;
 
     /// Scalar values that can be used in subqueries
     const SCALAR_VALUES: &[&str] = &[
@@ -45,22 +44,14 @@ mod subquery_tests {
     /// Tests scalar subqueries as function arguments
     #[turso_macros::test]
     pub fn subquery_in_function_args(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("subquery_in_function_args seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("subquery_in_function_args");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         const ITERATIONS: usize = 100;
         for i in 0..ITERATIONS {
-            if i % 25 == 0 {
-                println!(
-                    "subquery_in_function_args iteration {}/{}",
-                    i + 1,
-                    ITERATIONS
-                );
-            }
+            helpers::log_progress("subquery_in_function_args", i, ITERATIONS, 4);
 
             let (func_name, arg_count) =
                 SCALAR_FUNCTIONS[rng.random_range(0..SCALAR_FUNCTIONS.len())];
@@ -70,13 +61,11 @@ mod subquery_tests {
                 .collect();
 
             let query = format!("SELECT {}({})", func_name, args.join(", "));
-
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "Function argument mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("Function argument mismatch!\nseed: {seed}"),
             );
         }
     }
@@ -84,9 +73,7 @@ mod subquery_tests {
     /// Tests scalar subqueries in arithmetic expressions
     #[turso_macros::test]
     pub fn subquery_in_arithmetic(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("subquery_in_arithmetic seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("subquery_in_arithmetic");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -96,9 +83,7 @@ mod subquery_tests {
 
         const ITERATIONS: usize = 100;
         for i in 0..ITERATIONS {
-            if i % 25 == 0 {
-                println!("subquery_in_arithmetic iteration {}/{}", i + 1, ITERATIONS);
-            }
+            helpers::log_progress("subquery_in_arithmetic", i, ITERATIONS, 4);
 
             let op = OPS[rng.random_range(0..OPS.len())];
             let v1 = INTEGERS[rng.random_range(0..INTEGERS.len())];
@@ -118,13 +103,11 @@ mod subquery_tests {
             };
 
             let query = format!("SELECT (SELECT {v1}) {op} (SELECT {v2})");
-
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "Arithmetic mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("Arithmetic mismatch!\nseed: {seed}"),
             );
         }
     }
@@ -132,9 +115,7 @@ mod subquery_tests {
     /// Tests scalar subqueries in comparison expressions
     #[turso_macros::test]
     pub fn subquery_in_comparisons(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("subquery_in_comparisons seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("subquery_in_comparisons");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -144,22 +125,18 @@ mod subquery_tests {
 
         const ITERATIONS: usize = 100;
         for i in 0..ITERATIONS {
-            if i % 25 == 0 {
-                println!("subquery_in_comparisons iteration {}/{}", i + 1, ITERATIONS);
-            }
+            helpers::log_progress("subquery_in_comparisons", i, ITERATIONS, 4);
 
             let op = COMP_OPS[rng.random_range(0..COMP_OPS.len())];
             let v1 = VALUES[rng.random_range(0..VALUES.len())];
             let v2 = VALUES[rng.random_range(0..VALUES.len())];
 
             let query = format!("SELECT (SELECT {v1}) {op} (SELECT {v2})");
-
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "Comparison mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("Comparison mismatch!\nseed: {seed}"),
             );
         }
     }
@@ -167,18 +144,14 @@ mod subquery_tests {
     /// Tests CASE expressions with subqueries
     #[turso_macros::test]
     pub fn subquery_in_case(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("subquery_in_case seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("subquery_in_case");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         const ITERATIONS: usize = 100;
         for i in 0..ITERATIONS {
-            if i % 25 == 0 {
-                println!("subquery_in_case iteration {}/{}", i + 1, ITERATIONS);
-            }
+            helpers::log_progress("subquery_in_case", i, ITERATIONS, 4);
 
             let scenario = rng.random_range(0..4);
             let query = match scenario {
@@ -207,12 +180,11 @@ mod subquery_tests {
                 _ => unreachable!(),
             };
 
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "CASE mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("CASE mismatch!\nseed: {seed}"),
             );
         }
     }
@@ -220,18 +192,14 @@ mod subquery_tests {
     /// Tests BETWEEN with subqueries
     #[turso_macros::test]
     pub fn subquery_in_between(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("subquery_in_between seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("subquery_in_between");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         const ITERATIONS: usize = 50;
         for i in 0..ITERATIONS {
-            if i % 10 == 0 {
-                println!("subquery_in_between iteration {}/{}", i + 1, ITERATIONS);
-            }
+            helpers::log_progress("subquery_in_between", i, ITERATIONS, 5);
 
             let val = rng.random_range(1..20);
             let low = rng.random_range(1..10);
@@ -240,13 +208,11 @@ mod subquery_tests {
 
             let query =
                 format!("SELECT (SELECT {val}) {not}BETWEEN (SELECT {low}) AND (SELECT {high})");
-
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "BETWEEN mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("BETWEEN mismatch!\nseed: {seed}"),
             );
         }
     }
@@ -254,9 +220,7 @@ mod subquery_tests {
     /// Tests LIKE/GLOB with subqueries
     #[turso_macros::test]
     pub fn subquery_in_like_glob(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("subquery_in_like_glob seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("subquery_in_like_glob");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -267,9 +231,7 @@ mod subquery_tests {
 
         const ITERATIONS: usize = 50;
         for i in 0..ITERATIONS {
-            if i % 10 == 0 {
-                println!("subquery_in_like_glob iteration {}/{}", i + 1, ITERATIONS);
-            }
+            helpers::log_progress("subquery_in_like_glob", i, ITERATIONS, 5);
 
             let str_val = STRINGS[rng.random_range(0..STRINGS.len())];
             let use_glob = rng.random_bool(0.5);
@@ -282,12 +244,11 @@ mod subquery_tests {
                 format!("SELECT (SELECT {str_val}) LIKE (SELECT {pattern})")
             };
 
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "LIKE/GLOB mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("LIKE/GLOB mismatch!\nseed: {seed}"),
             );
         }
     }
@@ -295,9 +256,7 @@ mod subquery_tests {
     /// Tests FROM clause subqueries with various operations
     #[turso_macros::test]
     pub fn subquery_in_from_clause(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("subquery_in_from_clause seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("subquery_in_from_clause");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -306,9 +265,7 @@ mod subquery_tests {
 
         const ITERATIONS: usize = 100;
         for i in 0..ITERATIONS {
-            if i % 25 == 0 {
-                println!("subquery_in_from_clause iteration {}/{}", i + 1, ITERATIONS);
-            }
+            helpers::log_progress("subquery_in_from_clause", i, ITERATIONS, 4);
 
             let scenario = rng.random_range(0..6);
             let query = match scenario {
@@ -359,12 +316,11 @@ mod subquery_tests {
                 _ => unreachable!(),
             };
 
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "FROM clause mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("FROM clause mismatch!\nseed: {seed}"),
             );
         }
     }
@@ -372,18 +328,14 @@ mod subquery_tests {
     /// Tests joins between subqueries
     #[turso_macros::test]
     pub fn subquery_joins(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("subquery_joins seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("subquery_joins");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         const ITERATIONS: usize = 50;
         for i in 0..ITERATIONS {
-            if i % 10 == 0 {
-                println!("subquery_joins iteration {}/{}", i + 1, ITERATIONS);
-            }
+            helpers::log_progress("subquery_joins", i, ITERATIONS, 5);
 
             let scenario = rng.random_range(0..4);
             let query = match scenario {
@@ -423,12 +375,11 @@ mod subquery_tests {
                 _ => unreachable!(),
             };
 
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "JOIN mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("JOIN mismatch!\nseed: {seed}"),
             );
         }
     }
@@ -436,22 +387,14 @@ mod subquery_tests {
     /// Tests CTE combined with scalar subqueries
     #[turso_macros::test]
     pub fn cte_with_scalar_subqueries(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("cte_with_scalar_subqueries seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("cte_with_scalar_subqueries");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         const ITERATIONS: usize = 100;
         for i in 0..ITERATIONS {
-            if i % 25 == 0 {
-                println!(
-                    "cte_with_scalar_subqueries iteration {}/{}",
-                    i + 1,
-                    ITERATIONS
-                );
-            }
+            helpers::log_progress("cte_with_scalar_subqueries", i, ITERATIONS, 4);
 
             let scenario = rng.random_range(0..5);
             let query = match scenario {
@@ -509,12 +452,11 @@ mod subquery_tests {
                 _ => unreachable!(),
             };
 
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "CTE+subquery mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("CTE+subquery mismatch!\nseed: {seed}"),
             );
         }
     }
@@ -522,18 +464,14 @@ mod subquery_tests {
     /// Tests empty subquery edge cases
     #[turso_macros::test]
     pub fn subquery_empty_results(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("subquery_empty_results seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("subquery_empty_results");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         const ITERATIONS: usize = 50;
         for i in 0..ITERATIONS {
-            if i % 10 == 0 {
-                println!("subquery_empty_results iteration {}/{}", i + 1, ITERATIONS);
-            }
+            helpers::log_progress("subquery_empty_results", i, ITERATIONS, 5);
 
             let scenario = rng.random_range(0..5);
             let query = match scenario {
@@ -562,12 +500,11 @@ mod subquery_tests {
                 _ => unreachable!(),
             };
 
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "Empty subquery mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("Empty subquery mismatch!\nseed: {seed}"),
             );
         }
     }
@@ -575,22 +512,14 @@ mod subquery_tests {
     /// Tests NOT IN with NULL handling edge cases
     #[turso_macros::test]
     pub fn subquery_not_in_null_handling(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("subquery_not_in_null_handling seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("subquery_not_in_null_handling");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         const ITERATIONS: usize = 50;
         for i in 0..ITERATIONS {
-            if i % 10 == 0 {
-                println!(
-                    "subquery_not_in_null_handling iteration {}/{}",
-                    i + 1,
-                    ITERATIONS
-                );
-            }
+            helpers::log_progress("subquery_not_in_null_handling", i, ITERATIONS, 5);
 
             let scenario = rng.random_range(0..4);
             let query = match scenario {
@@ -620,12 +549,11 @@ mod subquery_tests {
                 _ => unreachable!(),
             };
 
-            let limbo_result = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
-
-            assert_eq!(
-                limbo_result, sqlite_result,
-                "NOT IN NULL mismatch!\nseed: {seed}\nquery: {query}\nlimbo: {limbo_result:?}\nsqlite: {sqlite_result:?}"
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                &format!("NOT IN NULL mismatch!\nseed: {seed}"),
             );
         }
     }

@@ -7,9 +7,9 @@ mod savepoint_tests {
     use rand_chacha::ChaCha8Rng;
     use rusqlite::params;
 
+    use crate::helpers;
     use core_tester::common::{
-        limbo_exec_rows, limbo_exec_rows_fallible, rng_from_time_or_env, sqlite_exec_rows,
-        TempDatabase,
+        limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase,
     };
 
     const SAVEPOINT_NAMES: [&str; 8] = ["sp0", "sp1", "outer", "inner", "alpha", "beta", "x", "y"];
@@ -31,11 +31,7 @@ mod savepoint_tests {
     }
 
     fn random_nullable_int(rng: &mut ChaCha8Rng, range: std::ops::RangeInclusive<i64>) -> String {
-        if rng.random_bool(0.2) {
-            "NULL".to_string()
-        } else {
-            rng.random_range(range).to_string()
-        }
+        helpers::random_nullable_int(rng, range, 0.2)
     }
 
     fn random_dml_stmt(rng: &mut ChaCha8Rng) -> String {
@@ -187,20 +183,12 @@ mod savepoint_tests {
     }
 
     fn history_tail(history: &[String], max_lines: usize) -> String {
-        let start = history.len().saturating_sub(max_lines);
-        history[start..]
-            .iter()
-            .enumerate()
-            .map(|(i, stmt)| format!("{:04}: {}", start + i + 1, stmt))
-            .collect::<Vec<_>>()
-            .join("\n")
+        helpers::history_tail(history, max_lines)
     }
 
     #[turso_macros::test(mvcc)]
     pub fn named_savepoint_differential_fuzz(db: TempDatabase) {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time_or_env();
-        println!("named_savepoint_differential_fuzz seed: {seed}");
+        let (mut rng, seed) = helpers::init_fuzz_test("named_savepoint_differential_fuzz");
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -266,13 +254,7 @@ mod savepoint_tests {
         ];
 
         for step in 0..STEPS {
-            if step % 250 == 0 {
-                println!(
-                    "named_savepoint_differential_fuzz step {}/{}",
-                    step + 1,
-                    STEPS
-                );
-            }
+            helpers::log_progress("named_savepoint_differential_fuzz", step, STEPS, 8);
 
             let stmt = match rng.random_range(0..100) {
                 0..=29 => random_dml_stmt(&mut rng),
