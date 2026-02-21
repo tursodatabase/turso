@@ -1,17 +1,20 @@
 ---
 source: sorting.sqltest
-expression: "SELECT id, name, price, stock, price * stock AS total_value\n    FROM products\n    ORDER BY price * stock DESC;"
+expression: |-
+  SELECT id, name, price, stock, price * stock AS total_value
+      FROM products
+      ORDER BY price * stock DESC;
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN products
-`--USE TEMP B-TREE FOR ORDER BY
+`--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode          p1  p2  p3  p4                p5  comment
