@@ -9641,6 +9641,7 @@ pub fn op_integrity_check(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IntegrityCk {
+            db,
             max_errors,
             roots,
             message_register,
@@ -9649,10 +9650,16 @@ pub fn op_integrity_check(
     );
 
     let mv_store = program.connection.mv_store();
+    // Use the correct pager for the target database (main or attached)
+    let target_pager = if *db == 0 {
+        pager.clone()
+    } else {
+        program.get_pager_from_database_index(db)
+    };
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
             let (freelist_trunk_page, db_size) =
-                return_if_io!(with_header(pager, mv_store.as_ref(), program, |header| (
+                return_if_io!(with_header(&target_pager, mv_store.as_ref(), program, |header| (
                     header.freelist_trunk_page.get(),
                     header.database_size.get()
                 )));
@@ -9662,7 +9669,7 @@ pub fn op_integrity_check(
 
             if freelist_trunk_page > 0 {
                 let expected_freelist_count =
-                    return_if_io!(with_header(pager, mv_store.as_ref(), program, |header| {
+                    return_if_io!(with_header(&target_pager, mv_store.as_ref(), program, |header| {
                         header.freelist_pages.get()
                     }));
                 integrity_check_state.set_expected_freelist_count(expected_freelist_count as usize);
@@ -9690,7 +9697,7 @@ pub fn op_integrity_check(
             return_if_io!(integrity_check(
                 integrity_check_state,
                 errors,
-                pager,
+                &target_pager,
                 mv_store.as_ref()
             ));
 
@@ -9724,7 +9731,7 @@ pub fn op_integrity_check(
 
             #[cfg(not(feature = "omit_autovacuum"))]
             let skip_page_never_used = !matches!(
-                pager.get_auto_vacuum_mode(),
+                target_pager.get_auto_vacuum_mode(),
                 crate::storage::pager::AutoVacuumMode::None
             );
             #[cfg(feature = "omit_autovacuum")]
@@ -9736,12 +9743,12 @@ pub fn op_integrity_check(
                         .page_reference
                         .contains_key(&(page_number as i64))
                     {
-                        if pager.pending_byte_page_id() != Some(page_number as u32) {
+                        if target_pager.pending_byte_page_id() != Some(page_number as u32) {
                             errors.push(IntegrityCheckError::PageNeverUsed {
                                 page_id: page_number as i64,
                             });
                         }
-                    } else if pager.pending_byte_page_id() == Some(page_number as u32) {
+                    } else if target_pager.pending_byte_page_id() == Some(page_number as u32) {
                         errors.push(IntegrityCheckError::PendingBytePageUsed {
                             page_id: page_number as i64,
                         })

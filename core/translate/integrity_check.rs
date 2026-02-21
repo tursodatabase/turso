@@ -166,6 +166,7 @@ fn translate_integrity_check_impl(
     let scratch_reg = program.alloc_register();
 
     program.emit_insn(Insn::IntegrityCk {
+        db: database_id,
         max_errors,
         roots: root_pages,
         message_register: message_reg,

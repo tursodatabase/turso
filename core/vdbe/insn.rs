@@ -1290,6 +1290,7 @@ pub enum Insn {
     /// Higher-level semantic checks (row/index consistency, constraints, etc.)
     /// are emitted as normal VDBE bytecode in translation.
     IntegrityCk {
+        db: usize,
         max_errors: usize,
         roots: Vec<i64>,
         message_register: usize,
