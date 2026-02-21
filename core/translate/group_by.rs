@@ -17,11 +17,12 @@ use crate::translate::{
     optimizer::Optimizable,
 };
 use crate::{
+    emit_explain,
     schema::PseudoCursorType,
     translate::collate::{get_collseq_from_expr, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
-        builder::{CursorType, ProgramBuilder},
+        builder::{CursorType, ProgramBuilder, QueryMode},
         insn::Insn,
         BranchOffset,
     },
@@ -156,6 +157,7 @@ pub fn init_group_by<'a>(
             columns: column_count,
             order_and_collations,
         });
+        emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
         let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
         GroupByRowSource::Sorter {
             pseudo_cursor,

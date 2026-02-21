@@ -88,19 +88,19 @@ setup schema {
 
 # Simple equality lookup on indexed column
 @setup schema
-snapshot simple-index-equality-lookup {
+snapshot-eqp simple-index-equality-lookup {
     SELECT id, name, price FROM products WHERE sku = 'ABC123';
 }
 
 # Primary key lookup (implicit index)
 @setup schema
-snapshot primary-key-lookup {
+snapshot-eqp primary-key-lookup {
     SELECT id, sku, name FROM products WHERE id = 42;
 }
 
 # Simple index lookup with additional non-indexed filter
 @setup schema
-snapshot simple-index-with-filter {
+snapshot-eqp simple-index-with-filter {
     SELECT id, name, price FROM products WHERE sku = 'ABC123' AND stock_qty > 0;
 }
 
@@ -110,7 +110,7 @@ snapshot simple-index-with-filter {
 
 # Full composite index usage (both columns in WHERE)
 @setup schema
-snapshot composite-index-full-usage {
+snapshot-eqp composite-index-full-usage {
     SELECT id, status, total_amount
     FROM orders
     WHERE customer_id = 100 AND order_date = '2024-01-15';
@@ -118,7 +118,7 @@ snapshot composite-index-full-usage {
 
 # Partial composite index usage (first column only - should use index)
 @setup schema
-snapshot composite-index-first-column-only {
+snapshot-eqp composite-index-first-column-only {
     SELECT id, order_date, total_amount
     FROM orders
     WHERE customer_id = 100;
@@ -126,7 +126,7 @@ snapshot composite-index-first-column-only {
 
 # Partial composite index usage (second column only - may not use index efficiently)
 @setup schema
-snapshot composite-index-second-column-only {
+snapshot-eqp composite-index-second-column-only {
     SELECT id, customer_id, total_amount
     FROM orders
     WHERE order_date = '2024-01-15';
@@ -134,7 +134,7 @@ snapshot composite-index-second-column-only {
 
 # Composite index with range on second column
 @setup schema
-snapshot composite-index-range-on-second {
+snapshot-eqp composite-index-range-on-second {
     SELECT id, order_date, total_amount
     FROM orders
     WHERE customer_id = 100 AND order_date >= '2024-01-01' AND order_date < '2024-02-01';
@@ -142,7 +142,7 @@ snapshot composite-index-range-on-second {
 
 # Composite index with ORDER BY matching index order
 @setup schema
-snapshot composite-index-order-by-match {
+snapshot-eqp composite-index-order-by-match {
     SELECT id, order_date, total_amount
     FROM orders
     WHERE customer_id = 100
@@ -155,7 +155,7 @@ snapshot composite-index-order-by-match {
 
 # Covering index: all requested columns are in the index
 @setup schema
-snapshot covering-index-all-columns {
+snapshot-eqp covering-index-all-columns {
     SELECT warehouse_id, product_id, quantity
     FROM inventory
     WHERE warehouse_id = 1 AND product_id = 500;
@@ -163,7 +163,7 @@ snapshot covering-index-all-columns {
 
 # Covering index: subset of indexed columns
 @setup schema
-snapshot covering-index-subset {
+snapshot-eqp covering-index-subset {
     SELECT warehouse_id, quantity
     FROM inventory
     WHERE warehouse_id = 1;
@@ -171,7 +171,7 @@ snapshot covering-index-subset {
 
 # Non-covering query: needs column not in index (requires table lookup)
 @setup schema
-snapshot non-covering-needs-table-lookup {
+snapshot-eqp non-covering-needs-table-lookup {
     SELECT warehouse_id, product_id, quantity, last_updated
     FROM inventory
     WHERE warehouse_id = 1 AND product_id = 500;
@@ -179,7 +179,7 @@ snapshot non-covering-needs-table-lookup {
 
 # Covering index with aggregation
 @setup schema
-snapshot covering-index-with-aggregation {
+snapshot-eqp covering-index-with-aggregation {
     SELECT warehouse_id, SUM(quantity) as total_qty
     FROM inventory
     WHERE warehouse_id = 1
@@ -192,37 +192,37 @@ snapshot covering-index-with-aggregation {
 
 # Range scan with BETWEEN
 @setup schema
-snapshot range-scan-between {
+snapshot-eqp range-scan-between {
     SELECT id, event_type, severity FROM events WHERE severity BETWEEN 3 AND 7;
 }
 
 # Range scan with greater than
 @setup schema
-snapshot range-scan-greater-than {
+snapshot-eqp range-scan-greater-than {
     SELECT id, event_type, severity FROM events WHERE severity > 5;
 }
 
 # Range scan with less than
 @setup schema
-snapshot range-scan-less-than {
+snapshot-eqp range-scan-less-than {
     SELECT id, event_type, severity FROM events WHERE severity < 3;
 }
 
 # Range scan with greater than or equal
 @setup schema
-snapshot range-scan-greater-equal {
+snapshot-eqp range-scan-greater-equal {
     SELECT id, event_type, severity FROM events WHERE severity >= 5;
 }
 
 # Range scan with less than or equal
 @setup schema
-snapshot range-scan-less-equal {
+snapshot-eqp range-scan-less-equal {
     SELECT id, event_type, severity FROM events WHERE severity <= 3;
 }
 
 # Range scan on timestamp (text comparison)
 @setup schema
-snapshot range-scan-timestamp {
+snapshot-eqp range-scan-timestamp {
     SELECT id, event_type, timestamp
     FROM events
     WHERE timestamp >= '2024-01-01' AND timestamp < '2024-02-01';
@@ -230,7 +230,7 @@ snapshot range-scan-timestamp {
 
 # Range scan combined with equality on another index
 @setup schema
-snapshot range-scan-with-equality {
+snapshot-eqp range-scan-with-equality {
     SELECT id, name, price
     FROM products
     WHERE category = 'Electronics' AND price BETWEEN 100 AND 500;
@@ -242,7 +242,7 @@ snapshot range-scan-with-equality {
 
 # OR on same indexed column (may use index union or full scan)
 @setup schema
-snapshot or-same-column {
+snapshot-eqp or-same-column {
     SELECT id, event_type, severity
     FROM events
     WHERE event_type = 'ERROR' OR event_type = 'CRITICAL';
@@ -250,7 +250,7 @@ snapshot or-same-column {
 
 # OR on different indexed columns
 @setup schema
-snapshot or-different-columns {
+snapshot-eqp or-different-columns {
     SELECT id, event_type, severity
     FROM events
     WHERE event_type = 'ERROR' OR severity > 8;
@@ -258,7 +258,7 @@ snapshot or-different-columns {
 
 # OR with one indexed and one non-indexed column
 @setup schema
-snapshot or-indexed-and-non-indexed {
+snapshot-eqp or-indexed-and-non-indexed {
     SELECT id, event_type, source
     FROM events
     WHERE event_type = 'ERROR' OR source = 'auth-service';
@@ -266,7 +266,7 @@ snapshot or-indexed-and-non-indexed {
 
 # IN clause (similar to multiple ORs)
 @setup schema
-snapshot in-clause-multiple-values {
+snapshot-eqp in-clause-multiple-values {
     SELECT id, event_type, severity
     FROM events
     WHERE event_type IN ('ERROR', 'WARNING', 'CRITICAL');
@@ -274,7 +274,7 @@ snapshot in-clause-multiple-values {
 
 # Complex OR with AND combinations
 @setup schema
-snapshot or-with-and-combinations {
+snapshot-eqp or-with-and-combinations {
     SELECT id, event_type, severity, source
     FROM events
     WHERE (event_type = 'ERROR' AND severity > 5)
@@ -287,19 +287,19 @@ snapshot or-with-and-combinations {
 
 # Full table scan on table without indexes
 @setup schema
-snapshot full-scan-no-index {
+snapshot-eqp full-scan-no-index {
     SELECT id, level, message FROM logs WHERE level = 'ERROR';
 }
 
 # Full table scan with non-indexed column filter
 @setup schema
-snapshot full-scan-non-indexed-column {
+snapshot-eqp full-scan-non-indexed-column {
     SELECT id, sku, name FROM products WHERE name LIKE '%Widget%';
 }
 
 # Full scan with aggregation
 @setup schema
-snapshot full-scan-with-aggregation {
+snapshot-eqp full-scan-with-aggregation {
     SELECT component, COUNT(*) as count
     FROM logs
     GROUP BY component;
@@ -307,13 +307,13 @@ snapshot full-scan-with-aggregation {
 
 # Full scan required due to function on indexed column
 @setup schema
-snapshot full-scan-function-on-indexed {
+snapshot-eqp full-scan-function-on-indexed {
     SELECT id, sku, name FROM products WHERE UPPER(sku) = 'ABC123';
 }
 
 # Full scan due to leading wildcard in LIKE
 @setup schema
-snapshot full-scan-leading-wildcard {
+snapshot-eqp full-scan-leading-wildcard {
     SELECT id, sku, name FROM products WHERE sku LIKE '%123';
 }
 
@@ -327,7 +327,7 @@ setup no_rowid_alias {
 
 # Rowid equality seek on table without explicit INTEGER PRIMARY KEY alias
 @setup no_rowid_alias
-snapshot rowid-seek-no-alias {
+snapshot-eqp rowid-seek-no-alias {
     SELECT rowid, name, value FROM items WHERE rowid = 5;
 }
 
@@ -343,30 +343,30 @@ snapshot rowid-range-no-alias {
 
 # Index used for ORDER BY without WHERE clause
 @setup schema
-snapshot index-for-order-by {
+snapshot-eqp index-for-order-by {
     SELECT id, sku, price FROM products ORDER BY price LIMIT 10;
 }
 
 # Index used for MIN/MAX optimization
 @setup schema
-snapshot index-for-min {
+snapshot-eqp index-for-min {
     SELECT MIN(price) FROM products;
 }
 
 @setup schema
-snapshot index-for-max {
+snapshot-eqp index-for-max {
     SELECT MAX(price) FROM products;
 }
 
 # Index with NOT equal (typically cannot use index efficiently)
 @setup schema
-snapshot index-not-equal {
+snapshot-eqp index-not-equal {
     SELECT id, sku, name FROM products WHERE category != 'Discontinued';
 }
 
 # Multiple indexes available - optimizer choice
 @setup schema
-snapshot multiple-indexes-choice {
+snapshot-eqp multiple-indexes-choice {
     SELECT id, sku, name, price
     FROM products
     WHERE category = 'Electronics' AND price < 100;
@@ -374,7 +374,7 @@ snapshot multiple-indexes-choice {
 
 # Join using indexed columns
 @setup schema
-snapshot join-with-index {
+snapshot-eqp join-with-index {
     SELECT o.id, o.order_date, i.quantity
     FROM orders o
     JOIN inventory i ON o.id = i.product_id
@@ -383,7 +383,7 @@ snapshot join-with-index {
 
 # Subquery with indexed lookup
 @setup schema
-snapshot subquery-with-index {
+snapshot-eqp subquery-with-index {
     SELECT id, sku, name
     FROM products
     WHERE id IN (SELECT product_id FROM inventory WHERE warehouse_id = 1);

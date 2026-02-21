@@ -1,14 +1,22 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        e.employee_id,\n        e.name AS employee_name,\n        e.department,\n        m.name AS manager_name\n    FROM\n        employees e\n    LEFT OUTER JOIN employees m ON e.manager_id = m.employee_id;"
+expression: |-
+  SELECT
+          e.employee_id,
+          e.name AS employee_name,
+          e.department,
+          m.name AS manager_name
+      FROM
+          employees e
+      LEFT OUTER JOIN employees m ON e.manager_id = m.employee_id;
 info:
   statement_type: SELECT
   tables:
-    - e.manager_id
-    - employees
+  - e.manager_id
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN employees AS e

@@ -34,103 +34,11 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
 |--SCAN orders
 |--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1
 |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
-`--USE TEMP B-TREE FOR ORDER BY
-
-BYTECODE
-addr  opcode                    p1  p2  p3  p4                                     p5  comment
-   0          Init               0  84   0                                          0  Start at 84
-   1          SorterOpen         0   1   0  k(1,-B)                                 0  cursor=0
-   2          Null               0   9   0                                          0  r[9]=NULL
-   3          SorterOpen         1   2   0  k(1,-B)                                 0  cursor=1
-   4          Integer            0   6   0                                          0  r[6]=0; clear group by abort flag
-   5          Null               0   7   0                                          0  r[7]=NULL; initialize group by comparison registers to NULL
-   6          Gosub             13  73   0                                          0  ; go to clear accumulator subroutine
-   7          OpenRead           3   8   0  k(8,B,B,B,B,B,B,B,B)                    0  table=customer, root=8, iDb=0
-   8          OpenRead           4   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
-   9          OpenRead           5  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-  10          OpenRead           6  11   0  k(3,B,B)                                0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
-  11          OpenRead           7   5   0  k(7,B,B,B,B,B,B,B)                      0  table=supplier, root=5, iDb=0
-  12          OpenRead           8   2   0  k(4,B,B,B,B)                            0  table=nation, root=2, iDb=0
-  13          OpenRead           9   3   0  k(3,B,B,B)                              0  table=region, root=3, iDb=0
-  14          Rewind             4  45   0                                          0  Rewind table orders
-  15            Column           4   4  15                                          0  r[15]=orders.o_orderdate
-  16            Lt              15  16  44  Binary                                  0  if r[15]<r[16] goto 44
-  17            Column           4   4  18                                          0  r[18]=orders.o_orderdate
-  18            Ge              18  19  44  Binary                                  0  if r[18]>=r[19] goto 44
-  19            RowId            4  20   0                                          0  r[20]=orders.rowid
-  20            SeekGE           6  44  20                                          0  key=[20..20]
-  21              IdxGT          6  44  20                                          0  key=[20..20]
-  22              DeferredSeek   6   5   0                                          0
-  23              Column         5   2  21                                          0  r[21]=lineitem.l_suppkey
-  24              SeekRowid      7  21  43                                          0  if (r[21]!=cursor 7 for table supplier.rowid) goto 43
-  25              Column         7   3  22                                          0  r[22]=supplier.s_nationkey
-  26              SeekRowid      8  22  43                                          0  if (r[22]!=cursor 8 for table nation.rowid) goto 43
-  27              Column         8   2  23                                          0  r[23]=nation.n_regionkey
-  28              SeekRowid      9  23  43                                          0  if (r[23]!=cursor 9 for table region.rowid) goto 43
-  29              Column         9   1  25                                          0  r[25]=region.r_name
-  30              Ne            25  26  43  Binary                                  0  if r[25]!=r[26] goto 43
-  31              Column         4   1  27                                          0  r[27]=orders.o_custkey
-  32              SeekRowid      3  27  43                                          0  if (r[27]!=cursor 3 for table customer.rowid) goto 43
-  33              Column         3   3  29                                          0  r[29]=customer.c_nationkey
-  34              Column         7   3  30                                          0  r[30]=supplier.s_nationkey
-  35              Ne            29  30  43  Binary                                  0  if r[29]!=r[30] goto 43
-  36              Column         8   1  11                                          0  r[11]=nation.n_name
-  37              Column         5   5  31                                          0  r[31]=lineitem.l_extendedprice
-  38              Column         5   6  34                                          0  r[34]=lineitem.l_discount
-  39              Subtract      33  34  32                                          0  r[32]=r[33]-r[34]
-  40              Multiply      31  32  12                                          0  r[12]=r[31]*r[32]
-  41              MakeRecord    11   2  10                                          0  r[10]=mkrec(r[11..12])
-  42              SorterInsert   1  10   0  0                                       0  key=r[10]
-  43            Next             6  21   0                                          0
-  44          Next               4  15   0                                          0
-  45          OpenPseudo         2  10   2                                          0  2 columns in r[10]
-  46          SorterSort         1  61   0                                          0
-  47            SorterData       1  10   2                                          0  r[10]=data
-  48            Column           2   0  35                                          0  r[35]=pseudo.column 0
-  49            Compare          7  35   1  k(1, Binary)                            0  r[7..7]==r[35..35]
-  50            Jump            51  55  51                                          0  ; start new group if comparison is not equal
-  51            Gosub            4  65   0                                          0  ; check if ended group had data, and output if so
-  52            Move            35   7   1                                          0  r[7..7]=r[35..35]
-  53            IfPos            6  76   0                                          0  r[6]>0 -> r[6]-=0, goto 76; check abort flag
-  54            Gosub           13  73   0                                          0  ; goto clear accumulator subroutine
-  55            Column           2   1  36                                          0  r[36]=pseudo.column 1
-  56            AggStep          0  36   9  sum                                     0  accum=r[9] step(r[36])
-  57            If               5  59   0                                          0  if r[5] goto 59; don't emit group columns if continuing existing group
-  58            Column           2   0   8                                          0  r[8]=pseudo.column 0
-  59            Integer          1   5   0                                          0  r[5]=1; indicate data in accumulator
-  60          SorterNext         1  47   0                                          0
-  61          Gosub              4  65   0                                          0  ; emit row for final group
-  62          Goto               0  76   0                                          0  ; group by finished
-  63          Integer            1   6   0                                          0  r[6]=1
-  64        Return               4   0   0                                          0
-  65        IfPos                5  67   0                                          0  r[5]>0 -> r[5]-=0, goto 67; output group by row subroutine start
-  66      Return                 4   0   0                                          0
-  67      AggFinal               0   9   0  sum                                     0  accum=r[9]
-  68      Copy                   9  37   0                                          0  r[37]=r[9]
-  69      Copy                   8  38   0                                          0  r[38]=r[8]
-  70      MakeRecord            37   2   3                                          0  r[3]=mkrec(r[37..38])
-  71      SorterInsert           0   3   0  0                                       0  key=r[3]
-  72    Return                   4   0   0                                          0
-  73    Null                     0   8   9                                          0  r[8..9]=NULL; clear accumulator subroutine start
-  74    Integer                  0   5   0                                          0  r[5]=0
-  75  Return                    13   0   0                                          0
-  76  OpenPseudo                10   3   2                                          0  2 columns in r[3]
-  77  SorterSort                 0  83   0                                          0
-  78    SorterData               0   3  10                                          0  r[3]=data
-  79    Column                  10   1   1                                          0  r[1]=pseudo.column 1
-  80    Column                  10   0   2                                          0  r[2]=pseudo.column 0
-  81    ResultRow                1   2   0                                          0  output=r[1..2]
-  82  SorterNext                 0  78   0                                          0
-  83  Halt                       0   0   0                                          0
-  84  Transaction                0   1   8                                          0  iDb=0 tx_mode=Read
-  85  String8                    0  16   0  1994-01-01                              0  r[16]='1994-01-01'
-  86  String8                    0  19   0  1995-01-01                              0  r[19]='1995-01-01'
-  87  String8                    0  26   0  MIDDLE EAST                             0  r[26]='MIDDLE EAST'
-  88  Integer                    1  33   0                                          0  r[33]=1
-  89  Goto                       0   1   0                                          0
+|--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
+|--USE SORTER FOR GROUP BY
+`--USE SORTER FOR ORDER BY

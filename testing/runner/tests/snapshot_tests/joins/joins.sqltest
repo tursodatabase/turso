@@ -80,7 +80,7 @@ setup schema {
 # =============================================================================
 
 @setup schema
-snapshot two-table-inner-join-basic {
+snapshot-eqp two-table-inner-join-basic {
     SELECT
         c.customer_id,
         c.name,
@@ -95,7 +95,7 @@ snapshot two-table-inner-join-basic {
 }
 
 @setup schema
-snapshot two-table-inner-join-explicit {
+snapshot-eqp two-table-inner-join-explicit {
     SELECT
         c.customer_id,
         c.name,
@@ -108,7 +108,7 @@ snapshot two-table-inner-join-explicit {
 }
 
 @setup schema
-snapshot two-table-inner-join-with-filter {
+snapshot-eqp two-table-inner-join-with-filter {
     SELECT
         c.customer_id,
         c.name,
@@ -127,7 +127,7 @@ snapshot two-table-inner-join-with-filter {
 # =============================================================================
 
 @setup schema
-snapshot three-table-join {
+snapshot-eqp three-table-join {
     SELECT
         c.name AS customer_name,
         o.order_id,
@@ -147,7 +147,7 @@ snapshot three-table-join {
 }
 
 @setup schema
-snapshot three-table-join-explicit {
+snapshot-eqp three-table-join-explicit {
     SELECT
         c.name AS customer_name,
         o.order_id,
@@ -163,7 +163,7 @@ snapshot three-table-join-explicit {
 }
 
 @setup schema
-snapshot four-table-join-with-aggregation {
+snapshot-eqp four-table-join-with-aggregation {
     SELECT
         c.name AS customer_name,
         c.city,
@@ -183,7 +183,7 @@ snapshot four-table-join-with-aggregation {
 }
 
 @setup schema
-snapshot multi-table-join-complex-filter {
+snapshot-eqp multi-table-join-complex-filter {
     SELECT
         c.name,
         o.order_id,
@@ -315,7 +315,7 @@ snapshot self-join-employee-manager {
 }
 
 @setup schema
-snapshot self-join-find-subordinates {
+snapshot-eqp self-join-find-subordinates {
     SELECT
         m.name AS manager_name,
         COUNT(e.employee_id) AS subordinate_count,
@@ -341,7 +341,7 @@ snapshot self-join-category-hierarchy {
 }
 
 @setup schema
-snapshot self-join-same-department {
+snapshot-eqp self-join-same-department {
     SELECT
         e1.name AS employee1,
         e2.name AS employee2,
@@ -371,7 +371,7 @@ snapshot self-join-same-department {
 # }
 
 @setup schema
-snapshot cross-join-implicit {
+snapshot-eqp cross-join-implicit {
     SELECT
         c.name AS customer_name,
         p.name AS product_name,
@@ -413,7 +413,7 @@ snapshot cross-join-implicit {
 # =============================================================================
 
 @setup schema
-snapshot index-assisted-join-single-customer {
+snapshot-eqp index-assisted-join-single-customer {
     SELECT
         c.name,
         o.order_id,
@@ -427,7 +427,7 @@ snapshot index-assisted-join-single-customer {
 }
 
 @setup schema
-snapshot index-assisted-join-order-items {
+snapshot-eqp index-assisted-join-order-items {
     SELECT
         o.order_id,
         o.order_date,
@@ -443,7 +443,7 @@ snapshot index-assisted-join-order-items {
 }
 
 @setup schema
-snapshot index-assisted-join-product-lookup {
+snapshot-eqp index-assisted-join-product-lookup {
     SELECT
         p.name AS product_name,
         p.category,
@@ -460,7 +460,7 @@ snapshot index-assisted-join-product-lookup {
 }
 
 @setup schema
-snapshot index-assisted-join-range-scan {
+snapshot-eqp index-assisted-join-range-scan {
     SELECT
         c.name,
         COUNT(o.order_id) AS order_count
@@ -478,7 +478,7 @@ snapshot index-assisted-join-range-scan {
 # =============================================================================
 
 @setup schema
-snapshot mixed-join-types {
+snapshot-eqp mixed-join-types {
     SELECT
         c.name AS customer_name,
         o.order_id,
@@ -492,7 +492,7 @@ snapshot mixed-join-types {
 }
 
 @setup schema
-snapshot join-with-subquery {
+snapshot-eqp join-with-subquery {
     SELECT
         c.name,
         c.city,
@@ -517,7 +517,7 @@ snapshot join-with-subquery {
 }
 
 @setup schema
-snapshot join-with-exists {
+snapshot-eqp join-with-exists {
     SELECT
         c.customer_id,
         c.name,
@@ -534,7 +534,7 @@ snapshot join-with-exists {
 }
 
 @setup schema
-snapshot join-multiple-conditions {
+snapshot-eqp join-multiple-conditions {
     SELECT
         e1.name AS employee1,
         e2.name AS employee2,
@@ -549,14 +549,14 @@ snapshot join-multiple-conditions {
 }
 
 @setup schema
-snapshot natural-join {
+snapshot-eqp natural-join {
     SELECT *
     FROM customers
     NATURAL JOIN orders;
 }
 
 @setup schema
-snapshot using-clause-join {
+snapshot-eqp using-clause-join {
     SELECT
         c.name,
         o.order_id,

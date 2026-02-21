@@ -142,6 +142,10 @@ pub enum Token {
     #[token("snapshot")]
     Snapshot,
 
+    /// `snapshot-eqp` keyword (EXPLAIN QUERY PLAN only, no bytecode)
+    #[token("snapshot-eqp")]
+    SnapshotEqp,
+
     /// `expect` keyword
     #[token("expect")]
     Expect,
@@ -233,6 +237,7 @@ impl fmt::Display for Token {
             Token::Setup => write!(f, "setup"),
             Token::Test => write!(f, "test"),
             Token::Snapshot => write!(f, "snapshot"),
+            Token::SnapshotEqp => write!(f, "snapshot-eqp"),
             Token::Expect => write!(f, "expect"),
             Token::Error => write!(f, "error"),
             Token::Pattern => write!(f, "pattern"),

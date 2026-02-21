@@ -1,19 +1,33 @@
 ---
 source: subqueries.sqltest
-expression: "WITH dept_avg AS (\n        SELECT department, avg(salary) AS avg_salary\n        FROM employees\n        GROUP BY department\n    )\n    SELECT e.name, e.department, e.salary\n    FROM employees e\n    WHERE e.salary > (\n        SELECT da.avg_salary\n        FROM dept_avg da\n        WHERE da.department = e.department\n    );"
+expression: |-
+  WITH dept_avg AS (
+          SELECT department, avg(salary) AS avg_salary
+          FROM employees
+          GROUP BY department
+      )
+      SELECT e.name, e.department, e.salary
+      FROM employees e
+      WHERE e.salary > (
+          SELECT da.avg_salary
+          FROM dept_avg da
+          WHERE da.department = e.department
+      );
 info:
   statement_type: WITH (CTE)
   tables:
-    - dept_avg
-    - employees
+  - dept_avg
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN employees AS e
-`--SCAN dept_avg AS da
-   `--SCAN employees
+`--CORRELATED SCALAR SUBQUERY 1
+   `--SCAN dept_avg AS da
+      |--SCAN employees
+      `--USE SORTER FOR GROUP BY
 
 BYTECODE
 addr  opcode                      p1  p2  p3  p4              p5  comment

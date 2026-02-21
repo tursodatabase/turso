@@ -1,13 +1,17 @@
 ---
 source: sorting.sqltest
-expression: "SELECT id, name, price\n    FROM products\n    ORDER BY id\n    LIMIT 10 OFFSET 20;"
+expression: |-
+  SELECT id, name, price
+      FROM products
+      ORDER BY id
+      LIMIT 10 OFFSET 20;
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN products

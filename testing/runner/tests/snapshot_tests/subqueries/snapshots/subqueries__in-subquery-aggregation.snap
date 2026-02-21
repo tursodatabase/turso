@@ -19,7 +19,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN orders AS o USING INDEX idx_orders_customer
+|--LIST SUBQUERY 1
+|  `--SCAN orders AS o USING INDEX idx_orders_customer
 `--SCAN customers AS c
 
 BYTECODE

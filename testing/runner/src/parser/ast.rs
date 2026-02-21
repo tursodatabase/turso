@@ -152,6 +152,9 @@ pub struct SnapshotCase {
     pub name_span: Range<usize>,
     /// SQL to execute (EXPLAIN will be prepended)
     pub sql: String,
+    /// If true, only run EXPLAIN QUERY PLAN (no bytecode).
+    /// Set by the `snapshot-eqp` directive.
+    pub eqp_only: bool,
     /// Common modifiers (setups, skip, backend, requires)
     pub modifiers: CaseModifiers,
 }

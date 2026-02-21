@@ -1,16 +1,23 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT\n        name,\n        price,\n        (SELECT max(price) FROM products) AS max_price\n    FROM products\n    WHERE price > 100;"
+expression: |-
+  SELECT
+          name,
+          price,
+          (SELECT max(price) FROM products) AS max_price
+      FROM products
+      WHERE price > 100;
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN products
+|--SCALAR SUBQUERY 1
+|  `--SCAN products
 `--SCAN products
 
 BYTECODE

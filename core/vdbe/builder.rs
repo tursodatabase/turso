@@ -185,6 +185,8 @@ pub struct ProgramBuilder {
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
     ctes_being_defined: Vec<String>,
+    /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
+    next_subquery_eqp_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -413,7 +415,14 @@ impl ProgramBuilder {
             materialized_ctes: HashMap::default(),
             cte_reference_counts: HashMap::default(),
             ctes_being_defined: Vec::new(),
+            next_subquery_eqp_id: 1,
         }
+    }
+
+    pub fn next_subquery_eqp_id(&mut self) -> usize {
+        let id = self.next_subquery_eqp_id;
+        self.next_subquery_eqp_id += 1;
+        id
     }
 
     pub fn alloc_hash_table_id(&mut self) -> usize {

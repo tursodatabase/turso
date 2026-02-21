@@ -19,7 +19,8 @@ info:
 ---
 QUERY PLAN
 |--SCAN orders AS o
-`--SEARCH oi USING INDEX idx_order_items_order
+`--CORRELATED SCALAR SUBQUERY 1
+   `--SEARCH oi USING INDEX idx_order_items_order
 
 BYTECODE
 addr  opcode           p1  p2  p3  p4            p5  comment

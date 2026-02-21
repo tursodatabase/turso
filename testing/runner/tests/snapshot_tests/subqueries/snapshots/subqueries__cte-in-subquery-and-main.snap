@@ -23,8 +23,9 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN products USING INDEX idx_products_category
-|--SCAN category_avg
+|--SCALAR SUBQUERY 1
+|  |--SCAN products USING INDEX idx_products_category
+|  `--SCAN category_avg
 |--SCAN products AS p
 `--SEARCH ca USING INDEX ephemeral_subquery_t5
 

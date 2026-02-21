@@ -852,21 +852,24 @@ pub fn emit_from_clause_subqueries(
         }
     }
 
-    // Include hash-join build tables so EXPLAIN reflects all tables that feed the loop.
-    let mut required_tables: HashSet<usize> = join_order
+    // Build the iteration order: join_order first (execution order), then any
+    // hash-join build tables that aren't already in the join order.
+    let mut visit_order: Vec<usize> = join_order
         .iter()
         .map(|member| member.original_idx)
         .collect();
+    let visit_set: HashSet<usize> = visit_order.iter().copied().collect();
     for table in tables.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
-            required_tables.insert(hash_join_op.build_table_idx);
+            let build_idx = hash_join_op.build_table_idx;
+            if !visit_set.contains(&build_idx) {
+                visit_order.push(build_idx);
+            }
         }
     }
 
-    for (table_index, table_reference) in tables.joined_tables_mut().iter_mut().enumerate() {
-        if !required_tables.contains(&table_index) {
-            continue;
-        }
+    for table_index in visit_order {
+        let table_reference = &mut tables.joined_tables_mut()[table_index];
         emit_explain!(
             program,
             true,
@@ -1530,6 +1533,29 @@ pub fn emit_non_from_clause_subquery(
     is_correlated: bool,
 ) -> Result<()> {
     program.nested(|program| {
+        let subquery_id = program.next_subquery_eqp_id();
+        let correlated_prefix = if is_correlated { "CORRELATED " } else { "" };
+        match query_type {
+            SubqueryType::Exists { .. } => {
+                // EXISTS subqueries don't get a separate EQP annotation in SQLite;
+                // instead the SEARCH/SCAN line gets an "EXISTS" suffix handled elsewhere.
+            }
+            SubqueryType::In { .. } => {
+                emit_explain!(
+                    program,
+                    true,
+                    format!("{correlated_prefix}LIST SUBQUERY {subquery_id}")
+                );
+            }
+            SubqueryType::RowValue { .. } => {
+                emit_explain!(
+                    program,
+                    true,
+                    format!("{correlated_prefix}SCALAR SUBQUERY {subquery_id}")
+                );
+            }
+        }
+
         let label_skip_after_first_run = if !is_correlated {
             let label = program.allocate_label();
             program.emit_insn(Insn::Once {
@@ -1585,6 +1611,10 @@ pub fn emit_non_from_clause_subquery(
                     can_fallthrough: true,
                 });
             }
+        }
+        // Pop the parent explain for LIST/SCALAR SUBQUERY annotations.
+        if !matches!(query_type, SubqueryType::Exists { .. }) {
+            program.pop_current_parent_explain();
         }
         if let Some(label) = label_skip_after_first_run {
             program.preassign_label_to_next_insn(label);

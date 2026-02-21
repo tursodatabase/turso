@@ -36,7 +36,8 @@ info:
 QUERY PLAN
 |--SCAN orders
 |--SCAN vip_customers AS v
-|  |--SCAN large_orders
+|  |--LIST SUBQUERY 1
+|  |  `--SCAN large_orders
 |  `--SCAN customers
 `--SEARCH l USING INDEX ephemeral_subquery_t8
 

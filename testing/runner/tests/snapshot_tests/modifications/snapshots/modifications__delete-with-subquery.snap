@@ -15,7 +15,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN users
+|--LIST SUBQUERY 1
+|  `--SCAN users
 `--SCAN orders USING COVERING INDEX idx_orders_user_id
 
 BYTECODE

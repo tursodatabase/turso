@@ -1,31 +1,16 @@
 ---
 source: sorting.sqltest
-expression: "SELECT id, name, category, price\n    FROM products\n    ORDER BY category, price;"
+expression: |-
+  SELECT id, name, category, price
+      FROM products
+      ORDER BY category, price;
 info:
   statement_type: SELECT
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN products USING INDEX idx_products_category_price
-
-BYTECODE
-addr  opcode          p1  p2  p3  p4                p5  comment
-   0  Init             0  13   0                     0  Start at 13
-   1  OpenRead         0   2   0  k(6,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
-   2  OpenRead         1   4   0  k(3,B,B)           0  index=idx_products_category_price, root=4, iDb=0
-   3  Rewind           1  12   0                     0  Rewind index idx_products_category_price
-   4    DeferredSeek   1   0   0                     0
-   5    IdxRowId       1   1   0                     0  r[1]=cursor 1 for index idx_products_category_price.rowid
-   6    Column         0   1   2                     0  r[2]=products.name
-   7    Column         0   3   3                     0  r[3]=products.category
-   8    Column         0   2   4                     0  r[4]=products.price
-   9    RealAffinity   4   0   0                     0
-  10    ResultRow      1   4   0                     0  output=r[1..4]
-  11  Next             1   4   0                     0
-  12  Halt             0   0   0                     0
-  13  Transaction      0   1   7                     0  iDb=0 tx_mode=Read
-  14  Goto             0   1   0                     0

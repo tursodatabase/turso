@@ -1,14 +1,20 @@
 ---
 source: setops.sqltest
-expression: "SELECT * FROM (\n        SELECT name, department FROM current_employees\n        UNION\n        SELECT name, department FROM former_employees\n    ) AS all_employees\n    WHERE department = 'Engineering';"
+expression: |-
+  SELECT * FROM (
+          SELECT name, department FROM current_employees
+          UNION
+          SELECT name, department FROM former_employees
+      ) AS all_employees
+      WHERE department = 'Engineering';
 info:
   statement_type: SELECT
   tables:
-    - current_employees
-    - former_employees
+  - current_employees
+  - former_employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN all_employees

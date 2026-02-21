@@ -1,55 +1,28 @@
 ---
 source: subqueries.sqltest
-expression: "WITH recent_orders AS (\n        SELECT id, customer_id\n        FROM orders\n        WHERE order_date >= '2024-01-01'\n    )\n    SELECT c.id, c.name\n    FROM customers c\n    WHERE EXISTS (\n        SELECT 1 FROM recent_orders ro\n        WHERE ro.customer_id = c.id\n    );"
+expression: |-
+  WITH recent_orders AS (
+          SELECT id, customer_id
+          FROM orders
+          WHERE order_date >= '2024-01-01'
+      )
+      SELECT c.id, c.name
+      FROM customers c
+      WHERE EXISTS (
+          SELECT 1 FROM recent_orders ro
+          WHERE ro.customer_id = c.id
+      );
 info:
   statement_type: WITH (CTE)
   tables:
-    - customers
-    - orders
-    - recent_orders
+  - customers
+  - orders
+  - recent_orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN customers AS c
 `--SCAN recent_orders AS ro
    `--SCAN orders
-
-BYTECODE
-addr  opcode              p1  p2  p3  p4            p5  comment
-   0    Init               0  32   0                 0  Start at 32
-   1    OpenRead           0   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
-   2    Rewind             0  31   0                 0  Rewind table customers
-   3      BeginSubrtn      4   0   0                 0  r[4]=NULL
-   4      Integer          0   1   0                 0  r[1]=0
-   5      InitCoroutine    5  15   6                 0
-   6      OpenRead         1   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
-   7      Rewind           1  14   0                 0  Rewind table orders
-   8        Column         1   2   9                 0  r[9]=orders.order_date
-   9        Lt             9  10  13  Binary         0  if r[9]<r[10] goto 13
-  10        RowId          1   6   0                 0  r[6]=orders.rowid
-  11        Column         1   1   7                 0  r[7]=orders.customer_id
-  12        Yield          5   0   0                 0
-  13      Next             1   8   0                 0
-  14      EndCoroutine     5   0   0                 0
-  15      Integer          1  12   0                 0  r[12]=1; LIMIT counter
-  16      IfNot           12  25   0                 0  if !r[12] goto 25
-  17      InitCoroutine    5   0   6                 0
-  18        Yield          5  25   0                 0
-  19        Copy           7  14   0                 0  r[14]=r[7]
-  20        RowId          0  15   0                 0  r[15]=customers.rowid
-  21        Ne            14  15  24  Binary         0  if r[14]!=r[15] goto 24
-  22        Integer        1   1   0                 0  r[1]=1
-  23        DecrJumpZero  12  25   0                 0  if (--r[12]==0) goto 25
-  24      Goto             0  18   0                 0
-  25    Return             4   0   1                 0
-  26    IfNot              1  30   1                 0  if !r[1] goto 30
-  27    RowId              0   2   0                 0  r[2]=customers.rowid
-  28    Column             0   1   3                 0  r[3]=customers.name
-  29    ResultRow          2   2   0                 0  output=r[2..3]
-  30  Next                 0   3   0                 0
-  31  Halt                 0   0   0                 0
-  32  Transaction          0   1  11                 0  iDb=0 tx_mode=Read
-  33  String8              0  10   0  2024-01-01     0  r[10]='2024-01-01'
-  34  Goto                 0   1   0                 0
