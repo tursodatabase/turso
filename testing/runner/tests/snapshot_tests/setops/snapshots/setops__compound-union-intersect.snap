@@ -1,15 +1,20 @@
 ---
 source: setops.sqltest
-expression: "SELECT department FROM current_employees\n    UNION\n    SELECT department FROM contractors\n    INTERSECT\n    SELECT department FROM former_employees;"
+expression: |-
+  SELECT department FROM current_employees
+      UNION
+      SELECT department FROM contractors
+      INTERSECT
+      SELECT department FROM former_employees;
 info:
   statement_type: SELECT
   tables:
-    - contractors
-    - current_employees
-    - former_employees
+  - contractors
+  - current_employees
+  - former_employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--COMPOUND QUERY

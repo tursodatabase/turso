@@ -1,14 +1,17 @@
 ---
 source: setops.sqltest
-expression: "SELECT name, department FROM current_employees\n    UNION\n    SELECT name, department FROM former_employees;"
+expression: |-
+  SELECT name, department FROM current_employees
+      UNION
+      SELECT name, department FROM former_employees;
 info:
   statement_type: SELECT
   tables:
-    - current_employees
-    - former_employees
+  - current_employees
+  - former_employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--COMPOUND QUERY

@@ -1,15 +1,25 @@
 ---
 source: setops.sqltest
-expression: "SELECT department, COUNT(*) as total_people\n    FROM (\n        SELECT name, department FROM current_employees\n        UNION ALL\n        SELECT name, department FROM former_employees\n        UNION ALL\n        SELECT name, department FROM contractors\n    ) AS all_workers\n    GROUP BY department\n    ORDER BY total_people DESC;"
+expression: |-
+  SELECT department, COUNT(*) as total_people
+      FROM (
+          SELECT name, department FROM current_employees
+          UNION ALL
+          SELECT name, department FROM former_employees
+          UNION ALL
+          SELECT name, department FROM contractors
+      ) AS all_workers
+      GROUP BY department
+      ORDER BY total_people DESC;
 info:
   statement_type: SELECT
   tables:
-    - contractors
-    - current_employees
-    - former_employees
+  - contractors
+  - current_employees
+  - former_employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN all_workers
@@ -20,7 +30,8 @@ QUERY PLAN
 |     |  `--SCAN former_employees
 |     `--UNION ALL
 |        `--SCAN contractors
-`--USE TEMP B-TREE FOR ORDER BY
+|--USE SORTER FOR GROUP BY
+`--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode                  p1  p2  p3  p4              p5  comment
