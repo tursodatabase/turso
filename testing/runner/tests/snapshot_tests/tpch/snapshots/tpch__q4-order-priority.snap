@@ -33,6 +33,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN orders
+|--USE SORTER FOR GROUP BY
 `--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1
 
 BYTECODE

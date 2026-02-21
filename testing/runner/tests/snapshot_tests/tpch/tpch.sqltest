@@ -129,7 +129,7 @@ snapshot q1-pricing-summary {
 
 # Q2: Minimum Cost Supplier
 @setup schema
-snapshot q2-minimum-cost-supplier {
+snapshot-eqp q2-minimum-cost-supplier {
     select
         s_acctbal,
         s_name,
@@ -178,7 +178,7 @@ snapshot q2-minimum-cost-supplier {
 
 # Q3: Shipping Priority
 @setup schema
-snapshot q3-shipping-priority {
+snapshot-eqp q3-shipping-priority {
     select
         l_orderkey,
         sum(l_extendedprice * (1 - l_discount)) as revenue,
@@ -232,7 +232,7 @@ snapshot q4-order-priority {
 
 # Q5: Local Supplier Volume
 @setup schema
-snapshot q5-local-supplier-volume {
+snapshot-eqp q5-local-supplier-volume {
     select
         n_name,
         sum(l_extendedprice * (1 - l_discount)) as revenue
@@ -275,7 +275,7 @@ snapshot q6-forecasting-revenue {
 
 # Q7: Volume Shipping
 @setup schema
-snapshot q7-volume-shipping {
+snapshot-eqp q7-volume-shipping {
     select
         supp_nation,
         cust_nation,
@@ -320,7 +320,7 @@ snapshot q7-volume-shipping {
 
 # Q8: National Market Share
 @setup schema
-snapshot q8-national-market-share {
+snapshot-eqp q8-national-market-share {
     select
         o_year,
         sum(cast(case
@@ -363,7 +363,7 @@ snapshot q8-national-market-share {
 
 # Q9: Product Type Profit Measure
 @setup schema
-snapshot q9-product-type-profit {
+snapshot-eqp q9-product-type-profit {
     select
         nation,
         o_year,
@@ -400,7 +400,7 @@ snapshot q9-product-type-profit {
 
 # Q10: Returned Item Reporting
 @setup schema
-snapshot q10-returned-item {
+snapshot-eqp q10-returned-item {
     select
         c_custkey,
         c_name,
@@ -502,7 +502,7 @@ snapshot q12-shipping-modes {
 
 # Q13: Customer Distribution
 @setup schema
-snapshot q13-customer-distribution {
+snapshot-eqp q13-customer-distribution {
     select
         c_count,
         count(*) as custdist
@@ -546,7 +546,7 @@ snapshot q14-promotion-effect {
 # Q15: Top Supplier
 # Note: This query uses a view in standard TPC-H, adapted here as a subquery
 @setup schema
-snapshot q15-top-supplier {
+snapshot-eqp q15-top-supplier {
     select
         s_suppkey,
         s_name,
@@ -592,7 +592,7 @@ snapshot q15-top-supplier {
 
 # Q16: Parts/Supplier Relationship
 @setup schema
-snapshot q16-parts-supplier {
+snapshot-eqp q16-parts-supplier {
     select
         p_brand,
         p_type,
@@ -649,7 +649,7 @@ snapshot q17-small-quantity-order {
 
 # Q18: Large Volume Customer
 @setup schema
-snapshot q18-large-volume-customer {
+snapshot-eqp q18-large-volume-customer {
     select
         c_name,
         c_custkey,
@@ -727,7 +727,7 @@ snapshot q19-discounted-revenue {
 
 # Q20: Potential Part Promotion
 @setup schema
-snapshot q20-potential-part-promotion {
+snapshot-eqp q20-potential-part-promotion {
     select
         s_name,
         s_address
@@ -769,7 +769,7 @@ snapshot q20-potential-part-promotion {
 
 # Q21: Suppliers Who Kept Orders Waiting
 @setup schema
-snapshot q21-suppliers-kept-waiting {
+snapshot-eqp q21-suppliers-kept-waiting {
     select
         s_name,
         count(*) as numwait
@@ -814,7 +814,7 @@ snapshot q21-suppliers-kept-waiting {
 
 # Q22: Global Sales Opportunity
 @setup schema
-snapshot q22-global-sales-opportunity {
+snapshot-eqp q22-global-sales-opportunity {
     select
         cntrycode,
         count(*) as numcust,

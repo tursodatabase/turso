@@ -1,13 +1,48 @@
 ---
 source: tpch.sqltest
-expression: "select\n        sum(l_extendedprice* (1 - l_discount)) as revenue\n    from\n        lineitem,\n        part\n    where\n        (\n            p_partkey = l_partkey\n            and p_brand = 'Brand#22'\n            and p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')\n            and l_quantity >= 8 and l_quantity <= 8 + 10\n            and p_size between 1 and 5\n            and l_shipmode in ('AIR', 'AIR REG')\n            and l_shipinstruct = 'DELIVER IN PERSON'\n        )\n        or\n        (\n            p_partkey = l_partkey\n            and p_brand = 'Brand#23'\n            and p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')\n            and l_quantity >= 10 and l_quantity <= 10 + 10\n            and p_size between 1 and 10\n            and l_shipmode in ('AIR', 'AIR REG')\n            and l_shipinstruct = 'DELIVER IN PERSON'\n        )\n        or\n        (\n            p_partkey = l_partkey\n            and p_brand = 'Brand#12'\n            and p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')\n            and l_quantity >= 24 and l_quantity <= 24 + 10\n            and p_size between 1 and 15\n            and l_shipmode in ('AIR', 'AIR REG')\n            and l_shipinstruct = 'DELIVER IN PERSON'\n        );"
+expression: |-
+  select
+          sum(l_extendedprice* (1 - l_discount)) as revenue
+      from
+          lineitem,
+          part
+      where
+          (
+              p_partkey = l_partkey
+              and p_brand = 'Brand#22'
+              and p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
+              and l_quantity >= 8 and l_quantity <= 8 + 10
+              and p_size between 1 and 5
+              and l_shipmode in ('AIR', 'AIR REG')
+              and l_shipinstruct = 'DELIVER IN PERSON'
+          )
+          or
+          (
+              p_partkey = l_partkey
+              and p_brand = 'Brand#23'
+              and p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
+              and l_quantity >= 10 and l_quantity <= 10 + 10
+              and p_size between 1 and 10
+              and l_shipmode in ('AIR', 'AIR REG')
+              and l_shipinstruct = 'DELIVER IN PERSON'
+          )
+          or
+          (
+              p_partkey = l_partkey
+              and p_brand = 'Brand#12'
+              and p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
+              and l_quantity >= 24 and l_quantity <= 24 + 10
+              and p_size between 1 and 15
+              and l_shipmode in ('AIR', 'AIR REG')
+              and l_shipinstruct = 'DELIVER IN PERSON'
+          );
 info:
   statement_type: SELECT
   tables:
-    - lineitem
+  - lineitem
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN lineitem

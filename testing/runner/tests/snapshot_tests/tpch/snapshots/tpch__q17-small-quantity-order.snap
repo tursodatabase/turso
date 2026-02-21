@@ -29,7 +29,8 @@ info:
 QUERY PLAN
 |--SCAN lineitem
 |--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
-`--SCAN lineitem
+`--CORRELATED SCALAR SUBQUERY 1
+   `--SCAN lineitem
 
 BYTECODE
 addr  opcode           p1  p2  p3  p4                                     p5  comment
