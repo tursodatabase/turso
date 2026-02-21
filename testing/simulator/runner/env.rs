@@ -833,6 +833,37 @@ impl SimulatorEnv {
                 panic!("error opening simulator test file {db_path:?}: {e:?}");
             }
         };
+
+        // Re-enable MVCC mode if the profile says to use MVCC
+        if self.profile.experimental_mvcc {
+            let conn = db
+                .connect()
+                .expect("Failed to create connection for MVCC setup");
+            conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+                .expect("Failed to enable MVCC mode");
+
+            // Pre-create attached DB files with MVCC so that journal modes are
+            // compatible when ATTACH happens later.
+            for name in &self.attached_dbs {
+                let aux_path = self.get_aux_db_path(name);
+                let aux_db = Database::open_file_with_flags(
+                    io.clone(),
+                    aux_path.to_str().unwrap(),
+                    turso_core::OpenFlags::default(),
+                    turso_core::DatabaseOpts::new().with_attach(true),
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("Failed to open aux DB {name}: {e}"));
+                let aux_conn = aux_db
+                    .connect()
+                    .expect("Failed to connect to aux DB for MVCC setup");
+                aux_conn
+                    .execute("PRAGMA journal_mode = 'experimental_mvcc'")
+                    .expect("Failed to enable MVCC on aux DB");
+                aux_conn.close().expect("Failed to close aux DB connection");
+            }
+        }
+
         self.io = io;
         self.db = Some(db);
     }
@@ -1007,6 +1038,27 @@ impl SimulatorEnv {
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
                 .expect("Failed to enable MVCC mode");
+
+            // Pre-create attached DB files with MVCC so that journal modes are
+            // compatible when ATTACH happens later.
+            for name in &attached_dbs {
+                let aux_path = paths.aux_db(&simulation_type, &SimulationPhase::Test, name);
+                let aux_db = Database::open_file_with_flags(
+                    io.clone(),
+                    aux_path.to_str().unwrap(),
+                    turso_core::OpenFlags::default(),
+                    turso_core::DatabaseOpts::new().with_attach(true),
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("Failed to open aux DB {name}: {e}"));
+                let aux_conn = aux_db
+                    .connect()
+                    .expect("Failed to connect to aux DB for MVCC setup");
+                aux_conn
+                    .execute("PRAGMA journal_mode = 'experimental_mvcc'")
+                    .expect("Failed to enable MVCC on aux DB");
+                aux_conn.close().expect("Failed to close aux DB connection");
+            }
         }
 
         let connections = (0..profile.max_connections)

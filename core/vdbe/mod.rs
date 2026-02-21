@@ -217,6 +217,12 @@ enum CommitState {
     CommitingMvcc {
         state_machine: StateMachine<CommitStateMachine<LocalClock>>,
     },
+    /// Committing MVCC transactions on attached databases after main MVCC commit is done.
+    CommittingAttachedMvcc {
+        state_machine: StateMachine<CommitStateMachine<LocalClock>>,
+        db_id: usize,
+        mv_store: Arc<MvStore>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1346,13 +1352,17 @@ impl Program {
 
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
-        if self.connection.get_tx_state() == TransactionState::None
+        let tx_state = self.connection.get_tx_state();
+        let has_attached_mv_txs = !self.connection.attached_mv_txs.read().is_empty();
+        if tx_state == TransactionState::None
             && matches!(program_state.commit_state, CommitState::Ready)
+            && !has_attached_mv_txs
         {
             // No need to do any work here if not in tx.
             // But if commit_state indicates an in-progress attached commit
             // (CommittingAttached), we must continue to complete it even though
             // the main DB tx_state was already set to None.
+            // Also skip early return when attached MVCC transactions are pending.
             return Ok(IOResult::Done(()));
         }
         if self.connection.is_nested_stmt() {
@@ -1445,18 +1455,26 @@ impl Program {
     ) -> Result<IOResult<()>> {
         let conn = self.connection.clone();
         let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
-        if auto_commit {
-            // FIXME: we don't want to commit stuff from other programs.
-            if matches!(program_state.commit_state, CommitState::Ready) {
-                let Some(tx_id) = conn.get_mv_tx_id() else {
-                    return Ok(IOResult::Done(()));
-                };
+        if !auto_commit {
+            return Ok(IOResult::Done(()));
+        }
+
+        // Phase 1: Commit main DB MVCC transaction
+        if matches!(program_state.commit_state, CommitState::Ready) {
+            if let Some(tx_id) = conn.get_mv_tx_id() {
                 let state_machine = mv_store.commit_tx(tx_id, &conn)?;
                 program_state.commit_state = CommitState::CommitingMvcc { state_machine };
             }
+            // If no main MVCC tx, fall through to attached phase
+        }
+
+        if matches!(
+            program_state.commit_state,
+            CommitState::CommitingMvcc { .. }
+        ) {
             let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
             else {
-                panic!("invalid state for mvcc commit step")
+                unreachable!()
             };
             match self.step_end_mvcc_txn(state_machine, mv_store)? {
                 IOResult::Done(_) => {
@@ -1464,12 +1482,102 @@ impl Program {
                     conn.set_mv_tx(None);
                     conn.set_tx_state(TransactionState::None);
                     pager.end_read_tx();
+                    // Fall through to attached phase
+                }
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
+        }
+
+        // Phase 2: Commit MVCC transactions on attached databases
+        // Resume an in-progress attached MVCC commit
+        if matches!(
+            program_state.commit_state,
+            CommitState::CommittingAttachedMvcc { .. }
+        ) {
+            let (step_result, db_id) = {
+                let CommitState::CommittingAttachedMvcc {
+                    state_machine,
+                    db_id,
+                    mv_store: ref attached_mv,
+                } = &mut program_state.commit_state
+                else {
+                    unreachable!()
+                };
+                (state_machine.step(attached_mv)?, *db_id)
+            };
+            match step_result {
+                IOResult::Done(_) => {
+                    let attached_pager = conn.get_pager_from_database_index(&db_id);
+                    conn.publish_attached_schema(db_id);
+                    conn.set_mv_tx_for_db(db_id, None);
+                    attached_pager.end_read_tx();
+                    // Fall through to look for more
+                }
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
+        }
+
+        // Start/continue committing remaining attached MVCC transactions
+        loop {
+            let next_tx = conn
+                .get_all_mv_txs()
+                .into_iter()
+                .find(|(db_id, _, _)| crate::is_attached_db(*db_id));
+            let Some((db_id, tx_id, _mode)) = next_tx else {
+                break;
+            };
+            let Some(attached_mv_store) = conn.mv_store_for_db(db_id) else {
+                conn.set_mv_tx_for_db(db_id, None);
+                continue;
+            };
+            let mut state_machine = attached_mv_store.commit_tx(tx_id, &conn)?;
+            match state_machine.step(&attached_mv_store)? {
+                IOResult::Done(_) => {
+                    let attached_pager = conn.get_pager_from_database_index(&db_id);
+                    conn.publish_attached_schema(db_id);
+                    conn.set_mv_tx_for_db(db_id, None);
+                    attached_pager.end_read_tx();
+                    continue;
+                }
+                IOResult::IO(io) => {
+                    program_state.commit_state = CommitState::CommittingAttachedMvcc {
+                        state_machine,
+                        db_id,
+                        mv_store: attached_mv_store,
+                    };
+                    return Ok(IOResult::IO(io));
+                }
+            }
+        }
+
+        // Phase 3: Commit WAL transactions on attached databases that don't use MVCC.
+        // When the main DB uses MVCC, we route through commit_txn_mvcc, but attached
+        // DBs may use WAL mode and need their dirty pages committed via the WAL path.
+        if matches!(
+            program_state.commit_state,
+            CommitState::CommittingAttached
+        ) {
+            // Re-entry after IO yield from attached WAL pager commit.
+            match self.end_attached_write_txns(&conn, _rollback)? {
+                IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
+                    self.end_attached_read_txns(&conn);
                     return Ok(IOResult::Done(()));
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
+
+        match self.end_attached_write_txns(&conn, _rollback)? {
+            IOResult::Done(_) => {}
+            IOResult::IO(io) => {
+                program_state.commit_state = CommitState::CommittingAttached;
+                return Ok(IOResult::IO(io));
+            }
+        }
+        self.end_attached_read_txns(&conn);
+
+        program_state.commit_state = CommitState::Ready;
         Ok(IOResult::Done(()))
     }
 
@@ -1737,15 +1845,32 @@ impl Program {
                 mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);
             }
             pager.end_read_tx();
+            // Rollback MVCC transactions on attached databases
+            for (db_id, tx_id, _mode) in self.connection.get_all_mv_txs() {
+                if !crate::is_attached_db(db_id) {
+                    continue;
+                }
+                if let Some(attached_mv_store) = self.connection.mv_store_for_db(db_id) {
+                    let attached_pager = self.connection.get_pager_from_database_index(&db_id);
+                    attached_mv_store.rollback_tx(tx_id, attached_pager.clone(), &self.connection);
+                    self.connection.database_schemas().write().remove(&db_id);
+                    attached_pager.end_read_tx();
+                }
+            }
+            self.connection.clear_all_mv_txs();
         } else {
             pager.rollback_tx(&self.connection);
             self.connection.auto_commit.store(true, Ordering::SeqCst);
         }
         // Also rollback all attached database pagers that hold write locks
-        // and discard connection-local schema changes.
+        // and discard connection-local schema changes (WAL-mode attached DBs).
         {
             let attached_pagers = self.connection.get_all_attached_pagers_with_index();
             for (db_id, attached_pager) in attached_pagers {
+                // Skip MVCC-enabled attached DBs (already handled above)
+                if self.connection.mv_store_for_db(db_id).is_some() {
+                    continue;
+                }
                 self.connection.database_schemas().write().remove(&db_id);
                 attached_pager.rollback_attached();
             }

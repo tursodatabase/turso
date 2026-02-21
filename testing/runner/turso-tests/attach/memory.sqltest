@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "attach not supported in MVCC mode"
 
 # Test querying attached in-memory database
 test attach-db-query {

@@ -376,7 +376,7 @@ pub fn op_checkpoint(
     // Re-fetch mv_store from connection to get the latest value.
     // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
     // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "experimental_mvcc"`).
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*database);
     if let Some(mv_store) = mv_store.as_ref() {
         if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
             return Err(LimboError::InvalidArgument(
@@ -878,7 +878,7 @@ pub fn op_open_read(
     );
 
     let pager = program.get_pager_from_database_index(db);
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -900,7 +900,7 @@ pub fn op_open_read(
         .cursor_ref
         .get(*cursor_id)
         .expect("cursor_id should exist in cursor_ref");
-    if program.connection.get_mv_tx_id().is_none() {
+    if program.connection.get_mv_tx_id_for_db(*db).is_none() {
         assert!(
             *root_page >= 0,
             "root page should be non negative when we are not in a MVCC transaction"
@@ -917,7 +917,7 @@ pub fn op_open_read(
     let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
                                         mv_cursor_type: MvccCursorType|
      -> Result<Box<dyn CursorTrait>> {
-        if let Some(tx_id) = program.connection.get_mv_tx_id() {
+        if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
             let mv_store = mv_store
                 .as_ref()
                 .expect("mv_store should be Some when MVCC transaction is active")
@@ -2228,7 +2228,8 @@ pub fn op_transaction_inner(
         );
     }
     let pager = program.get_pager_from_database_index(db);
-    let mv_store = program.connection.mv_store();
+    // Get the MvStore for the specific database (main or attached).
+    let mv_store = program.connection.mv_store_for_db(*db);
     loop {
         match state.op_transaction_state {
             OpTransactionState::Start => {
@@ -2240,7 +2241,13 @@ pub fn op_transaction_inner(
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
+                let is_attached = crate::is_attached_db(*db);
                 let (new_transaction_state, updated) = if conn.is_nested_stmt() {
+                    (current_state, false)
+                } else if is_attached {
+                    // For attached databases, don't modify the connection-level
+                    // transaction state — it tracks the main database's state.
+                    // Attached pager locks are managed independently below.
                     (current_state, false)
                 } else {
                     match (current_state, write) {
@@ -2283,75 +2290,114 @@ pub fn op_transaction_inner(
 
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
-                    let started_read_tx =
-                        updated && matches!(current_state, TransactionState::None);
-                    if started_read_tx {
-                        turso_assert!(
-                            !conn.is_nested_stmt(),
-                            "nested stmt should not begin a new read transaction"
-                        );
-                        pager.begin_read_tx()?;
-                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                    }
-                    // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
-                    pager.mvcc_refresh_if_db_changed();
-                    // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
-                    // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
-                    // for both.
-                    let current_mv_tx = program.connection.get_mv_tx();
-                    let has_existing_mv_tx = current_mv_tx.is_some();
+                    if is_attached {
+                        // For attached databases with MVCC: start pager read tx
+                        // and begin an MVCC transaction on the attached MvStore.
+                        if !pager.holds_read_lock() {
+                            pager.begin_read_tx()?;
+                        }
+                        pager.mvcc_refresh_if_db_changed();
 
-                    let conn_has_executed_begin_deferred = !has_existing_mv_tx
-                        && !program.connection.auto_commit.load(Ordering::SeqCst);
-                    if conn_has_executed_begin_deferred && *tx_mode == TransactionMode::Concurrent {
-                        return Err(LimboError::TxError(
-                            "Cannot start CONCURRENT transaction after BEGIN DEFERRED".to_string(),
-                        ));
-                    }
-
-                    if !has_existing_mv_tx {
-                        let tx_id = match tx_mode {
-                            TransactionMode::None
-                            | TransactionMode::Read
-                            | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone()),
-                            TransactionMode::Write => {
-                                mv_store.begin_exclusive_tx(pager.clone(), None)
-                            }
-                        };
-                        match tx_id {
-                            Ok(tx_id) => {
-                                program.connection.set_mv_tx(Some((tx_id, *tx_mode)));
-                            }
-                            Err(err) => {
-                                if started_read_tx {
-                                    pager.end_read_tx();
-                                    conn.set_tx_state(TransactionState::None);
-                                    state.auto_txn_cleanup = TxnCleanup::None;
+                        let current_mv_tx = conn.get_mv_tx_for_db(*db);
+                        if current_mv_tx.is_none() {
+                            // Use the same tx_mode as the main DB's active
+                            // transaction when available, so BEGIN CONCURRENT
+                            // applies to all databases uniformly.
+                            let effective_mode =
+                                conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
+                            let tx_id = match effective_mode {
+                                TransactionMode::None
+                                | TransactionMode::Read
+                                | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone()),
+                                TransactionMode::Write => {
+                                    mv_store.begin_exclusive_tx(pager.clone(), None)
                                 }
-                                return Err(err);
+                            };
+                            match tx_id {
+                                Ok(tx_id) => {
+                                    conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
+                                }
+                                Err(err) => {
+                                    pager.end_read_tx();
+                                    return Err(err);
+                                }
                             }
                         }
-                    } else if updated {
-                        // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
-                        let (tx_id, mv_tx_mode) = current_mv_tx
-                            .expect("current_mv_tx should be Some when updated is true");
-                        let actual_tx_mode = if mv_tx_mode == TransactionMode::Concurrent {
-                            TransactionMode::Concurrent
-                        } else {
-                            *tx_mode
-                        };
-                        if matches!(new_transaction_state, TransactionState::Write { .. })
-                            && matches!(actual_tx_mode, TransactionMode::Write)
+                    } else {
+                        // Main database MVCC path (unchanged logic)
+                        let started_read_tx =
+                            updated && matches!(current_state, TransactionState::None);
+                        if started_read_tx {
+                            turso_assert!(
+                                !conn.is_nested_stmt(),
+                                "nested stmt should not begin a new read transaction"
+                            );
+                            pager.begin_read_tx()?;
+                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        }
+                        // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
+                        pager.mvcc_refresh_if_db_changed();
+                        // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
+                        // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
+                        // for both.
+                        let current_mv_tx = program.connection.get_mv_tx_for_db(*db);
+                        let has_existing_mv_tx = current_mv_tx.is_some();
+
+                        let conn_has_executed_begin_deferred = !has_existing_mv_tx
+                            && !program.connection.auto_commit.load(Ordering::SeqCst);
+                        if conn_has_executed_begin_deferred
+                            && *tx_mode == TransactionMode::Concurrent
                         {
-                            if let Err(err) =
-                                mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id))
-                            {
-                                if started_read_tx {
-                                    pager.end_read_tx();
-                                    conn.set_tx_state(TransactionState::None);
-                                    state.auto_txn_cleanup = TxnCleanup::None;
+                            return Err(LimboError::TxError(
+                                "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
+                                    .to_string(),
+                            ));
+                        }
+
+                        if !has_existing_mv_tx {
+                            let tx_id = match tx_mode {
+                                TransactionMode::None
+                                | TransactionMode::Read
+                                | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone()),
+                                TransactionMode::Write => {
+                                    mv_store.begin_exclusive_tx(pager.clone(), None)
                                 }
-                                return Err(err);
+                            };
+                            match tx_id {
+                                Ok(tx_id) => {
+                                    program.connection.set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
+                                }
+                                Err(err) => {
+                                    if started_read_tx {
+                                        pager.end_read_tx();
+                                        conn.set_tx_state(TransactionState::None);
+                                        state.auto_txn_cleanup = TxnCleanup::None;
+                                    }
+                                    return Err(err);
+                                }
+                            }
+                        } else if updated {
+                            // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
+                            let (tx_id, mv_tx_mode) = current_mv_tx
+                                .expect("current_mv_tx should be Some when updated is true");
+                            let actual_tx_mode = if mv_tx_mode == TransactionMode::Concurrent {
+                                TransactionMode::Concurrent
+                            } else {
+                                *tx_mode
+                            };
+                            if matches!(new_transaction_state, TransactionState::Write { .. })
+                                && matches!(actual_tx_mode, TransactionMode::Write)
+                            {
+                                if let Err(err) =
+                                    mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id))
+                                {
+                                    if started_read_tx {
+                                        pager.end_read_tx();
+                                        conn.set_tx_state(TransactionState::None);
+                                        state.auto_txn_cleanup = TxnCleanup::None;
+                                    }
+                                    return Err(err);
+                                }
                             }
                         }
                     }
@@ -2362,7 +2408,7 @@ pub fn op_transaction_inner(
                                 .to_string(),
                         ));
                     }
-                    // For attached databases (db >= 2), always start read/write
+                    // For attached databases without MVCC, always start read/write
                     // transactions on the attached pager, since the connection-level
                     // transaction state may already be Read/Write from the main database.
                     let is_attached = crate::is_attached_db(*db);
@@ -2465,7 +2511,7 @@ pub fn op_transaction_inner(
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
             OpTransactionState::CheckSchemaCookie => {
-                let res = get_schema_cookie(&pager, mv_store.as_ref(), program);
+                let res = get_schema_cookie(&pager, mv_store.as_ref(), program, *db);
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {
                         if header_schema_cookie != *schema_cookie {
@@ -2541,12 +2587,10 @@ pub fn op_auto_commit(
     let had_autocommit = conn.auto_commit.load(Ordering::SeqCst); // true, not in tx
 
     // Drive any multi-step commit/rollback that's already in progress.
-    // This handles both main DB commits (Committing) and attached DB commits
-    // (CommittingAttached) that yielded on IO and need re-entry.
-    if matches!(
-        state.commit_state,
-        CommitState::Committing | CommitState::CommittingAttached
-    ) {
+    // This handles main DB commits (Committing), attached DB commits
+    // (CommittingAttached), MVCC commits (CommitingMvcc), and attached
+    // MVCC commits (CommittingAttachedMvcc) that yielded on IO and need re-entry.
+    if !matches!(state.commit_state, CommitState::Ready) {
         let res = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
             .map(Into::into);
@@ -7659,14 +7703,8 @@ fn new_rowid_inner(
                             }
                         }
                     } else {
-                        // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
-                        let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
-                            panic!("Expected MvCursor or BTreeCursor in op_new_rowid");
-                        };
-                        turso_assert!(
-                            ephemeral_cursor.pager.wal.is_none(),
-                            "MVCC is enabled but got a non-ephemeral BTreeCursor"
-                        );
+                        // Not an MvCursor — either an ephemeral cursor or an attached DB
+                        // cursor without MVCC (e.g., :memory: attached DBs skip MVCC).
                         state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
                             mvcc_already_initialized: false,
                         };
@@ -8042,7 +8080,7 @@ pub fn op_open_write(
         return Err(LimboError::ReadOnly);
     }
     let pager = program.get_pager_from_database_index(db);
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -8076,7 +8114,7 @@ pub fn op_open_write(
 
     if root_page == SQLITE_SCHEMA_ROOT_PAGE {
         if let Some(mv_store) = mv_store.as_ref() {
-            let Some(tx_id) = program.connection.get_mv_tx_id() else {
+            let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) else {
                 return Err(LimboError::InternalError(
                     "Schema changes in MVCC mode require an exclusive MVCC transaction".to_string(),
                 ));
@@ -8112,7 +8150,7 @@ pub fn op_open_write(
         let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<Box<dyn CursorTrait>> {
-            if let Some(tx_id) = program.connection.get_mv_tx_id() {
+            if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
                 let mv_store = mv_store
                     .as_ref()
                     .expect("mv_store should be Some when MVCC transaction is active")
@@ -8200,7 +8238,7 @@ pub fn op_create_btree(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
 
     if let Some(mv_store) = mv_store.as_ref() {
         let root_page = mv_store.get_next_table_id();
@@ -8226,7 +8264,7 @@ pub fn op_index_method_create(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
     if let Some(_mv_store) = mv_store.as_ref() {
         todo!("MVCC is not supported yet");
     }
@@ -8257,7 +8295,7 @@ pub fn op_index_method_destroy(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
     if let Some(_mv_store) = mv_store.as_ref() {
         todo!("MVCC is not supported yet");
     }
@@ -8288,7 +8326,7 @@ pub fn op_index_method_optimize(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
     if let Some(_mv_store) = mv_store.as_ref() {
         todo!("MVCC is not supported yet");
     }
@@ -8366,7 +8404,7 @@ pub fn op_destroy(
     if *is_temp == 1 {
         todo!("temp databases not implemented yet.");
     }
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         // MVCC only does pager operations in checkpoint
         state.pc += 1;
@@ -8594,7 +8632,7 @@ pub fn op_page_count(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(PageCount { db, dest }, insn);
     let pager = program.get_pager_from_database_index(db);
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
     let count = match with_header(&pager, mv_store.as_ref(), program, |header| {
         header.database_size.get()
     }) {
@@ -8631,39 +8669,55 @@ pub fn op_parse_schema(
     } else {
         "sqlite_schema".to_string()
     };
-    let maybe_nested_stmt_err = if let Some(where_clause) = where_clause {
-        let stmt = conn.prepare(format!("SELECT * FROM {schema_table} WHERE {where_clause}"))?;
-
-        conn.with_database_schema_mut(*db, |schema| {
-            // TODO: This function below is synchronous, make it async
-            let existing_views = schema.incremental_views.clone();
-            conn.start_nested();
-            parse_schema_rows(
-                stmt,
-                schema,
-                &conn.syms.read(),
-                program.connection.get_mv_tx(),
-                existing_views,
-                enable_triggers,
-            )
-        })
+    let sql = if let Some(where_clause) = where_clause {
+        format!("SELECT * FROM {schema_table} WHERE {where_clause}")
     } else {
-        let stmt = conn.prepare(format!("SELECT * FROM {schema_table}"))?;
-
-        conn.with_database_schema_mut(*db, |schema| {
-            // TODO: This function below is synchronous, make it async
-            let existing_views = schema.incremental_views.clone();
-            conn.start_nested();
-            parse_schema_rows(
-                stmt,
-                schema,
-                &conn.syms.read(),
-                program.connection.get_mv_tx(),
-                existing_views,
-                enable_triggers,
-            )
-        })
+        format!("SELECT * FROM {schema_table}")
     };
+    let stmt = conn.prepare(sql)?;
+
+    // Get a mutable schema clone *without* holding the schema lock during
+    // nested statement execution.  The nested Statement may call reprepare()
+    // which also acquires the schema / database_schemas write lock, so holding
+    // it here would deadlock on the same thread (parking_lot RwLock is not
+    // re-entrant).
+    let mut schema_arc = if crate::is_attached_db(*db) {
+        let mut schemas = conn.database_schemas().write();
+        schemas
+            .entry(*db)
+            .or_insert_with(|| {
+                let attached_dbs = conn.attached_databases.read();
+                let (db_inst, _pager) = attached_dbs
+                    .index_to_data
+                    .get(db)
+                    .expect("Database ID should be valid");
+                let schema = db_inst.schema.lock().clone();
+                schema
+            })
+            .clone() // cheap Arc clone; write lock released at end of block
+    } else {
+        conn.schema.read().clone()
+    };
+
+    let schema = Arc::make_mut(&mut schema_arc);
+    // TODO: This function below is synchronous, make it async
+    let existing_views = schema.incremental_views.clone();
+    conn.start_nested();
+    let maybe_nested_stmt_err = parse_schema_rows(
+        stmt,
+        schema,
+        &conn.syms.read(),
+        program.connection.get_mv_tx(),
+        existing_views,
+        enable_triggers,
+    );
+
+    // Store the modified schema back
+    if crate::is_attached_db(*db) {
+        conn.database_schemas().write().insert(*db, schema_arc);
+    } else {
+        *conn.schema.write() = schema_arc;
+    }
     conn.end_nested();
     conn.auto_commit
         .store(previous_auto_commit, Ordering::SeqCst);
@@ -8897,7 +8951,7 @@ pub fn op_read_cookie(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ReadCookie { db, dest, cookie }, insn);
     let pager = program.get_pager_from_database_index(db);
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
 
     let cookie_value =
         match with_header(&pager, mv_store.as_ref(), program, |header| match cookie {
@@ -8933,12 +8987,13 @@ pub fn op_set_cookie(
         insn
     );
     let pager = program.get_pager_from_database_index(db);
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
 
     return_if_io!(with_header_mut(
         &pager,
         mv_store.as_ref(),
         program,
+        *db,
         |header| {
             match cookie {
                 Cookie::ApplicationId => header.application_id = (*value).into(),
@@ -9704,7 +9759,7 @@ pub fn op_integrity_check(
         insn
     );
 
-    let mv_store = program.connection.mv_store();
+    let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
     let target_pager = if *db == crate::MAIN_DB_ID {
         pager.clone()
@@ -11206,7 +11261,7 @@ fn op_journal_mode_inner(
         match state.op_journal_mode_state.sub_state {
             OpJournalModeSubState::Start => {
                 // Read header to get current mode
-                let mv_store = program.connection.mv_store();
+                let mv_store = program.connection.mv_store_for_db(*db);
                 let header_result = with_header(pager, mv_store.as_ref(), program, |header| {
                     header.read_version
                 });
@@ -11260,7 +11315,7 @@ fn op_journal_mode_inner(
 
             OpJournalModeSubState::Checkpoint => {
                 // Checkpoint WAL or MVCC before changing mode
-                let mv_store = program.connection.mv_store();
+                let mv_store = program.connection.mv_store_for_db(*db);
                 if let Some(mv_store) = mv_store.as_ref() {
                     // MVCC checkpoint using state machine
                     if state.op_journal_mode_state.checkpoint_sm.is_none() {
@@ -12188,13 +12243,14 @@ pub fn with_header_mut<T, F>(
     pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
+    db: usize,
     f: F,
 ) -> Result<IOResult<T>>
 where
     F: Fn(&mut DatabaseHeader) -> T,
 {
     if let Some(mv_store) = mv_store {
-        let tx_id = program.connection.get_mv_tx_id();
+        let tx_id = program.connection.get_mv_tx_id_for_db(db);
         mv_store
             .with_header_mut(f, tx_id.as_ref())
             .map(IOResult::Done)
@@ -12207,9 +12263,10 @@ fn get_schema_cookie(
     pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
+    db: usize,
 ) -> Result<IOResult<u32>> {
     if let Some(mv_store) = mv_store {
-        let tx_id = program.connection.get_mv_tx_id();
+        let tx_id = program.connection.get_mv_tx_id_for_db(db);
         mv_store
             .with_header(|header| header.schema_cookie.get(), tx_id.as_ref())
             .map(IOResult::Done)

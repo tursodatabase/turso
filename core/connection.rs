@@ -24,6 +24,7 @@ use crate::{
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use smallvec::SmallVec;
 use std::fmt::Display;
 use std::ops::Deref;
 use tracing::{instrument, Level};
@@ -102,6 +103,10 @@ pub struct Connection {
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
+    /// Per-attached-database MVCC transactions (cold path, typically 0-3 entries).
+    /// Main DB uses `mv_tx` above for zero-cost hot path access.
+    pub(crate) attached_mv_txs:
+        RwLock<SmallVec<[(usize, crate::mvcc::database::TxID, TransactionMode); 4]>>,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
@@ -999,6 +1004,18 @@ impl Connection {
                         }
                     }
                     pager.end_read_tx();
+                    // Rollback MVCC transactions on attached databases
+                    for (db_id, tx_id, _mode) in self.get_all_mv_txs() {
+                        if !crate::is_attached_db(db_id) {
+                            continue;
+                        }
+                        if let Some(attached_mv_store) = self.mv_store_for_db(db_id) {
+                            let attached_pager = self.get_pager_from_database_index(&db_id);
+                            attached_mv_store.rollback_tx(tx_id, attached_pager.clone(), self);
+                            attached_pager.end_read_tx();
+                        }
+                    }
+                    self.clear_all_mv_txs();
                 } else {
                     pager.rollback_tx(self);
                 }
@@ -1450,7 +1467,7 @@ impl Connection {
         };
         let main_db_flags = self.db.open_flags;
         let (db, encryption_opts) =
-            Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+            Self::from_uri_attached(path, db_opts, main_db_flags, io.clone())?;
         // Build encryption key from URI opts to pass to _init for decrypting page 1.
         let encryption_key = if let Some(ref enc) = encryption_opts {
             Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
@@ -1458,7 +1475,18 @@ impl Connection {
             None
         };
         let pager = Arc::new(db._init(encryption_key.as_ref())?);
-
+        // Reject incompatible journal modes: if the main database uses MVCC,
+        // attached databases must also use MVCC (and vice versa). Silently
+        // converting the attached DB's header would be a write side-effect
+        // (the user may have attached read-only), so we error instead.
+        if self.mvcc_enabled() != db.mvcc_enabled() && !path.contains(":memory:") {
+            let main_mode = if self.mvcc_enabled() { "MVCC" } else { "WAL" };
+            let attached_mode = if db.mvcc_enabled() { "MVCC" } else { "WAL" };
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot attach database '{alias}': main database uses {main_mode} journal mode \
+                 but attached database uses {attached_mode}. Both must use the same journal mode."
+            )));
+        }
         self.attached_databases.write().insert(alias, (db, pager));
 
         Ok(())
@@ -1855,6 +1883,82 @@ impl Connection {
     pub(crate) fn set_mv_tx(&self, tx_id_and_mode: Option<(u64, TransactionMode)>) {
         tracing::debug!("set_mv_tx: {:?}", tx_id_and_mode);
         *self.mv_tx.write() = tx_id_and_mode;
+    }
+
+    /// Get MVCC transaction ID for a specific database.
+    /// Uses fast path for main DB, linear scan of SmallVec for attached DBs.
+    pub(crate) fn get_mv_tx_id_for_db(&self, db: usize) -> Option<u64> {
+        if !crate::is_attached_db(db) {
+            self.get_mv_tx_id()
+        } else {
+            let txs = self.attached_mv_txs.read();
+            txs.iter()
+                .find(|(id, _, _)| *id == db)
+                .map(|(_, tx_id, _)| *tx_id)
+        }
+    }
+
+    /// Get MVCC transaction ID and mode for a specific database.
+    pub(crate) fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
+        if !crate::is_attached_db(db) {
+            self.get_mv_tx()
+        } else {
+            let txs = self.attached_mv_txs.read();
+            txs.iter()
+                .find(|(id, _, _)| *id == db)
+                .map(|(_, tx_id, mode)| (*tx_id, *mode))
+        }
+    }
+
+    /// Set MVCC transaction for a specific database.
+    pub(crate) fn set_mv_tx_for_db(&self, db: usize, val: Option<(u64, TransactionMode)>) {
+        if !crate::is_attached_db(db) {
+            self.set_mv_tx(val);
+        } else {
+            let mut txs = self.attached_mv_txs.write();
+            // Remove existing entry for this db
+            txs.retain(|(id, _, _)| *id != db);
+            if let Some((tx_id, mode)) = val {
+                txs.push((db, tx_id, mode));
+            }
+        }
+    }
+
+    /// Clear all MVCC transactions (main + attached). Used during rollback.
+    pub(crate) fn clear_all_mv_txs(&self) {
+        *self.mv_tx.write() = None;
+        self.attached_mv_txs.write().clear();
+    }
+
+    /// Collect all active MVCC transactions across all databases.
+    /// Returns (db_id, tx_id, mode) for each database with an active MVCC tx.
+    pub(crate) fn get_all_mv_txs(&self) -> Vec<(usize, u64, TransactionMode)> {
+        let mut result = Vec::new();
+        if let Some((tx_id, mode)) = *self.mv_tx.read() {
+            result.push((crate::MAIN_DB_ID, tx_id, mode));
+        }
+        let attached = self.attached_mv_txs.read();
+        for &(db_id, tx_id, mode) in attached.iter() {
+            result.push((db_id, tx_id, mode));
+        }
+        result
+    }
+
+    /// Get the MvStore for a specific database.
+    /// Returns None for databases without MVCC or for bootstrap connections.
+    pub(crate) fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
+        if self.is_mvcc_bootstrap_connection() {
+            return None;
+        }
+        if !crate::is_attached_db(db) {
+            self.db.get_mv_store().as_ref().cloned()
+        } else {
+            let catalog = self.attached_databases.read();
+            catalog
+                .index_to_data
+                .get(&db)
+                .and_then(|(db, _)| db.get_mv_store().as_ref().cloned())
+        }
     }
 
     pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
