@@ -4957,6 +4957,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn last(&mut self) -> Result<IOResult<()>> {
+        self.set_null_flag(false);
         let always_seek = false;
         let cursor_has_record = return_if_io!(self.move_to_rightmost(always_seek));
         self.set_has_record(cursor_has_record);
@@ -5643,6 +5644,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn rewind(&mut self) -> Result<IOResult<()>> {
+        self.set_null_flag(false);
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
