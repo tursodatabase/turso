@@ -1,0 +1,28 @@
+---
+source: cte_cardinality.sqltest
+expression: |-
+  WITH small AS (
+          SELECT id FROM items LIMIT 2
+      ),
+      big AS (
+          SELECT id FROM items LIMIT 100
+      )
+      SELECT s.id, b.id
+      FROM small s
+      JOIN big b ON s.id = b.id;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - big
+  - items
+  - s.id
+  - small
+  setup_blocks:
+  - tables
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN big AS b
+|  `--SCAN items
+`--SEARCH s USING INDEX ephemeral_subquery_t2
+   `--SCAN items

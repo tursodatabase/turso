@@ -518,8 +518,31 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         &mut plan.offset,
     )?;
 
-    if let Some(best_join_order) = best_join_order {
+    if let Some((best_join_order, output_rows)) = best_join_order {
         plan.join_order = best_join_order;
+        let mut est = output_rows as f64;
+        // Clamp to LIMIT when it's a literal non-negative number.
+        // Negative LIMIT means "no limit" in SQLite, so we skip those.
+        if let Some(limit_expr) = &plan.limit {
+            if let Ok(val) = crate::util::parse_signed_number(limit_expr) {
+                let limit_f64 = match val {
+                    crate::types::Value::Numeric(Numeric::Integer(i)) if i >= 0 => Some(i as f64),
+                    crate::types::Value::Numeric(Numeric::Float(f)) => {
+                        let f: f64 = f.into();
+                        if f >= 0.0 {
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(limit_val) = limit_f64 {
+                    est = est.min(limit_val);
+                }
+            }
+        }
+        plan.estimated_output_rows = Some(est);
     }
 
     Ok(())
@@ -793,6 +816,7 @@ fn add_ephemeral_table_to_update_plan(
         window: None,
         // Move subqueries from the main plan to the ephemeral plan since the WHERE clause was moved
         non_from_clause_subqueries: plan.non_from_clause_subqueries.drain(..).collect(),
+        estimated_output_rows: None,
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
@@ -1000,6 +1024,45 @@ fn base_row_estimate(
             }
             RowCountEstimate::hardcoded_fallback(params)
         }
+        Table::FromClauseSubquery(subquery) => match subquery.plan.as_ref() {
+            Plan::Select(plan) => {
+                if let Some(rows) = plan.estimated_output_rows {
+                    return RowCountEstimate::AnalyzeStats(rows.max(1.0));
+                }
+                RowCountEstimate::hardcoded_fallback(params)
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                // Combine estimates from all branches according to set operation semantics.
+                // left = [(A, op1), (B, op2)], right_most = C
+                // represents: (A op1 B) op2 C
+                // We fold left-to-right: seed with A, then apply op_i with plan_{i+1}.
+                let fallback = *RowCountEstimate::hardcoded_fallback(params);
+                let est = |p: &SelectPlan| p.estimated_output_rows.unwrap_or(fallback);
+                let mut combined = left.first().map_or(
+                    right_most.estimated_output_rows.unwrap_or(fallback),
+                    |(p, _)| est(p),
+                );
+                // The estimates to the right of each operator: left[1..].est, then right_most.est
+                let rhs_estimates = left
+                    .iter()
+                    .skip(1)
+                    .map(|(p, _)| est(p))
+                    .chain(std::iter::once(est(right_most)));
+                for ((_, op), rhs) in left.iter().zip(rhs_estimates) {
+                    combined = match op {
+                        ast::CompoundOperator::UnionAll | ast::CompoundOperator::Union => {
+                            combined + rhs
+                        }
+                        ast::CompoundOperator::Intersect => combined.min(rhs),
+                        ast::CompoundOperator::Except => combined,
+                    };
+                }
+                RowCountEstimate::AnalyzeStats(combined.max(1.0))
+            }
+            _ => RowCountEstimate::hardcoded_fallback(params),
+        },
         _ => RowCountEstimate::hardcoded_fallback(params),
     }
 }
@@ -1083,7 +1146,7 @@ fn optimize_table_access(
     subqueries: &[NonFromClauseSubquery],
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
-) -> Result<Option<Vec<JoinOrderMember>>> {
+) -> Result<Option<(Vec<JoinOrderMember>, usize)>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
     #[cfg(feature = "optimizer_params")]
@@ -1280,6 +1343,8 @@ fn optimize_table_access(
     } else {
         best_plan
     };
+
+    let final_output_cardinality = best_plan.output_cardinality;
 
     let mut sort_eliminated = false;
 
@@ -1814,7 +1879,7 @@ fn optimize_table_access(
         }
     }
 
-    Ok(Some(best_join_order))
+    Ok(Some((best_join_order, final_output_cardinality)))
 }
 
 fn build_vtab_scan_op(
