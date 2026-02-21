@@ -24,25 +24,3 @@ info:
 QUERY PLAN
 |--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
 `--SEARCH o USING INDEX idx_orders_customer_id
-
-BYTECODE
-addr  opcode          p1  p2  p3  p4              p5  comment
-   0  Init             0  16   0                   0  Start at 16
-   1  OpenRead         0   2   0  k(5,B,B,B,B,B)   0  table=customers, root=2, iDb=0
-   2  OpenRead         1   4   0  k(5,B,B,B,B,B)   0  table=orders, root=4, iDb=0
-   3  OpenRead         2   8   0  k(2,B)           0  index=idx_orders_customer_id, root=8, iDb=0
-   4  SeekRowid        0   5  15                   0  if (r[5]!=cursor 0 for table customers.rowid) goto 15
-   5  RowId            0   6   0                   0  r[6]=customers.rowid
-   6  SeekGE           2  15   6                   0  key=[6..6]
-   7    IdxGT          2  15   6                   0  key=[6..6]
-   8    DeferredSeek   2   1   0                   0
-   9    Column         0   1   1                   0  r[1]=customers.name
-  10    IdxRowId       2   2   0                   0  r[2]=cursor 2 for index idx_orders_customer_id.rowid
-  11    Column         1   2   3                   0  r[3]=orders.order_date
-  12    Column         1   4   4                   0  r[4]=orders.total_amount
-  13    ResultRow      1   4   0                   0  output=r[1..4]
-  14  Next             2   7   0                   0
-  15  Halt             0   0   0                   0
-  16  Transaction      0   1  10                   0  iDb=0 tx_mode=Read
-  17  Integer         42   5   0                   0  r[5]=42
-  18  Goto             0   1   0                   0

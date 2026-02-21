@@ -1,40 +1,27 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        c.customer_id,\n        c.name,\n        o.order_id,\n        o.total_amount\n    FROM\n        customers c\n    INNER JOIN orders o ON c.customer_id = o.customer_id\n    WHERE\n        o.status = 'completed'\n        AND o.total_amount > 100;"
+expression: |-
+  SELECT
+          c.customer_id,
+          c.name,
+          o.order_id,
+          o.total_amount
+      FROM
+          customers c
+      INNER JOIN orders o ON c.customer_id = o.customer_id
+      WHERE
+          o.status = 'completed'
+          AND o.total_amount > 100;
 info:
   statement_type: SELECT
   tables:
-    - c.customer_id
-    - customers
-    - orders
+  - c.customer_id
+  - customers
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
-|--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
-`--SCAN orders AS o
-
-BYTECODE
-addr  opcode        p1  p2  p3  p4              p5  comment
-   0  Init           0  17   0                   0  Start at 17
-   1  OpenRead       0   2   0  k(5,B,B,B,B,B)   0  table=customers, root=2, iDb=0
-   2  OpenRead       1   4   0  k(5,B,B,B,B,B)   0  table=orders, root=4, iDb=0
-   3  Rewind         1  16   0                   0  Rewind table orders
-   4    Column       1   3   6                   0  r[6]=orders.status
-   5    Ne           6   7  15  Binary           0  if r[6]!=r[7] goto 15
-   6    Column       1   4   9                   0  r[9]=orders.total_amount
-   7    Le           9  10  15  Binary           0  if r[9]<=r[10] goto 15
-   8    Column       1   1  11                   0  r[11]=orders.customer_id
-   9    SeekRowid    0  11  15                   0  if (r[11]!=cursor 0 for table customers.rowid) goto 15
-  10    RowId        0   1   0                   0  r[1]=customers.rowid
-  11    Column       0   1   2                   0  r[2]=customers.name
-  12    RowId        1   3   0                   0  r[3]=orders.rowid
-  13    Column       1   4   4                   0  r[4]=orders.total_amount
-  14    ResultRow    1   4   0                   0  output=r[1..4]
-  15  Next           1   4   0                   0
-  16  Halt           0   0   0                   0
-  17  Transaction    0   1  10                   0  iDb=0 tx_mode=Read
-  18  String8        0   7   0  completed        0  r[7]='completed'
-  19  Integer      100  10   0                   0  r[10]=100
-  20  Goto           0   1   0                   0
+|--SCAN orders AS o
+`--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)

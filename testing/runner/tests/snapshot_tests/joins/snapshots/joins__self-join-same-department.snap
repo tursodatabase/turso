@@ -1,35 +1,24 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        e1.name AS employee1,\n        e2.name AS employee2,\n        e1.department\n    FROM\n        employees e1,\n        employees e2\n    WHERE\n        e1.department = e2.department\n        AND e1.employee_id < e2.employee_id;"
+expression: |-
+  SELECT
+          e1.name AS employee1,
+          e2.name AS employee2,
+          e1.department
+      FROM
+          employees e1,
+          employees e2
+      WHERE
+          e1.department = e2.department
+          AND e1.employee_id < e2.employee_id;
 info:
   statement_type: SELECT
   tables:
-    - employees
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN employees AS e1
 `--SEARCH e2 USING INTEGER PRIMARY KEY (rowid=?)
-
-BYTECODE
-addr  opcode         p1  p2  p3  p4              p5  comment
-   0  Init            0  16   0                   0  Start at 16
-   1  OpenRead        0   6   0  k(5,B,B,B,B,B)   0  table=employees, root=6, iDb=0
-   2  OpenRead        1   6   0  k(5,B,B,B,B,B)   0  table=employees, root=6, iDb=0
-   3  Rewind          0  15   0                   0  Rewind table employees
-   4    RowId         0   4   0                   0  r[4]=employees.rowid
-   5    SeekGT        1  14   4                   0  key=[4..4]
-   6      Column      0   3   6                   0  r[6]=employees.department
-   7      Column      1   3   7                   0  r[7]=employees.department
-   8      Ne          6   7  13  Binary           0  if r[6]!=r[7] goto 13
-   9      Column      0   1   1                   0  r[1]=employees.name
-  10      Column      1   1   2                   0  r[2]=employees.name
-  11      Column      0   3   3                   0  r[3]=employees.department
-  12      ResultRow   1   3   0                   0  output=r[1..3]
-  13    Next          1   6   0                   0
-  14  Next            0   4   0                   0
-  15  Halt            0   0   0                   0
-  16  Transaction     0   1  10                   0  iDb=0 tx_mode=Read
-  17  Goto            0   1   0                   0
