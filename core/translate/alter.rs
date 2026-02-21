@@ -209,7 +209,7 @@ fn emit_add_column_default_type_validation(
     program.emit_insn(Insn::OpenRead {
         cursor_id: check_cursor_id,
         root_page: original_btree.root_page,
-        db: 0,
+        db: crate::MAIN_DB_ID,
     });
 
     let skip_check_label = program.allocate_label();
@@ -358,7 +358,7 @@ pub fn translate_alter_table(
         body: alter_table,
     } = alter;
     let database_id = resolver.resolve_database_id(&qualified_name)?;
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }

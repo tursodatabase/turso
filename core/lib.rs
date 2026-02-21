@@ -136,6 +136,23 @@ pub use vdbe::{
     FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
 
+/// Database index for the main database (always 0 in SQLite).
+pub const MAIN_DB_ID: usize = 0;
+
+/// Database index for the temp database (always 1 in SQLite).
+pub const TEMP_DB_ID: usize = 1;
+
+/// First database index used for ATTACH-ed databases.
+/// SQLite reserves 0 for "main" and 1 for "temp", so attached databases
+/// start at index 2.
+pub const FIRST_ATTACHED_DB_ID: usize = 2;
+
+/// Returns true if the database index refers to an attached database
+/// (i.e. not "main" and not "temp").
+pub const fn is_attached_db(database_id: usize) -> bool {
+    database_id >= FIRST_ATTACHED_DB_ID
+}
+
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {

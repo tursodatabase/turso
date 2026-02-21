@@ -132,9 +132,6 @@ impl<'a> Resolver<'a> {
     const MAIN_DB: &'static str = "main";
     const TEMP_DB: &'static str = "temp";
 
-    const MAIN_DB_ID: usize = 0;
-    const TEMP_DB_ID: usize = 1;
-
     pub(crate) fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
@@ -200,7 +197,7 @@ impl<'a> Resolver<'a> {
 
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
-        if database_id == Self::MAIN_DB_ID || database_id == Self::TEMP_DB_ID {
+        if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
             f(self.schema)
         } else {
             // Attached database: prefer the connection-local copy (which may contain
@@ -262,8 +259,8 @@ impl<'a> Resolver<'a> {
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
         match index {
-            0 => Some(Self::MAIN_DB.to_string()),
-            1 => Some(Self::TEMP_DB.to_string()),
+            crate::MAIN_DB_ID => Some(Self::MAIN_DB.to_string()),
+            crate::TEMP_DB_ID => Some(Self::TEMP_DB.to_string()),
             _ => self.attached_databases.read().get_name_by_index(index),
         }
     }
@@ -4236,7 +4233,7 @@ pub fn prepare_cdc_if_necessary(
     program.emit_insn(Insn::OpenWrite {
         cursor_id,
         root_page: cdc_btree.root_page.into(),
-        db: 0, // CDC table always lives in the main database
+        db: crate::MAIN_DB_ID, // CDC table always lives in the main database
     });
     Ok(Some((cursor_id, cdc_btree)))
 }

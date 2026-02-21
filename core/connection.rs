@@ -1325,7 +1325,7 @@ impl Connection {
         database_id: usize,
         f: impl FnOnce(&mut Schema) -> T,
     ) -> T {
-        if database_id < 2 {
+        if !crate::is_attached_db(database_id) {
             self.with_schema_mut(f)
         } else {
             // For attached databases, update a connection-local copy of the schema.
@@ -1516,11 +1516,11 @@ impl Connection {
 
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
-        if database_id == 0 {
+        if database_id == crate::MAIN_DB_ID {
             // Main database - use connection's schema which should be kept in sync
             let schema = self.schema.read();
             f(&schema)
-        } else if database_id == 1 {
+        } else if database_id == crate::TEMP_DB_ID {
             // Temp database - uses same schema as main for now, but this will change later.
             let schema = self.schema.read();
             f(&schema)

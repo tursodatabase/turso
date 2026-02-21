@@ -9658,20 +9658,23 @@ pub fn op_integrity_check(
     };
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
-            let (freelist_trunk_page, db_size) =
-                return_if_io!(with_header(&target_pager, mv_store.as_ref(), program, |header| (
-                    header.freelist_trunk_page.get(),
-                    header.database_size.get()
-                )));
+            let (freelist_trunk_page, db_size) = return_if_io!(with_header(
+                &target_pager,
+                mv_store.as_ref(),
+                program,
+                |header| (header.freelist_trunk_page.get(), header.database_size.get())
+            ));
             let mut errors = Vec::new();
             let mut integrity_check_state = IntegrityCheckState::new(db_size as usize);
             let mut current_root_idx = 0;
 
             if freelist_trunk_page > 0 {
-                let expected_freelist_count =
-                    return_if_io!(with_header(&target_pager, mv_store.as_ref(), program, |header| {
-                        header.freelist_pages.get()
-                    }));
+                let expected_freelist_count = return_if_io!(with_header(
+                    &target_pager,
+                    mv_store.as_ref(),
+                    program,
+                    |header| { header.freelist_pages.get() }
+                ));
                 integrity_check_state.set_expected_freelist_count(expected_freelist_count as usize);
                 integrity_check_state.start(
                     freelist_trunk_page as i64,

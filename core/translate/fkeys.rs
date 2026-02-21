@@ -1479,7 +1479,7 @@ fn fire_fk_cascade_delete(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = if database_id > 0 {
+    let db_name = if database_id != crate::MAIN_DB_ID {
         resolver.get_database_name_by_index(database_id)
     } else {
         None
@@ -1512,7 +1512,7 @@ fn fire_fk_set_null(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = if database_id > 0 {
+    let db_name = if database_id != crate::MAIN_DB_ID {
         resolver.get_database_name_by_index(database_id)
     } else {
         None
@@ -1538,7 +1538,7 @@ fn fire_fk_set_default(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = if database_id > 0 {
+    let db_name = if database_id != crate::MAIN_DB_ID {
         resolver.get_database_name_by_index(database_id)
     } else {
         None
@@ -1564,7 +1564,7 @@ fn fire_fk_cascade_update(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = if database_id > 0 {
+    let db_name = if database_id != crate::MAIN_DB_ID {
         resolver.get_database_name_by_index(database_id)
     } else {
         None

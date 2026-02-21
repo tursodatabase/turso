@@ -300,7 +300,7 @@ pub fn translate_insert(
 
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
 
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }

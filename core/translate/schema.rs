@@ -182,7 +182,7 @@ pub fn translate_create_table(
     connection: &Connection,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(&tbl_name)?;
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
@@ -707,7 +707,7 @@ pub fn translate_create_virtual_table(
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
-        db: 0,
+        db: crate::MAIN_DB_ID,
     });
 
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
@@ -725,7 +725,7 @@ pub fn translate_create_virtual_table(
     )?;
 
     program.emit_insn(Insn::SetCookie {
-        db: 0,
+        db: crate::MAIN_DB_ID,
         cookie: Cookie::SchemaVersion,
         value: resolver.schema().schema_version as i32 + 1,
         p5: 0,
@@ -777,7 +777,7 @@ pub fn translate_drop_table(
     };
     program.extend(&opts);
 
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
@@ -1188,7 +1188,7 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::OpenWrite {
             cursor_id: ver_cursor_id,
             root_page: version_table.root_page.into(),
-            db: 0,
+            db: crate::MAIN_DB_ID,
         });
 
         let end_ver_loop_label = program.allocate_label();

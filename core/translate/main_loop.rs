@@ -171,7 +171,7 @@ pub fn init_loop(
             continue;
         }
         // Ensure attached databases have a Transaction instruction for read access
-        if table.database_id >= 2 {
+        if crate::is_attached_db(table.database_id) {
             let schema_cookie = t_ctx
                 .resolver
                 .with_schema(table.database_id, |s| s.schema_version);
@@ -1418,7 +1418,7 @@ pub fn open_loop(
                     )?;
                 }
                 program.emit_insn(Insn::IndexMethodQuery {
-                    db: 0,
+                    db: crate::MAIN_DB_ID,
                     cursor_id: index_cursor_id.expect("IndexMethod requires a index cursor"),
                     start_reg,
                     count_reg: query.arguments.len() + 1,

@@ -98,7 +98,7 @@ pub fn translate_create_index(
     };
     program.extend(&opts);
 
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
@@ -778,7 +778,7 @@ pub fn translate_drop_index(
     };
     program.extend(&opts);
 
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
@@ -1042,7 +1042,10 @@ pub fn translate_optimize(
     // Emit optimize instructions for each index method index
     for idx in &indexes_to_optimize {
         let cursor_id = program.alloc_cursor_index(None, idx)?;
-        program.emit_insn(Insn::IndexMethodOptimize { db: 0, cursor_id });
+        program.emit_insn(Insn::IndexMethodOptimize {
+            db: crate::MAIN_DB_ID,
+            cursor_id,
+        });
     }
 
     Ok(())
