@@ -98,6 +98,10 @@ reset-db:
 	./scripts/clone_test_db.sh
 .PHONY: reset-db
 
+test-fuzz:
+	RUST_LOG=$(RUST_LOG) cargo test -p core_tester --release -- fuzz 
+.PHONY: test-fuzz
+
 test-sqlite3: reset-db
 	cargo test -p turso_sqlite3 --test compat -- --test-threads=1
 	./scripts/clone_test_db.sh
