@@ -40,6 +40,43 @@ pub fn assert_differential(
     );
 }
 
+pub fn assert_differential_no_ordering(
+    limbo_conn: &Arc<turso_core::Connection>,
+    sqlite_conn: &rusqlite::Connection,
+    query: &str,
+    context: &str,
+) {
+    let limbo_results = limbo_exec_rows(limbo_conn, query);
+    let sqlite_results = sqlite_exec_rows(sqlite_conn, query);
+
+    // Check if results match
+    if limbo_results.len() != sqlite_results.len() {
+        panic!(
+                "Row count mismatch for query: {}\nLimbo: {} rows, SQLite: {} rows\nLimbo: {:?}\nSQLite: {:?}\n",
+                query, limbo_results.len(), sqlite_results.len(), limbo_results, sqlite_results,
+            );
+    }
+
+    // Check if all rows match (order might be different)
+    // Since Value doesn't implement Ord, we'll check containment both ways
+    let all_limbo_in_sqlite = limbo_results.iter().all(|limbo_row| {
+        sqlite_results
+            .iter()
+            .any(|sqlite_row| limbo_row == sqlite_row)
+    });
+    let all_sqlite_in_limbo = sqlite_results.iter().all(|sqlite_row| {
+        limbo_results
+            .iter()
+            .any(|limbo_row| sqlite_row == limbo_row)
+    });
+
+    if !all_limbo_in_sqlite || !all_sqlite_in_limbo {
+        panic!(
+                "Results mismatch for query: {query}\nLimbo: {limbo_results:?}\nSQLite: {sqlite_results:?}\n{context}",
+            );
+    }
+}
+
 /// Assert that both engines either succeeded or both failed. Panics on mismatch.
 pub fn assert_outcome_parity<T: std::fmt::Debug, U: std::fmt::Debug>(
     sqlite_res: &Result<T, impl std::fmt::Debug>,
