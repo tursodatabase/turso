@@ -669,23 +669,46 @@ impl Connection {
     #[cfg(feature = "fs")]
     fn from_uri_attached(
         uri: &str,
-        db_opts: DatabaseOpts,
+        mut db_opts: DatabaseOpts,
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
-    ) -> Result<Arc<Database>> {
+    ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
         if main_db_flags.contains(OpenFlags::ReadOnly) {
             flags |= OpenFlags::ReadOnly;
         }
+        let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
+            (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
+            (Some(_), None) => {
+                return Err(LimboError::InvalidArgument(
+                    "hexkey is required when cipher is provided".to_string(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(LimboError::InvalidArgument(
+                    "cipher is required when hexkey is provided".to_string(),
+                ))
+            }
+            (None, None) => None,
+        };
+        if encryption_opts.is_some() {
+            db_opts = db_opts.with_encryption(true);
+        }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts, None)?;
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            &opts.path,
+            flags,
+            db_opts,
+            encryption_opts.clone(),
+        )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        Ok(db)
+        Ok((db, encryption_opts))
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
@@ -1426,8 +1449,15 @@ impl Connection {
             self.db.io.clone()
         };
         let main_db_flags = self.db.open_flags;
-        let db = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
-        let pager = Arc::new(db._init(None)?);
+        let (db, encryption_opts) = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+        // Build encryption key from URI opts to pass to _init for decrypting page 1.
+        let encryption_key = if let Some(ref enc) = encryption_opts {
+            Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
+        } else {
+            None
+        };
+        let pager = Arc::new(db._init(encryption_key.as_ref())?);
+
         self.attached_databases.write().insert(alias, (db, pager));
 
         Ok(())
