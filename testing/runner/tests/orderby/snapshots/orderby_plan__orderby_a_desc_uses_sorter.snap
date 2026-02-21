@@ -6,12 +6,12 @@ info:
   tables:
   - t
   setup_blocks:
-  - orderby_temp_btree
+  - orderby_plan
   database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN t
-`--USE TEMP B-TREE FOR ORDER BY
+`--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode          p1  p2  p3  p4       p5  comment

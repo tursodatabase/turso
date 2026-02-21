@@ -188,9 +188,11 @@ pub fn emit_order_by(
         + if has_sequence { 1 } else { 0 }
         + remappings.iter().filter(|r| !r.deduplicated).count();
 
-    // TODO: we need to know how many indices used for sorting
-    // to emit correct explain output.
-    emit_explain!(program, false, "USE TEMP B-TREE FOR ORDER BY".to_owned());
+    if use_heap_sort {
+        emit_explain!(program, false, "USE TEMP B-TREE FOR ORDER BY".to_owned());
+    } else {
+        emit_explain!(program, false, "USE SORTER FOR ORDER BY".to_owned());
+    }
 
     let cursor_id = if !use_heap_sort {
         let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {

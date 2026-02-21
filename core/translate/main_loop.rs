@@ -21,6 +21,7 @@ use super::{
     },
 };
 use crate::{
+    emit_explain,
     schema::{Index, Table},
     translate::{
         collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
@@ -37,7 +38,7 @@ use crate::{
         affinity::{self, Affinity},
         builder::{
             CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
-            ProgramBuilder,
+            ProgramBuilder, QueryMode,
         },
         insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
@@ -147,6 +148,11 @@ pub fn init_loop(
                 label_on_conflict: program.allocate_label(),
             }),
         };
+        emit_explain!(
+            program,
+            false,
+            format!("USE HASH TABLE FOR {}(DISTINCT)", agg.func)
+        );
     }
     // Include hash-join build tables so their cursors are opened for hash build.
     let mut required_tables: HashSet<usize> = join_order
