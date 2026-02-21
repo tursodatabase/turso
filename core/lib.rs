@@ -480,6 +480,42 @@ impl Database {
         Self::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)
     }
 
+    /// Look up a database in the process-wide registry by path.
+    /// Returns the cached Database if found, with encryption validation.
+    /// This avoids opening a file (and acquiring a file lock) when the
+    /// database is already open in this process.
+    fn lookup_in_registry(
+        path: &str,
+        encryption_opts: &Option<EncryptionOpts>,
+    ) -> Result<Option<Arc<Database>>> {
+        if path.starts_with(":memory:") {
+            return Ok(None);
+        }
+        let canonical = match std::fs::canonicalize(path)
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+        {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let registry = DATABASE_MANAGER.lock_arc();
+        let db = match registry.get(&canonical).and_then(Weak::upgrade) {
+            Some(db) => db,
+            None => return Ok(None),
+        };
+
+        // Validate encryption compatibility (key is not stored for security,
+        // so we can only check cipher mode)
+        let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
+        if db_is_encrypted && encryption_opts.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "Database is encrypted but no encryption options provided".to_string(),
+            ));
+        }
+
+        Ok(Some(db))
+    }
+
     #[cfg(feature = "fs")]
     pub fn open_file_with_flags(
         io: Arc<dyn IO>,
@@ -488,6 +524,11 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
+        // Check the registry before opening the file to avoid acquiring a file
+        // lock that would conflict with an already-open Database in this process.
+        if let Some(db) = Self::lookup_in_registry(path, &encryption_opts)? {
+            return Ok(db);
+        }
         let file = io.open_file(path, flags, true)?;
         let db_file = Arc::new(DatabaseFile::new(file));
         Self::open_with_flags(io, path, db_file, flags, opts, encryption_opts)
