@@ -270,6 +270,7 @@ pub fn prepare_delete_plan(
             values: vec![],
             window: None,
             non_from_clause_subqueries: vec![],
+            estimated_output_rows: None,
         };
 
         Ok(Plan::Delete(DeletePlan {

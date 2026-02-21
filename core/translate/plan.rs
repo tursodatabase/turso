@@ -490,6 +490,9 @@ pub struct SelectPlan {
     pub window: Option<Window>,
     /// Subqueries that appear in any part of the query apart from the FROM clause
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
+    /// Estimated output rows from the optimizer's join order computation.
+    /// Used to propagate cardinality estimates for CTE/subquery tables.
+    pub estimated_output_rows: Option<f64>,
 }
 
 impl SelectPlan {
