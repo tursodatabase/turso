@@ -1716,6 +1716,7 @@ fn optimize_table_access(
                 where_term_idx,
                 set_op,
                 additional_consumed_terms,
+                estimated_rows_per_outer_row: _,
             } => {
                 // Mark the primary WHERE clause term as consumed
                 where_clause[*where_term_idx].consumed = true;

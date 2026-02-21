@@ -855,6 +855,13 @@ pub fn join_lhs_and_rhs<'a>(
             // Final: input_rows × fanout × local_filters
             (input_cardinality as f64 * fanout * local_filter_multiplier).ceil() as usize
         }
+    } else if let AccessMethodParams::MultiIndexScan {
+        estimated_rows_per_outer_row,
+        ..
+    } = &best_access_method.params
+    {
+        (input_cardinality as f64 * estimated_rows_per_outer_row * local_filter_multiplier).ceil()
+            as usize
     } else {
         // HashJoin, VirtualTable, Subquery: use full selectivity formula
         (input_cardinality as f64 * *rhs_base_rows * output_cardinality_multiplier).ceil() as usize

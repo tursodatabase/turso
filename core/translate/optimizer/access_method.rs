@@ -124,6 +124,8 @@ pub enum AccessMethodParams {
         set_op: SetOperation,
         /// For Intersection: additional WHERE term indices consumed.
         additional_consumed_terms: Vec<usize>,
+        /// Estimated unique rows per outer row from the multi-index scan.
+        estimated_rows_per_outer_row: f64,
     },
 }
 
@@ -464,7 +466,7 @@ fn evaluate_multi_index_branches(
         branch_params.push(params_for_branch);
     }
 
-    let multi_index_cost = match set_op {
+    let (multi_index_cost, estimated_rows) = match set_op {
         SetOperation::Union => estimate_multi_index_scan_cost(
             &branch_costs,
             &branch_rows,
@@ -472,16 +474,13 @@ fn evaluate_multi_index_branches(
             input_cardinality,
             params,
         ),
-        SetOperation::Intersection => {
-            let (cost, _) = estimate_multi_index_intersection_cost(
-                &branch_costs,
-                &branch_rows,
-                base_row_count,
-                input_cardinality,
-                params,
-            );
-            cost
-        }
+        SetOperation::Intersection => estimate_multi_index_intersection_cost(
+            &branch_costs,
+            &branch_rows,
+            base_row_count,
+            input_cardinality,
+            params,
+        ),
     };
 
     if multi_index_cost < best_cost {
@@ -492,6 +491,7 @@ fn evaluate_multi_index_branches(
                 where_term_idx,
                 set_op,
                 additional_consumed_terms,
+                estimated_rows_per_outer_row: estimated_rows,
             },
         })
     } else {
