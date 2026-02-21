@@ -1,13 +1,23 @@
 ---
 source: aggregation.sqltest
-expression: "SELECT\n        category,\n        MIN(amount) as min_sale,\n        MAX(amount) as max_sale\n    FROM\n        sales\n    GROUP BY\n        category\n    ORDER BY\n        category;"
+expression: |-
+  SELECT
+          category,
+          MIN(amount) as min_sale,
+          MAX(amount) as max_sale
+      FROM
+          sales
+      GROUP BY
+          category
+      ORDER BY
+          category;
 info:
   statement_type: SELECT
   tables:
-    - sales
+  - sales
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN sales USING INDEX idx_sales_category

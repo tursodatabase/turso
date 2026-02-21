@@ -1,20 +1,34 @@
 ---
 source: aggregation.sqltest
-expression: "SELECT\n        p.category,\n        COUNT(DISTINCT o.customer_id) as unique_customers,\n        COUNT(DISTINCT o.order_id) as total_orders\n    FROM\n        products p\n        INNER JOIN orders o ON p.product_id = o.product_id\n    GROUP BY\n        p.category\n    ORDER BY\n        unique_customers DESC;"
+expression: |-
+  SELECT
+          p.category,
+          COUNT(DISTINCT o.customer_id) as unique_customers,
+          COUNT(DISTINCT o.order_id) as total_orders
+      FROM
+          products p
+          INNER JOIN orders o ON p.product_id = o.product_id
+      GROUP BY
+          p.category
+      ORDER BY
+          unique_customers DESC;
 info:
   statement_type: SELECT
   tables:
-    - orders
-    - p.product_id
-    - products
+  - orders
+  - p.product_id
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
-|--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
 |--SCAN orders AS o
-`--USE TEMP B-TREE FOR ORDER BY
+|--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
+|--USE SORTER FOR GROUP BY
+|--USE HASH TABLE FOR count(DISTINCT)
+|--USE HASH TABLE FOR count(DISTINCT)
+`--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode                          p1  p2  p3  p4                p5  comment

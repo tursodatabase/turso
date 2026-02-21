@@ -1,13 +1,22 @@
 ---
 source: aggregation.sqltest
-expression: "SELECT\n        COUNT(*) as total_transactions,\n        SUM(amount) as total_revenue,\n        AVG(amount) as avg_transaction,\n        MIN(amount) as min_transaction,\n        MAX(amount) as max_transaction,\n        SUM(quantity) as total_units_sold\n    FROM\n        sales;"
+expression: |-
+  SELECT
+          COUNT(*) as total_transactions,
+          SUM(amount) as total_revenue,
+          AVG(amount) as avg_transaction,
+          MIN(amount) as min_transaction,
+          MAX(amount) as max_transaction,
+          SUM(quantity) as total_units_sold
+      FROM
+          sales;
 info:
   statement_type: SELECT
   tables:
-    - sales
+  - sales
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN sales

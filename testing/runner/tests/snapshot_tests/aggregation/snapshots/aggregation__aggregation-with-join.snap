@@ -26,7 +26,8 @@ info:
 QUERY PLAN
 |--SCAN products AS p
 |--SEARCH o USING INDEX idx_orders_product
-`--USE TEMP B-TREE FOR ORDER BY
+|--USE SORTER FOR GROUP BY
+`--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode                    p1  p2  p3  p4                p5  comment
