@@ -11,14 +11,13 @@ pub fn to_u16(v: usize) -> u16 {
 }
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
-use crate::sync::RwLock;
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
     vdbe::affinity::Affinity,
-    Statement, Value,
+    PreparedProgram, Value,
 };
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
@@ -615,7 +614,7 @@ pub enum Insn {
     /// is used by subprograms to access content in registers of the calling bytecode program."
     Program {
         params: Vec<Value>,
-        program: Arc<RwLock<Statement>>,
+        program: Arc<PreparedProgram>,
     },
 
     /// Write an integer value into a register.

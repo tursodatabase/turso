@@ -1,12 +1,11 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
-use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::translate_expr;
 use crate::translate::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
-use crate::{bail_parse_error, QueryMode, Result, Statement};
+use crate::{bail_parse_error, QueryMode, Result};
 use rustc_hash::FxHashSet as HashSet;
 use std::num::NonZero;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
@@ -649,14 +648,9 @@ fn execute_trigger_commands(
         );
     }
 
-    let turso_stmt = Statement::new(
-        built_subprogram,
-        connection.pager.load().clone(),
-        QueryMode::Normal,
-    );
     program.emit_insn(Insn::Program {
         params,
-        program: Arc::new(RwLock::new(turso_stmt)),
+        program: built_subprogram.prepared().clone(),
     });
     connection.end_trigger_compilation();
 
