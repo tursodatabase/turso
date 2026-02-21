@@ -151,9 +151,14 @@ pub fn join_lhs_and_rhs<'a>(
     // If we have a previous table, consider hash join as an alternative
     let mut best_access_method = method;
 
-    // Consider multi-index scans (OR-by-union and AND-by-intersection) for BTree tables
-    // Only when accessing a single table (no LHS) and the table has a rowid
-    if lhs.is_none() && rhs_table_reference.btree().is_some_and(|b| b.has_rowid) {
+    // Reuse for multi-index scans, hash cost and output cardinality computation
+    let lhs_mask = lhs.map_or_else(TableMask::new, |l| {
+        TableMask::from_table_number_iter(l.table_numbers())
+    });
+
+    // Consider multi-index scans (OR-by-union and AND-by-intersection) for BTree tables with rowids.
+    // Cross-table disjuncts are validated against lhs_mask in the respective consider_ functions.
+    if rhs_table_reference.btree().is_some_and(|b| b.has_rowid) {
         // Try OR-by-union
         if let Some(multi_idx_method) = consider_multi_index_union(
             rhs_table_reference,
@@ -166,6 +171,7 @@ pub fn join_lhs_and_rhs<'a>(
             rhs_base_rows,
             params,
             best_access_method.cost,
+            &lhs_mask,
         ) {
             best_access_method = multi_idx_method;
         }
@@ -182,15 +188,11 @@ pub fn join_lhs_and_rhs<'a>(
             rhs_base_rows,
             params,
             best_access_method.cost,
+            &lhs_mask,
         ) {
             best_access_method = multi_idx_and_method;
         }
     }
-
-    // Reuse for both hash cost and output cardinality computation
-    let lhs_mask = lhs.map_or_else(TableMask::new, |l| {
-        TableMask::from_table_number_iter(l.table_numbers())
-    });
 
     // Self-constraints are conditions comparing columns within the same table
     // (e.g., t.col1 < t.col2). Include them in selectivity since they filter rows.

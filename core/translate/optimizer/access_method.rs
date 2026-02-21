@@ -37,6 +37,7 @@ use super::{
     order::OrderTarget,
 };
 use crate::translate::optimizer::order::ColumnTarget;
+use crate::translate::planner::TableMask;
 
 #[derive(Debug, Clone)]
 /// Represents a way to access a table.
@@ -515,6 +516,7 @@ pub fn consider_multi_index_union(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
     best_cost: Cost,
+    lhs_mask: &TableMask,
 ) -> Option<AccessMethod> {
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed {
@@ -539,6 +541,20 @@ pub fn consider_multi_index_union(
         };
 
         if !decomposition.all_indexable {
+            continue;
+        }
+
+        // Verify that every disjunct's constraining expression only references
+        // tables already on the LHS. This ensures cross-table disjuncts are only
+        // used when their referenced tables are available in the join context.
+        // Note: `all_indexable` check above guarantees every disjunct has a constraint,
+        // so the `is_some_and` never short-circuits to false on a None constraint.
+        let all_usable = decomposition.disjuncts.iter().all(|d| {
+            d.constraint
+                .as_ref()
+                .is_some_and(|c| lhs_mask.contains_all(&c.lhs_mask))
+        });
+        if !all_usable {
             continue;
         }
 
@@ -601,6 +617,7 @@ pub fn consider_multi_index_intersection(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
     best_cost: Cost,
+    lhs_mask: &TableMask,
 ) -> Option<AccessMethod> {
     let decomposition = analyze_and_terms_for_multi_index(
         rhs_table,
@@ -613,6 +630,17 @@ pub fn consider_multi_index_intersection(
     )?;
 
     if decomposition.branches.len() < 2 {
+        return None;
+    }
+
+    // Verify all branches only reference tables already on the LHS.
+    // Although analyze_and_terms_for_multi_index currently filters out cross-table
+    // constraints (lhs_mask.is_empty()), this explicit check provides defense-in-depth.
+    let all_usable = decomposition
+        .branches
+        .iter()
+        .all(|b| lhs_mask.contains_all(&b.constraint.lhs_mask));
+    if !all_usable {
         return None;
     }
 
