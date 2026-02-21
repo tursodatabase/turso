@@ -1710,3 +1710,54 @@ fn test_update_pk_on_attached_table_with_unique_index(tmp_db: TempDatabase) -> a
 
     Ok(())
 }
+
+/// Regression test: when a statement writes to the main DB and reads from an
+/// attached DB, the attached pager's read lock must be released after commit.
+/// Without the fix, the stale read lock would cause subsequent statements on
+/// the attached DB to use a stale WAL snapshot, missing data committed by
+/// other connections.
+#[turso_macros::test]
+fn test_attached_read_lock_released_after_main_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("aux_readlock.db")
+        .to_string_lossy()
+        .to_string();
+
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    // Set up: conn1 creates a main table and an attached table with initial data.
+    conn1.execute("CREATE TABLE main_t (id INTEGER PRIMARY KEY, val TEXT)")?;
+    conn1.execute(format!("ATTACH '{aux_path}' AS aux1"))?;
+    conn1.execute("CREATE TABLE aux1.t1 (x INTEGER)")?;
+    conn1.execute("INSERT INTO aux1.t1 VALUES (1)")?;
+
+    // conn2 attaches the same DB file.
+    conn2.execute(format!("ATTACH '{aux_path}' AS aux1"))?;
+
+    // conn2 writes to main DB and reads from attached DB in the same statement.
+    // This gives main pager a Write lock and attached pager a Read lock.
+    // After auto-commit, the attached Read lock must be released.
+    conn2.execute(
+        "INSERT INTO main_t (id, val) VALUES (1, (SELECT CAST(x AS TEXT) FROM aux1.t1 LIMIT 1))",
+    )?;
+
+    // conn1 inserts more data into the attached table.
+    conn1.execute("INSERT INTO aux1.t1 VALUES (2)")?;
+
+    // conn2 reads from the attached table. With the bug, it would use a stale
+    // snapshot and only see 1 row instead of 2.
+    let rows = limbo_exec_rows(&conn2, "SELECT x FROM aux1.t1 ORDER BY x");
+    assert_eq!(
+        rows.len(),
+        2,
+        "conn2 should see both rows after conn1's commit"
+    );
+    assert_eq!(rows[0], vec![RValue::Integer(1)]);
+    assert_eq!(rows[1], vec![RValue::Integer(2)]);
+
+    Ok(())
+}

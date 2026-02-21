@@ -1490,6 +1490,9 @@ impl Program {
                     return Ok(IOResult::IO(io));
                 }
             }
+            // Release read locks on attached pagers that only had read transactions
+            // (end_attached_write_txns only handles pagers with write locks).
+            self.end_attached_read_txns(connection);
             return Ok(IOResult::Done(()));
         }
         let txn_finish_result = if !rollback {
@@ -1518,6 +1521,9 @@ impl Program {
                 return Ok(IOResult::IO(io));
             }
         }
+        // Release read locks on attached pagers that only had read transactions
+        // (end_attached_write_txns only handles pagers with write locks).
+        self.end_attached_read_txns(connection);
         Ok(IOResult::Done(()))
     }
 
