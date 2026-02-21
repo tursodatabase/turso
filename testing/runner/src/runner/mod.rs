@@ -154,11 +154,14 @@ impl Runnable for SnapshotCase {
     }
 
     fn queries_to_execute(&self) -> Vec<String> {
-        // Run both EXPLAIN QUERY PLAN and EXPLAIN
-        vec![
-            format!("EXPLAIN QUERY PLAN {}", self.sql),
-            format!("EXPLAIN {}", self.sql),
-        ]
+        if self.eqp_only {
+            vec![format!("EXPLAIN QUERY PLAN {}", self.sql)]
+        } else {
+            vec![
+                format!("EXPLAIN QUERY PLAN {}", self.sql),
+                format!("EXPLAIN {}", self.sql),
+            ]
+        }
     }
 
     async fn evaluate_results(
@@ -166,25 +169,25 @@ impl Runnable for SnapshotCase {
         results: Vec<QueryResult>,
         options: &RunOptions,
     ) -> TestOutcome {
-        // results[0] = EXPLAIN QUERY PLAN
-        // results[1] = EXPLAIN
-        let eqp_result = results.first().expect("should have two query results");
-        let explain_result = results.get(1).expect("should have two query results");
+        let eqp_result = results.first().expect("should have EQP result");
 
-        // Check for errors in query execution
         if let Some(err) = &eqp_result.error {
             return TestOutcome::Error {
                 message: format!("EXPLAIN QUERY PLAN failed: {err}"),
             };
         }
-        if let Some(err) = &explain_result.error {
-            return TestOutcome::Error {
-                message: format!("EXPLAIN failed: {err}"),
-            };
-        }
 
-        // Format both outputs
-        let actual_output = format_snapshot_content(&eqp_result.rows, &explain_result.rows);
+        let actual_output = if self.eqp_only {
+            format_eqp_snapshot_content(&eqp_result.rows)
+        } else {
+            let explain_result = results.get(1).expect("should have EXPLAIN result");
+            if let Some(err) = &explain_result.error {
+                return TestOutcome::Error {
+                    message: format!("EXPLAIN failed: {err}"),
+                };
+            }
+            format_snapshot_content(&eqp_result.rows, &explain_result.rows)
+        };
 
         // Build snapshot info with metadata
         let db_location_str = options.db_config.location.to_string();
@@ -221,6 +224,16 @@ impl Runnable for SnapshotCase {
             SnapshotResult::Error { msg } => TestOutcome::Error { message: msg },
         }
     }
+}
+
+/// Format EQP-only snapshot content (no bytecode).
+fn format_eqp_snapshot_content(eqp_rows: &[Vec<String>]) -> String {
+    use crate::snapshot::format_explain_query_plan_output;
+
+    let mut output = String::new();
+    output.push_str("QUERY PLAN\n");
+    output.push_str(&format_explain_query_plan_output(eqp_rows));
+    output
 }
 
 /// Format the combined snapshot content with both EXPLAIN QUERY PLAN and EXPLAIN output.

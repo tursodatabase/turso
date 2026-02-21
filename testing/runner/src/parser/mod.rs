@@ -77,7 +77,8 @@ impl Parser {
                     | Token::AtRequires
                     | Token::AtBackend
                     | Token::Test
-                    | Token::Snapshot,
+                    | Token::Snapshot
+                    | Token::SnapshotEqp,
                 ) => {
                     // Could be test or snapshot with decorators, peek ahead
                     let item = self.parse_test_or_snapshot()?;
@@ -258,8 +259,9 @@ impl Parser {
 
         // Now check if it's a test or snapshot
         match self.peek() {
-            Some(Token::Snapshot) => {
-                self.expect_token(Token::Snapshot)?;
+            Some(Token::Snapshot | Token::SnapshotEqp) => {
+                let eqp_only = matches!(self.peek(), Some(Token::SnapshotEqp));
+                self.advance();
                 let (name, name_span) = self.expect_identifier_with_span()?;
                 let sql = self.expect_block_content()?.trim().to_string();
 
@@ -269,6 +271,7 @@ impl Parser {
                     name,
                     name_span,
                     sql,
+                    eqp_only,
                     modifiers: CaseModifiers {
                         setups: test_setups,
                         skip,
