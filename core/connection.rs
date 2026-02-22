@@ -823,7 +823,17 @@ impl Connection {
         else {
             return Ok(false);
         };
-        self.get_pager().io.wait_for_completion(c)?;
+        match self.get_pager().io.wait_for_completion(c) {
+            #[cfg(all(target_os = "windows", feature = "win_iocp"))]
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::UnexpectedEof,
+            ))) => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+            _ => {}
+        }
+
         self.try_wal_watermark_read_page_end(page, page_ref)
     }
 

@@ -38,10 +38,11 @@
 //  `process_packet_from_iocp`
 
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::io::common;
 use crate::sync::Arc;
 
 use crate::sync::Mutex;
-use crate::{Clock, Completion, File, IO, LimboError, OpenFlags, Result};
+use crate::{Clock, Completion, File, LimboError, OpenFlags, Result, IO};
 
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
@@ -49,27 +50,28 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr::NonNull;
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
-    FormatMessageW,
-};
 use windows_sys::core::BOOL;
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    FormatMessageW, FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM,
+    FORMAT_MESSAGE_IGNORE_INSERTS,
+};
 
 use std::{io, mem, ptr};
-use tracing::{Level, debug, instrument, trace, warn};
+use tracing::{debug, instrument, trace, warn, Level};
 
 use super::FileSyncType;
 use crate::io::completions::CompletionInner;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE,
-    GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, TRUE, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, LocalFree, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
+    ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_END_OF_FILE_INFO, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
-    FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LOCKFILE_EXCLUSIVE_LOCK,
-    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
-    SetFileInformationByHandle, UnlockFileEx, WriteFile,
+    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
+    SetFileInformationByHandle, UnlockFileEx, WriteFile, FILE_END_OF_FILE_INFO,
+    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    OPEN_ALWAYS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
@@ -79,6 +81,10 @@ use windows_sys::Win32::System::IO::{
 // Constants
 
 const CACHING_CAPACITY: usize = 128;
+//TODO: enable this or remove when direct IO stabilized
+const ENABLE_DIRECT_IO: bool = false;
+//TODO: enable this or remove when windows locking stabilized
+const ENABLE_LOCK_ON_OPEN: bool = false;
 
 // Types
 
@@ -111,6 +117,9 @@ struct IoOverlappedPacket {
     completion: Option<Completion>,
     kind: IoKind,
 }
+
+unsafe impl Send for IoOverlappedPacket {}
+unsafe impl Sync for IoOverlappedPacket {}
 
 impl std::fmt::Debug for IoOverlappedPacket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -253,7 +262,7 @@ impl IO for WindowsIOCP {
             OPEN_EXISTING
         };
 
-        let flags_and_attributes = if direct_access {
+        let flags_and_attributes = if ENABLE_DIRECT_IO && direct_access {
             FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH
         } else {
             FILE_FLAG_OVERLAPPED
@@ -287,6 +296,13 @@ impl IO for WindowsIOCP {
             if result.is_null() {
                 return Err(get_generic_limboerror_from_last_os_err());
             };
+
+            if ENABLE_LOCK_ON_OPEN
+                && (std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+                    || !open_flags.contains(OpenFlags::ReadOnly))
+            {
+                windows_file.lock_file(true)?;
+            }
 
             Ok(windows_file)
         }
@@ -544,11 +560,15 @@ impl InnerWindowsIOCP {
                 completion.abort();
             }
             (FALSE, error_code) => {
-                let error = io::Error::from_raw_os_error(
-                    error_code
-                        .try_into()
-                        .map_err(|_| GetIOCPPacketError::InvalidIO)?,
-                );
+                let error = match error_code {
+                    ERROR_HANDLE_EOF => {
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "Reading past the EOF point")
+                    }
+                    code => io::Error::from_raw_os_error(
+                        code.try_into().map_err(|_| GetIOCPPacketError::InvalidIO)?,
+                    ),
+                };
+
                 trace!(
                     "completion {} errored {error}",
                     get_unique_key_from_completion(&completion).addr()
@@ -857,8 +877,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
+        io::{win_iocp::get_generic_limboerror_from_os_err, TempFile},
         Buffer, Completion, IO,
-        io::{TempFile, win_iocp::get_generic_limboerror_from_os_err},
     };
 
     use super::WindowsIOCP;
