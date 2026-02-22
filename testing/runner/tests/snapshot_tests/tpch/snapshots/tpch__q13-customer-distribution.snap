@@ -33,7 +33,8 @@ info:
 ---
 QUERY PLAN
 |--SCAN c_orders
+|  |--HASH JOIN orders
 |  |--SCAN customer
-|  `--HASH JOIN orders
-`--USE TEMP B-TREE FOR ORDER BY
-
+|  `--USE SORTER FOR GROUP BY
+|--USE SORTER FOR GROUP BY
+`--USE SORTER FOR ORDER BY

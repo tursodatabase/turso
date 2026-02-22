@@ -99,7 +99,7 @@ pub enum AccessMethodParams {
         materialize_build_input: bool,
         /// Whether to use a bloom filter on the probe side.
         use_bloom_filter: bool,
-        /// The type of join semantics (Inner, LeftOuter, FullOuter).
+        /// Join semantics: Inner, LeftOuter, or FullOuter.
         join_type: HashJoinType,
     },
     /// Custom index method access (e.g., FTS).
@@ -806,10 +806,7 @@ pub fn try_hash_join_access_method(
     if build_root_page == probe_root_page {
         return None;
     }
-    // Determine hash join type from the probe table's join_info.
-    // Convention: build=LHS (hash table), probe=RHS (scanned).
-    // For LEFT JOIN: probe has join_info.outer = true.
-    // For FULL OUTER: probe has join_info.full_outer = true.
+    // Determine join type from the probe table's join_info.
     let hash_join_type = if probe_table
         .join_info
         .as_ref()
@@ -822,8 +819,8 @@ pub fn try_hash_join_access_method(
         HashJoinType::Inner
     };
 
-    // Don't build from a table that can be NullRow'd by an outer join — the
-    // hash table would contain real data even when the cursor is in NullRow mode.
+    // Can't build from a NullRow'd table — the hash table would hold real data
+    // even when the cursor is in NullRow mode.
     if build_table
         .join_info
         .as_ref()
@@ -891,10 +888,8 @@ pub fn try_hash_join_access_method(
         return None;
     }
 
-    // Check if either table has an index (or rowid) on any of the join columns.
-    // If so, prefer nested-loop with index lookup over hash join,
-    // this avoids building a hash table when we can use an existing index.
-    // Skip this check for FULL OUTER JOIN — hash join is required for unmatched build scanning.
+    // Prefer nested-loop with index lookup when an index exists on join columns.
+    // FULL OUTER must use hash join (needed for the unmatched-build scan).
     // Check both tables because we could potentially use a different
     // join order where the indexed table becomes the probe/inner table.
     if hash_join_type != HashJoinType::FullOuter {

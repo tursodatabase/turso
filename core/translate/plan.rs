@@ -637,8 +637,7 @@ pub fn select_star(
     out_columns: &mut Vec<ResultSetColumn>,
     right_join_swapped: bool,
 ) {
-    // When tables were swapped for a RIGHT JOIN rewrite, iterate in reverse
-    // so that the output column order matches the original FROM clause order.
+    // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
     let table_iter: Vec<&JoinedTable> = if right_join_swapped {
         tables.iter().rev().collect()
     } else {
@@ -683,7 +682,7 @@ pub fn select_star(
 pub struct JoinInfo {
     /// Whether this is an OUTER JOIN.
     pub outer: bool,
-    /// Whether this is a FULL OUTER JOIN (implies outer = true).
+    /// FULL OUTER JOIN (implies `outer = true`).
     pub full_outer: bool,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
     pub using: Vec<ast::Name>,
@@ -804,9 +803,8 @@ pub struct TableReferences {
     joined_tables: Vec<JoinedTable>,
     /// Tables from outer scopes that are referenced in this query scope.
     outer_query_refs: Vec<OuterQueryReference>,
-    /// When a RIGHT JOIN is rewritten as LEFT JOIN by swapping the two tables,
-    /// this flag is set so that `select_star` can emit columns in the original
-    /// (pre-swap) order, preserving the user-visible column ordering.
+    /// Set when a RIGHT JOIN is rewritten as LEFT JOIN by swapping the two tables,
+    /// so `select_star` emits columns in the original user-visible order.
     right_join_swapped: bool,
 }
 
@@ -838,12 +836,12 @@ impl TableReferences {
         self.joined_tables.is_empty() && self.outer_query_refs.is_empty()
     }
 
-    /// Mark that the first two joined tables were swapped to rewrite a RIGHT JOIN as LEFT JOIN.
+    /// Mark that tables were swapped for a RIGHT-to-LEFT JOIN rewrite.
     pub fn set_right_join_swapped(&mut self) {
         self.right_join_swapped = true;
     }
 
-    /// Whether the first two joined tables were swapped for a RIGHT JOIN rewrite.
+    /// Whether tables were swapped for a RIGHT JOIN rewrite.
     pub fn right_join_swapped(&self) -> bool {
         self.right_join_swapped
     }
@@ -1265,19 +1263,14 @@ impl HashJoinKey {
     }
 }
 
-/// The type of hash join to perform.
-///
-/// Build = LHS (the table whose rows populate the hash table).
-/// Probe = RHS (the table scanned to look up matches in the hash table).
+/// Hash join semantics. Build = LHS (populates hash table), Probe = RHS (scanned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashJoinType {
-    /// Standard inner join: only matching rows emitted.
+    /// Only matching rows emitted.
     Inner,
-    /// Left outer join: all build rows appear in output; unmatched build
-    /// entries are emitted with NULLs for the probe side.
+    /// All build rows appear; unmatched build rows get NULLs for the probe side.
     LeftOuter,
-    /// Full outer join: like LeftOuter (unmatched build -> NULLs for probe),
-    /// plus unmatched probe rows are emitted with NULLs for the build side.
+    /// Like LeftOuter, plus unmatched probe rows get NULLs for the build side.
     FullOuter,
 }
 
@@ -1297,7 +1290,7 @@ pub struct HashJoinOp {
     pub materialize_build_input: bool,
     /// Whether to use a bloom filter on the probe side.
     pub use_bloom_filter: bool,
-    /// The type of join semantics for this hash join.
+    /// Join semantics (inner, left outer, or full outer).
     pub join_type: HashJoinType,
 }
 

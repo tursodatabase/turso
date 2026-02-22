@@ -372,20 +372,17 @@ pub struct HashCtx {
     /// These references may point at multiple tables when a build input was
     /// materialized from a join prefix.
     pub payload_columns: Vec<MaterializedColumnRef>,
-    /// For outer hash joins: label where HashProbe miss / HashNext exhaustion jump to
-    /// for the IfPos check_outer logic. None for inner hash joins.
+    /// Jump target for unmatched probe rows (outer joins only).
     pub check_outer_label: Option<BranchOffset>,
-    /// The cursor ID for the build table (needed for NullRow in outer hash joins).
+    /// Build table cursor (for NullRow in outer joins).
     pub build_cursor_id: Option<CursorID>,
-    /// The join type of this hash join.
     pub join_type: HashJoinType,
-    /// Register for Gosub/Return when inner loops are wrapped in a subroutine.
-    /// For outer hash joins, inner table loops are wrapped so unmatched emission
-    /// paths can re-enter them via Gosub.
+    /// Gosub register for the inner-loop subroutine wrapping subsequent tables.
+    /// Outer hash joins wrap inner loops so unmatched-row paths can re-enter via Gosub.
     pub inner_loop_gosub_reg: Option<usize>,
-    /// Label for the inner loop subroutine entry point.
+    /// Entry label for the inner-loop subroutine.
     pub inner_loop_gosub_label: Option<BranchOffset>,
-    /// Label to skip over the inner loop subroutine body (resolved after Return).
+    /// Label that skips past the subroutine body (resolved after Return).
     pub inner_loop_skip_label: Option<BranchOffset>,
 }
 

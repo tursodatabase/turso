@@ -689,7 +689,7 @@ pub fn join_lhs_and_rhs<'a>(
                             );
                         }
                     }
-                    // FULL OUTER JOIN requires hash join for unmatched build scanning
+                    // FULL OUTER requires hash join for the unmatched-build scan.
                     let is_full_outer = matches!(
                         &hash_join_method.params,
                         AccessMethodParams::HashJoin {
@@ -738,8 +738,7 @@ pub fn join_lhs_and_rhs<'a>(
         }
     }
 
-    // FULL OUTER requires hash join for unmatched build scanning. Error if the
-    // optimizer couldn't select one (no equi-join, USING clause, chaining, etc.).
+    // FULL OUTER needs a hash join. If the optimizer couldn't pick one, bail.
     if lhs.is_some() {
         let is_full_outer = rhs_table_reference
             .join_info
@@ -754,9 +753,7 @@ pub fn join_lhs_and_rhs<'a>(
                 }
             )
         {
-            // This ordering doesn't support FULL OUTER (no equi-join or
-            // chaining issue). Return Ok(None) so the DP/greedy planner can
-            // try other orderings — the naive left-to-right plan may work.
+            // This ordering can't satisfy FULL OUTER. Let the planner try others.
             return Ok(None);
         }
     }
@@ -1345,19 +1342,18 @@ pub fn compute_best_join_order<'a>(
             },
         })),
         None => {
-            // If any table uses FULL OUTER JOIN, produce a specific error
-            // explaining why no plan was found.
+            // Give a targeted error for FULL OUTER when no plan was found.
             let has_full_outer = joined_tables
                 .iter()
                 .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.full_outer));
             if has_full_outer {
-                // Distinguish chaining from missing equi-join.
+                // Distinguish chaining from a missing equi-join condition.
                 let build_is_outer = joined_tables.iter().any(|t| {
                     let is_full = t.join_info.as_ref().is_some_and(|ji| ji.full_outer);
                     if !is_full {
                         return false;
                     }
-                    // Check if any earlier table (potential build) has outer/full_outer.
+                    // Check if any earlier table (potential build) is also outer.
                     joined_tables.iter().any(|other| {
                         !std::ptr::eq(t, other)
                             && other

@@ -1654,17 +1654,14 @@ fn parse_join(
             let is_left = join_type.contains(JoinType::LEFT);
             let is_outer = join_type.contains(JoinType::OUTER);
             let is_natural = join_type.contains(JoinType::NATURAL);
-            // FULL OUTER = (LEFT + RIGHT) or (OUTER without LEFT/RIGHT)
+            // FULL OUTER: LEFT+RIGHT or bare OUTER
             let is_full = (is_left && is_right) || (is_outer && !is_left && !is_right);
 
             if is_right && !is_left && !is_full {
-                // RIGHT JOIN -> swap last two table entries, treat as LEFT JOIN.
-                // The rightmost table (just added) becomes the left side, and vice versa.
+                // RIGHT JOIN: swap the last two tables, then treat as LEFT JOIN.
                 let len = table_references.joined_tables().len();
-                // The swap is only correct when the two tables being swapped are
-                // the only tables in the FROM clause. When prior joins exist
-                // (len > 2), swapping would move tables to positions where their
-                // ON clause conditions reference tables that haven't been scanned.
+                // Only valid for a two-table FROM clause; with prior joins the swap
+                // would break ON clause column references.
                 if len > 2 {
                     crate::bail_parse_error!(
                         "RIGHT JOIN following another join is not yet supported. \
@@ -1673,9 +1670,7 @@ fn parse_join(
                 }
                 table_references.joined_tables_mut().swap(len - 2, len - 1);
                 table_references.set_right_join_swapped();
-                // The outer flag goes on the table that was originally on the left
-                // (now in the rightmost position after swap), this is correct because
-                // JoinInfo.outer marks the table whose columns become NULL on miss.
+                // outer flag goes on the originally-left table (now rightmost after swap).
                 (true, is_natural, false)
             } else if is_full {
                 (true, is_natural, true)

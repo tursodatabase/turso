@@ -174,8 +174,7 @@ pub fn plan_satisfies_order_target(
     joined_tables: &[JoinedTable],
     order_target: &OrderTarget,
 ) -> bool {
-    // Cannot eliminate sort when an outer hash join is present — the unmatched
-    // build scan produces rows in hash bucket order, not scan order.
+    // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
     for (_, access_method_index) in plan.data.iter() {
         let access_method = &access_methods_arena[*access_method_index];
         if let AccessMethodParams::HashJoin { join_type, .. } = &access_method.params {
