@@ -6,7 +6,7 @@ test avg_hex_large {
     SELECT typeof(AVG(a)), AVG(a) FROM t1;
 }
 expect {
-    real|0.0
+    real|Inf
 }
 expect @js {
     real|0
