@@ -112,7 +112,7 @@ mod tests {
                             Err(e) => panic!("unexpected begin_tx error: {e:?}"),
                         }
                     };
-                    let committed_row = mvcc_store.read(tx, id).unwrap();
+                    let committed_row = mvcc_store.read(tx, &id).unwrap();
                     loop {
                         match commit_tx_no_conn(&db, tx, &conn) {
                             Ok(()) => break,
@@ -173,7 +173,7 @@ mod tests {
                             Err(e) => panic!("unexpected begin_tx error: {e:?}"),
                         }
                     };
-                    let committed_row = mvcc_store.read(tx, id).unwrap();
+                    let committed_row = mvcc_store.read(tx, &id).unwrap();
                     loop {
                         match commit_tx_no_conn(&db, tx, &conn) {
                             Ok(()) => break,
@@ -246,7 +246,7 @@ mod tests {
                         mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn);
                         continue;
                     }
-                    let committed_row = mvcc_store.read(tx, id).unwrap();
+                    let committed_row = mvcc_store.read(tx, &id).unwrap();
                     match commit_tx_no_conn(&db, tx, &conn) {
                         Ok(()) => {}
                         Err(LimboError::Busy | LimboError::WriteWriteConflict) => {

@@ -77,7 +77,7 @@ fn bench(c: &mut Criterion) {
             db.mvcc_store
                 .read(
                     tx_id,
-                    RowID {
+                    &RowID {
                         table_id: (-2).into(),
                         row_id: RowKey::Int(1),
                     },
@@ -143,7 +143,7 @@ fn bench(c: &mut Criterion) {
             db.mvcc_store
                 .read(
                     tx_id,
-                    RowID {
+                    &RowID {
                         table_id: (-2).into(),
                         row_id: RowKey::Int(1),
                     },
