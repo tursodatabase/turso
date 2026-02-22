@@ -1,0 +1,23 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# Reproducer: INSERT OR REPLACE on a table with a dependent materialized view
+# panics with "to capture old record accurately, we must be located at the
+# correct position in the table".
+# INSERT OR REPLACE sets REQUIRE_SEEK, but the old-record capture for IVM
+# assumed the cursor was already positioned.
+test matview-insert-or-replace {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
+    CREATE MATERIALIZED VIEW v AS SELECT val, COUNT(*) as cnt FROM t1 GROUP BY val;
+    SELECT * FROM v ORDER BY val;
+    INSERT OR REPLACE INTO t1 VALUES (1, 'c');
+    SELECT * FROM v ORDER BY val;
+}
+expect {
+    a|1
+    b|1
+    b|1
+    c|1
+}
