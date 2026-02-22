@@ -2878,6 +2878,7 @@ fn test_snapshot_isolation_tx_visible1() {
         // tx 8 with Preparing(3): current_tx (begin_ts=4) can speculatively read
         (8, new_tx(8, 1, TransactionState::Preparing(3))),
     ]);
+    let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     let current_tx = new_tx(4, 4, TransactionState::Preparing(7));
 
@@ -2890,7 +2891,7 @@ fn test_snapshot_isolation_tx_visible1() {
             btree_resident: false,
         };
         tracing::debug!("Testing visibility of {row_version:?}");
-        row_version.is_visible_to(&current_tx, &txs)
+        row_version.is_visible_to(&current_tx, &txs, &finalized_tx_states)
     };
 
     // begin visible:   transaction committed with ts < current_tx.begin_ts
@@ -2975,12 +2976,45 @@ fn test_snapshot_isolation_tx_visible1() {
     assert!(!rv_visible(None, None));
 }
 
+#[test]
+fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
+    let txs: SkipMap<TxID, Transaction> = SkipMap::new();
+    let finalized_tx_states: SkipMap<TxID, TransactionState> =
+        SkipMap::from_iter([(42, TransactionState::Committed(5))]);
+    let reader = new_tx(7, 10, TransactionState::Active);
+
+    let inserted_row = RowVersion {
+        id: 1,
+        begin: Some(TxTimestampOrID::TxID(42)),
+        end: None,
+        row: generate_simple_string_row((-2).into(), 1, "x"),
+        btree_resident: false,
+    };
+    assert!(
+        inserted_row.is_visible_to(&reader, &txs, &finalized_tx_states),
+        "stale begin=TxID should resolve via finalized committed state"
+    );
+
+    let deleted_row = RowVersion {
+        id: 2,
+        begin: Some(TxTimestampOrID::Timestamp(1)),
+        end: Some(TxTimestampOrID::TxID(42)),
+        row: generate_simple_string_row((-2).into(), 2, "y"),
+        btree_resident: false,
+    };
+    assert!(
+        !deleted_row.is_visible_to(&reader, &txs, &finalized_tx_states),
+        "stale end=TxID should resolve via finalized committed state"
+    );
+}
+
 /// Test Hekaton register-and-report: speculative read increments CommitDepCounter
 /// and adds to CommitDepSet.
 #[test]
 fn test_commit_dependency_speculative_read() {
     let txs: SkipMap<TxID, Transaction> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     // Reader with begin_ts=10 > end_ts=5 → speculative read → dependency
     let reader = new_tx(2, 10, TransactionState::Active);
@@ -2996,7 +3030,7 @@ fn test_commit_dependency_speculative_read() {
     assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 0);
 
     // Speculative read: begin_ts(10) >= end_ts(5) → visible, dependency registered
-    assert!(rv.is_visible_to(&reader, &txs));
+    assert!(rv.is_visible_to(&reader, &txs, &finalized_tx_states));
     assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 1);
 
     // Verify tx 1's CommitDepSet contains reader's tx_id
@@ -3010,6 +3044,7 @@ fn test_commit_dependency_speculative_read() {
 fn test_commit_dependency_cascade_abort() {
     let txs: SkipMap<TxID, Transaction> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     let reader = new_tx(2, 10, TransactionState::Active);
 
@@ -3022,7 +3057,7 @@ fn test_commit_dependency_cascade_abort() {
     };
 
     // Speculative read registers dependency
-    assert!(rv.is_visible_to(&reader, &txs));
+    assert!(rv.is_visible_to(&reader, &txs, &finalized_tx_states));
     assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 1);
     assert!(!reader.abort_now.load(Ordering::Acquire));
 
@@ -3083,6 +3118,7 @@ fn test_commit_dependency_speculative_ignore() {
         (1, new_tx(1, 1, TransactionState::Committed(2))),
         (3, new_tx(3, 3, TransactionState::Preparing(5))),
     ]);
+    let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     // Reader with begin_ts=10 > end_ts=5: will speculatively ignore (treat as deleted)
     let reader = new_tx(4, 10, TransactionState::Active);
@@ -3098,7 +3134,7 @@ fn test_commit_dependency_speculative_ignore() {
     // is_end_visible: Preparing(5), begin_ts(10) < 5 = false → deletion visible
     // is_begin_visible: Timestamp(2), 10 >= 2 = true
     // Combined: true && false = false (row not visible because it was deleted)
-    assert!(!rv.is_visible_to(&reader, &txs));
+    assert!(!rv.is_visible_to(&reader, &txs, &finalized_tx_states));
     assert_eq!(
         reader.commit_dep_counter.load(Ordering::Acquire),
         1,
@@ -3112,6 +3148,7 @@ fn test_commit_dependency_speculative_ignore() {
 fn test_commit_dependency_multiple_reads() {
     let txs: SkipMap<TxID, Transaction> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     let reader = new_tx(2, 10, TransactionState::Active);
 
@@ -3124,9 +3161,9 @@ fn test_commit_dependency_multiple_reads() {
     };
 
     // Read 3 rows from the same preparing tx
-    assert!(make_rv(1).is_visible_to(&reader, &txs));
-    assert!(make_rv(2).is_visible_to(&reader, &txs));
-    assert!(make_rv(3).is_visible_to(&reader, &txs));
+    assert!(make_rv(1).is_visible_to(&reader, &txs, &finalized_tx_states));
+    assert!(make_rv(2).is_visible_to(&reader, &txs, &finalized_tx_states));
+    assert!(make_rv(3).is_visible_to(&reader, &txs, &finalized_tx_states));
 
     assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 3);
 
