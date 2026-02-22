@@ -4,8 +4,8 @@ use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
-    DeletePlan, IterationDirection, JoinOrderMember, Operation, Plan, QueryDestination,
-    ResultSetColumn, Scan, SelectPlan,
+    DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
+    QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
 use crate::translate::planner::{parse_limit, parse_where, plan_ctes_as_outer_refs};
 use crate::translate::subquery::{
@@ -79,9 +79,10 @@ pub fn translate_delete(
 
     optimize_plan(program, &mut delete_plan, resolver)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
-        // Re-run rowset safety checks after optimization because optimizer-selected access
-        // methods can introduce unsafe mutation-while-iterating patterns.
-        if delete_needs_rowset_after_optimization(delete_plan_inner) {
+        // Re-check after optimization: chosen access paths can make "delete while scanning"
+        // unsafe, so we may need to collect rowids first.
+        record_delete_optimizer_safety(delete_plan_inner);
+        if delete_plan_inner.safety.requires_stable_write_set() {
             ensure_delete_uses_rowset(program, delete_plan_inner);
         }
 
@@ -231,6 +232,14 @@ pub fn prepare_delete_plan(
         })
         .unwrap_or(false);
 
+    let mut safety = DmlSafety::default();
+    if has_delete_triggers {
+        safety.require(DmlSafetyReason::Trigger);
+    }
+    if where_clause_has_subquery(&where_predicates) {
+        safety.require(DmlSafetyReason::SubqueryInWhere);
+    }
+
     let mut delete_plan = DeletePlan {
         table_references,
         result_columns,
@@ -243,9 +252,10 @@ pub fn prepare_delete_plan(
         rowset_plan: None,
         rowset_reg: None,
         non_from_clause_subqueries,
+        safety,
     };
 
-    if delete_needs_rowset_for_correctness(has_delete_triggers, &delete_plan.where_clause) {
+    if delete_plan.safety.requires_stable_write_set() {
         ensure_delete_uses_rowset(program, &mut delete_plan);
     }
 
@@ -282,26 +292,16 @@ fn estimate_num_instructions(plan: &DeletePlan) -> usize {
     base + plan.table_references.joined_tables().len() * 10
 }
 
-/// Returns true when DELETE must materialize target rowids into a RowSet for correctness.
-///
-/// This check must remain independent of optimizer choices so DELETE remains safe even if the
-/// optimizer is disabled or bypassed.
-fn delete_needs_rowset_for_correctness(
-    has_delete_triggers: bool,
-    where_predicates: &[WhereTerm],
-) -> bool {
-    // We use a RowSet for trigger safety and for WHERE subqueries (matching SQLite's conservative
-    // behavior for mutation safety).
-    has_delete_triggers || where_clause_has_subquery(where_predicates)
-}
-
-/// Returns true when the optimizer selected a DELETE iteration strategy that requires
-/// pre-materialization to avoid mutating while iterating.
-fn delete_needs_rowset_after_optimization(plan: &DeletePlan) -> bool {
-    plan.table_references
+/// Add post-optimizer reasons that force "collect rowids first, then delete".
+fn record_delete_optimizer_safety(plan: &mut DeletePlan) {
+    if plan
+        .table_references
         .joined_tables()
         .first()
         .is_some_and(|table| matches!(table.op, Operation::MultiIndexScan(_)))
+    {
+        plan.safety.require(DmlSafetyReason::MultiIndexScan);
+    }
 }
 
 /// Convert a DELETE plan into a RowSet-driven delete:

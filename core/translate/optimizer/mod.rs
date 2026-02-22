@@ -13,7 +13,7 @@ use crate::{
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
-            ColumnUsedMask, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
+            ColumnUsedMask, DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
             SeekKeyComponent,
         },
@@ -608,27 +608,33 @@ fn optimize_update_plan(
         &mut plan.offset,
     )?;
 
-    let table_ref = &mut plan.table_references.joined_tables_mut()[0];
+    if let Some(reason) = first_update_safety_reason(plan, resolver)? {
+        plan.safety.require(reason);
+    }
 
-    // An ephemeral table is required if:
-    // 1. The UPDATE modifies any column that is present in the key of the btree used to iterate over the table.
-    //    For regular table scans or seeks, this is just the rowid or the rowid alias column (INTEGER PRIMARY KEY)
-    //    For index scans and seeks, this is any column in the index used.
-    // 2. There are UPDATE triggers on the table. This is done in SQLite for all UPDATE triggers on
-    //    the affected table even if the trigger would not have an impact on the target table --
-    //    presumably due to lack of static analysis capabilities to determine whether it's safe
-    //    to skip the rowset materialization.
-    let requires_ephemeral_table = 'requires: {
+    if !plan.safety.requires_stable_write_set() {
+        return Ok(());
+    }
+
+    add_ephemeral_table_to_update_plan(program, plan)
+}
+
+fn first_update_safety_reason(
+    plan: &UpdatePlan,
+    resolver: &Resolver,
+) -> Result<Option<DmlSafetyReason>> {
+    let table_ref = &plan.table_references.joined_tables()[0];
+    let reason = 'requires: {
         let Some(btree_table_arc) = table_ref.table.btree() else {
-            break 'requires false;
+            break 'requires None;
         };
         let btree_table = btree_table_arc.as_ref();
 
-        // Multi-index scans iterate via RowSet over rowids gathered from multiple branches.
-        // For UPDATE we always route through the prebuilt ephemeral-table path so the final
-        // mutation loop operates over a stable rowid set regardless of branch/index overlap.
+        // Multi-index scans gather rowids from multiple index branches.
+        // For UPDATE, we always use the prebuilt ephemeral-table path so writes run against
+        // that fixed rowid list (no surprises from branch/index overlap).
         if matches!(table_ref.op, Operation::MultiIndexScan(_)) {
-            break 'requires true;
+            break 'requires Some(DmlSafetyReason::MultiIndexScan);
         }
 
         // Check if there are UPDATE triggers
@@ -642,7 +648,7 @@ fn optimize_update_plan(
                 btree_table,
             )
         }) {
-            break 'requires true;
+            break 'requires Some(DmlSafetyReason::Trigger);
         }
 
         // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
@@ -651,7 +657,7 @@ fn optimize_update_plan(
             plan.or_conflict,
             Some(turso_parser::ast::ResolveType::Replace)
         ) {
-            break 'requires true;
+            break 'requires Some(DmlSafetyReason::ReplaceMode);
         }
 
         let Some(index) = table_ref.op.index() else {
@@ -659,16 +665,16 @@ fn optimize_update_plan(
                 accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
             });
             if rowid_alias_used {
-                break 'requires true;
+                break 'requires Some(DmlSafetyReason::KeyMutation);
             }
             let direct_rowid_update = plan
                 .set_clauses
                 .iter()
                 .any(|(idx, _)| *idx == ROWID_SENTINEL);
             if direct_rowid_update {
-                break 'requires true;
+                break 'requires Some(DmlSafetyReason::KeyMutation);
             }
-            break 'requires false;
+            break 'requires None;
         };
 
         for (set_clause_col_idx, _) in plan.set_clauses.iter() {
@@ -677,21 +683,17 @@ fn optimize_update_plan(
                     let expr_idx_cols_mask =
                         expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
                     if expr_idx_cols_mask.get(*set_clause_col_idx) {
-                        break 'requires true;
+                        break 'requires Some(DmlSafetyReason::KeyMutation);
                     }
                 } else if c.pos_in_table == *set_clause_col_idx {
-                    break 'requires true;
+                    break 'requires Some(DmlSafetyReason::KeyMutation);
                 }
             }
         }
-        break 'requires false;
+        break 'requires None;
     };
 
-    if !requires_ephemeral_table {
-        return Ok(());
-    }
-
-    add_ephemeral_table_to_update_plan(program, plan)
+    Ok(reason)
 }
 
 /// An ephemeral table is required if:
