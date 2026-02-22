@@ -24,6 +24,9 @@ vfs_list = ["syscall", "sqlite"]
 if platform.system() == "Linux":
     vfs_list.append("io_uring")
 
+if platform.system() == "Windows":
+    vfs_list.append("win_iocp")
+
 
 def append_time(i, times, start, perf_counter):
     if i > 0:

@@ -22,6 +22,8 @@ pub enum IoBackend {
     /// Use io_uring backend (linux only)
     #[cfg(target_os = "linux")]
     IoUring,
+    #[cfg(target_os = "windows")]
+    WindowsIOCP,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]

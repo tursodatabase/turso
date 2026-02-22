@@ -591,10 +591,24 @@ impl TursoDatabase {
                                     ))
                                 })?)
                             }
+                            #[cfg(all(target_os = "windows", not(miri)))]
+                            Some("win_iocp") => {
+                                Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
+                                    TursoError::Error(format!(
+                                        "unable to create win_iocp backend: {e}"
+                                    ))
+                                })?)
+                            }
                             #[cfg(any(not(target_os = "linux"), miri))]
                             Some("io_uring") => {
                                 return Err(TursoError::Error(
                                     "io_uring is only available on Linux targets".to_string(),
+                                ));
+                            }
+                            #[cfg(any(not(target_os = "windows"), miri))]
+                            Some("win_iocp") => {
+                                return Err(TursoError::Error(
+                                    "win_iocp is only available on Windows targets".to_string(),
                                 ));
                             }
                             Some(vfs) => {

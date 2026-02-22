@@ -19,6 +19,9 @@ vfs_list = ["syscall"]
 if platform.system() == "Linux":
     vfs_list.append("io_uring")
 
+if platform.system() == "Windows":
+    vfs_list.append("win_iocp")
+
 
 def append_time(times, start, perf_counter):
     times.append(perf_counter() - start)

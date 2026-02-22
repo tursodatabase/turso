@@ -1187,6 +1187,10 @@ impl Connection {
             {
                 all_vfs.push("io_uring".to_string());
             }
+            #[cfg(all(target_os = "windows", feature = "win_iocp"))]
+            {
+                all_vfs.push("win_iocp".to_string());
+            }
             all_vfs.extend(crate::ext::list_vfs_modules());
         }
         all_vfs
