@@ -3082,6 +3082,10 @@ pub fn op_row_id(
                     .get_mut(*cursor_id)
                     .expect("cursor_id should be valid")
                 {
+                    if btree_cursor.get_null_flag() {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                        break;
+                    }
                     if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
                         state.registers[*dest].set_int(*rowid);
                     } else {

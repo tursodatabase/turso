@@ -800,6 +800,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
 impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn last(&mut self) -> Result<IOResult<()>> {
+        // A cursor may be NullRow'd during outer-join unmatched emission.
+        // Repositioning to a real row must clear that synthetic NULL state.
+        self.set_null_flag(false);
         let state = self.state.clone();
         if state.is_none() {
             let _ = self.table_iterator.take();
@@ -1534,6 +1537,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn rewind(&mut self) -> Result<IOResult<()>> {
+        // A cursor may be NullRow'd during outer-join unmatched emission.
+        // Repositioning to a real row must clear that synthetic NULL state.
+        self.set_null_flag(false);
         let state = self.state.clone();
         if state.is_none() {
             let _ = self.table_iterator.take();
