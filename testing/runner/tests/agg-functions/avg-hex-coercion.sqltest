@@ -1,0 +1,25 @@
+@database :memory:
+
+test avg_hex_large {
+    CREATE TABLE t1 (a);
+    INSERT INTO t1 VALUES (hex(18446744073709551488));
+    SELECT typeof(AVG(a)), AVG(a) FROM t1;
+}
+expect {
+    real|0.0
+}
+expect @js {
+    real|0
+}
+
+test avg_hex_text {
+    CREATE TABLE t2 (a);
+    INSERT INTO t2 VALUES (hex(x'AABBCC'));
+    SELECT typeof(AVG(a)), AVG(a) FROM t2;
+}
+expect {
+    real|0.0
+}
+expect @js {
+    real|0
+}
