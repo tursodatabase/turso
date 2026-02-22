@@ -1,3 +1,4 @@
+//! Regression test for snapshot isolation issue https://github.com/tursodatabase/turso/issues/5420
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
