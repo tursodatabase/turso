@@ -592,8 +592,8 @@ pub struct DeletePlan {
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
     pub indexes: Vec<Arc<Index>>,
-    /// If there are DELETE triggers, materialize rowids into a RowSet first.
-    /// This ensures triggers see a stable set of rows to delete.
+    /// If DELETE requires stable pre-materialization (e.g. triggers, WHERE subqueries,
+    /// or optimizer-selected unsafe iteration strategies), materialize rowids into a RowSet first.
     pub rowset_plan: Option<SelectPlan>,
     /// Register ID for the RowSet (if rowset_plan is Some)
     pub rowset_reg: Option<usize>,

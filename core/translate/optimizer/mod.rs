@@ -624,6 +624,13 @@ fn optimize_update_plan(
         };
         let btree_table = btree_table_arc.as_ref();
 
+        // Multi-index scans iterate via RowSet over rowids gathered from multiple branches.
+        // For UPDATE we always route through the prebuilt ephemeral-table path so the final
+        // mutation loop operates over a stable rowid set regardless of branch/index overlap.
+        if matches!(table_ref.op, Operation::MultiIndexScan(_)) {
+            break 'requires true;
+        }
+
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
         let database_id = table_ref.database_id;

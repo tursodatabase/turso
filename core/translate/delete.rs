@@ -79,8 +79,15 @@ pub fn translate_delete(
 
     optimize_plan(program, &mut delete_plan, resolver)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
-        // Rewrite the Delete plan after optimization whenever a RowSet is used (DELETE triggers
-        // or subqueries are present), so the joined table is treated as a plain table scan again.
+        // Re-run rowset safety checks after optimization because optimizer-selected access
+        // methods can introduce unsafe mutation-while-iterating patterns.
+        if delete_needs_rowset_after_optimization(delete_plan_inner) {
+            ensure_delete_uses_rowset(program, delete_plan_inner);
+        }
+
+        // Rewrite the Delete plan after optimization whenever a RowSet is used (trigger/subquery
+        // safety or optimizer-induced safety), so the joined table is treated as a plain table
+        // scan again.
         //
         // RowSets re-seek the base table cursor for every delete, so expressions that reference
         // columns during index maintenance must bind to the table cursor again (not the index we
@@ -224,83 +231,25 @@ pub fn prepare_delete_plan(
         })
         .unwrap_or(false);
 
-    // We also use a RowSet for safety when the WHERE clause of the DELETE statement contains any subqueries.
-    // This coarse approach is also what SQLite does; one could do analysis on the subquery and verify that it does not
-    // reference the table being deleted, but falling back to this broader default is certainly safe.
-    let needs_rowset = has_delete_triggers || where_clause_has_subquery(&where_predicates);
+    let mut delete_plan = DeletePlan {
+        table_references,
+        result_columns,
+        where_clause: where_predicates,
+        order_by: vec![],
+        limit: resolved_limit,
+        offset: resolved_offset,
+        contains_constant_false_condition: false,
+        indexes,
+        rowset_plan: None,
+        rowset_reg: None,
+        non_from_clause_subqueries,
+    };
 
-    if needs_rowset {
-        // Create a SelectPlan that materializes rowids into a RowSet
-        let rowid_internal_id = table_references
-            .joined_tables()
-            .first()
-            .unwrap()
-            .internal_id;
-        let rowset_reg = program.alloc_register();
-
-        let rowset_plan = SelectPlan {
-            table_references: table_references.clone(),
-            result_columns: vec![ResultSetColumn {
-                expr: Expr::RowId {
-                    database: None,
-                    table: rowid_internal_id,
-                },
-                alias: None,
-                contains_aggregates: false,
-            }],
-            where_clause: where_predicates,
-            group_by: None,
-            order_by: vec![],
-            aggregates: vec![],
-            limit: resolved_limit,
-            query_destination: QueryDestination::RowSet { rowset_reg },
-            join_order: table_references
-                .joined_tables()
-                .iter()
-                .enumerate()
-                .map(|(i, t)| JoinOrderMember {
-                    table_id: t.internal_id,
-                    original_idx: i,
-                    is_outer: false,
-                })
-                .collect(),
-            offset: resolved_offset,
-            contains_constant_false_condition: false,
-            distinctness: super::plan::Distinctness::NonDistinct,
-            values: vec![],
-            window: None,
-            non_from_clause_subqueries: vec![],
-            estimated_output_rows: None,
-        };
-
-        Ok(Plan::Delete(DeletePlan {
-            table_references,
-            result_columns,
-            where_clause: vec![],
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            contains_constant_false_condition: false,
-            indexes,
-            rowset_plan: Some(rowset_plan),
-            rowset_reg: Some(rowset_reg),
-            non_from_clause_subqueries,
-        }))
-    } else {
-        Ok(Plan::Delete(DeletePlan {
-            table_references,
-            result_columns,
-            where_clause: where_predicates,
-            order_by: vec![],
-            limit: resolved_limit,
-            offset: resolved_offset,
-            contains_constant_false_condition: false,
-            indexes,
-            rowset_plan: None,
-            rowset_reg: None,
-            non_from_clause_subqueries,
-        }))
+    if delete_needs_rowset_for_correctness(has_delete_triggers, &delete_plan.where_clause) {
+        ensure_delete_uses_rowset(program, &mut delete_plan);
     }
+
+    Ok(Plan::Delete(delete_plan))
 }
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
@@ -331,4 +280,85 @@ fn estimate_num_instructions(plan: &DeletePlan) -> usize {
     let base = 20;
 
     base + plan.table_references.joined_tables().len() * 10
+}
+
+/// Returns true when DELETE must materialize target rowids into a RowSet for correctness.
+///
+/// This check must remain independent of optimizer choices so DELETE remains safe even if the
+/// optimizer is disabled or bypassed.
+fn delete_needs_rowset_for_correctness(
+    has_delete_triggers: bool,
+    where_predicates: &[WhereTerm],
+) -> bool {
+    // We use a RowSet for trigger safety and for WHERE subqueries (matching SQLite's conservative
+    // behavior for mutation safety).
+    has_delete_triggers || where_clause_has_subquery(where_predicates)
+}
+
+/// Returns true when the optimizer selected a DELETE iteration strategy that requires
+/// pre-materialization to avoid mutating while iterating.
+fn delete_needs_rowset_after_optimization(plan: &DeletePlan) -> bool {
+    plan.table_references
+        .joined_tables()
+        .first()
+        .is_some_and(|table| matches!(table.op, Operation::MultiIndexScan(_)))
+}
+
+/// Convert a DELETE plan into a RowSet-driven delete:
+/// 1. execute a SELECT-like rowid producer into RowSet
+/// 2. iterate RowSet to perform actual deletes
+fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan) {
+    if plan.rowset_plan.is_some() {
+        return;
+    }
+
+    let rowid_internal_id = plan
+        .table_references
+        .joined_tables()
+        .first()
+        .expect("DELETE should have one target table")
+        .internal_id;
+    let rowset_reg = plan.rowset_reg.unwrap_or_else(|| {
+        let reg = program.alloc_register();
+        plan.rowset_reg = Some(reg);
+        reg
+    });
+
+    let rowset_plan = SelectPlan {
+        table_references: plan.table_references.clone(),
+        result_columns: vec![ResultSetColumn {
+            expr: Expr::RowId {
+                database: None,
+                table: rowid_internal_id,
+            },
+            alias: None,
+            contains_aggregates: false,
+        }],
+        where_clause: std::mem::take(&mut plan.where_clause),
+        group_by: None,
+        order_by: vec![],
+        aggregates: vec![],
+        limit: plan.limit.take(),
+        query_destination: QueryDestination::RowSet { rowset_reg },
+        join_order: plan
+            .table_references
+            .joined_tables()
+            .iter()
+            .enumerate()
+            .map(|(i, t)| JoinOrderMember {
+                table_id: t.internal_id,
+                original_idx: i,
+                is_outer: false,
+            })
+            .collect(),
+        offset: plan.offset.take(),
+        contains_constant_false_condition: false,
+        distinctness: super::plan::Distinctness::NonDistinct,
+        values: vec![],
+        window: None,
+        // WHERE subqueries should already be planned into this SelectPlan when needed.
+        non_from_clause_subqueries: vec![],
+        estimated_output_rows: None,
+    };
+    plan.rowset_plan = Some(rowset_plan);
 }
