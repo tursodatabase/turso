@@ -1580,7 +1580,7 @@ mod tests {
         let mvcc_store = db.get_mvcc_store();
         for (rowid, value) in &values {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-            let row = mvcc_store.read(tx, &rowid).unwrap().unwrap();
+            let row = mvcc_store.read(tx, rowid).unwrap().unwrap();
             let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
             let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {

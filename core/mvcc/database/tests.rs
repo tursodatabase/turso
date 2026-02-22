@@ -1940,7 +1940,7 @@ fn test_delete_nonexistent() {
         .mvcc_store
         .delete(
             tx,
-            &RowID {
+            RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1)
             },
@@ -2161,7 +2161,7 @@ fn test_dirty_read_deleted() {
         .mvcc_store
         .delete(
             tx2,
-            &RowID {
+            RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1)
             },

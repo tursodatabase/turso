@@ -482,8 +482,8 @@ impl Transaction {
         }
     }
 
-    fn insert_to_read_set(&self, id: &RowID) {
-        self.read_set.insert(id.clone());
+    fn insert_to_read_set(&self, id: RowID) {
+        self.read_set.insert(id);
     }
 
     fn insert_to_write_set(&self, id: RowID) {
@@ -2630,7 +2630,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         .rev()
                         .find(|rv| rv.is_visible_to(tx, &self.txs))
                     {
-                        tx.insert_to_read_set(id);
+                        tx.insert_to_read_set(id.clone());
                         return Ok(Some(rv.row.clone()));
                     }
                 }

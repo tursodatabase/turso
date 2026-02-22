@@ -368,7 +368,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             MvccCursorType::Table => None,
         };
         self.db
-            .read_from_table_or_index(self.tx_id, &row_id, maybe_index_id)
+            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)
     }
 
     pub fn close(self) -> Result<()> {
@@ -1485,7 +1485,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn count(&mut self) -> Result<IOResult<usize>> {
         loop {
-            let state = self.count_state.clone();
+            let state = self.count_state;
             match state {
                 None => {
                     self.count_state.replace(CountState::Rewind);
