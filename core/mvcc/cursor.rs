@@ -35,7 +35,7 @@ enum CursorPosition {
     End,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum ExistsState {
     ExistsBtree,
 }
@@ -49,27 +49,27 @@ enum AdvanceBtreeState {
     NextCheckBtreeKey,   // Check if next key found is valid, if it isn't go back to NextBtree
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 /// Rewind state is used to track the state of the rewind **AND** last operation. Since both seem to do similiar
 /// operations we can use the same enum for both.
 enum RewindState {
     Advance,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum NextState {
     AdvanceUnitialized,
     CheckNeedsAdvance,
     Advance,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum PrevState {
     AdvanceUnitialized,
     CheckNeedsAdvance,
     Advance,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum SeekBtreeState {
     /// Seeking in btree (MVCC seek already done)
     SeekBtree,
@@ -79,7 +79,7 @@ enum SeekBtreeState {
     CheckRow,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum SeekState {
     /// Seeking in btree (MVCC seek already done)
     SeekBtree(SeekBtreeState),
@@ -87,7 +87,7 @@ enum SeekState {
     PickWinner,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum CountState {
     Rewind,
     NextBtree { count: usize },
@@ -359,7 +359,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     pub fn read_mvcc_current_row(&self) -> Result<Option<Row>> {
-        let row_id = match self.current_pos.clone() {
+        let row_id = match &self.current_pos {
             CursorPosition::Loaded { row_id, in_btree } if !in_btree => row_id,
             _ => panic!("invalid position to read current mvcc row"),
         };
@@ -1290,7 +1290,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // FIXME: set btree to somewhere close to this rowid?
         if self
             .db
-            .read_from_table_or_index(self.tx_id, row.id.clone(), maybe_index_id)?
+            .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
             .is_some()
         {
             self.db
@@ -1488,7 +1488,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn count(&mut self) -> Result<IOResult<usize>> {
         loop {
-            let state = self.count_state.clone();
+            let state = self.count_state;
             match state {
                 None => {
                     self.count_state.replace(CountState::Rewind);

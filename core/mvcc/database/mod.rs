@@ -2583,7 +2583,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// Returns `Some(row)` with the row data if the row with the given `id` exists,
     /// and `None` otherwise.
-    pub fn read(&self, tx_id: TxID, id: RowID) -> Result<Option<Row>> {
+    pub fn read(&self, tx_id: TxID, id: &RowID) -> Result<Option<Row>> {
         self.read_from_table_or_index(tx_id, id, None)
     }
 
@@ -2591,7 +2591,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn read_from_table_or_index(
         &self,
         tx_id: TxID,
-        id: RowID,
+        id: &RowID,
         maybe_index_id: Option<MVTableId>,
     ) -> Result<Option<Row>> {
         tracing::trace!("read(tx_id={}, id={:?})", tx_id, id);
@@ -2606,10 +2606,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Some(index_id) => {
                 let rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
                 let rows = rows.value();
-                let RowKey::Record(sortable_key) = id.row_id else {
+                let RowKey::Record(sortable_key) = &id.row_id else {
                     panic!("Index reads must have a record row_id");
                 };
-                let row_versions_opt = rows.get(&sortable_key);
+                let row_versions_opt = rows.get(sortable_key);
                 if let Some(ref row_versions) = row_versions_opt {
                     let row_versions = row_versions.value().read();
                     if let Some(rv) = row_versions
@@ -2623,14 +2623,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 Ok(None)
             }
             None => {
-                if let Some(row_versions) = self.rows.get(&id) {
+                if let Some(row_versions) = self.rows.get(id) {
                     let row_versions = row_versions.value().read();
                     if let Some(rv) = row_versions
                         .iter()
                         .rev()
                         .find(|rv| rv.is_visible_to(tx, &self.txs))
                     {
-                        tx.insert_to_read_set(id);
+                        tx.insert_to_read_set(id.clone());
                         return Ok(Some(rv.row.clone()));
                     }
                 }

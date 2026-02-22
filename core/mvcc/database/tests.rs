@@ -1817,7 +1817,7 @@ fn test_insert_read() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -1835,7 +1835,7 @@ fn test_insert_read() {
         .mvcc_store
         .read(
             tx2,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -1856,7 +1856,7 @@ fn test_read_nonexistent() {
         .unwrap();
     let row = db.mvcc_store.read(
         tx,
-        RowID {
+        &RowID {
             table_id: (-2).into(),
             row_id: RowKey::Int(1),
         },
@@ -1880,7 +1880,7 @@ fn test_delete() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -1901,7 +1901,7 @@ fn test_delete() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -1918,7 +1918,7 @@ fn test_delete() {
         .mvcc_store
         .read(
             tx2,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -1963,7 +1963,7 @@ fn test_commit() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -1977,7 +1977,7 @@ fn test_commit() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -1995,7 +1995,7 @@ fn test_commit() {
         .mvcc_store
         .read(
             tx2,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2022,7 +2022,7 @@ fn test_rollback() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2036,7 +2036,7 @@ fn test_rollback() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2054,7 +2054,7 @@ fn test_rollback() {
         .mvcc_store
         .read(
             tx2,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2080,7 +2080,7 @@ fn test_dirty_write() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2099,7 +2099,7 @@ fn test_dirty_write() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2130,7 +2130,7 @@ fn test_dirty_read() {
         .mvcc_store
         .read(
             tx2,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2175,7 +2175,7 @@ fn test_dirty_read_deleted() {
         .mvcc_store
         .read(
             tx3,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2202,7 +2202,7 @@ fn test_fuzzy_read() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2219,7 +2219,7 @@ fn test_fuzzy_read() {
         .mvcc_store
         .read(
             tx2,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2240,7 +2240,7 @@ fn test_fuzzy_read() {
         .mvcc_store
         .read(
             tx2,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2273,7 +2273,7 @@ fn test_lost_update() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2313,7 +2313,7 @@ fn test_lost_update() {
         .mvcc_store
         .read(
             tx4,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2347,7 +2347,7 @@ fn test_committed_visibility() {
         .mvcc_store
         .read(
             tx2,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2363,7 +2363,7 @@ fn test_committed_visibility() {
         .mvcc_store
         .read(
             tx3,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2393,7 +2393,7 @@ fn test_future_row() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -2407,7 +2407,7 @@ fn test_future_row() {
         .mvcc_store
         .read(
             tx1,
-            RowID {
+            &RowID {
                 table_id: (-2).into(),
                 row_id: RowKey::Int(1),
             },
@@ -3859,7 +3859,7 @@ fn test_restart() {
 
         let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
         let row = mvcc_store
-            .read(tx_id, RowID::new(synthetic_table_id, RowKey::Int(2)))
+            .read(tx_id, &RowID::new(synthetic_table_id, RowKey::Int(2)))
             .unwrap()
             .unwrap();
         let record = get_record_value(&row);
@@ -5328,7 +5328,7 @@ fn test_gc_active_reader_pins_lwm() {
     }
 
     // T2 still sees the old version.
-    let read_row = db.mvcc_store.read(tx2, row_id.clone()).unwrap().unwrap();
+    let read_row = db.mvcc_store.read(tx2, &row_id).unwrap().unwrap();
     assert_eq!(
         read_row, row_v1,
         "active reader should still see the old version"

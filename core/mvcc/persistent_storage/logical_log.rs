@@ -1500,7 +1500,7 @@ mod tests {
         let mvcc_store = db.get_mvcc_store();
         let tx = mvcc_store.begin_tx(pager).unwrap();
         let row = mvcc_store
-            .read(tx, RowID::new((-100).into(), RowKey::Int(1)))
+            .read(tx, &RowID::new((-100).into(), RowKey::Int(1)))
             .unwrap()
             .unwrap();
         let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
@@ -1580,7 +1580,7 @@ mod tests {
         let mvcc_store = db.get_mvcc_store();
         for (rowid, value) in &values {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-            let row = mvcc_store.read(tx, rowid.clone()).unwrap().unwrap();
+            let row = mvcc_store.read(tx, rowid).unwrap().unwrap();
             let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
             let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {
@@ -1699,7 +1699,7 @@ mod tests {
         // Check rowids that weren't deleted
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         for present_rowid in present_rowids {
-            let row = mvcc_store.read(tx, present_rowid.clone()).unwrap().unwrap();
+            let row = mvcc_store.read(tx, &present_rowid).unwrap().unwrap();
             let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
             let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {
@@ -1715,7 +1715,7 @@ mod tests {
         // Check rowids that were deleted
         let tx = mvcc_store.begin_tx(pager).unwrap();
         for present_rowid in non_present_rowids {
-            let row = mvcc_store.read(tx, present_rowid.clone()).unwrap();
+            let row = mvcc_store.read(tx, &present_rowid).unwrap();
             assert!(
                 row.is_none(),
                 "row {present_rowid:?} should have been removed"
@@ -1777,7 +1777,7 @@ mod tests {
         let tx = mvcc_store.begin_tx(pager).unwrap();
         for (row_id, expected_data) in [(1, "foo"), (2, "bar"), (3, "baz")] {
             let row = mvcc_store
-                .read(tx, RowID::new(table_id, RowKey::Int(row_id)))
+                .read(tx, &RowID::new(table_id, RowKey::Int(row_id)))
                 .unwrap()
                 .expect("Table row should exist");
             let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
@@ -1808,7 +1808,7 @@ mod tests {
             // Use read_from_table_or_index to read the index row
             // This verifies that index rows were properly serialized and deserialized from the logical log
             let index_row_opt = mvcc_store
-                .read_from_table_or_index(tx, index_rowid.clone(), Some(index_id))
+                .read_from_table_or_index(tx, &index_rowid, Some(index_id))
                 .unwrap_or_else(|e| {
                     panic!("Failed to read index row for ({}, {}): {:?}. Index ID: {:?}, root_page: {}", 
                            data_value, row_id, e, index_id, index.root_page)
