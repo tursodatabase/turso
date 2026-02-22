@@ -2208,8 +2208,7 @@ fn emit_unmatched_row_conditions_and_loop<'a>(
         .iter()
         .filter(|c| !c.consumed && c.from_outer_join.is_none())
         .filter(|c| {
-            !has_gosub
-                || expr_tables_subset_of(&c.expr, &plan.table_references, &allowed_tables)
+            !has_gosub || expr_tables_subset_of(&c.expr, &plan.table_references, &allowed_tables)
         })
     {
         let jump_target_when_true = program.allocate_label();
@@ -2558,7 +2557,9 @@ pub fn close_loop<'a>(
                             hash_join_op.build_table_idx,
                             table_index,
                             label_next_unmatched,
-                            hash_ctx.inner_loop_gosub_reg.zip(hash_ctx.inner_loop_gosub_label),
+                            hash_ctx
+                                .inner_loop_gosub_reg
+                                .zip(hash_ctx.inner_loop_gosub_label),
                         )?;
 
                         program.resolve_label(label_next_unmatched, program.offset());
