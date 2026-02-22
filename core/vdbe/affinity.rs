@@ -501,7 +501,9 @@ fn create_result_from_significand(
     if sign < 0 {
         final_result = -final_result;
     }
-
+    if !final_result.is_finite() {
+        return (parse_result, ParsedNumber::None);
+    }
     (parse_result, ParsedNumber::Float(final_result))
 }
 
