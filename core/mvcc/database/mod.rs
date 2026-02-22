@@ -732,7 +732,7 @@ impl std::fmt::Display for Transaction {
 }
 
 /// Transaction state.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Copy)]
 enum TransactionState {
     Active,
     /// Preparing state includes the end_ts so other transactions can compare
