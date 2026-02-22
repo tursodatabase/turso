@@ -139,6 +139,11 @@ fn new_join_type(n0: &[u8], n1: Option<&[u8]>, n2: Option<&[u8]>) -> Result<Join
     Ok(jt)
 }
 
+/// Maximum expression nesting depth. SQLite defaults to 1000, but Rust debug-mode
+/// stack frames are much larger than C, so we use a lower limit to prevent stack
+/// overflow on threads with small stacks (e.g. 2MB tokio workers).
+pub const MAX_EXPR_DEPTH: u32 = 15;
+
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
 
@@ -149,6 +154,9 @@ pub struct Parser<'a> {
     /// Last assigned id of positional variable
     /// Parser tracks that in order to properly auto-assign variable ids in correct order for anonymous parameters '?'
     last_variable_id: u32,
+
+    /// Current expression nesting depth for overflow protection
+    expr_depth: u32,
 }
 
 impl<'a> Iterator for Parser<'a> {
@@ -172,6 +180,7 @@ impl<'a> Parser<'a> {
             peekable: false,
             current_token: Token::new(&input[..0], TokenType::TK_NONE),
             last_variable_id: 0,
+            expr_depth: 0,
         }
     }
 
@@ -1625,6 +1634,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
+        self.expr_depth += 1;
+        if self.expr_depth > MAX_EXPR_DEPTH {
+            self.expr_depth -= 1;
+            return Err(Error::ParseError(
+                "expression tree is too large".to_string(),
+            ));
+        }
+        let result = self.parse_expr_inner(precedence);
+        self.expr_depth -= 1;
+        result
+    }
+
+    fn parse_expr_inner(&mut self, precedence: u8) -> Result<Box<Expr>> {
         let mut result = self.parse_expr_operand()?;
 
         loop {
@@ -11784,5 +11806,64 @@ mod tests {
                 assert_eq!(result, expected.clone(), "Input: {rstring:?}");
             }
         }
+    }
+
+    #[test]
+    fn test_expr_depth_limit() {
+        // Build a deeply nested CASE expression that exceeds MAX_EXPR_DEPTH
+        let n = MAX_EXPR_DEPTH + 1;
+        let mut sql = String::from("SELECT ");
+        for _ in 0..n {
+            sql.push_str("CASE WHEN 1 THEN ");
+        }
+        sql.push('1');
+        for _ in 0..n {
+            sql.push_str(" ELSE 0 END");
+        }
+        let mut parser = Parser::new(sql.as_bytes());
+        let result = parser.next().unwrap();
+        assert!(result.is_err(), "Should fail with depth limit error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expression tree is too large"),
+            "Expected 'expression tree is too large' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_or_chain_not_limited_by_depth() {
+        // OR chains are parsed iteratively (loop in parse_expr_inner),
+        // so even long chains should not hit the depth limit.
+        let n = 200;
+        let terms: Vec<&str> = std::iter::repeat_n("0", n).collect();
+        let sql = format!("SELECT {} OR 1", terms.join(" OR "));
+        let mut parser = Parser::new(sql.as_bytes());
+        let result = parser.next().unwrap();
+        assert!(
+            result.is_ok(),
+            "OR chain of {n} terms should parse successfully",
+        );
+    }
+
+    #[test]
+    fn test_expr_depth_within_limit() {
+        // Expressions within the depth limit should parse successfully.
+        let n = MAX_EXPR_DEPTH - 1;
+        let mut sql = String::from("SELECT ");
+        for _ in 0..n {
+            sql.push_str("CASE WHEN 1 THEN ");
+        }
+        sql.push('1');
+        for _ in 0..n {
+            sql.push_str(" ELSE 0 END");
+        }
+        let mut parser = Parser::new(sql.as_bytes());
+        let result = parser.next();
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert!(
+            result.is_ok(),
+            "{n} nested CASEs should parse successfully",
+        );
     }
 }
