@@ -1,3 +1,5 @@
+use futures::Stream;
+
 use crate::{assert_send_sync, Error, Result, Statement, Value};
 use std::fmt::Debug;
 use std::future::Future;
@@ -12,7 +14,7 @@ impl Rows {
         Self { inner }
     }
     /// Fetch the next row of this result set.
-    pub async fn next(&mut self) -> Result<Option<Row>> {
+    pub async fn next_deprecated(&mut self) -> Result<Option<Row>> {
         struct Next {
             columns: usize,
             stmt: Statement,
@@ -37,6 +39,23 @@ impl Rows {
         };
 
         next.await
+    }
+}
+
+impl Stream for Rows {
+    type Item = Result<Row>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let columns = self.inner.inner.lock().unwrap().column_count();
+        match self.inner.step(Some(columns), cx) {
+            std::task::Poll::Ready(Ok(Some(row))) => std::task::Poll::Ready(Some(Ok(row))),
+            std::task::Poll::Ready(Ok(None)) => std::task::Poll::Ready(None),
+            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Some(Err(err))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 

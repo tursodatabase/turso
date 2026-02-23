@@ -31,7 +31,7 @@ async fn list_users(conn: &Connection) -> Result<(), Error> {
 
     let mut rows = stmt.query(["%@example.com"]).await?;
 
-    while let Some(row) = rows.next().await? {
+    while let Some(row) = rows.next_deprecated().await? {
         let u: User = User {
             email: row.get(0)?,
             age: row.get(1)?,

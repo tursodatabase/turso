@@ -6132,6 +6132,7 @@ version = "0.5.0-pre.13"
 dependencies = [
  "anyhow",
  "bytes",
+ "futures",
  "http-body-util",
  "hyper",
  "hyper-tls",

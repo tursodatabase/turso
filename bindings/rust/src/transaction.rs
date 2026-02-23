@@ -393,7 +393,7 @@ mod test {
 
         // Using conn.query should rollback the dangling transaction
         let mut rows = conn.query("SELECT count(*) FROM foo", ()).await.unwrap();
-        let result = rows.next().await.unwrap().unwrap();
+        let result = rows.next_deprecated().await.unwrap().unwrap();
 
         // The insert from the dropped transaction should have been rolled back
         assert_eq!(0, result.get::<i32>(0).unwrap());
@@ -414,7 +414,7 @@ mod test {
             .unwrap();
 
         let mut rows = conn.query("SELECT count(*) FROM foo", ()).await.unwrap();
-        let result = rows.next().await.unwrap().unwrap();
+        let result = rows.next_deprecated().await.unwrap().unwrap();
 
         // The insert from the dropped transaction should have been rolled back
         assert_eq!(1, result.get::<i32>(0).unwrap());

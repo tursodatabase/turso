@@ -420,10 +420,13 @@ impl Statement {
     pub async fn query_row(&mut self, params: impl IntoParams) -> Result<Row> {
         let mut rows = self.query(params).await?;
 
-        let first_row = rows.next().await?.ok_or(Error::QueryReturnedNoRows)?;
+        let first_row = rows
+            .next_deprecated()
+            .await?
+            .ok_or(Error::QueryReturnedNoRows)?;
         // Discard remaining rows so that the statement is executed to completion
         // Otherwise Drop of the statement will cause transaction rollback
-        while rows.next().await?.is_some() {}
+        while rows.next_deprecated().await?.is_some() {}
         Ok(first_row)
     }
 }
@@ -492,13 +495,16 @@ mod tests {
             .query("SELECT name FROM test_persistence ORDER BY id;", ())
             .await?;
 
-        let row1 = rows.next().await?.expect("Expected first row");
+        let row1 = rows.next_deprecated().await?.expect("Expected first row");
         assert_eq!(row1.get_value(0)?, Value::Text("Alice".to_string()));
 
-        let row2 = rows.next().await?.expect("Expected second row");
+        let row2 = rows.next_deprecated().await?.expect("Expected second row");
         assert_eq!(row2.get_value(0)?, Value::Text("Bob".to_string()));
 
-        assert!(rows.next().await?.is_none(), "Expected no more rows");
+        assert!(
+            rows.next_deprecated().await?.is_none(),
+            "Expected no more rows"
+        );
 
         Ok(())
     }
@@ -549,7 +555,7 @@ mod tests {
 
             for (i, value) in original_data.iter().enumerate().take(NUM_INSERTS) {
                 let row = rows
-                    .next()
+                    .next_deprecated()
                     .await?
                     .unwrap_or_else(|| panic!("Expected row {i} but found None"));
                 assert_eq!(
@@ -560,7 +566,7 @@ mod tests {
             }
 
             assert!(
-                rows.next().await?.is_none(),
+                rows.next_deprecated().await?.is_none(),
                 "Expected no more rows after retrieving all inserted data"
             );
 
@@ -616,9 +622,9 @@ mod tests {
                 let mut rows_iter = conn
                     .query("SELECT count(*) FROM test_persistence;", ())
                     .await?;
-                let rows = rows_iter.next().await?.unwrap();
+                let rows = rows_iter.next_deprecated().await?.unwrap();
                 assert_eq!(rows.get_value(0)?, Value::Integer(i as i64 + 1));
-                assert!(rows_iter.next().await?.is_none());
+                assert!(rows_iter.next_deprecated().await?.is_none());
             }
         }
 
