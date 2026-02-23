@@ -2758,7 +2758,9 @@ pub fn translate_expr(
             database: _,
             table: table_ref_id,
         } => {
-             let (_, table) = referenced_tables
+            let referenced_tables =
+                referenced_tables.expect("table_references needed translating Expr::RowId");
+            let (_, table) = referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .expect("table reference should be found");
             let Table::BTree(btree) = table else {
