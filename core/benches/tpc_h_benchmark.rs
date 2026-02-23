@@ -115,7 +115,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
                             }
                         }
                     }
-                    stmt.reset();
+                    stmt.reset().unwrap();
                 });
             },
         );

@@ -2837,7 +2837,7 @@ pub fn op_program(
                     pager.clone(),
                     QueryMode::Normal,
                 );
-                statement.reset();
+                statement.reset()?;
 
                 // Check if this is a trigger subprogram - if so, track execution
                 let is_trigger = if let Some(ref trigger) = statement.get_trigger() {
@@ -11757,7 +11757,7 @@ fn op_vacuum_into_inner(
 
                     let values: Vec<Value> = row.get_values().cloned().collect();
 
-                    dest_insert_stmt.reset();
+                    dest_insert_stmt.reset()?;
                     dest_insert_stmt.clear_bindings();
                     for (i, value) in values.iter().enumerate() {
                         let index =

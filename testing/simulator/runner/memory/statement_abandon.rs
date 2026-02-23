@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use turso_core::{Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
 
+use crate::runner::SimIO;
 use crate::runner::memory::io::MemorySimIO;
 
 fn make_conn(seed: u64) -> Result<(Arc<Connection>, Arc<MemorySimIO>)> {
@@ -33,6 +34,25 @@ fn query_count(conn: &Arc<Connection>, io: &MemorySimIO) -> Result<i64> {
                 return Ok(count);
             }
             StepResult::Done => panic!("count query ended without a row"),
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+}
+
+fn query_rows(conn: &Arc<Connection>, io: &MemorySimIO) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT id, v FROM t ORDER BY id")?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Row => {
+                let row = stmt.row().expect("row should exist");
+                rows.push((
+                    row.get::<i64>(0).expect("id column should exist"),
+                    row.get::<String>(1).expect("v column should exist"),
+                ));
+            }
+            StepResult::Done => return Ok(rows),
             other => panic!("unexpected step result: {other:?}"),
         }
     }
@@ -86,5 +106,39 @@ fn sim_abandon_after_first_returning_row_commits() -> Result<()> {
     drop(stmt);
 
     assert_eq!(query_count(&conn, io.as_ref())?, 3);
+    Ok(())
+}
+
+#[test]
+fn sim_reset_error_does_not_hold_locks() -> Result<()> {
+    let (conn, io) = make_conn(3)?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+
+    let mut stmt =
+        conn.prepare("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c') RETURNING id")?;
+    loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Row => break,
+            StepResult::Done => panic!("statement completed before yielding RETURNING row"),
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+
+    // Force commit/rollback I/O in reset to fail; reset() should return an error
+    // but still release transactional resources so subsequent writes can proceed.
+    io.inject_fault(true);
+    let reset_result = stmt.reset();
+    io.inject_fault(false);
+    assert!(
+        reset_result.is_err(),
+        "expected reset to fail under I/O fault"
+    );
+
+    conn.execute("INSERT INTO t VALUES (99, 'ok')")?;
+    assert_eq!(
+        query_rows(&conn, io.as_ref())?,
+        vec![(99, "ok".to_string())]
+    );
     Ok(())
 }

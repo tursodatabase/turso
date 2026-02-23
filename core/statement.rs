@@ -58,7 +58,7 @@ impl std::fmt::Debug for Statement {
 
 impl Drop for Statement {
     fn drop(&mut self) {
-        self.reset();
+        self.reset_best_effort();
     }
 }
 
@@ -330,7 +330,7 @@ impl Statement {
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
-        self.reset_internal(Some(max_registers), Some(cursor_count));
+        self.reset_internal(Some(max_registers), Some(cursor_count))?;
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())
@@ -503,11 +503,34 @@ impl Statement {
         self.state.clear_bindings();
     }
 
-    pub fn reset(&mut self) {
-        self.reset_internal(None, None);
+    pub fn reset(&mut self) -> Result<()> {
+        self.reset_internal(None, None)
     }
 
-    fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+    pub fn reset_best_effort(&mut self) {
+        if let Err(err) = self.reset() {
+            tracing::error!("Statement reset failed during best-effort cleanup: {err}");
+        }
+    }
+
+    fn reset_internal(
+        &mut self,
+        max_registers: Option<usize>,
+        max_cursors: Option<usize>,
+    ) -> Result<()> {
+        fn capture_reset_error(
+            reset_error: &mut Option<LimboError>,
+            err: LimboError,
+            context: &str,
+        ) {
+            tracing::error!("{context}: {err}");
+            if reset_error.is_none() {
+                *reset_error = Some(err);
+            }
+        }
+
+        let mut reset_error: Option<LimboError> = None;
+
         if !std::thread::panicking() && self.state.execution_state.is_running() {
             if self.query_mode == QueryMode::Normal
                 && self.program.change_cnt_on
@@ -517,32 +540,55 @@ impl Statement {
                 // With ephemeral-buffered RETURNING, ALL DML completed before any
                 // rows were yielded. The remaining work is just the scan-back
                 // (in-memory) + Halt. Commit the transaction via halt().
+                let mut halt_completed = false;
                 loop {
                     match vdbe::execute::halt(&self.program, &mut self.state, &self.pager, 0, "") {
-                        Ok(vdbe::execute::InsnFunctionStepResult::Done) => break,
+                        Ok(vdbe::execute::InsnFunctionStepResult::Done) => {
+                            halt_completed = true;
+                            break;
+                        }
                         Ok(vdbe::execute::InsnFunctionStepResult::IO(_)) => {
                             if let Err(e) = self.pager.io.step() {
-                                tracing::error!("Error committing during statement reset: {}", e);
-                                if let Err(abort_err) =
-                                    self.program.abort(&self.pager, Some(&e), &mut self.state)
-                                {
-                                    tracing::error!(
-                                        "Abort failed during statement reset: {abort_err}"
-                                    );
-                                }
+                                capture_reset_error(
+                                    &mut reset_error,
+                                    e,
+                                    "Error committing during statement reset",
+                                );
                                 break;
                             }
                         }
                         Err(e) => {
-                            tracing::error!("Error halting statement during reset: {}", e);
-                            if let Err(abort_err) =
-                                self.program.abort(&self.pager, Some(&e), &mut self.state)
-                            {
-                                tracing::error!("Abort failed during statement reset: {abort_err}");
-                            }
+                            capture_reset_error(
+                                &mut reset_error,
+                                e,
+                                "Error halting statement during reset",
+                            );
                             break;
                         }
-                        _ => break,
+                        Ok(vdbe::execute::InsnFunctionStepResult::Row)
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Step) => {
+                            capture_reset_error(
+                                &mut reset_error,
+                                LimboError::InternalError(
+                                    "Unexpected halt result during reset".to_string(),
+                                ),
+                                "Statement reset encountered unexpected halt result",
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                if !halt_completed {
+                    if let Err(abort_err) =
+                        self.program
+                            .abort(&self.pager, reset_error.as_ref(), &mut self.state)
+                    {
+                        capture_reset_error(
+                            &mut reset_error,
+                            abort_err,
+                            "Abort failed during statement reset",
+                        );
                     }
                 }
             } else {
@@ -551,13 +597,21 @@ impl Statement {
                 // write statement without RETURNING. Rollback to avoid committing
                 // partial DML or silently retrying after transient errors (Busy).
                 if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
-                    tracing::error!("Abort failed during statement reset: {abort_err}");
+                    capture_reset_error(
+                        &mut reset_error,
+                        abort_err,
+                        "Abort failed during statement reset",
+                    );
                 }
             }
         } else if !std::thread::panicking() {
             // Statement not running (Done/Failed/Init) — cleanup only.
             if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
-                tracing::error!("Abort failed during statement reset: {abort_err}");
+                capture_reset_error(
+                    &mut reset_error,
+                    abort_err,
+                    "Abort failed during statement reset",
+                );
             }
         }
         if let Some(io) = self.state.io_completions.take() {
@@ -568,6 +622,11 @@ impl Statement {
         self.busy = false;
         self.busy_handler_state = None;
         self.has_returned_row = false;
+
+        if let Some(err) = reset_error {
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub fn row(&self) -> Option<&Row> {

@@ -328,8 +328,13 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_reset<'local>(
         }
     };
 
-    stmt.stmt.reset();
-    0
+    match stmt.stmt.reset() {
+        Ok(_) => 0,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            -1
+        }
+    }
 }
 
 /// Converts an optional `JObject` into Java's `TursoStepResult`.

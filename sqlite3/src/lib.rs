@@ -777,7 +777,9 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if result != SQLITE_OK {
         return result;
     }
-    stmt.stmt.reset();
+    if let Err(err) = stmt.stmt.reset() {
+        return handle_limbo_err(err, std::ptr::null_mut());
+    }
     stmt.clear_text_cache();
     SQLITE_OK
 }

@@ -467,7 +467,7 @@ fn bench(criterion: &mut Criterion) {
                         }
                     }
                 }
-                stmt.reset();
+                stmt.reset().unwrap();
             });
         });
 
@@ -625,7 +625,7 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
                     }
                 }
             }
-            stmt.reset();
+            stmt.reset().unwrap();
         });
     });
 
@@ -917,7 +917,7 @@ fn bench_json_patch(criterion: &mut Criterion) {
                         }
                     }
                 }
-                stmt.reset();
+                stmt.reset().unwrap();
             });
         });
 

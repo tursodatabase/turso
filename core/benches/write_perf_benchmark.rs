@@ -154,10 +154,10 @@ fn bench_index_impact(criterion: &mut Criterion) {
                     let start = std::time::Instant::now();
                     run_to_completion(&mut insert_stmt, &db).unwrap();
                     total += start.elapsed();
-                    insert_stmt.reset();
+                    insert_stmt.reset().unwrap();
                     // Clear table for next iteration (not timed)
                     run_to_completion(&mut delete_stmt, &db).unwrap();
-                    delete_stmt.reset();
+                    delete_stmt.reset().unwrap();
                 }
                 total
             });
@@ -232,15 +232,15 @@ fn bench_transaction_size(criterion: &mut Criterion) {
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
                     run_to_completion(&mut begin, &db).unwrap();
-                    begin.reset();
+                    begin.reset().unwrap();
                     run_to_completion(&mut insert_stmt, &db).unwrap();
-                    insert_stmt.reset();
+                    insert_stmt.reset().unwrap();
                     run_to_completion(&mut commit, &db).unwrap();
-                    commit.reset();
+                    commit.reset().unwrap();
                     total += start.elapsed();
                     // Clear for next iteration (not timed)
                     run_to_completion(&mut delete_stmt, &db).unwrap();
-                    delete_stmt.reset();
+                    delete_stmt.reset().unwrap();
                 }
                 total
             });
@@ -334,9 +334,9 @@ fn bench_key_pattern(criterion: &mut Criterion) {
                 let start = std::time::Instant::now();
                 run_to_completion(&mut stmt, &db).unwrap();
                 total += start.elapsed();
-                stmt.reset();
+                stmt.reset().unwrap();
                 run_to_completion(&mut delete_stmt, &db).unwrap();
-                delete_stmt.reset();
+                delete_stmt.reset().unwrap();
             }
             total
         });
@@ -359,9 +359,9 @@ fn bench_key_pattern(criterion: &mut Criterion) {
                 let start = std::time::Instant::now();
                 run_to_completion(&mut stmt, &db).unwrap();
                 total += start.elapsed();
-                stmt.reset();
+                stmt.reset().unwrap();
                 run_to_completion(&mut delete_stmt, &db).unwrap();
-                delete_stmt.reset();
+                delete_stmt.reset().unwrap();
             }
             total
         });
@@ -471,7 +471,7 @@ fn bench_update_performance(criterion: &mut Criterion) {
         let mut stmt = conn.prepare(&batch_update).unwrap();
         b.iter(|| {
             run_to_completion(&mut stmt, &db).unwrap();
-            stmt.reset();
+            stmt.reset().unwrap();
         });
     });
 
@@ -721,9 +721,9 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
                 let start = std::time::Instant::now();
                 run_to_completion(&mut insert_stmt, &db).unwrap();
                 total += start.elapsed();
-                insert_stmt.reset();
+                insert_stmt.reset().unwrap();
                 run_to_completion(&mut delete_stmt, &db).unwrap();
-                delete_stmt.reset();
+                delete_stmt.reset().unwrap();
             }
             total
         });
@@ -747,9 +747,9 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
                 let start = std::time::Instant::now();
                 run_to_completion(&mut insert_stmt, &db).unwrap();
                 total += start.elapsed();
-                insert_stmt.reset();
+                insert_stmt.reset().unwrap();
                 run_to_completion(&mut delete_stmt, &db).unwrap();
-                delete_stmt.reset();
+                delete_stmt.reset().unwrap();
             }
             total
         });

@@ -17,7 +17,7 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     })
     .unwrap();
 
-    stmt.reset();
+    stmt.reset()?;
 
     stmt.bind_at(1.try_into()?, Value::from_i64(2));
 
@@ -711,7 +711,7 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn1 = tmp_db.connect_limbo();
     let mut stmt1 = conn1.prepare("INSERT INTO test VALUES (?)").unwrap();
     for _ in 0..3 {
-        stmt1.reset();
+        stmt1.reset()?;
         stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
         loop {
             match stmt1.step().unwrap() {
@@ -726,7 +726,7 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
         .execute("INSERT INTO test VALUES (randomblob(1024))")
         .unwrap();
 
-    stmt1.reset();
+    stmt1.reset()?;
     stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
     loop {
         match stmt1.step().unwrap() {
