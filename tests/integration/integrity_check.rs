@@ -107,7 +107,7 @@ fn run_integrity_check_or_error(conn: &Arc<turso_core::Connection>) -> Result<St
                 .join("\n");
             Ok(msg)
         }
-        Err(e) => Err(format!("{}", e)),
+        Err(e) => Err(format!("{e}")),
     }
 }
 

@@ -23,8 +23,8 @@ use super::main_loop::{
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{
-    Distinctness, JoinOrderMember, Operation, Scan, SeekKeyComponent, SelectPlan, TableReferences,
-    UpdatePlan,
+    Distinctness, HashJoinType, JoinOrderMember, Operation, Scan, SeekKeyComponent, SelectPlan,
+    TableReferences, UpdatePlan,
 };
 use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
@@ -372,6 +372,18 @@ pub struct HashCtx {
     /// These references may point at multiple tables when a build input was
     /// materialized from a join prefix.
     pub payload_columns: Vec<MaterializedColumnRef>,
+    /// Jump target for unmatched probe rows (outer joins only).
+    pub check_outer_label: Option<BranchOffset>,
+    /// Build table cursor (for NullRow in outer joins).
+    pub build_cursor_id: Option<CursorID>,
+    pub join_type: HashJoinType,
+    /// Gosub register for the inner-loop subroutine wrapping subsequent tables.
+    /// Outer hash joins wrap inner loops so unmatched-row paths can re-enter via Gosub.
+    pub inner_loop_gosub_reg: Option<usize>,
+    /// Entry label for the inner-loop subroutine.
+    pub inner_loop_gosub_label: Option<BranchOffset>,
+    /// Label that skips past the subroutine body (resolved after Return).
+    pub inner_loop_skip_label: Option<BranchOffset>,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
@@ -1422,6 +1434,7 @@ pub fn emit_query<'a>(
         &plan.table_references,
         &plan.join_order,
         OperationMode::SELECT,
+        Some(plan),
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -1651,6 +1664,7 @@ fn emit_program_for_delete(
             &plan.table_references,
             &join_order,
             OperationMode::DELETE,
+            None,
         )?;
     }
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -2584,6 +2598,7 @@ fn emit_program_for_update(
         &plan.table_references,
         &join_order,
         mode,
+        None,
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);

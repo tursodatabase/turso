@@ -2062,6 +2062,47 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
+        Insn::HashMarkMatched { hash_table_id } => (
+            "HashMarkMatched",
+            *hash_table_id as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        Insn::HashScanUnmatched { hash_table_id, dest_reg, target_pc, payload_dest_reg, num_payload } => {
+            let payload_info = if let Some(p_reg) = payload_dest_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+            } else {
+                String::new()
+            };
+            (
+                "HashScanUnmatched",
+                *hash_table_id as i64,
+                *dest_reg as i64,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}{payload_info}"),
+            )
+        },
+        Insn::HashNextUnmatched { hash_table_id, dest_reg, target_pc, payload_dest_reg, num_payload } => {
+            let payload_info = if let Some(p_reg) = payload_dest_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+            } else {
+                String::new()
+            };
+            (
+                "HashNextUnmatched",
+                *hash_table_id as i64,
+                *dest_reg as i64,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(""),
+                0,
+                format!("hash_table_id={hash_table_id}{payload_info}"),
+            )
+        },
         Insn::VacuumInto { dest_path } => (
             "VacuumInto",
             0,

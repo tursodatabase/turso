@@ -1645,19 +1645,40 @@ fn parse_join(
         connection,
     )?;
 
-    let (outer, natural) = match join_operator {
+    let (outer, natural, full_outer) = match join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
-            if join_type.contains(JoinType::RIGHT) {
-                crate::bail_parse_error!("RIGHT JOIN is not supported");
-            }
             if join_type.contains(JoinType::CROSS) {
                 crate::bail_parse_error!("CROSS JOIN is not supported");
             }
+            let is_right = join_type.contains(JoinType::RIGHT);
+            let is_left = join_type.contains(JoinType::LEFT);
             let is_outer = join_type.contains(JoinType::OUTER);
             let is_natural = join_type.contains(JoinType::NATURAL);
-            (is_outer, is_natural)
+            // FULL OUTER: LEFT+RIGHT or bare OUTER
+            let is_full = (is_left && is_right) || (is_outer && !is_left && !is_right);
+
+            if is_right && !is_left && !is_full {
+                // RIGHT JOIN: swap the last two tables, then treat as LEFT JOIN.
+                let len = table_references.joined_tables().len();
+                // Only valid for a two-table FROM clause; with prior joins the swap
+                // would break ON clause column references.
+                if len > 2 {
+                    crate::bail_parse_error!(
+                        "RIGHT JOIN following another join is not yet supported. \
+                         Try rewriting as LEFT JOIN or using a subquery."
+                    );
+                }
+                table_references.joined_tables_mut().swap(len - 2, len - 1);
+                table_references.set_right_join_swapped();
+                // outer flag goes on the originally-left table (now rightmost after swap).
+                (true, is_natural, false)
+            } else if is_full {
+                (true, is_natural, true)
+            } else {
+                (is_outer || is_left, is_natural, false)
+            }
         }
-        _ => (false, false),
+        _ => (false, false, false),
     };
 
     if natural && constraint.is_some() {
@@ -1834,7 +1855,11 @@ fn parse_join(
         .joined_tables_mut()
         .get_mut(last_idx)
         .unwrap();
-    rightmost_table.join_info = Some(JoinInfo { outer, using });
+    rightmost_table.join_info = Some(JoinInfo {
+        outer,
+        full_outer,
+        using,
+    });
 
     Ok(())
 }

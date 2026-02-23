@@ -238,12 +238,6 @@ def test_hash_join_outer_join_exclusion(turso: TestTursoShell):
         lambda x: "HASH JOIN" in x,
         "INNER JOIN uses hash join",
     )
-    # LEFT JOIN should NOT use hash join
-    turso.run_test_fn(
-        "explain query plan SELECT * FROM outer_t1 LEFT JOIN outer_t2 ON outer_t1.a = outer_t2.a;",
-        lambda x: "HASH JOIN" not in x,
-        "LEFT JOIN does not use hash join",
-    )
     turso.run_test_fn(
         "SELECT outer_t1.a, outer_t2.a FROM outer_t1 LEFT JOIN outer_t2"
         " ON outer_t1.a = outer_t2.a ORDER BY outer_t1.a;",

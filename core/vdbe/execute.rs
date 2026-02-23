@@ -10365,6 +10365,7 @@ pub fn op_hash_build(
                 num_keys: data.num_keys,
                 collations: data.collations.clone(),
                 temp_store,
+                track_matched: data.track_matched,
             };
             HashTable::new(config, pager.io.clone())
         });
@@ -10471,6 +10472,7 @@ pub fn op_hash_distinct(
                 num_keys: data.num_keys,
                 collations: data.collations.clone(),
                 temp_store,
+                track_matched: false,
             };
             HashTable::new(config, pager.io.clone())
         });
@@ -10714,6 +10716,139 @@ pub fn op_hash_clear(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_hash_mark_matched(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashMarkMatched { hash_table_id }, insn);
+    if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
+        hash_table.mark_current_matched();
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_hash_scan_unmatched(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashScanUnmatched {
+            hash_table_id,
+            dest_reg,
+            target_pc,
+            payload_dest_reg,
+            num_payload,
+        },
+        insn
+    );
+
+    let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) else {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    hash_table.begin_unmatched_scan();
+    advance_unmatched_scan(
+        hash_table,
+        &mut state.registers,
+        &mut state.pc,
+        *dest_reg,
+        target_pc.as_offset_int(),
+        *payload_dest_reg,
+        *num_payload,
+    )
+}
+
+pub fn op_hash_next_unmatched(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashNextUnmatched {
+            hash_table_id,
+            dest_reg,
+            target_pc,
+            payload_dest_reg,
+            num_payload,
+        },
+        insn
+    );
+
+    let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
+    })?;
+
+    advance_unmatched_scan(
+        hash_table,
+        &mut state.registers,
+        &mut state.pc,
+        *dest_reg,
+        target_pc.as_offset_int(),
+        *payload_dest_reg,
+        *num_payload,
+    )
+}
+
+/// Shared logic for HashScanUnmatched/HashNextUnmatched: find the next unmatched
+/// entry, loading spilled partitions as needed.
+fn advance_unmatched_scan(
+    hash_table: &mut HashTable,
+    registers: &mut [Register],
+    pc: &mut u32,
+    dest_reg: usize,
+    target_pc: u32,
+    payload_dest_reg: Option<usize>,
+    num_payload: usize,
+) -> Result<InsnFunctionStepResult> {
+    if hash_table.has_spilled() {
+        if let Some(partition_idx) = hash_table.unmatched_scan_current_partition() {
+            if !hash_table.is_partition_loaded(partition_idx) {
+                match hash_table.load_spilled_partition(partition_idx)? {
+                    crate::types::IOResult::Done(()) => {}
+                    crate::types::IOResult::IO(io) => {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+            }
+        }
+    }
+
+    loop {
+        match hash_table.next_unmatched() {
+            Some(entry) => {
+                registers[dest_reg] =
+                    Register::Value(Value::Numeric(Numeric::Integer(entry.rowid)));
+                write_hash_payload_to_registers(registers, entry, payload_dest_reg, num_payload);
+                *pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            None => {
+                if hash_table.has_spilled() {
+                    if let Some(partition_idx) = hash_table.unmatched_scan_current_partition() {
+                        if !hash_table.is_partition_loaded(partition_idx) {
+                            match hash_table.load_spilled_partition(partition_idx)? {
+                                crate::types::IOResult::Done(()) => continue,
+                                crate::types::IOResult::IO(io) => {
+                                    return Ok(InsnFunctionStepResult::IO(io));
+                                }
+                            }
+                        }
+                    }
+                }
+                *pc = target_pc;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
 }
 
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
