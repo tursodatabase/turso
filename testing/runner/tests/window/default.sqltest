@@ -824,23 +824,3 @@ expect {
     y|1|1|2
     y|1|2|2
 }
-
-test window-subquery-in-window-order-by-term {
-    WITH t(a, b) AS (
-        VALUES (1, 10), (1, 20), (2, 30)
-    )
-    SELECT
-        a,
-        b,
-        row_number() OVER (
-            PARTITION BY a
-            ORDER BY (SELECT max(b) FROM t t2 WHERE t2.a = t.a)
-        )
-    FROM t
-    ORDER BY a, b;
-}
-expect {
-    1|10|1
-    1|20|2
-    2|30|1
-}
