@@ -62,6 +62,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test negative-zero-in-table {
     CREATE TABLE t1(x REAL);
     INSERT INTO t1 VALUES (-0.0);
@@ -74,6 +75,7 @@ expect @js {
     0
 }
 
+@cross-check-integrity
 test negative-zero-in-table-comparison {
     CREATE TABLE t2(x REAL);
     INSERT INTO t2 VALUES (-0.0);
@@ -83,6 +85,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test negative-zero-arithmetic-result {
     CREATE TABLE t3(x REAL);
     INSERT INTO t3 VALUES (-1e-300 * 0);
@@ -96,6 +99,7 @@ expect @js {
 }
 
 
+@cross-check-integrity
 test negative-zero-order-by {
     CREATE TABLE t4(id INTEGER, x REAL);
     INSERT INTO t4 VALUES (1, 0.0);
@@ -114,6 +118,7 @@ expect @js {
     3|0
 }
 
+@cross-check-integrity
 test negative-zero-distinct {
     CREATE TABLE t5(x REAL);
     INSERT INTO t5 VALUES (0.0);
@@ -128,6 +133,7 @@ expect @js {
     0
 }
 
+@cross-check-integrity
 test negative-zero-group-by {
     CREATE TABLE t6(x REAL, v INTEGER);
     INSERT INTO t6 VALUES (0.0, 1);

@@ -7,6 +7,7 @@
 # LEFT JOIN with hash join
 # ============================================================
 
+@cross-check-integrity
 test left-hash-join-basic {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -20,6 +21,7 @@ expect {
     3|z||
 }
 
+@cross-check-integrity
 test left-hash-join-no-matches {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -32,6 +34,7 @@ expect {
     2|y||
 }
 
+@cross-check-integrity
 test left-hash-join-all-match {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -44,6 +47,7 @@ expect {
     2|y|2|b
 }
 
+@cross-check-integrity
 test left-hash-join-duplicate-keys {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -58,6 +62,7 @@ expect {
     3|z||
 }
 
+@cross-check-integrity
 test left-hash-join-empty-right {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -69,6 +74,7 @@ expect {
     2|y||
 }
 
+@cross-check-integrity
 test left-hash-join-with-where {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -82,6 +88,7 @@ expect {
     3|b
 }
 
+@cross-check-integrity
 test left-hash-join-count-with-nulls {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -97,6 +104,7 @@ expect {
 # RIGHT JOIN (rewritten as LEFT JOIN)
 # ============================================================
 
+@cross-check-integrity
 test right-join-basic {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -109,6 +117,7 @@ expect {
     ||3|b
 }
 
+@cross-check-integrity
 test right-join-no-matches {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -121,6 +130,7 @@ expect {
     ||2|b
 }
 
+@cross-check-integrity
 test right-join-all-match {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -137,6 +147,7 @@ expect {
 # FULL OUTER JOIN
 # ============================================================
 
+@cross-check-integrity
 test full-outer-join-basic {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -151,6 +162,7 @@ expect {
     ||4|b
 }
 
+@cross-check-integrity
 test full-outer-join-no-matches {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -165,6 +177,7 @@ expect {
     ||4|b
 }
 
+@cross-check-integrity
 test full-outer-join-all-match {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -177,6 +190,7 @@ expect {
     2|y|2|b
 }
 
+@cross-check-integrity
 test full-outer-join-duplicates {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -191,6 +205,7 @@ expect {
     ||3|b
 }
 
+@cross-check-integrity
 test full-outer-join-empty-left {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -202,6 +217,7 @@ expect {
     ||2|b
 }
 
+@cross-check-integrity
 test full-outer-join-empty-right {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -213,6 +229,7 @@ expect {
     2|y||
 }
 
+@cross-check-integrity
 test full-outer-join-count {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -224,6 +241,7 @@ expect {
     4|3|2
 }
 
+@cross-check-integrity
 test full-outer-join-with-where {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -237,6 +255,7 @@ expect {
     3|
 }
 
+@cross-check-integrity
 test full-outer-join-coalesce {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -254,6 +273,7 @@ expect {
 # Larger tables to strongly favor hash join
 # ============================================================
 
+@cross-check-integrity
 test left-hash-join-larger {
     CREATE TABLE big1(a, b);
     CREATE TABLE big2(c, d);
@@ -265,6 +285,7 @@ expect {
     100
 }
 
+@cross-check-integrity
 test left-hash-join-larger-null-count {
     CREATE TABLE big1(a, b);
     CREATE TABLE big2(c, d);
@@ -276,6 +297,7 @@ expect {
     100|51
 }
 
+@cross-check-integrity
 test right-join-larger {
     CREATE TABLE big1(a, b);
     CREATE TABLE big2(c, d);
@@ -287,6 +309,7 @@ expect {
     51|21|51
 }
 
+@cross-check-integrity
 test full-outer-join-larger {
     CREATE TABLE big1(a, b);
     CREATE TABLE big2(c, d);
@@ -298,6 +321,7 @@ expect {
     120|100|71
 }
 
+@cross-check-integrity
 test full-outer-join-larger-verify-rows {
     CREATE TABLE big1(a, b);
     CREATE TABLE big2(c, d);
@@ -327,6 +351,7 @@ expect {
 # Adversarial / edge-case tests
 # ============================================================
 
+@cross-check-integrity
 test full-outer-join-null-keys-both-sides {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -342,6 +367,7 @@ expect {
     ||4|c
 }
 
+@cross-check-integrity
 test full-outer-join-all-nulls {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -356,6 +382,7 @@ expect {
     |y||
 }
 
+@cross-check-integrity
 test full-outer-join-single-row-each {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -367,6 +394,7 @@ expect {
     1|1
 }
 
+@cross-check-integrity
 test full-outer-join-single-row-no-match {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -379,6 +407,7 @@ expect {
     |2
 }
 
+@cross-check-integrity
 test full-outer-join-duplicate-keys-both-sides {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -393,6 +422,7 @@ expect {
     1|y|1|b
 }
 
+@cross-check-integrity
 test full-outer-join-mixed-types {
     CREATE TABLE t1(a INTEGER, b TEXT);
     CREATE TABLE t2(c REAL, d TEXT);
@@ -407,6 +437,7 @@ expect {
     |4.0
 }
 
+@cross-check-integrity
 test full-outer-join-where-filters-both-sides {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -420,6 +451,7 @@ expect {
     |4
 }
 
+@cross-check-integrity
 test full-outer-join-with-expressions-in-select {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -434,6 +466,7 @@ expect {
 }
 
 @skip-if sqlite "supported in sqlite"
+@cross-check-integrity
 test full-outer-join-non-equi-errors {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -444,6 +477,7 @@ expect error {
 }
 
 @skip-if sqlite "supported in sqlite"
+@cross-check-integrity
 test full-outer-join-using-errors {
     CREATE TABLE t1(id, name);
     CREATE TABLE t2(id, val);
@@ -454,6 +488,7 @@ expect error {
 }
 
 @skip-if sqlite "supported in sqlite"
+@cross-check-integrity
 test full-outer-join-no-on-clause-errors {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -463,6 +498,7 @@ expect error {
     FULL OUTER JOIN requires an equality condition in the ON clause
 }
 
+@cross-check-integrity
 test right-join-duplicate-keys {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -476,6 +512,7 @@ expect {
     ||2|b
 }
 
+@cross-check-integrity
 test right-join-with-where {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -488,6 +525,7 @@ expect {
     |4
 }
 
+@cross-check-integrity
 test full-outer-join-with-group-by {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -502,6 +540,7 @@ expect {
     4|1
 }
 
+@cross-check-integrity
 test full-outer-join-with-aggregate-no-group-by {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -521,6 +560,7 @@ expect {
 
 # Three-way LEFT JOIN chain: when t2 doesn't match, t3 should also be NULL.
 # No indexes on join columns → hash join.
+@cross-check-integrity
 test multi-table-left-join-chain {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -542,6 +582,7 @@ expect {
 
 # Three-way chain where t3 depends on t2 (not t1).
 # When t2 is NULL, t3 join condition can't match.
+@cross-check-integrity
 test multi-table-left-join-t3-depends-on-t2 {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -562,6 +603,7 @@ expect {
 }
 
 # Four-way LEFT JOIN chain with partial matches at each level.
+@cross-check-integrity
 test four-way-left-join-chain {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -587,6 +629,7 @@ expect {
 
 # Multi-table LEFT JOIN where all build rows are unmatched.
 # Forces the unmatched scan to iterate through inner loops via Gosub.
+@cross-check-integrity
 test multi-table-left-join-all-unmatched {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -607,6 +650,7 @@ expect {
 }
 
 # Multi-table LEFT JOIN with duplicates in the hash join table.
+@cross-check-integrity
 test multi-table-left-join-duplicate-hash-keys {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -627,6 +671,7 @@ expect {
 }
 
 # FULL OUTER JOIN followed by LEFT JOIN (mixed join types).
+@cross-check-integrity
 test full-outer-then-left-join {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -648,6 +693,7 @@ expect {
 
 # LEFT JOIN with hash join where ON condition has multiple predicates.
 # Some probes match the hash key but fail the extra condition → should still emit NULLs.
+@cross-check-integrity
 test left-hash-join-multi-predicate {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -665,6 +711,7 @@ expect {
 
 # LEFT JOIN with spilling hash table (large build table).
 # This tests that the unmatched scan correctly iterates all spilled partitions.
+@cross-check-integrity
 test left-hash-join-spill-unmatched {
     CREATE TABLE big_left(a, b);
     CREATE TABLE small_right(c, d);
@@ -678,6 +725,7 @@ expect {
 }
 
 # LEFT JOIN spill: verify the unmatched rows are correct, not just count.
+@cross-check-integrity
 test left-hash-join-spill-verify-order {
     CREATE TABLE big_left(a, b);
     CREATE TABLE small_right(c, d);
@@ -697,6 +745,7 @@ expect {
 }
 
 # FULL OUTER JOIN with spilling hash table.
+@cross-check-integrity
 test full-outer-join-spill {
     CREATE TABLE big1(a, b);
     CREATE TABLE big2(c, d);
@@ -711,6 +760,7 @@ expect {
 
 # Multi-table LEFT JOIN with spill: inner loop must be iterated via Gosub
 # for each unmatched row across all spilled partitions.
+@cross-check-integrity
 test multi-table-left-join-spill-with-inner {
     CREATE TABLE big_t1(a, b);
     CREATE TABLE big_t2(c, d);
@@ -728,6 +778,7 @@ expect {
 }
 
 # RIGHT JOIN with multi-table chain (RIGHT is rewritten as LEFT).
+@cross-check-integrity
 test right-join-with-inner-join {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -749,6 +800,7 @@ expect {
 
 # LEFT JOIN where WHERE clause filters NULLs from right table.
 # This effectively converts the LEFT JOIN to an INNER JOIN.
+@cross-check-integrity
 test left-join-where-filters-to-inner {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -766,6 +818,7 @@ expect {
 
 # LEFT JOIN with ORDER BY on the nullable (right) table column.
 # NULLs should sort first in ASC order.
+@cross-check-integrity
 test left-join-order-by-nullable-column {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -782,6 +835,7 @@ expect {
 }
 
 # Both tables completely empty.
+@cross-check-integrity
 test full-outer-join-both-empty {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -791,6 +845,7 @@ expect {
 }
 
 # FULL OUTER with LIMIT — ensures unmatched scan respects LIMIT.
+@cross-check-integrity
 test full-outer-join-with-limit {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -805,6 +860,7 @@ expect {
 }
 
 # Composite join keys with partial NULLs — only full key match should join.
+@cross-check-integrity
 test full-outer-join-composite-keys {
     CREATE TABLE t1(a, b, v);
     CREATE TABLE t2(c, d, w);
@@ -823,6 +879,7 @@ expect {
 }
 
 # Expression in ON clause (not just column = column).
+@cross-check-integrity
 test full-outer-join-expression-in-on {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -838,6 +895,7 @@ expect {
 }
 
 # NULL key on probe side only — should appear as unmatched probe row.
+@cross-check-integrity
 test full-outer-join-null-probe-key {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -853,6 +911,7 @@ expect {
 }
 
 # Large duplicate keys on both sides — stress test for matched_bits.
+@cross-check-integrity
 test full-outer-join-many-duplicates {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -868,6 +927,7 @@ expect {
 
 # WHERE clause references both build and probe columns on unmatched rows.
 # Unmatched build rows have NULL probe; WHERE must evaluate correctly.
+@cross-check-integrity
 test full-outer-join-where-references-both {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -887,6 +947,7 @@ expect {
 
 # Self-join with FULL OUTER is unsupported (same root page).
 @skip-if sqlite "supported in sqlite"
+@cross-check-integrity
 test full-outer-self-join-errors {
     CREATE TABLE t1(a, b);
     SELECT a.a, b.a FROM t1 a FULL OUTER JOIN t1 b ON a.a = b.a;
@@ -896,6 +957,7 @@ expect error {
 }
 
 # FULL OUTER with GROUP BY and HAVING.
+@cross-check-integrity
 test full-outer-join-group-by-having {
     CREATE TABLE t1(a, v);
     CREATE TABLE t2(b, w);
@@ -913,6 +975,7 @@ expect {
 }
 
 # FULL OUTER with aggregate functions that differentiate NULL from no-row.
+@cross-check-integrity
 test full-outer-join-sum-with-nulls {
     CREATE TABLE t1(a, val);
     CREATE TABLE t2(b, val);
@@ -927,6 +990,7 @@ expect {
 }
 
 # RIGHT JOIN with NULL keys — NULLs should appear on the preserved side.
+@cross-check-integrity
 test right-join-null-keys {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -944,6 +1008,7 @@ expect {
 
 # Verify FULL OUTER correctness: count should equal
 # left_count + unmatched_right_count.
+@cross-check-integrity
 test full-outer-join-count-verification {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -957,6 +1022,7 @@ expect {
 }
 
 # FULL OUTER with OFFSET (not just LIMIT).
+@cross-check-integrity
 test full-outer-join-with-offset {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -973,6 +1039,7 @@ expect {
 # FULL OUTER's build table has join_info.outer from the first join,
 # which we currently disallow. Verify we return a useful error.
 @skip-if sqlite "supported in sqlite"
+@cross-check-integrity
 test three-way-full-outer-join-errors {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -988,6 +1055,7 @@ expect error {
 
 # FULL OUTER with a large number of matched and unmatched rows to stress-test
 # that matched_bits tracking survives across many entries.
+@cross-check-integrity
 test full-outer-join-stress-matched-bits {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -1005,6 +1073,7 @@ expect {
 # ============================================================
 
 # RIGHT JOIN followed by LEFT JOIN chain.
+@cross-check-integrity
 test right-then-left-chain {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -1026,6 +1095,7 @@ expect {
 # LEFT JOIN then FULL OUTER should error — build table has join_info.outer
 # from the LEFT JOIN.
 @skip-if sqlite "supported in sqlite"
+@cross-check-integrity
 test left-then-full-outer-chain-errors {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -1042,6 +1112,7 @@ expect error {
 # RIGHT JOIN then FULL OUTER should also error — after RIGHT is rewritten
 # as LEFT, the build table has join_info.outer.
 @skip-if sqlite "supported in sqlite"
+@cross-check-integrity
 test right-then-full-outer-chain-errors {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -1056,6 +1127,7 @@ expect error {
 }
 
 # RIGHT JOIN with aggregate functions and NULL propagation.
+@cross-check-integrity
 test right-join-aggregate-counts {
     CREATE TABLE t1(a, v);
     CREATE TABLE t2(b, w);
@@ -1069,6 +1141,7 @@ expect {
 }
 
 # FULL OUTER with CASE WHEN expressions in select list.
+@cross-check-integrity
 test full-outer-case-expressions {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -1090,6 +1163,7 @@ expect {
 }
 
 # FULL OUTER with DISTINCT.
+@cross-check-integrity
 test full-outer-join-distinct {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -1108,6 +1182,7 @@ expect {
 
 # RIGHT JOIN with WHERE filtering NULL rows from left side —
 # effectively converts to INNER JOIN.
+@cross-check-integrity
 test right-join-where-filters-nulls {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -1124,6 +1199,7 @@ expect {
 
 # INNER JOIN then FULL OUTER JOIN — the optimizer must find a valid ordering
 # where the build table for the FULL OUTER has an equi-join with the probe.
+@cross-check-integrity
 test inner-then-full-outer-join {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -1146,6 +1222,7 @@ expect {
 # RIGHT JOIN following another join is not supported — the table swap
 # would corrupt prior ON clause references.
 @skip-if sqlite "supported in sqlite"
+@cross-check-integrity
 test left-then-right-join-chain-errors {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -1160,6 +1237,7 @@ expect error {
 }
 
 @skip-if sqlite "supported in sqlite"
+@cross-check-integrity
 test right-then-right-join-chain-errors {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -1176,6 +1254,7 @@ expect error {
 # FULL OUTER then RIGHT JOIN should also error — RIGHT after FULL OUTER
 # means len > 2 at the time of the RIGHT JOIN swap.
 @skip-if sqlite "supported in sqlite"
+@cross-check-integrity
 test full-outer-then-right-join-errors {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -1190,6 +1269,7 @@ expect error {
 }
 
 # FULL OUTER where ON condition uses expressions on both sides.
+@cross-check-integrity
 test full-outer-join-expr-both-sides-on {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -1214,6 +1294,7 @@ expect {
 # even though RIGHT JOIN is internally rewritten as LEFT JOIN by
 # swapping the tables.
 
+@cross-check-integrity
 test right-join-select-star-column-order {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(x, y);
@@ -1227,6 +1308,7 @@ expect {
     ||4|FOUR
 }
 
+@cross-check-integrity
 test right-join-select-star-no-matches {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(x, y);
@@ -1239,6 +1321,7 @@ expect {
     ||2|TWO
 }
 
+@cross-check-integrity
 test right-join-select-star-all-match {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(x, y);
@@ -1251,6 +1334,7 @@ expect {
     2|two|2|TWO
 }
 
+@cross-check-integrity
 test right-join-select-star-empty-left {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(x, y);
@@ -1262,6 +1346,7 @@ expect {
     ||2|TWO
 }
 
+@cross-check-integrity
 test right-join-select-star-many-columns {
     CREATE TABLE t1(a, b, c);
     CREATE TABLE t2(x, y, z);
@@ -1274,6 +1359,7 @@ expect {
     |||3|y3|z3
 }
 
+@cross-check-integrity
 test right-join-select-star-duplicate-keys {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(x, y);
@@ -1287,6 +1373,7 @@ expect {
     ||2|Y
 }
 
+@cross-check-integrity
 test right-join-table-star {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(x, y);
@@ -1299,6 +1386,7 @@ expect {
     ||3|THREE
 }
 
+@cross-check-integrity
 test right-join-select-star-with-where {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(x, y);
@@ -1311,6 +1399,7 @@ expect {
     ||4|FOUR
 }
 
+@cross-check-integrity
 test right-join-select-star-with-aggregate {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(x, y);

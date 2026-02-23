@@ -1,6 +1,7 @@
 @database :memory:
 
 # Basic DROP INDEX functionality
+@cross-check-integrity
 test drop-index-basic-1 {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY);
     CREATE INDEX t_idx on t1 (x);
@@ -14,6 +15,7 @@ expect {
 }
 
 # Test DROP INDEX IF EXISTS on existing index
+@cross-check-integrity
 test drop-index-if-exists-1 {
     CREATE TABLE t2 (x INTEGER PRIMARY KEY);
     CREATE INDEX t_idx2 on t2 (x);
@@ -25,6 +27,7 @@ expect {
 }
 
 # Test DROP INDEX IF EXISTS on non-existent index
+@cross-check-integrity
 test drop-index-if-exists-2 {
     DROP TABLE IF EXISTS nonexistent_index;
     SELECT 'success';
@@ -34,6 +37,7 @@ expect {
 }
 
 # Test dropping non-existant index produces an error
+@cross-check-integrity
 test drop-index-no-index {
     DROP INDEX t_idx;
 }
@@ -42,6 +46,7 @@ expect error {
 }
 
 # Test dropping index after multiple inserts and deletes
+@cross-check-integrity
 test drop-index-after-ops-1 {
     CREATE TABLE t6 (x INTEGER PRIMARY KEY);
     CREATE INDEX t_idx6 on t6 (x);
@@ -57,6 +62,7 @@ expect {
 }
 
 # Test dropping of indices associated with unique or primary contraint indices produces an error
+@cross-check-integrity
 test drop-index-primary-key-index {
     CREATE TABLE t15a (id TEXT PRIMARY KEY );
     DROP INDEX sqlite_autoindex_t15a_1;
@@ -65,6 +71,7 @@ expect error {
     index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped
 }
 
+@cross-check-integrity
 test drop-index-unique-index {
     CREATE TABLE t15b (id INT UNIQUE );
     DROP INDEX sqlite_autoindex_t15b_1;

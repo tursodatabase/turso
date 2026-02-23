@@ -1,6 +1,7 @@
 @database :memory:
 
 # regression test for issue 2794: not nulling out rowid properly when left join does not match
+@cross-check-integrity
 test min-null-regression-test {
     create table t (x integer primary key, y);
     create table u (x integer primary key, y);
@@ -13,6 +14,7 @@ expect {
 }
 
 # regression test for issue 2949: consuming WHERE terms not originating from the LEFT JOIN
+@cross-check-integrity
 test left-join-seek-key-regression-test {
     CREATE TABLE t (x INTEGER PRIMARY KEY);
     CREATE TABLE u (x INTEGER PRIMARY KEY);
@@ -23,6 +25,7 @@ expect {
 }
 
 # regression test for issue 2924: calling Next on a cursor that hasn't moved yet
+@cross-check-integrity
 test next-crash {
     create table a(x int primary key,y);
     create table b(x int primary key,y);
@@ -36,6 +39,7 @@ expect {
 }
 
 # regression test for crash in op_column
+@cross-check-integrity
 test left-join-column-crash {
     create table a(x int primary key,y);
     create table b(x int primary key,y);
@@ -49,6 +53,7 @@ expect {
 }
 
 # regression test for ignoring ON clause when LEFT JOIN uses a FROM clause subquery
+@cross-check-integrity
 test left-join-subquery-on {
     CREATE TABLE t1(a INTEGER);
     INSERT INTO t1 VALUES (1),(2),(3);
@@ -65,6 +70,7 @@ expect {
 # Test that column names in USING clause are not ambiguous since they are deduplicated.
 # The column 'a' appears in both tables but can be referenced unqualified in the SELECT
 # since it's in the USING clause.
+@cross-check-integrity
 test using-deduplicates-columns {
     create table t(a);
     create table tt(a);
@@ -78,6 +84,7 @@ expect {
 }
 
 # regression test for https://github.com/tursodatabase/turso/issues/3470
+@cross-check-integrity
 test left-join-where-clause-regression {
     create table t(a);
     create table s(a);
@@ -92,6 +99,7 @@ expect {
 }
 
 # Regression test for: https://github.com/tursodatabase/turso/issues/3468
+@cross-check-integrity
 test left-join-using-star-vs-explicit {
     create table t(a, tb);
     create table s(a, sb);
@@ -107,6 +115,7 @@ expect {
     2|t2|
 }
 
+@cross-check-integrity
 test left-join-using-null {
     create table t(a, b);
     create table s(a, b);
@@ -120,6 +129,7 @@ expect {
 }
 
 # Regression test for: https://github.com/tursodatabase/turso/issues/3656
+@cross-check-integrity
 test redundant-join-condition {
     create table t(x);
     insert into t values ('lol');
@@ -130,6 +140,7 @@ expect {
 }
 
 # Regression test for: https://github.com/tursodatabase/turso/issues/4098
+@cross-check-integrity
 test left-join-duplicate-column-constraints {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, c INT);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, c INT);
@@ -143,6 +154,7 @@ expect {
     17|17|20|17
 }
 
+@cross-check-integrity
 test test-spill-hash-join-count {
     CREATE TABLE t(a,b);
     CREATE TABLE t2(a,b);
@@ -156,6 +168,7 @@ expect {
     22500
 }
 
+@cross-check-integrity
 test test-spill-hash-join-rows {
     CREATE TABLE t(a,b);
     CREATE TABLE t2(a,b);
@@ -170,6 +183,7 @@ expect {
     aaaa|abcd
 }
 
+@cross-check-integrity
 test inner-join-using-null {
     create table t(a, b);
     create table s(a, b);
@@ -180,6 +194,7 @@ test inner-join-using-null {
 expect {
 }
 
+@cross-check-integrity
 test left-join-null-probe-key {
     create table t(a, b);
     create table s(a, b);
@@ -195,6 +210,7 @@ expect {
     |y||
 }
 
+@cross-check-integrity
 test three-way-left-chain-null {
     create table t(a, b);
     create table u(a, b);
@@ -214,6 +230,7 @@ expect {
     3|||v3
 }
 
+@cross-check-integrity
 test three-way-inner-using-null {
     create table t(a, b);
     create table u(a, b);
@@ -232,6 +249,7 @@ expect {
     3|z||
 }
 
+@cross-check-integrity
 test four-way-left-joins-null-keys {
     create table t(a, b);
     create table u(a, b);
@@ -253,6 +271,7 @@ expect {
     2||||
 }
 
+@cross-check-integrity
 test left-join-integer-real {
     CREATE TABLE IF NOT EXISTS t1 (a INTEGER, b INTEGER);
     CREATE TABLE IF NOT EXISTS t2 (a INTEGER, c REAL);
@@ -269,6 +288,7 @@ expect @js {
     2|10|1|10
 }
 
+@cross-check-integrity
 test left-join-real-integer {
     CREATE TABLE IF NOT EXISTS t3 (a INTEGER, b REAL);
     CREATE TABLE IF NOT EXISTS t4 (a INTEGER, c INTEGER);
@@ -285,6 +305,7 @@ expect @js {
     2|10|1|10
 }
 
+@cross-check-integrity
 test inner-join-integer-real {
     CREATE TABLE IF NOT EXISTS t5 (a INTEGER, b INTEGER);
     CREATE TABLE IF NOT EXISTS t6 (a INTEGER, c REAL);
@@ -301,6 +322,7 @@ expect @js {
     2|10|1|10
 }
 
+@cross-check-integrity
 test left-join-integer-real-zero {
     CREATE TABLE IF NOT EXISTS t7 (a INTEGER, b INTEGER);
     CREATE TABLE IF NOT EXISTS t8 (a INTEGER, c REAL);
@@ -315,6 +337,7 @@ expect @js {
     1|0|1|0
 }
 
+@cross-check-integrity
 test left-join-integer-real-negative {
     CREATE TABLE IF NOT EXISTS t9 (a INTEGER, b INTEGER);
     CREATE TABLE IF NOT EXISTS t10 (a INTEGER, c REAL);
@@ -329,6 +352,7 @@ expect @js {
     1|-10|1|-10
 }
 
+@cross-check-integrity
 test left-join-integer-real-no-match {
     CREATE TABLE IF NOT EXISTS t11 (a INTEGER, b INTEGER);
     CREATE TABLE IF NOT EXISTS t12 (a INTEGER, c REAL);
@@ -340,6 +364,7 @@ expect {
     1|10||
 }
 
+@cross-check-integrity
 test left-join-integer-real-multi-key {
     CREATE TABLE IF NOT EXISTS t13 (a INTEGER, b INTEGER, c INTEGER);
     CREATE TABLE IF NOT EXISTS t14 (a INTEGER, b REAL, c REAL);
@@ -354,6 +379,7 @@ expect @js {
     1|10|20|1|10|20
 }
 
+@cross-check-integrity
 test affinity-hash-join {
     CREATE TABLE x(a INTEGER);
     CREATE TABLE y(b TEXT);
@@ -371,6 +397,7 @@ expect {
 
 # regression test: hash table destroyed by HashClose but not rebuilt due to Once
 # in correlated subqueries with hash joins
+@cross-check-integrity
 test correlated-subquery-hash-join-reuse {
     CREATE TABLE outer_loop (id INTEGER PRIMARY KEY);
     CREATE TABLE build_table (id INTEGER PRIMARY KEY, key INTEGER);
@@ -395,6 +422,7 @@ expect {
 }
 
 @skip-if sqlite "sqlite supports full outer joins"
+@cross-check-integrity
 test full-outer-join {
 	create table t(a);
 	create table u(a);
@@ -408,6 +436,7 @@ expect error {
 # Regression test for LEFT JOIN + materialized subquery bug
 # After NullRow, Next should not continue iterating the ephemeral index
 # The fix is in op_next: check null_flag before advancing cursor
+@cross-check-integrity
 test left-join-materialized-subquery-nullrow-bug {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
@@ -482,6 +511,7 @@ expect {
 # The optimizer scans t_int (INTEGER affinity) and seeks idx_text_val (TEXT
 # affinity).  The OP_Affinity before the seek must use the index column's
 # affinity (TEXT) so the integer probe is coerced to text before seeking.
+@cross-check-integrity
 test join-text-index-integer-probe {
     CREATE TABLE t_text(id INTEGER PRIMARY KEY, val TEXT);
     CREATE INDEX idx_text_val ON t_text(val);
@@ -496,6 +526,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test join-text-index-integer-probe-reversed {
     CREATE TABLE t_text(id INTEGER PRIMARY KEY, val TEXT);
     CREATE INDEX idx_text_val ON t_text(val);
@@ -510,6 +541,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test join-text-index-integer-probe-no-index {
     CREATE TABLE t_text(id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO t_text VALUES (1, '100'), (2, '200');
@@ -524,6 +556,7 @@ expect {
 
 # Range seek on TEXT index with integer probes — exercises the end-key affinity
 # path in emit_seek_termination (same underlying fix as the equality case above).
+@cross-check-integrity
 test text-index-range-seek-integer-probes {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
     CREATE INDEX idx_t_val ON t(val);

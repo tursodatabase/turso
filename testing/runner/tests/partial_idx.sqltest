@@ -1,6 +1,7 @@
 @database :memory:
 @skip-file-if mvcc "partial indexes not fully supported in MVCC mode"
 
+@cross-check-integrity
 test partial-index-unique-basic {
     CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, status TEXT);
     CREATE UNIQUE INDEX idx_active_email ON users(email) WHERE status = 'active';
@@ -15,6 +16,7 @@ expect {
     3|user@test.com|deleted
 }
 
+@cross-check-integrity
 test partial-index-unique-violation {
     CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, status TEXT);
     CREATE UNIQUE INDEX idx_active_email ON users(email) WHERE status = 'active';
@@ -27,6 +29,7 @@ expect error {
     UNIQUE constraint failed: users.email
 }
 
+@cross-check-integrity
 test partial-index-expression-where {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
     CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
@@ -43,6 +46,7 @@ expect {
     4|ABC123|75
 }
 
+@cross-check-integrity
 test partial-index-expensive-violation {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
     CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
@@ -56,6 +60,7 @@ expect error {
     UNIQUE constraint failed: products.sku
 }
 
+@cross-check-integrity
 test partial-index-expensive-violation-update {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
     CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
@@ -69,6 +74,7 @@ expect error {
     UNIQUE constraint failed: products.sku
 }
 
+@cross-check-integrity
 test partial-index-null-where {
     CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT, category TEXT);
     CREATE UNIQUE INDEX idx_categorized ON items(code) WHERE category IS NOT NULL;
@@ -85,6 +91,7 @@ expect {
     4|ITEM2|books
 }
 
+@cross-check-integrity
 test partial-index-function-where {
     CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
     CREATE UNIQUE INDEX idx_lower_title ON docs(title) WHERE LOWER(title) = title;
@@ -96,6 +103,7 @@ expect error {
     UNIQUE constraint failed: docs.title
 }
 
+@cross-check-integrity
 test partial-index-multiple {
     CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT, priority INTEGER, status TEXT);
     CREATE UNIQUE INDEX idx_urgent ON tasks(name) WHERE priority = 1;
@@ -113,6 +121,7 @@ expect {
     4|task2|1|done
 }
 
+@cross-check-integrity
 test partial-index-multiple-violation-priority {
     CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT, priority INTEGER, status TEXT);
     CREATE UNIQUE INDEX idx_urgent ON tasks(name) WHERE priority = 1;
@@ -127,6 +136,7 @@ expect error {
     UNIQUE constraint failed: tasks.name
 }
 
+@cross-check-integrity
 test partial-index-multiple-violation-status {
     CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT, priority INTEGER, status TEXT);
     CREATE UNIQUE INDEX idx_urgent ON tasks(name) WHERE priority = 1;
@@ -141,6 +151,7 @@ expect error {
     UNIQUE constraint failed: tasks.name
 }
 
+@cross-check-integrity
 test partial-index-update-rowid {
     CREATE TABLE rowid_test (id INTEGER PRIMARY KEY, val TEXT, flag INTEGER);
     CREATE UNIQUE INDEX idx_flagged ON rowid_test(val) WHERE flag = 1;
@@ -154,6 +165,7 @@ expect {
     10|test|1
 }
 
+@cross-check-integrity
 test partial-index-update-complex {
     CREATE TABLE complex (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c TEXT);
     CREATE UNIQUE INDEX idx_complex ON complex(a) WHERE b > 10 AND c = 'active';
@@ -166,6 +178,7 @@ expect error {
     UNIQUE constraint failed: complex.a
 }
 
+@cross-check-integrity
 test partial-index-delete {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
     CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
@@ -183,6 +196,7 @@ expect {
     6|XYZ789|600
 }
 
+@cross-check-integrity
 test partial-index-delete-function-where {
     CREATE TABLE func_del (id INTEGER PRIMARY KEY, name TEXT);
     CREATE UNIQUE INDEX idx_lower ON func_del(name) WHERE LOWER(name) = name;
@@ -201,6 +215,7 @@ expect {
     5|another
 }
 
+@cross-check-integrity
 test partial-index-delete-all {
     CREATE TABLE del_all (id INTEGER PRIMARY KEY, val TEXT, flag INTEGER);
     CREATE UNIQUE INDEX idx_all ON del_all(val) WHERE flag = 1;
@@ -213,6 +228,7 @@ expect error {
     UNIQUE constraint failed: del_all.val
 }
 
+@cross-check-integrity
 test partial-index-delete-cascade-scenario {
     CREATE TABLE parent_del (id INTEGER PRIMARY KEY, status TEXT);
     CREATE TABLE child_del (id INTEGER PRIMARY KEY, parent_id INTEGER, name TEXT, active INTEGER);
@@ -230,6 +246,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test partial-index-delete-null-where {
     CREATE TABLE null_del (id INTEGER PRIMARY KEY, code TEXT, category TEXT);
     CREATE UNIQUE INDEX idx_with_category ON null_del(code) WHERE category IS NOT NULL;
@@ -247,6 +264,7 @@ expect {
     5|CODE1|cat3
 }
 
+@cross-check-integrity
 test partial-index-delete-complex-where {
     CREATE TABLE complex_del (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT);
     CREATE UNIQUE INDEX idx_complex ON complex_del(c) WHERE a > 10 AND b < 20;
@@ -262,6 +280,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test partial-index-update-enter-conflict-1 {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
     CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
@@ -273,6 +292,7 @@ expect error {
     UNIQUE constraint failed: products.sku
 }
 
+@cross-check-integrity
 test partial-index-update-change-key-conflict {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
     CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
@@ -284,6 +304,7 @@ expect error {
     UNIQUE constraint failed: products.sku
 }
 
+@cross-check-integrity
 test partial-index-update-exit-then-reenter {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
     CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
@@ -296,6 +317,7 @@ expect error {
     UNIQUE constraint failed: products.sku
 }
 
+@cross-check-integrity
 test partial-index-update-multirow-conflict {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
     CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
@@ -308,6 +330,7 @@ expect error {
     UNIQUE constraint failed: products.sku
 }
 
+@cross-check-integrity
 test partial-index-update-unrelated-column {
     CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
     CREATE UNIQUE INDEX idx_active_email ON users(email) WHERE status = 'active';
@@ -321,6 +344,7 @@ expect {
     2|u@test.com|inactive|changed
 }
 
+@cross-check-integrity
 test partial-index-update-null-enters-conflict {
     CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT, category TEXT);
     CREATE UNIQUE INDEX idx_categorized ON items(code) WHERE category IS NOT NULL;
@@ -332,6 +356,7 @@ expect error {
     UNIQUE constraint failed: items.code
 }
 
+@cross-check-integrity
 test partial-index-update-function-enters {
     CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
     CREATE UNIQUE INDEX idx_lower_title ON docs(title) WHERE LOWER(title) = title;
@@ -343,6 +368,7 @@ expect error {
     UNIQUE constraint failed: docs.title
 }
 
+@cross-check-integrity
 test partial-index-update-multicol-enter-conflict {
     CREATE TABLE inv (id INTEGER PRIMARY KEY, sku TEXT, region TEXT, price INT);
     CREATE UNIQUE INDEX idx_sr ON inv(sku,region) WHERE price > 100;
@@ -355,6 +381,7 @@ expect error {
     UNIQUE constraint failed: inv.sku, inv.region
 }
 
+@cross-check-integrity
 test partial-index-update-multicol-change-second {
     CREATE TABLE inv2 (id INTEGER PRIMARY KEY, sku TEXT, region TEXT, price INT);
     CREATE UNIQUE INDEX idx_sr2 ON inv2(sku,region) WHERE price > 100;
@@ -366,6 +393,7 @@ expect error {
     UNIQUE constraint failed: inv2.sku, inv2.region
 }
 
+@cross-check-integrity
 test partial-index-update-exit-change-key-reenter {
     CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INT);
     CREATE UNIQUE INDEX idx_a ON t(a) WHERE b > 0;
@@ -379,6 +407,7 @@ expect error {
     UNIQUE constraint failed: t.a
 }
 
+@cross-check-integrity
 test partial-index-update-rowid-no-self-conflict {
     CREATE TABLE rowid_test (id INTEGER PRIMARY KEY, val TEXT, flag INT);
     CREATE UNIQUE INDEX idx_flagged ON rowid_test(val) WHERE flag = 1;
@@ -390,6 +419,7 @@ expect {
     9|v|1
 }
 
+@cross-check-integrity
 test partial-index-update-batch-crossing {
     CREATE TABLE p (id INTEGER PRIMARY KEY, k TEXT, x INT);
     CREATE UNIQUE INDEX idx_k ON p(k) WHERE x > 0;
@@ -402,6 +432,7 @@ expect error {
     UNIQUE constraint failed: p.k
 }
 
+@cross-check-integrity
 test partial-index-update-stay-in-predicate-change-to-unique {
     CREATE TABLE q (id INTEGER PRIMARY KEY, k TEXT, x INT);
     CREATE UNIQUE INDEX idx_kx ON q(k) WHERE x > 0;
@@ -415,6 +446,7 @@ expect {
     2|B|1
 }
 
+@cross-check-integrity
 test partial-index-update-only-predicate-col-error {
     CREATE TABLE r2 (id INTEGER PRIMARY KEY, k TEXT, x INT);
     CREATE UNIQUE INDEX idx_k ON r2(k) WHERE x > 0;
@@ -426,6 +458,7 @@ expect error {
     UNIQUE constraint failed: r2.k
 }
 
+@cross-check-integrity
 test partial-index-multi-predicate-references {
     CREATE TABLE r2 (id INTEGER PRIMARY KEY, k TEXT, x INT);
     CREATE UNIQUE INDEX idx_k ON r2(k) WHERE x < 10 AND id > 10;
@@ -438,6 +471,7 @@ expect {
     13
 }
 
+@cross-check-integrity
 test partial-index-multi-predicate-references-rowid-alias {
     CREATE TABLE r2 (id INTEGER PRIMARY KEY, k TEXT, x INT);
     CREATE UNIQUE INDEX idx_k ON r2(k) WHERE x < 10 AND id > 10;
@@ -451,6 +485,7 @@ expect error {
     UNIQUE constraint failed: r2.k
 }
 
+@cross-check-integrity
 test upsert-partial-donothing-basic {
     CREATE TABLE u1(id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
     CREATE UNIQUE INDEX idx_active_email ON u1(email) WHERE status='active';
@@ -461,6 +496,7 @@ test upsert-partial-donothing-basic {
 expect error {
 }
 
+@cross-check-integrity
 test upsert-partial-doupdate-basic {
     CREATE TABLE u2(id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
     CREATE UNIQUE INDEX idx_active_email ON u2(email) WHERE status='active';
@@ -474,6 +510,7 @@ expect {
     1|a@test|active|nNEW
 }
 
+@cross-check-integrity
 test upsert-partial-doupdate-leave-predicate {
     CREATE TABLE u3(id INTEGER PRIMARY KEY, email TEXT, status TEXT);
     CREATE UNIQUE INDEX idx_active_email ON u3(email) WHERE status='active';
@@ -489,6 +526,7 @@ expect {
     2|a@test|active
 }
 
+@cross-check-integrity
 test upsert-partial-doupdate-where-skip {
     CREATE TABLE u4(id INTEGER PRIMARY KEY, email TEXT, status TEXT, hits INT DEFAULT 0);
     CREATE UNIQUE INDEX idx_active_email ON u4(email) WHERE status='active';
@@ -502,6 +540,7 @@ expect {
     1|a@test|active|5
 }
 
+@cross-check-integrity
 test upsert-partial-omitted-target-matches {
     CREATE TABLE u6(id INTEGER PRIMARY KEY, email TEXT, status TEXT, n INT);
     CREATE UNIQUE INDEX idx_active_email ON u6(email) WHERE status='active';
@@ -515,6 +554,7 @@ expect {
     1|a@test|active|10
 }
 
+@cross-check-integrity
 test upsert-partial-multicol-leave-predicate {
     CREATE TABLE m2(id INTEGER PRIMARY KEY, sku TEXT, region TEXT, price INT);
     CREATE UNIQUE INDEX idx_sr ON m2(sku,region) WHERE price > 100;
@@ -530,6 +570,7 @@ expect {
     2|A|US|200
 }
 
+@cross-check-integrity
 test upsert-partial-func-predicate {
     CREATE TABLE d1(id INTEGER PRIMARY KEY, title TEXT, n INT DEFAULT 0);
     CREATE UNIQUE INDEX idx_lower_title ON d1(title) WHERE LOWER(title)=title;
@@ -543,6 +584,7 @@ expect {
     1|lower|1
 }
 
+@cross-check-integrity
 test upsert-partial-rowid-predicate {
     CREATE TABLE r1(id INTEGER PRIMARY KEY, k TEXT, x INT, hits INT DEFAULT 0);
     CREATE UNIQUE INDEX idx_k ON r1(k) WHERE x < 10 AND id > 10;
@@ -557,6 +599,7 @@ expect {
     A|1
 }
 
+@cross-check-integrity
 test upsert-partial-excluded-rewrite {
     CREATE TABLE ex1(id INTEGER PRIMARY KEY, a TEXT, b INT, c TEXT);
     CREATE UNIQUE INDEX idx_a ON ex1(a) WHERE b>0;
@@ -570,6 +613,7 @@ expect {
     1|X|1|new
 }
 
+@cross-check-integrity
 test upsert-partial-stay-change-to-unique {
     CREATE TABLE s1(id INTEGER PRIMARY KEY, a TEXT, flag INT);
     CREATE UNIQUE INDEX idx_a ON s1(a) WHERE flag=1;
@@ -583,6 +627,7 @@ expect {
     1|K2|1
 }
 
+@cross-check-integrity
 test upsert-partial-toggle-predicate {
     CREATE TABLE tgl(id INTEGER PRIMARY KEY, k TEXT, x INT);
     CREATE UNIQUE INDEX idx_k ON tgl(k) WHERE x>0;
@@ -598,6 +643,7 @@ expect {
     2|A|5
 }
 
+@cross-check-integrity
 test upsert-partial-target-pk-only {
     CREATE TABLE pko(id INTEGER PRIMARY KEY, k TEXT, x INT);
     CREATE UNIQUE INDEX idx_k ON pko(k) WHERE x>0;
@@ -610,6 +656,7 @@ expect error {
     UNIQUE constraint failed: pko.k
 }
 
+@cross-check-integrity
 test upsert-partial-omitted-no-conflict {
     CREATE TABLE insfree(id INTEGER PRIMARY KEY, k TEXT, x INT);
     CREATE UNIQUE INDEX idx_k ON insfree(k) WHERE x>0;
@@ -624,6 +671,7 @@ expect {
 }
 
 # Create a partial index with BETWEEN and verify it exists
+@cross-check-integrity
 test partial-index-between-create {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER, data TEXT);
     CREATE INDEX idx_between ON t1(val) WHERE val BETWEEN 10 AND 20;
@@ -634,6 +682,7 @@ expect {
 }
 
 # INSERT into table with partial index containing BETWEEN
+@cross-check-integrity
 test partial-index-between-insert {
     CREATE TABLE t2(id INTEGER PRIMARY KEY, val INTEGER, data TEXT);
     CREATE INDEX idx_t2 ON t2(val) WHERE val BETWEEN 5 AND 15;
@@ -651,6 +700,7 @@ expect {
 }
 
 # UPDATE rows with partial index containing BETWEEN - moving in/out of index range
+@cross-check-integrity
 test partial-index-between-update {
     CREATE TABLE t3(id INTEGER PRIMARY KEY, val INTEGER);
     CREATE INDEX idx_t3 ON t3(val) WHERE val BETWEEN 0 AND 10;
@@ -666,6 +716,7 @@ expect {
 }
 
 # DELETE rows with partial index containing BETWEEN
+@cross-check-integrity
 test partial-index-between-delete {
     CREATE TABLE t4(id INTEGER PRIMARY KEY, val INTEGER);
     CREATE INDEX idx_t4 ON t4(val) WHERE val BETWEEN 100 AND 200;
@@ -681,6 +732,7 @@ expect {
 }
 
 # SELECT with partial index containing BETWEEN - verify data integrity
+@cross-check-integrity
 test partial-index-between-select {
     CREATE TABLE t5(id INTEGER PRIMARY KEY, val INTEGER, name TEXT);
     CREATE INDEX idx_t5 ON t5(val) WHERE val BETWEEN 1 AND 100;
@@ -696,6 +748,7 @@ expect {
 }
 
 # Multiple partial indexes with BETWEEN on same table
+@cross-check-integrity
 test partial-index-between-multiple {
     CREATE TABLE t6(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
     CREATE INDEX idx_t6_a ON t6(a) WHERE a BETWEEN 0 AND 50;
@@ -712,6 +765,7 @@ expect {
 }
 
 # Partial index with BETWEEN on text column
+@cross-check-integrity
 test partial-index-between-text {
     CREATE TABLE t7(id INTEGER PRIMARY KEY, code TEXT);
     CREATE INDEX idx_t7 ON t7(code) WHERE code BETWEEN 'A' AND 'M';
@@ -727,6 +781,7 @@ expect {
 }
 
 # Partial index with BETWEEN combined with other conditions
+@cross-check-integrity
 test partial-index-between-combined {
     CREATE TABLE t8(id INTEGER PRIMARY KEY, val INTEGER, active INTEGER);
     CREATE INDEX idx_t8 ON t8(val) WHERE val BETWEEN 1 AND 10 AND active = 1;
@@ -742,6 +797,7 @@ expect {
 }
 
 # UNIQUE partial index with BETWEEN - should enforce uniqueness only within range
+@cross-check-integrity
 test partial-index-between-unique {
     CREATE TABLE t9(id INTEGER PRIMARY KEY, val INTEGER, code TEXT);
     CREATE UNIQUE INDEX idx_t9 ON t9(code) WHERE val BETWEEN 1 AND 10;
@@ -757,6 +813,7 @@ expect {
 }
 
 # UNIQUE partial index with BETWEEN - conflict within range should fail
+@cross-check-integrity
 test partial-index-between-unique-conflict {
     CREATE TABLE t10(id INTEGER PRIMARY KEY, val INTEGER, code TEXT);
     CREATE UNIQUE INDEX idx_t10 ON t10(code) WHERE val BETWEEN 1 AND 10;
@@ -767,6 +824,7 @@ expect error {
 }
 
 # UPSERT with partial index containing BETWEEN
+@cross-check-integrity
 test partial-index-between-upsert {
     CREATE TABLE t11(id INTEGER PRIMARY KEY, val INTEGER, data TEXT);
     CREATE UNIQUE INDEX idx_t11 ON t11(val) WHERE val BETWEEN 0 AND 100;
@@ -779,6 +837,7 @@ expect {
 }
 
 # Bulk operations with partial index containing BETWEEN
+@cross-check-integrity
 test partial-index-between-bulk {
     CREATE TABLE t12(id INTEGER PRIMARY KEY, val INTEGER);
     CREATE INDEX idx_t12 ON t12(val) WHERE val BETWEEN -10 AND 10;
@@ -796,6 +855,7 @@ expect {
 }
 
 # Update moving multiple rows in/out of BETWEEN range
+@cross-check-integrity
 test partial-index-between-update-multi {
     CREATE TABLE t13(id INTEGER PRIMARY KEY, val INTEGER);
     CREATE INDEX idx_t13 ON t13(val) WHERE val BETWEEN 10 AND 20;
@@ -812,6 +872,7 @@ expect {
 }
 
 # NOT BETWEEN in partial index
+@cross-check-integrity
 test partial-index-not-between {
     CREATE TABLE t14(id INTEGER PRIMARY KEY, val INTEGER);
     CREATE INDEX idx_t14 ON t14(val) WHERE val NOT BETWEEN 10 AND 20;
@@ -827,6 +888,7 @@ expect {
 }
 
 # Partial index with BETWEEN and NULL handling
+@cross-check-integrity
 test partial-index-between-null {
     CREATE TABLE t15(id INTEGER PRIMARY KEY, val INTEGER);
     CREATE INDEX idx_t15 ON t15(val) WHERE val BETWEEN 1 AND 100;
@@ -842,6 +904,7 @@ expect {
 }
 
 # Nested BETWEEN expressions in partial index
+@cross-check-integrity
 test partial-index-between-nested {
     CREATE TABLE t16(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
     CREATE INDEX idx_t16 ON t16(a, b) WHERE a BETWEEN 1 AND 10 AND b BETWEEN 20 AND 30;
@@ -859,6 +922,7 @@ expect {
 }
 
 # Partial index with function call using qualified column reference (issue #5037)
+@cross-check-integrity
 test partial-index-qualified-column-in-function {
     CREATE TABLE t0(c0 INT, c1 INT, c2 BOOLEAN, c3 BOOLEAN, PRIMARY KEY(c0, c2));
     CREATE UNIQUE INDEX t0i0 ON t0 (c1, c2) WHERE LENGTH(t0.c0);
@@ -872,6 +936,7 @@ expect {
 }
 
 # Partial index with doubly qualified column reference in function
+@cross-check-integrity
 test partial-index-doubly-qualified-column-in-function {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT, flag INTEGER);
     CREATE INDEX idx_t1 ON t1(val) WHERE LENGTH(main.t1.val) > 3;
@@ -886,6 +951,7 @@ expect {
 
 # OR in partial index WHERE clause (issue #5429)
 # The OR expression requires jump_target_when_true to be a real label
+@cross-check-integrity
 test partial-index-or-where-clause {
     CREATE TABLE t_or(x INTEGER);
     INSERT INTO t_or VALUES(0);
@@ -905,6 +971,7 @@ expect {
 }
 
 # NOT BETWEEN in partial index WHERE clause (desugars to OR, issue #5429)
+@cross-check-integrity
 test partial-index-not-between-existing-rows {
     CREATE TABLE t_nb(c0 INTEGER);
     INSERT INTO t_nb VALUES(1);
@@ -924,6 +991,7 @@ expect {
 }
 
 # OR with multiple existing rows that match different sides
+@cross-check-integrity
 test partial-index-or-multiple-existing {
     CREATE TABLE t_or2(val INTEGER);
     INSERT INTO t_or2 VALUES(-10);
@@ -941,6 +1009,7 @@ expect {
 }
 
 # OR in partial index with UNIQUE constraint
+@cross-check-integrity
 test partial-index-or-unique {
     CREATE TABLE t_oru(x INTEGER, y TEXT);
     INSERT INTO t_oru VALUES(10, 'a');
@@ -954,6 +1023,7 @@ expect error {
 }
 
 # Complex OR with nested AND in partial index
+@cross-check-integrity
 test partial-index-or-and-combined {
     CREATE TABLE t_oa(a INTEGER, b INTEGER);
     INSERT INTO t_oa VALUES(1, 100);

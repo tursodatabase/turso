@@ -45,6 +45,7 @@ expect {
 }
 
 # Regression: constant COALESCE with IN(...) must not generate jumps into unopened cursor loops.
+@cross-check-integrity
 test coalesce-constant-in-orderby-regression {
     DROP TABLE IF EXISTS coalesce_regression;
     CREATE TABLE coalesce_regression (a INTEGER, b INTEGER);

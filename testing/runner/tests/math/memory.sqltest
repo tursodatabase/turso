@@ -3009,6 +3009,7 @@ expect {
 
 # Test that INSERT with overflowing arithmetic in remainder works
 # SQLite allows whole-number floats to be inserted into INTEGER columns
+@cross-check-integrity
 test remainder-multiplication-overflow-insert {
     CREATE TABLE test_overflow (id INTEGER PRIMARY KEY);
     INSERT INTO test_overflow (id) VALUES (5949738080128696532 * 2434505998659733097 % -586451354473716618);
@@ -3019,6 +3020,7 @@ expect {
     426601719749026560
 }
 
+@cross-check-integrity
 test is-nonnull-divide-by-zero {
     CREATE TABLE t (x PRIMARY KEY, y, z);
     INSERT INTO t VALUES (37, -70, -196792117);

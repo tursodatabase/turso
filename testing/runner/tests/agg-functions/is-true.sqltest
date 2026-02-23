@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test sum-is-true-ungrouped-and-join {
     CREATE TABLE t0(c0 INT NOT NULL);
     CREATE TABLE t1(c0 INT NOT NULL);

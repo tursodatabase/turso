@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test window-partition-by-duplicate-columns {
     CREATE TABLE t1 (a INTEGER, b INTEGER, c INTEGER);
     INSERT INTO t1 VALUES (1, 2, 3);
@@ -12,6 +13,7 @@ expect @js {
     1
 }
 
+@cross-check-integrity
 test window-partition-by-duplicate-columns-multi-row {
     CREATE TABLE t2 (a INTEGER, b INTEGER, c INTEGER);
     INSERT INTO t2 VALUES (1, 10, 100), (2, 10, 100), (3, 20, 200), (4, 20, 200);
@@ -24,6 +26,7 @@ expect {
     7
 }
 
+@cross-check-integrity
 test window-partition-by-duplicate-columns-collation {
     CREATE TABLE t3 (val INTEGER, name TEXT COLLATE NOCASE);
     INSERT INTO t3 VALUES (1, 'Apple'), (2, 'apple'), (3, 'Banana'), (4, 'banana');
@@ -36,6 +39,7 @@ expect {
     7
 }
 
+@cross-check-integrity
 test window-collate-partition-by {
     CREATE TABLE fruits(name collate nocase);
     INSERT INTO fruits(name) VALUES ('Apple'), ('banana'), ('apple');
@@ -50,6 +54,7 @@ expect {
     banana|1
 }
 
+@cross-check-integrity
 test window-collate-order-by {
     CREATE TABLE fruits(name collate nocase);
     INSERT INTO fruits(name) VALUES ('Apple'),('banana'), ('apple');
@@ -64,6 +69,7 @@ expect {
     banana|3
 }
 
+@cross-check-integrity
 test window-in-exists-subquery-referencing-outer-column {
     CREATE TABLE t1 (a);
     INSERT INTO t1 VALUES (1), (2), (3);

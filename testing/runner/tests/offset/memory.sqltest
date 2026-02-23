@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test select-limit-comma-offset-equivalence {
     CREATE TABLE nums (x INTEGER);
     INSERT INTO nums VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
@@ -16,6 +17,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3300
+@cross-check-integrity
 test select-ungrouped-aggregate-with-offset-limit {
     CREATE TABLE t(a INTEGER);
     INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
@@ -30,6 +32,7 @@ test offset-expr-can-be-cast-losslessly-1 {
 expect {
 }
 
+@cross-check-integrity
 test offset-expr-can-be-cast-losslessly-2 {
     CREATE TABLE T(a);
     INSERT INTO T VALUES (1),(2),(3),(4);
@@ -40,6 +43,7 @@ expect {
 }
 
 # Strings are cast to float. Final result is integer losslessly
+@cross-check-integrity
 test offset-expr-can-be-cast-losslessly-3 {
     CREATE TABLE T(a);
     INSERT INTO T VALUES (1),(2),(3),(4);

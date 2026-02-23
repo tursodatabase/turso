@@ -34,6 +34,7 @@ expect {
 # SQLite has memory mode, but we only report wal or mvcc
 @backend rust
 @skip-if mvcc "should return something different for mvcc"
+@cross-check-integrity
 test pragma-function-update-journal-mode {
     SELECT * FROM pragma_journal_mode()
 }
@@ -43,6 +44,7 @@ expect {
 
 # SQLite only allows memory mode when in memory, but we allow wal or mvcc for in-mem dbs
 @backend rust
+@cross-check-integrity
 test pragma-update-journal-mode-wal {
     PRAGMA journal_mode=WAL
 }
@@ -58,6 +60,7 @@ expect {
 }
 
 @skip-if mvcc "page_count not implemented for mvcc"
+@cross-check-integrity
 test pragma-page-count-table {
     CREATE TABLE foo (bar);
     PRAGMA page_count
@@ -66,6 +69,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test pragma-function-argument-with-space {
     CREATE TABLE "foo bar"(c0);
     SELECT * FROM pragma_table_info('foo bar')
@@ -81,6 +85,7 @@ expect {
 # - CREATE TABLE foo (c0);
 # - SELECT 'bar';
 # No output means that none of them were executed.
+@cross-check-integrity
 test pragma-function-sql-injection {
     SELECT * FROM pragma_table_info('sqlite_schema'';CREATE TABLE foo (c0);SELECT ''bar');
     SELECT * FROM pragma_table_info('foo');
@@ -89,6 +94,7 @@ expect {
 }
 
 # pragma page_size=xxx doesn't change the page size of an initialized database.
+@cross-check-integrity
 test pragma-page-size-set-initialized-db {
     CREATE TABLE "foo bar"(c0);
     PRAGMA page_size=1024;
@@ -99,6 +105,7 @@ expect {
 }
 
 @skip-if mvcc "max_page_count and page_count not implemented for mvcc"
+@cross-check-integrity
 test pragma-max-page-count-clamping-with-data {
     CREATE TABLE test (id INTEGER);
     PRAGMA page_count;
@@ -110,6 +117,7 @@ expect {
 }
 
 @skip-if mvcc "max_page_count not implemented for mvcc"
+@cross-check-integrity
 test pragma-max-page-count-enforcement-error {
     PRAGMA max_page_count = 1;
     CREATE TABLE test (id INTEGER)
@@ -141,6 +149,7 @@ expect {
 }
 
 @skip-if mvcc "user_version not implemented for mvcc"
+@cross-check-integrity
 test pragma-user-version-update {
     PRAGMA user_version = 42;
     PRAGMA user_version;
@@ -175,6 +184,7 @@ expect {
 }
 
 @skip-if mvcc "application_id not implemented for mvcc"
+@cross-check-integrity
 test pragma-application-id-update {
     PRAGMA application_id = 12345;
     PRAGMA application_id;

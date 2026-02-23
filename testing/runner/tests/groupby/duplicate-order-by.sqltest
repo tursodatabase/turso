@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test duplicate_order_by_with_group_by {
     CREATE TABLE t(a);
     INSERT INTO t VALUES (3), (1), (2);
@@ -11,6 +12,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test duplicate_order_by_desc_with_group_by {
     CREATE TABLE t2(a);
     INSERT INTO t2 VALUES (3), (1), (2);
@@ -22,6 +24,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test triple_duplicate_order_by_with_group_by {
     CREATE TABLE t3(a);
     INSERT INTO t3 VALUES (3), (1), (2);

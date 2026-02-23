@@ -5,6 +5,7 @@
 # Blobs with non-UTF-8 bytes must still parse the leading digits correctly,
 # matching SQLite behavior.
 
+@cross-check-integrity
 test total-blob-ascii-digit-prefix {
     CREATE TABLE t1 (a INTEGER PRIMARY KEY, b BLOB);
     INSERT INTO t1 VALUES (1, X'3941');
@@ -17,6 +18,7 @@ expect @js {
     9
 }
 
+@cross-check-integrity
 test total-blob-non-utf8-with-leading-digit {
     CREATE TABLE t2 (a INTEGER PRIMARY KEY, b BLOB);
     INSERT INTO t2 VALUES (1, X'395E459F');
@@ -29,6 +31,7 @@ expect @js {
     9
 }
 
+@cross-check-integrity
 test total-blob-long-non-utf8-with-leading-digit {
     CREATE TABLE t3 (a INTEGER PRIMARY KEY, b BLOB);
     INSERT INTO t3 VALUES (1, X'395E459FF9CE1328346F9BF1CDD0604D');
@@ -41,6 +44,7 @@ expect @js {
     9
 }
 
+@cross-check-integrity
 test total-blob-no-leading-digit {
     CREATE TABLE t4 (a INTEGER PRIMARY KEY, b BLOB);
     INSERT INTO t4 VALUES (1, X'4655');
@@ -53,6 +57,7 @@ expect @js {
     0
 }
 
+@cross-check-integrity
 test sum-blob-non-utf8-with-leading-digit {
     CREATE TABLE t5 (a INTEGER PRIMARY KEY, b BLOB);
     INSERT INTO t5 VALUES (1, X'399F4142');
@@ -66,6 +71,7 @@ expect @js {
     real|48
 }
 
+@cross-check-integrity
 test sum-cast-text-to-blob-returns-real {
     CREATE TABLE t6 (id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO t6 VALUES (1, '10'), (2, '20'), (3, '30');

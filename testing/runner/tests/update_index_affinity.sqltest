@@ -5,6 +5,7 @@
 # that need type conversion (e.g., TEXT to REAL)
 # Regression test for differential fuzzer seed 4000
 
+@cross-check-integrity
 test update-index-affinity-text-to-real {
     CREATE TABLE t1 (pk TEXT PRIMARY KEY, a REAL, b TEXT NOT NULL);
     INSERT INTO t1 VALUES ('pk1', -1e-124, '5364810111559134897');
@@ -30,6 +31,7 @@ expect @js {
     ok
 }
 
+@cross-check-integrity
 test update-index-affinity-nullif-expression {
     CREATE TABLE t2 (pk TEXT PRIMARY KEY, a REAL, b TEXT NOT NULL);
     INSERT INTO t2 VALUES ('pk1', -1e-124, '5364810111559134897');
@@ -47,6 +49,7 @@ expect @js {
     ok
 }
 
+@cross-check-integrity
 test update-index-affinity-multi-column {
     CREATE TABLE t3 (pk TEXT PRIMARY KEY, w REAL NOT NULL, mov REAL NOT NULL, inq REAL, ngb TEXT NOT NULL);
     INSERT INTO t3 VALUES ('pk1', 1.0, -1e-124, -1e-66, '5364810111559134897');
@@ -71,6 +74,7 @@ expect @js {
     ok
 }
 
+@cross-check-integrity
 test update-index-affinity-non-unique {
     CREATE TABLE t4 (pk INTEGER PRIMARY KEY, a REAL, b TEXT);
     INSERT INTO t4 VALUES (1, 1.0, '12345');

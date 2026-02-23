@@ -34,6 +34,7 @@ expect {
 }
 
 @setup tables
+@cross-check-integrity
 test window-over-triple-selfjoin-update {
     UPDATE v0 SET c1 = c1 + 1e18 WHERE ( SELECT * FROM v0 AS a4
       JOIN v0 AS a5 USING ( c1 ) JOIN v0 AS a6 USING ( c1 )

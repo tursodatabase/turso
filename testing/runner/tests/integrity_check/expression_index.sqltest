@@ -8,6 +8,7 @@
 # pos_in_table = usize::MAX as a sentinel value indicating they're not
 # direct column references.
 
+@cross-check-integrity
 test integrity-check-expression-index {
     CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
     CREATE INDEX idx ON t(a + 1);
@@ -18,6 +19,7 @@ expect {
     ok
 }
 
+@cross-check-integrity
 test integrity-check-expression-index-empty-table {
     CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
     CREATE INDEX idx ON t(a * 2);
@@ -27,6 +29,7 @@ expect {
     ok
 }
 
+@cross-check-integrity
 test integrity-check-multiple-expression-indexes {
     CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
     CREATE INDEX idx1 ON t(a + 1);
@@ -38,6 +41,7 @@ expect {
     ok
 }
 
+@cross-check-integrity
 test integrity-check-mixed-column-and-expression-index {
     CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
     CREATE INDEX idx_regular ON t(a);
@@ -49,6 +53,7 @@ expect {
     ok
 }
 
+@cross-check-integrity
 test quick-check-expression-index {
     CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
     CREATE INDEX idx ON t(a + 1);

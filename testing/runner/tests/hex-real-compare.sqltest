@@ -5,6 +5,7 @@
 #
 # SQLite evaluates this predicate as false for all rows below.
 # A buggy implementation may treat one positive REAL row as true and delete it.
+@cross-check-integrity
 test compare-hex-real-le-delete-regression {
     CREATE TABLE t_hex_real_cmp (x REAL);
     INSERT INTO t_hex_real_cmp VALUES

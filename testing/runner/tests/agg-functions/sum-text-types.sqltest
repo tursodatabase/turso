@@ -4,6 +4,7 @@
 # matching SQLite behavior. Text like '4abc' partially parses as integer 4,
 # but because it's not a pure integer string, SUM treats it as approximate.
 
+@cross-check-integrity
 test sum-partial-integer-text-returns-real {
     CREATE TABLE t1 (a TEXT);
     INSERT INTO t1 VALUES ('4abc');
@@ -17,6 +18,7 @@ expect @js {
     real|7
 }
 
+@cross-check-integrity
 test sum-pure-integer-text-returns-integer {
     CREATE TABLE t2 (a TEXT);
     INSERT INTO t2 VALUES ('4');
@@ -27,6 +29,7 @@ expect {
     integer|7
 }
 
+@cross-check-integrity
 test sum-non-numeric-text-returns-real {
     CREATE TABLE t3 (a TEXT);
     INSERT INTO t3 VALUES ('abc');
@@ -39,6 +42,7 @@ expect @js {
     real|0
 }
 
+@cross-check-integrity
 test sum-mixed-pure-and-partial-text-returns-real {
     CREATE TABLE t4 (a TEXT);
     INSERT INTO t4 VALUES ('4');
@@ -53,6 +57,7 @@ expect @js {
 }
 
 
+@cross-check-integrity
 test sum-text-default-partial-numeric {
     CREATE TABLE t5 (a INTEGER PRIMARY KEY, b TEXT DEFAULT ('4dMH'));
     INSERT INTO t5 (a) VALUES (1);

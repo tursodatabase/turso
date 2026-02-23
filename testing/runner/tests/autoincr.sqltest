@@ -1,6 +1,7 @@
 @database :memory:
 
 # Test: Create an AUTOINCREMENT table and verify sqlite_sequence is also created.
+@cross-check-integrity
 test autoinc-create-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;
@@ -11,6 +12,7 @@ expect {
 }
 
 # Test: The sqlite_sequence table is initially empty after table creation.
+@cross-check-integrity
 test autoinc-sequence-table-is-initially-empty {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     SELECT * FROM sqlite_sequence;
@@ -19,6 +21,7 @@ expect {
 }
 
 # Test: You cannot drop the sqlite_sequence table.
+@cross-check-integrity
 test autoinc-fail-drop-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     DROP TABLE sqlite_sequence;
@@ -27,6 +30,7 @@ expect error {
 }
 
 # Test: You cannot create an index on the sqlite_sequence table.
+@cross-check-integrity
 test autoinc-fail-index-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     CREATE INDEX seqidx ON sqlite_sequence(name);
@@ -35,6 +39,7 @@ expect error {
 }
 
 # Test: First insert populates sqlite_sequence.
+@cross-check-integrity
 test autoinc-first-insert-populates-sequence {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(12,34);
@@ -45,6 +50,7 @@ expect {
 }
 
 # Test: Inserting a value larger than the current sequence updates the sequence.
+@cross-check-integrity
 test autoinc-larger-insert-updates-sequence {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(12,34);
@@ -56,6 +62,7 @@ expect {
 }
 
 # Test: Inserting NULL generates a key one greater than the max.
+@cross-check-integrity
 test autoinc-null-insert-increments-sequence {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(123,456);
@@ -67,6 +74,7 @@ expect {
 }
 
 # Test: Sequence value is not decreased after a DELETE.
+@cross-check-integrity
 test autoinc-sequence-not-decremented-by-delete {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(123,456);
@@ -79,6 +87,7 @@ expect {
 }
 
 # Test: A NULL insert after a DELETE continues from the previous high-water mark.
+@cross-check-integrity
 test autoinc-insert-after-delete-uses-high-water-mark {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(125, 1);
@@ -91,6 +100,7 @@ expect {
 }
 
 # Test: Clearing a table does not reset the sequence.
+@cross-check-integrity
 test autoinc-delete-all-does-not-reset-sequence {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(125, 456);
@@ -102,6 +112,7 @@ expect {
 }
 
 # Test: Manually updating the sequence table affects the next generated key.
+@cross-check-integrity
 test autoinc-manual-update-to-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(1, 1);
@@ -115,6 +126,7 @@ expect {
 }
 
 # Test: AUTOINCREMENT works for multiple tables independently.
+@cross-check-integrity
 test autoinc-multiple-tables {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     CREATE TABLE t2(d, e INTEGER PRIMARY KEY AUTOINCREMENT, f);
@@ -133,6 +145,7 @@ expect {
 }
 
 # Test: Dropping an AUTOINCREMENT table removes its entry from sqlite_sequence.
+@cross-check-integrity
 test autoinc-drop-table-removes-sequence-entry {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     CREATE TABLE t2(d, e INTEGER PRIMARY KEY AUTOINCREMENT, f);
@@ -146,6 +159,7 @@ expect {
 }
 
 # Test: When the last AUTOINCREMENT table is dropped, the sequence table remains but is empty.
+@cross-check-integrity
 test autoinc-drop-last-table-empties-sequence {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     DROP TABLE t1;
@@ -155,6 +169,7 @@ expect {
 }
 
 # Test: AUTOINCREMENT fails if the maximum rowid is reached. (Assumes 64-bit rowid)
+@cross-check-integrity
 test autoinc-fail-on-max-rowid {
     CREATE TABLE t6(v INTEGER PRIMARY KEY AUTOINCREMENT, w);
     INSERT INTO t6 VALUES(9223372036854775807, 1);
@@ -164,6 +179,7 @@ expect error {
 }
 
 # Test: AUTOINCREMENT keyword is allowed in a separate PRIMARY KEY clause.
+@cross-check-integrity
 test autoinc-keyword-in-pk-clause {
     CREATE TABLE t7(x INTEGER, y REAL, PRIMARY KEY(x AUTOINCREMENT));
     INSERT INTO t7(y) VALUES(123);
@@ -181,6 +197,7 @@ expect @js {
 }
 
 # Test: AUTOINCREMENT fails if the primary key is not an INTEGER.
+@cross-check-integrity
 test autoinc-fail-on-non-integer-pk {
     CREATE TABLE t8(x TEXT PRIMARY KEY AUTOINCREMENT);
 }
@@ -188,6 +205,7 @@ expect error {
 }
 
 # Test: An empty INSERT...SELECT does not damage the sequence table. (Ticket #3148)
+@cross-check-integrity
 test autoinc-empty-insert-select-is-safe {
     CREATE TABLE t2(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t2 VALUES(NULL, 1);
@@ -200,6 +218,7 @@ expect {
 }
 
 # Test: AUTOINCREMENT with the xfer optimization. (Ticket 7b3328086a5c1)
+@cross-check-integrity
 test autoinc-with-xfer-optimization {
     CREATE TABLE t10a(a INTEGER PRIMARY KEY AUTOINCREMENT, b UNIQUE);
     INSERT INTO t10a VALUES(888,9999);
@@ -213,6 +232,7 @@ expect {
 }
 
 # Test: AUTOINCREMENT works correctly with UPSERT.
+@cross-check-integrity
 test autoinc-with-upsert {
     CREATE TABLE t11(a INTEGER PRIMARY KEY AUTOINCREMENT, b UNIQUE);
     INSERT INTO t11(a,b) VALUES(2,3),(5,6),(4,3),(1,2)
@@ -225,6 +245,7 @@ expect {
 
 # refer https://github.com/tursodatabase/turso/pull/2983#issuecomment-3322404270 was discovered while adding autoincr to fuzz tests
 @skip-if mvcc "not supported in MVCC mode"
+@cross-check-integrity
 test autoinc-conflict-on-nothing {
     CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT);
     CREATE UNIQUE INDEX idx_k_partial ON t(k) WHERE id > 1;
@@ -241,6 +262,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3664
+@cross-check-integrity
 test autoinc-skips-manually-updated-pk {
     CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
     INSERT INTO t DEFAULT VALUES;
@@ -259,6 +281,7 @@ expect {
 # https://github.com/tursodatabase/turso/issues/5097
 # Ensure AUTOINCREMENT validation still rejects non-INTEGER PK when the PK
 # column reference uses a mixed-case quoted string name.
+@cross-check-integrity
 test autoinc-fail-on-non-integer-pk-mixed-case-string-name {
     CREATE TABLE t("Id" TEXT, PRIMARY KEY('ID' AUTOINCREMENT));
 }

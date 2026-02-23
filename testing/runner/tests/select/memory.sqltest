@@ -86,6 +86,7 @@ expect {
 }
 
 # IS TRUE/IS FALSE in WHERE clause
+@cross-check-integrity
 test is-true-where {
     CREATE TABLE t_truth(x);
     INSERT INTO t_truth VALUES(1),(0),(NULL),(8),('hello');
@@ -96,6 +97,7 @@ expect {
     8
 }
 
+@cross-check-integrity
 test is-false-where {
     CREATE TABLE t_truth(x);
     INSERT INTO t_truth VALUES(1),(0),(NULL),(8),('hello');
@@ -106,6 +108,7 @@ expect {
     hello
 }
 
+@cross-check-integrity
 test select-union-all-1 {
     CREATE TABLE t1 (x INTEGER);
     CREATE TABLE t2 (x INTEGER);
@@ -131,6 +134,7 @@ expect {
     9
 }
 
+@cross-check-integrity
 test select-union-all-with-filters {
     CREATE TABLE t4 (x INTEGER);
     CREATE TABLE t5 (x INTEGER);
@@ -152,6 +156,7 @@ expect {
     10
 }
 
+@cross-check-integrity
 test select-union-1 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -164,6 +169,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-union-all-union {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -180,6 +186,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-union-all-union-2 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -194,6 +201,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-union-3 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -208,6 +216,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-union-4 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -222,6 +231,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-union-all-union-3 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -238,6 +248,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-union-all-with-offset {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -249,6 +260,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-union-with-offset {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -260,6 +272,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-intersect-1 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -271,6 +284,7 @@ expect {
     x|x
 }
 
+@cross-check-integrity
 test select-intersect-2 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -284,6 +298,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-intersect-union {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -298,6 +313,7 @@ expect {
     z|z
 }
 
+@cross-check-integrity
 test select-union-intersect {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -311,6 +327,7 @@ expect {
     x|x
 }
 
+@cross-check-integrity
 test select-union-all-intersect {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -324,6 +341,7 @@ expect {
     x|x
 }
 
+@cross-check-integrity
 test select-intersect-union-all {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -339,6 +357,7 @@ expect {
     z|z
 }
 
+@cross-check-integrity
 test select-intersect-with-limit {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -351,6 +370,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-intersect-with-offset {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -363,6 +383,7 @@ expect {
     z|z
 }
 
+@cross-check-integrity
 test select-intersect-union-with-limit {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -378,6 +399,7 @@ expect {
     z|z
 }
 
+@cross-check-integrity
 test select-except-1 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -389,6 +411,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-except-2 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -399,6 +422,7 @@ test select-except-2 {
 expect {
 }
 
+@cross-check-integrity
 test select-except-3 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -412,6 +436,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-except-limit {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -424,6 +449,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-except-union-all {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -439,6 +465,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-union-all-except {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -452,6 +479,7 @@ expect {
     z|y
 }
 
+@cross-check-integrity
 test select-except-union {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -467,6 +495,7 @@ expect {
     z|z
 }
 
+@cross-check-integrity
 test select-union-except {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -481,6 +510,7 @@ expect {
     z|y
 }
 
+@cross-check-integrity
 test select-except-intersect {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -494,6 +524,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-intersect-except {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
@@ -506,6 +537,7 @@ test select-intersect-except {
 expect {
 }
 
+@cross-check-integrity
 test select-values-union {
     CREATE TABLE t (x TEXT, y TEXT);
     INSERT INTO t VALUES('x','x'),('y','y');
@@ -516,6 +548,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-values-union-2 {
     CREATE TABLE t (x TEXT, y TEXT);
     INSERT INTO t VALUES('x','x'),('y','y');
@@ -526,6 +559,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-values-except {
     CREATE TABLE t (x TEXT, y TEXT);
     INSERT INTO t VALUES('x','x'),('y','y');
@@ -535,6 +569,7 @@ expect {
     y|y
 }
 
+@cross-check-integrity
 test select-values-union-all-limit {
     CREATE TABLE t (x TEXT);
     INSERT INTO t VALUES('x'), ('y'), ('z');
@@ -546,6 +581,7 @@ expect {
     y
 }
 
+@cross-check-integrity
 test select-values-union-all-limit-1 {
     CREATE TABLE t (x TEXT);
     INSERT INTO t VALUES('x'), ('y'), ('z');
@@ -557,6 +593,7 @@ expect {
     x
 }
 
+@cross-check-integrity
 test select-values-union-all-offset {
     CREATE TABLE t (x TEXT);
     INSERT INTO t VALUES('x'), ('y'), ('z');
@@ -568,6 +605,7 @@ expect {
     y
 }
 
+@cross-check-integrity
 test select-values-union-all-offset-1 {
     CREATE TABLE t (x TEXT);
     INSERT INTO t VALUES('i'), ('j'), ('x'), ('y'), ('z');
@@ -582,6 +620,7 @@ expect {
 # Test that CTE column resolution in UNION ALL properly rejects columns
 # that exist in one CTE's source table but not in another's.
 # This should produce a "no such column" error, not a panic.
+@cross-check-integrity
 test select-cte-union-all-column-resolution {
     CREATE TABLE t1(a, x);
     CREATE TABLE t2(b);
@@ -597,6 +636,7 @@ expect error {
     no such column: x
 }
 
+@cross-check-integrity
 test select-no-match-in-leaf-page {
     CREATE TABLE t (a INTEGER PRIMARY KEY, b);
     insert into t values (1, randomblob(1024));
@@ -644,6 +684,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test select-range-search-count-asc-index {
     CREATE TABLE t (a, b);
     CREATE INDEX t_idx ON t(a, b);
@@ -695,6 +736,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test select-range-search-count-desc-index {
     CREATE TABLE t (a, b);
     CREATE INDEX t_idx ON t(a, b DESC);
@@ -746,6 +788,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test select-range-search-scan-asc-index {
     CREATE TABLE t (a, b);
     CREATE INDEX t_idx ON t(a, b);
@@ -785,6 +828,7 @@ expect {
     2|2
 }
 
+@cross-check-integrity
 test select-range-search-scan-desc-index {
     CREATE TABLE t (a, b);
     CREATE INDEX t_idx ON t(a, b DESC);
@@ -887,6 +931,7 @@ expect raw {
 
 }
 
+@cross-check-integrity
 test select-in-complex {
     CREATE TABLE test_table (id INTEGER, category TEXT, value INTEGER);
     INSERT INTO test_table VALUES (1, 'A', 10), (2, 'B', 20), (3, 'A', 30), (4, 'C', 40);
@@ -904,6 +949,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test limit-expr-can-be-cast-losslessly-2 {
     CREATE TABLE T(a);
     INSERT INTO T VALUES (1),(1),(1),(1);
@@ -916,6 +962,7 @@ expect {
 }
 
 # Numeric strings are cast to float. The final evaluation of the expression returns an int losslessly
+@cross-check-integrity
 test limit-expr-can-be-cast-losslessly-3 {
     CREATE TABLE T(a);
     INSERT INTO T VALUES (1),(1),(1),(1);
@@ -994,6 +1041,7 @@ expect error {
     datatype mismatch
 }
 
+@cross-check-integrity
 test rowid-references {
     CREATE TABLE test_table (id INTEGER);
     INSERT INTO test_table VALUES (5),(5);
@@ -1018,6 +1066,7 @@ expect {
 }
 
 # User-defined columns named oid/rowid/_rowid_ take precedence over rowid aliases
+@cross-check-integrity
 test oid-column-overrides-rowid-alias {
     CREATE TABLE t1 (oid TEXT, name TEXT);
     INSERT INTO t1 VALUES ('my-oid', 'alice');
@@ -1027,6 +1076,7 @@ expect {
     my-oid
 }
 
+@cross-check-integrity
 test rowid-column-overrides-rowid-alias {
     CREATE TABLE t2 (rowid TEXT, val INTEGER);
     INSERT INTO t2 VALUES ('custom-rowid', 42);
@@ -1036,6 +1086,7 @@ expect {
     custom-rowid
 }
 
+@cross-check-integrity
 test _rowid_-column-overrides-rowid-alias {
     CREATE TABLE t3 (_rowid_ TEXT, val INTEGER);
     INSERT INTO t3 VALUES ('custom', 42);
@@ -1045,6 +1096,7 @@ expect {
     custom
 }
 
+@cross-check-integrity
 test rowid-alias-still-works-without-user-column {
     CREATE TABLE t4 (a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t4 VALUES (100, 'hello');
@@ -1054,6 +1106,7 @@ expect {
     100
 }
 
+@cross-check-integrity
 test null-in-search {
     CREATE TABLE t_x_asc (id INTEGER PRIMARY KEY, x);
     CREATE INDEX t_x_asc_idx ON t_x_asc(x ASC);
@@ -1081,6 +1134,7 @@ expect {
     2|2
 }
 
+@cross-check-integrity
 test limit-column-reference-error {
     CREATE TABLE t(a);
     SELECT * FROM t LIMIT (t.a);
@@ -1105,6 +1159,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3667 regression test
+@cross-check-integrity
 test rowid-select-from-clause-subquery {
     CREATE TABLE t(a);
     SELECT rowid FROM (SELECT * FROM t);
@@ -1113,6 +1168,7 @@ expect error {
     no such column: rowid
 }
 
+@cross-check-integrity
 test rowid-select-from-clause-subquery-explicit-works {
     CREATE TABLE t(a);
     INSERT INTO t values ('abc');
@@ -1123,6 +1179,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3505 regression test
+@cross-check-integrity
 test ambiguous-self-join {
     CREATE TABLE T(a);
     INSERT INTO t VALUES (1), (2), (3);
@@ -1131,6 +1188,7 @@ test ambiguous-self-join {
 expect error {
 }
 
+@cross-check-integrity
 test unambiguous-self-join {
     CREATE TABLE T(a);
     INSERT INTO t VALUES (1), (2), (3);
@@ -1149,6 +1207,7 @@ expect {
 }
 
 # Regression test for https://github.com/tursodatabase/turso/issues/3853
+@cross-check-integrity
 test order-by-limit-0 {
     CREATE TABLE t(a);
     INSERT INTO t VALUES (1), (2), (3);
@@ -1158,6 +1217,7 @@ expect {
 }
 
 # Regression test for https://github.com/tursodatabase/turso/issues/3853
+@cross-check-integrity
 test group-by-limit-0 {
     CREATE TABLE t(a);
     INSERT INTO t VALUES (1), (2), (3);
@@ -1166,6 +1226,7 @@ test group-by-limit-0 {
 expect {
 }
 
+@cross-check-integrity
 test duplicate-with-cte-name {
     CREATE TABLE t2(x INTEGER);
     WITH t as (SELECT 1), t as (SELECT 2)  SELECT  * FROM t2;
@@ -1202,6 +1263,7 @@ expect {
     1|2
 }
 
+@cross-check-integrity
 test cte-multiple-refs-with-data {
     CREATE TABLE items(id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO items VALUES (1, 10), (2, 20), (3, 30);
@@ -1281,6 +1343,7 @@ expect {
 }
 
 # Test UNION with different collations
+@cross-check-integrity
 test collate-compound-1 {
     CREATE TABLE t1(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
     INSERT INTO t1 VALUES ('abc', 'ABC'), ('ABC', 'abc'), ('def', 'DEF');
@@ -1293,6 +1356,7 @@ expect {
 }
 
 # Test INTERSECT with explicit collation
+@cross-check-integrity
 test collate-compound-3 {
     CREATE TABLE t2(x TEXT COLLATE NOCASE);
     CREATE TABLE t3(y TEXT COLLATE BINARY);
@@ -1306,6 +1370,7 @@ expect {
 }
 
 # Test EXCEPT with collation mismatch
+@cross-check-integrity
 test collate-compound-4 {
     CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
     SELECT 'abc' COLLATE NOCASE EXCEPT SELECT 'ABC' COLLATE BINARY;
@@ -1314,6 +1379,7 @@ expect {
 }
 
 # Test compound with COLLATE in result column
+@cross-check-integrity
 test collate-compound-5 {
     CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
     SELECT 'abc' COLLATE NOCASE
@@ -1325,6 +1391,7 @@ expect {
 }
 
 # Test nested compound with collations
+@cross-check-integrity
 test collate-compound-7 {
     CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
     SELECT 'a' COLLATE NOCASE
@@ -1337,6 +1404,7 @@ expect {
 }
 
 # Test UNION ALL preserving duplicates with case differences
+@cross-check-integrity
 test collate-compound-8 {
     CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
     SELECT 'Test' COLLATE NOCASE
@@ -1352,6 +1420,7 @@ expect {
 }
 
 # Test INTERSECT with RTRIM collation
+@cross-check-integrity
 test collate-compound-9 {
     CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
     SELECT 'abc  ' COLLATE RTRIM
@@ -1363,6 +1432,7 @@ abc
 }
 
 # Test compound with collation in WHERE clause
+@cross-check-integrity
 test collate-compound-10 {
     CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
     CREATE TABLE t4(col TEXT);
@@ -1378,6 +1448,7 @@ expect {
 }
 
 # Test EXCEPT with multiple collations
+@cross-check-integrity
 test collate-compound-11 {
     CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
     SELECT 'apple' UNION SELECT 'BANANA' UNION SELECT 'cherry'
@@ -1391,6 +1462,7 @@ expect {
 }
 
 # Test UNION with table having default collation vs explicit
+@cross-check-integrity
 test collate-compound-13 {
     CREATE TABLE t5(n TEXT COLLATE NOCASE);
     INSERT INTO t5 VALUES ('Test');
@@ -1403,6 +1475,7 @@ expect {
 }
 
 # Test three-way compound with different collations
+@cross-check-integrity
 test collate-compound-14 {
     CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
     SELECT 'abc'
@@ -1417,6 +1490,7 @@ expect {
 }
 
 # Test INTERSECT ALL (if supported) with collations
+@cross-check-integrity
 test collate-compound-15 {
     CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
     SELECT 'test' COLLATE NOCASE
@@ -1428,6 +1502,7 @@ expect {
 }
 
 # Queries that use an idx and have to do an affinity conversion
+@cross-check-integrity
 test affinity-conversion-1 {
     CREATE TABLE t(a TEXT);
     INSERT INTO t VALUES ('10'), ('2'), ('02'), ('2a');
@@ -1439,6 +1514,7 @@ expect {
     2a
 }
 
+@cross-check-integrity
 test affinity-conversion-2 {
     CREATE TABLE t(a TEXT);
     INSERT INTO t VALUES ('10'), ('2'), ('02'), ('2a');
@@ -1454,6 +1530,7 @@ expect {
 # TEST 1: TEXT column with INTEGER value
 # Should emit OP_Affinity to convert 2 → '2'
 # ============================================
+@cross-check-integrity
 test affinity-conversion-4 {
     CREATE TABLE t1(a TEXT);
     INSERT INTO t1 VALUES ('10'), ('2'), ('02'), ('2a');
@@ -1469,6 +1546,7 @@ expect {
 # TEST 2: TEXT column with INTEGER equality
 # Should emit OP_Affinity for equality comparison
 # ============================================
+@cross-check-integrity
 test affinity-conversion-5 {
     CREATE TABLE t2(name TEXT);
     INSERT INTO t2 VALUES ('100'), ('20'), ('abc'), ('2');
@@ -1483,6 +1561,7 @@ expect {
 # TEST 3: INTEGER column with convertible string
 # Should emit OP_Affinity with INTEGER affinity
 # ============================================
+@cross-check-integrity
 test affinity-conversion-6 {
     CREATE TABLE t3(value INTEGER);
     INSERT INTO t3 VALUES (100), (20), (5), (200);
@@ -1498,6 +1577,7 @@ expect {
 # TEST 4: INTEGER column with non-convertible string
 # String 'abc' cannot convert to integer
 # ============================================
+@cross-check-integrity
 test affinity-conversion-7 {
     CREATE TABLE t4(value INTEGER);
     INSERT INTO t4 VALUES (100), (20), (5);
@@ -1511,6 +1591,7 @@ expect {
 # TEST 5: NUMERIC column with integer
 # Should emit OP_Affinity with NUMERIC affinity
 # ============================================
+@cross-check-integrity
 test affinity-conversion-8 {
     CREATE TABLE t5(score NUMERIC);
     INSERT INTO t5 VALUES (100), (20.5), ('30'), (45);
@@ -1525,6 +1606,7 @@ expect {
 # TEST 6: REAL column with integer
 # Should emit OP_Affinity to convert to REAL
 # ============================================
+@cross-check-integrity
 test affinity-conversion-9 {
     CREATE TABLE t6(price REAL);
     INSERT INTO t6 VALUES (99.99), (19.99), (50.00), (25.50);
@@ -1540,6 +1622,7 @@ expect {
 # TEST 7: TEXT column with REAL value
 # Should emit OP_Affinity to convert 20.5 → '20.5'
 # ============================================
+@cross-check-integrity
 test affinity-conversion-10 {
     CREATE TABLE t7(name TEXT);
     INSERT INTO t7 VALUES ('100'), ('20.5'), ('abc'), ('30');
@@ -1554,6 +1637,7 @@ expect {
 # TEST 8: TEXT column with IN clause
 # Should emit OP_Affinity for batch conversion
 # ============================================
+@cross-check-integrity
 test affinity-conversion-11 {
     CREATE TABLE t8(name TEXT);
     INSERT INTO t8 VALUES ('1'), ('2'), ('3'), ('4'), ('abc');
@@ -1570,6 +1654,7 @@ expect {
 # TEST 9: Compound index with mixed types
 # Should emit OP_Affinity with multi-char affinity string
 # ============================================
+@cross-check-integrity
 test affinity-conversion-12 {
     CREATE TABLE t9(a TEXT, b INTEGER, c NUMERIC);
     INSERT INTO t9 VALUES ('100', 200, 300);
@@ -1586,6 +1671,7 @@ expect {
 # TEST 10: INTEGER PRIMARY KEY range (NO affinity)
 # Contrast: should NOT emit OP_Affinity
 # ============================================
+@cross-check-integrity
 test affinity-conversion-13 {
     CREATE TABLE t10(x INTEGER PRIMARY KEY);
     INSERT INTO t10 VALUES (1), (2), (100), (200);
@@ -1611,6 +1697,7 @@ expect {
 # TEST 12: TEXT column with string that looks numeric
 # Should apply TEXT affinity and use lexicographic order
 # ============================================
+@cross-check-integrity
 test affinity-conversion-15 {
     CREATE TABLE t12(name TEXT);
     INSERT INTO t12 VALUES ('1'), ('10'), ('2'), ('20');
@@ -1626,6 +1713,7 @@ expect {
 # TEST 13: INTEGER column with float string
 # Should convert '50.5' to 50 (INTEGER affinity)
 # ============================================
+@cross-check-integrity
 test affinity-conversion-16 {
     CREATE TABLE t13(value INTEGER);
     INSERT INTO t13 VALUES (50), (51), (100);
@@ -1641,6 +1729,7 @@ expect {
 # TEST 14: NUMERIC with text that converts
 # Should apply NUMERIC affinity
 # ============================================
+@cross-check-integrity
 test affinity-conversion-17 {
     CREATE TABLE t14(score NUMERIC);
     INSERT INTO t14 VALUES (10), (20), (30), (40);
@@ -1656,6 +1745,7 @@ expect {
 # TEST 15: Multiple columns, only one needs conversion
 # Should emit affinity string with mixed affinities
 # ============================================
+@cross-check-integrity
 test affinity-conversion-18 {
     CREATE TABLE t15(a INTEGER, b TEXT);
     INSERT INTO t15 VALUES (1, '100'), (2, '200'), (3, '300');
@@ -1670,6 +1760,7 @@ expect {
 # TEST 16: BLOB column (should not convert)
 # BLOB affinity doesn't perform conversions
 # ============================================
+@cross-check-integrity
 test affinity-conversion-19 {
     CREATE TABLE t16(data BLOB);
     INSERT INTO t16 VALUES (X'48656c6c6f'), (X'576f726c64');
@@ -1685,6 +1776,7 @@ expect {
 # TEST 17: Negative numbers with TEXT affinity
 # Should convert -5 to '-5' for comparison
 # ============================================
+@cross-check-integrity
 test affinity-conversion-20 {
     CREATE TABLE t17(name TEXT);
     INSERT INTO t17 VALUES ('-10'), ('-5'), ('0'), ('5');
@@ -1701,6 +1793,7 @@ expect {
 # TEST 18: Zero with different types
 # Tests affinity with special value zero
 # ============================================
+@cross-check-integrity
 test affinity-conversion-21 {
     CREATE TABLE t18(value NUMERIC);
     INSERT INTO t18 VALUES (0), (0.0), ('0'), (1), (-1);
@@ -1717,6 +1810,7 @@ expect {
 # TEST 19: Large numbers requiring conversion
 # Tests affinity (B) with large integer values
 # ============================================
+@cross-check-integrity
 test affinity-conversion-22 {
     CREATE TABLE t19(val TEXT);
     INSERT INTO t19 VALUES ('1000000'), ('999999'), ('1000001');
@@ -1741,6 +1835,7 @@ setup headers {
 
 @backend cli
 @setup headers
+@cross-check-integrity
 test compound-headers-1 {
     .headers on
     CREATE TABLE t(x);
@@ -1753,6 +1848,7 @@ expect {
 
 @backend cli
 @setup headers
+@cross-check-integrity
 test compound-headers-2 {
     .headers on
     CREATE TABLE t(x);

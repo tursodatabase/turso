@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test upsert-pk-update {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name);
     INSERT INTO t VALUES (1,'old');
@@ -10,6 +11,7 @@ expect {
     1|new
 }
 
+@cross-check-integrity
 test upsert-pk-do-nothing {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name);
     INSERT INTO t VALUES (1,'new');
@@ -20,6 +22,7 @@ expect {
     1|new
 }
 
+@cross-check-integrity
 test upsert-unique-update {
     CREATE TABLE u (a, b, c);
     CREATE UNIQUE INDEX u_a ON u(a);
@@ -31,6 +34,7 @@ expect {
     1|20|200
 }
 
+@cross-check-integrity
 test upsert-unique-do-nothing {
     CREATE TABLE u (a, b, c);
     CREATE UNIQUE INDEX u_a ON u(a);
@@ -43,6 +47,7 @@ expect {
     2|30|300
 }
 
+@cross-check-integrity
 test upsert-where-guard-no-change {
     CREATE TABLE g (a UNIQUE, b);
     INSERT INTO g VALUES (1,'x');
@@ -53,6 +58,7 @@ expect {
     1|x
 }
 
+@cross-check-integrity
 test upsert-where-guard-apply {
     CREATE TABLE g (a UNIQUE, b);
     INSERT INTO g VALUES (1,NULL);
@@ -63,6 +69,7 @@ expect {
     1|y
 }
 
+@cross-check-integrity
 test upsert-selfref-and-excluded {
     CREATE TABLE s (a UNIQUE, b, c);
     INSERT INTO s VALUES (1,10,'old');
@@ -74,6 +81,7 @@ expect {
     1|11|new
 }
 
+@cross-check-integrity
 test upsert-values-mixed-insert-update {
     CREATE TABLE m (a UNIQUE, b);
     INSERT INTO m VALUES (1,'one');
@@ -86,6 +94,7 @@ expect {
     2|dos
 }
 
+@cross-check-integrity
 test upsert-select-single {
     CREATE TABLE s1 (a UNIQUE, b);
     INSERT INTO s1 VALUES (1,'old');
@@ -96,6 +105,7 @@ expect {
     1|NEW
 }
 
+@cross-check-integrity
 test upsert-composite-target-orderless {
     CREATE TABLE c (a, b, val);
     CREATE UNIQUE INDEX c_ab ON c(a,b);
@@ -107,6 +117,7 @@ expect {
     y
 }
 
+@cross-check-integrity
 test upsert-collate-nocase {
     CREATE TABLE nc (name TEXT COLLATE NOCASE UNIQUE, v);
     INSERT INTO nc VALUES ('Alice', 1);
@@ -118,6 +129,7 @@ expect {
     Alice|2
 }
 
+@cross-check-integrity
 test upsert-returning-update {
     CREATE TABLE r (id INTEGER PRIMARY KEY, name);
     INSERT INTO r VALUES (1,'a');
@@ -129,6 +141,7 @@ expect {
     1|b
 }
 
+@cross-check-integrity
 test upsert-returning-insert {
     CREATE TABLE r2 (id INTEGER PRIMARY KEY, name);
     INSERT INTO r2 VALUES (2,'c')
@@ -139,6 +152,7 @@ expect {
     2|c
 }
 
+@cross-check-integrity
 test upsert-returning-do-nothing-empty {
     CREATE TABLE r3 (id INTEGER PRIMARY KEY, name);
     INSERT INTO r3 VALUES (2,'orig');
@@ -149,6 +163,7 @@ test upsert-returning-do-nothing-empty {
 expect {
 }
 
+@cross-check-integrity
 test upsert-rowid-in-set {
     CREATE TABLE rid (id INTEGER PRIMARY KEY, name);
     INSERT INTO rid VALUES (5,'foo');
@@ -160,6 +175,7 @@ expect {
     5|id=5
 }
 
+@cross-check-integrity
 test upsert-notnull-violation {
     CREATE TABLE nn (a UNIQUE, b NOT NULL);
     INSERT INTO nn VALUES (1,'x');
@@ -168,6 +184,7 @@ test upsert-notnull-violation {
 expect error {
 }
 
+@cross-check-integrity
 test upsert-updates-other-unique-key {
     CREATE TABLE idx (a UNIQUE, b UNIQUE);
     INSERT INTO idx VALUES (1,1);
@@ -178,6 +195,7 @@ expect {
     1|2
 }
 
+@cross-check-integrity
 test upsert-target-mismatch-errors {
     CREATE TABLE tm (a, b UNIQUE);
     INSERT INTO tm VALUES (1,1);
@@ -187,6 +205,7 @@ test upsert-target-mismatch-errors {
 expect error {
 }
 
+@cross-check-integrity
 test upsert-omitted-target-matches-pk {
     CREATE TABLE pkalias (a INTEGER PRIMARY KEY, b);
     INSERT INTO pkalias VALUES (42,'old');
@@ -197,6 +216,7 @@ expect {
     42|new
 }
 
+@cross-check-integrity
 test upsert-rowvalue-set {
     CREATE TABLE rv (a INTEGER PRIMARY KEY, b, c);
     INSERT INTO rv VALUES (1,'x','y');
@@ -208,6 +228,7 @@ expect {
     1|B|C
 }
 
+@cross-check-integrity
 test upsert-where-excluded-vs-target {
     CREATE TABLE wh (a UNIQUE, b);
     INSERT INTO wh VALUES (1,5);
@@ -221,6 +242,7 @@ expect {
     1|10
 }
 
+@cross-check-integrity
 test upsert-invalid-qualified-lhs {
     CREATE TABLE bad (a UNIQUE, b);
     INSERT INTO bad VALUES (1,'x');
@@ -230,6 +252,7 @@ test upsert-invalid-qualified-lhs {
 expect error {
 }
 
+@cross-check-integrity
 test upsert-values-returning-mixed {
     CREATE TABLE mix (k UNIQUE, v);
     INSERT INTO mix VALUES (1,'one');
@@ -242,6 +265,7 @@ expect {
     2|dos
 }
 
+@cross-check-integrity
 test upsert-collate-implicit-match {
     CREATE TABLE ci (name TEXT COLLATE NOCASE, v);
     -- no explicit collate on index
@@ -256,6 +280,7 @@ expect {
 }
 
 # Composite index requires exact coverage, targeting too few columns must not match.
+@cross-check-integrity
 test upsert-composite-target-too-few {
     CREATE TABLE ct (a, b, val);
     CREATE UNIQUE INDEX ct_ab ON ct(a,b);
@@ -267,6 +292,7 @@ expect error {
 }
 
 # Composite index requires exact coverage, targeting too few columns must not match.
+@cross-check-integrity
 test upsert-multilple-conflict-targets {
     CREATE TABLE ct (id INTEGER PRIMARY KEY, x UNIQUE, y UNIQUE, z DEFAULT NULL);
     INSERT INTO ct(id, x, y) VALUES (1, 'x', 'y');
@@ -285,6 +311,7 @@ expect {
 }
 
 # Qualified target (t.a) should match unique index on a.
+@cross-check-integrity
 test upsert-qualified-target {
     CREATE TABLE qt (a UNIQUE, b);
     INSERT INTO qt VALUES (1,'old');
@@ -297,6 +324,7 @@ expect {
 }
 
 # Non-simple target expression is not allowed (e.g., lower(name)) → no match → error.
+@cross-check-integrity
 test upsert-invalid-target-expression {
     CREATE TABLE it (name, v);
     CREATE UNIQUE INDEX it_name ON it(name);
@@ -308,6 +336,7 @@ expect error {
 }
 
 # WHERE with three-valued logic: b < excluded.b is NULL if b IS NULL, should NOT update.
+@cross-check-integrity
 test upsert-where-null-3vl-no-update {
     CREATE TABLE w3 (a UNIQUE, b);
     INSERT INTO w3 VALUES (1, NULL);
@@ -320,6 +349,7 @@ expect {
 }
 
 # WHERE false on PK conflict → behaves like DO NOTHING.
+@cross-check-integrity
 test upsert-pk-where-false {
     CREATE TABLE pw (id INTEGER PRIMARY KEY, name);
     INSERT INTO pw VALUES (7,'keep');
@@ -332,6 +362,7 @@ expect {
 }
 
 # WHERE referencing both target and EXCLUDED with arithmetic.
+@cross-check-integrity
 test upsert-where-combo {
     CREATE TABLE wc (a UNIQUE, b);
     INSERT INTO wc VALUES (1, 10);
@@ -345,6 +376,7 @@ expect {
 }
 
 # Invalid EXCLUDED reference should error.
+@cross-check-integrity
 test upsert-invalid-excluded-column {
     CREATE TABLE xe (a UNIQUE, v);
     INSERT INTO xe VALUES (1, 'ok');
@@ -356,6 +388,7 @@ expect error {
 }
 
 # DO UPDATE changes the *conflicting key column* to a different unique value.
+@cross-check-integrity
 test upsert-update-conflicting-key {
     CREATE TABLE uk (a UNIQUE, b);
     INSERT INTO uk VALUES (1,'old');
@@ -368,6 +401,7 @@ expect {
 }
 
 # DO UPDATE that writes the same values (no-op) should still succeed.
+@cross-check-integrity
 test upsert-noop-update-ok {
     CREATE TABLE nu (a UNIQUE, b);
     INSERT INTO nu VALUES (5,'same');
@@ -380,6 +414,7 @@ expect {
 }
 
 # DO UPDATE that would violate a different UNIQUE constraint should error.
+@cross-check-integrity
 test upsert-update-causes-second-unique-violation {
     CREATE TABLE uv (a UNIQUE, b UNIQUE);
     INSERT INTO uv VALUES (1, 10);
@@ -391,6 +426,7 @@ expect error {
 }
 
 # Multi-row VALUES with mixed conflict/non-conflict and WHERE filter in the DO UPDATE.
+@cross-check-integrity
 test upsert-multirow-mixed-where {
     CREATE TABLE mm (k UNIQUE, v);
     INSERT INTO mm VALUES (1,'one');
@@ -405,6 +441,7 @@ expect {
 }
 
 # Omitted target with UNIQUE index: confirm it updates.
+@cross-check-integrity
 test upsert-omitted-target-updates-unique {
     CREATE TABLE ou (a, b);
     CREATE UNIQUE INDEX ou_a ON ou(a);
@@ -417,6 +454,7 @@ expect {
     3|y
 }
 
+@cross-check-integrity
 test upsert-current-qualified_1 {
     CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
     INSERT INTO dq VALUES (1,'old');
@@ -428,6 +466,7 @@ expect {
     1|old-new
 }
 
+@cross-check-integrity
 test upsert-multicol-set_1 {
     CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
     INSERT INTO dq VALUES (1,'old');
@@ -439,6 +478,7 @@ expect {
     1|new
 }
 
+@cross-check-integrity
 test upsert-where-predicate_1 {
     CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
     INSERT INTO dq VALUES (1,'old');
@@ -450,6 +490,7 @@ expect {
     1|old
 }
 
+@cross-check-integrity
 test upsert-doubly-qualified-target {
     CREATE TABLE dq (a UNIQUE, b);
     INSERT INTO dq VALUES (1,'old');
@@ -461,6 +502,7 @@ expect {
     1|new
 }
 
+@cross-check-integrity
 test upsert-targets-chain {
     CREATE TABLE dq (a UNIQUE, b UNIQUE, c UNIQUE, value TEXT);
     CREATE UNIQUE INDEX dq_ab ON dq(a, b);
@@ -484,6 +526,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3384
+@cross-check-integrity
 test upsert-non-rowid-pk-target {
     create table phonebook(name text primary key, phonenumber text, validDate date);
     insert into phonebook values ('Alice','704-545-3333','2018-10-10');
@@ -498,6 +541,7 @@ expect {
 # (right now it errors on Parse Error: cannot use expressions in CREATE INDEX)
 #
 # Target specifies BINARY but the unique index is NOCASE: target should NOT match, so expect error
+@cross-check-integrity
 test upsert-collate-target-mismatch {
     CREATE TABLE cm (name TEXT, v);
     CREATE UNIQUE INDEX cm_name_nocase ON cm(name COLLATE NOCASE);
@@ -508,6 +552,7 @@ test upsert-collate-target-mismatch {
 expect error {
 }
 
+@cross-check-integrity
 test upsert-collate-omitted-target-matches {
     CREATE TABLE co (name TEXT, v);
     CREATE UNIQUE INDEX co_name_nocase ON co(name COLLATE NOCASE);
@@ -520,6 +565,7 @@ expect {
     Alice|9
 }
 
+@cross-check-integrity
 test upsert-composite-collate-orderless {
     CREATE TABLE cc (name TEXT, city TEXT, val);
     CREATE UNIQUE INDEX cc_nc ON cc(name COLLATE NOCASE, city);
@@ -532,6 +578,7 @@ expect {
     Alice|SF|new
 }
 
+@cross-check-integrity
 test upsert-unique-update-rowid-change {
     CREATE TABLE t (
         id INTEGER PRIMARY KEY,
@@ -558,6 +605,7 @@ expect {
     3|new_a|old_b|10|old_u2
 }
 
+@cross-check-integrity
 test upsert-unique-update-rowid-change-preserves-unique {
     CREATE TABLE t (
         id INTEGER PRIMARY KEY,
@@ -579,6 +627,7 @@ expect error {
 # Referencing a table other than the target or EXCLUDED in UPSERT DO UPDATE
 # should produce a graceful error, not a panic.
 # https://github.com/tursodatabase/turso/issues/5281
+@cross-check-integrity
 test upsert-unresolved-table-reference {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
     CREATE TABLE other(id INTEGER PRIMARY KEY, val INTEGER);
@@ -590,6 +639,7 @@ expect error {
 }
 
 # Same for DO UPDATE WHERE clause referencing another table.
+@cross-check-integrity
 test upsert-unresolved-table-in-where {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
     CREATE TABLE other(id INTEGER PRIMARY KEY, val INTEGER);
@@ -605,6 +655,7 @@ expect error {
 # statement fails if INSERT values violate CHECK.
 
 # INSERT violates CHECK, conflict exists, DO UPDATE would be valid -> ERROR
+@cross-check-integrity
 test upsert-check-insert-violates-check-conflict-exists {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
     INSERT INTO t VALUES (1, 50, 'one');
@@ -615,6 +666,7 @@ expect error {
 }
 
 # INSERT violates CHECK, no conflict exists -> ERROR
+@cross-check-integrity
 test upsert-check-insert-violates-check-no-conflict {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
     INSERT INTO t VALUES (1, 200, 'bad') ON CONFLICT(id) DO UPDATE SET val = 70, name = 'fixed';
@@ -624,6 +676,7 @@ expect error {
 }
 
 # INSERT valid, conflict exists, DO UPDATE violates CHECK -> ERROR
+@cross-check-integrity
 test upsert-check-update-violates-check {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
     INSERT INTO t VALUES (1, 50, 'one');
@@ -634,6 +687,7 @@ expect error {
 }
 
 # INSERT valid, conflict exists, DO UPDATE valid -> SUCCESS
+@cross-check-integrity
 test upsert-check-all-valid-with-conflict {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
     INSERT INTO t VALUES (1, 50, 'one');
@@ -645,6 +699,7 @@ expect {
 }
 
 # INSERT valid, no conflict -> inserts normally
+@cross-check-integrity
 test upsert-check-valid-insert-no-conflict {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
     INSERT INTO t VALUES (1, 60, 'ok') ON CONFLICT(id) DO UPDATE SET val = 70, name = 'updated';
@@ -655,6 +710,7 @@ expect {
 }
 
 # UNIQUE index: INSERT violates CHECK, conflict exists -> ERROR
+@cross-check-integrity
 test upsert-check-unique-index-insert-violates {
     CREATE TABLE t(a TEXT UNIQUE, val INTEGER CHECK(val >= 0), tag TEXT);
     INSERT INTO t VALUES ('key', 10, 'orig');
@@ -665,6 +721,7 @@ expect error {
 }
 
 # DO NOTHING also evaluates CHECK on INSERT values
+@cross-check-integrity
 test upsert-check-do-nothing-insert-violates {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100));
     INSERT INTO t VALUES (1, 50);
@@ -675,6 +732,7 @@ expect error {
 }
 
 # excluded. references with valid values -> SUCCESS
+@cross-check-integrity
 test upsert-check-excluded-ref-valid {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER CHECK(val BETWEEN 0 AND 100), name TEXT);
     INSERT INTO t VALUES (1, 50, 'one');

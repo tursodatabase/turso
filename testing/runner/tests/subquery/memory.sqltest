@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test correlated-left-join-exists {
     create table t(a);
     create table s(a);
@@ -14,6 +15,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test subquery-correlated-from-clause-nested {
     create table t1 (name text, region text);
     insert into t1 values ('Alice', 'North'), ('Bob', 'South');
@@ -30,6 +32,7 @@ expect {
     Bob|South
 }
 
+@cross-check-integrity
 test subquery-correlated-derived-in-select {
     create table t1 (id int primary key, value1 integer, value2 integer);
     create table t2 (id int primary key, ref_id integer, data integer);
@@ -81,6 +84,7 @@ expect {
 
 # WHERE CLAUSE SUBQUERIES
 # EXISTS/NOT EXISTS
+@cross-check-integrity
 test subquery-exists-basic {
     create table test(a);
     insert into test values (1);
@@ -93,6 +97,7 @@ expect {
 }
 
 # Trivial example: get all users if there are any products
+@cross-check-integrity
 test subquery-exists-uncorrelated {
     create table products(id, name, price);
     create table users(id, name);
@@ -107,6 +112,7 @@ expect {
 }
 
 # Get all products when there are no users
+@cross-check-integrity
 test subquery-not-exists-uncorrelated {
     create table products(id, name, price);
     create table users(id, name);
@@ -119,6 +125,7 @@ expect {
 }
 
 # Get products that have a matching category
+@cross-check-integrity
 test subquery-exists-correlated {
     create table products(id, name, category_id);
     create table categories(id, name);
@@ -134,6 +141,7 @@ expect {
 }
 
 # Get users who have no orders
+@cross-check-integrity
 test subquery-not-exists-correlated {
     create table users(id, name, age);
     create table orders(id, user_id, amount);
@@ -148,6 +156,7 @@ expect {
 }
 
 # Get products that belong to the 'Clothing' category
+@cross-check-integrity
 test subquery-exists-with-conditions {
     create table categories(id, name);
     create table products(id, name, price, category_id);
@@ -164,6 +173,7 @@ expect {
 }
 
 # Get users who have products with high-rated reviews
+@cross-check-integrity
 test subquery-nested-exists {
     create table users(id, name);
     create table products(id, name, user_id);
@@ -182,6 +192,7 @@ expect {
 }
 
 # Get products that have tags (none exist, so empty result)
+@cross-check-integrity
 test subquery-exists-empty-result {
     create table products(id, name);
     create table tags(product_id, tag);
@@ -194,6 +205,7 @@ expect {
 }
 
 # Get users whose emails are not in the blocked list
+@cross-check-integrity
 test subquery-not-exists-all-match {
     create table users(id, email);
     create table blocked_emails(email);
@@ -210,6 +222,7 @@ expect {
 
 # SCALAR SUBQUERIES
 # Get products with price higher than average price
+@cross-check-integrity
 test subquery-scalar-comparison {
     create table products(id, name, price);
     insert into products values (1, 'hat', 50), (2, 'cap', 25), (3, 'jacket', 75);
@@ -223,6 +236,7 @@ expect {
 }
 
 # Get users with the highest score
+@cross-check-integrity
 test subquery-scalar-max {
     create table users(id, name, score);
     insert into users values (1, 'Alice', 85), (2, 'Bob', 92), (3, 'Charlie', 92);
@@ -237,6 +251,7 @@ expect {
 
 # (x,y) IN SUBQUERIES
 # Get products from specific categories using IN
+@cross-check-integrity
 test subquery-in-single-column {
     create table products(id, name, category_id);
     create table categories(id, name);
@@ -253,6 +268,7 @@ expect {
 }
 
 # Get products NOT in discontinued categories
+@cross-check-integrity
 test subquery-not-in-single-column {
     create table products(id, name, category_id);
     create table discontinued_categories(category_id);
@@ -268,6 +284,7 @@ expect {
 }
 
 # Get order items matching specific product-quantity combinations
+@cross-check-integrity
 test subquery-in-multiple-columns {
     create table order_items(order_id, product_id, quantity);
     create table special_offers(product_id, min_quantity);
@@ -283,6 +300,7 @@ expect {
 }
 
 # Get users whose (name, age) combination is not in the restricted list
+@cross-check-integrity
 test subquery-not-in-multiple-columns {
     create table users(id, name, age);
     create table restricted_profiles(name, age);
@@ -299,6 +317,7 @@ expect {
 
 # NULL HANDLING IN IN/NOT IN SUBQUERIES
 # When value is found in subquery, result is 1 (regardless of NULLs)
+@cross-check-integrity
 test subquery-in-null-value-found {
     create table t(x);
     insert into t values (5), (NULL);
@@ -309,6 +328,7 @@ expect {
 }
 
 # When value not found and subquery has NULLs, result is NULL (unknown)
+@cross-check-integrity
 test subquery-in-null-value-not-found {
     create table t(x);
     insert into t values (5), (NULL);
@@ -319,6 +339,7 @@ expect {
 }
 
 # When LHS is NULL and subquery is non-empty, result is NULL
+@cross-check-integrity
 test subquery-in-null-lhs-nonempty {
     create table t(x);
     insert into t values (5), (NULL);
@@ -329,6 +350,7 @@ expect {
 }
 
 # When LHS is NULL and subquery is empty, result is 0 (FALSE)
+@cross-check-integrity
 test subquery-in-null-lhs-empty {
     create table t(x);
     select null in (select * from t);
@@ -338,6 +360,7 @@ expect {
 }
 
 # NOT IN: when value found, result is 0 (regardless of NULLs)
+@cross-check-integrity
 test subquery-not-in-null-value-found {
     create table t(x);
     insert into t values (5), (NULL);
@@ -348,6 +371,7 @@ expect {
 }
 
 # NOT IN: when value not found and subquery has NULLs, result is NULL
+@cross-check-integrity
 test subquery-not-in-null-value-not-found {
     create table t(x);
     insert into t values (5), (NULL);
@@ -358,6 +382,7 @@ expect {
 }
 
 # NOT IN: when LHS is NULL and subquery is non-empty, result is NULL
+@cross-check-integrity
 test subquery-not-in-null-lhs-nonempty {
     create table t(x);
     insert into t values (5), (NULL);
@@ -368,6 +393,7 @@ expect {
 }
 
 # NOT IN: when LHS is NULL and subquery is empty, result is 1 (TRUE)
+@cross-check-integrity
 test subquery-not-in-null-lhs-empty {
     create table t(x);
     select null not in (select * from t);
@@ -377,6 +403,7 @@ expect {
 }
 
 # IN subquery in result column with NULL handling
+@cross-check-integrity
 test subquery-in-result-column-null-handling {
     create table t(x);
     insert into t values (5), (NULL);
@@ -388,6 +415,7 @@ expect {
 }
 
 # NOT IN subquery in result column with NULL handling
+@cross-check-integrity
 test subquery-not-in-result-column-null-handling {
     create table t(x);
     insert into t values (5), (NULL);
@@ -399,6 +427,7 @@ expect {
 }
 
 # IN subquery with NULL in both LHS column and subquery result
+@cross-check-integrity
 test subquery-in-null-handling-multiple-rows {
     create table t(x);
     create table t2(y);
@@ -414,6 +443,7 @@ expect {
 
 # SUBQUERIES IN OTHER POSITIONS (result columns, GROUP BY, ORDER BY, HAVING, LIMIT, OFFSET)
 # Uncorrelated subquery in result column
+@cross-check-integrity
 test subquery-uncorrelated-in-result-column {
     create table employees(id, name, dept_id);
     create table company_info(total_depts);
@@ -427,6 +457,7 @@ expect {
 }
 
 # Correlated subquery in result column
+@cross-check-integrity
 test subquery-correlated-in-result-column {
     create table employees(id, name, dept_id);
     create table departments(id, name);
@@ -440,6 +471,7 @@ expect {
 }
 
 # Correlated subquery in result column with join
+@cross-check-integrity
 test subquery-correlated-in-result-column-with-join {
     create table employees(id, name, dept_id, manager_id);
     create table departments(id, name);
@@ -456,6 +488,7 @@ expect {
 }
 
 # Uncorrelated IN-subquery in result column
+@cross-check-integrity
 test subquery-uncorrelated-in-result-column-in {
     create table employees(id, name, dept_id);
     create table special_depts(dept_id);
@@ -470,6 +503,7 @@ expect {
 }
 
 # Correlated IN-subquery in result column
+@cross-check-integrity
 test subquery-correlated-in-result-column-in {
     create table employees(id, name, dept_id);
     create table dept_awards(dept_id, employee_id);
@@ -484,6 +518,7 @@ expect {
 }
 
 # Uncorrelated subquery in GROUP BY clause
+@cross-check-integrity
 test subquery-uncorrelated-in-group-by {
     create table sales(id, amount, region_id);
     create table grouping_config(group_column);
@@ -499,6 +534,7 @@ expect {
 }
 
 # Correlated subquery in GROUP BY clause
+@cross-check-integrity
 test subquery-correlated-in-group-by {
     create table sales(id, amount, region_id);
     create table regions(id, name);
@@ -514,6 +550,7 @@ expect {
 }
 
 # Correlated subquery in GROUP BY clause with join
+@cross-check-integrity
 test subquery-correlated-in-group-by-with-join {
     create table sales(id, amount, region_id, salesperson_id);
     create table regions(id, name);
@@ -532,6 +569,7 @@ expect {
 }
 
 # Uncorrelated IN-subquery in ORDER BY clause
+@cross-check-integrity
 test subquery-uncorrelated-in-order-by-in {
     create table products(id, name, category_id);
     create table priority_categories(category_id);
@@ -547,6 +585,7 @@ expect {
 }
 
 # Uncorrelated subquery in HAVING clause
+@cross-check-integrity
 test subquery-uncorrelated-in-having {
     create table orders(id, customer_id, amount);
     create table vip_threshold(min_amount);
@@ -562,6 +601,7 @@ expect {
 }
 
 # Uncorrelated IN-subquery in HAVING clause
+@cross-check-integrity
 test subquery-uncorrelated-in-having-in {
     create table orders(id, customer_id, amount);
     create table target_totals(total_amount);
@@ -578,6 +618,7 @@ expect {
 }
 
 # Uncorrelated subquery in LIMIT clause
+@cross-check-integrity
 test subquery-in-limit {
     create table items(id, name);
     create table config(max_results);
@@ -591,6 +632,7 @@ expect {
 }
 
 # Uncorrelated subquery in OFFSET clause
+@cross-check-integrity
 test subquery-in-offset {
     create table items(id, name);
     create table config(skip_count);
@@ -605,6 +647,7 @@ expect {
 
 ### INCORRECT NUMBER OF RETURNED VALUES - ERROR TESTS ###
 # Subquery returning multiple columns in SELECT clause (should error)
+@cross-check-integrity
 test subquery-multiple-columns-in-select {
     create table t(x, y);
     insert into t values (1, 2);
@@ -614,6 +657,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in WHERE clause (should error)
+@cross-check-integrity
 test subquery-vector-in-where {
     create table t1(x,y);
     create table t2(y);
@@ -625,6 +669,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in HAVING clause (should error)
+@cross-check-integrity
 test subquery-vector-in-having {
     create table orders(customer_id, amount);
     create table thresholds(min_amount, max_amount);
@@ -639,6 +684,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in LIMIT clause (should error)
+@cross-check-integrity
 test subquery-vector-in-limit {
     create table items(id);
     create table config(max_results, other_col);
@@ -650,6 +696,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in OFFSET clause (should error)
+@cross-check-integrity
 test subquery-vector-in-offset {
     create table items(id);
     create table config(skip_count, other_col);
@@ -661,6 +708,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in ORDER BY clause (should error)
+@cross-check-integrity
 test subquery-vector-in-order-by {
     create table items(id, name);
     create table sort_order(priority, other_col);
@@ -672,6 +720,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in GROUP BY clause (should error)
+@cross-check-integrity
 test subquery-vector-in-group-by {
     create table sales(product_id, amount);
     create table grouping(category, other_col);
@@ -683,6 +732,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in CASE WHEN (should error)
+@cross-check-integrity
 test subquery-vector-in-case-when {
     create table t1(x);
     create table t2(y, z);
@@ -694,6 +744,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in CASE THEN (should error)
+@cross-check-integrity
 test subquery-vector-in-case-then {
     create table t1(x);
     create table t2(y, z);
@@ -705,6 +756,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in CASE ELSE (should error)
+@cross-check-integrity
 test subquery-vector-in-case-else {
     create table t1(x);
     create table t2(y, z);
@@ -716,6 +768,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in aggregate function argument (should error)
+@cross-check-integrity
 test subquery-vector-in-aggregate-arg {
     create table t1(x);
     create table t2(y, z);
@@ -727,6 +780,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in binary expression (should error)
+@cross-check-integrity
 test subquery-vector-in-binary-expr {
     create table t1(x);
     create table t2(y, z);
@@ -738,6 +792,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in BETWEEN (should error)
+@cross-check-integrity
 test subquery-vector-in-between {
     create table t1(x);
     create table t2(y, z);
@@ -749,6 +804,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in CAST (should error)
+@cross-check-integrity
 test subquery-vector-in-cast {
     create table t1(x);
     create table t2(y, z);
@@ -760,6 +816,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in COLLATE (should error)
+@cross-check-integrity
 test subquery-vector-in-collate {
     create table t1(x);
     create table t2(y, z);
@@ -771,6 +828,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in IS NULL (should error)
+@cross-check-integrity
 test subquery-vector-in-is-null {
     create table t1(x);
     create table t2(y, z);
@@ -782,6 +840,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in NOT NULL (should error)
+@cross-check-integrity
 test subquery-vector-in-not-null {
     create table t1(x);
     create table t2(y, z);
@@ -793,6 +852,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in LIKE (should error)
+@cross-check-integrity
 test subquery-vector-in-like {
     create table t1(x);
     create table t2(y, z);
@@ -804,6 +864,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in unary operator (should error)
+@cross-check-integrity
 test subquery-vector-in-unary {
     create table t1(x);
     create table t2(y, z);
@@ -815,6 +876,7 @@ expect error {
 }
 
 # Subquery returning multiple columns in function call (should error)
+@cross-check-integrity
 test subquery-vector-in-function-call {
     create table t1(x);
     create table t2(y, z);
@@ -847,6 +909,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test subquery-exists-in-aggregate-with-table {
     create table t1(x);
     insert into t1 values (1), (2), (3);
@@ -878,6 +941,7 @@ expect {
     5
 }
 
+@cross-check-integrity
 test subquery-scalar-in-aggregate-group-concat {
     create table t2(x);
     insert into t2 values (1), (2);
@@ -887,6 +951,7 @@ expect {
     a,a
 }
 
+@cross-check-integrity
 test subquery-scalar-in-aggregate-with-table-ref {
     create table t3(x);
     insert into t3 values (10), (20), (30);
@@ -915,6 +980,7 @@ expect {
 
 # With actual ORDER BY effect (GROUP BY present, so ORDER BY is not cleared)
 # Uses uncorrelated subquery since correlated subqueries in ORDER BY are not yet supported
+@cross-check-integrity
 test subquery-exists-in-order-by-aggregate-with-group {
     create table t4(x, g);
     insert into t4 values (1, 'a'), (2, 'a'), (3, 'b'), (4, 'b');
@@ -931,6 +997,7 @@ expect {
 # - INTEGER affinity causes string operands to be coerced to numeric
 # - Without proper affinity inheritance, '9' would not be coerced and
 #   10 > '9' would be false (comparing int to text directly)
+@cross-check-integrity
 test subquery-column-affinity-inheritance {
     create table t11(x INTEGER);
     insert into t11 values (10);
@@ -941,6 +1008,7 @@ expect {
 }
 
 # Same test with TEXT affinity - should preserve text comparison behavior
+@cross-check-integrity
 test subquery-column-affinity-inheritance-text {
     create table t12(x TEXT);
     insert into t12 values ('10');
@@ -953,6 +1021,7 @@ expect {
 # TEXT PRIMARY KEY can contain NULL (unlike INTEGER PRIMARY KEY which is rowid alias).
 # NOT IN subquery with NULL in TEXT PRIMARY KEY should return NULL, not 0.
 # Regression test: is_nonnull() must check is_rowid_alias(), not primary_key().
+@cross-check-integrity
 test subquery-not-in-text-primary-key-null {
     create table t(a TEXT PRIMARY KEY);
     insert into t values (NULL);
@@ -965,6 +1034,7 @@ expect {
 }
 
 # Same test with IN (not NOT IN)
+@cross-check-integrity
 test subquery-in-text-primary-key-null {
     create table t(a TEXT PRIMARY KEY);
     insert into t values (NULL);
@@ -977,6 +1047,7 @@ expect {
 }
 
 # INTEGER PRIMARY KEY cannot contain NULL (auto-assigns rowid)
+@cross-check-integrity
 test subquery-not-in-integer-primary-key-null {
     create table t(a INTEGER PRIMARY KEY);
     insert into t values (NULL);
@@ -991,6 +1062,7 @@ expect {
 # EXISTS in SELECT list with aggregates on empty table
 # When the source table is empty, the aggregate loop never runs, but EXISTS
 # should still return 0 (not NULL) because the subquery result is evaluated.
+@cross-check-integrity
 test subquery-exists-in-select-with-aggregate-empty-table {
     create table t5(x);
     select exists (select 1 from t5), count(*) from t5;
@@ -1000,6 +1072,7 @@ expect {
 }
 
 # Correlated EXISTS in SELECT list with aggregates on empty table
+@cross-check-integrity
 test subquery-correlated-exists-in-select-with-aggregate-empty-table {
     create table t6(id);
     select exists (select 1 where t6.id = 1), count(*) from t6;
@@ -1010,6 +1083,7 @@ expect {
 
 # Scalar subquery in SELECT list with aggregates on empty table
 # Scalar subquery returns a constant, should work even when main table is empty
+@cross-check-integrity
 test subquery-scalar-in-select-with-aggregate-empty-table {
     create table t7(x);
     select (select 42), count(*) from t7;
@@ -1019,6 +1093,7 @@ expect {
 }
 
 # Scalar subquery returning NULL in SELECT list with aggregates on empty table
+@cross-check-integrity
 test subquery-scalar-null-in-select-with-aggregate-empty-table {
     create table t8(x);
     create table t8_empty(y);
@@ -1029,6 +1104,7 @@ expect {
 }
 
 # IN subquery in SELECT list with aggregates on empty table
+@cross-check-integrity
 test subquery-in-in-select-with-aggregate-empty-table {
     create table t9(x);
     select 1 in (select x from t9), count(*) from t9;
@@ -1038,6 +1114,7 @@ expect {
 }
 
 # Column IS NULL in ungrouped aggregate on empty table
+@cross-check-integrity
 test column-is-null-in-aggregate-empty-table {
     create table t10(x);
     select x IS NULL, count(*) from t10;
@@ -1049,6 +1126,7 @@ expect {
 # EXISTS subquery in ungrouped aggregate query with data
 # The EXISTS subquery is non-correlated and should be evaluated before the loop,
 # returning 1 when the subquery table has data.
+@cross-check-integrity
 test exists-in-ungrouped-aggregate-with-data {
     create table t11(a text);
     insert into t11(a) values ('x');
@@ -1065,6 +1143,7 @@ expect @js {
 # The EXISTS subquery is non-correlated and evaluated before the loop.
 # Even though the main table is empty, EXISTS should return 1 because
 # the subquery table has data.
+@cross-check-integrity
 test exists-in-ungrouped-aggregate-empty-main-table {
     create table t12(a text);
     create table t12_sub(b text);
@@ -1077,6 +1156,7 @@ expect {
 
 # EXISTS subquery in ungrouped aggregate query where subquery table is empty
 # EXISTS should return 0 because the subquery returns no rows.
+@cross-check-integrity
 test exists-in-ungrouped-aggregate-empty-subquery-table {
     create table t13(a text);
     create table t13_sub(b text);
@@ -1093,6 +1173,7 @@ expect @js {
 # Correlated EXISTS in ungrouped aggregate with empty main table
 # Since the main loop never runs, the correlated EXISTS is never evaluated.
 # The result should be 0 (initialized default for EXISTS).
+@cross-check-integrity
 test correlated-exists-in-ungrouped-aggregate-empty-main-table {
     create table t14(a integer);
     create table t14_sub(b integer);
@@ -1108,6 +1189,7 @@ expect {
 # ============================================================================
 
 # Simple INNER JOIN with FROM clause subquery
+@cross-check-integrity
 test from-subquery-inner-join {
     create table users(id integer primary key, name text);
     create table orders(id, user_id, amount);
@@ -1124,6 +1206,7 @@ expect {
 }
 
 # LEFT JOIN with FROM clause subquery (should return NULL for non-matching)
+@cross-check-integrity
 test from-subquery-left-join {
     create table users(id integer primary key, name text);
     create table orders(id, user_id, amount);
@@ -1141,6 +1224,7 @@ expect {
 }
 
 # Multiple FROM clause subqueries with joins
+@cross-check-integrity
 test from-subquery-multiple-joins {
     create table products(id integer primary key, name text);
     create table sales(product_id, quantity);
@@ -1164,6 +1248,7 @@ expect {
 }
 
 # FROM clause subquery with expression in join column
+@cross-check-integrity
 test from-subquery-expression-join {
     create table users(first_name text);
     create table products(name text);
@@ -1180,6 +1265,7 @@ expect {
 }
 
 # FROM clause subquery - subquery as outer table (driving table)
+@cross-check-integrity
 test from-subquery-as-outer-table {
     create table categories(id integer primary key, name text);
     create table products(id, name, category_id);
@@ -1197,6 +1283,7 @@ expect {
 }
 
 # FROM clause subquery with multiple join columns
+@cross-check-integrity
 test from-subquery-multi-column-join {
     create table sales(year int, region text, amount int);
     create table targets(year int, region text, target int);
@@ -1214,6 +1301,7 @@ expect {
 }
 
 # FROM clause subquery with DISTINCT
+@cross-check-integrity
 test from-subquery-distinct {
     create table orders(id, product_id);
     create table products(id integer primary key, name text);
@@ -1231,6 +1319,7 @@ expect {
 }
 
 # FROM clause subquery with LIMIT
+@cross-check-integrity
 test from-subquery-with-limit {
     create table users(id integer primary key, name text);
     create table scores(user_id, score);
@@ -1248,6 +1337,7 @@ expect {
 }
 
 # FROM clause subquery nested in another FROM clause subquery
+@cross-check-integrity
 test from-subquery-nested {
     create table t(x);
     insert into t values (1), (2), (3);
@@ -1264,6 +1354,7 @@ expect {
 }
 
 # Self-join with FROM clause subquery
+@cross-check-integrity
 test from-subquery-self-join {
     create table employees(id integer primary key, name text, manager_id int);
     insert into employees values (1, 'Alice', null), (2, 'Bob', 1), (3, 'Charlie', 1), (4, 'Dave', 2);
@@ -1281,6 +1372,7 @@ expect {
 
 # Correlated subquery referencing a derived table from the outer scope.
 # When the derived table is materialized, reads must come from the index cursor.
+@cross-check-integrity
 test from-subquery-outer-ref-in-correlated-subquery {
     create table orders(id int, user_id int);
     create table purchases(user_id int, total int);

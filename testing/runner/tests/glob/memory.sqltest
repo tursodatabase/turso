@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test glob-null-other-types {
     DROP TABLE IF EXISTS t0;
     CREATE TABLE IF NOT EXISTS t0 (c0 REAL);

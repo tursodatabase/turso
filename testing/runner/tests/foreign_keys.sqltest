@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test fk-basic-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
@@ -13,6 +14,7 @@ expect {
     11|
 }
 
+@cross-check-integrity
 test fk-column-constraint-multi-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(a, c);
@@ -21,6 +23,7 @@ test fk-column-constraint-multi-parent {
 expect error {
 }
 
+@cross-check-integrity
 test fk-insert-child-missing-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
@@ -30,6 +33,7 @@ test fk-insert-child-missing-parent {
 expect error {
 }
 
+@cross-check-integrity
 test fk-update-child-to-missing-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
@@ -41,6 +45,7 @@ test fk-update-child-to-missing-parent {
 expect error {
 }
 
+@cross-check-integrity
 test fk-update-child-to-null-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t (id INTEGER PRIMARY KEY);
@@ -54,6 +59,7 @@ expect {
     7|
 }
 
+@cross-check-integrity
 test fk-delete-parent-blocked {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
@@ -65,6 +71,7 @@ test fk-delete-parent-blocked {
 expect error {
 }
 
+@cross-check-integrity
 test fk-delete-parent-ok-when-no-child {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
@@ -78,6 +85,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test fk-composite-pk-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(
@@ -100,6 +108,7 @@ expect {
     12||2
 }
 
+@cross-check-integrity
 test fk-composite-pk-missing {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(
@@ -118,6 +127,7 @@ test fk-composite-pk-missing {
 expect error {
 }
 
+@cross-check-integrity
 test fk-composite-update-child-missing {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
@@ -130,6 +140,7 @@ test fk-composite-update-child-missing {
 expect error {
 }
 
+@cross-check-integrity
 test fk-composite-unique-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
@@ -143,6 +154,7 @@ expect {
     1|A|B
 }
 
+@cross-check-integrity
 test fk-composite-unique-missing {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
@@ -154,6 +166,7 @@ test fk-composite-unique-missing {
 expect error {
 }
 
+@cross-check-integrity
 test fk-rowid-alias-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
@@ -164,6 +177,7 @@ test fk-rowid-alias-parent {
 expect error {
 }
 
+@cross-check-integrity
 test fk-rowid-alias-parent-missing {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
@@ -173,6 +187,7 @@ test fk-rowid-alias-parent-missing {
 expect error {
 }
 
+@cross-check-integrity
 test fk-update-child-noop-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -186,6 +201,7 @@ expect {
     10|1
 }
 
+@cross-check-integrity
 test fk-delete-parent-composite-scan {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
@@ -198,6 +214,7 @@ test fk-delete-parent-composite-scan {
 expect error {
 }
 
+@cross-check-integrity
 test fk-update-child-to-existing-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY);
@@ -211,6 +228,7 @@ expect {
     9|2
 }
 
+@cross-check-integrity
 test fk-composite-pk-delete-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
@@ -226,6 +244,7 @@ expect {
     2|3
 }
 
+@cross-check-integrity
 test fk-composite-pk-delete-violate {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
@@ -240,6 +259,7 @@ expect error {
 }
 
 # Parent columns omitted: should default to parent's declared PRIMARY KEY (composite)
+@cross-check-integrity
 test fk-default-parent-pk-composite-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(
@@ -263,6 +283,7 @@ expect {
     12||2
 }
 
+@cross-check-integrity
 test fk-default-parent-pk-composite-missing {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
@@ -275,6 +296,7 @@ expect error {
 }
 
 # Parent has no explicitly declared PK, so we throw parse error when referencing bare table
+@cross-check-integrity
 test fk-default-parent-rowid-no-parent-pk {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p_no_pk(v TEXT);
@@ -286,6 +308,7 @@ test fk-default-parent-rowid-no-parent-pk {
 expect error {
 }
 
+@cross-check-integrity
 test fk-parent-omit-cols-parent-has-pk {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p_pk(id INTEGER PRIMARY KEY, v TEXT);
@@ -301,6 +324,7 @@ expect {
 }
 
 # Self-reference (same table) with INTEGER PRIMARY KEY: single-row insert should pass
+@cross-check-integrity
 test fk-self-ipk-single-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -315,6 +339,7 @@ expect {
 }
 
 # Self-reference with mismatched value: should fail immediately (no counter semantics used)
+@cross-check-integrity
 test fk-self-ipk-single-mismatch {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -327,6 +352,7 @@ expect error {
 }
 
 # Self-reference on composite PRIMARY KEY: single-row insert should pass
+@cross-check-integrity
 test fk-self-composite-single-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -345,6 +371,7 @@ expect {
 }
 
 # Rowid parent path: text '10' must be coerced to integer (MustBeInt) and succeed
+@cross-check-integrity
 test fk-rowid-mustbeint-coercion-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -358,6 +385,7 @@ expect {
 }
 
 # Rowid parent path: non-numeric text cannot be coerced -> violation
+@cross-check-integrity
 test fk-rowid-mustbeint-coercion-fail {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -369,6 +397,7 @@ expect error {
 }
 
 # Parent match via UNIQUE index (non-rowid), success path
+@cross-check-integrity
 test fk-parent-unique-index-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
@@ -383,6 +412,7 @@ expect {
 }
 
 # Parent UNIQUE index path: missing key -> immediate violation
+@cross-check-integrity
 test fk-parent-unique-index-missing {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
@@ -395,6 +425,7 @@ expect error {
 }
 
 # NULL in child short-circuits FK check
+@cross-check-integrity
 test fk-child-null-shortcircuit {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -406,6 +437,7 @@ expect {
     1|
 }
 
+@cross-check-integrity
 test fk-self-unique-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -424,6 +456,7 @@ expect {
     A|B|A|B
 }
 
+@cross-check-integrity
 test fk-self-unique-mismatch {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -440,6 +473,7 @@ test fk-self-unique-mismatch {
 expect error {
 }
 
+@cross-check-integrity
 test fk-self-unique-reference-existing-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -461,6 +495,7 @@ expect {
     X|Y|P|Q
 }
 
+@cross-check-integrity
 test fk-self-unique-multirow-no-fastpath {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -478,6 +513,7 @@ test fk-self-unique-multirow-no-fastpath {
 expect {
 }
 
+@cross-check-integrity
 test fk-self-multirow-one-bad {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, rid INTEGER,
@@ -488,6 +524,7 @@ expect error {
 }
 
 # doesnt fail because tx is un-committed
+@cross-check-integrity
 test fk-deferred-commit-doesnt-fail-early {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -499,6 +536,7 @@ expect {
 }
 
 # it should fail here because we actuall COMMIT
+@cross-check-integrity
 test fk-deferred-commit-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -511,6 +549,7 @@ expect error {
 }
 
 # If we fix it before COMMIT, COMMIT succeeds
+@cross-check-integrity
 test fk-deferred-fix-before-commit-succeeds {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -529,6 +568,7 @@ expect {
 }
 
 #  ROLLBACK clears deferred state; a new tx can still fail if violation persists
+@cross-check-integrity
 test fk-deferred-rollback-clears {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -550,6 +590,7 @@ expect {
     1|123
 }
 
+@cross-check-integrity
 test fk-deferred-insert-parent-fixes-before-commit {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -567,6 +608,7 @@ expect {
     1|50
 }
 
+@cross-check-integrity
 test fk-deferred-update-fixes-child-before-commit {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -585,6 +627,7 @@ expect {
     1|32
 }
 
+@cross-check-integrity
 test fk-deferred-delete-fixes-child-before-commit {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -602,6 +645,7 @@ test fk-deferred-delete-fixes-child-before-commit {
 expect {
 }
 
+@cross-check-integrity
 test fk-deferred-update-fixes-parent-before-commit {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -621,6 +665,7 @@ expect {
 }
 
 # Self-referential: row referencing itself should succeed
+@cross-check-integrity
 test fk-deferred-self-ref-succeeds {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -637,6 +682,7 @@ expect {
 }
 
 # Two-step self-ref: insert invalid, then create parent before COMMIT
+@cross-check-integrity
 test fk-deferred-self-ref-late-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -655,6 +701,7 @@ expect {
 }
 
 # counter must not be neutralized by later good statements
+@cross-check-integrity
 test fk-deferred-neutralize_1 {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -672,6 +719,7 @@ test fk-deferred-neutralize_1 {
 expect error {
 }
 
+@cross-check-integrity
 test fk-deferred-upsert-late-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -692,6 +740,7 @@ expect {
     1|32
 }
 
+@cross-check-integrity
 test fk-deferred-upsert-late-child {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(
@@ -717,6 +766,7 @@ expect {
     50|1
 }
 
+@cross-check-integrity
 test fk-deferred-insert-commit-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -731,6 +781,7 @@ test fk-deferred-insert-commit-fails {
 expect error {
 }
 
+@cross-check-integrity
 test fk-deferred-insert-parent-fix-before-commit {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -748,6 +799,7 @@ expect {
     1|99
 }
 
+@cross-check-integrity
 test fk-deferred-insert-multi-children-one-parent-fix {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -764,6 +816,7 @@ expect {
     2|50
 }
 
+@cross-check-integrity
 test fk-deferred-insert-then-delete-child-fix {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -778,6 +831,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test fk-deferred-insert-self-ref-succeeds {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -793,6 +847,7 @@ expect {
     1|1
 }
 
+@cross-check-integrity
 test fk-deferred-update-child-breaks-commit-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -806,6 +861,7 @@ test fk-deferred-update-child-breaks-commit-fails {
 expect error {
 }
 
+@cross-check-integrity
 test fk-deferred-update-child-fix-before-commit {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -822,6 +878,7 @@ expect {
     1|10
 }
 
+@cross-check-integrity
 test fk-deferred-update-child-fix-by-inserting-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -838,6 +895,7 @@ expect {
     1|50
 }
 
+@cross-check-integrity
 test fk-deferred-update-parent-breaks-commit-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -851,6 +909,7 @@ test fk-deferred-update-parent-breaks-commit-fails {
 expect error {
 }
 
+@cross-check-integrity
 test fk-deferred-update-parent-fix-by-updating-child {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -867,6 +926,7 @@ expect {
     1|50
 }
 
+@cross-check-integrity
 test fk-deferred-update-parent-fix-by-reverting-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -883,6 +943,7 @@ expect {
     1|32
 }
 
+@cross-check-integrity
 test fk-deferred-update-self-ref-id-change-and-fix {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -900,6 +961,7 @@ expect {
     2|2
 }
 
+@cross-check-integrity
 test fk-deferred-delete-parent-commit-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -913,6 +975,7 @@ test fk-deferred-delete-parent-commit-fails {
 expect error {
 }
 
+@cross-check-integrity
 test fk-deferred-delete-parent-then-delete-child-fix {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -929,6 +992,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test fk-deferred-delete-parent-then-reinsert-parent-fix {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -945,6 +1009,7 @@ expect {
     1|10
 }
 
+@cross-check-integrity
 test fk-deferred-delete-self-ref-row-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
@@ -961,6 +1026,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test fk-deferred-delete-parent-then-update-child-to-null-fix {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -981,6 +1047,7 @@ expect {
 }
 
 # AUTOCOMMIT: deferred FK still fails at end-of-statement
+@cross-check-integrity
 test fk-deferred-autocommit-insert-missing-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -991,6 +1058,7 @@ expect error {
 }
 
 # AUTOCOMMIT: self-referential insert is OK (parent is same row)
+@cross-check-integrity
 test fk-deferred-autocommit-selfref-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
@@ -1002,6 +1070,7 @@ expect {
 }
 
 # AUTOCOMMIT: deleting a parent that has a child → fails at statement end
+@cross-check-integrity
 test fk-deferred-autocommit-delete-parent-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1014,6 +1083,7 @@ expect error {
 }
 
 # TX: delete a referenced parent then reinsert before COMMIT -> OK
+@cross-check-integrity
 test fk-deferred-tx-delete-parent-then-reinsert-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1031,6 +1101,7 @@ expect {
 }
 
 # TX: multiple violating children, later insert parent, COMMIT -> OK
+@cross-check-integrity
 test fk-deferred-tx-multi-children-fixed-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1048,6 +1119,7 @@ expect {
 }
 
 #  one of several children left unfixed -> COMMIT fails
+@cross-check-integrity
 test fk-deferred-tx-multi-children-one-left-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1063,6 +1135,7 @@ expect error {
 }
 
 # composite PK parent, fix via parent UPDATE before COMMIT -> OK
+@cross-check-integrity
 test fk-deferred-composite-parent-update-fix {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
@@ -1080,6 +1153,7 @@ expect {
 }
 
 # TX: NULL in child FK -> never a violation
+@cross-check-integrity
 test fk-deferred-null-fk-never-violates {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1094,6 +1168,7 @@ expect {
 }
 
 # TX: child UPDATE to NULL resolves before COMMIT
+@cross-check-integrity
 test fk-deferred-update-child-null-resolves {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1109,6 +1184,7 @@ expect {
 }
 
 # TX: delete violating child resolves before COMMIT
+@cross-check-integrity
 test fk-deferred-delete-child-resolves {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1124,6 +1200,7 @@ expect {
 }
 
 # TX: update parent PK to match child before COMMIT -> OK
+@cross-check-integrity
 test fk-deferred-update-parent-pk-resolves {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1140,6 +1217,7 @@ expect {
 }
 
 # Two-table cycle; both inserted before COMMIT -> OK
+@cross-check-integrity
 test fk-deferred-cycle-two-tables-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE a(id INT PRIMARY KEY, b_id INT, FOREIGN KEY(b_id) REFERENCES b(id) DEFERRABLE INITIALLY DEFERRED);
@@ -1155,6 +1233,7 @@ expect {
 }
 
 # Delete a row that self-references (child==parent) within a tx -> OK
+@cross-check-integrity
 test fk-deferred-selfref-delete-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
@@ -1168,6 +1247,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test fk-parentcomp-donothing-noconflict-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent (id INTEGER PRIMARY KEY, a INT, b INT);
@@ -1188,6 +1268,7 @@ expect {
     -1|-1|9
 }
 
+@cross-check-integrity
 test fk-parentcomp-donothing-conflict-noop {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
@@ -1204,6 +1285,7 @@ expect {
     10|20|1
 }
 
+@cross-check-integrity
 test fk-parentcomp-donothing-unrelated-immediate-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent (id INTEGER PRIMARY KEY);
@@ -1223,6 +1305,7 @@ expect {
     -1|-1|9
 }
 
+@cross-check-integrity
 test fk-parentcomp-deferred-fix-inside-tx-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
@@ -1240,6 +1323,7 @@ expect {
     1|-5|-6
 }
 
+@cross-check-integrity
 test fk-parentcomp-autocommit-unrelated-children-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
@@ -1258,6 +1342,7 @@ expect {
 }
 
 # ROLLBACK must clear any deferred state; next statement must not trip.
+@cross-check-integrity
 test fk-rollback-clears-then-donothing-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1274,6 +1359,7 @@ expect {
 }
 
 # DO NOTHING conflict path must touch no FK maintenance at all.
+@cross-check-integrity
 test fk-parentcomp-donothing-conflict-stays-quiet {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
@@ -1295,6 +1381,7 @@ expect {
 
 # Two-statement fix inside an explicit transaction (separate statements).
 #Insert child (violation), then insert parent in a new statement; commit must pass.
+@cross-check-integrity
 test fk-deferred-two-stmt-fix-inside-tx-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1309,6 +1396,7 @@ expect {
     1|777
 }
 
+@cross-check-integrity
 test fk-delete-composite-bounds {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY(a,b));
@@ -1323,6 +1411,7 @@ expect {
 }
 
 # Single column unique index on parent, FK referenced by child
+@cross-check-integrity
 test fk-update-parent-unique-single-col {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id UNIQUE);
@@ -1335,6 +1424,7 @@ expect error {
 }
 
 # Single column with explicit CREATE UNIQUE INDEX
+@cross-check-integrity
 test fk-update-parent-explicit-unique-single-col {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id);
@@ -1348,6 +1438,7 @@ expect error {
 }
 
 # Multi-column unique index on parent, FK referenced by multi-column FK in child
+@cross-check-integrity
 test fk-update-parent-unique-multi-col {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a, b, UNIQUE(a, b));
@@ -1360,6 +1451,7 @@ expect error {
 }
 
 # Multi-column unique index on parent, FK referenced by multi-column FK in child
+@cross-check-integrity
 test fk-update-parent-unique-multi-col-2 {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a, b, UNIQUE(a, b));
@@ -1372,6 +1464,7 @@ expect error {
 }
 
 # Multi-column index defined explicitly as CREATE UNIQUE INDEX
+@cross-check-integrity
 test fk-update-parent-explicit-unique-multi-col {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a, b);
@@ -1385,6 +1478,7 @@ expect error {
 }
 
 # Multi-column index defined explicitly as CREATE UNIQUE INDEX
+@cross-check-integrity
 test fk-update-parent-explicit-unique-multi-col-2 {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a, b);
@@ -1398,6 +1492,7 @@ expect error {
 }
 
 # Single column INTEGER PRIMARY KEY
+@cross-check-integrity
 test fk-update-parent-int-pk {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -1410,6 +1505,7 @@ expect error {
 }
 
 # Single column TEXT PRIMARY KEY
+@cross-check-integrity
 test fk-update-parent-text-pk {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id PRIMARY KEY);
@@ -1422,6 +1518,7 @@ expect error {
 }
 
 # Multi-column PRIMARY KEY
+@cross-check-integrity
 test fk-update-parent-multi-col-pk {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a, b, PRIMARY KEY(a, b));
@@ -1434,6 +1531,7 @@ expect error {
 }
 
 # Multi-column PRIMARY KEY
+@cross-check-integrity
 test fk-update-parent-multi-col-pk-2 {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a, b, PRIMARY KEY(a, b));
@@ -1446,6 +1544,7 @@ expect error {
 }
 
 # https://github.com/tursodatabase/turso/issues/3965
+@cross-check-integrity
 test fk-no-val-on-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t1(
@@ -1464,6 +1563,7 @@ expect {
     5|10
 }
 
+@cross-check-integrity
 test fk-val-on-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t1(
@@ -1482,6 +1582,7 @@ expect error {
 }
 
 # Basic ON DELETE CASCADE - single child row
+@cross-check-integrity
 test fk-cascade-delete-basic {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -1496,6 +1597,7 @@ expect {
 }
 
 # ON DELETE CASCADE - delete parent with no children
+@cross-check-integrity
 test fk-cascade-delete-no-children {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -1510,6 +1612,7 @@ expect {
 }
 
 # ON DELETE CASCADE - composite key
+@cross-check-integrity
 test fk-cascade-delete-composite {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(a INT, b INT, PRIMARY KEY(a,b));
@@ -1525,6 +1628,7 @@ expect {
 }
 
 # ON DELETE CASCADE - child with NULL FK value should not be deleted
+@cross-check-integrity
 test fk-cascade-delete-null-child {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -1539,6 +1643,7 @@ expect {
 }
 
 # ON DELETE CASCADE - recursive cascade (A->B->C)
+@cross-check-integrity
 test fk-cascade-delete-recursive {
     PRAGMA foreign_keys=ON;
     CREATE TABLE a(id INTEGER PRIMARY KEY);
@@ -1554,6 +1659,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test fk-cascade-delete-recursive-check-c {
     PRAGMA foreign_keys=ON;
     CREATE TABLE a(id INTEGER PRIMARY KEY);
@@ -1570,6 +1676,7 @@ expect {
 }
 
 # Basic ON UPDATE CASCADE - single child row
+@cross-check-integrity
 test fk-cascade-update-basic {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -1584,6 +1691,7 @@ expect {
 }
 
 # ON UPDATE CASCADE - multiple children
+@cross-check-integrity
 test fk-cascade-update-multi-children {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1600,6 +1708,7 @@ expect {
 }
 
 # ON UPDATE CASCADE - composite key
+@cross-check-integrity
 test fk-cascade-update-composite {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(a INT, b INT, PRIMARY KEY(a,b));
@@ -1615,6 +1724,7 @@ expect {
 }
 
 # Basic ON DELETE SET NULL
+@cross-check-integrity
 test fk-setnull-delete-basic {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1629,6 +1739,7 @@ expect {
 }
 
 # ON DELETE SET NULL - multiple children
+@cross-check-integrity
 test fk-setnull-delete-multi-children {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1645,6 +1756,7 @@ expect {
 }
 
 # ON DELETE SET NULL - composite key
+@cross-check-integrity
 test fk-setnull-delete-composite {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(a INT, b INT, PRIMARY KEY(a,b));
@@ -1660,6 +1772,7 @@ expect {
 }
 
 # Basic ON UPDATE SET NULL
+@cross-check-integrity
 test fk-setnull-update-basic {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1674,6 +1787,7 @@ expect {
 }
 
 # ON DELETE CASCADE with ON UPDATE NO ACTION
+@cross-check-integrity
 test fk-cascade-delete-noaction-update {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1688,6 +1802,7 @@ expect {
 }
 
 # ON DELETE NO ACTION with ON UPDATE CASCADE
+@cross-check-integrity
 test fk-noaction-delete-cascade-update {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1702,6 +1817,7 @@ expect {
 }
 
 # INSERT OR REPLACE with ON DELETE CASCADE
+@cross-check-integrity
 test fk-replace-delete-cascade {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
@@ -1716,6 +1832,7 @@ expect {
 }
 
 # INSERT OR REPLACE with ON DELETE SET NULL
+@cross-check-integrity
 test fk-replace-delete-setnull {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
@@ -1732,6 +1849,7 @@ expect {
 }
 
 # INSERT OR REPLACE with ON DELETE SET DEFAULT
+@cross-check-integrity
 test fk-replace-delete-setdefault {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
@@ -1748,6 +1866,7 @@ expect {
 }
 
 # INSERT OR REPLACE with composite FK and ON DELETE CASCADE
+@cross-check-integrity
 test fk-replace-delete-cascade-composite {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(a INT, b INT, name TEXT, PRIMARY KEY(a,b));
@@ -1763,6 +1882,7 @@ expect {
 }
 
 # INSERT OR REPLACE with recursive cascade (A->B->C)
+@cross-check-integrity
 test fk-replace-delete-cascade-recursive {
     PRAGMA foreign_keys=ON;
     CREATE TABLE a(id INTEGER PRIMARY KEY, name TEXT);
@@ -1778,6 +1898,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test fk-replace-delete-cascade-recursive-check-c {
     PRAGMA foreign_keys=ON;
     CREATE TABLE a(id INTEGER PRIMARY KEY, name TEXT);
@@ -1794,6 +1915,7 @@ expect {
 }
 
 # UPSERT with ON UPDATE CASCADE
+@cross-check-integrity
 test fk-upsert-update-cascade {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
@@ -1808,6 +1930,7 @@ expect {
 }
 
 # UPSERT with ON UPDATE SET NULL
+@cross-check-integrity
 test fk-upsert-update-setnull {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
@@ -1822,6 +1945,7 @@ expect {
 }
 
 # UPSERT with ON UPDATE SET DEFAULT
+@cross-check-integrity
 test fk-upsert-update-setdefault {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
@@ -1836,6 +1960,7 @@ expect {
 }
 
 # UPSERT with multiple children and ON UPDATE CASCADE
+@cross-check-integrity
 test fk-upsert-update-cascade-multi-children {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
@@ -1852,6 +1977,7 @@ expect {
 }
 
 # UPSERT with composite FK and ON UPDATE CASCADE
+@cross-check-integrity
 test fk-upsert-update-cascade-composite {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY, a INT, b INT, UNIQUE(a,b));
@@ -1867,6 +1993,7 @@ expect {
 }
 
 # UPSERT recursive cascade (A->B->C)
+@cross-check-integrity
 test fk-upsert-update-cascade-recursive {
     PRAGMA foreign_keys=ON;
     CREATE TABLE a(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
@@ -1883,6 +2010,7 @@ expect {
 }
 
 # UPSERT that doesn't change the FK column should not trigger cascade
+@cross-check-integrity
 test fk-upsert-update-cascade-noop {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE, other TEXT);
@@ -1897,6 +2025,7 @@ expect {
 }
 
 # ON DELETE RESTRICT should fail when child references the parent row
+@cross-check-integrity
 test fk-delete-restrict-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -1909,6 +2038,7 @@ expect error {
 }
 
 # ON DELETE RESTRICT should succeed when no child references the parent row
+@cross-check-integrity
 test fk-delete-restrict-ok-no-child {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -1923,6 +2053,7 @@ expect {
 }
 
 # ON UPDATE RESTRICT should fail when child references the parent key being updated
+@cross-check-integrity
 test fk-update-restrict-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -1935,6 +2066,7 @@ expect error {
 }
 
 # ON UPDATE RESTRICT should succeed when no child references the parent key
+@cross-check-integrity
 test fk-update-restrict-ok-no-child {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -1950,6 +2082,7 @@ expect {
 }
 
 # INSERT OR REPLACE with ON DELETE RESTRICT should fail
+@cross-check-integrity
 test fk-replace-restrict-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
@@ -1962,6 +2095,7 @@ expect error {
 }
 
 # UPSERT with ON UPDATE RESTRICT on PRIMARY KEY should fail
+@cross-check-integrity
 test fk-upsert-restrict-pk-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -1974,6 +2108,7 @@ expect error {
 }
 
 # UPSERT with ON UPDATE RESTRICT on UNIQUE column should fail
+@cross-check-integrity
 test fk-upsert-restrict-unique-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
@@ -1986,6 +2121,7 @@ expect error {
 }
 
 # UPSERT with ON UPDATE RESTRICT should succeed when FK column is not updated
+@cross-check-integrity
 test fk-upsert-restrict-ok-no-change {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE, other TEXT);
@@ -2000,6 +2136,7 @@ expect {
 }
 
 # RESTRICT with NULL child value should not block parent operations
+@cross-check-integrity
 test fk-restrict-null-child-ok {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2014,6 +2151,7 @@ expect {
 }
 
 # DROP parent table should fail when child rows reference it
+@cross-check-integrity
 test fk-drop-parent-with-child-references {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2026,6 +2164,7 @@ expect error {
 }
 
 # DROP parent table should succeed when child FK values are all NULL
+@cross-check-integrity
 test fk-drop-parent-ok-when-child-fk-null {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2040,6 +2179,7 @@ expect {
 }
 
 # DROP parent table should succeed when child table is empty
+@cross-check-integrity
 test fk-drop-parent-ok-when-child-empty {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2053,6 +2193,7 @@ expect {
 }
 
 # DROP parent table should succeed after child FK updated to NULL
+@cross-check-integrity
 test fk-drop-parent-ok-after-child-fk-set-null {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2068,6 +2209,7 @@ expect {
 }
 
 # DROP parent table should succeed after child row deleted
+@cross-check-integrity
 test fk-drop-parent-ok-after-child-deleted {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2083,6 +2225,7 @@ expect {
 }
 
 # DROP parent with multiple children - some NULL, some not - should fail
+@cross-check-integrity
 test fk-drop-parent-mixed-null-references {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2096,6 +2239,7 @@ expect error {
 }
 
 # DROP parent should succeed when child has orphaned FK value
+@cross-check-integrity
 test fk-drop-parent-ok-with-orphaned-fk {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2112,6 +2256,7 @@ expect {
 }
 
 # DROP parent should succeed with multiple orphaned FK values
+@cross-check-integrity
 test fk-drop-parent-ok-with-multiple-orphaned-fks {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2132,6 +2277,7 @@ expect {
 }
 
 # DROP parent should succeed with mixed orphaned and NULL FK values
+@cross-check-integrity
 test fk-drop-parent-ok-with-orphaned-and-null {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2150,6 +2296,7 @@ expect {
 }
 
 # DROP parent should FAIL with mixed orphaned and valid FK references
+@cross-check-integrity
 test fk-drop-parent-fail-with-orphaned-and-valid {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2165,6 +2312,7 @@ expect error {
 }
 
 # DROP parent should succeed with composite FK orphaned values
+@cross-check-integrity
 test fk-drop-parent-ok-composite-orphaned {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
@@ -2183,6 +2331,7 @@ expect {
 }
 
 # DROP parent should FAIL with composite FK that matches
+@cross-check-integrity
 test fk-drop-parent-fail-composite-valid {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
@@ -2195,6 +2344,7 @@ expect error {
 }
 
 # DROP parent with ON DELETE CASCADE should delete child rows
+@cross-check-integrity
 test fk-drop-parent-cascade-deletes-children {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2208,6 +2358,7 @@ expect {
 }
 
 # DROP parent with ON DELETE CASCADE - multiple children per parent
+@cross-check-integrity
 test fk-drop-parent-cascade-multi-children {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2222,6 +2373,7 @@ expect {
 }
 
 # DROP parent with ON DELETE CASCADE - child with NULL FK preserved
+@cross-check-integrity
 test fk-drop-parent-cascade-null-preserved {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2236,6 +2388,7 @@ expect {
 }
 
 # DROP parent with ON DELETE SET NULL should set child FK to NULL
+@cross-check-integrity
 test fk-drop-parent-setnull-sets-children {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2252,6 +2405,7 @@ expect {
 }
 
 # DROP parent with ON DELETE SET NULL - multiple children per parent
+@cross-check-integrity
 test fk-drop-parent-setnull-multi-children {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2268,6 +2422,7 @@ expect {
 }
 
 # DROP parent with ON DELETE SET NULL - already NULL values unchanged
+@cross-check-integrity
 test fk-drop-parent-setnull-null-unchanged {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2283,6 +2438,7 @@ expect {
 }
 
 # DROP parent with ON DELETE SET DEFAULT (default is NULL) should work like SET NULL
+@cross-check-integrity
 test fk-drop-parent-setdefault-null-default {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2299,6 +2455,7 @@ expect {
 
 # DROP parent with ON DELETE SET DEFAULT (non-null default) should fail if default doesn't exist
 # This matches SQLite behavior - SET DEFAULT sets to default value, which then fails FK check
+@cross-check-integrity
 test fk-drop-parent-setdefault-nonexistent-default {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2311,6 +2468,7 @@ expect error {
 }
 
 # DROP parent with ON DELETE CASCADE - composite FK
+@cross-check-integrity
 test fk-drop-parent-cascade-composite-fk {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
@@ -2325,6 +2483,7 @@ expect {
 }
 
 # DROP parent with ON DELETE SET NULL - composite FK
+@cross-check-integrity
 test fk-drop-parent-setnull-composite-fk {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
@@ -2341,6 +2500,7 @@ expect {
 }
 
 # DROP parent with mixed FK actions - CASCADE and SET NULL on different children
+@cross-check-integrity
 test fk-drop-parent-mixed-cascade-setnull {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2360,6 +2520,7 @@ expect {
 }
 
 # DROP parent with mixed actions - some RESTRICT (should fail)
+@cross-check-integrity
 test fk-drop-parent-mixed-with-restrict {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2374,6 +2535,7 @@ expect error {
 }
 
 # DROP parent with recursive CASCADE (A->B->C)
+@cross-check-integrity
 test fk-drop-parent-cascade-recursive {
     PRAGMA foreign_keys=ON;
     CREATE TABLE a(id INTEGER PRIMARY KEY);
@@ -2391,6 +2553,7 @@ expect {
 }
 
 # DROP parent with orphaned FK values and CASCADE - orphaned should be ignored
+@cross-check-integrity
 test fk-drop-parent-cascade-with-orphaned {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2408,6 +2571,7 @@ expect {
 }
 
 # DROP COLUMN on child FK column should fail (FK column cannot be dropped)
+@cross-check-integrity
 test fk-drop-column-child-fk-fails {
     PRAGMA foreign_keys=OFF;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2418,6 +2582,7 @@ expect error {
 }
 
 # DROP COLUMN on child FK column should also fail when FK is enabled
+@cross-check-integrity
 test fk-drop-column-child-fk-enabled-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2428,6 +2593,7 @@ expect error {
 }
 
 # DROP COLUMN on child FK column should fail even with orphaned FK (parent dropped)
+@cross-check-integrity
 test fk-drop-column-orphaned-fk-fails {
     PRAGMA foreign_keys=OFF;
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2439,6 +2605,7 @@ expect error {
 }
 
 # DROP COLUMN on composite FK column should fail
+@cross-check-integrity
 test fk-drop-column-composite-fk-fails {
     PRAGMA foreign_keys=OFF;
     CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
@@ -2450,6 +2617,7 @@ expect error {
 }
 
 # No-op UPDATE on NULL FK column with deferred FK should not error (#5410)
+@cross-check-integrity
 test fk-deferred-noop-update-null {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -2465,6 +2633,7 @@ expect {
 }
 
 # No-op UPDATE on non-NULL FK column with deferred FK and valid parent
+@cross-check-integrity
 test fk-deferred-noop-update-valid-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -2481,6 +2650,7 @@ expect {
 }
 
 # UPDATE NULL FK column to NULL explicitly with deferred FK
+@cross-check-integrity
 test fk-deferred-update-null-to-null {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -2496,6 +2666,7 @@ expect {
 }
 
 # Multiple rows with NULL FK, no-op UPDATE should succeed for all
+@cross-check-integrity
 test fk-deferred-noop-update-null-multi-row {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -2513,6 +2684,7 @@ expect {
 }
 
 # No-op UPDATE on NULL FK with immediate (non-deferred) FK should also succeed
+@cross-check-integrity
 test fk-immediate-noop-update-null {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -2526,6 +2698,7 @@ expect {
 }
 
 # Issue #5409: deferred FK not enforced at COMMIT when UPDATE touches NULL FK row
+@cross-check-integrity
 test fk-deferred-update-null-row-does-not-clear-violation {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id TEXT PRIMARY KEY);
@@ -2540,6 +2713,7 @@ expect error {
 }
 
 # Variant: UPDATE on NULL FK row should not decrement counter (INTEGER PK parent)
+@cross-check-integrity
 test fk-deferred-update-null-ipk-parent-does-not-clear {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -2554,6 +2728,7 @@ expect error {
 }
 
 # UPDATE on violating row itself should NOT resolve (pid stays 'missing')
+@cross-check-integrity
 test fk-deferred-noop-update-on-violating-row {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id TEXT PRIMARY KEY);
@@ -2567,6 +2742,7 @@ expect error {
 }
 
 # Multiple NULL rows updated should not affect deferred counter
+@cross-check-integrity
 test fk-deferred-update-multiple-null-rows {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id TEXT PRIMARY KEY);
@@ -2582,6 +2758,7 @@ expect error {
 }
 
 # Verify that updating a NULL FK to a valid value still works correctly
+@cross-check-integrity
 test fk-deferred-update-null-to-valid {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id TEXT PRIMARY KEY);

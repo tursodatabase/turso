@@ -7,6 +7,7 @@
 # instead of the attached database ID when opening index cursors, causing an
 # index seek to land on a table page in the wrong database.
 
+@cross-check-integrity
 test update-attached-db-rowid-change-with-unique-index {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val REAL UNIQUE, data INTEGER);
@@ -27,6 +28,7 @@ expect @js {
     10|10|999
 }
 
+@cross-check-integrity
 test update-attached-db-rowid-with-where-subquery {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val REAL UNIQUE, data INTEGER);
@@ -49,6 +51,7 @@ expect @js {
     20|30|555
 }
 
+@cross-check-integrity
 test update-attached-db-integrity-after-rowid-change {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val REAL UNIQUE, data INTEGER);
@@ -63,6 +66,7 @@ expect {
     ok
 }
 
+@cross-check-integrity
 test update-attached-db-non-rowid-column {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val REAL UNIQUE, data INTEGER);

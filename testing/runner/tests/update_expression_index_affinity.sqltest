@@ -9,6 +9,7 @@
 # Reproducer 1: CAST expression index with INT affinity column.
 # '0.0' with INT affinity should become Integer(0), so
 # CAST(0 AS TEXT) = '0', not CAST(0.0 AS TEXT) = '0.0'.
+@cross-check-integrity
 test cast-expr-index-int-affinity {
     CREATE TABLE t0 (c0 INT);
     INSERT INTO t0 VALUES (0);
@@ -26,6 +27,7 @@ expect {
 # Reproducer 2: Comparison expression index with TEXT affinity column.
 # The comparison c0 = 0 must use TEXT affinity in both OLD and NEW
 # image paths during UPDATE.
+@cross-check-integrity
 test comparison-expr-index-text-affinity {
     CREATE TABLE t0 (c0 TEXT);
     INSERT INTO t0 VALUES ('x');
@@ -41,6 +43,7 @@ expect {
 }
 
 # Multiple sequential updates on CAST expression index.
+@cross-check-integrity
 test cast-expr-index-multiple-updates {
     CREATE TABLE t1 (c0 INT);
     INSERT INTO t1 VALUES (0);
@@ -57,6 +60,7 @@ expect {
 }
 
 # Comparison expression index with NUMERIC affinity.
+@cross-check-integrity
 test comparison-expr-index-numeric-affinity {
     CREATE TABLE t2 (c0 NUMERIC);
     INSERT INTO t2 VALUES (1);
@@ -72,6 +76,7 @@ expect {
 }
 
 # Expression index with INTEGER affinity and float-like text values.
+@cross-check-integrity
 test expr-index-int-affinity-float-text {
     CREATE TABLE t3 (c0 INT);
     INSERT INTO t3 VALUES (0);
@@ -91,6 +96,7 @@ expect {
 }
 
 # Expression index with NULL values.
+@cross-check-integrity
 test expr-index-null-values {
     CREATE TABLE t4 (c0 INT);
     INSERT INTO t4 VALUES (NULL);
@@ -106,6 +112,7 @@ expect {
 }
 
 # Multiple rows with expression index.
+@cross-check-integrity
 test expr-index-multi-row {
     CREATE TABLE t5 (id INTEGER PRIMARY KEY, c0 INT);
     INSERT INTO t5 VALUES (1, 10);
@@ -124,6 +131,7 @@ expect {
 }
 
 # Comparison expression index with multiple updates changing truth value.
+@cross-check-integrity
 test comparison-expr-index-truth-value-changes {
     CREATE TABLE t6 (c0 TEXT);
     INSERT INTO t6 VALUES ('hello');

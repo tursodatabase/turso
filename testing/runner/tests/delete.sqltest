@@ -1,6 +1,7 @@
 @database :memory:
 
 # Basic single row delete test
+@cross-check-integrity
 test delete-single-1 {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY);
     INSERT INTO t1 VALUES (1);
@@ -15,6 +16,7 @@ expect {
 }
 
 # Test alternating delete-insert pattern to stress freelist
+@cross-check-integrity
 test delete-insert-alternate-1 {
     CREATE TABLE t4 (x INTEGER PRIMARY KEY);
     INSERT INTO t4 VALUES (1);
@@ -33,6 +35,7 @@ expect {
 }
 
 # Test deleting from both ends
+@cross-check-integrity
 test delete-ends-1 {
     CREATE TABLE t5 (x INTEGER PRIMARY KEY);
     INSERT INTO t5 VALUES (1);
@@ -52,6 +55,7 @@ expect {
 }
 
 # Test delete-insert cycles with value reuse
+@cross-check-integrity
 test delete-reuse-1 {
     CREATE TABLE t6 (x INTEGER PRIMARY KEY);
     INSERT INTO t6 VALUES (1);
@@ -68,6 +72,7 @@ expect {
 }
 
 # Test delete works when there are indexes
+@cross-check-integrity
 test delete-all-with-indexes-1 {
     CREATE TABLE t (a PRIMARY KEY);
     CREATE INDEX tasc ON t(a);
@@ -79,6 +84,7 @@ test delete-all-with-indexes-1 {
 expect {
 }
 
+@cross-check-integrity
 test delete_where_falsy {
     CREATE TABLE resourceful_schurz (diplomatic_kaplan BLOB);
     INSERT INTO resourceful_schurz VALUES (X'696E646570656E64656E745F6A6165636B6C65'), (X'67656E65726F75735F62617262616E65677261'), (X'73757065725F74616E6E656E6261756D'), (X'6D6F76696E675F6E616F756D6F76'), (X'7374756E6E696E675F6B62');
@@ -98,6 +104,7 @@ expect {
     sparkling_gray
 }
 
+@cross-check-integrity
 test doubly-qualified-delete {
     create table test(col);
     insert into test(col) values (1);
@@ -110,6 +117,7 @@ expect {
 }
 
 # Test DELETE with IN subquery
+@cross-check-integrity
 test delete-in-subquery-1 {
     CREATE TABLE file_input (id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE eval_input_path (file_input_id INTEGER);
@@ -125,6 +133,7 @@ expect {
 
 
 # Test DELETE with NOT IN subquery
+@cross-check-integrity
 test delete-not-in-subquery-1  {
     CREATE TABLE file_input (id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE eval_input_path (file_input_id INTEGER);
@@ -139,6 +148,7 @@ expect {
 }
 
 # Test DELETE with IN subquery returning empty set
+@cross-check-integrity
 test delete-in-subquery-empty-1  {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);
@@ -154,6 +164,7 @@ expect {
 
 
 # Test DELETE with NOT IN subquery returning empty set (should delete all)
+@cross-check-integrity
 test delete-not-in-subquery-empty-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);
@@ -165,6 +176,7 @@ expect {
 }
 
 # Test DELETE with IN subquery and multiple columns in outer table
+@cross-check-integrity
 test delete-in-subquery-multicol-1 {
     CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
     CREATE TABLE discontinued (product_id INTEGER);
@@ -180,6 +192,7 @@ expect {
 
 
 # Test DELETE with EXISTS subquery
+@cross-check-integrity
 test delete-exists-subquery-1 {
     CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
     CREATE TABLE order_items (order_id INTEGER, product TEXT);
@@ -193,6 +206,7 @@ expect {
 }
 
 # Test DELETE with NOT EXISTS subquery
+@cross-check-integrity
 test delete-not-exists-subquery-1 {
     CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
     CREATE TABLE order_items (order_id INTEGER, product TEXT);
@@ -207,6 +221,7 @@ expect {
 }
 
 # Test DELETE with scalar comparison subquery (=)
+@cross-check-integrity
 test delete-scalar-eq-subquery-1 {
     CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department_id INTEGER);
     CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);
@@ -220,6 +235,7 @@ expect {
 }
 
 # Test DELETE with scalar comparison subquery (>)
+@cross-check-integrity
 test delete-scalar-gt-subquery-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER);
     CREATE TABLE t2 (max_val INTEGER);
@@ -234,6 +250,7 @@ expect {
 }
 
 # Test DELETE with scalar comparison subquery (<)
+@cross-check-integrity
 test delete-scalar-lt-subquery-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER);
     CREATE TABLE t2 (min_val INTEGER);
@@ -249,6 +266,7 @@ expect {
 
 
 # Test DELETE with scalar subquery using aggregate
+@cross-check-integrity
 test delete-scalar-agg-subquery-1 {
     CREATE TABLE items (id INTEGER PRIMARY KEY, score INTEGER);
     INSERT INTO items VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
@@ -262,6 +280,7 @@ expect {
 }
 
 # Test DELETE with EXISTS and empty subquery result
+@cross-check-integrity
 test delete-exists-empty-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);

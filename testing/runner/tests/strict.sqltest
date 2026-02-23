@@ -1,6 +1,7 @@
 @database :memory:
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-null-integer-column {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER) STRICT;
     INSERT INTO t1 (a) VALUES (5);
@@ -11,6 +12,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-null-text-column {
     CREATE TABLE t2 (id INTEGER PRIMARY KEY, first TEXT, last TEXT) STRICT;
     INSERT INTO t2 (first) VALUES ('John');
@@ -21,6 +23,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-null-real-column {
     CREATE TABLE t3 (id INTEGER PRIMARY KEY, a REAL, b REAL) STRICT;
     INSERT INTO t3 (a) VALUES (3.14);
@@ -31,6 +34,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-null-blob-column {
     CREATE TABLE t4 (id INTEGER PRIMARY KEY, a BLOB, b BLOB) STRICT;
     INSERT INTO t4 (a) VALUES (X'CAFE');
@@ -41,6 +45,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-explicit-null-insert {
     CREATE TABLE t5 (id INTEGER PRIMARY KEY, a INTEGER, b TEXT) STRICT;
     INSERT INTO t5 VALUES (1, NULL, NULL);
@@ -51,6 +56,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-not-null-still-enforced {
     CREATE TABLE t6 (id INTEGER PRIMARY KEY, a INTEGER NOT NULL) STRICT;
     INSERT INTO t6 (id) VALUES (1);

@@ -4,6 +4,7 @@
 # page_free_array used u16 for offset/len which overflows when offset + len > 65535
 # on 65536-byte pages with large index cells.
 
+@cross-check-integrity
 test large-page-index-insert {
     PRAGMA page_size = 65536;
     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);

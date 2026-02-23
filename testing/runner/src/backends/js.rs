@@ -77,13 +77,13 @@ impl SqlBackend for JsBackend {
         &self,
         config: &DatabaseConfig,
     ) -> Result<Box<dyn DatabaseInstance>, BackendError> {
-        let (db_path, temp_file, is_memory) = match &config.location {
+        let (db_path, temp_file, buffer_setups) = match &config.location {
             DatabaseLocation::Memory => (":memory:".to_string(), None, true),
             DatabaseLocation::TempFile => {
                 let temp = NamedTempFile::new()
                     .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
                 let path = temp.path().to_string_lossy().to_string();
-                (path, Some(temp), false)
+                (path, Some(temp), true)
             }
             DatabaseLocation::Path(path) => (path.to_string_lossy().to_string(), None, false),
             DatabaseLocation::Default | DatabaseLocation::DefaultNoRowidAlias => {
@@ -108,7 +108,7 @@ impl SqlBackend for JsBackend {
             readonly: config.readonly,
             timeout: self.timeout,
             _temp_file: temp_file,
-            is_memory,
+            buffer_setups,
             setup_buffer: Vec::new(),
             mvcc: self.mvcc,
         }))
@@ -125,7 +125,7 @@ pub struct JsDatabaseInstance {
     /// Keep temp file alive - it's deleted when this is dropped
     _temp_file: Option<NamedTempFile>,
     /// Whether this is an in-memory database (needs buffering)
-    is_memory: bool,
+    buffer_setups: bool,
     /// Buffer of setup SQL (for memory databases)
     setup_buffer: Vec<String>,
     /// Enable MVCC mode
@@ -223,7 +223,7 @@ impl JsDatabaseInstance {
 #[async_trait]
 impl DatabaseInstance for JsDatabaseInstance {
     async fn execute_setup(&mut self, sql: &str) -> Result<(), BackendError> {
-        if self.is_memory {
+        if self.buffer_setups {
             // For memory databases, buffer the setup SQL for later
             self.setup_buffer.push(sql.to_string());
             Ok(())
@@ -241,7 +241,7 @@ impl DatabaseInstance for JsDatabaseInstance {
     }
 
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError> {
-        if self.is_memory && !self.setup_buffer.is_empty() {
+        if self.buffer_setups && !self.setup_buffer.is_empty() {
             // Combine buffered setup SQL with the query, using a marker to separate them
             let mut combined = self.setup_buffer.join("\n");
             combined.push('\n');

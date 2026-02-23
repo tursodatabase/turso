@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test last-insert-rowid-unchanged-after-update {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO t1 VALUES (1, 'a');
@@ -17,6 +18,7 @@ expect {
     6
 }
 
+@cross-check-integrity
 test last-insert-rowid-unchanged-after-upsert-update {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO t1 VALUES (1, 'a');
@@ -32,6 +34,7 @@ expect {
     6
 }
 
+@cross-check-integrity
 test last-insert-rowid-after-insert-returning {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
 

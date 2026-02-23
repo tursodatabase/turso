@@ -689,6 +689,7 @@ expect {
 }
 
 # github-issue: 2957.
+@cross-check-integrity
 test compare-int-float-lte-negative-zero {
     CREATE TABLE t1(i INTEGER);
     INSERT INTO t1 VALUES (0), (-1), (1);
@@ -699,6 +700,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test compare-int-float-lt-negative-zero {
     CREATE TABLE t1(i INTEGER);
     INSERT INTO t1 VALUES (0), (-1), (1);

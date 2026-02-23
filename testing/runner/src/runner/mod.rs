@@ -414,10 +414,12 @@ async fn run_single<B: SqlBackend, R: Runnable>(
         // - test passed
         // - database is not readonly (readonly DBs are pre-generated)
         // - test doesn't expect an error
+        // - MVCC mode is off (MVCC databases have turso-specific format)
         if test.cross_check_integrity()
             && matches!(outcome, TestOutcome::Passed)
             && !options.db_config.readonly
             && !test.expects_error()
+            && !options.mvcc
         {
             if let Some(ref binary) = options.cross_check_binary {
                 if let Some(ref db_path) = file_handle.path {
@@ -1133,6 +1135,7 @@ async fn run_cross_check_integrity(binary: &Path, db_path: &Path) -> Result<(), 
     if is_turso {
         cmd.arg("-q");
         cmd.arg("-m").arg("list");
+        cmd.arg("--experimental-triggers");
     }
 
     cmd.arg("PRAGMA integrity_check;");

@@ -53,6 +53,7 @@ expect {
 }
 
 # Test quick_check with table and index
+@cross-check-integrity
 test quick-check-with-index {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);
     CREATE INDEX idx_t1_name ON t1(name);
@@ -77,6 +78,7 @@ expect {
 }
 
 # Test integrity_check with configurable max errors
+@cross-check-integrity
 test integrity-check-max-errors {
     CREATE TABLE t1(id INTEGER PRIMARY KEY);
     PRAGMA integrity_check(10);
@@ -86,6 +88,7 @@ expect {
 }
 
 # Test quick_check skips index validation (should still return ok)
+@cross-check-integrity
 test quick-check-skips-index {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);
     CREATE INDEX idx_t1_name ON t1(name);

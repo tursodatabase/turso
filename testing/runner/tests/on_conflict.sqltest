@@ -11,6 +11,7 @@
 
 # ABORT is the default - rolls back the statement on constraint violation
 
+@cross-check-integrity
 test insert-or-abort-notnull {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL);
     INSERT INTO t1 VALUES (1, 'one');
@@ -19,6 +20,7 @@ test insert-or-abort-notnull {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-abort-notnull-verify-rollback {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL);
     INSERT INTO t1 VALUES (1, 'one');
@@ -28,6 +30,7 @@ test insert-or-abort-notnull-verify-rollback {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-abort-unique {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -36,6 +39,7 @@ test insert-or-abort-unique {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-abort-pk {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t1 VALUES (1, 'one');
@@ -50,6 +54,7 @@ expect error {
 
 # IGNORE skips the row that would cause a constraint violation
 
+@cross-check-integrity
 test insert-or-ignore-notnull {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL);
     INSERT INTO t1 VALUES (1, 'one');
@@ -60,6 +65,7 @@ expect {
     1|one
 }
 
+@cross-check-integrity
 test insert-or-ignore-unique {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -70,6 +76,7 @@ expect {
     1|one
 }
 
+@cross-check-integrity
 test insert-or-ignore-pk {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t1 VALUES (1, 'one');
@@ -80,6 +87,7 @@ expect {
     1|one
 }
 
+@cross-check-integrity
 test insert-or-ignore-continue-after-skip {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -91,6 +99,7 @@ expect {
     3|three
 }
 
+@cross-check-integrity
 test insert-or-ignore-no-conflict {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
     INSERT INTO t1 VALUES (1, 'one');
@@ -108,6 +117,7 @@ expect {
 
 # REPLACE deletes conflicting rows before inserting the new row
 
+@cross-check-integrity
 test insert-or-replace-unique {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -118,6 +128,7 @@ expect {
     2|one
 }
 
+@cross-check-integrity
 test insert-or-replace-pk {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t1 VALUES (1, 'one');
@@ -128,6 +139,7 @@ expect {
     1|replaced
 }
 
+@cross-check-integrity
 test insert-or-replace-notnull-with-default {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL DEFAULT 'default_val');
     INSERT INTO t1 VALUES (1, 'one');
@@ -139,6 +151,7 @@ expect {
     2|default_val
 }
 
+@cross-check-integrity
 test insert-or-replace-notnull-no-default {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
     INSERT INTO t1 VALUES (1, 'one');
@@ -147,6 +160,7 @@ test insert-or-replace-notnull-no-default {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-replace-multiple-conflicts {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'b1', 'c1');
@@ -158,6 +172,7 @@ expect {
     3|b1|c2
 }
 
+@cross-check-integrity
 test insert-or-replace-no-conflict {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -171,6 +186,7 @@ expect {
 
 # INSERT OR REPLACE should preserve user values for multiple NOT NULL DEFAULT columns
 
+@cross-check-integrity
 test insert-or-replace-multi-notnull-default {
     CREATE TABLE t1(
         id INTEGER PRIMARY KEY,
@@ -184,6 +200,7 @@ expect {
     1|100|hello
 }
 
+@cross-check-integrity
 test insert-or-replace-multi-notnull-default-many-cols {
     CREATE TABLE t1(id INTEGER PRIMARY KEY,
         a TEXT NOT NULL DEFAULT 'da',
@@ -198,6 +215,7 @@ expect {
 
 # INSERT OR REPLACE must not bypass CHECK constraints via default substitution
 
+@cross-check-integrity
 test insert-or-replace-notnull-default-respects-check {
     CREATE TABLE t1(
         id INTEGER PRIMARY KEY,
@@ -213,6 +231,7 @@ expect {
 
 # INSERT OR REPLACE must keep index and table data consistent for NOT NULL DEFAULT UNIQUE columns
 
+@cross-check-integrity
 test insert-or-replace-notnull-default-unique-index-consistent {
     CREATE TABLE t1(
         id INTEGER PRIMARY KEY,
@@ -229,6 +248,7 @@ expect {
 
 # INSERT OR REPLACE ... SELECT should also preserve user values for NOT NULL DEFAULT columns
 
+@cross-check-integrity
 test insert-or-replace-select-multi-notnull-default {
     CREATE TABLE src(id INTEGER PRIMARY KEY, val INTEGER, name TEXT);
     INSERT INTO src VALUES (1, 100, 'hello');
@@ -250,6 +270,7 @@ expect {
 
 # ROLLBACK rolls back the entire transaction, not just the statement
 
+@cross-check-integrity
 test insert-or-rollback-autocommit {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -258,6 +279,7 @@ test insert-or-rollback-autocommit {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-rollback-autocommit-no-partial {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -267,6 +289,7 @@ test insert-or-rollback-autocommit-no-partial {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-rollback-in-transaction {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -277,6 +300,7 @@ test insert-or-rollback-in-transaction {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-rollback-rolls-back-entire-tx {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -289,6 +313,7 @@ expect error {
 }
 
 # After ROLLBACK error, should only see original data
+@cross-check-integrity
 test insert-or-rollback-verify-state-after-error {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -304,6 +329,7 @@ expect {
 
 # FAIL aborts current statement but doesn't rollback changes already made
 
+@cross-check-integrity
 test insert-or-fail-autocommit {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -312,6 +338,7 @@ test insert-or-fail-autocommit {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-fail-keeps-prior-changes {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -322,6 +349,7 @@ expect error {
 }
 
 # FAIL in multi-row insert keeps rows before the failure
+@cross-check-integrity
 test insert-or-fail-partial-insert {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT OR FAIL INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'one'), (4, 'four');
@@ -330,6 +358,7 @@ test insert-or-fail-partial-insert {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-fail-in-transaction {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     BEGIN;
@@ -340,6 +369,7 @@ expect error {
 }
 
 # FAIL in transaction - earlier changes persist, transaction still active
+@cross-check-integrity
 test insert-or-fail-tx-still-active {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     BEGIN;
@@ -356,6 +386,7 @@ expect error {
 
 # UPDATE OR IGNORE with NOT NULL violation should skip the row
 
+@cross-check-integrity
 test update-or-ignore-notnull {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -370,6 +401,7 @@ expect {
 
 # UPDATE OR IGNORE with UNIQUE violation should skip the row
 
+@cross-check-integrity
 test update-or-ignore-unique {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -384,6 +416,7 @@ expect {
 
 # UPDATE OR IGNORE with PRIMARY KEY violation (rowid update) should skip
 
+@cross-check-integrity
 test update-or-ignore-pk {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -398,6 +431,7 @@ expect {
 
 # UPDATE OR IGNORE with no conflict should proceed normally
 
+@cross-check-integrity
 test update-or-ignore-no-conflict {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -412,6 +446,7 @@ expect {
 
 # UPDATE OR IGNORE should continue processing other rows after skipping
 
+@cross-check-integrity
 test update-or-ignore-continue {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -426,6 +461,7 @@ expect {
 
 # UPDATE OR IGNORE - multiple rows, some skip, some succeed
 
+@cross-check-integrity
 test update-or-ignore-partial-update {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four');
@@ -443,6 +479,7 @@ expect {
 # UPDATE OR ABORT tests (default behavior)
 # =============================================================================
 
+@cross-check-integrity
 test update-or-abort-notnull {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
@@ -453,6 +490,7 @@ expect error {
 
 # UPDATE OR ABORT with UNIQUE violation should fail
 
+@cross-check-integrity
 test update-or-abort-unique {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
@@ -461,6 +499,7 @@ test update-or-abort-unique {
 expect error {
 }
 
+@cross-check-integrity
 test update-or-abort-pk {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
@@ -471,6 +510,7 @@ expect error {
 
 # UPDATE OR ABORT should rollback statement changes when conflict occurs
 
+@cross-check-integrity
 test update-or-abort-rollback-statement {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
     INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
@@ -485,6 +525,7 @@ expect error {
 
 # UPDATE OR REPLACE with UNIQUE violation should delete the conflicting row
 
+@cross-check-integrity
 test update-or-replace-unique {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -498,6 +539,7 @@ expect {
 
 # UPDATE OR REPLACE with NOT NULL violation and default value should use default
 
+@cross-check-integrity
 test update-or-replace-notnull-default {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL DEFAULT 'default_val');
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
@@ -511,6 +553,7 @@ expect {
 
 # UPDATE OR REPLACE with NOT NULL violation and no default should fail
 
+@cross-check-integrity
 test update-or-replace-notnull-no-default {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
@@ -521,6 +564,7 @@ expect error {
 
 # UPDATE OR REPLACE with PRIMARY KEY conflict should delete conflicting row
 
+@cross-check-integrity
 test update-or-replace-pk {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -534,6 +578,7 @@ expect {
 
 # UPDATE OR REPLACE with no conflict should proceed normally
 
+@cross-check-integrity
 test update-or-replace-no-conflict {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -548,6 +593,7 @@ expect {
 
 # UPDATE OR REPLACE - multiple conflicts resolved by deletion
 
+@cross-check-integrity
 test update-or-replace-multiple-conflicts {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'b1', 'c1');
@@ -564,6 +610,7 @@ expect {
 # UPDATE OR ROLLBACK tests
 # =============================================================================
 
+@cross-check-integrity
 test update-or-rollback-autocommit {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
@@ -572,6 +619,7 @@ test update-or-rollback-autocommit {
 expect error {
 }
 
+@cross-check-integrity
 test update-or-rollback-in-transaction {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -583,6 +631,7 @@ expect error {
 }
 
 # ROLLBACK rolls back entire transaction
+@cross-check-integrity
 test update-or-rollback-entire-tx-rolled-back {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -595,6 +644,7 @@ expect error {
 }
 
 # After ROLLBACK error in tx, only original data visible
+@cross-check-integrity
 test update-or-rollback-verify-state {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -608,6 +658,7 @@ expect {
 # UPDATE OR FAIL tests
 # =============================================================================
 
+@cross-check-integrity
 test update-or-fail-autocommit {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
@@ -616,6 +667,7 @@ test update-or-fail-autocommit {
 expect error {
 }
 
+@cross-check-integrity
 test update-or-fail-in-transaction {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -627,6 +679,7 @@ expect error {
 }
 
 # FAIL keeps prior changes in the statement
+@cross-check-integrity
 test update-or-fail-partial-update {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
     INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
@@ -637,6 +690,7 @@ expect error {
 }
 
 # FAIL in transaction - tx stays open with prior changes
+@cross-check-integrity
 test update-or-fail-tx-stays-active {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -654,6 +708,7 @@ expect error {
 
 # FK errors always behave like ABORT, regardless of ON CONFLICT clause
 
+@cross-check-integrity
 test insert-or-ignore-fk-still-fails {
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
     CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
@@ -664,6 +719,7 @@ test insert-or-ignore-fk-still-fails {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-replace-fk-still-fails {
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
     CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
@@ -674,6 +730,7 @@ test insert-or-replace-fk-still-fails {
 expect error {
 }
 
+@cross-check-integrity
 test update-or-ignore-fk-still-fails {
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
     CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
@@ -685,6 +742,7 @@ test update-or-ignore-fk-still-fails {
 expect error {
 }
 
+@cross-check-integrity
 test update-or-replace-fk-still-fails {
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
     CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
@@ -696,6 +754,7 @@ test update-or-replace-fk-still-fails {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-fail-fk-still-fails {
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
     CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
@@ -706,6 +765,7 @@ test insert-or-fail-fk-still-fails {
 expect error {
 }
 
+@cross-check-integrity
 test insert-or-rollback-fk-still-fails {
     CREATE TABLE parent(id INTEGER PRIMARY KEY);
     CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
@@ -722,6 +782,7 @@ expect error {
 
 # Multiple constraint violations in single row - first encountered wins
 
+@cross-check-integrity
 test multiple-constraints-first-wins {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL, c UNIQUE);
     INSERT INTO t1 VALUES (1, 'one', 'c1');
@@ -734,6 +795,7 @@ expect {
 
 # UPDATE affecting multiple rows with constraint violation
 
+@cross-check-integrity
 test update-multiple-rows-one-fails {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
     INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
@@ -744,6 +806,7 @@ expect error {
 
 # INSERT with SELECT and ON CONFLICT
 
+@cross-check-integrity
 test insert-select-or-ignore {
     CREATE TABLE src(a INTEGER, b TEXT);
     CREATE TABLE dst(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
@@ -758,6 +821,7 @@ expect {
     10|existing
 }
 
+@cross-check-integrity
 test insert-select-or-replace {
     CREATE TABLE src(a INTEGER, b TEXT);
     CREATE TABLE dst(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
@@ -773,6 +837,7 @@ expect {
 
 # Empty result - no violations
 
+@cross-check-integrity
 test insert-or-ignore-empty {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT OR IGNORE INTO t1 SELECT * FROM t1;
@@ -783,6 +848,7 @@ expect {
 
 # Self-referential update with constraint
 
+@cross-check-integrity
 test self-ref-update-or-ignore {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
     INSERT INTO t1 VALUES (1, 10), (2, 20);
@@ -796,6 +862,7 @@ expect {
 
 # RETURNING with ON CONFLICT
 
+@cross-check-integrity
 test insert-or-ignore-returning {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -805,6 +872,7 @@ expect {
     3|three
 }
 
+@cross-check-integrity
 test insert-or-replace-returning {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one');
@@ -814,6 +882,7 @@ expect {
     2|one
 }
 
+@cross-check-integrity
 test update-or-ignore-returning {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -822,6 +891,7 @@ test update-or-ignore-returning {
 expect {
 }
 
+@cross-check-integrity
 test update-or-replace-returning {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
     INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -835,6 +905,7 @@ expect {
 # Autoincrement with ON CONFLICT
 # =============================================================================
 
+@cross-check-integrity
 test insert-or-ignore-autoincrement {
     CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT UNIQUE);
     INSERT INTO t1(b) VALUES ('one');
@@ -847,6 +918,7 @@ expect {
     3|three
 }
 
+@cross-check-integrity
 test insert-or-replace-autoincrement {
     CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT UNIQUE);
     INSERT INTO t1(b) VALUES ('one');

@@ -1,6 +1,7 @@
 @database :memory:
 
 # Basic column-level CHECK constraints
+@cross-check-integrity
 test check_constraint_column_level_basic {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -18,6 +19,7 @@ expect {
 }
 
 # Column-level CHECK constraint violation on INSERT
+@cross-check-integrity
 test check_constraint_column_age_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -28,6 +30,7 @@ test check_constraint_column_age_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_column_salary_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -38,6 +41,7 @@ test check_constraint_column_salary_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_column_salary_zero_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -49,6 +53,7 @@ expect error {
 }
 
 # Table-level CHECK constraints
+@cross-check-integrity
 test check_constraint_table_level_basic {
     CREATE TABLE products (
         id INTEGER PRIMARY KEY,
@@ -65,6 +70,7 @@ expect {
     2|50|50
 }
 
+@cross-check-integrity
 test check_constraint_table_level_violation {
     CREATE TABLE products (
         id INTEGER PRIMARY KEY,
@@ -78,6 +84,7 @@ expect error {
 }
 
 # Complex CHECK constraints with IN operator
+@cross-check-integrity
 test check_constraint_in_operator {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -97,6 +104,7 @@ expect {
     4|Marketing
 }
 
+@cross-check-integrity
 test check_constraint_in_operator_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -109,6 +117,7 @@ expect error {
 }
 
 # NULL handling in CHECK constraints
+@cross-check-integrity
 test check_constraint_null_passes {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -124,6 +133,7 @@ expect {
 }
 
 # UPDATE operations with CHECK constraints
+@cross-check-integrity
 test check_constraint_update_success {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -139,6 +149,7 @@ expect {
     1|30|60000
 }
 
+@cross-check-integrity
 test check_constraint_update_age_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -150,6 +161,7 @@ test check_constraint_update_age_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_update_salary_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -162,6 +174,7 @@ expect error {
 }
 
 # Multiple CHECK constraints on same table
+@cross-check-integrity
 test check_constraint_multiple {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -177,6 +190,7 @@ expect {
     2|65|1000000
 }
 
+@cross-check-integrity
 test check_constraint_multiple_first_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -187,6 +201,7 @@ test check_constraint_multiple_first_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_multiple_second_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -199,6 +214,7 @@ expect error {
 
 # STRICT tables with CHECK constraints
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test check_constraint_strict_table_basic {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -214,6 +230,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"  
+@cross-check-integrity
 test check_constraint_strict_type_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -225,6 +242,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test check_constraint_strict_numeric_string_coercion {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -239,6 +257,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test check_constraint_strict_check_violation_after_coercion {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -251,6 +270,7 @@ expect error {
 }
 
 # Regular (non-STRICT) tables with type affinity
+@cross-check-integrity
 test check_constraint_regular_table_numeric_string {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -266,6 +286,7 @@ expect {
     2|30|integer
 }
 
+@cross-check-integrity
 test check_constraint_regular_table_text_stored {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -281,6 +302,7 @@ expect {
 }
 
 # Complex expressions in CHECK constraints
+@cross-check-integrity
 test check_constraint_complex_expression {
     CREATE TABLE orders (
         id INTEGER PRIMARY KEY,
@@ -298,6 +320,7 @@ expect {
     2|3|25|75
 }
 
+@cross-check-integrity
 test check_constraint_complex_expression_violation {
     CREATE TABLE orders (
         id INTEGER PRIMARY KEY,
@@ -312,6 +335,7 @@ expect error {
 }
 
 # CHECK constraints with AND/OR logic
+@cross-check-integrity
 test check_constraint_and_logic {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -328,6 +352,7 @@ expect {
     2|30|10
 }
 
+@cross-check-integrity
 test check_constraint_and_logic_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -341,6 +366,7 @@ test check_constraint_and_logic_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_or_logic {
     CREATE TABLE products (
         id INTEGER PRIMARY KEY,
@@ -359,6 +385,7 @@ expect {
 }
 
 # BETWEEN operator in CHECK constraints
+@cross-check-integrity
 test check_constraint_between {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -376,6 +403,7 @@ expect {
     3|65
 }
 
+@cross-check-integrity
 test check_constraint_between_lower_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -387,6 +415,7 @@ test check_constraint_between_lower_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_between_upper_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -399,6 +428,7 @@ expect error {
 }
 
 # String pattern matching in CHECK constraints
+@cross-check-integrity
 test check_constraint_like_pattern {
     CREATE TABLE emails (
         id INTEGER PRIMARY KEY,
@@ -414,6 +444,7 @@ expect {
     2|admin@test.org
 }
 
+@cross-check-integrity
 test check_constraint_like_pattern_violation {
     CREATE TABLE emails (
         id INTEGER PRIMARY KEY,
@@ -426,6 +457,7 @@ expect error {
 }
 
 # CHECK constraints with NOT operator
+@cross-check-integrity
 test check_constraint_not_operator {
     CREATE TABLE products (
         id INTEGER PRIMARY KEY,
@@ -441,6 +473,7 @@ expect {
     2|pending
 }
 
+@cross-check-integrity
 test check_constraint_not_operator_violation {
     CREATE TABLE products (
         id INTEGER PRIMARY KEY,
@@ -453,6 +486,7 @@ expect error {
 }
 
 # CHECK constraint with length() function
+@cross-check-integrity
 test check_constraint_length_function {
     CREATE TABLE users (
         id INTEGER PRIMARY KEY,
@@ -468,6 +502,7 @@ expect {
     2|alice_wonderland
 }
 
+@cross-check-integrity
 test check_constraint_length_too_short {
     CREATE TABLE users (
         id INTEGER PRIMARY KEY,
@@ -479,6 +514,7 @@ test check_constraint_length_too_short {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_length_too_long {
     CREATE TABLE users (
         id INTEGER PRIMARY KEY,
@@ -491,6 +527,7 @@ expect error {
 }
 
 # Multiple rows insert with CHECK constraint
+@cross-check-integrity
 test check_constraint_multi_row_insert_all_pass {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -505,6 +542,7 @@ expect {
     3|45
 }
 
+@cross-check-integrity
 test check_constraint_multi_row_insert_one_fails {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -516,6 +554,7 @@ expect error {
 }
 
 # CHECK constraints on REAL values with precision
+@cross-check-integrity
 test check_constraint_real_precision {
     CREATE TABLE measurements (
         id INTEGER PRIMARY KEY,
@@ -538,6 +577,7 @@ expect @js {
     3|100
 }
 
+@cross-check-integrity
 test check_constraint_real_precision_violation {
     CREATE TABLE measurements (
         id INTEGER PRIMARY KEY,
@@ -549,6 +589,7 @@ expect error {
 }
 
 # Transaction rollback on CHECK constraint failure
+@cross-check-integrity
 test check_constraint_transaction_rollback {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -564,6 +605,7 @@ test check_constraint_transaction_rollback {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_verify_rollback {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -584,6 +626,7 @@ expect error {
 }
 
 # Edge case: CHECK constraint with 0 and 1 (false and true)
+@cross-check-integrity
 test check_constraint_boolean_style {
     CREATE TABLE flags (
         id INTEGER PRIMARY KEY,
@@ -598,6 +641,7 @@ expect {
     2|1
 }
 
+@cross-check-integrity
 test check_constraint_boolean_style_violation {
     CREATE TABLE flags (
         id INTEGER PRIMARY KEY,
@@ -609,6 +653,7 @@ expect error {
 }
 
 # CASE expressions in CHECK constraints
+@cross-check-integrity
 test check_constraint_case_expression {
     CREATE TABLE orders (
         id INTEGER PRIMARY KEY,
@@ -631,6 +676,7 @@ expect {
     3|pending|-50
 }
 
+@cross-check-integrity
 test check_constraint_case_expression_violation {
     CREATE TABLE orders (
         id INTEGER PRIMARY KEY,
@@ -648,6 +694,7 @@ expect error {
 }
 
 # Rowid references in CHECK constraints
+@cross-check-integrity
 test check_constraint_rowid_reference {
     CREATE TABLE audit_log (
         message TEXT,
@@ -662,6 +709,7 @@ expect {
     2|Second entry
 }
 
+@cross-check-integrity
 test check_constraint_rowid_reference_violation {
     CREATE TABLE audit_log (
         message TEXT,
@@ -673,6 +721,7 @@ expect error {
 }
 
 # DEFAULT values with CHECK constraints
+@cross-check-integrity
 test check_constraint_default_value {
     CREATE TABLE tasks (
         id INTEGER PRIMARY KEY,
@@ -687,6 +736,7 @@ expect {
     2|active
 }
 
+@cross-check-integrity
 test check_constraint_default_value_violation {
     CREATE TABLE tasks (
         id INTEGER PRIMARY KEY,
@@ -698,6 +748,7 @@ expect error {
 }
 
 # CAST in CHECK constraints
+@cross-check-integrity
 test check_constraint_cast_expression {
     CREATE TABLE numeric_strings (
         id INTEGER PRIMARY KEY,
@@ -713,6 +764,7 @@ expect {
     2|456
 }
 
+@cross-check-integrity
 test check_constraint_cast_expression_violation {
     CREATE TABLE numeric_strings (
         id INTEGER PRIMARY KEY,
@@ -725,6 +777,7 @@ expect error {
 }
 
 # ON CONFLICT clauses with CHECK constraints
+@cross-check-integrity
 test check_constraint_on_conflict_ignore {
     CREATE TABLE items (
         id INTEGER PRIMARY KEY,
@@ -740,6 +793,7 @@ expect {
     3|20
 }
 
+@cross-check-integrity
 test check_constraint_on_conflict_replace {
     CREATE TABLE items (
         id INTEGER PRIMARY KEY,
@@ -752,6 +806,7 @@ test check_constraint_on_conflict_replace {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_on_conflict_fail {
     CREATE TABLE items (
         id INTEGER PRIMARY KEY,
@@ -764,6 +819,7 @@ test check_constraint_on_conflict_fail {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_on_conflict_abort {
     CREATE TABLE items (
         id INTEGER PRIMARY KEY,
@@ -776,6 +832,7 @@ test check_constraint_on_conflict_abort {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_on_conflict_rollback {
     CREATE TABLE items (
         id INTEGER PRIMARY KEY,
@@ -790,6 +847,7 @@ expect error {
 }
 
 # Foreign key + CHECK constraint interaction
+@cross-check-integrity
 test check_constraint_with_foreign_key {
     PRAGMA foreign_keys = ON;
     CREATE TABLE parent (id INTEGER PRIMARY KEY);
@@ -809,6 +867,7 @@ expect {
     2|2
 }
 
+@cross-check-integrity
 test check_constraint_before_foreign_key {
     PRAGMA foreign_keys = ON;
     CREATE TABLE parent (id INTEGER PRIMARY KEY);
@@ -823,6 +882,7 @@ test check_constraint_before_foreign_key {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_foreign_key_fails {
     PRAGMA foreign_keys = ON;
     CREATE TABLE parent (id INTEGER PRIMARY KEY);
@@ -838,6 +898,7 @@ expect error {
 }
 
 # COLLATE in CHECK constraints
+@cross-check-integrity
 test check_constraint_collate_nocase {
     CREATE TABLE users (
         id INTEGER PRIMARY KEY,
@@ -853,6 +914,7 @@ expect {
     2|USER2
 }
 
+@cross-check-integrity
 test check_constraint_collate_nocase_violation {
     CREATE TABLE users (
         id INTEGER PRIMARY KEY,
@@ -865,6 +927,7 @@ expect error {
 }
 
 # Arithmetic overflow in CHECK constraints
+@cross-check-integrity
 test check_constraint_arithmetic_overflow {
     CREATE TABLE numbers (
         id INTEGER PRIMARY KEY,
@@ -880,6 +943,7 @@ expect {
     2|49
 }
 
+@cross-check-integrity
 test check_constraint_arithmetic_overflow_violation {
     CREATE TABLE numbers (
         id INTEGER PRIMARY KEY,
@@ -892,6 +956,7 @@ expect error {
 }
 
 # ALTER TABLE with CHECK constraints
+@cross-check-integrity
 test check_constraint_alter_table_add_column_violation {
     CREATE TABLE products (
         id INTEGER PRIMARY KEY,
@@ -904,6 +969,7 @@ expect error {
 }
 
 # ALTER TABLE ADD COLUMN with CHECK on a table with existing data
+@cross-check-integrity
 test check_constraint_alter_add_column_with_data {
     CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO products VALUES (1, 'Widget A');
@@ -918,6 +984,7 @@ expect {
     2|Widget B|
 }
 
+@cross-check-integrity
 test check_constraint_alter_add_column_with_data_enforced {
     CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO products VALUES (1, 'Widget A');
@@ -932,6 +999,7 @@ expect {
     2|Widget B|25.99
 }
 
+@cross-check-integrity
 test check_constraint_alter_add_column_with_data_violation {
     CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO products VALUES (1, 'Widget A');
@@ -943,6 +1011,7 @@ test check_constraint_alter_add_column_with_data_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_alter_add_column_with_data_update_violation {
     CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO products VALUES (1, 'Widget A');
@@ -954,6 +1023,7 @@ test check_constraint_alter_add_column_with_data_update_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_trigger_violation {
     CREATE TABLE audit (
         id INTEGER PRIMARY KEY,
@@ -989,6 +1059,7 @@ expect {
     2|150
 }
 
+@cross-check-integrity
 test check_constraint_pragma_ignore_then_enforce {
     CREATE TABLE restricted (
         id INTEGER PRIMARY KEY,
@@ -1004,6 +1075,7 @@ expect error {
 }
 
 # ALTER TABLE ADD COLUMN with CHECK constraints
+@cross-check-integrity
 test alter_table_add_column_check_constraint_success {
     CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
     ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
@@ -1019,6 +1091,7 @@ expect {
     2|Widget B|25.99
 }
 
+@cross-check-integrity
 test alter_table_add_column_check_constraint_named {
     CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT);
 
@@ -1034,6 +1107,7 @@ expect error {
 }
 
 # UPSERT DO UPDATE must evaluate CHECK constraints on the updated values
+@cross-check-integrity
 test check_constraint_upsert_do_update_violation {
     CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0));
     INSERT INTO t VALUES(1, 10);
@@ -1043,6 +1117,7 @@ test check_constraint_upsert_do_update_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_upsert_do_update_success {
     CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0));
     INSERT INTO t VALUES(1, 10);
@@ -1054,6 +1129,7 @@ expect {
 }
 
 # UPDATE OR IGNORE should skip rows that violate CHECK constraints
+@cross-check-integrity
 test check_constraint_update_or_ignore_single_row {
     CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0));
     INSERT INTO t VALUES(1, 10);
@@ -1069,6 +1145,7 @@ expect {
     3|30
 }
 
+@cross-check-integrity
 test check_constraint_update_or_ignore_all_rows {
     CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0));
     INSERT INTO t VALUES(1, 10);
@@ -1083,6 +1160,7 @@ expect {
 }
 
 # CHECK constraints referencing rowid aliases (_rowid_, oid)
+@cross-check-integrity
 test check_constraint_rowid_alias_underscore {
     CREATE TABLE t(val INTEGER, CHECK(_rowid_ > 0));
     INSERT INTO t VALUES(100);
@@ -1092,6 +1170,7 @@ expect {
     1|100
 }
 
+@cross-check-integrity
 test check_constraint_rowid_alias_oid {
     CREATE TABLE t(val INTEGER, CHECK(oid > 0));
     INSERT INTO t(rowid, val) VALUES(-1, 100);
@@ -1100,6 +1179,7 @@ expect error {
 }
 
 # UPDATE that changes rowid to a value violating CHECK
+@cross-check-integrity
 test check_constraint_update_rowid_violation {
     CREATE TABLE t(val INTEGER, CHECK(rowid > 0));
     INSERT INTO t VALUES(100);
@@ -1109,6 +1189,7 @@ expect error {
 }
 
 # UPDATE that does NOT change rowid should still pass CHECK referencing rowid
+@cross-check-integrity
 test check_constraint_update_no_rowid_change {
     CREATE TABLE t(val INTEGER, CHECK(rowid > 0));
     INSERT INTO t VALUES(100);
@@ -1120,6 +1201,7 @@ expect {
 }
 
 # UPSERT DO UPDATE with rowid CHECK
+@cross-check-integrity
 test check_constraint_upsert_rowid_check {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, CHECK(rowid > 0));
     INSERT INTO t VALUES(1, 10);
@@ -1131,6 +1213,7 @@ expect {
 }
 
 # Qualified column references in CHECK constraints (table.column)
+@cross-check-integrity
 test check_constraint_qualified_column_ref {
     CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
     INSERT INTO t VALUES(10);
@@ -1140,6 +1223,7 @@ expect {
     10
 }
 
+@cross-check-integrity
 test check_constraint_qualified_column_ref_violation {
     CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
     INSERT INTO t VALUES(-1);
@@ -1147,6 +1231,7 @@ test check_constraint_qualified_column_ref_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_qualified_rowid_ref {
     CREATE TABLE t(val INTEGER, CHECK(t.rowid > 0));
     INSERT INTO t VALUES(100);
@@ -1156,6 +1241,7 @@ expect {
     1|100
 }
 
+@cross-check-integrity
 test check_constraint_qualified_rowid_ref_violation {
     CREATE TABLE t(val INTEGER, CHECK(t.rowid > 0));
     INSERT INTO t(rowid, val) VALUES(-1, 100);
@@ -1163,6 +1249,7 @@ test check_constraint_qualified_rowid_ref_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_qualified_rowid_alias_underscore {
     CREATE TABLE t(val INTEGER, CHECK(t._rowid_ > 0));
     INSERT INTO t VALUES(100);
@@ -1172,6 +1259,7 @@ expect {
     1|100
 }
 
+@cross-check-integrity
 test check_constraint_qualified_rowid_alias_oid {
     CREATE TABLE t(val INTEGER, CHECK(t.oid > 0));
     INSERT INTO t(rowid, val) VALUES(-1, 100);
@@ -1179,6 +1267,7 @@ test check_constraint_qualified_rowid_alias_oid {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_qualified_column_update {
     CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
     INSERT INTO t VALUES(10);
@@ -1189,6 +1278,7 @@ expect {
     20
 }
 
+@cross-check-integrity
 test check_constraint_qualified_column_update_violation {
     CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
     INSERT INTO t VALUES(10);
@@ -1198,6 +1288,7 @@ expect error {
 }
 
 # CHECK constraints referencing a rowid alias column by name
+@cross-check-integrity
 test check_constraint_rowid_alias_column_by_name {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, CHECK(id > 0));
     INSERT INTO t VALUES(1, 10);
@@ -1209,6 +1300,7 @@ expect {
     2|20
 }
 
+@cross-check-integrity
 test check_constraint_rowid_alias_column_by_name_violation {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, CHECK(id > 0));
     INSERT INTO t VALUES(-1, 10);
@@ -1216,6 +1308,7 @@ test check_constraint_rowid_alias_column_by_name_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_rowid_alias_column_qualified_violation {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, CHECK(t.id > 0));
     INSERT INTO t VALUES(-1, 10);
@@ -1224,6 +1317,7 @@ expect error {
 }
 
 # CHECK constraint should still work after ALTER TABLE RENAME COLUMN (column-level)
+@cross-check-integrity
 test check_constraint_rename_column_inline {
     CREATE TABLE t(a INTEGER CHECK(a > 0));
     ALTER TABLE t RENAME COLUMN a TO b;
@@ -1234,6 +1328,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test check_constraint_rename_column_inline_violation {
     CREATE TABLE t(a INTEGER CHECK(a > 0));
     ALTER TABLE t RENAME COLUMN a TO b;
@@ -1243,6 +1338,7 @@ expect error {
 }
 
 # CHECK constraint should still work after ALTER TABLE RENAME COLUMN (table-level)
+@cross-check-integrity
 test check_constraint_rename_column_table_level {
     CREATE TABLE t(a INTEGER, CHECK(a > 0));
     ALTER TABLE t RENAME COLUMN a TO b;
@@ -1253,6 +1349,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test check_constraint_rename_column_table_level_violation {
     CREATE TABLE t(a INTEGER, CHECK(a > 0));
     ALTER TABLE t RENAME COLUMN a TO b;
@@ -1262,6 +1359,7 @@ expect error {
 }
 
 # CHECK constraint with qualified column ref should work after RENAME COLUMN
+@cross-check-integrity
 test check_constraint_rename_column_qualified_ref {
     CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
     ALTER TABLE t RENAME COLUMN x TO y;
@@ -1272,6 +1370,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test check_constraint_rename_column_qualified_ref_violation {
     CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
     ALTER TABLE t RENAME COLUMN x TO y;
@@ -1281,6 +1380,7 @@ expect error {
 }
 
 # CHECK constraint should still work after ALTER TABLE RENAME TABLE
+@cross-check-integrity
 test check_constraint_rename_table {
     CREATE TABLE t(a INTEGER, CHECK(a > 0));
     ALTER TABLE t RENAME TO t2;
@@ -1291,6 +1391,7 @@ expect {
     10
 }
 
+@cross-check-integrity
 test check_constraint_rename_table_violation {
     CREATE TABLE t(a INTEGER, CHECK(a > 0));
     ALTER TABLE t RENAME TO t2;
@@ -1300,6 +1401,7 @@ expect error {
 }
 
 # BUG 2: Non-existent table-qualified column ref should error at CREATE TABLE time
+@cross-check-integrity
 test check_constraint_nonexistent_qualified_column {
     CREATE TABLE t(a INTEGER, CHECK(other.a > 0));
 }
@@ -1307,12 +1409,14 @@ expect error {
 }
 
 # BUG 3: Non-existent column reference should error at CREATE TABLE time
+@cross-check-integrity
 test check_constraint_nonexistent_column {
     CREATE TABLE t(a INTEGER CHECK(b > 0));
 }
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_nonexistent_column_table_level {
     CREATE TABLE t(a INTEGER, CHECK(b > 0));
 }
@@ -1320,6 +1424,7 @@ expect error {
 }
 
 # BUG 4a: Non-existent function in CHECK should error at CREATE TABLE time
+@cross-check-integrity
 test check_constraint_nonexistent_function {
     CREATE TABLE t(a INTEGER CHECK(nope(a) > 0));
 }
@@ -1327,12 +1432,14 @@ expect error {
 }
 
 # BUG 4b: Aggregate function in CHECK should error at CREATE TABLE time
+@cross-check-integrity
 test check_constraint_aggregate_function {
     CREATE TABLE t(a INTEGER, CHECK(a > count(*)));
 }
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_aggregate_function_sum {
     CREATE TABLE t(a INTEGER, CHECK(sum(a) > 0));
 }
@@ -1340,6 +1447,7 @@ expect error {
 }
 
 # BUG 4c: Bind parameter in CHECK should error at CREATE TABLE time
+@cross-check-integrity
 test check_constraint_bind_parameter {
     CREATE TABLE t(a INTEGER CHECK(a > ?));
 }
@@ -1347,6 +1455,7 @@ expect error {
 }
 
 # BUG 4d: Subquery in CHECK should error at CREATE TABLE time
+@cross-check-integrity
 test check_constraint_subquery {
     CREATE TABLE t(a INTEGER CHECK(a IN (SELECT 1)));
 }
@@ -1354,6 +1463,7 @@ expect error {
 }
 
 # Validate CHECK in ALTER TABLE ADD COLUMN too
+@cross-check-integrity
 test check_constraint_alter_add_column_nonexistent_column {
     CREATE TABLE t(a INTEGER);
     ALTER TABLE t ADD COLUMN b INTEGER CHECK(c > 0);
@@ -1361,6 +1471,7 @@ test check_constraint_alter_add_column_nonexistent_column {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_alter_add_column_aggregate {
     CREATE TABLE t(a INTEGER);
     ALTER TABLE t ADD COLUMN b INTEGER CHECK(count(*) > 0);
@@ -1369,6 +1480,7 @@ expect error {
 }
 
 # Valid CHECK with functions should still work (sanity)
+@cross-check-integrity
 test check_constraint_valid_function {
     CREATE TABLE t(a TEXT CHECK(length(a) > 0));
     INSERT INTO t VALUES('hello');
@@ -1379,6 +1491,7 @@ expect {
 }
 
 # Bug fix: CHECK on INTEGER PRIMARY KEY enforced during UPDATE
+@cross-check-integrity
 test check_constraint_ipk_update_violation {
     CREATE TABLE t(id INTEGER PRIMARY KEY CHECK(id > 0));
     INSERT INTO t VALUES(1);
@@ -1387,6 +1500,7 @@ test check_constraint_ipk_update_violation {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_ipk_update_valid {
     CREATE TABLE t(id INTEGER PRIMARY KEY CHECK(id > 0));
     INSERT INTO t VALUES(1);
@@ -1397,6 +1511,7 @@ expect {
     5
 }
 
+@cross-check-integrity
 test check_constraint_ipk_referenced_in_table_check {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, CHECK(id + val > 0));
     INSERT INTO t VALUES(10, 5);
@@ -1405,6 +1520,7 @@ test check_constraint_ipk_referenced_in_table_check {
 expect error {
 }
 
+@cross-check-integrity
 test check_constraint_ipk_not_updated_but_referenced {
     CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, CHECK(id > 0));
     INSERT INTO t VALUES(1, 'hello');
@@ -1416,6 +1532,7 @@ expect {
 }
 
 # Bug fix: DROP COLUMN with qualified CHECK reference should error
+@cross-check-integrity
 test check_constraint_drop_column_qualified_ref {
     CREATE TABLE t1(a INTEGER, b INTEGER, CHECK(t1.b > 0));
     ALTER TABLE t1 DROP COLUMN b;
@@ -1424,6 +1541,7 @@ expect error {
 }
 
 # Bug fix: Error message for unnamed CHECK should not include "CHECK (...)" wrapper
+@cross-check-integrity
 test check_constraint_error_message_unnamed {
     CREATE TABLE t(a INTEGER CHECK(a > 0));
     INSERT INTO t VALUES(-1);
@@ -1432,6 +1550,7 @@ expect error {
     CHECK constraint failed: a > 0
 }
 
+@cross-check-integrity
 test check_constraint_error_message_named {
     CREATE TABLE t(a INTEGER, CONSTRAINT my_check CHECK(a > 0));
     INSERT INTO t VALUES(-1);
@@ -1442,6 +1561,7 @@ expect error {
 
 # RENAME TABLE should rewrite table-qualified refs in CHECK constraints
 # (e.g. t1.a > 0 becomes t2.a > 0). Matches SQLite 3.49.1+ behavior.
+@cross-check-integrity
 test check_constraint_rename_table_qualified_ref {
     CREATE TABLE t1(a INTEGER, CHECK(t1.a > 0));
     INSERT INTO t1 VALUES(5);
@@ -1454,6 +1574,7 @@ expect {
     10
 }
 
+@cross-check-integrity
 test check_constraint_rename_table_qualified_ref_still_enforced {
     CREATE TABLE t1(a INTEGER, CHECK(t1.a > 0));
     INSERT INTO t1 VALUES(5);
@@ -1464,6 +1585,7 @@ expect error {
 }
 
 # RENAME TABLE should succeed when CHECK has no qualified refs
+@cross-check-integrity
 test check_constraint_rename_table_unqualified {
     CREATE TABLE t1(a INTEGER, CHECK(a > 0));
     INSERT INTO t1 VALUES(5);
@@ -1479,6 +1601,7 @@ expect {
 # Bug fix: Column-level CHECK should stay inline in DDL after ADD COLUMN
 # Use LIKE to avoid exact DDL formatting differences between SQLite and Turso
 # (Turso adds a space after table name due to 022f679f; SQLite preserves original)
+@cross-check-integrity
 test check_constraint_ddl_column_level_preserved {
     CREATE TABLE t(a INTEGER CHECK(a > 0), b TEXT);
     ALTER TABLE t ADD COLUMN c REAL CHECK(c > 0);
@@ -1490,6 +1613,7 @@ expect {
 
 # Bug fix: RENAME COLUMN to SQL keyword should preserve quotes in CHECK DDL
 # Use LIKE to avoid exact DDL formatting differences (022f679f)
+@cross-check-integrity
 test check_constraint_rename_column_to_keyword_ddl {
     CREATE TABLE t("value" INTEGER CHECK("value" > 0));
     ALTER TABLE t RENAME COLUMN "value" TO "group";
@@ -1499,6 +1623,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test check_constraint_rename_column_to_keyword_still_works {
     CREATE TABLE t("value" INTEGER CHECK("value" > 0));
     ALTER TABLE t RENAME COLUMN "value" TO "group";
@@ -1509,6 +1634,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test check_constraint_rename_column_to_keyword_violation {
     CREATE TABLE t("value" INTEGER CHECK("value" > 0));
     ALTER TABLE t RENAME COLUMN "value" TO "group";
@@ -1520,6 +1646,7 @@ expect error {
 # Bug fix: ALTER TABLE ADD COLUMN with DEFAULT that violates CHECK should be rejected
 # when the table has existing rows (existing rows would get the DEFAULT value which
 # violates the CHECK constraint).
+@cross-check-integrity
 test check_constraint_alter_add_column_default_violates_check {
     CREATE TABLE t1(x INTEGER);
     INSERT INTO t1 VALUES(1);
@@ -1529,6 +1656,7 @@ expect error {
 }
 
 # Same scenario but with empty table should succeed (no existing rows to violate)
+@cross-check-integrity
 test check_constraint_alter_add_column_default_violates_check_empty_table {
     CREATE TABLE t1(x INTEGER);
     ALTER TABLE t1 ADD COLUMN y INTEGER DEFAULT -5 CHECK(y > 0);
@@ -1541,6 +1669,7 @@ expect {
 }
 
 # NULL default (no DEFAULT clause) should always pass CHECK, even with existing rows
+@cross-check-integrity
 test check_constraint_alter_add_column_null_default_passes_check {
     CREATE TABLE t1(x INTEGER);
     INSERT INTO t1 VALUES(1);
@@ -1552,6 +1681,7 @@ expect {
 }
 
 # DEFAULT value that satisfies CHECK should succeed even with existing rows
+@cross-check-integrity
 test check_constraint_alter_add_column_default_satisfies_check {
     CREATE TABLE t1(x INTEGER);
     INSERT INTO t1 VALUES(1);
@@ -1563,6 +1693,7 @@ expect {
 }
 
 # DEFAULT 0 violates CHECK(y > 0)
+@cross-check-integrity
 test check_constraint_alter_add_column_default_zero_violates_check {
     CREATE TABLE t1(x INTEGER);
     INSERT INTO t1 VALUES(1);
@@ -1572,6 +1703,7 @@ expect error {
 }
 
 # String DEFAULT that violates CHECK with IN clause
+@cross-check-integrity
 test check_constraint_alter_add_column_default_string_violates_check {
     CREATE TABLE t1(x INTEGER);
     INSERT INTO t1 VALUES(1);
@@ -1581,6 +1713,7 @@ expect error {
 }
 
 # String DEFAULT that satisfies CHECK with IN clause
+@cross-check-integrity
 test check_constraint_alter_add_column_default_string_satisfies_check {
     CREATE TABLE t1(x INTEGER);
     INSERT INTO t1 VALUES(1);
@@ -1607,6 +1740,7 @@ expect {
 }
 
 # UPDATE touching a column with a CHECK should still enforce that CHECK.
+@cross-check-integrity
 test check_constraint_update_enforces_check_on_changed_column {
     CREATE TABLE t1(x INTEGER CHECK(x > 0), y INTEGER);
     INSERT INTO t1 VALUES(1, 1);
@@ -1631,6 +1765,7 @@ expect {
 }
 
 # Same table-level CHECK but updating a referenced column should trigger it.
+@cross-check-integrity
 test check_constraint_update_table_level_triggers_on_referenced_col {
     CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER, CHECK(a + b > 0));
     INSERT INTO t1 VALUES(5, 5, 1);
@@ -1643,6 +1778,7 @@ expect error {
 # Constraint names that are SQL keywords must preserve quoting in regenerated DDL
 # after ALTER TABLE operations (e.g., DROP COLUMN).
 # Use LIKE to avoid exact DDL formatting differences (022f679f)
+@cross-check-integrity
 test check_constraint_keyword_constraint_name_quoting_after_alter {
     CREATE TABLE t1(x INTEGER CONSTRAINT "select" CHECK(x > 0), y TEXT);
     ALTER TABLE t1 DROP COLUMN y;
@@ -1658,6 +1794,7 @@ expect {
 # Bug fix: integrity_check must not flag NULL values as CHECK violations.
 # Per SQL standard, NULL does not violate CHECK constraints.
 @skip-if mvcc "MVCC integrity_check does not perform row-level CHECK validation"
+@cross-check-integrity
 test check_constraint_integrity_check_null_not_violation {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val REAL CHECK (val > 0));
     INSERT INTO t (id, val) VALUES (1, 100.0);
@@ -1682,6 +1819,7 @@ expect {
 }
 
 
+@cross-check-integrity
 test check_constraint_text_affinity_coercion_pass {
     CREATE TABLE t(val TEXT CHECK(val > 5));
     -- '6' > '5' in text comparison is true
@@ -1692,6 +1830,7 @@ expect {
     6
 }
 
+@cross-check-integrity
 test check_constraint_text_affinity_coercion_update_violation {
     CREATE TABLE t(val TEXT CHECK(val > 5));
     INSERT INTO t VALUES ('6');
@@ -1702,6 +1841,7 @@ expect error {
     CHECK constraint failed: val > 5
 }
 
+@cross-check-integrity
 test check_constraint_integer_affinity_coercion {
     CREATE TABLE t(val INTEGER CHECK(val > 5));
     INSERT INTO t VALUES (10);
@@ -1713,6 +1853,7 @@ expect {
     20
 }
 
+@cross-check-integrity
 test check_constraint_integer_affinity_coercion_violation {
     CREATE TABLE t(val INTEGER CHECK(val > 5));
     INSERT INTO t VALUES (3);

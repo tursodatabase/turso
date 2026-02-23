@@ -6,6 +6,7 @@ setup schema {
 }
 
 @setup schema
+@cross-check-integrity
 test insert-or-ignore-check-failure-updates-sequence {
     INSERT OR IGNORE INTO t(id, val) VALUES(10, 'row10');
     SELECT * FROM sqlite_sequence;
@@ -15,6 +16,7 @@ expect {
 }
 
 @setup schema
+@cross-check-integrity
 test insert-or-ignore-check-failure-does-not-insert-row {
     INSERT OR IGNORE INTO t(id, val) VALUES(10, 'row10');
     SELECT * FROM t;
@@ -24,6 +26,7 @@ expect {
 }
 
 @setup schema
+@cross-check-integrity
 test insert-or-ignore-check-pass-updates-sequence {
     INSERT OR IGNORE INTO t(id, val) VALUES(3, 'row3');
     SELECT * FROM sqlite_sequence;
@@ -33,6 +36,7 @@ expect {
 }
 
 @setup schema
+@cross-check-integrity
 test insert-or-ignore-check-pass-inserts-row {
     INSERT OR IGNORE INTO t(id, val) VALUES(3, 'row3');
     SELECT * FROM t;

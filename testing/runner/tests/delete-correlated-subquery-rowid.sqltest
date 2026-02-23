@@ -8,6 +8,7 @@ setup schema {
 }
 
 @setup schema
+@cross-check-integrity
 test delete-correlated-subquery-rowid-basic {
     DELETE FROM tt WHERE a IN (SELECT a FROM tt tt1 WHERE tt1.rowid = tt.rowid);
     SELECT * FROM tt;
@@ -24,6 +25,7 @@ setup partial-schema {
 }
 
 @setup partial-schema
+@cross-check-integrity
 test delete-correlated-subquery-rowid-partial {
     DELETE FROM t2 WHERE a IN (SELECT a FROM t2 x WHERE x.rowid = t2.rowid AND t2.rowid <= 2);
     SELECT a FROM t2 ORDER BY a;
@@ -34,6 +36,7 @@ expect {
 }
 
 @setup schema
+@cross-check-integrity
 test delete-correlated-subquery-underscore-rowid {
     DELETE FROM tt WHERE a IN (SELECT a FROM tt t1 WHERE t1._rowid_ = tt._rowid_);
     SELECT * FROM tt;
@@ -42,6 +45,7 @@ expect {
 }
 
 @setup schema
+@cross-check-integrity
 test delete-correlated-subquery-oid {
     DELETE FROM tt WHERE a IN (SELECT a FROM tt t1 WHERE t1.oid = tt.oid);
     SELECT * FROM tt;
@@ -54,6 +58,7 @@ setup empty-schema {
 }
 
 @setup empty-schema
+@cross-check-integrity
 test delete-correlated-subquery-empty-table {
     DELETE FROM t_empty WHERE a IN (SELECT a FROM t_empty t1 WHERE t1.rowid = t_empty.rowid);
     SELECT count(*) FROM t_empty;
@@ -70,6 +75,7 @@ setup null-schema {
 }
 
 @setup null-schema
+@cross-check-integrity
 test delete-correlated-subquery-with-nulls {
     DELETE FROM t_null WHERE a IN (SELECT a FROM t_null t1 WHERE t1.rowid = t_null.rowid);
     SELECT count(*) FROM t_null;

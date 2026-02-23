@@ -6,6 +6,7 @@ setup schema {
 }
 
 @setup schema
+@cross-check-integrity
 test delete-correlated-min-per-group {
     DELETE FROM t WHERE val = (SELECT MIN(d2.val) FROM t d2 WHERE d2.grp = t.grp);
     SELECT * FROM t ORDER BY id;
@@ -21,6 +22,7 @@ setup schema2 {
 }
 
 @setup schema2
+@cross-check-integrity
 test delete-correlated-min-with-condition {
     DELETE FROM t WHERE val = (SELECT MIN(val) FROM t d2 WHERE d2.id <= t.id);
     SELECT * FROM t ORDER BY id;
@@ -36,6 +38,7 @@ setup schema3 {
 }
 
 @setup schema3
+@cross-check-integrity
 test delete-correlated-single-row-groups {
     DELETE FROM t WHERE val = (SELECT MIN(d2.val) FROM t d2 WHERE d2.grp = t.grp);
     SELECT * FROM t ORDER BY id;
@@ -49,6 +52,7 @@ setup schema4 {
 }
 
 @setup schema4
+@cross-check-integrity
 test delete-correlated-exists {
     DELETE FROM t WHERE EXISTS (SELECT 1 FROM t d2 WHERE d2.grp = t.grp AND d2.val < t.val);
     SELECT * FROM t ORDER BY id;
@@ -64,6 +68,7 @@ setup schema5 {
 }
 
 @setup schema5
+@cross-check-integrity
 test delete-correlated-in-subquery {
     DELETE FROM t WHERE id IN (SELECT d2.id FROM t d2 WHERE d2.val = (SELECT MIN(d3.val) FROM t d3 WHERE d3.grp = d2.grp));
     SELECT * FROM t ORDER BY id;
@@ -79,6 +84,7 @@ setup schema6 {
 }
 
 @setup schema6
+@cross-check-integrity
 test delete-correlated-max-per-group {
     DELETE FROM t WHERE val = (SELECT MAX(d2.val) FROM t d2 WHERE d2.grp = t.grp);
     SELECT * FROM t ORDER BY id;
@@ -93,6 +99,7 @@ setup schema7 {
 }
 
 @setup schema7
+@cross-check-integrity
 test delete-correlated-empty-table {
     DELETE FROM t WHERE val = (SELECT MIN(d2.val) FROM t d2 WHERE d2.grp = t.grp);
     SELECT count(*) FROM t;

@@ -1,6 +1,7 @@
 @database :memory:
 
 # https://github.com/tursodatabase/turso/issues/3966
+@cross-check-integrity
 test not-null-just-cuz-unique {
     create table t (a int, x int unique);
     insert into t(a) values(1);
@@ -15,6 +16,7 @@ expect {
 # always return NULL (unknown), which is falsy.
 
 # Ascending index: x > NULL should return 0 rows
+@cross-check-integrity
 test null-comparison-asc-gt {
     CREATE TABLE t1(x);
     CREATE INDEX t1_idx ON t1(x ASC);
@@ -25,6 +27,7 @@ expect {
 }
 
 # Descending index: x > NULL should return 0 rows
+@cross-check-integrity
 test null-comparison-desc-gt {
     CREATE TABLE t2(x);
     CREATE INDEX t2_idx ON t2(x DESC);
@@ -35,6 +38,7 @@ expect {
 }
 
 # Ascending index: x < NULL should return 0 rows
+@cross-check-integrity
 test null-comparison-asc-lt {
     CREATE TABLE t3(x);
     CREATE INDEX t3_idx ON t3(x ASC);
@@ -45,6 +49,7 @@ expect {
 }
 
 # Descending index: x < NULL should return 0 rows
+@cross-check-integrity
 test null-comparison-desc-lt {
     CREATE TABLE t4(x);
     CREATE INDEX t4_idx ON t4(x DESC);
@@ -55,6 +60,7 @@ expect {
 }
 
 # Ascending index: x >= NULL should return 0 rows
+@cross-check-integrity
 test null-comparison-asc-ge {
     CREATE TABLE t5(x);
     CREATE INDEX t5_idx ON t5(x ASC);
@@ -65,6 +71,7 @@ expect {
 }
 
 # Descending index: x >= NULL should return 0 rows
+@cross-check-integrity
 test null-comparison-desc-ge {
     CREATE TABLE t6(x);
     CREATE INDEX t6_idx ON t6(x DESC);
@@ -75,6 +82,7 @@ expect {
 }
 
 # Ascending index: x <= NULL should return 0 rows
+@cross-check-integrity
 test null-comparison-asc-le {
     CREATE TABLE t7(x);
     CREATE INDEX t7_idx ON t7(x ASC);
@@ -85,6 +93,7 @@ expect {
 }
 
 # Descending index: x <= NULL should return 0 rows
+@cross-check-integrity
 test null-comparison-desc-le {
     CREATE TABLE t8(x);
     CREATE INDEX t8_idx ON t8(x DESC);
@@ -95,6 +104,7 @@ expect {
 }
 
 # Descending index with ORDER BY: x > NULL should return 0 rows
+@cross-check-integrity
 test null-comparison-desc-order-by {
     CREATE TABLE t9(x);
     CREATE INDEX t9_idx ON t9(x DESC);
@@ -106,6 +116,7 @@ expect {
 
 # Composite index: NULL in second column should not match range comparisons
 # https://github.com/tursodatabase/turso/issues/5358
+@cross-check-integrity
 test composite-index-null-second-col-le {
     CREATE TABLE t10(c1 TEXT, c2 TEXT);
     CREATE INDEX t10_idx ON t10(c2, c1);
@@ -115,6 +126,7 @@ test composite-index-null-second-col-le {
 expect {
 }
 
+@cross-check-integrity
 test composite-index-null-second-col-lt {
     CREATE TABLE t11(c1 TEXT, c2 TEXT);
     CREATE INDEX t11_idx ON t11(c2, c1);
@@ -124,6 +136,7 @@ test composite-index-null-second-col-lt {
 expect {
 }
 
+@cross-check-integrity
 test composite-index-null-second-col-ge {
     CREATE TABLE t12(c1 TEXT, c2 TEXT);
     CREATE INDEX t12_idx ON t12(c2, c1);
@@ -133,6 +146,7 @@ test composite-index-null-second-col-ge {
 expect {
 }
 
+@cross-check-integrity
 test composite-index-null-second-col-le-desc {
     CREATE TABLE t12d(c1 TEXT, c2 TEXT);
     CREATE INDEX t12d_idx ON t12d(c2, c1 DESC);
@@ -142,6 +156,7 @@ test composite-index-null-second-col-le-desc {
 expect {
 }
 
+@cross-check-integrity
 test composite-index-null-second-col-lt-desc {
     CREATE TABLE t12e(c1 TEXT, c2 TEXT);
     CREATE INDEX t12e_idx ON t12e(c2, c1 DESC);
@@ -151,6 +166,7 @@ test composite-index-null-second-col-lt-desc {
 expect {
 }
 
+@cross-check-integrity
 test composite-index-null-second-col-gt {
     CREATE TABLE t13(c1 TEXT, c2 TEXT);
     CREATE INDEX t13_idx ON t13(c2, c1);
@@ -161,6 +177,7 @@ expect {
 }
 
 # Composite index with mixed NULL and non-NULL values
+@cross-check-integrity
 test composite-index-mixed-null-nonnull {
     CREATE TABLE t14(c1 TEXT, c2 TEXT);
     CREATE INDEX t14_idx ON t14(c2, c1);
@@ -176,6 +193,7 @@ expect {
 # Regression for simulator seed 16218053103538286000:
 # a prefix-only equality probe on the first column of a composite index must not
 # synthesize an extra NULL key component (that previously caused an OOB panic).
+@cross-check-integrity
 test composite-index-prefix-eq-no-range-no-crash {
     CREATE TABLE t15(a INT, b INT);
     CREATE INDEX t15_idx ON t15(a DESC, b ASC);

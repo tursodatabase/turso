@@ -1,6 +1,7 @@
 @database :memory:
 
 #!/usr/bin/env tclsh
+@cross-check-integrity
 test simple-rollback {
     create table t (x);
     insert into t values (1);
@@ -13,6 +14,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test simple-rollback-2 {
     create table t (x);
     begin;
@@ -24,6 +26,7 @@ test simple-rollback-2 {
 expect {
 }
 
+@cross-check-integrity
 test rollback-after-update {
     create table t (x);
     insert into t values (1);
@@ -38,6 +41,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test rollback-after-delete {
     create table t (x);
     insert into t values (1);
@@ -54,6 +58,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test rollback-mixed-operations {
     create table t (x);
     insert into t values (1);
@@ -72,6 +77,7 @@ expect {
 
 # The point of this test was to test we drop dirty pages after rollback by inserting into another table so that
 # pages used are different.
+@cross-check-integrity
 test insert-after-rollback {
     create table t (x);
     create table t2 (x);
@@ -89,6 +95,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test schema-change-rollback {
     begin;
     create table t (x);
@@ -100,6 +107,7 @@ expect {
     ok
 }
 
+@cross-check-integrity
 test schema-change-rollback-version {
     begin;
     create table t (x);
@@ -111,6 +119,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test schema-version-after-update {
     create table t (x);
     PRAGMA schema_version;
@@ -119,6 +128,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test schema-change-rollback-2 {
     begin;
     create table t (x);
@@ -128,6 +138,7 @@ test schema-change-rollback-2 {
 expect {
 }
 
+@cross-check-integrity
 test schema-change-rollback-2-2 {
     create table before (x);
     begin;
@@ -141,6 +152,7 @@ expect {
     after
 }
 
+@cross-check-integrity
 test schema-alter-rollback {
     create table t (x);
     begin;
@@ -152,6 +164,7 @@ expect {
     CREATE TABLE t (x)
 }
 
+@cross-check-integrity
 test schema-alter-rollback-and-repeat {
     create table t (x);
     begin;
@@ -164,6 +177,7 @@ expect {
     CREATE TABLE t (x, y)
 }
 
+@cross-check-integrity
 test schema-create-index-rollback {
     create table t (x);
     begin;
@@ -175,6 +189,7 @@ expect {
     CREATE TABLE t (x)
 }
 
+@cross-check-integrity
 test schema-drop-table-rollback {
     create table t (x);
     begin;
