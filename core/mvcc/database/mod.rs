@@ -3061,8 +3061,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
             if let TransactionState::Committed(commit_ts) = tx.state.load() {
-                self.finalized_tx_states
-                    .insert(tx_id, TransactionState::Committed(commit_ts));
+                // Read-only transactions cannot leave row versions with stale TxID
+                // references, so they do not need finalized-state caching.
+                if !tx.write_set.is_empty() {
+                    self.finalized_tx_states
+                        .insert(tx_id, TransactionState::Committed(commit_ts));
+                }
             }
             let dep_set = std::mem::take(&mut *tx.commit_dep_set.lock());
             // Invariant: commit_dep_set must be drained before removing the transaction.
@@ -3629,24 +3633,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn drop_unused_row_versions(&self) -> usize {
         let lwm = self.compute_lwm();
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
+        let mut referenced_tx_ids = HashSet::default();
 
-        let dropped =
-            self.gc_table_row_versions(lwm, ckpt_max) + self.gc_index_row_versions(lwm, ckpt_max);
+        let dropped = self.gc_table_row_versions(lwm, ckpt_max, &mut referenced_tx_ids)
+            + self.gc_index_row_versions(lwm, ckpt_max, &mut referenced_tx_ids);
+        let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids);
 
         tracing::trace!(
-            "drop_unused_row_versions() -> dropped {dropped}, txs: {}, rows: {}",
+            "drop_unused_row_versions() -> dropped {dropped}, pruned_finalized={pruned_finalized}, txs: {}, finalized_tx_states: {}, rows: {}",
             self.txs.len(),
+            self.finalized_tx_states.len(),
             self.rows.len()
         );
         dropped
     }
 
-    fn gc_table_row_versions(&self, lwm: u64, ckpt_max: u64) -> usize {
+    fn gc_table_row_versions(
+        &self,
+        lwm: u64,
+        ckpt_max: u64,
+        referenced_tx_ids: &mut HashSet<TxID>,
+    ) -> usize {
         let mut dropped = 0;
 
         for entry in self.rows.iter() {
             let mut versions = entry.value().write();
             dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
+            Self::collect_referenced_txids(&versions, referenced_tx_ids);
             // Empty entries are left in the SkipMap (lazy removal). This avoids
             // a TOCTOU race where a concurrent writer inserts a version between
             // the emptiness check and SkipMap::remove(). Empty entries are reused
@@ -3656,7 +3669,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         dropped
     }
 
-    fn gc_index_row_versions(&self, lwm: u64, ckpt_max: u64) -> usize {
+    fn gc_index_row_versions(
+        &self,
+        lwm: u64,
+        ckpt_max: u64,
+        referenced_tx_ids: &mut HashSet<TxID>,
+    ) -> usize {
         let mut dropped = 0;
 
         for outer_entry in self.index_rows.iter() {
@@ -3665,10 +3683,43 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             for inner_entry in inner_map.iter() {
                 let mut versions = inner_entry.value().write();
                 dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
+                Self::collect_referenced_txids(&versions, referenced_tx_ids);
             }
             // Empty entries left in place — same TOCTOU rationale as table rows.
         }
         dropped
+    }
+
+    fn collect_referenced_txids(versions: &[RowVersion], referenced_tx_ids: &mut HashSet<TxID>) {
+        for version in versions {
+            if let Some(TxTimestampOrID::TxID(tx_id)) = version.begin {
+                referenced_tx_ids.insert(tx_id);
+            }
+            if let Some(TxTimestampOrID::TxID(tx_id)) = version.end {
+                referenced_tx_ids.insert(tx_id);
+            }
+        }
+    }
+
+    fn prune_finalized_tx_states(&self, referenced_tx_ids: &HashSet<TxID>) -> usize {
+        if self.finalized_tx_states.is_empty() {
+            return 0;
+        }
+
+        let to_remove: Vec<TxID> = self
+            .finalized_tx_states
+            .iter()
+            .filter_map(|entry| {
+                let tx_id = *entry.key();
+                (!referenced_tx_ids.contains(&tx_id)).then_some(tx_id)
+            })
+            .collect();
+
+        for tx_id in &to_remove {
+            self.finalized_tx_states.remove(tx_id);
+        }
+
+        to_remove.len()
     }
 
     /// Apply GC rules to a single version chain. Returns number of versions removed.
