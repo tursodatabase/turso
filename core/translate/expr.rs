@@ -2758,26 +2758,16 @@ pub fn translate_expr(
             database: _,
             table: table_ref_id,
         } => {
-            let referenced_tables =
-                referenced_tables.expect("table_references needed translating Expr::RowId");
-            let (_, table) = referenced_tables
+             let (_, table) = referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
-                .unwrap_or_else(|| {
-                    unreachable!(
-                        "table reference should be found: {} (referenced_tables: {:?})",
-                        table_ref_id, referenced_tables
-                    )
-                });
-            match table {
-                Table::BTree(btree) => {
-                    if !btree.has_rowid {
-                        crate::bail_parse_error!("no such column: rowid");
-                    }
-                }
-                _ => {
-                    crate::bail_parse_error!("no such column: rowid");
-                }
+                .expect("table reference should be found");
+            let Table::BTree(btree) = table else {
+                crate::bail_parse_error!("no such column: rowid");
+            };
+            if !btree.has_rowid {
+                crate::bail_parse_error!("no such column: rowid");
             }
+
             // When a cursor override is active, always read rowid from the override cursor.
             let has_cursor_override = program.has_cursor_override(*table_ref_id);
             let (index, use_covering_index) = if has_cursor_override {
