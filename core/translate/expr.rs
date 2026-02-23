@@ -2758,13 +2758,32 @@ pub fn translate_expr(
             database: _,
             table: table_ref_id,
         } => {
+            let referenced_tables =
+                referenced_tables.expect("table_references needed translating Expr::RowId");
+            let (_, table) = referenced_tables
+                .find_table_by_internal_id(*table_ref_id)
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "table reference should be found: {} (referenced_tables: {:?})",
+                        table_ref_id, referenced_tables
+                    )
+                });
+            match table {
+                Table::BTree(btree) => {
+                    if !btree.has_rowid {
+                        crate::bail_parse_error!("no such column: rowid");
+                    }
+                }
+                _ => {
+                    crate::bail_parse_error!("no such column: rowid");
+                }
+            }
             // When a cursor override is active, always read rowid from the override cursor.
             let has_cursor_override = program.has_cursor_override(*table_ref_id);
             let (index, use_covering_index) = if has_cursor_override {
                 (None, false)
-            } else if let Some(table_reference) = referenced_tables
-                .unwrap()
-                .find_joined_table_by_internal_id(*table_ref_id)
+            } else if let Some(table_reference) =
+                referenced_tables.find_joined_table_by_internal_id(*table_ref_id)
             {
                 (
                     table_reference.op.index(),
@@ -4622,17 +4641,17 @@ pub fn bind_and_rewrite_expr<'a>(
                                 ));
                             }
                         // only if we haven't found a match, check for explicit rowid reference
-                        } else {
-                            let is_btree_table = matches!(joined_table.table, Table::BTree(_));
-                            if is_btree_table {
-                                if let Some(row_id_expr) = parse_row_id(
-                                    &normalized_id,
-                                    referenced_tables.joined_tables()[0].internal_id,
-                                    || referenced_tables.joined_tables().len() != 1,
-                                )? {
-                                    *expr = row_id_expr;
-                                    return Ok(WalkControl::Continue);
+                        } else if let Table::BTree(btree) = &joined_table.table {
+                            if let Some(row_id_expr) = parse_row_id(
+                                &normalized_id,
+                                referenced_tables.joined_tables()[0].internal_id,
+                                || referenced_tables.joined_tables().len() != 1,
+                            )? {
+                                if !btree.has_rowid {
+                                    crate::bail_parse_error!("no such column: {}", id.as_str());
                                 }
+                                *expr = row_id_expr;
+                                return Ok(WalkControl::Continue);
                             }
                         }
                     }
@@ -4739,11 +4758,13 @@ pub fn bind_and_rewrite_expr<'a>(
                     // Note: Only BTree tables have rowid; derived tables (FromClauseSubquery)
                     // don't have a rowid.
                     let Some(col_idx) = col_idx else {
-                        let is_btree_table = matches!(tbl, Table::BTree(_));
-                        if is_btree_table {
+                        if let Table::BTree(btree) = tbl {
                             if let Some(row_id_expr) =
                                 parse_row_id(&normalized_id, tbl_id, || false)?
                             {
+                                if !btree.has_rowid {
+                                    crate::bail_parse_error!("no such column: {}", normalized_id);
+                                }
                                 *expr = row_id_expr;
                                 // Mark the table's rowid as referenced so correlated
                                 // subquery detection works correctly when a rowid
