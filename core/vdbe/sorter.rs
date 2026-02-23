@@ -166,7 +166,11 @@ impl Sorter {
                     if self.chunks.iter().any(|chunk| {
                         matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
                     }) {
-                        return Err(CompletionError::IOError(std::io::ErrorKind::WriteZero).into());
+                        return Err(CompletionError::IOError(
+                            std::io::ErrorKind::WriteZero,
+                            "sorter write",
+                        )
+                        .into());
                     }
                     turso_assert!(
                         !self.chunks.iter().any(|chunk| {
@@ -255,9 +259,11 @@ impl Sorter {
                         if self.chunks.iter().any(|chunk| {
                             matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
                         }) {
-                            return Err(
-                                CompletionError::IOError(std::io::ErrorKind::WriteZero).into()
-                            );
+                            return Err(CompletionError::IOError(
+                                std::io::ErrorKind::WriteZero,
+                                "sorter write",
+                            )
+                            .into());
                         }
                     }
                 }

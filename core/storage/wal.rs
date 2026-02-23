@@ -654,13 +654,13 @@ impl OngoingCheckpoint {
                     self.pending_writes.insert(slot.page_id, buf);
                     moved = true;
                 } else {
-                    err = Some(std::io::Error::other("read done but buf missing").into());
+                    err = Some(CompletionError::IOError(std::io::ErrorKind::Other, "read"));
                 }
             } else {
                 err = Some(
                     slot.completion
                         .get_error()
-                        .unwrap_or_else(|| std::io::Error::other("wal read failed").into()),
+                        .unwrap_or(CompletionError::IOError(std::io::ErrorKind::Other, "read")),
                 );
             }
             false
@@ -2911,6 +2911,7 @@ impl WalFileShared {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
                 std::io::ErrorKind::NotFound,
+                _,
             ))) if flags.contains(crate::OpenFlags::ReadOnly) => {
                 // In readonly mode, if the WAL file doesn't exist, we just return a noop WAL
                 // since there's nothing to read from.

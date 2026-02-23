@@ -1,5 +1,5 @@
 use super::{Completion, File, OpenFlags, IO};
-use crate::error::LimboError;
+use crate::error::{io_error, CompletionError, LimboError};
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::io::FileSyncType;
@@ -102,7 +102,7 @@ impl IO for UnixIO {
             file.create(flags.contains(OpenFlags::Create));
         }
 
-        let file = file.open(path)?;
+        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
 
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
@@ -117,7 +117,7 @@ impl IO for UnixIO {
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(path).map_err(|e| io_error(e, "remove_file"))?;
         Ok(())
     }
 
@@ -187,7 +187,7 @@ impl File for UnixFile {
         };
         if result == -1 {
             let e = std::io::Error::last_os_error();
-            Err(e.into())
+            Err(io_error(e, "pread"))
         } else {
             trace!("pread n: {}", result);
             // Read succeeded immediately
@@ -221,16 +221,15 @@ impl File for UnixFile {
                     // EINTR, retry without advancing
                     continue;
                 }
-                return Err(e.into());
+                return Err(io_error(e, "pwrite"));
             }
             let written = result as usize;
             if written == 0 {
                 // Unexpected EOF for regular files
-                return Err(std::io::Error::new(
+                return Err(LimboError::CompletionError(CompletionError::IOError(
                     ErrorKind::UnexpectedEof,
-                    "pwrite returned 0 bytes written",
-                )
-                .into());
+                    "pwrite",
+                )));
             }
 
             total_written += written;
@@ -266,11 +265,10 @@ impl File for UnixFile {
                 Ok(written) => {
                     if written == 0 {
                         // Unexpected EOF
-                        return Err(std::io::Error::new(
+                        return Err(LimboError::CompletionError(CompletionError::IOError(
                             ErrorKind::UnexpectedEof,
-                            "pwritev returned 0 bytes written",
-                        )
-                        .into());
+                            "pwritev",
+                        )));
                     }
                     total_written += written;
                     current_pos += written as u64;
@@ -300,7 +298,7 @@ impl File for UnixFile {
                     continue;
                 }
                 Err(e) => {
-                    return Err(e.into());
+                    return Err(io_error(e, "pwritev"));
                 }
             }
         }
@@ -331,7 +329,7 @@ impl File for UnixFile {
 
         if result == -1 {
             let e = std::io::Error::last_os_error();
-            Err(e.into())
+            Err(io_error(e, "sync"))
         } else {
             #[cfg(target_vendor = "apple")]
             match sync_type {
@@ -349,7 +347,7 @@ impl File for UnixFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn size(&self) -> Result<u64> {
         let file = self.file.lock();
-        Ok(file.metadata()?.len())
+        Ok(file.metadata().map_err(|e| io_error(e, "metadata"))?.len())
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]
@@ -362,7 +360,7 @@ impl File for UnixFile {
                 c.complete(0);
                 Ok(c)
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(io_error(e, "truncate")),
         }
     }
 }

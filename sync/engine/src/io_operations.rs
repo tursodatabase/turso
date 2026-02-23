@@ -36,6 +36,7 @@ impl IoOperations for Arc<dyn turso_core::IO> {
             Ok(file) => Ok(Some(file)),
             Err(LimboError::CompletionError(turso_core::CompletionError::IOError(
                 std::io::ErrorKind::NotFound,
+                _,
             ))) => Ok(None),
             Err(err) => Err(err.into()),
         }

@@ -1,3 +1,4 @@
+use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::{Clock, Completion, File, OpenFlags, Result, IO};
 use crate::sync::RwLock;
@@ -25,7 +26,7 @@ impl IO for GenericIO {
             file.create(flags.contains(OpenFlags::Create));
         }
 
-        let file = file.open(path)?;
+        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
         Ok(Arc::new(GenericFile {
             file: RwLock::new(file),
         }))
@@ -34,7 +35,8 @@ impl IO for GenericIO {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn remove_file(&self, path: &str) -> Result<()> {
         trace!("remove_file(path = {})", path);
-        Ok(std::fs::remove_file(path)?)
+        std::fs::remove_file(path).map_err(|e| io_error(e, "remove_file"))?;
+        Ok(())
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
@@ -71,12 +73,12 @@ impl File for GenericFile {
     #[instrument(skip(self, c), level = Level::TRACE)]
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         let mut file = self.file.write();
-        file.seek(std::io::SeekFrom::Start(pos))?;
+        file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| io_error(e, "pread"))?;
         let nr = {
             let r = c.as_read();
             let buf = r.buf();
             let buf = buf.as_mut_slice();
-            file.read(buf)? as i32
+            file.read(buf).map_err(|e| io_error(e, "pread"))? as i32
         };
         c.complete(nr);
         Ok(c)
@@ -85,9 +87,9 @@ impl File for GenericFile {
     #[instrument(skip(self, c, buffer), level = Level::TRACE)]
     fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let mut file = self.file.write();
-        file.seek(std::io::SeekFrom::Start(pos))?;
+        file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| io_error(e, "pwrite"))?;
         let buf = buffer.as_slice();
-        file.write_all(buf)?;
+        file.write_all(buf).map_err(|e| io_error(e, "pwrite"))?;
         c.complete(buffer.len() as i32);
         Ok(c)
     }
@@ -95,7 +97,7 @@ impl File for GenericFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
         let file = self.file.write();
-        file.sync_all()?;
+        file.sync_all().map_err(|e| io_error(e, "sync"))?;
         c.complete(0);
         Ok(c)
     }
@@ -103,13 +105,13 @@ impl File for GenericFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         let file = self.file.write();
-        file.set_len(len)?;
+        file.set_len(len).map_err(|e| io_error(e, "truncate"))?;
         c.complete(0);
         Ok(c)
     }
 
     fn size(&self) -> Result<u64> {
         let file = self.file.read();
-        Ok(file.metadata().unwrap().len())
+        Ok(file.metadata().map_err(|e| io_error(e, "metadata"))?.len())
     }
 }

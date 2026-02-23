@@ -3553,12 +3553,11 @@ impl Pager {
                         .iter()
                         .find(|c| !c.succeeded())
                         .cloned();
-                    if let Some(failed) = failed {
-                        return Err(std::io::Error::other(format!(
-                            "Page read failed during commit: {:?}",
-                            failed.get_error()
-                        ))
-                        .into());
+                    if let Some(_failed) = failed {
+                        return Err(LimboError::CompletionError(CompletionError::IOError(
+                            std::io::ErrorKind::Other,
+                            "read",
+                        )));
                     }
                     // All reads complete and successful, proceed to frame preparation
                     commit_info.completions.clear();
@@ -3639,15 +3638,14 @@ impl Pager {
                         .cloned();
 
                     let mut commit_info = self.commit_info.write();
-                    if let Some(failed) = failed {
+                    if let Some(_failed) = failed {
                         commit_info.completions.clear();
                         commit_info.completion_group = None;
                         commit_info.prepared_frames.clear();
-                        return Err(std::io::Error::other(format!(
-                            "WAL write failed: {:?}",
-                            failed.get_error()
-                        ))
-                        .into());
+                        return Err(LimboError::CompletionError(CompletionError::IOError(
+                            std::io::ErrorKind::Other,
+                            "write",
+                        )));
                     }
                     commit_info.completions.clear();
                     commit_info.completion_group = None;
@@ -3687,7 +3685,10 @@ impl Pager {
                                 sync_c.get_error()
                             );
                         }
-                        return Err(std::io::Error::other("WAL fsync failed").into());
+                        return Err(LimboError::CompletionError(CompletionError::IOError(
+                            std::io::ErrorKind::Other,
+                            "sync",
+                        )));
                     }
                     commit_info.completions.clear();
                     commit_info.state = CommitState::WalCommitDone;

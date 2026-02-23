@@ -105,8 +105,8 @@ pub enum Error {
     NotAdb(String),
     #[error("{0}")]
     Corrupt(String),
-    #[error("I/O error: {0}")]
-    IoError(std::io::ErrorKind),
+    #[error("I/O error ({1}): {0}")]
+    IoError(std::io::ErrorKind, &'static str),
 }
 
 impl From<turso_sdk_kit::rsapi::TursoError> for Error {
@@ -122,7 +122,7 @@ impl From<turso_sdk_kit::rsapi::TursoError> for Error {
             turso_sdk_kit::rsapi::TursoError::DatabaseFull(err) => Error::DatabaseFull(err),
             turso_sdk_kit::rsapi::TursoError::NotAdb(err) => Error::NotAdb(err),
             turso_sdk_kit::rsapi::TursoError::Corrupt(err) => Error::Corrupt(err),
-            turso_sdk_kit::rsapi::TursoError::IoError(kind) => Error::IoError(kind),
+            turso_sdk_kit::rsapi::TursoError::IoError(kind, op) => Error::IoError(kind, op),
         }
     }
 }

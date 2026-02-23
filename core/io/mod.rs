@@ -136,7 +136,7 @@ impl TempFile {
     pub fn new(io: &Arc<dyn IO>) -> Result<Self> {
         #[cfg(not(target_family = "wasm"))]
         {
-            let temp_dir = tempfile::tempdir()?;
+            let temp_dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
             let chunk_file_path = temp_dir.as_ref().join("tursodb_temp_file");
             let chunk_file_path_str = chunk_file_path.to_str().ok_or_else(|| {
                 crate::LimboError::InternalError("temp file path is not valid UTF-8".to_string())

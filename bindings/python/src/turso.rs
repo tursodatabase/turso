@@ -48,7 +48,7 @@ pub(crate) fn turso_error_to_py_err(err: TursoError) -> PyErr {
         rsapi::TursoError::DatabaseFull(message) => DatabaseFull::new_err(message),
         rsapi::TursoError::NotAdb(message) => NotAdb::new_err(message),
         rsapi::TursoError::Corrupt(message) => Corrupt::new_err(message),
-        rsapi::TursoError::IoError(kind) => IoError::new_err(format!("{kind:?}")),
+        rsapi::TursoError::IoError(kind, op) => IoError::new_err(format!("{op}: {kind:?}")),
     }
 }
 

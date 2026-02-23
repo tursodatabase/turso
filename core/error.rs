@@ -95,13 +95,6 @@ pub enum LimboError {
     CheckpointFailed(String),
 }
 
-// We only propagate the error kind so we can avoid string allocation in hot path and copying/cloning enums is cheaper
-impl From<std::io::Error> for LimboError {
-    fn from(value: std::io::Error) -> Self {
-        Self::CompletionError(CompletionError::IOError(value.kind()))
-    }
-}
-
 #[cfg(target_family = "unix")]
 impl From<rustix::io::Errno> for LimboError {
     fn from(value: rustix::io::Errno) -> Self {
@@ -116,17 +109,10 @@ impl From<&'static str> for LimboError {
     }
 }
 
-// We only propagate the error kind
-impl From<std::io::Error> for CompletionError {
-    fn from(value: std::io::Error) -> Self {
-        CompletionError::IOError(value.kind())
-    }
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Error)]
 pub enum CompletionError {
-    #[error("I/O error: {0}")]
-    IOError(std::io::ErrorKind),
+    #[error("I/O error ({1}): {0}")]
+    IOError(std::io::ErrorKind, &'static str),
     #[cfg(target_family = "unix")]
     #[error("I/O error: {0}")]
     RustixIOError(#[from] rustix::io::Errno),
@@ -160,6 +146,11 @@ pub enum CompletionError {
     },
     #[error("tursodb not compiled with checksum feature")]
     ChecksumNotEnabled,
+}
+
+/// Convert a `std::io::Error` into a `LimboError` with an operation label.
+pub fn io_error(e: std::io::Error, op: &'static str) -> LimboError {
+    LimboError::CompletionError(CompletionError::IOError(e.kind(), op))
 }
 
 #[cold]

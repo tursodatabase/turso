@@ -347,7 +347,7 @@ pub enum TursoError {
     DatabaseFull(String),
     NotAdb(String),
     Corrupt(String),
-    IoError(std::io::ErrorKind),
+    IoError(std::io::ErrorKind, &'static str),
 }
 
 impl TursoStatusCode {
@@ -385,7 +385,7 @@ impl TursoError {
             TursoError::DatabaseFull(_) => capi::c::turso_status_code_t::TURSO_DATABASE_FULL,
             TursoError::NotAdb(_) => capi::c::turso_status_code_t::TURSO_NOTADB,
             TursoError::Corrupt(_) => capi::c::turso_status_code_t::TURSO_CORRUPT,
-            TursoError::IoError(_) => capi::c::turso_status_code_t::TURSO_IOERR,
+            TursoError::IoError(..) => capi::c::turso_status_code_t::TURSO_IOERR,
         }
     }
 }
@@ -403,7 +403,7 @@ impl Display for TursoError {
             | TursoError::DatabaseFull(s)
             | TursoError::NotAdb(s)
             | TursoError::Corrupt(s) => f.write_str(s),
-            TursoError::IoError(kind) => write!(f, "I/O error: {kind}"),
+            TursoError::IoError(kind, op) => write!(f, "I/O error ({op}): {kind}"),
         }
     }
 }
@@ -433,8 +433,8 @@ impl From<LimboError> for TursoError {
             LimboError::BusySnapshot => TursoError::BusySnapshot(
                 "database snapshot is stale, rollback and retry the transaction".to_string(),
             ),
-            LimboError::CompletionError(turso_core::CompletionError::IOError(kind)) => {
-                TursoError::IoError(kind)
+            LimboError::CompletionError(turso_core::CompletionError::IOError(kind, op)) => {
+                TursoError::IoError(kind, op)
             }
             _ => TursoError::Error(value.to_string()),
         }
