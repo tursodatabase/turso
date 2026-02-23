@@ -34,7 +34,7 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    Connection, Database, LimboError, Numeric, OpenFlags, QueryMode, Statement, Value,
+    io_error, Connection, Database, LimboError, Numeric, OpenFlags, QueryMode, Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -297,18 +297,20 @@ impl Limbo {
             self.handle_first_input()?;
         }
         if !quiet {
-            self.writeln_fmt(format_args!("Turso v{}", env!("CARGO_PKG_VERSION")))?;
-            self.writeln("Enter \".help\" for usage hints.")?;
+            self.writeln_fmt(format_args!("Turso v{}", env!("CARGO_PKG_VERSION")))
+                .map_err(|e| io_error(e, "write"))?;
+            self.writeln("Enter \".help\" for usage hints.")
+                .map_err(|e| io_error(e, "write"))?;
 
             // Add random feature hint
             if let Some(hint) = manual::get_random_feature_hint() {
-                self.writeln(&hint)?;
+                self.writeln(&hint).map_err(|e| io_error(e, "write"))?;
             }
 
             self.writeln(
                 "This software is in BETA, use caution with production data and ensure you have backups."
-            )?;
-            self.display_in_memory()?;
+            ).map_err(|e| io_error(e, "write"))?;
+            self.display_in_memory().map_err(|e| io_error(e, "write"))?;
         }
         Ok(())
     }
@@ -1056,7 +1058,7 @@ impl Limbo {
                         if matches!(value, Value::Null) {
                             let _ = self.write(null_value.as_bytes());
                         } else {
-                            write!(self, "{value}")?;
+                            write!(self, "{value}").map_err(|e| io_error(e, "write"))?;
                         }
                     }
                     let _ = self.writeln("");
@@ -1138,7 +1140,7 @@ impl Limbo {
         }
 
         if !table.is_empty() {
-            writeln!(self, "{table}")?;
+            writeln!(self, "{table}").map_err(|e| io_error(e, "write"))?;
         }
         Ok(())
     }
@@ -1165,20 +1167,22 @@ impl Limbo {
             match stepper.next_row() {
                 Ok(Some(row)) => {
                     if first_row_printed {
-                        self.writeln("")?;
+                        self.writeln("").map_err(|e| io_error(e, "write"))?;
                     } else {
                         first_row_printed = true;
                     }
 
                     for (i, value) in row.get_values().enumerate() {
-                        self.write(&formatted_columns[i])?;
-                        self.write(b" = ")?;
+                        self.write(&formatted_columns[i])
+                            .map_err(|e| io_error(e, "write"))?;
+                        self.write(b" = ").map_err(|e| io_error(e, "write"))?;
                         if matches!(value, Value::Null) {
-                            self.write(null_value.as_bytes())?;
+                            self.write(null_value.as_bytes())
+                                .map_err(|e| io_error(e, "write"))?;
                         } else {
-                            write!(self, "{value}")?;
+                            write!(self, "{value}").map_err(|e| io_error(e, "write"))?;
                         }
-                        self.writeln("")?;
+                        self.writeln("").map_err(|e| io_error(e, "write"))?;
                     }
                 }
                 Ok(None) => break,
@@ -1666,7 +1670,7 @@ impl Limbo {
                     return Ok(());
                 }
                 let ddl: &str = row.get::<&str>(1)?;
-                writeln!(out, "{ddl};")?;
+                writeln!(out, "{ddl};").map_err(|e| io_error(e, "write"))?;
                 Self::dump_table_from_conn(&conn, out, name, &mut progress)?;
                 progress.on(name);
                 Ok(())
@@ -1720,15 +1724,16 @@ impl Limbo {
         let select = format!("SELECT {cols_str} FROM {}", quote_ident(table_name));
         if let Some(mut rows) = conn.query(select)? {
             rows.run_with_row_callback(|row| {
-                write!(out, "INSERT INTO {} VALUES(", quote_ident(table_name))?;
+                write!(out, "INSERT INTO {} VALUES(", quote_ident(table_name))
+                    .map_err(|e| io_error(e, "write"))?;
                 for i in 0..cols.len() {
                     if i > 0 {
-                        out.write_all(b",")?;
+                        out.write_all(b",").map_err(|e| io_error(e, "write"))?;
                     }
                     let v = row.get::<&Value>(i)?;
-                    Self::write_sql_value_from_value(out, v)?;
+                    Self::write_sql_value_from_value(out, v).map_err(|e| io_error(e, "write"))?;
                 }
-                out.write_all(b");\n")?;
+                out.write_all(b");\n").map_err(|e| io_error(e, "write"))?;
                 Ok(())
             })?;
         }
@@ -1758,7 +1763,8 @@ impl Limbo {
                     "INSERT INTO sqlite_sequence(name,seq) VALUES({},{});",
                     sql_quote_string(name),
                     seq
-                )?;
+                )
+                .map_err(|e| io_error(e, "write"))?;
                 Ok(())
             })?;
         }
@@ -1784,7 +1790,7 @@ impl Limbo {
                 let ddl: &str = row.get::<&str>(1)?;
                 let name: &str = row.get::<&str>(0)?;
                 progress.on(name);
-                writeln!(out, "{ddl};")?;
+                writeln!(out, "{ddl};").map_err(|e| io_error(e, "write"))?;
                 Ok(())
             })?;
         }

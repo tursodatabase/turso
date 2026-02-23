@@ -5,6 +5,7 @@ use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::sync::Mutex;
 use crate::turso_assert;
+use crate::error::io_error;
 use crate::{CompletionError, LimboError, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
@@ -109,15 +110,15 @@ impl UringIO {
             .build(ENTRIES)
         {
             Ok(ring) => ring,
-            Err(_) => io_uring::IoUring::new(ENTRIES)?,
+            Err(_) => io_uring::IoUring::new(ENTRIES).map_err(|e| io_error(e, "io_uring_setup"))?,
         };
         // we only ever have 2 files open at a time for the moment
-        ring.submitter().register_files_sparse(FILES)?;
+        ring.submitter().register_files_sparse(FILES).map_err(|e| io_error(e, "register_files"))?;
         // RL_MEMLOCK cap is typically 8MB, the current design is to have one large arena
         // registered at startup and therefore we can simply use the zero index, falling back
         // to similar logic as the existing buffer pool for cases where it is over capacity.
         ring.submitter()
-            .register_buffers_sparse(ARENA_COUNT as u32)?;
+            .register_buffers_sparse(ARENA_COUNT as u32).map_err(|e| io_error(e, "register_buffers"))?;
         let inner = InnerUringIO {
             ring: WrappedIOUring {
                 ring,
@@ -260,7 +261,7 @@ impl InnerUringIO {
             self.ring
                 .ring
                 .submitter()
-                .register_files_update(slot, &[fd.as_raw_fd()])?;
+                .register_files_update(slot, &[fd.as_raw_fd()]).map_err(|e| io_error(e, "register_files_update"))?;
             return Ok(slot);
         }
         Err(crate::error::CompletionError::UringIOError(
@@ -272,7 +273,7 @@ impl InnerUringIO {
         self.ring
             .ring
             .submitter()
-            .register_files_update(id, &[-1])?;
+            .register_files_update(id, &[-1]).map_err(|e| io_error(e, "register_files_update"))?;
         self.free_files.push_back(id);
         Ok(())
     }
@@ -317,7 +318,7 @@ impl WrappedIOUring {
         }
         // place cancel op at the front, if overflowed
         self.overflow.push_front(entry.clone());
-        self.ring.submit()?;
+        self.ring.submit().map_err(|e| io_error(e, "io_uring_submit"))?;
         Ok(())
     }
 
@@ -353,7 +354,7 @@ impl WrappedIOUring {
         }
         let wants = std::cmp::min(self.pending_ops, MAX_WAIT);
         tracing::trace!("submit_and_wait for {wants} pending operations to complete");
-        self.ring.submit_and_wait(wants)?;
+        self.ring.submit_and_wait(wants).map_err(|e| io_error(e, "io_uring_submit_and_wait"))?;
         Ok(())
     }
 
@@ -425,7 +426,7 @@ impl WrappedIOUring {
             let err = std::io::Error::from_raw_os_error(-result);
             tracing::error!("writev failed (user_data: {}): {}", user_data, err);
             state.free_last_iov(&mut self.iov_pool);
-            completion_from_key(user_data).error(err.into());
+            completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "pwritev"));
             return;
         }
 
@@ -473,7 +474,7 @@ impl IO for UringIO {
             file.create(flags.contains(OpenFlags::Create));
         }
 
-        let file = file.open(path)?;
+        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
         // Let's attempt to enable direct I/O. Not all filesystems support it
         // so ignore any errors.
         let fd = file.as_fd();
@@ -498,7 +499,7 @@ impl IO for UringIO {
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(path).map_err(|e| io_error(e, "remove_file"))?;
         Ok(())
     }
 
@@ -539,7 +540,7 @@ impl IO for UringIO {
                 if result < 0 {
                     let errno = -result;
                     let err = std::io::Error::from_raw_os_error(errno);
-                    completion_from_key(user_data).error(err.into());
+                    completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
                 } else {
                     completion_from_key(user_data).complete(result)
                 }
@@ -593,7 +594,7 @@ impl IO for UringIO {
             if result < 0 {
                 let errno = -result;
                 let err = std::io::Error::from_raw_os_error(errno);
-                completion_from_key(user_data).error(err.into());
+                completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
             } else {
                 completion_from_key(user_data).complete(result)
             }
@@ -618,7 +619,7 @@ impl IO for UringIO {
                     iov_len: len,
                 }],
                 None,
-            )?
+            ).map_err(|e| io_error(e, "register_buffers_update"))?
         };
         inner.free_arenas[slot] = Some((ptr, len));
         Ok(slot as u32)
@@ -808,7 +809,7 @@ impl File for UringFile {
     }
 
     fn size(&self) -> Result<u64> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.file.metadata().map_err(|e| io_error(e, "metadata"))?.len())
     }
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {

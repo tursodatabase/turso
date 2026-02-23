@@ -1,5 +1,4 @@
-#[cfg(target_family = "windows")]
-use crate::error::CompletionError;
+use crate::error::io_error;
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
@@ -641,8 +640,9 @@ impl Connection {
             encryption_opts,
         )?;
         if let Some(modeof) = opts.modeof {
-            let perms = std::fs::metadata(modeof)?;
-            std::fs::set_permissions(&opts.path, perms.permissions())?;
+            let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
+            std::fs::set_permissions(&opts.path, perms.permissions())
+                .map_err(|e| io_error(e, "set_permissions"))?;
         }
         let conn = db.connect()?;
         if let Some(cipher) = opts.cipher {
@@ -669,8 +669,9 @@ impl Connection {
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
         let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts, None)?;
         if let Some(modeof) = opts.modeof {
-            let perms = std::fs::metadata(modeof)?;
-            std::fs::set_permissions(&opts.path, perms.permissions())?;
+            let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
+            std::fs::set_permissions(&opts.path, perms.permissions())
+                .map_err(|e| io_error(e, "set_permissions"))?;
         }
         Ok(db)
     }
@@ -778,8 +779,9 @@ impl Connection {
             Ok(result) => result,
             // on windows, zero read will trigger UnexpectedEof
             #[cfg(target_os = "windows")]
-            Err(LimboError::CompletionError(CompletionError::IOError(
+            Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
                 std::io::ErrorKind::UnexpectedEof,
+                _,
             ))) => return Ok(None),
             Err(err) => return Err(err),
         };

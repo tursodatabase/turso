@@ -49,9 +49,11 @@ impl IO for MemoryIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         let mut files = self.files.lock();
         if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
-            return Err(
-                crate::error::CompletionError::IOError(std::io::ErrorKind::NotFound).into(),
-            );
+            return Err(crate::error::CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                "open",
+            )
+            .into());
         }
         if !files.contains_key(path) {
             files.insert(

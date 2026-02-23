@@ -715,7 +715,7 @@ mod tests {
             assert_eq!(status, turso_status_code_t::TURSO_IOERR);
             assert_eq!(
                 std::ffi::CStr::from_ptr(error).to_str().unwrap(),
-                "I/O error: entity not found"
+                "I/O error (open): entity not found"
             );
             turso_str_deinit(error);
             turso_database_deinit(db);

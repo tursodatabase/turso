@@ -738,7 +738,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         stop = true;
                         break;
                     }
-                    Err(turso::Error::IoError(std::io::ErrorKind::StorageFull)) => {
+                    Err(turso::Error::IoError(std::io::ErrorKind::StorageFull, _)) => {
                         log_sql(&sql_log, thread, stmt, "ERROR(io): StorageFull");
                         eprintln!("No storage space, stopping");
                         stop = true;
@@ -754,9 +754,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         println!("Error (busy snapshot): {e}");
                         retry_counter += 1;
                     }
-                    Err(turso::Error::IoError(kind)) => {
-                        log_sql(&sql_log, thread, stmt, &format!("ERROR(io): {kind:?}"));
-                        eprintln!("I/O error ({kind:?}), stopping");
+                    Err(turso::Error::IoError(kind, op)) => {
+                        log_sql(
+                            &sql_log,
+                            thread,
+                            stmt,
+                            &format!("ERROR(io): {op}: {kind:?}"),
+                        );
+                        eprintln!("I/O error ({op}: {kind:?}), stopping");
                         stop = true;
                         break;
                     }
@@ -873,9 +878,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                             );
                             eprintln!("thread#{thread} Database full: {e}");
                         }
-                        turso::Error::IoError(kind) => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR(io): {kind:?}"));
-                            eprintln!("thread#{thread} I/O error ({kind:?}), continuing...");
+                        turso::Error::IoError(kind, op) => {
+                            log_sql(
+                                &sql_log,
+                                thread,
+                                &sql,
+                                &format!("ERROR(io): {op}: {kind:?}"),
+                            );
+                            eprintln!("thread#{thread} I/O error ({op}: {kind:?}), continuing...");
                         }
                         _ => {
                             log_sql(&sql_log, thread, &sql, &format!("ERROR(fatal): {e}"));
