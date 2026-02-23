@@ -31,7 +31,7 @@ QUERY PLAN
    |--SCAN subquery_0
    |  `--SCAN window_subquery_0
    |     `--SCAN employees USING INDEX idx_employees_department
-   `--USE TEMP B-TREE FOR ORDER BY
+   `--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode              p1   p2  p3  p4                     p5  comment
@@ -70,12 +70,12 @@ addr  opcode              p1   p2  p3  p4                     p5  comment
   32        AggStep        0   23  13  avg                     0  accum=r[13] step(r[23])
   33      Goto             0   20   0                          0
   34      Null             0   21   0                          0  r[21]=NULL; return remaining buffered rows
-  35      Rewind           2   48   0                          0  Rewind  buffer_table_window_0
+  35      Rewind           2   48   0                          0  Rewind  ephemeral(buffer_table_window_0)
   36      AggValue         0   13  14  avg                     0  accum=r[13] dest=r[14]
-  37        Column         2    1  15                          0  r[15]=buffer_table_window_0.emp_id
-  38        Column         2    2  16                          0  r[16]=buffer_table_window_0.name
-  39        Column         2    0  17                          0  r[17]=buffer_table_window_0.department
-  40        Column         2    3  18                          0  r[18]=buffer_table_window_0.salary
+  37        Column         2    1  15                          0  r[15]=ephemeral(buffer_table_window_0).emp_id
+  38        Column         2    2  16                          0  r[16]=ephemeral(buffer_table_window_0).name
+  39        Column         2    0  17                          0  r[17]=ephemeral(buffer_table_window_0).department
+  40        Column         2    3  18                          0  r[18]=ephemeral(buffer_table_window_0).salary
   41        Copy          15    8   0                          0  r[8]=r[15]
   42        Copy          16    9   0                          0  r[9]=r[16]
   43        Copy          17   10   0                          0  r[10]=r[17]
@@ -132,12 +132,12 @@ addr  opcode              p1   p2  p3  p4                     p5  comment
   94      Insert           7   58  53  buffer_table_window_0   0  intkey=r[53] data=r[58]
   95    Goto               0   82   0                          0
   96    Null               0   55   0                          0  r[55]=NULL; return remaining buffered rows
-  97    Rewind             6  116   0                          0  Rewind  buffer_table_window_0
-  98      Column           6    1  48                          0  r[48]=buffer_table_window_0.emp_id
-  99      Column           6    2  49                          0  r[49]=buffer_table_window_0.name
- 100      Column           6    3  50                          0  r[50]=buffer_table_window_0.department
- 101      Column           6    4  51                          0  r[51]=buffer_table_window_0.salary
- 102      Column           6    5  52                          0  r[52]=buffer_table_window_0.dept_avg
+  97    Rewind             6  116   0                          0  Rewind  ephemeral(buffer_table_window_0)
+  98      Column           6    1  48                          0  r[48]=ephemeral(buffer_table_window_0).emp_id
+  99      Column           6    2  49                          0  r[49]=ephemeral(buffer_table_window_0).name
+ 100      Column           6    3  50                          0  r[50]=ephemeral(buffer_table_window_0).department
+ 101      Column           6    4  51                          0  r[51]=ephemeral(buffer_table_window_0).salary
+ 102      Column           6    5  52                          0  r[52]=ephemeral(buffer_table_window_0).dept_avg
  103      AddImm          54    1   0                          0  r[54]=r[54]+1
  104      Copy            54   47   0                          0  r[47]=r[54]
  105      Copy            48   39   0                          0  r[39]=r[48]
