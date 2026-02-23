@@ -141,13 +141,13 @@ pub struct ProgramBuilder {
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
-    write_databases: std::collections::HashSet<usize>,
+    write_databases: HashSet<usize>,
     /// Set of attached database IDs that need read transactions.
-    read_databases: std::collections::HashSet<usize>,
+    read_databases: HashSet<usize>,
     /// Schema cookies for attached databases at prepare time.
-    write_database_cookies: std::collections::HashMap<usize, u32>,
+    write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
-    read_database_cookies: std::collections::HashMap<usize, u32>,
+    read_database_cookies: HashMap<usize, u32>,
     rollback: bool,
     /// The mode in which the query is being executed.
     query_mode: QueryMode,
@@ -401,10 +401,10 @@ impl ProgramBuilder {
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
             txn_mode: TransactionMode::None,
-            write_databases: std::collections::HashSet::new(),
-            read_databases: std::collections::HashSet::new(),
-            write_database_cookies: std::collections::HashMap::new(),
-            read_database_cookies: std::collections::HashMap::new(),
+            write_databases: HashSet::default(),
+            read_databases: HashSet::default(),
+            write_database_cookies: HashMap::default(),
+            read_database_cookies: HashMap::default(),
             rollback: false,
             query_mode,
             current_parent_explain_idx: None,

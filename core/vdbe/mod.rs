@@ -17,7 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
-use crate::{turso_assert, turso_assert_ne, turso_debug_assert};
+use crate::{turso_assert, turso_assert_ne, turso_debug_assert, HashSet};
 pub mod affinity;
 pub mod bloom_filter;
 pub mod builder;
@@ -828,9 +828,9 @@ pub struct PreparedProgram {
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
-    pub write_databases: std::collections::HashSet<usize>,
+    pub write_databases: HashSet<usize>,
     /// Set of attached database indices that need read transactions.
-    pub read_databases: std::collections::HashSet<usize>,
+    pub read_databases: HashSet<usize>,
 }
 
 #[derive(Clone)]

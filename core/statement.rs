@@ -295,7 +295,7 @@ impl Statement {
             .write_databases
             .iter()
             .chain(self.program.prepared.read_databases.iter())
-            .filter(|&&id| id >= 2)
+            .filter(|&&id| crate::is_attached_db(id))
             .copied()
             .collect();
         for db_id in attached_db_ids {

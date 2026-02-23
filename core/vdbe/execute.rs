@@ -2330,7 +2330,7 @@ pub fn op_transaction_inner(
                     // For attached databases (db >= 2), always start read/write
                     // transactions on the attached pager, since the connection-level
                     // transaction state may already be Read/Write from the main database.
-                    let is_attached = *db >= 2;
+                    let is_attached = crate::is_attached_db(*db);
                     if is_attached {
                         // If the pager already holds a read lock (e.g., after
                         // SchemaUpdated reprepare or prior write tx), skip
@@ -2453,13 +2453,15 @@ pub fn op_transaction_inner(
                 state.op_transaction_state = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                if *db == 0 && program.needs_stmt_subtransactions.load(Ordering::Relaxed) {
+                if *db == crate::MAIN_DB_ID
+                    && program.needs_stmt_subtransactions.load(Ordering::Relaxed)
+                {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
-                } else if *db >= 2
+                } else if crate::is_attached_db(*db)
                     && matches!(tx_mode, TransactionMode::Write)
                     && program.needs_stmt_subtransactions.load(Ordering::Relaxed)
                 {
@@ -8318,7 +8320,7 @@ pub fn op_destroy(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let destroy_pager = if *db > 0 {
+    let destroy_pager = if *db != crate::MAIN_DB_ID {
         program.get_pager_from_database_index(db)
     } else {
         pager.clone()
@@ -8568,7 +8570,7 @@ pub fn op_parse_schema(
 
     let enable_triggers = conn.experimental_triggers_enabled();
     // For attached databases, qualify the sqlite_schema table with the database name
-    let schema_table = if *db >= 2 {
+    let schema_table = if crate::is_attached_db(*db) {
         let db_name = conn
             .get_database_name_by_index(*db)
             .unwrap_or_else(|| "main".to_string());
@@ -8897,7 +8899,7 @@ pub fn op_set_cookie(
                 Cookie::SchemaVersion => {
                     // Only mark schema_did_change on connection for main database (db 0).
                     // Attached databases track their schema independently.
-                    if *db == 0 {
+                    if *db == crate::MAIN_DB_ID {
                         match program.connection.get_tx_state() {
                             TransactionState::Write { .. } => {
                                 program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
@@ -9651,7 +9653,7 @@ pub fn op_integrity_check(
 
     let mv_store = program.connection.mv_store();
     // Use the correct pager for the target database (main or attached)
-    let target_pager = if *db == 0 {
+    let target_pager = if *db == crate::MAIN_DB_ID {
         pager.clone()
     } else {
         program.get_pager_from_database_index(db)

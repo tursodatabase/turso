@@ -1516,32 +1516,33 @@ impl Connection {
 
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
-        if database_id == crate::MAIN_DB_ID {
-            // Main database - use connection's schema which should be kept in sync
-            let schema = self.schema.read();
-            f(&schema)
-        } else if database_id == crate::TEMP_DB_ID {
-            // Temp database - uses same schema as main for now, but this will change later.
-            let schema = self.schema.read();
-            f(&schema)
-        } else {
-            // Attached database: prefer the connection-local copy (which may contain
-            // uncommitted schema changes from this connection's transaction), falling
-            // back to the shared Database schema (last committed state).
-            let schemas = self.database_schemas.read();
-            if let Some(local_schema) = schemas.get(&database_id) {
-                return f(local_schema);
+        match database_id {
+            crate::MAIN_DB_ID | crate::TEMP_DB_ID => {
+                // Main database - use connection's schema which should be kept in sync
+                // NOTE: for Temp databases, for now they can use the connection-local schema
+                // but this will change in the future
+                let schema = self.schema.read();
+                f(&schema)
             }
-            drop(schemas);
+            _ => {
+                // Attached database: prefer the connection-local copy (which may contain
+                // uncommitted schema changes from this connection's transaction), falling
+                // back to the shared Database schema (last committed state).
+                let schemas = self.database_schemas.read();
+                if let Some(local_schema) = schemas.get(&database_id) {
+                    return f(local_schema);
+                }
+                drop(schemas);
 
-            let attached_dbs = self.attached_databases.read();
-            let (db, _pager) = attached_dbs
-                .index_to_data
-                .get(&database_id)
-                .expect("Database ID should be valid after resolve_database_id");
+                let attached_dbs = self.attached_databases.read();
+                let (db, _pager) = attached_dbs
+                    .index_to_data
+                    .get(&database_id)
+                    .expect("Database ID should be valid after resolve_database_id");
 
-            let schema = db.schema.lock().clone();
-            f(&schema)
+                let schema = db.schema.lock().clone();
+                f(&schema)
+            }
         }
     }
 
