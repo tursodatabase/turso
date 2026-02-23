@@ -176,4 +176,3 @@ test create-table-only-generated-column-error {
 }
 expect error {
 }
-

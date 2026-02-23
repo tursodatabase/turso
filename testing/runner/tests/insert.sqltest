@@ -1843,7 +1843,6 @@ test insert-or-replace-data-correctness {
 expect {
     133|a133
 }
-
 # https://github.com/tursodatabase/turso/issues/5226
 test insert-select-nonexistent-column {
     CREATE TABLE t(a);

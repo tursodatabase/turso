@@ -15,7 +15,8 @@
  *   numbers are IEEE 754 doubles with 53 bits of mantissa precision.
  */
 
-import { connect } from '@tursodatabase/database';
+import { pathToFileURL } from 'node:url';
+import { splitStatements } from './turso-sql-split.mjs';
 
 async function readStdin() {
     const chunks = [];
@@ -81,6 +82,7 @@ async function main() {
 
     let db;
     try {
+        const { connect } = await import('@tursodatabase/database');
         db = await connect(dbPath, { readonly, experimental: ['triggers', 'attach'] });
         // Enable safe integers to preserve precision for large integers
         db.defaultSafeIntegers(true);
@@ -94,29 +96,17 @@ async function main() {
         const statements = splitStatements(sql);
 
         // Accumulate results from ALL queries (matches Rust backend behavior)
-        let allResults = [];
+        const allResults = [];
 
         for (const stmt of statements) {
             const trimmed = stmt.trim();
             if (!trimmed) continue;
 
-            // Check if this is a query that returns rows (includes RETURNING clauses)
-            // Note: WITH (CTEs) can contain either SELECT or DML statements.
-            // We include WITH here because even CTE-wrapped DML returns empty
-            // from .all() (unless RETURNING is used), which is fine.
-            const isQuery = /^\s*(SELECT|PRAGMA|EXPLAIN|WITH|VALUES)/i.test(trimmed) ||
-                           /\bRETURNING\b/i.test(trimmed);
-
-            if (isQuery) {
-                const prepared = db.prepare(trimmed);
-                prepared.raw(true);
-                const rows = await prepared.all();
-                allResults.push(...rows);
-                await prepared.close();
-            } else {
-                // Non-query statement (INSERT, UPDATE, DELETE, CREATE, etc.)
-                await db.exec(trimmed);
-            }
+            const prepared = db.prepare(trimmed);
+            prepared.raw(true);
+            const rows = await prepared.all();
+            allResults.push(...rows);
+            prepared.close();
         }
 
         // Output all accumulated results
@@ -135,78 +125,11 @@ async function main() {
     }
 }
 
-/**
- * Split SQL text into individual statements.
- *
- * NOTE: This manual splitting is necessary because the JS bindings don't expose
- * an ergonomic way to execute multiple statements while capturing results from
- * the last one. The bindings provide:
- * - db.exec(sql) - executes multiple statements but doesn't return row data
- * - db.prepare(sql) - returns rows but only handles a single statement
- *
- * The native BatchExecutor uses Turso's parser internally (conn.consume_stmt)
- * but doesn't expose a row() method. Adding that would allow us to remove this
- * manual splitting. See: bindings/javascript/src/lib.rs BatchExecutor impl.
- */
-function splitStatements(sql) {
-    const statements = [];
-    let current = '';
-    let inString = false;
-    let stringChar = '';
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 
-    for (let i = 0; i < sql.length; i++) {
-        const char = sql[i];
-        const nextChar = sql[i + 1];
-
-        if (inString) {
-            current += char;
-            // Check for escape sequences
-            if (char === stringChar) {
-                if (nextChar === stringChar) {
-                    // Escaped quote
-                    current += nextChar;
-                    i++;
-                } else {
-                    inString = false;
-                }
-            }
-        } else if (char === "'" || char === '"') {
-            inString = true;
-            stringChar = char;
-            current += char;
-        } else if (char === '-' && nextChar === '-') {
-            // Skip single-line comment (don't add to current statement)
-            i++; // skip second '-'
-            while (i < sql.length && sql[i] !== '\n') {
-                i++;
-            }
-            // i now points to '\n' or end; the for loop will increment past it
-        } else if (char === '/' && nextChar === '*') {
-            // Skip multi-line comment
-            i++; // skip '*'
-            while (i < sql.length - 1 && !(sql[i] === '*' && sql[i + 1] === '/')) {
-                i++;
-            }
-            i++; // skip past closing '/'
-        } else if (char === ';') {
-            if (current.trim()) {
-                statements.push(current.trim());
-            }
-            current = '';
-        } else {
-            current += char;
-        }
-    }
-
-    // Add any remaining statement
-    if (current.trim()) {
-        statements.push(current.trim());
-    }
-
-    return statements;
+if (isMain) {
+    main().catch(err => {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+    });
 }
-
-main().catch(err => {
-    console.error(`Error: ${err.message}`);
-    process.exit(1);
-});
