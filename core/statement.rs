@@ -508,8 +508,14 @@ impl Statement {
     }
 
     pub fn reset_best_effort(&mut self) {
-        if let Err(err) = self.reset() {
-            tracing::error!("Statement reset failed during best-effort cleanup: {err}");
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.reset())) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::error!("Statement reset failed during best-effort cleanup: {err}");
+            }
+            Err(_) => {
+                tracing::error!("Statement reset panicked during best-effort cleanup");
+            }
         }
     }
 
@@ -531,7 +537,7 @@ impl Statement {
 
         let mut reset_error: Option<LimboError> = None;
 
-        if !std::thread::panicking() && self.state.execution_state.is_running() {
+        if self.state.execution_state.is_running() {
             if self.query_mode == QueryMode::Normal
                 && self.program.change_cnt_on
                 && self.has_returned_row
@@ -604,7 +610,7 @@ impl Statement {
                     );
                 }
             }
-        } else if !std::thread::panicking() {
+        } else {
             // Statement not running (Done/Failed/Init) — cleanup only.
             if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
                 capture_reset_error(
