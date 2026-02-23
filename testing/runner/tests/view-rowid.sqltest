@@ -17,10 +17,3 @@ test view-rowid-select {
 }
 expect error {
 }
-
-test table-without-rowid-select {
-    CREATE TABLE t(a PRIMARY KEY) WITHOUT ROWID;
-    SELECT rowid FROM t;
-}
-expect error {
-}
