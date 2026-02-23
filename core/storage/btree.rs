@@ -50,7 +50,7 @@ use crate::{
 };
 use crate::{
     turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
-    turso_assert_less_than, turso_assert_less_than_or_equal, turso_assert_ne,
+    turso_assert_less_than, turso_assert_less_than_or_equal,
 };
 use std::{
     any::Any,
@@ -3130,7 +3130,7 @@ impl BTreeCursor {
                         for cell in &cell_array.cell_payloads {
                             cells_debug.push(cell.to_vec());
                             if is_leaf {
-                                turso_assert_ne!(cell[0], 0);
+                                crate::turso_assert_ne!(cell[0], 0);
                             }
                         }
                     }
