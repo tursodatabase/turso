@@ -1,0 +1,112 @@
+@database :memory:
+
+# Tests for DELETE with LIMIT and OFFSET clauses
+# SQLite CI build does not enable DELETE ... LIMIT/OFFSET, so these are tursodb-only
+
+setup schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5);
+}
+
+# Reproducer from issue #5542: OFFSET was being ignored
+@setup schema
+@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
+@cross-check-integrity
+test delete-limit-offset-basic {
+    DELETE FROM t LIMIT 1 OFFSET 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+    5
+}
+
+# Delete multiple rows with offset
+@setup schema
+@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
+@cross-check-integrity
+test delete-limit-offset-multiple {
+    DELETE FROM t LIMIT 2 OFFSET 1;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1
+    4
+    5
+}
+
+# OFFSET 0 should behave same as no offset
+@setup schema
+@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
+@cross-check-integrity
+test delete-limit-offset-zero {
+    DELETE FROM t LIMIT 1 OFFSET 0;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2
+    3
+    4
+    5
+}
+
+# OFFSET beyond all rows - nothing deleted
+@setup schema
+@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
+@cross-check-integrity
+test delete-limit-offset-beyond-rows {
+    DELETE FROM t LIMIT 1 OFFSET 5;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+# LIMIT larger than remaining rows after offset
+@setup schema
+@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
+@cross-check-integrity
+test delete-limit-offset-limit-exceeds {
+    DELETE FROM t LIMIT 10 OFFSET 3;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# DELETE with LIMIT only (no OFFSET) still works
+@setup schema
+@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
+@cross-check-integrity
+test delete-limit-no-offset {
+    DELETE FROM t LIMIT 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    3
+    4
+    5
+}
+
+# DELETE with LIMIT and OFFSET combined with WHERE clause
+@setup schema
+@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
+@cross-check-integrity
+test delete-limit-offset-with-where {
+    DELETE FROM t WHERE id > 1 LIMIT 1 OFFSET 1;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+    5
+}

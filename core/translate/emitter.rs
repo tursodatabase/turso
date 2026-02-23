@@ -1496,7 +1496,7 @@ fn emit_program_for_delete(
         None
     };
 
-    init_limit(program, &mut t_ctx, &plan.limit, &None)?;
+    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
@@ -1887,6 +1887,20 @@ fn emit_delete_insns<'a>(
     } else {
         false
     };
+
+    // Apply OFFSET: skip the first N matching rows before deleting
+    if let Some(offset) = t_ctx.reg_offset {
+        let loop_labels = *t_ctx
+            .labels_main_loop
+            .first()
+            .expect("loop labels to exist");
+        program.emit_insn(Insn::IfPos {
+            reg: offset,
+            target_pc: loop_labels.next,
+            decrement_by: 1,
+        });
+    }
+
     let cols_len = unsafe { &*table_reference }.columns().len();
     let (columns_start_reg, rowid_reg): (Option<usize>, usize) = {
         // Get rowid for RETURNING
