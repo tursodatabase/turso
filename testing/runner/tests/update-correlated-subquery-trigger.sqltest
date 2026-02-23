@@ -1,0 +1,141 @@
+@database :memory:
+@requires-file trigger "correlated subquery update tests require trigger support"
+
+# Correlated subquery in UPDATE SET with AFTER trigger should see in-flight row changes.
+# Regression test for #5547: When an AFTER UPDATE trigger fires between rows, the
+# correlated subquery in SET should re-evaluate against the updated table state.
+
+test correlated-subquery-trigger-basic {
+    CREATE TABLE accounts(id INT PRIMARY KEY, owner TEXT, balance INT);
+    CREATE TABLE audit(id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT);
+    CREATE TRIGGER bal AFTER UPDATE ON accounts WHEN NEW.balance != OLD.balance
+    BEGIN INSERT INTO audit(msg) VALUES('changed'); END;
+
+    INSERT INTO accounts VALUES(1,'Zeus',700),(2,'Hera',500),(3,'Athena',750),(4,'Ares',500);
+
+    UPDATE accounts SET balance = balance + (
+      SELECT COALESCE(SUM(a2.balance), 0) / 4 - accounts.balance FROM accounts a2
+    ) WHERE balance < (SELECT AVG(balance) FROM accounts);
+
+    SELECT * FROM accounts ORDER BY id;
+    SELECT '---';
+    SELECT COUNT(*) FROM audit;
+}
+expect {
+    1|Zeus|700
+    2|Hera|612
+    3|Athena|750
+    4|Ares|640
+    ---
+    2
+}
+
+# Same query without trigger should produce identical results
+test correlated-subquery-no-trigger {
+    CREATE TABLE accounts2(id INT PRIMARY KEY, owner TEXT, balance INT);
+    INSERT INTO accounts2 VALUES(1,'Zeus',700),(2,'Hera',500),(3,'Athena',750),(4,'Ares',500);
+
+    UPDATE accounts2 SET balance = balance + (
+      SELECT COALESCE(SUM(a2.balance), 0) / 4 - accounts2.balance FROM accounts2 a2
+    ) WHERE balance < (SELECT AVG(balance) FROM accounts2);
+
+    SELECT * FROM accounts2 ORDER BY id;
+}
+expect {
+    1|Zeus|700
+    2|Hera|612
+    3|Athena|750
+    4|Ares|640
+}
+
+# UPDATE with trigger and correlated subquery on single matching row
+test correlated-subquery-trigger-single-row {
+    CREATE TABLE t1(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log1(msg TEXT);
+    CREATE TRIGGER tr1 AFTER UPDATE ON t1
+    BEGIN INSERT INTO log1(msg) VALUES('updated'); END;
+
+    INSERT INTO t1 VALUES(1, 10),(2, 20),(3, 30);
+
+    UPDATE t1 SET val = (SELECT SUM(t2.val) FROM t1 t2) WHERE id = 2;
+    SELECT * FROM t1 ORDER BY id;
+}
+expect {
+    1|10
+    2|60
+    3|30
+}
+
+# UPDATE with BEFORE trigger and correlated subquery
+test correlated-subquery-before-trigger {
+    CREATE TABLE t2(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log2(msg TEXT);
+    CREATE TRIGGER tr2 BEFORE UPDATE ON t2
+    BEGIN INSERT INTO log2(msg) VALUES('before'); END;
+
+    INSERT INTO t2 VALUES(1, 100),(2, 200),(3, 300);
+
+    UPDATE t2 SET val = val + (SELECT MAX(t2b.val) - t2.val FROM t2 t2b) WHERE val < 300;
+    SELECT * FROM t2 ORDER BY id;
+}
+expect {
+    1|300
+    2|300
+    3|300
+}
+
+# Multiple correlated subqueries in SET with trigger
+test multiple-correlated-subqueries-trigger {
+    CREATE TABLE t3(id INT PRIMARY KEY, a INT, b INT);
+    CREATE TABLE log3(msg TEXT);
+    CREATE TRIGGER tr3 AFTER UPDATE ON t3
+    BEGIN INSERT INTO log3(msg) VALUES('fired'); END;
+
+    INSERT INTO t3 VALUES(1, 10, 100),(2, 20, 200),(3, 30, 300);
+
+    UPDATE t3 SET a = (SELECT MIN(x.a) FROM t3 x), b = (SELECT MAX(x.b) FROM t3 x) WHERE id = 2;
+    SELECT * FROM t3 ORDER BY id;
+}
+expect {
+    1|10|100
+    2|10|300
+    3|30|300
+}
+
+# Mixed correlated and uncorrelated subqueries in SET with trigger
+test mixed-correlated-uncorrelated-set {
+    CREATE TABLE t4(id INT PRIMARY KEY, a INT, b INT);
+    CREATE TABLE log4(msg TEXT);
+    CREATE TRIGGER tr4 AFTER UPDATE ON t4
+    BEGIN INSERT INTO log4(msg) VALUES('fired'); END;
+
+    INSERT INTO t4 VALUES(1, 10, 100),(2, 20, 200),(3, 30, 300);
+
+    UPDATE t4 SET a = (SELECT SUM(x.a) FROM t4 x), b = (SELECT 42) WHERE id <= 2;
+    SELECT * FROM t4 ORDER BY id;
+}
+expect {
+    1|60|42
+    2|60|42
+    3|30|300
+}
+
+# Subqueries in both WHERE and SET clauses with trigger
+test subquery-in-where-and-set {
+    CREATE TABLE t5(id INT PRIMARY KEY, a INT);
+    CREATE TABLE log5(msg TEXT);
+    CREATE TRIGGER tr5 AFTER UPDATE ON t5
+    BEGIN INSERT INTO log5(msg) VALUES('fired'); END;
+
+    INSERT INTO t5 VALUES(1, 10),(2, 20),(3, 30),(4, 40);
+
+    UPDATE t5 SET a = (SELECT MAX(x.a) FROM t5 x WHERE x.id > t5.id)
+    WHERE id IN (SELECT id FROM t5 WHERE a < 30);
+    SELECT * FROM t5 ORDER BY id;
+}
+expect {
+    1|40
+    2|40
+    3|30
+    4|40
+}

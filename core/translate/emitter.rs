@@ -2471,28 +2471,42 @@ fn emit_program_for_update(
         })
         .collect::<Vec<_>>();
 
-    // Evaluate uncorrelated subqueries as early as possible (only for normal path without ephemeral table)
-    // For the ephemeral path, subqueries are handled by emit_program_for_select on the ephemeral_plan.
-    if !has_ephemeral_table {
-        for subquery in plan
+    // Separate correlated SET clause subqueries from the rest. These must be evaluated
+    // inside the update loop so they see in-flight row modifications. The remaining
+    // subqueries (uncorrelated ones) are emitted before the loop as usual.
+    let mut correlated_set_subqueries = if has_ephemeral_table {
+        let (correlated, rest): (Vec<_>, Vec<_>) = plan
             .non_from_clause_subqueries
-            .iter_mut()
-            .filter(|s| !s.has_been_evaluated())
-        {
-            let eval_at = subquery.get_eval_at(&join_order, Some(&plan.table_references))?;
-            if eval_at != EvalAt::BeforeLoop {
-                continue;
-            }
-            let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+            .drain(..)
+            .partition(|sq| sq.correlated && !sq.has_been_evaluated());
+        plan.non_from_clause_subqueries = rest;
+        correlated
+    } else {
+        vec![]
+    };
 
-            emit_non_from_clause_subquery(
-                program,
-                &t_ctx.resolver,
-                *subquery_plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
+    // Evaluate uncorrelated subqueries as early as possible.
+    // For the ephemeral path, WHERE clause subqueries are handled by emit_program_for_select
+    // on the ephemeral_plan. SET clause subqueries remain in the main plan and are emitted here
+    // (uncorrelated) or inside the update loop (correlated, extracted above).
+    for subquery in plan
+        .non_from_clause_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        let eval_at = subquery.get_eval_at(&join_order, Some(&plan.table_references))?;
+        if eval_at != EvalAt::BeforeLoop {
+            continue;
         }
+        let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+        emit_non_from_clause_subquery(
+            program,
+            &t_ctx.resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
     }
 
     // Initialize the main loop
@@ -2637,6 +2651,7 @@ fn emit_program_for_update(
         target_table,
         resolver,
         returning_buffer.as_ref(),
+        &mut correlated_set_subqueries,
     )?;
 
     // Close the main loop
@@ -2911,6 +2926,7 @@ fn emit_update_insns<'a>(
     target_table: Arc<JoinedTable>,
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
+    correlated_set_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     let internal_id = target_table.internal_id;
@@ -3019,6 +3035,22 @@ fn emit_update_insns<'a>(
             reg: beg,
             target_pc: t_ctx.label_main_loop_end.unwrap(),
         });
+    }
+
+    // Emit correlated SET clause subqueries after cursor positioning.
+    // These must be re-evaluated for each row to see in-flight modifications.
+    for subquery in correlated_set_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+        emit_non_from_clause_subquery(
+            program,
+            &t_ctx.resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
     }
 
     if is_virtual {

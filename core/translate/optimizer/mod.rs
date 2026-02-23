@@ -42,10 +42,11 @@ use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy}
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
+use turso_parser::ast::{self, Expr, SortOrder, TableInternalId, TriggerEvent};
 
 use super::{
     emitter::Resolver,
+    expr::{walk_expr, WalkControl},
     plan::{
         DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, MultiIndexBranch,
         MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, TableReferences,
@@ -791,13 +792,39 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        // Move subqueries from the main plan to the ephemeral plan since the WHERE clause was moved
-        non_from_clause_subqueries: plan.non_from_clause_subqueries.drain(..).collect(),
+        // Move only WHERE clause subqueries to the ephemeral plan.
+        // SET clause subqueries must remain in the main plan so they are
+        // re-evaluated during the update loop and can see in-flight row changes.
+        non_from_clause_subqueries: {
+            let set_clause_subquery_ids = collect_set_clause_subquery_ids(&plan.set_clauses);
+            let (set_subqueries, where_subqueries): (Vec<_>, Vec<_>) = plan
+                .non_from_clause_subqueries
+                .drain(..)
+                .partition(|sq| set_clause_subquery_ids.contains(&sq.internal_id));
+            plan.non_from_clause_subqueries = set_subqueries;
+            where_subqueries
+        },
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
 
     Ok(())
+}
+
+/// Collect all SubqueryResult IDs referenced by SET clause expressions.
+/// These subqueries must stay in the main UPDATE plan (not the ephemeral scan plan)
+/// so they are re-evaluated during the update loop and can see in-flight row changes.
+fn collect_set_clause_subquery_ids(set_clauses: &[(usize, Box<Expr>)]) -> HashSet<TableInternalId> {
+    let mut ids = HashSet::default();
+    for (_, expr) in set_clauses.iter() {
+        let _ = walk_expr(expr, &mut |e| {
+            if let Expr::SubqueryResult { subquery_id, .. } = e {
+                ids.insert(*subquery_id);
+            }
+            Ok(WalkControl::Continue)
+        });
+    }
+    ids
 }
 
 fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
