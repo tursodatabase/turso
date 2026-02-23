@@ -1,12 +1,12 @@
 //! Schema introspection from a live database.
 //!
 //! Uses PRAGMA commands to query the current database schema and converts it
-//! to the `sql_gen_prop::Schema` format for query generation.
+//! to the `sql_gen::Schema` format for query generation.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sql_gen_prop::{ColumnDef, DataType, Schema, SchemaBuilder, Table};
+use sql_gen::{ColumnDef, DataType, Schema, SchemaBuilder, Table};
 
 /// Introspects schema from a database connection.
 pub struct SchemaIntrospector;
@@ -20,7 +20,7 @@ impl SchemaIntrospector {
         for table_name in table_names {
             let columns = Self::get_columns_turso(conn, &table_name)?;
             if !columns.is_empty() {
-                builder = builder.add_table(Table::new(table_name, columns));
+                builder = builder.table(Table::new(table_name, columns));
             }
         }
 
@@ -35,7 +35,7 @@ impl SchemaIntrospector {
         for table_name in table_names {
             let columns = Self::get_columns_sqlite(conn, &table_name)?;
             if !columns.is_empty() {
-                builder = builder.add_table(Table::new(table_name, columns));
+                builder = builder.table(Table::new(table_name, columns));
             }
         }
 
@@ -45,7 +45,7 @@ impl SchemaIntrospector {
     fn get_table_names_turso(conn: &Arc<turso_core::Connection>) -> Result<Vec<String>> {
         let mut tables = Vec::new();
         let mut rows = conn
-            .query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY name")
             .context("Failed to query table names")?
             .context("Expected rows from query")?;
 
@@ -62,7 +62,7 @@ impl SchemaIntrospector {
 
     fn get_table_names_sqlite(conn: &rusqlite::Connection) -> Result<Vec<String>> {
         let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY name")
             .context("Failed to prepare table query")?;
 
         let tables = stmt
@@ -173,21 +173,20 @@ impl SchemaIntrospector {
         for table_name in table_names {
             let columns = Self::get_columns_turso(conn, &table_name)?;
             if !columns.is_empty() {
-                builder = builder.add_table(Table::new(table_name, columns));
+                builder = builder.table(Table::new(table_name, columns));
             }
         }
 
         // Discover attached databases
         let attached_dbs = Self::get_attached_databases_turso(conn)?;
         for db_name in &attached_dbs {
-            builder = builder.add_database(db_name.clone());
+            builder = builder.database(db_name.clone());
             let tables = Self::get_table_names_turso_db(conn, db_name)?;
             for table_name in tables {
                 let query = format!("PRAGMA {db_name}.table_info(\"{table_name}\")");
                 let columns = Self::get_columns_turso_query(conn, &query)?;
                 if !columns.is_empty() {
-                    builder =
-                        builder.add_table(Table::new(table_name, columns).in_database(db_name));
+                    builder = builder.table(Table::new(table_name, columns).in_database(db_name));
                 }
             }
         }
@@ -203,16 +202,16 @@ impl SchemaIntrospector {
         for table_name in table_names {
             let columns = Self::get_columns_sqlite(conn, &table_name)?;
             if !columns.is_empty() {
-                builder = builder.add_table(Table::new(table_name, columns));
+                builder = builder.table(Table::new(table_name, columns));
             }
         }
 
         // Discover attached databases
         let attached_dbs = Self::get_attached_databases_sqlite(conn)?;
         for db_name in &attached_dbs {
-            builder = builder.add_database(db_name.clone());
+            builder = builder.database(db_name.clone());
             let query = format!(
-                "SELECT name FROM {db_name}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                "SELECT name FROM {db_name}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY name"
             );
             let mut stmt = conn
                 .prepare(&query)
@@ -255,8 +254,7 @@ impl SchemaIntrospector {
                 }
 
                 if !result.is_empty() {
-                    builder =
-                        builder.add_table(Table::new(table_name, result).in_database(db_name));
+                    builder = builder.table(Table::new(table_name, result).in_database(db_name));
                 }
             }
         }
@@ -309,7 +307,7 @@ impl SchemaIntrospector {
     ) -> Result<Vec<String>> {
         let mut tables = Vec::new();
         let query = format!(
-            "SELECT name FROM {db_name}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            "SELECT name FROM {db_name}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY name"
         );
         let mut rows = conn
             .query(&query)

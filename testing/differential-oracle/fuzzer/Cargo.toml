@@ -20,6 +20,7 @@ path = "lib.rs"
 [dependencies]
 turso_core = { workspace = true, features = ["simulator"] }
 sql_gen_prop = { path = "../sql_gen_prop" }
+sql_gen = { path = "../sql_gen", features = ["serde"] }
 rusqlite.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
@@ -31,6 +32,7 @@ proptest = "1.9"
 indexmap.workspace = true
 parking_lot.workspace = true
 comfy-table = "7"
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 [lints]

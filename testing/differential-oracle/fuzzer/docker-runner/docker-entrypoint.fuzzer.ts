@@ -12,6 +12,7 @@ const TIME_LIMIT_MINUTES = Number.isInteger(Number(process.env.TIME_LIMIT_MINUTE
 const PER_RUN_TIMEOUT_SECONDS = Number.isInteger(Number(process.env.PER_RUN_TIMEOUT_SECONDS)) ? Number(process.env.PER_RUN_TIMEOUT_SECONDS) : 20 * 60;
 const LOG_TO_STDOUT = process.env.LOG_TO_STDOUT === "true";
 const NUM_STATEMENTS = Number.isInteger(Number(process.env.NUM_STATEMENTS)) ? Number(process.env.NUM_STATEMENTS) : 1000;
+const ENABLE_MVCC = process.env.ENABLE_MVCC === "true";
 
 const github = new GithubClient();
 const slack = new SlackClient();
@@ -27,6 +28,7 @@ console.log(`Log simulator output to stdout: ${LOG_TO_STDOUT}`);
 console.log(`Sleep between runs: ${SLEEP_BETWEEN_RUNS_SECONDS} seconds`);
 console.log(`Per run timeout: ${PER_RUN_TIMEOUT_SECONDS} seconds`);
 console.log(`Num statements per run: ${NUM_STATEMENTS}`);
+console.log(`MVCC enabled: ${ENABLE_MVCC}`);
 
 process.on("SIGINT", () => {
   console.log("Received SIGINT, exiting...");
@@ -172,7 +174,8 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
   const args = [
     '-n', String(NUM_STATEMENTS),
     '--verbose',
-    '--seed', seed
+    '--seed', seed,
+    ...(ENABLE_MVCC ? ['--mvcc'] : []),
   ];
 
   console.log(`[${timestamp}]: Running "fuzzer ${args.join(" ")}" - (seed ${seed}, run number ${runNumber})`);
