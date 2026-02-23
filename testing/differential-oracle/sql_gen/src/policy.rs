@@ -1492,6 +1492,9 @@ pub struct CreateTableConfig {
     /// Probability of CHECK constraint on a column.
     pub check_constraint_probability: f64,
 
+    /// Probability of generating a STRICT table.
+    pub strict_probability: f64,
+
     // Stubs (not yet implemented, probability 0.0)
     /// Probability of FOREIGN KEY.
     pub foreign_key_probability: f64,
@@ -1516,6 +1519,7 @@ impl Default for CreateTableConfig {
             default_probability: 0.2,
             if_not_exists_probability: 0.5,
             check_constraint_probability: 0.15,
+            strict_probability: 0.2,
             // Stubs
             foreign_key_probability: 0.0,
             autoincrement_probability: 0.0,

@@ -128,8 +128,8 @@ impl ColumnProfile {
         }
     }
 
-    /// Builder method to create a profile with strict constraints (many NOT NULL and UNIQUE).
-    pub fn strict(self) -> Self {
+    /// Builder method to create a profile with high constraints (many NOT NULL and UNIQUE).
+    pub fn high_constraints(self) -> Self {
         Self {
             not_null_probability: 70,
             unique_probability: 30,
@@ -282,6 +282,8 @@ pub struct CreateTableProfile {
     pub column_count_range: RangeInclusive<usize>,
     /// Probability (0-100) of generating IF NOT EXISTS clause.
     pub if_not_exists_probability: u8,
+    /// Probability (0-100) of generating a STRICT table.
+    pub strict_probability: u8,
     /// Profile for primary key generation.
     pub primary_key: PrimaryKeyProfile,
     /// Profile for non-PK column generation.
@@ -294,6 +296,7 @@ impl Default for CreateTableProfile {
             identifier_pattern: "[a-z][a-z0-9_]{0,30}".to_string(),
             column_count_range: 0..=10,
             if_not_exists_probability: 50,
+            strict_probability: 20,
             primary_key: PrimaryKeyProfile::default(),
             column: ColumnProfile::default(),
         }
@@ -307,6 +310,7 @@ impl CreateTableProfile {
             identifier_pattern: "[a-z][a-z0-9_]{0,15}".to_string(),
             column_count_range: 1..=3,
             if_not_exists_probability: 50,
+            strict_probability: self.strict_probability,
             primary_key: self.primary_key.integer_only(),
             column: self.column.minimal(),
         }
@@ -318,17 +322,19 @@ impl CreateTableProfile {
             identifier_pattern: "[a-z][a-z0-9_]{0,30}".to_string(),
             column_count_range: 5..=20,
             if_not_exists_probability: 30,
+            strict_probability: self.strict_probability,
             primary_key: self.primary_key,
-            column: self.column.strict(),
+            column: self.column.high_constraints(),
         }
     }
 
     /// Builder method to create a profile for strict schema with many constraints.
-    pub fn strict(self) -> Self {
+    pub fn high_constraints(self) -> Self {
         Self {
             identifier_pattern: "[a-z][a-z0-9_]{0,30}".to_string(),
             column_count_range: 2..=8,
             if_not_exists_probability: 20,
+            strict_probability: self.strict_probability,
             primary_key: self.primary_key.integer_only(),
             column: self.column.full_constraints(),
         }
@@ -340,6 +346,7 @@ impl CreateTableProfile {
             identifier_pattern: "[a-z][a-z0-9_]{0,30}".to_string(),
             column_count_range: 1..=10,
             if_not_exists_probability: 50,
+            strict_probability: self.strict_probability,
             primary_key: self.primary_key.none(),
             column: self.column,
         }
@@ -382,6 +389,7 @@ pub struct CreateTableStatement {
     pub table_name: String,
     pub columns: Vec<ColumnDef>,
     pub if_not_exists: bool,
+    pub strict: bool,
 }
 
 impl fmt::Display for CreateTableStatement {
@@ -395,7 +403,13 @@ impl fmt::Display for CreateTableStatement {
         write!(f, "{} (", self.table_name)?;
 
         let col_defs: Vec<String> = self.columns.iter().map(|c| c.to_string()).collect();
-        write!(f, "{})", col_defs.join(", "))
+        write!(f, "{})", col_defs.join(", "))?;
+
+        if self.strict {
+            write!(f, " STRICT")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -658,17 +672,21 @@ pub fn create_table(
     let column_profile = create_table_profile.column.clone();
     let pk_profile = create_table_profile.primary_key.clone();
     let if_not_exists_prob = create_table_profile.if_not_exists_probability;
+    let strict_prob = create_table_profile.strict_probability;
 
     (
         identifier_excluding(existing_names),
         if_not_exists_with_probability(if_not_exists_prob),
+        (0u8..100),
         optional_primary_key(&pk_profile),
         proptest::collection::vec(column_def_with_profile(&column_profile), column_count_range),
         // 50% chance of targeting an attached database when available
         any::<proptest::sample::Index>(),
     )
         .prop_map(
-            move |(table_name, if_not_exists, pk_col, other_cols, db_idx)| {
+            move |(table_name, if_not_exists, strict_roll, pk_col, other_cols, db_idx)| {
+                let strict = strict_roll < strict_prob;
+
                 let mut columns = Vec::with_capacity(other_cols.len() + 1);
                 if let Some(pk) = pk_col {
                     columns.push(pk);
@@ -686,6 +704,16 @@ pub fn create_table(
                         default: None,
                         check_constraint: None,
                     });
+                }
+
+                // For strict tables, convert any Null types to Integer (STRICT doesn't allow
+                // untyped columns).
+                if strict {
+                    for col in &mut columns {
+                        if col.data_type == DataType::Null {
+                            col.data_type = DataType::Integer;
+                        }
+                    }
                 }
 
                 // Optionally qualify the table name with an attached database.
@@ -708,6 +736,7 @@ pub fn create_table(
                     table_name: qualified_name,
                     columns,
                     if_not_exists,
+                    strict,
                 }
             },
         )
@@ -759,6 +788,7 @@ mod tests {
                 },
             ],
             if_not_exists: false,
+            strict: false,
         };
 
         assert_eq!(
@@ -781,6 +811,7 @@ mod tests {
                 check_constraint: None,
             }],
             if_not_exists: true,
+            strict: false,
         };
 
         assert_eq!(
@@ -857,8 +888,8 @@ mod tests {
     }
 
     #[test]
-    fn test_create_table_profile_strict() {
-        let profile = CreateTableProfile::default().strict();
+    fn test_create_table_profile_high_constraints() {
+        let profile = CreateTableProfile::default().high_constraints();
         assert_eq!(profile.column.not_null_probability, 100);
         assert_eq!(profile.column.unique_probability, 50);
     }
@@ -895,7 +926,7 @@ mod tests {
             stmt in create_table(
                 &empty_schema(),
                 &StatementProfile::default()
-                    .with_create_table_profile(WeightedProfile::with_extra(1, CreateTableProfile::default().strict()))
+                    .with_create_table_profile(WeightedProfile::with_extra(1, CreateTableProfile::default().high_constraints()))
             )
         ) {
             let sql = stmt.to_string();

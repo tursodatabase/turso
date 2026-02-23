@@ -178,7 +178,12 @@ fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
                 col
             })
             .collect();
-        builder = builder.add_table(sql_gen_prop::Table::new(table.name.clone(), columns));
+        let prop_table = if table.strict {
+            sql_gen_prop::Table::new_strict(table.name.clone(), columns)
+        } else {
+            sql_gen_prop::Table::new(table.name.clone(), columns)
+        };
+        builder = builder.add_table(prop_table);
     }
     for index in &schema.indexes {
         let mut idx = sql_gen_prop::Index::new(
