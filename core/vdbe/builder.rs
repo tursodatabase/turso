@@ -13,6 +13,7 @@ use crate::{
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
+    vdbe::affinity::Affinity,
     Arc, CaptureDataChangesInfo, Connection, Value, VirtualTable,
 };
 
@@ -1481,7 +1482,7 @@ impl ProgramBuilder {
                 break 'value None;
             };
 
-            Some(match literal {
+            let mut value = match literal {
                 ast::Literal::Numeric(s) => Value::Numeric(Numeric::from(s)),
                 ast::Literal::Null => Value::Null,
                 ast::Literal::String(s) => Value::Text(sanitize_string(s).into()),
@@ -1499,7 +1500,25 @@ impl ProgramBuilder {
                         .collect(),
                 ),
                 _ => break 'value None,
-            })
+            };
+
+            // Apply column affinity to the default value, matching SQLite's
+            // sqlite3ColumnDefault which calls sqlite3ValueFromExpr with
+            // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
+            // DEFAULT 0 returns text "0" rather than integer 0 for pre-existing rows.
+            let affinity = match cursor_type {
+                CursorType::BTreeTable(btree) => btree.columns[column].affinity(),
+                CursorType::MaterializedView(btree, _) => btree.columns[column].affinity(),
+                _ => Affinity::Blob,
+            };
+            if let Some(converted) = affinity.convert(&value) {
+                value = match converted {
+                    either::Either::Left(val_ref) => val_ref.to_owned(),
+                    either::Either::Right(val) => val,
+                };
+            }
+
+            Some(value)
         };
 
         self.emit_insn(Insn::Column {
