@@ -46,8 +46,8 @@ addr  opcode         p1  p2  p3  p4      p5  comment
   16    Column        3   0   5           0  r[5]=idx_former_dept.department
   17    IdxDelete     0   5   1           0
   18  Next            3  16   0           0
-  19  Rewind          0  22   0           0  Rewind  compound_dedupe
-  20    Column        0   0   6           0  r[6]=compound_dedupe.department
+  19  Rewind          0  22   0           0  Rewind  ephemeral(compound_dedupe)
+  20    Column        0   0   6           0  r[6]=ephemeral(compound_dedupe).department
   21    ResultRow     6   1   0           0  output=r[6]
   22  Next            0  20   0           0
   23  Close           0   0   0           0

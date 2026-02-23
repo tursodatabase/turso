@@ -1,0 +1,57 @@
+---
+source: returning.sqltest
+expression: UPDATE t1 SET value = value + 1 WHERE name = 'alice' RETURNING *;
+info:
+  statement_type: UPDATE
+  tables:
+  - t1
+  setup_blocks:
+  - schema
+  - data
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode          p1  p2  p3  p4     p5  comment
+   0  Init             0  37   0          0  Start at 37
+   1  OpenEphemeral    0   1   0          0  cursor=0 is_table=true
+   2  OpenWrite        1   2   0          0  root=2; iDb=0
+   3  OpenWrite        2   3   0          0  root=3; iDb=0
+   4  String8          0   1   0  alice   0  r[1]='alice'
+   5  SeekGE           2  30   1          0  key=[1..1]
+   6    IdxGT          2  30   1          0  key=[1..1]
+   7    DeferredSeek   2   1   0          0
+   8    RowId          1   2   0          0  r[2]=t1.rowid
+   9    IsNull         2  30   0          0  if (r[2]==NULL) goto 30
+  10    Null           0   3   0          0  r[3]=NULL
+  11    Column         2   0   4          0  r[4]=idx_t1_name.name
+  12    Column         1   2   6          0  r[6]=t1.value
+  13    RealAffinity   6   0   0          0
+  14    Add            6   7   5          0  r[5]=r[6]+r[7]
+  15    Affinity       3   3   0          0  r[3..6] = D, B, E
+  16    RowId          1   8   0          0  r[8]=t1.rowid
+  17    Column         1   1   9          0  r[9]=t1.name
+  18    Column         1   2  10          0  r[10]=t1.value
+  19    Null           0   3   0          0  r[3]=NULL
+  20    Column         2   0   4          0  r[4]=idx_t1_name.name
+  21    MakeRecord     3   3  11          0  r[11]=mkrec(r[3..5])
+  22    Insert         1  11   2  t1      8  intkey=r[2] data=r[11]
+  23    Copy           2  12   0          0  r[12]=r[2]
+  24    Copy           4  13   0          0  r[13]=r[4]
+  25    Copy           5  14   0          0  r[14]=r[5]
+  26    MakeRecord    12   3  15          0  r[15]=mkrec(r[12..14])
+  27    NewRowid       0  16   0          0  r[16]=rowid
+  28    Insert         0  15  16          4  intkey=r[16] data=r[15]
+  29  Next             2   6   0          0
+  30  Rewind           0  36   0          0  Rewind  ephemeral(t1)
+  31    Column         0   0  17          0  r[17]=ephemeral(t1).id
+  32    Column         0   1  18          0  r[18]=ephemeral(t1).name
+  33    Column         0   2  19          0  r[19]=ephemeral(t1).value
+  34    ResultRow     17   3   0          0  output=r[17..19]
+  35  Next             0  31   0          0
+  36  Halt             0   0   0          0
+  37  Transaction      0   2   2          0  iDb=0 tx_mode=Write
+  38  Integer          1   7   0          0  r[7]=1
+  39  Goto             0   1   0          0

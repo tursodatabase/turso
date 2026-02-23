@@ -397,7 +397,7 @@ pub unsafe extern "C" fn db_statement_execute_step(
 #[no_mangle]
 pub unsafe extern "C" fn free_statement(statement_ptr: *mut Statement) {
     let mut statement = unsafe { Box::from_raw(statement_ptr) };
-    statement.reset();
+    statement.reset_best_effort();
 }
 
 /// Gets the current value from the row at the specified column index.

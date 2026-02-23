@@ -31,3 +31,23 @@ expect {
     6
     6
 }
+
+test last-insert-rowid-after-insert-returning {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+
+    INSERT INTO t1 VALUES(10, 'a');
+    SELECT last_insert_rowid();
+
+    INSERT INTO t1 VALUES(20, 'b') RETURNING last_insert_rowid();
+    SELECT last_insert_rowid();
+
+    INSERT INTO t1 VALUES(50, 'c') RETURNING *;
+    SELECT last_insert_rowid();
+}
+expect {
+    10
+    20
+    20
+    50|c
+    50
+}

@@ -196,7 +196,7 @@ fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
         }
     }
 
-    stmt.reset();
+    stmt.reset()?;
 
     loop {
         match stmt.step()? {

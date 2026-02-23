@@ -44,8 +44,8 @@ addr  opcode          p1  p2  p3  p4            p5  comment
   20    Affinity       9   1   0                 0  r[9..10] = C
   21    NotFound       0  23   9                 0  if not found goto 23
   22    Goto           0  29   0                 0
-  23    Rewind         0  31   0                 0  Rewind  ephemeral_index_where_sub_t2
-  24      Column       0   0  10                 0  r[10]=ephemeral_index_where_sub_t2.id
+  23    Rewind         0  31   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
+  24      Column       0   0  10                 0  r[10]=ephemeral(ephemeral_index_where_sub_t2).id
   25      Ne           9  10  27  Binary         0  if r[9]!=r[10] goto 27
   26      Goto         0  33   0                 0
   27    Next           0  24   0                 0

@@ -419,7 +419,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
                             }
                         }
                     }
-                    stmt.reset();
+                    stmt.reset().unwrap();
                 });
             },
         );
@@ -480,7 +480,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
                     }
                 }
             }
-            stmt.reset();
+            stmt.reset().unwrap();
         });
     });
 
@@ -532,7 +532,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
                     }
                 }
             }
-            stmt.reset();
+            stmt.reset().unwrap();
         });
     });
 
@@ -617,7 +617,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
                         }
                     }
                 }
-                stmt.reset();
+                stmt.reset().unwrap();
             });
         });
 
@@ -745,7 +745,7 @@ fn bench_limbo(
                     if mvcc {
                         unreachable!();
                     }
-                    stmt.reset();
+                    stmt.reset().unwrap();
                 }
                 _ => {
                     unreachable!()
@@ -839,7 +839,7 @@ fn bench_limbo_mvcc(
                         unreachable!();
                     }
                     println!("resetting statement");
-                    stmt.reset();
+                    stmt.reset().unwrap();
                 }
                 Err(err) => {
                     if let LimboError::SchemaUpdated = err {
@@ -1008,7 +1008,7 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
                         }
                     }
                 }
-                stmt.reset();
+                stmt.reset().unwrap();
             });
         });
 

@@ -8,6 +8,7 @@ mod integrity_check;
 mod mvcc;
 mod pragma;
 mod query_processing;
+mod statement_reset;
 mod storage;
 mod trigger;
 mod wal;

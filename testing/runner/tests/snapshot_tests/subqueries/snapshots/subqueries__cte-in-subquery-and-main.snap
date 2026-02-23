@@ -78,9 +78,9 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   44    Null                     0  22   0                   0  r[22]=NULL
   45    Integer                  1  23   0                   0  r[23]=1; LIMIT counter
   46    IfNot                   23  53   0                   0  if !r[23] goto 53
-  47    Rewind                   3  53   0                   0  Rewind
-  48      Column                 3   0  19                   0  r[19]=.column 0
-  49      Column                 3   1  20                   0  r[20]=.column 1
+  47    Rewind                   3  53   0                   0  Rewind  ephemeral()
+  48      Column                 3   0  19                   0  r[19]=ephemeral().column 0
+  49      Column                 3   1  20                   0  r[20]=ephemeral().column 1
   50      Copy                  20  24   0                   0  r[24]=r[20]
   51      AggStep                0  24  22  max              0  accum=r[22] step(r[24])
   52    Next                     3  48   0                   0
@@ -90,12 +90,12 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   56  Return                     2   0   1                   0
   57  OpenDup                    4   0   0                   0  new_cursor=4, original_cursor=0
   58  OpenEphemeral              5   0   0                   0  cursor=5 is_table=false
-  59  Rewind                     4  68   0                   0  Rewind
-  60    Column                   4   0  26                   0  r[26]=.column 0
-  61    Column                   4   1  27                   0  r[27]=.column 1
+  59  Rewind                     4  68   0                   0  Rewind  ephemeral()
+  60    Column                   4   0  26                   0  r[26]=ephemeral().column 0
+  61    Column                   4   1  27                   0  r[27]=ephemeral().column 1
   62    Copy                    26  28   0                   0  r[28]=r[26]
   63    Copy                    27  29   0                   0  r[29]=r[27]
-  64    RowId                    4  30   0                   0  r[30]=.rowid
+  64    RowId                    4  30   0                   0  r[30]=ephemeral().rowid
   65    MakeRecord              28   3  25                   0  r[25]=mkrec(r[28..30]); for ephemeral_subquery_t5
   66    IdxInsert                5  25  28                   0  key=r[25]
   67  Next                       4  60   0                   0
@@ -111,12 +111,12 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   77    Affinity                41   1   0                   0  r[41..42] = D
   78    SeekGE                   5  88  41                   0  key=[41..41]
   79      IdxGT                  5  88  41                   0  key=[41..41]
-  80      Column                 5   0  31                   0  r[31]=ephemeral_subquery_t5.category_id
-  81      Column                 5   1  32                   0  r[32]=ephemeral_subquery_t5.avg_price
+  80      Column                 5   0  31                   0  r[31]=ephemeral(ephemeral_subquery_t5).category_id
+  81      Column                 5   1  32                   0  r[32]=ephemeral(ephemeral_subquery_t5).avg_price
   82      Column                 6   1  33                   0  r[33]=products.name
   83      Column                 6   3  34                   0  r[34]=products.price
   84      RealAffinity          34   0   0                   0
-  85      Column                 5   1  35                   0  r[35]=ephemeral_subquery_t5.avg_price
+  85      Column                 5   1  35                   0  r[35]=ephemeral(ephemeral_subquery_t5).avg_price
   86      ResultRow             33   3   0                   0  output=r[33..35]
   87    Next                     5  79   0                   0
   88  Next                       6  70   0                   0

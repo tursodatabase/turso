@@ -221,3 +221,37 @@ expect {
     1
 }
 
+test changes-with-returning {
+    create table t1(a integer primary key, b text);
+
+    insert into t1 values(1, 'a');
+    select changes();
+
+    insert into t1 values(10, 'r') returning *;
+    select changes();
+
+    insert into t1 values(11, 's'), (12, 't') returning *;
+    select changes();
+
+    update t1 set b = 'y' where a >= 10 returning *;
+    select changes();
+
+    delete from t1 where a >= 10 returning *;
+    select changes();
+}
+expect {
+    1
+    10|r
+    1
+    11|s
+    12|t
+    2
+    10|y
+    11|y
+    12|y
+    3
+    10|y
+    11|y
+    12|y
+    3
+}

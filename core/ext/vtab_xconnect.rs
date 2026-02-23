@@ -268,5 +268,5 @@ pub unsafe extern "C" fn stmt_close(stmt: *mut Stmt) {
     }
     // free the managed internal context
     let mut internal = Box::<Statement>::from_raw(wrapper._ctx.cast());
-    internal.reset();
+    internal.reset_best_effort();
 }

@@ -472,7 +472,7 @@ impl DatabaseChangesIterator {
         let query_stmt = self.query_stmt.as_mut().unwrap();
 
         let change_id_filter = self.first_change_id.unwrap_or(self.mode.first_id());
-        query_stmt.reset();
+        query_stmt.reset()?;
         query_stmt.bind_at(
             1.try_into().unwrap(),
             turso_core::Value::from_i64(change_id_filter),
@@ -532,7 +532,7 @@ async fn replay_stmt<Ctx>(
     stmt: &mut turso_core::Statement,
     values: Vec<turso_core::Value>,
 ) -> Result<()> {
-    stmt.reset();
+    stmt.reset()?;
     for (i, value) in values.into_iter().enumerate() {
         stmt.bind_at((i + 1).try_into().unwrap(), value);
     }
@@ -583,7 +583,7 @@ impl DatabaseReplaySession {
                                 key
                             );
                             let cached = self.cached_delete_stmt.get_mut(key).unwrap();
-                            cached.stmt.reset();
+                            cached.stmt.reset()?;
                             let values = self.generator.replay_values(
                                 &cached.info,
                                 change_type,
@@ -600,7 +600,7 @@ impl DatabaseReplaySession {
                                 key
                             );
                             let cached = self.cached_insert_stmt.get_mut(&key).unwrap();
-                            cached.stmt.reset();
+                            cached.stmt.reset()?;
                             let values = self.generator.replay_values(
                                 &cached.info,
                                 change_type,
@@ -630,7 +630,7 @@ impl DatabaseReplaySession {
                                 key
                             );
                             let cached = self.cached_update_stmt.get_mut(&key).unwrap();
-                            cached.stmt.reset();
+                            cached.stmt.reset()?;
                             let values = self.generator.replay_values(
                                 &cached.info,
                                 change_type,
@@ -651,7 +651,7 @@ impl DatabaseReplaySession {
                                 key
                             );
                             let cached = self.cached_delete_stmt.get_mut(key).unwrap();
-                            cached.stmt.reset();
+                            cached.stmt.reset()?;
                             let values = self.generator.replay_values(
                                 &cached.info,
                                 DatabaseChangeType::Delete,
@@ -667,7 +667,7 @@ impl DatabaseReplaySession {
                                 key
                             );
                             let cached = self.cached_insert_stmt.get_mut(&key).unwrap();
-                            cached.stmt.reset();
+                            cached.stmt.reset()?;
                             let values = self.generator.replay_values(
                                 &cached.info,
                                 DatabaseChangeType::Insert,

@@ -1,13 +1,24 @@
 ---
 source: windows.sqltest
-expression: "SELECT\n        emp_id,\n        name,\n        department,\n        salary,\n        COUNT(*) OVER () AS total_employees,\n        COUNT(*) OVER (PARTITION BY department) AS dept_employees,\n        MIN(salary) OVER (PARTITION BY department) AS dept_min_salary,\n        MAX(salary) OVER (PARTITION BY department) AS dept_max_salary,\n        AVG(salary) OVER (PARTITION BY department) AS dept_avg_salary\n    FROM employees;"
+expression: |-
+  SELECT
+          emp_id,
+          name,
+          department,
+          salary,
+          COUNT(*) OVER () AS total_employees,
+          COUNT(*) OVER (PARTITION BY department) AS dept_employees,
+          MIN(salary) OVER (PARTITION BY department) AS dept_min_salary,
+          MAX(salary) OVER (PARTITION BY department) AS dept_max_salary,
+          AVG(salary) OVER (PARTITION BY department) AS dept_avg_salary
+      FROM employees;
 info:
   statement_type: SELECT
   tables:
-    - employees
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN window_subquery_0
@@ -55,15 +66,15 @@ addr  opcode              p1  p2  p3  p4                     p5  comment
   36        AggStep        0  34  18  avg                     0  accum=r[18] step(r[34])
   37      Goto             0  19   0                          0
   38      Null             0  29   0                          0  r[29]=NULL; return remaining buffered rows
-  39      Rewind           2  58   0                          0  Rewind  buffer_table_window_1
+  39      Rewind           2  58   0                          0  Rewind  ephemeral(buffer_table_window_1)
   40      AggValue         0  15  19  count                   0  accum=r[15] dest=r[19]
   41      AggValue         0  16  20  min                     0  accum=r[16] dest=r[20]
   42      AggValue         0  17  21  max                     0  accum=r[17] dest=r[21]
   43      AggValue         0  18  22  avg                     0  accum=r[18] dest=r[22]
-  44        Column         2   1  23                          0  r[23]=buffer_table_window_1.emp_id
-  45        Column         2   2  24                          0  r[24]=buffer_table_window_1.name
-  46        Column         2   0  25                          0  r[25]=buffer_table_window_1.department
-  47        Column         2   3  26                          0  r[26]=buffer_table_window_1.salary
+  44        Column         2   1  23                          0  r[23]=ephemeral(buffer_table_window_1).emp_id
+  45        Column         2   2  24                          0  r[24]=ephemeral(buffer_table_window_1).name
+  46        Column         2   0  25                          0  r[25]=ephemeral(buffer_table_window_1).department
+  47        Column         2   3  26                          0  r[26]=ephemeral(buffer_table_window_1).salary
   48        Copy          23   7   0                          0  r[7]=r[23]
   49        Copy          24   8   0                          0  r[8]=r[24]
   50        Copy          25   9   0                          0  r[9]=r[25]
@@ -90,16 +101,16 @@ addr  opcode              p1  p2  p3  p4                     p5  comment
   71      AggStep          0  57  44  count                   0  accum=r[44] step(r[57])
   72    Goto               0  65   0                          0
   73    Null               0  55   0                          0  r[55]=NULL; return remaining buffered rows
-  74    Rewind             4  95   0                          0  Rewind  buffer_table_window_0
+  74    Rewind             4  95   0                          0  Rewind  ephemeral(buffer_table_window_0)
   75    AggValue           0  44  45  count                   0  accum=r[44] dest=r[45]
-  76      Column           4   0  46                          0  r[46]=buffer_table_window_0.emp_id
-  77      Column           4   1  47                          0  r[47]=buffer_table_window_0.name
-  78      Column           4   2  48                          0  r[48]=buffer_table_window_0.department
-  79      Column           4   3  49                          0  r[49]=buffer_table_window_0.salary
-  80      Column           4   4  50                          0  r[50]=buffer_table_window_0.column 4
-  81      Column           4   5  51                          0  r[51]=buffer_table_window_0.column 5
-  82      Column           4   6  52                          0  r[52]=buffer_table_window_0.column 6
-  83      Column           4   7  53                          0  r[53]=buffer_table_window_0.column 7
+  76      Column           4   0  46                          0  r[46]=ephemeral(buffer_table_window_0).emp_id
+  77      Column           4   1  47                          0  r[47]=ephemeral(buffer_table_window_0).name
+  78      Column           4   2  48                          0  r[48]=ephemeral(buffer_table_window_0).department
+  79      Column           4   3  49                          0  r[49]=ephemeral(buffer_table_window_0).salary
+  80      Column           4   4  50                          0  r[50]=ephemeral(buffer_table_window_0).column 4
+  81      Column           4   5  51                          0  r[51]=ephemeral(buffer_table_window_0).column 5
+  82      Column           4   6  52                          0  r[52]=ephemeral(buffer_table_window_0).column 6
+  83      Column           4   7  53                          0  r[53]=ephemeral(buffer_table_window_0).column 7
   84      Copy            46  35   0                          0  r[35]=r[46]
   85      Copy            47  36   0                          0  r[36]=r[47]
   86      Copy            48  37   0                          0  r[37]=r[48]

@@ -78,14 +78,14 @@ addr  opcode                   p1  p2  p3  p4            p5  comment
   46    RowId                   3  27   0                 0  r[27]=customers.rowid
   47    SeekGE                  0  59  27                 0  key=[27..27]
   48      IdxGT                 0  59  27                 0  key=[27..27]
-  49      Column                0   0   1                 0  r[1]=ephemeral_subquery_t3.customer_id
-  50      Column                0   1   2                 0  r[2]=ephemeral_subquery_t3.total_orders
-  51      Column                0   2   3                 0  r[3]=ephemeral_subquery_t3.total_spent
-  52      Column                0   2  29                 0  r[29]=ephemeral_subquery_t3.total_spent
+  49      Column                0   0   1                 0  r[1]=ephemeral(ephemeral_subquery_t3).customer_id
+  50      Column                0   1   2                 0  r[2]=ephemeral(ephemeral_subquery_t3).total_orders
+  51      Column                0   2   3                 0  r[3]=ephemeral(ephemeral_subquery_t3).total_spent
+  52      Column                0   2  29                 0  r[29]=ephemeral(ephemeral_subquery_t3).total_spent
   53      Le                   29  30  58  Binary         0  if r[29]<=r[30] goto 58
   54      Column                3   1  24                 0  r[24]=customers.name
-  55      Column                0   1  25                 0  r[25]=ephemeral_subquery_t3.total_orders
-  56      Column                0   2  26                 0  r[26]=ephemeral_subquery_t3.total_spent
+  55      Column                0   1  25                 0  r[25]=ephemeral(ephemeral_subquery_t3).total_orders
+  56      Column                0   2  26                 0  r[26]=ephemeral(ephemeral_subquery_t3).total_spent
   57      ResultRow            24   3   0                 0  output=r[24..26]
   58    Next                    0  48   0                 0
   59  Next                      3  46   0                 0

@@ -592,7 +592,10 @@ impl Statement {
     }
     #[napi]
     pub fn reset(&self) -> Result<()> {
-        self.stmt()?.borrow_mut().reset();
+        self.stmt()?
+            .borrow_mut()
+            .reset()
+            .map_err(|e| to_generic_error("reset failed", e))?;
         Ok(())
     }
 

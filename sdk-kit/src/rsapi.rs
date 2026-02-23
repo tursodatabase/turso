@@ -1075,7 +1075,7 @@ impl TursoStatement {
     }
     /// reset internal statement state and bindings
     pub fn reset(&mut self) -> Result<(), TursoError> {
-        self.statement.reset();
+        self.statement.reset()?;
         self.statement.clear_bindings();
         Ok(())
     }

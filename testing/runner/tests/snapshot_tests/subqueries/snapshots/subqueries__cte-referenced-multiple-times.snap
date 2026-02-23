@@ -82,9 +82,9 @@ addr  opcode                      p1   p2  p3  p4            p5  comment
   44      Null                     0   23   0                 0  r[23]=NULL
   45      Integer                  1   24   0                 0  r[24]=1; LIMIT counter
   46      IfNot                   24   53   0                 0  if !r[24] goto 53
-  47      Rewind                   3   53   0                 0  Rewind
-  48        Column                 3    0  20                 0  r[20]=.column 0
-  49        Column                 3    1  21                 0  r[21]=.column 1
+  47      Rewind                   3   53   0                 0  Rewind  ephemeral()
+  48        Column                 3    0  20                 0  r[20]=ephemeral().column 0
+  49        Column                 3    1  21                 0  r[21]=ephemeral().column 1
   50        Copy                  21   25   0                 0  r[25]=r[21]
   51        AggStep                0   25  23  avg            0  accum=r[23] step(r[25])
   52      Next                     3   48   0                 0
@@ -99,9 +99,9 @@ addr  opcode                      p1   p2  p3  p4            p5  comment
   61    Null                       0   30   0                 0  r[30]=NULL
   62    Integer                    1   31   0                 0  r[31]=1; LIMIT counter
   63    IfNot                     31   70   0                 0  if !r[31] goto 70
-  64    Rewind                     4   70   0                 0  Rewind
-  65      Column                   4    0  27                 0  r[27]=.column 0
-  66      Column                   4    1  28                 0  r[28]=.column 1
+  64    Rewind                     4   70   0                 0  Rewind  ephemeral()
+  65      Column                   4    0  27                 0  r[27]=ephemeral().column 0
+  66      Column                   4    1  28                 0  r[28]=ephemeral().column 1
   67      Copy                    28   32   0                 0  r[32]=r[28]
   68      AggStep                  0   32  30  avg            0  accum=r[30] step(r[32])
   69    Next                       4   65   0                 0
@@ -111,12 +111,12 @@ addr  opcode                      p1   p2  p3  p4            p5  comment
   73  Return                      26    0   1                 0
   74  OpenDup                      5    0   0                 0  new_cursor=5, original_cursor=0
   75  OpenEphemeral                6    0   0                 0  cursor=6 is_table=false
-  76  Rewind                       5   85   0                 0  Rewind
-  77    Column                     5    0  34                 0  r[34]=.column 0
-  78    Column                     5    1  35                 0  r[35]=.column 1
+  76  Rewind                       5   85   0                 0  Rewind  ephemeral()
+  77    Column                     5    0  34                 0  r[34]=ephemeral().column 0
+  78    Column                     5    1  35                 0  r[35]=ephemeral().column 1
   79    Copy                      34   36   0                 0  r[36]=r[34]
   80    Copy                      35   37   0                 0  r[37]=r[35]
-  81    RowId                      5   38   0                 0  r[38]=.rowid
+  81    RowId                      5   38   0                 0  r[38]=ephemeral().rowid
   82    MakeRecord                36    3  33                 0  r[33]=mkrec(r[36..38]); for ephemeral_subquery_t5
   83    IdxInsert                  6   33  36                 0  key=r[33]
   84  Next                         5   77   0                 0
@@ -125,13 +125,13 @@ addr  opcode                      p1   p2  p3  p4            p5  comment
   87    RowId                      7   44   0                 0  r[44]=customers.rowid
   88    SeekGE                     6  100  44                 0  key=[44..44]
   89      IdxGT                    6  100  44                 0  key=[44..44]
-  90      Column                   6    0  39                 0  r[39]=ephemeral_subquery_t5.customer_id
-  91      Column                   6    1  40                 0  r[40]=ephemeral_subquery_t5.total
-  92      Column                   6    1  46                 0  r[46]=ephemeral_subquery_t5.total
+  90      Column                   6    0  39                 0  r[39]=ephemeral(ephemeral_subquery_t5).customer_id
+  91      Column                   6    1  40                 0  r[40]=ephemeral(ephemeral_subquery_t5).total
+  92      Column                   6    1  46                 0  r[46]=ephemeral(ephemeral_subquery_t5).total
   93      Copy                     1   47   0                 0  r[47]=r[1]
   94      Le                      46   47  99  Binary         0  if r[46]<=r[47] goto 99
   95      Column                   7    1  41                 0  r[41]=customers.name
-  96      Column                   6    1  42                 0  r[42]=ephemeral_subquery_t5.total
+  96      Column                   6    1  42                 0  r[42]=ephemeral(ephemeral_subquery_t5).total
   97      Copy                     2   43   0                 0  r[43]=r[2]
   98      ResultRow               41    3   0                 0  output=r[41..43]
   99    Next                       6   89   0                 0

@@ -73,8 +73,8 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   45    Affinity                19   1   0                 0  r[19..20] = C
   46    NotFound                 0  48  19                 0  if not found goto 48
   47    Goto                     0  54   0                 0
-  48    Rewind                   0  56   0                 0  Rewind  ephemeral_index_where_sub_t2
-  49      Column                 0   0  20                 0  r[20]=ephemeral_index_where_sub_t2.customer_id
+  48    Rewind                   0  56   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
+  49      Column                 0   0  20                 0  r[20]=ephemeral(ephemeral_index_where_sub_t2).customer_id
   50      Ne                    19  20  52  Binary         0  if r[19]!=r[20] goto 52
   51      Goto                   0  58   0                 0
   52    Next                     0  49   0                 0

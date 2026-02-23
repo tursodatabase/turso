@@ -1,13 +1,21 @@
 ---
 source: windows.sqltest
-expression: "SELECT\n        emp_id,\n        name,\n        department,\n        salary,\n        CAST(salary AS REAL) * 100.0 / SUM(salary) OVER () AS pct_of_total,\n        CAST(salary AS REAL) * 100.0 / SUM(salary) OVER (PARTITION BY department) AS pct_of_dept\n    FROM employees;"
+expression: |-
+  SELECT
+          emp_id,
+          name,
+          department,
+          salary,
+          CAST(salary AS REAL) * 100.0 / SUM(salary) OVER () AS pct_of_total,
+          CAST(salary AS REAL) * 100.0 / SUM(salary) OVER (PARTITION BY department) AS pct_of_dept
+      FROM employees;
 info:
   statement_type: SELECT
   tables:
-    - employees
+  - employees
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN window_subquery_0
@@ -50,12 +58,12 @@ addr  opcode              p1  p2  p3  p4                     p5  comment
   31        AggStep        0  22  12  sum                     0  accum=r[12] step(r[22])
   32      Goto             0  19   0                          0
   33      Null             0  20   0                          0  r[20]=NULL; return remaining buffered rows
-  34      Rewind           2  47   0                          0  Rewind  buffer_table_window_1
+  34      Rewind           2  47   0                          0  Rewind  ephemeral(buffer_table_window_1)
   35      AggValue         0  12  13  sum                     0  accum=r[12] dest=r[13]
-  36        Column         2   1  14                          0  r[14]=buffer_table_window_1.emp_id
-  37        Column         2   2  15                          0  r[15]=buffer_table_window_1.name
-  38        Column         2   0  16                          0  r[16]=buffer_table_window_1.department
-  39        Column         2   3  17                          0  r[17]=buffer_table_window_1.salary
+  36        Column         2   1  14                          0  r[14]=ephemeral(buffer_table_window_1).emp_id
+  37        Column         2   2  15                          0  r[15]=ephemeral(buffer_table_window_1).name
+  38        Column         2   0  16                          0  r[16]=ephemeral(buffer_table_window_1).department
+  39        Column         2   3  17                          0  r[17]=ephemeral(buffer_table_window_1).salary
   40        Copy          14   7   0                          0  r[7]=r[14]
   41        Copy          15   8   0                          0  r[8]=r[15]
   42        Copy          16   9   0                          0  r[9]=r[16]
@@ -80,13 +88,13 @@ addr  opcode              p1  p2  p3  p4                     p5  comment
   61      AggStep          0  39  29  sum                     0  accum=r[29] step(r[39])
   62    Goto               0  54   0                          0
   63    Null               0  37   0                          0  r[37]=NULL; return remaining buffered rows
-  64    Rewind             4  87   0                          0  Rewind  buffer_table_window_0
+  64    Rewind             4  87   0                          0  Rewind  ephemeral(buffer_table_window_0)
   65    AggValue           0  29  30  sum                     0  accum=r[29] dest=r[30]
-  66      Column           4   0  31                          0  r[31]=buffer_table_window_0.emp_id
-  67      Column           4   1  32                          0  r[32]=buffer_table_window_0.name
-  68      Column           4   2  33                          0  r[33]=buffer_table_window_0.department
-  69      Column           4   3  34                          0  r[34]=buffer_table_window_0.salary
-  70      Column           4   4  35                          0  r[35]=buffer_table_window_0.column 4
+  66      Column           4   0  31                          0  r[31]=ephemeral(buffer_table_window_0).emp_id
+  67      Column           4   1  32                          0  r[32]=ephemeral(buffer_table_window_0).name
+  68      Column           4   2  33                          0  r[33]=ephemeral(buffer_table_window_0).department
+  69      Column           4   3  34                          0  r[34]=ephemeral(buffer_table_window_0).salary
+  70      Column           4   4  35                          0  r[35]=ephemeral(buffer_table_window_0).column 4
   71      Copy            31  23   0                          0  r[23]=r[31]
   72      Copy            32  24   0                          0  r[24]=r[32]
   73      Copy            33  25   0                          0  r[25]=r[33]

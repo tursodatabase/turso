@@ -880,7 +880,12 @@ impl Whopper {
                             fiber_idx,
                             fiber.rows.len()
                         );
-                        fiber.statement.replace(None).unwrap().reset();
+                        fiber
+                            .statement
+                            .replace(None)
+                            .unwrap()
+                            .reset()
+                            .expect("statement reset should succeed before restart");
                         fiber.rows.clear();
                     }
                 }
