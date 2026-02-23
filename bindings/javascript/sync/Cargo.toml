@@ -16,7 +16,7 @@ crate-type = ["cdylib"]
 napi = { version = "3.1.3", default-features = false, features = ["napi6"] }
 napi-derive = { version = "3.1.1", default-features = true }
 turso_sync_engine = { workspace = true }
-turso_core = { workspace = true }
+turso_core = { workspace = true, features = ["fts"] }
 turso_node = { workspace = true }
 genawaiter = { version = "0.99.1", default-features = false }
 tracing-subscriber = { workspace = true }

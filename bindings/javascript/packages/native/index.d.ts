@@ -89,6 +89,8 @@ export declare class Database {
   ioLoopSync(): void
   /** Runs the I/O loop asynchronously, returning a Promise. */
   ioLoopAsync(): Promise<void>
+  /** Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback". */
+  classifySql(sql: string): string
 }
 
 /** A prepared statement. */
