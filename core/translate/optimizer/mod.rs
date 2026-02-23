@@ -797,6 +797,10 @@ fn add_ephemeral_table_to_update_plan(
         .unwrap()
         .internal_id;
 
+    let where_clause: Vec<WhereTerm> = plan.where_clause.drain(..).collect();
+    let ephemeral_subqueries =
+        drain_where_clause_subqueries(&where_clause, &mut plan.non_from_clause_subqueries);
+
     let ephemeral_plan = SelectPlan {
         table_references: table_references_ephemeral_select,
         result_columns: vec![ResultSetColumn {
@@ -807,7 +811,7 @@ fn add_ephemeral_table_to_update_plan(
             alias: None,
             contains_aggregates: false,
         }],
-        where_clause: plan.where_clause.drain(..).collect(),
+        where_clause,
         group_by: None,     // N/A
         order_by: vec![],   // N/A
         aggregates: vec![], // N/A
@@ -823,14 +827,47 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        // Move subqueries from the main plan to the ephemeral plan since the WHERE clause was moved
-        non_from_clause_subqueries: plan.non_from_clause_subqueries.drain(..).collect(),
+        non_from_clause_subqueries: ephemeral_subqueries,
         estimated_output_rows: None,
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
 
     Ok(())
+}
+
+/// Drain only the subqueries that are referenced by the WHERE clause expressions.
+/// Returns the drained subqueries. Subqueries not referenced by the WHERE clause
+/// (e.g. from SET or RETURNING clauses) remain in `all_subqueries`.
+fn drain_where_clause_subqueries(
+    where_clause: &[WhereTerm],
+    all_subqueries: &mut Vec<NonFromClauseSubquery>,
+) -> Vec<NonFromClauseSubquery> {
+    use crate::translate::expr::{walk_expr, WalkControl};
+
+    // Collect subquery IDs referenced from WHERE clause expressions.
+    let mut where_subquery_ids = HashSet::default();
+    for term in where_clause {
+        let _ = walk_expr(&term.expr, &mut |e: &Expr| -> Result<WalkControl> {
+            if let Expr::SubqueryResult { subquery_id, .. } = e {
+                where_subquery_ids.insert(*subquery_id);
+            }
+            Ok(WalkControl::Continue)
+        });
+    }
+
+    // Partition: extract WHERE-referenced subqueries, leave the rest.
+    let mut ephemeral = Vec::new();
+    let mut remaining = Vec::new();
+    for s in all_subqueries.drain(..) {
+        if where_subquery_ids.contains(&s.internal_id) {
+            ephemeral.push(s);
+        } else {
+            remaining.push(s);
+        }
+    }
+    *all_subqueries = remaining;
+    ephemeral
 }
 
 fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {

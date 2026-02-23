@@ -1,0 +1,152 @@
+@database :memory:
+@requires-file trigger "CTE update trigger tests require trigger support"
+
+setup schema {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES('fired'); END;
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+}
+
+# Exact reproducer from issue #5546: CTE in UPDATE with AFTER trigger
+# should use materialized CTE values, not re-evaluate against modified state.
+@setup schema
+test cte-update-with-after-trigger {
+    WITH c AS (SELECT id, val * 2 as doubled FROM t)
+    UPDATE t SET val = (SELECT doubled FROM c WHERE c.id = t.id) WHERE id <= 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|20
+    2|40
+    3|30
+}
+
+setup schema-all {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES('fired'); END;
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+}
+
+# Updating ALL rows with CTE + trigger
+@setup schema-all
+test cte-update-all-rows-with-trigger {
+    WITH c AS (SELECT id, val + 100 as newval FROM t)
+    UPDATE t SET val = (SELECT newval FROM c WHERE c.id = t.id);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|110
+    2|120
+    3|130
+}
+
+setup schema-single {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES('fired'); END;
+    INSERT INTO t VALUES(1,10);
+}
+
+# Single row: CTE + trigger should produce correct value
+@setup schema-single
+test cte-update-single-row-with-trigger {
+    WITH c AS (SELECT id, val * 3 as tripled FROM t)
+    UPDATE t SET val = (SELECT tripled FROM c WHERE c.id = t.id);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|30
+}
+
+setup schema-no-trigger {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+}
+
+# Without trigger: baseline correctness
+@setup schema-no-trigger
+test cte-update-without-trigger {
+    WITH c AS (SELECT id, val * 2 as doubled FROM t)
+    UPDATE t SET val = (SELECT doubled FROM c WHERE c.id = t.id) WHERE id <= 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|20
+    2|40
+    3|30
+}
+
+setup schema-trigger-diff-table {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE audit(msg TEXT);
+    CREATE TRIGGER tr_audit AFTER UPDATE ON t BEGIN INSERT INTO audit VALUES('updated ' || OLD.id); END;
+    INSERT INTO t VALUES(1,5),(2,15),(3,25);
+}
+
+# CTE with trigger that logs to a different table
+@setup schema-trigger-diff-table
+test cte-update-trigger-fires-correctly {
+    WITH c AS (SELECT id, val * 10 as scaled FROM t)
+    UPDATE t SET val = (SELECT scaled FROM c WHERE c.id = t.id) WHERE id IN (1, 3);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|50
+    2|15
+    3|250
+}
+
+# Verify the trigger fired the expected number of times
+@setup schema-trigger-diff-table
+test cte-update-trigger-audit-count {
+    WITH c AS (SELECT id, val * 10 as scaled FROM t)
+    UPDATE t SET val = (SELECT scaled FROM c WHERE c.id = t.id) WHERE id IN (1, 3);
+    SELECT COUNT(*) FROM audit;
+}
+expect {
+    2
+}
+
+setup schema-before-trigger {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES('before'); END;
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+}
+
+# BEFORE trigger: same fix should apply
+@setup schema-before-trigger
+test cte-update-with-before-trigger {
+    WITH c AS (SELECT id, val * 2 as doubled FROM t)
+    UPDATE t SET val = (SELECT doubled FROM c WHERE c.id = t.id) WHERE id <= 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|20
+    2|40
+    3|30
+}
+
+setup schema-multi-cte {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES('fired'); END;
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+}
+
+# Multiple CTEs in SET clause with trigger
+@setup schema-multi-cte
+test cte-update-multiple-ctes-with-trigger {
+    WITH c1 AS (SELECT id, val * 2 as d FROM t),
+         c2 AS (SELECT id, val + 100 as a FROM t)
+    UPDATE t SET val = (SELECT d FROM c1 WHERE c1.id = t.id) + (SELECT a FROM c2 WHERE c2.id = t.id)
+    WHERE id <= 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|130
+    2|160
+    3|30
+}

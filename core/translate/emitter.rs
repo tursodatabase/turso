@@ -2472,8 +2472,19 @@ fn emit_program_for_update(
         })
         .collect::<Vec<_>>();
 
+    // When using an ephemeral table (triggers present), SET clause subqueries
+    // remain in non_from_clause_subqueries and must be evaluated inside the
+    // update loop body (after the target table cursor is positioned). Extract
+    // them here so open_loop doesn't see them.
+    let mut deferred_subqueries = if has_ephemeral_table {
+        std::mem::take(&mut plan.non_from_clause_subqueries)
+    } else {
+        vec![]
+    };
+
     // Evaluate uncorrelated subqueries as early as possible (only for normal path without ephemeral table)
-    // For the ephemeral path, subqueries are handled by emit_program_for_select on the ephemeral_plan.
+    // For the ephemeral path, WHERE-clause subqueries are handled by emit_program_for_select on the
+    // ephemeral_plan, and SET-clause subqueries are deferred to the update loop body.
     if !has_ephemeral_table {
         for subquery in plan
             .non_from_clause_subqueries
@@ -2638,6 +2649,7 @@ fn emit_program_for_update(
         target_table,
         resolver,
         returning_buffer.as_ref(),
+        &mut deferred_subqueries,
     )?;
 
     // Close the main loop
@@ -2912,6 +2924,7 @@ fn emit_update_insns<'a>(
     target_table: Arc<JoinedTable>,
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
+    deferred_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     let internal_id = target_table.internal_id;
@@ -3038,6 +3051,25 @@ fn emit_update_insns<'a>(
         });
     }
     let col_len = target_table.table.columns().len();
+
+    // Evaluate deferred SET clause subqueries now that the target table cursor
+    // is positioned. These were kept out of the ephemeral plan so they are
+    // evaluated per-row with the correct cursor state (see #5546).
+    for subquery in deferred_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        // Loop(0) is correct: the ephemeral table path has exactly one table
+        // in the join order, so all deferred subqueries evaluate at loop index 0.
+        let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+        emit_non_from_clause_subquery(
+            program,
+            &t_ctx.resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
+    }
 
     // we scan a column at a time, loading either the column's values, or the new value
     // from the Set expression, into registers so we can emit a MakeRecord and update the row.
