@@ -578,6 +578,7 @@ impl ProgramState {
         self.hash_tables.clear();
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
+        self.uses_subjournal = false;
         self.distinct_key_values.clear();
         self.n_change.store(0, Ordering::SeqCst);
         *self.explain_state.write() = ExplainState::default();
@@ -1514,6 +1515,19 @@ impl Program {
         err: Option<&LimboError>,
         state: &mut ProgramState,
     ) -> Result<()> {
+        fn capture_abort_error(
+            abort_error: &mut Option<LimboError>,
+            err: LimboError,
+            context: &str,
+        ) {
+            tracing::error!("{context}: {err}");
+            if abort_error.is_none() {
+                *abort_error = Some(err);
+            }
+        }
+
+        let mut abort_error: Option<LimboError> = None;
+
         if self.is_trigger_subprogram() {
             self.connection.end_trigger_execution();
         }
@@ -1526,11 +1540,17 @@ impl Program {
                 let should_rollback_stmt = !(self.resolve_type == ResolveType::Fail
                     && matches!(err, Some(LimboError::Constraint(_))));
                 if should_rollback_stmt {
-                    state.end_statement(
+                    if let Err(end_stmt_err) = state.end_statement(
                         &self.connection,
                         pager,
                         EndStatement::RollbackSavepoint,
-                    )?;
+                    ) {
+                        capture_abort_error(
+                            &mut abort_error,
+                            end_stmt_err,
+                            "Failed to rollback statement savepoint during abort",
+                        );
+                    }
                 }
             }
             match err {
@@ -1572,11 +1592,17 @@ impl Program {
                             // For non-autocommit mode, release the savepoint so changes become part
                             // of the outer transaction.
                             if !self.connection.get_auto_commit() {
-                                state.end_statement(
+                                if let Err(end_stmt_err) = state.end_statement(
                                     &self.connection,
                                     pager,
                                     EndStatement::ReleaseSavepoint,
-                                )?;
+                                ) {
+                                    capture_abort_error(
+                                        &mut abort_error,
+                                        end_stmt_err,
+                                        "Failed to release statement savepoint during abort",
+                                    );
+                                }
                             }
                         }
                         _ => {
@@ -1594,7 +1620,14 @@ impl Program {
                 }
             }
         }
+        if state.uses_subjournal {
+            pager.stop_use_subjournal();
+            state.uses_subjournal = false;
+        }
         state.auto_txn_cleanup = TxnCleanup::None;
+        if let Some(err) = abort_error {
+            return Err(err);
+        }
         Ok(())
     }
 

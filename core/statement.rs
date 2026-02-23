@@ -537,6 +537,16 @@ impl Statement {
 
         let mut reset_error: Option<LimboError> = None;
 
+        if let Some(io) = self.state.io_completions.take() {
+            if let Err(err) = io.wait(self.pager.io.as_ref()) {
+                capture_reset_error(
+                    &mut reset_error,
+                    err,
+                    "Error while draining pending IO during statement reset",
+                );
+            }
+        }
+
         if self.state.execution_state.is_running() {
             if self.query_mode == QueryMode::Normal
                 && self.program.change_cnt_on
@@ -619,9 +629,6 @@ impl Statement {
                     "Abort failed during statement reset",
                 );
             }
-        }
-        if let Some(io) = self.state.io_completions.take() {
-            io.abort();
         }
         self.state.reset(max_registers, max_cursors);
         self.state.n_change.store(0, Ordering::SeqCst);
