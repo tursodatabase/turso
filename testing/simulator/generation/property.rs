@@ -1253,7 +1253,7 @@ impl Property {
                                                 db_sorted.len()
                                             )));
                                         }
-                                        if db_sorted != exp_sorted {
+                                        if !rows_approx_equal(&db_sorted, &exp_sorted) {
                                             print_diff(
                                                 &exp_sorted,
                                                 &db_sorted,
@@ -1955,6 +1955,42 @@ impl<'a> ArbitraryFrom<&PropertyDistribution<'a>> for Property {
     ) -> Self {
         property_distr.sample(rng, conn_ctx)
     }
+}
+
+/// Compare two result sets allowing for floating-point tolerance in SUM values.
+/// Returns true if rows match (treating float values within 1e-10 relative error as equal).
+fn rows_approx_equal(a: &[Vec<SimValue>], b: &[Vec<SimValue>]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(row_a, row_b)| {
+        if row_a.len() != row_b.len() {
+            return false;
+        }
+        row_a
+            .iter()
+            .zip(row_b.iter())
+            .all(|(va, vb)| match (&va.0, &vb.0) {
+                (
+                    types::Value::Numeric(Numeric::Float(fa)),
+                    types::Value::Numeric(Numeric::Float(fb)),
+                ) => {
+                    let fa: f64 = (*fa).into();
+                    let fb: f64 = (*fb).into();
+                    if fa == fb {
+                        return true;
+                    }
+                    let diff = (fa - fb).abs();
+                    let max_abs = fa.abs().max(fb.abs());
+                    if max_abs == 0.0 {
+                        diff < 1e-15
+                    } else {
+                        diff / max_abs < 1e-10
+                    }
+                }
+                _ => va == vb,
+            })
+    })
 }
 
 fn print_row(row: &[SimValue]) -> String {
