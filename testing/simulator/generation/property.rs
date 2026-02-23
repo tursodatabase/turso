@@ -239,7 +239,8 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
-            | Property::AllTableHaveExpectedContent { .. } => {
+            | Property::AllTableHaveExpectedContent { .. }
+            | Property::GroupByAggregateCheck { .. } => {
                 unreachable!("No extensional queries")
             }
         }
@@ -1033,6 +1034,7 @@ impl Property {
                             from: select.body.select.from.clone(),
                             where_clause: p_true,
                             order_by: None,
+                            group_by: None,
                         }),
                         compounds: vec![
                             CompoundSelect {
@@ -1043,6 +1045,7 @@ impl Property {
                                     from: select.body.select.from.clone(),
                                     where_clause: p_false,
                                     order_by: None,
+                                    group_by: None,
                                 }),
                             },
                             CompoundSelect {
@@ -1053,6 +1056,7 @@ impl Property {
                                     from: select.body.select.from.clone(),
                                     where_clause: p_null,
                                     order_by: None,
+                                    group_by: None,
                                 }),
                             },
                         ],
@@ -1191,6 +1195,103 @@ impl Property {
                     )
                 ),
                 ].into_iter().map(InteractionBuilder::with_interaction).collect()
+            }
+            Property::GroupByAggregateCheck { select, table } => {
+                let table_dependency = table.clone();
+                let assumption = InteractionType::Assumption(Assertion::new(
+                    format!("table {table} exists"),
+                    {
+                        let table = table.clone();
+                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                            let conn_tables = env.get_conn_tables(connection_index);
+                            if conn_tables.iter().any(|t| t.name == table) {
+                                Ok(Ok(()))
+                            } else {
+                                Ok(Err(format!("table {table} does not exist")))
+                            }
+                        }
+                    },
+                    vec![table_dependency.clone()],
+                ));
+
+                let select_query = InteractionType::Query(Query::Select(select.clone()));
+
+                let select_for_shadow = select.clone();
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    "GROUP BY aggregate results should match shadow model".to_string(),
+                    move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        let Some(db_result) = stack.last() else {
+                            // Stack is empty - the query errored and was handled
+                            // by error recovery (e.g. both engines failed in
+                            // differential mode). Nothing to assert.
+                            return Ok(Ok(()));
+                        };
+                        match db_result {
+                            Ok(db_rows) => {
+                                // Compute expected result from shadow model
+                                let expected = select_for_shadow
+                                    .shadow(&mut env.get_conn_tables_mut(connection_index));
+                                match expected {
+                                    Ok(expected_rows) => {
+                                        // Compare as unordered multisets since
+                                        // GROUP BY order is unspecified
+                                        let mut db_sorted = db_rows.clone();
+                                        let mut exp_sorted = expected_rows;
+                                        db_sorted.sort_unstable();
+                                        exp_sorted.sort_unstable();
+
+                                        if db_sorted.len() != exp_sorted.len() {
+                                            print_diff(
+                                                &exp_sorted,
+                                                &db_sorted,
+                                                "shadow",
+                                                "database",
+                                            );
+                                            return Ok(Err(format!(
+                                                "GROUP BY row count mismatch: expected {} rows, got {}",
+                                                exp_sorted.len(),
+                                                db_sorted.len()
+                                            )));
+                                        }
+                                        if db_sorted != exp_sorted {
+                                            print_diff(
+                                                &exp_sorted,
+                                                &db_sorted,
+                                                "shadow",
+                                                "database",
+                                            );
+                                            return Ok(Err(
+                                                "GROUP BY results differ between shadow and database"
+                                                    .to_string(),
+                                            ));
+                                        }
+                                        Ok(Ok(()))
+                                    }
+                                    Err(e) => {
+                                        // Shadow computation failed, skip assertion
+                                        tracing::warn!("GROUP BY shadow computation failed: {}", e);
+                                        Ok(Ok(()))
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // Query failed (e.g. IntegerOverflow from SUM).
+                                // This is a valid SQL error, not a bug.
+                                Ok(Ok(()))
+                            }
+                        }
+                    },
+                    vec![table_dependency],
+                ));
+
+                let mut select_builder = InteractionBuilder::with_interaction(select_query);
+                select_builder.ignore_error(true);
+
+                vec![
+                    InteractionBuilder::with_interaction(assumption),
+                    select_builder,
+                    InteractionBuilder::with_interaction(assertion),
+                ]
             }
             Property::Queries { queries } => queries
                 .clone()
@@ -1572,6 +1673,18 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_group_by_aggregate_check<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    assert!(!ctx.tables().is_empty());
+    let select = sql_generation::generation::query::gen_group_by_select(rng, ctx);
+    let table = select.dependencies().into_iter().next().unwrap();
+    Property::GroupByAggregateCheck { select, table }
+}
+
 fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
     rng: &mut R,
     query_distr: &QueryDistribution,
@@ -1620,6 +1733,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::GroupByAggregateCheck => property_group_by_aggregate_check,
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -1725,6 +1839,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::GroupByAggregateCheck => {
+                if !env.opts.disable_group_by_aggregate_check && !ctx.tables().is_empty() {
+                    remaining.select / 2
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -1765,6 +1886,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::GroupByAggregateCheck => QueryCapabilities::SELECT,
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

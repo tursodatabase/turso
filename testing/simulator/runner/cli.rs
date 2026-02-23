@@ -145,6 +145,8 @@ pub struct SimulatorCLI {
     pub disable_fsync_no_wait: bool,
     #[clap(long, help = "disable FaultyQuery Property")]
     pub disable_faulty_query: bool,
+    #[clap(long, help = "disable GroupByAggregateCheck Property")]
+    pub disable_group_by_aggregate_check: bool,
     #[clap(long, help = "disable Reopen-Database fault")]
     pub disable_reopen_database: bool,
     #[clap(long = "latency-prob", help = "added IO latency probability", value_parser = clap::value_parser!(u8).range(0..=100))]
