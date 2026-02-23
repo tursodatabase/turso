@@ -109,6 +109,48 @@ expect {
     CREATE TABLE test (a, [b c])
 }
 
+test alter-table-add-column-default-affinity-text {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    INSERT INTO t VALUES(2);
+    ALTER TABLE t ADD COLUMN c TEXT DEFAULT 0;
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|text|0
+    2|text|0
+}
+
+test alter-table-add-column-default-affinity-integer {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN c INTEGER DEFAULT '5';
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|integer|5
+}
+
+test alter-table-add-column-default-affinity-real {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN c REAL DEFAULT '3';
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|real|3.0
+}
+
+test alter-table-add-column-default-affinity-numeric {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN c NUMERIC DEFAULT '7';
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|integer|7
+}
+
 test alter-table-drop-column {
     CREATE TABLE t (a, b);
     INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
