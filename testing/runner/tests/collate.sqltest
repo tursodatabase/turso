@@ -66,6 +66,7 @@ expect {
 
 
 
+@cross-check-integrity
 test collate_unique_constraint {
     CREATE TABLE t (a TEXT COLLATE NOCASE PRIMARY KEY);
     INSERT INTO t VALUES ('lol'), ('LOL'), ('lOl');
@@ -73,6 +74,7 @@ test collate_unique_constraint {
 expect error {
 }
 
+@cross-check-integrity
 test collate_unique_constraint-2 {
     CREATE TABLE t (a TEXT COLLATE NOCASE PRIMARY KEY);
     INSERT INTO t VALUES ('lol'), ('LOL'), ('lOl');
@@ -80,6 +82,7 @@ test collate_unique_constraint-2 {
 expect error {
 }
 
+@cross-check-integrity
 test collate_aggregation_default_binary {
     create table fruits(name collate binary);
     insert into fruits(name) values ('Apple') ,('banana') ,('CHERRY');
@@ -89,6 +92,7 @@ expect {
     banana
 }
 
+@cross-check-integrity
 test collate_aggregation_default_nocase {
     create table fruits(name collate nocase);
     insert into fruits(name) values ('Apple') ,('banana') ,('CHERRY');
@@ -98,6 +102,7 @@ expect {
     CHERRY
 }
 
+@cross-check-integrity
 test collate_aggregation_explicit_binary {
     create table fruits(name collate nocase);
     insert into fruits(name) values ('Apple') ,('banana') ,('CHERRY');
@@ -107,6 +112,7 @@ expect {
     banana
 }
 
+@cross-check-integrity
 test collate_aggregation_explicit_nocase {
     create table fruits(name collate binary);
     insert into fruits(name) values ('Apple') ,('banana') ,('CHERRY');
@@ -116,6 +122,7 @@ expect {
     CHERRY
 }
 
+@cross-check-integrity
 test collate_grouped_aggregation_default_binary {
     create table fruits(name collate binary, category text);
     insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
@@ -126,6 +133,7 @@ expect {
     blueberry
 }
 
+@cross-check-integrity
 test collate_grouped_aggregation_default_nocase {
     create table fruits(name collate nocase, category text);
     insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
@@ -136,6 +144,7 @@ expect {
     CHERRY
 }
 
+@cross-check-integrity
 test collate_grouped_aggregation_explicit_binary {
     create table fruits(name collate nocase, category text);
     insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
@@ -146,6 +155,7 @@ expect {
     blueberry
 }
 
+@cross-check-integrity
 test collate_groupped_aggregation_explicit_nocase {
     create table fruits(name collate binary, category text);
     insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
@@ -156,6 +166,7 @@ expect {
     CHERRY
 }
 
+@cross-check-integrity
 test collate_join_nocase {
     CREATE TABLE a(s TEXT);
     CREATE TABLE b(s TEXT);
@@ -171,6 +182,7 @@ expect {
 # as the hash build table. The collation must be determined from both sides of
 # the comparison, not just the build side, to avoid case-sensitive hashing when
 # the join semantics require case-insensitive matching.
+@cross-check-integrity
 test collate_hash_join_nocase_column_with_order_by {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_name TEXT, data TEXT);
@@ -183,6 +195,7 @@ expect {
     Bob|y
 }
 
+@cross-check-integrity
 test collate_hash_join_nocase_column_without_order_by {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_name TEXT, data TEXT);
@@ -195,6 +208,7 @@ expect {
     Bob|y
 }
 
+@cross-check-integrity
 test collate_columns_where_implicit {
     CREATE TABLE t(
     a TEXT COLLATE NOCASE,
@@ -216,6 +230,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test collate_columns_where_explicit_override {
     CREATE TABLE t(
     a TEXT COLLATE NOCASE,
@@ -237,6 +252,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test collate_order_by_binary {
     CREATE TABLE words(w TEXT COLLATE BINARY);
     INSERT INTO words(w) VALUES ('Apple'), ('banana'), ('CHERRY');
@@ -248,6 +264,7 @@ expect {
     banana
 }
 
+@cross-check-integrity
 test collate_order_by_nocase {
     CREATE TABLE words(w TEXT COLLATE NOCASE);
     INSERT INTO words(w) VALUES ('Apple'), ('banana'), ('CHERRY');
@@ -259,6 +276,7 @@ expect {
     CHERRY
 }
 
+@cross-check-integrity
 test collate_order_by_explicit_override {
     CREATE TABLE words(w TEXT COLLATE NOCASE);
     INSERT INTO words(w) VALUES ('Apple'), ('banana'), ('CHERRY');
@@ -270,6 +288,7 @@ expect {
     banana
 }
 
+@cross-check-integrity
 test collate_distinct_rtrim {
     CREATE TABLE t(c TEXT COLLATE RTRIM);
     INSERT INTO t(c) VALUES ('x'), ('x '), ('x  '), ('y'), ('y  ');
@@ -279,6 +298,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test collate_unique_nocase_conflict {
     CREATE TABLE u(a TEXT COLLATE NOCASE UNIQUE);
     INSERT INTO u VALUES ('aa');
@@ -287,6 +307,7 @@ test collate_unique_nocase_conflict {
 expect error {
 }
 
+@cross-check-integrity
 test collate_unique_rtrim_conflict {
     CREATE TABLE r(a TEXT COLLATE RTRIM UNIQUE);
     INSERT INTO r VALUES ('bb');
@@ -295,6 +316,7 @@ test collate_unique_rtrim_conflict {
 expect error {
 }
 
+@cross-check-integrity
 test collate_unique_binary_allows_case {
     CREATE TABLE ub(a TEXT COLLATE BINARY UNIQUE);
     INSERT INTO ub VALUES ('aa');
@@ -305,6 +327,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test collate_pk_rtrim_conflict {
     CREATE TABLE p(a TEXT COLLATE RTRIM PRIMARY KEY);
     INSERT INTO p VALUES ('key');
@@ -313,6 +336,7 @@ test collate_pk_rtrim_conflict {
 expect error {
 }
 
+@cross-check-integrity
 test collate_join_implicit_nocase_columns {
     CREATE TABLE a(s TEXT COLLATE NOCASE);
     CREATE TABLE b(s TEXT COLLATE NOCASE);
@@ -324,6 +348,7 @@ expect {
     A|a
 }
 
+@cross-check-integrity
 test collate_join_mixed_implicit_binary_left {
     CREATE TABLE a(s TEXT COLLATE BINARY);
     CREATE TABLE b(s TEXT COLLATE NOCASE);
@@ -334,6 +359,7 @@ test collate_join_mixed_implicit_binary_left {
 expect {
 }
 
+@cross-check-integrity
 test collate_join_mixed_explicit_nocase_left {
     CREATE TABLE a(s TEXT COLLATE BINARY);
     CREATE TABLE b(s TEXT COLLATE NOCASE);
@@ -345,6 +371,7 @@ expect {
     A|a
 }
 
+@cross-check-integrity
 test collate_where_with_and_without_explicit {
     CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY, c TEXT COLLATE RTRIM);
     INSERT INTO t VALUES ('Foo','Foo','Foo '), ('fOo','fOo','Foo'), ('other','other','other');
@@ -364,6 +391,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test collate_group_by_implicit_nocase {
     CREATE TABLE t(s TEXT COLLATE NOCASE);
     INSERT INTO t VALUES ('A'), ('a'), ('B'), ('b');
@@ -374,6 +402,7 @@ expect {
     B|2
 }
 
+@cross-check-integrity
 test collate_group_by_implicit_rtrim {
     CREATE TABLE t(s TEXT COLLATE RTRIM);
     INSERT INTO t VALUES ('A'), ('A '), ('B'), ('B  ');
@@ -384,6 +413,7 @@ expect {
     B|2
 }
 
+@cross-check-integrity
 test collate_group_by_explicit_override {
     CREATE TABLE t(s TEXT COLLATE BINARY);
     INSERT INTO t VALUES ('A'), ('a'), ('B'), ('b');
@@ -394,6 +424,7 @@ expect {
     B|2
 }
 
+@cross-check-integrity
 test collate_group_by_mixed_columns {
     CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE RTRIM);
     INSERT INTO t VALUES ('A', 'x'), ('a', 'x '), ('B', 'y'), ('b', 'y  ');
@@ -404,6 +435,7 @@ expect {
     B|y|2
 }
 
+@cross-check-integrity
 test collate_subquery_preserves_column_collation {
     CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
     INSERT INTO t VALUES ('A', 'A'), ('a', 'a'), ('B', 'B'), ('b', 'b');
@@ -417,6 +449,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test collate_subquery_preserves_explicit_collation {
     CREATE TABLE t(a TEXT COLLATE BINARY, b TEXT COLLATE BINARY);
     INSERT INTO t VALUES ('A', 'A'), ('a', 'a'), ('B', 'B'), ('b', 'b');
@@ -430,6 +463,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test collate_subquery_preserves_collation_in_order_by {
     CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
     INSERT INTO t VALUES ('A', 'A'), ('b', 'b'), ('C', 'C');
@@ -455,6 +489,7 @@ expect {
 # incorrectly using the index (which would produce wrong ordering).
 # ORDER BY COLLATE BINARY should not use an index
 # with COLLATE RTRIM, as the orderings are incompatible.
+@cross-check-integrity
 test collate_orderby_binary_vs_index_rtrim {
     CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
     INSERT INTO t1 VALUES (' ');
@@ -468,6 +503,7 @@ zzz|text
 }
 
 # Verify correct ordering with matching collations (index should be usable)
+@cross-check-integrity
 test collate_orderby_rtrim_matches_index_rtrim {
     CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
     CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM DESC);
@@ -482,6 +518,7 @@ expect {
 }
 
 # ORDER BY NOCASE should not use BINARY index
+@cross-check-integrity
 test collate_orderby_nocase_vs_index_binary {
     CREATE TABLE t1 (c1 TEXT COLLATE BINARY);
     CREATE INDEX i1 ON t1 (c1 COLLATE BINARY);
@@ -496,6 +533,7 @@ expect {
 }
 
 # ORDER BY BINARY should not use NOCASE index
+@cross-check-integrity
 test collate_orderby_binary_vs_index_nocase {
     CREATE TABLE t1 (c1 TEXT COLLATE NOCASE);
     CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE);
@@ -510,6 +548,7 @@ expect {
 }
 
 # Multi-column ORDER BY: first column collation matches, second doesn't
+@cross-check-integrity
 test collate_orderby_multi_column_mixed {
     CREATE TABLE t1 (a TEXT COLLATE BINARY, b TEXT COLLATE NOCASE);
     CREATE INDEX i1 ON t1 (a COLLATE BINARY, b COLLATE NOCASE);
@@ -524,6 +563,7 @@ expect {
 }
 
 # ORDER BY with implicit column collation vs explicit index collation
+@cross-check-integrity
 test collate_orderby_implicit_vs_explicit_index {
     CREATE TABLE t1 (c1 TEXT COLLATE NOCASE);
     -- Index uses BINARY explicitly, but column defaults to NOCASE
@@ -539,6 +579,7 @@ expect {
 }
 
 # Explicit ORDER BY collation overrides column collation
+@cross-check-integrity
 test collate_orderby_explicit_override_column {
     CREATE TABLE t1 (c1 TEXT COLLATE NOCASE);
     CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE);
@@ -553,6 +594,7 @@ expect {
 }
 
 # Test with rowid tiebreaker - collation mismatch
+@cross-check-integrity
 test collate_orderby_with_rowid_tiebreaker {
     CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
     CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM);
@@ -569,6 +611,7 @@ expect {
 }
 
 # DESC ordering with collation mismatch
+@cross-check-integrity
 test collate_orderby_desc_collation_mismatch {
     CREATE TABLE t1 (c1 TEXT);
     CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE DESC);
@@ -584,6 +627,7 @@ expect {
 }
 
 # Matching collation with DESC - index should be usable
+@cross-check-integrity
 test collate_orderby_desc_collation_match {
     CREATE TABLE t1 (c1 TEXT);
     CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE DESC);
@@ -598,6 +642,7 @@ expect {
 }
 
 # Test RTRIM vs BINARY - index with RTRIM shouldn't be used for BINARY ordering
+@cross-check-integrity
 test collate_orderby_rtrim_vs_binary_spaces {
     CREATE TABLE t1 (c1 TEXT);
     CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM);
@@ -613,6 +658,7 @@ expect {
 }
 
 # Test that index with matching collation is preferred
+@cross-check-integrity
 test collate_orderby_prefers_matching_index {
     CREATE TABLE t1 (c1 TEXT);
     CREATE INDEX i1_nocase ON t1 (c1 COLLATE NOCASE);
@@ -628,6 +674,7 @@ expect {
 }
 
 # Expression in ORDER BY with collation
+@cross-check-integrity
 test collate_orderby_expression_collation {
     CREATE TABLE t1 (c1 TEXT COLLATE BINARY);
     CREATE INDEX i1 ON t1 (c1 COLLATE BINARY);
@@ -648,6 +695,7 @@ expect {
 # non-comparison operators like concatenation (||), so that the collation
 # is correctly applied to any parent comparison.
 
+@cross-check-integrity
 test collate_concat_check_constraint_nocase {
     CREATE TABLE t(name TEXT CHECK((name COLLATE NOCASE || '') <> 'admin'));
     INSERT INTO t VALUES ('Admin');
@@ -655,6 +703,7 @@ test collate_concat_check_constraint_nocase {
 expect error {
 }
 
+@cross-check-integrity
 test collate_concat_check_constraint_allows_valid {
     CREATE TABLE t(name TEXT CHECK((name COLLATE NOCASE || '') <> 'admin'));
     INSERT INTO t VALUES ('bob');

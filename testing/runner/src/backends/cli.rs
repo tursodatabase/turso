@@ -1,4 +1,6 @@
-use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend, parse_list_output};
+use super::{
+    BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend, parse_list_output,
+};
 use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
@@ -99,13 +101,13 @@ impl SqlBackend for CliBackend {
         &self,
         config: &DatabaseConfig,
     ) -> Result<Box<dyn DatabaseInstance>, BackendError> {
-        let (db_path, temp_file, is_memory) = match &config.location {
+        let (db_path, temp_file, buffer_setups) = match &config.location {
             DatabaseLocation::Memory => (":memory:".to_string(), None, true),
             DatabaseLocation::TempFile => {
                 let temp = NamedTempFile::new()
                     .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
                 let path = temp.path().to_string_lossy().to_string();
-                (path, Some(temp), false)
+                (path, Some(temp), true)
             }
             DatabaseLocation::Path(path) => (path.to_string_lossy().to_string(), None, false),
             DatabaseLocation::Default | DatabaseLocation::DefaultNoRowidAlias => {
@@ -130,7 +132,7 @@ impl SqlBackend for CliBackend {
             readonly: config.readonly,
             timeout: self.timeout,
             _temp_file: temp_file,
-            is_memory,
+            buffer_setups,
             setup_buffer: Vec::new(),
             mvcc: self.mvcc,
             is_sqlite: self.is_sqlite,
@@ -147,9 +149,10 @@ pub struct CliDatabaseInstance {
     timeout: Duration,
     /// Keep temp file alive - it's deleted when this is dropped
     _temp_file: Option<NamedTempFile>,
-    /// Whether this is an in-memory database (needs buffering)
-    is_memory: bool,
-    /// Buffer of setup SQL (for memory databases)
+    /// Whether to buffer setups and send them with the test SQL in one subprocess.
+    /// True for per-test databases (memory, temp); false for shared databases (file, default).
+    buffer_setups: bool,
+    /// Buffered setup SQL to prepend to the first query
     setup_buffer: Vec<String>,
     /// Enable MVCC mode
     mvcc: bool,
@@ -276,7 +279,7 @@ impl CliDatabaseInstance {
 #[async_trait]
 impl DatabaseInstance for CliDatabaseInstance {
     async fn execute_setup(&mut self, sql: &str) -> Result<(), BackendError> {
-        if self.is_memory {
+        if self.buffer_setups {
             // For memory databases, buffer the setup SQL for later
             self.setup_buffer.push(sql.to_string());
             Ok(())
@@ -294,7 +297,7 @@ impl DatabaseInstance for CliDatabaseInstance {
     }
 
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError> {
-        if self.is_memory && !self.setup_buffer.is_empty() {
+        if self.buffer_setups && !self.setup_buffer.is_empty() {
             // Combine buffered setup SQL with the query, using a marker to separate them
             let mut combined = self.setup_buffer.join("\n");
             combined.push('\n');
@@ -311,8 +314,10 @@ impl DatabaseInstance for CliDatabaseInstance {
         }
     }
 
-    async fn close(self: Box<Self>) -> Result<(), BackendError> {
-        // Temp file will be automatically deleted when self is dropped
-        Ok(())
+    async fn close(self: Box<Self>) -> Result<DatabaseFileHandle, BackendError> {
+        match self._temp_file {
+            Some(tf) => Ok(DatabaseFileHandle::temp(tf)),
+            None => Ok(DatabaseFileHandle::none()),
+        }
     }
 }

@@ -14,6 +14,7 @@
 # =============================================================================
 
 # Test: INSERT OR IGNORE with PRIMARY KEY conflict still fires BEFORE trigger
+@cross-check-integrity
 test insert-or-ignore-pk-fires-before-trigger {
     CREATE TABLE parent(id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE log(msg TEXT);
@@ -30,6 +31,7 @@ expect {
 }
 
 # Test: INSERT OR IGNORE with UNIQUE constraint conflict still fires BEFORE trigger
+@cross-check-integrity
 test insert-or-ignore-unique-fires-before-trigger {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
     CREATE TABLE log(msg TEXT);
@@ -48,6 +50,7 @@ expect {
 # Test: Nested INSERT OR IGNORE in trigger - OR IGNORE propagates to nested triggers
 # When trigger does INSERT OR IGNORE and the row exists, the BEFORE trigger fires
 # but the nested trigger's effects are silently ignored due to OR IGNORE propagation
+@cross-check-integrity
 test nested-insert-or-ignore-pk-in-trigger {
     CREATE TABLE parent(id INTEGER PRIMARY KEY, a INT, b INT);
     CREATE TABLE child(id INTEGER PRIMARY KEY, pid INT);
@@ -71,6 +74,7 @@ expect {
 }
 
 # Test: Nested INSERT OR IGNORE in trigger - OR IGNORE propagates (UNIQUE constraint)
+@cross-check-integrity
 test nested-insert-or-ignore-unique-in-trigger {
     CREATE TABLE parent(id UNIQUE, a INT, b INT);
     CREATE TABLE child(id INTEGER PRIMARY KEY, pid INT);
@@ -94,6 +98,7 @@ expect {
 }
 
 # Test: INSERT OR IGNORE with no conflict should fire BEFORE trigger normally
+@cross-check-integrity
 test insert-or-ignore-no-conflict-fires-trigger {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE log(msg TEXT);
@@ -116,6 +121,7 @@ expect {
 # =============================================================================
 
 # Test: UPSERT DO UPDATE trigger with nested INSERT OR IGNORE should error on conflict
+@cross-check-integrity
 test upsert-do-update-trigger-insert-or-ignore-errors {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val INT);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_id INT);
@@ -130,6 +136,7 @@ expect error {
 }
 
 # Test: UPSERT DO UPDATE trigger with nested INSERT that doesn't conflict succeeds
+@cross-check-integrity
 test upsert-do-update-trigger-insert-no-conflict {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val INT);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_id INT);
@@ -147,6 +154,7 @@ expect {
 }
 
 # Test: Plain UPDATE trigger (not from UPSERT) allows INSERT OR IGNORE
+@cross-check-integrity
 test plain-update-trigger-insert-or-ignore-works {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val INT);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_id INT);
@@ -171,6 +179,7 @@ expect {
 # Test: Multiple levels of triggers with INSERT OR IGNORE
 # The nested INSERT OR IGNORE fires the BEFORE trigger on table 'a' even though
 # the row already exists and will be ignored
+@cross-check-integrity
 test multi-level-triggers-insert-or-ignore {
     CREATE TABLE a(id INTEGER PRIMARY KEY, val INT);
     CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INT);
@@ -198,6 +207,7 @@ expect {
 }
 
 # Test: Trigger chain where inner INSERT OR IGNORE is properly skipped
+@cross-check-integrity
 test trigger-chain-insert-or-ignore-skipped {
     CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INT);
@@ -224,6 +234,7 @@ expect {
 # AFTER triggers should also respect OR IGNORE skipping
 # =============================================================================
 
+@cross-check-integrity
 test insert-or-ignore-pk-skips-after-trigger {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE log(msg TEXT);
@@ -247,6 +258,7 @@ expect {
 # =============================================================================
 
 # Test: INSERT OR REPLACE should fire INSERT trigger but NOT DELETE trigger (by default)
+@cross-check-integrity
 test insert-or-replace-no-delete-trigger-by-default {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE log(msg TEXT);
@@ -272,6 +284,7 @@ expect {
 # https://github.com/tursodatabase/turso/issues/5281
 # =============================================================================
 
+@cross-check-integrity
 test trigger-upsert-new-column {
     CREATE TABLE balances(id INTEGER PRIMARY KEY, amount INTEGER);
     CREATE TABLE transactions(id INTEGER PRIMARY KEY, account_id INTEGER, delta INTEGER);
@@ -288,6 +301,7 @@ expect {
 }
 
 # NEW.column in UPSERT DO UPDATE WHERE inside a trigger
+@cross-check-integrity
 test trigger-upsert-new-in-where {
     CREATE TABLE balances(id INTEGER PRIMARY KEY, amount INTEGER);
     CREATE TABLE transactions(id INTEGER PRIMARY KEY, account_id INTEGER, delta INTEGER);
@@ -305,6 +319,7 @@ expect {
 }
 
 # NEW.column in UPSERT where delta is negative and WHERE filters it out
+@cross-check-integrity
 test trigger-upsert-new-in-where-no-update {
     CREATE TABLE balances(id INTEGER PRIMARY KEY, amount INTEGER);
     CREATE TABLE transactions(id INTEGER PRIMARY KEY, account_id INTEGER, delta INTEGER);

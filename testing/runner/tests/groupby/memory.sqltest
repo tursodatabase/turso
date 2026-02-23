@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test group_by_no_sorting_required_reordered_columns {
     create table t0 (a INT, b INT, c INT);
     create index a_b_idx on t0 (a, b);
@@ -17,6 +18,7 @@ expect {
     3|2|2
 }
 
+@cross-check-integrity
 test having_or {
     CREATE TABLE users (first_name TEXT, age INTEGER);
     INSERT INTO users VALUES
@@ -39,6 +41,7 @@ expect @js {
 }
 
 # In GROUP BY clauses, column aliases take precedence when resolving identifiers to columns.
+@cross-check-integrity
 test group_by_alias_precedence {
     CREATE TABLE t(x,y);
     INSERT INTO t VALUES (1,200),(2,100);
@@ -50,6 +53,7 @@ expect {
     1|400
 }
 
+@cross-check-integrity
 test having_without_group_by_basic {
     CREATE TABLE t(a INTEGER);
     INSERT INTO t VALUES (1), (2), (3), (4), (5);
@@ -59,6 +63,7 @@ expect {
     15
 }
 
+@cross-check-integrity
 test having_without_group_by_no_match {
     CREATE TABLE t(a INTEGER);
     INSERT INTO t VALUES (1), (2), (3), (4), (5);
@@ -67,6 +72,7 @@ test having_without_group_by_no_match {
 expect {
 }
 
+@cross-check-integrity
 test having_without_group_by_multiple_aggregates {
     CREATE TABLE t(a INTEGER);
     INSERT INTO t VALUES (1), (2), (3), (4), (5);
@@ -76,6 +82,7 @@ expect {
     15|5
 }
 
+@cross-check-integrity
 test having_without_group_by_expression {
     CREATE TABLE t(a INTEGER);
     INSERT INTO t VALUES (10), (20), (30);
@@ -85,6 +92,7 @@ expect {
     60
 }
 
+@cross-check-integrity
 test having_without_group_by_complex_condition {
     CREATE TABLE t(a INTEGER);
     INSERT INTO t VALUES (1), (2), (3), (4), (5);
@@ -97,6 +105,7 @@ expect @js {
     15|3
 }
 
+@cross-check-integrity
 test having_without_group_by_count {
     CREATE TABLE t(a INTEGER);
     INSERT INTO t VALUES (1), (2), (3);
@@ -106,6 +115,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test having_without_group_by_max_min {
     CREATE TABLE t(a INTEGER);
     INSERT INTO t VALUES (5), (10), (15), (20);
@@ -115,6 +125,7 @@ expect {
     20|5
 }
 
+@cross-check-integrity
 test having_without_group_by_non_aggregate_error {
     CREATE TABLE t(a INTEGER);
     INSERT INTO t VALUES (1), (2), (3);
@@ -125,6 +136,7 @@ expect error {
 
 # Regression test: GROUP BY with constant false WHERE clause (e.g., WHERE 0)
 # should return empty result set, not panic due to unopened sorter cursor.
+@cross-check-integrity
 test group_by_where_false {
     CREATE TABLE t0 (c0 INT);
     INSERT INTO t0 VALUES (1);
@@ -137,6 +149,7 @@ expect {
 # The ORDER BY expression uses an aggregate (max(email)) that is not mentioned
 # in the SELECT clause. This requires correct expression matching between
 # the ORDER BY aggregate and the computed aggregate value.
+@cross-check-integrity
 test groupby_orderby_agg_not_in_select {
     CREATE TABLE t2923 (name TEXT, value INT, email TEXT);
     INSERT INTO t2923 VALUES ('Alice', 10, 'z@example.com');
@@ -153,6 +166,7 @@ expect {
 # Regression test for issue #2923: Multiple GROUP BY and ORDER BY keys
 # Tests that sort directions are copied position-by-position when GROUP BY
 # and ORDER BY have the same number of expressions.
+@cross-check-integrity
 test groupby_orderby_multiple_keys {
     CREATE TABLE t2923b (a TEXT, b TEXT, value INT, email TEXT);
     INSERT INTO t2923b VALUES
@@ -173,6 +187,7 @@ expect {
 # Regression test for issue #2923: Different number of GROUP BY vs ORDER BY keys
 # When GROUP BY has more expressions than ORDER BY, the remaining keys
 # should default to ascending order.
+@cross-check-integrity
 test groupby_orderby_different_key_counts {
     CREATE TABLE t2923c (a TEXT, b TEXT, value INT);
     INSERT INTO t2923c VALUES
@@ -192,6 +207,7 @@ expect {
 # Regression test for issue #2923: Multiple keys with LIMIT
 # Ensures correct results when LIMIT is applied with multiple GROUP BY
 # and ORDER BY keys.
+@cross-check-integrity
 test groupby_orderby_multiple_keys_limit {
     CREATE TABLE t2923d (a TEXT, b TEXT, value INT, email TEXT);
     INSERT INTO t2923d VALUES
@@ -209,6 +225,7 @@ expect {
 
 # Regression test for issue #2923: ORDER BY has more expressions than GROUP BY
 # When counts differ, falls through to expression-matching logic.
+@cross-check-integrity
 test groupby_orderby_more_orderby_keys {
     CREATE TABLE t2923e (a TEXT, value INT, email TEXT);
     INSERT INTO t2923e VALUES
@@ -225,6 +242,7 @@ expect {
 
 # Regression test for issue #2923: Same column in both GROUP BY and ORDER BY
 # Tests position-by-position copying when GROUP BY column also appears in ORDER BY.
+@cross-check-integrity
 test groupby_orderby_same_column_in_both {
     CREATE TABLE t2923f (a TEXT, value INT, email TEXT);
     INSERT INTO t2923f VALUES
@@ -244,6 +262,7 @@ expect {
 # the sort_order for remaining GROUP BY columns (not in ORDER BY) must
 # default to ASC. Previously they kept stale values from the pre-reorder
 # sort_order, causing incorrect tie-breaking within equal ORDER BY groups.
+@cross-check-integrity
 test groupby_desc_tiebreak_extra_columns {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t VALUES (1, 'x'), (2, 'x'), (3, 'x'), (4, 'y'), (5, 'z');
@@ -257,6 +276,7 @@ expect {
     3|3
 }
 
+@cross-check-integrity
 test groupby_desc_tiebreak_extra_columns_limit_offset {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t VALUES (1, 'x'), (2, 'x'), (3, 'x'), (4, 'y'), (5, 'z');

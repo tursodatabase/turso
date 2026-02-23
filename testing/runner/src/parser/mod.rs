@@ -76,6 +76,7 @@ impl Parser {
                     | Token::AtSkipIf
                     | Token::AtRequires
                     | Token::AtBackend
+                    | Token::AtCrossCheckIntegrity
                     | Token::Test
                     | Token::Snapshot
                     | Token::SnapshotEqp,
@@ -203,6 +204,7 @@ impl Parser {
         let mut skip = vec![];
         let mut backend = None;
         let mut requires = Vec::new();
+        let mut cross_check_integrity = false;
 
         // Parse decorators
         loop {
@@ -253,6 +255,11 @@ impl Parser {
                     );
                     self.skip_newlines_and_comments();
                 }
+                Some(Token::AtCrossCheckIntegrity) => {
+                    self.advance();
+                    cross_check_integrity = true;
+                    self.skip_newlines_and_comments();
+                }
                 _ => break,
             }
         }
@@ -277,6 +284,7 @@ impl Parser {
                         skip,
                         backend,
                         requires,
+                        cross_check_integrity,
                     },
                 }))
             }
@@ -347,6 +355,7 @@ impl Parser {
                         skip,
                         backend,
                         requires,
+                        cross_check_integrity,
                     },
                 }))
             }

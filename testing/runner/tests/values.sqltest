@@ -82,6 +82,7 @@ expect {
 }
 
 # regression test for: https://github.com/tursodatabase/turso/issues/2158
+@cross-check-integrity
 test values-between {
     CREATE TABLE t0 (c0);
     INSERT INTO t0 VALUES ((0 BETWEEN 0 AND 0)), (0);
@@ -92,6 +93,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test values-illegal-column-ref {
     CREATE TABLE t0 (c0);
     INSERT INTO t0 VALUES (c0);
@@ -113,6 +115,7 @@ expect error {
 }
 
 # Also verify correlated VALUES references outer columns row-by-row
+@cross-check-integrity
 test values-correlated-values-in-select {
     CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO users (name) VALUES ('jack'), ('jill');

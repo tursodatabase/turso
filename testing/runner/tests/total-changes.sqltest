@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test total-changes-on-basic-insert {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1);
@@ -9,6 +10,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test total-changes-on-multiple-row-insert {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3);
@@ -18,6 +20,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test total-changes-on-multiple-inserts {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3);
@@ -28,6 +31,7 @@ expect {
     7
 }
 
+@cross-check-integrity
 test total-changes-on-update-single-row {
     create table temp (t1 integer primary key, t2 text);
     insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
@@ -38,6 +42,7 @@ expect {
     4
 }
 
+@cross-check-integrity
 test total-changes-on-update-multiple-rows {
     create table temp (t1 integer primary key, t2 text);
     insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
@@ -48,6 +53,7 @@ expect {
     5
 }
 
+@cross-check-integrity
 test total-changes-on-update-no-match {
     create table temp (t1 integer primary key, t2 text);
     insert into temp values (1, 'a'), (2, 'b');
@@ -58,6 +64,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test total-changes-insert-in-transaction {
     create table t(id integer primary key, val text);
     begin;
@@ -69,6 +76,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test total-changes-insert-in-transaction-after-commit {
     create table t(id integer primary key, val text);
     begin;
@@ -80,6 +88,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test total-changes-multiple-stmts-in-transaction {
     create table t(id integer primary key, val text);
     insert into t values(1, 'a'), (2, 'b');

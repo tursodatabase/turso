@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test pragma-index-info-single-column {
     CREATE TABLE t1(a, b, c);
     CREATE INDEX idx1 ON t1(b);
@@ -9,6 +10,7 @@ expect {
     0|1|b
 }
 
+@cross-check-integrity
 test pragma-index-info-equals-syntax {
     CREATE TABLE t1(a, b, c);
     CREATE INDEX idx1 ON t1(b);
@@ -18,6 +20,7 @@ expect {
     0|1|b
 }
 
+@cross-check-integrity
 test pragma-index-info-multi-column {
     CREATE TABLE t1(a, b, c);
     CREATE INDEX idx1 ON t1(b, c);
@@ -28,6 +31,7 @@ expect {
     1|2|c
 }
 
+@cross-check-integrity
 test pragma-index-info-unique-index {
     CREATE TABLE t1(a, b, c);
     CREATE UNIQUE INDEX idx1 ON t1(a, c);
@@ -38,6 +42,7 @@ expect {
     1|2|c
 }
 
+@cross-check-integrity
 test pragma-index-info-autoindex {
     CREATE TABLE t1(a PRIMARY KEY, b, c);
     PRAGMA index_info('sqlite_autoindex_t1_1');
@@ -52,6 +57,7 @@ test pragma-index-info-nonexistent {
 expect {
 }
 
+@cross-check-integrity
 test pragma-index-info-function-syntax {
     CREATE TABLE t1(a, b, c);
     CREATE INDEX idx1 ON t1(a);

@@ -1,6 +1,7 @@
 @database :memory:
 
 #!/usr/bin/env tclsh
+@cross-check-integrity
 test default-value-text {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY, y TEXT DEFAULT 'default_value');
     INSERT INTO t1 (x) VALUES (1);
@@ -10,6 +11,7 @@ expect {
     default_value
 }
 
+@cross-check-integrity
 test default-value-integer {
     CREATE TABLE t2 (x INTEGER PRIMARY KEY, y INTEGER DEFAULT 42);
     INSERT INTO t2 (x) VALUES (1);
@@ -19,6 +21,7 @@ expect {
     42
 }
 
+@cross-check-integrity
 test default-value-real {
     CREATE TABLE t3 (x INTEGER PRIMARY KEY, y REAL DEFAULT 3.14);
     INSERT INTO t3 (x) VALUES (1);
@@ -28,6 +31,7 @@ expect {
     3.14
 }
 
+@cross-check-integrity
 test default-value-null {
     CREATE TABLE t5 (x INTEGER PRIMARY KEY, y TEXT DEFAULT NULL);
     INSERT INTO t5 (x) VALUES (1);
@@ -36,6 +40,7 @@ test default-value-null {
 expect {
 }
 
+@cross-check-integrity
 test default-value-boolean {
     CREATE TABLE t6 (x INTEGER PRIMARY KEY, y BOOLEAN DEFAULT 1);
     INSERT INTO t6 (x) VALUES (1);
@@ -45,6 +50,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test default-value-function {
     CREATE TABLE t7 (x INTEGER PRIMARY KEY, y INTEGER DEFAULT (ABS(-5)));
     INSERT INTO t7 (x) VALUES (1);
@@ -54,6 +60,7 @@ expect {
     5
 }
 
+@cross-check-integrity
 test default-value-identifier {
     CREATE TABLE t7 (x INTEGER PRIMARY KEY, y DEFAULT asdf);
     INSERT INTO t7 (x) VALUES (1);

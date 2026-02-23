@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test changes-on-basic-insert {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1);
@@ -9,6 +10,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test changes-on-multiple-row-insert {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3);
@@ -18,6 +20,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test changes-shows-most-recent {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3);
@@ -29,6 +32,7 @@ expect {
 }
 
 # github.com/tursodatabase/turso/issues/3259
+@cross-check-integrity
 test changes-doesnt-track-indexes {
     create table users (id integer primary key, name text, age integer);
     create index idx_name on users(name);
@@ -42,6 +46,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3688
+@cross-check-integrity
 test changes-1_69 {
     create table t(id integer primary key, value text);
     insert into t values (1, 'a');
@@ -54,6 +59,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test changes-delete-doesnt-track-indexes {
     create table t (a int);
     create index idx on t(a);
@@ -65,6 +71,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test changes-on-delete {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3), (4), (5);
@@ -75,6 +82,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test changes-on-update {
     create table temp (t1 integer, t2 text, primary key (t1));
     insert into temp values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
@@ -85,6 +93,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test changes-on-update-rowid {
     create table temp (t1 integer primary key, t2 text);
     insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
@@ -95,6 +104,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test changes-resets-after-select {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3);
@@ -108,6 +118,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test changes-on-delete-no-match {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3);
@@ -118,6 +129,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test changes-on-update-no-match {
     create table temp (t1 integer, t2 text, primary key (t1));
     insert into temp values (1, 'a'), (2, 'b');
@@ -128,6 +140,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test changes-on-delete-all {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3), (4), (5), (6);
@@ -138,6 +151,7 @@ expect {
     6
 }
 
+@cross-check-integrity
 test changes-mixed-operations {
     create table temp (t1 integer, t2 text, primary key (t1));
     insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
@@ -149,6 +163,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test changes-insert-in-transaction {
     create table t(id integer primary key, val text);
     begin;
@@ -160,6 +175,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test changes-insert-in-transaction-after-commit {
     create table t(id integer primary key, val text);
     begin;
@@ -171,6 +187,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test changes-delete-in-transaction {
     create table t(id integer primary key, val integer);
     insert into t values(1, 10), (2, 20), (3, 30);
@@ -183,6 +200,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test changes-insert-in-transaction-with-prior-data {
     create table t(id integer primary key, val integer);
     insert into t values(1, 10), (2, 20), (3, 30);
@@ -195,6 +213,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test changes-update-in-transaction {
     create table t(id integer primary key, val text);
     insert into t values(1, 'a'), (2, 'b'), (3, 'c');
@@ -207,6 +226,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test changes-multiple-stmts-in-transaction {
     create table t(id integer primary key, val text);
     begin;
@@ -221,6 +241,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test changes-with-returning {
     create table t1(a integer primary key, b text);
 

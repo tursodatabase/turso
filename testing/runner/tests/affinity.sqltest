@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test affinity {
     CREATE TABLE t1 (c INTEGER);
     INSERT INTO t1 VALUES ('1');
@@ -11,6 +12,7 @@ expect {
     1a|text
 }
 
+@cross-check-integrity
 test affinity-nan-inf-integer {
     CREATE TABLE t1 (c INTEGER);
     INSERT INTO t1 VALUES ('nan'), ('inf');
@@ -21,6 +23,7 @@ expect {
     text|'inf'
 }
 
+@cross-check-integrity
 test affinity-rowid {
     create table t(a integer);
     insert into t(rowid, a) values (1, 1);
@@ -35,6 +38,7 @@ expect {
 # ============================================
 # TEXT affinity: numeric values should be converted to text on INSERT
 # ============================================
+@cross-check-integrity
 test affinity-insert-text-from-real {
     CREATE TABLE t1 (c1 TEXT);
     INSERT INTO t1 VALUES (1025.1655084065987);
@@ -44,6 +48,7 @@ expect {
     1025.1655084066|text
 }
 
+@cross-check-integrity
 test affinity-insert-text-from-integer {
     CREATE TABLE t1 (c1 TEXT);
     INSERT INTO t1 VALUES (42);
@@ -56,6 +61,7 @@ expect {
 # ============================================
 # TEXT affinity with index: both table and index should use converted value
 # ============================================
+@cross-check-integrity
 test affinity-insert-text-with-index {
     CREATE TABLE t1 (c1 TEXT);
     CREATE INDEX i1 ON t1 (c1);
@@ -69,6 +75,7 @@ expect {
 # ============================================
 # UPDATE with TEXT affinity: numeric values should be converted
 # ============================================
+@cross-check-integrity
 test affinity-update-text-from-real {
     CREATE TABLE t1 (c1 TEXT);
     INSERT INTO t1 VALUES ('initial');
@@ -79,6 +86,7 @@ expect {
     999.888|text
 }
 
+@cross-check-integrity
 test affinity-update-text-with-index {
     CREATE TABLE t1 (c1 TEXT);
     CREATE INDEX i1 ON t1 (c1);
@@ -93,6 +101,7 @@ expect {
 # ============================================
 # UPSERT with TEXT affinity
 # ============================================
+@cross-check-integrity
 test affinity-upsert-text {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, c1 TEXT);
     INSERT INTO t1 VALUES (1, 'initial');
@@ -121,6 +130,7 @@ expect {
 # ============================================
 # IN clause with TEXT column: should apply TEXT affinity to comparison
 # ============================================
+@cross-check-integrity
 test affinity-in-text-column {
     CREATE TABLE t1 (name TEXT);
     INSERT INTO t1 VALUES ('1'), ('2'), ('3'), ('abc');
@@ -132,6 +142,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test affinity-in-text-column-with-index {
     CREATE TABLE t1 (name TEXT);
     INSERT INTO t1 VALUES ('1'), ('2'), ('3'), ('abc');
@@ -147,6 +158,7 @@ expect {
 # ============================================
 # IN clause with INTEGER column: should apply INTEGER affinity
 # ============================================
+@cross-check-integrity
 test affinity-in-integer-column {
     CREATE TABLE t1 (id INTEGER);
     INSERT INTO t1 VALUES (1), (2), (3), (100);
@@ -158,6 +170,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test affinity-in-subquery-cast-text {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, v REAL);
     INSERT INTO t1 VALUES (893900, 835162.5053372835);
@@ -167,6 +180,7 @@ expect {
     893900
 }
 
+@cross-check-integrity
 test affinity-in-subquery-group-concat {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, v REAL);
     INSERT INTO t1 VALUES (1, 1.0), (2, 2.0), (3, 3.0);
@@ -178,6 +192,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test affinity-in-subquery-text-lhs-integer-rhs {
     CREATE TABLE t_text (a TEXT);
     CREATE TABLE t_int (i INTEGER);
@@ -194,6 +209,7 @@ expect {
 # ============================================
 # Multiple columns with different affinities
 # ============================================
+@cross-check-integrity
 test affinity-mixed-columns-insert {
     CREATE TABLE t1 (a TEXT, b INTEGER, c REAL);
     INSERT INTO t1 VALUES (100, '200', '300.5');
@@ -203,6 +219,7 @@ expect {
     100|text|200|integer|300.5|real
 }
 
+@cross-check-integrity
 test affinity-mixed-columns-update {
     CREATE TABLE t1 (a TEXT, b INTEGER, c REAL);
     INSERT INTO t1 VALUES ('x', 0, 0.0);
@@ -216,6 +233,7 @@ expect {
 # ============================================
 # Original test case from issue https://github.com/tursodatabase/turso/issues/4154
 # ============================================
+@cross-check-integrity
 test affinity-original-issue {
     CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
     INSERT INTO t1 VALUES (' ');
@@ -231,6 +249,7 @@ text|
 # ============================================
 # TEXT affinity: numeric values should be converted to text on INSERT
 # ============================================
+@cross-check-integrity
 test affinity-insert-text-from-real-2 {
     CREATE TABLE t1 (c1 TEXT);
     INSERT INTO t1 VALUES (1025.1655084065987);
@@ -240,6 +259,7 @@ expect {
     1025.1655084066|text
 }
 
+@cross-check-integrity
 test affinity-insert-text-from-integer-2 {
     CREATE TABLE t1 (c1 TEXT);
     INSERT INTO t1 VALUES (42);
@@ -252,6 +272,7 @@ expect {
 # ============================================
 # TEXT affinity with index: both table and index should use converted value
 # ============================================
+@cross-check-integrity
 test affinity-insert-text-with-index-2 {
     CREATE TABLE t1 (c1 TEXT);
     CREATE INDEX i1 ON t1 (c1);
@@ -265,6 +286,7 @@ expect {
 # ============================================
 # UPDATE with TEXT affinity: numeric values should be converted
 # ============================================
+@cross-check-integrity
 test affinity-update-text-from-real-2 {
     CREATE TABLE t1 (c1 TEXT);
     INSERT INTO t1 VALUES ('initial');
@@ -275,6 +297,7 @@ expect {
     999.888|text
 }
 
+@cross-check-integrity
 test affinity-update-text-with-index-2 {
     CREATE TABLE t1 (c1 TEXT);
     CREATE INDEX i1 ON t1 (c1);
@@ -289,6 +312,7 @@ expect {
 # ============================================
 # UPSERT with TEXT affinity
 # ============================================
+@cross-check-integrity
 test affinity-upsert-text-2 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, c1 TEXT);
     INSERT INTO t1 VALUES (1, 'initial');
@@ -302,6 +326,7 @@ expect {
 # ============================================
 # IN clause with TEXT column: should apply TEXT affinity to comparison
 # ============================================
+@cross-check-integrity
 test affinity-in-text-column-2 {
     CREATE TABLE t1 (name TEXT);
     INSERT INTO t1 VALUES ('1'), ('2'), ('3'), ('abc');
@@ -313,6 +338,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test affinity-in-text-column-with-index-2 {
     CREATE TABLE t1 (name TEXT);
     INSERT INTO t1 VALUES ('1'), ('2'), ('3'), ('abc');
@@ -328,6 +354,7 @@ expect {
 # ============================================
 # IN clause with INTEGER column: should apply INTEGER affinity
 # ============================================
+@cross-check-integrity
 test affinity-in-integer-column-2 {
     CREATE TABLE t1 (id INTEGER);
     INSERT INTO t1 VALUES (1), (2), (3), (100);
@@ -342,6 +369,7 @@ expect {
 # ============================================
 # Multiple columns with different affinities
 # ============================================
+@cross-check-integrity
 test affinity-mixed-columns-insert-2 {
     CREATE TABLE t1 (a TEXT, b INTEGER, c REAL);
     INSERT INTO t1 VALUES (100, '200', '300.5');
@@ -351,6 +379,7 @@ expect {
     100|text|200|integer|300.5|real
 }
 
+@cross-check-integrity
 test affinity-mixed-columns-update-2 {
     CREATE TABLE t1 (a TEXT, b INTEGER, c REAL);
     INSERT INTO t1 VALUES ('x', 0, 0.0);
@@ -364,6 +393,7 @@ expect {
 # ============================================
 # Original test case from issue https://github.com/tursodatabase/turso/issues/4154
 # ============================================
+@cross-check-integrity
 test affinity-original-issue-2 {
     CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
     INSERT INTO t1 VALUES (' ');
@@ -376,6 +406,7 @@ text|1025.1655084066
 text| 
 }
 
+@cross-check-integrity
 test affinity-ascii-whitespace-1_1 {
     CREATE TABLE nb1(i INTEGER);
     INSERT INTO nb1 VALUES ('12' || CHAR(160));
@@ -390,6 +421,7 @@ expect {
 # REAL affinity with leading + sign
 # Strings with leading + should be converted to REAL
 # ============================================
+@cross-check-integrity
 test affinity-real-leading-plus-sign {
     CREATE TABLE t0 (c0 REAL);
     INSERT INTO t0 VALUES ('+3'), ('+3.14'), ('+1e5');
@@ -407,6 +439,7 @@ expect @js {
     real|100000
 }
 
+@cross-check-integrity
 test affinity-real-mixed-signs {
     CREATE TABLE t0 (c0 REAL);
     INSERT INTO t0 VALUES ('+3'), ('-5'), ('+3.14'), ('-3.14'), ('+1e5'), ('-1e5');
@@ -432,6 +465,7 @@ expect @js {
 # ============================================
 # ANY affinity (non-STRICT vs STRICT)
 # ============================================
+@cross-check-integrity
 test affinity-any-non-strict {
     CREATE TABLE t1 (c1 ANY);
     INSERT INTO t1 VALUES ('1'), ('1.5'), ('1a');
@@ -444,6 +478,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test affinity-any-strict {
     CREATE TABLE t1 (c1 ANY) STRICT;
     INSERT INTO t1 VALUES ('1'), ('1.5'), ('1a');

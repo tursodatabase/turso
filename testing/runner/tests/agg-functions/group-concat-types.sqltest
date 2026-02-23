@@ -3,6 +3,7 @@
 # Tests for GROUP_CONCAT always returning TEXT type
 # Regression tests for: GROUP_CONCAT was returning Integer instead of Text
 
+@cross-check-integrity
 test group-concat-integer-returns-text-type {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (1), (2), (3);
@@ -12,6 +13,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-single-integer-returns-text-type {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (42);
@@ -21,6 +23,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-single-integer-value {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (42);
@@ -30,6 +33,7 @@ expect {
     42
 }
 
+@cross-check-integrity
 test group-concat-integer-separator {
     CREATE TABLE t(x TEXT);
     INSERT INTO t VALUES ('a'), ('b'), ('c');
@@ -39,6 +43,7 @@ expect {
     a100b100c
 }
 
+@cross-check-integrity
 test group-concat-integer-separator-type {
     CREATE TABLE t(x TEXT);
     INSERT INTO t VALUES ('a'), ('b'), ('c');
@@ -48,6 +53,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-null-separator {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (1), (2), (3);
@@ -57,6 +63,7 @@ expect {
     123
 }
 
+@cross-check-integrity
 test group-concat-null-separator-type {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (1), (2), (3);
@@ -66,6 +73,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-with-null-values {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (1), (NULL), (3);
@@ -75,6 +83,7 @@ expect {
     1,3
 }
 
+@cross-check-integrity
 test group-concat-only-null-values {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (NULL), (NULL);
@@ -83,6 +92,7 @@ test group-concat-only-null-values {
 expect {
 }
 
+@cross-check-integrity
 test group-concat-first-value-null {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (NULL), (1), (2);
@@ -92,6 +102,7 @@ expect {
     1,2
 }
 
+@cross-check-integrity
 test group-concat-first-value-null-type {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (NULL), (1), (2);
@@ -101,6 +112,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-float-returns-text-type {
     CREATE TABLE t(x REAL);
     INSERT INTO t VALUES (1.5);
@@ -110,6 +122,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-boolean-expression-returns-text {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (1), (2);
@@ -119,6 +132,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-boolean-expression-value {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (1), (2);
@@ -128,6 +142,7 @@ expect {
     1,1
 }
 
+@cross-check-integrity
 test string-agg-integer-returns-text-type {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (1), (2), (3);
@@ -137,6 +152,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test string-agg-single-integer-returns-text-type {
     CREATE TABLE t(x INTEGER);
     INSERT INTO t VALUES (42);
@@ -146,6 +162,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test string-agg-integer-separator {
     CREATE TABLE t(x TEXT);
     INSERT INTO t VALUES ('a'), ('b'), ('c');
@@ -157,6 +174,7 @@ expect {
 
 # Mixed type permutation tests
 
+@cross-check-integrity
 test group-concat-integer-and-text {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1), ('hello'), (2);
@@ -166,6 +184,7 @@ expect {
     1,hello,2
 }
 
+@cross-check-integrity
 test group-concat-integer-and-text-type {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1), ('hello'), (2);
@@ -175,6 +194,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-real-and-integer {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1.5), (2), (3.7);
@@ -184,6 +204,7 @@ expect {
     1.5,2,3.7
 }
 
+@cross-check-integrity
 test group-concat-real-and-integer-type {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1.5), (2), (3.7);
@@ -193,6 +214,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-text-and-real {
     CREATE TABLE t(x);
     INSERT INTO t VALUES ('abc'), (3.14), ('def');
@@ -202,6 +224,7 @@ expect {
     abc,3.14,def
 }
 
+@cross-check-integrity
 test group-concat-blob-single {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (x'48454c4c4f');
@@ -211,6 +234,7 @@ expect {
     HELLO
 }
 
+@cross-check-integrity
 test group-concat-blob-single-type {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (x'48454c4c4f');
@@ -220,6 +244,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-blob-multiple {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (x'48454c4c4f'), (x'574f524c44');
@@ -229,6 +254,7 @@ expect {
     HELLO,WORLD
 }
 
+@cross-check-integrity
 test group-concat-blob-and-text {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (x'48454c4c4f'), ('world');
@@ -238,6 +264,7 @@ expect {
     HELLO,world
 }
 
+@cross-check-integrity
 test group-concat-blob-and-integer {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (x'4142'), (123), (x'4344');
@@ -247,6 +274,7 @@ expect {
     AB,123,CD
 }
 
+@cross-check-integrity
 test group-concat-blob-and-real {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (x'4142'), (3.14);
@@ -256,6 +284,7 @@ expect {
     AB,3.14
 }
 
+@cross-check-integrity
 test group-concat-null-and-integer {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (NULL), (1), (NULL), (2);
@@ -265,6 +294,7 @@ expect {
     1,2
 }
 
+@cross-check-integrity
 test group-concat-null-and-text {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (NULL), ('a'), (NULL), ('b');
@@ -274,6 +304,7 @@ expect {
     a,b
 }
 
+@cross-check-integrity
 test group-concat-null-and-blob {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (NULL), (x'4142'), (NULL);
@@ -283,6 +314,7 @@ expect {
     AB
 }
 
+@cross-check-integrity
 test group-concat-null-and-real {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (NULL), (1.5), (NULL), (2.5);
@@ -292,6 +324,7 @@ expect {
     1.5,2.5
 }
 
+@cross-check-integrity
 test group-concat-all-types-mixed {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1), ('hello'), (3.14), (x'4142'), (NULL), (2);
@@ -301,6 +334,7 @@ expect {
     1,hello,3.14,AB,2
 }
 
+@cross-check-integrity
 test group-concat-all-types-mixed-type {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1), ('hello'), (3.14), (x'4142'), (NULL), (2);
@@ -310,6 +344,7 @@ expect {
     text
 }
 
+@cross-check-integrity
 test group-concat-integer-text-real-blob {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (42), ('foo'), (2.718), (x'424152');
@@ -319,6 +354,7 @@ expect {
     42,foo,2.718,BAR
 }
 
+@cross-check-integrity
 test group-concat-real-blob-text-integer {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1.1), (x'5858'), ('yy'), (99);
@@ -330,6 +366,7 @@ expect {
 
 # Mixed types with custom separator
 
+@cross-check-integrity
 test group-concat-mixed-types-custom-separator {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1), ('a'), (2.5);
@@ -339,6 +376,7 @@ expect {
     1 | a | 2.5
 }
 
+@cross-check-integrity
 test group-concat-blob-text-integer-separator {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (x'4142'), ('cd'), (12);
@@ -350,6 +388,7 @@ expect {
 
 # Empty string and mixed types
 
+@cross-check-integrity
 test group-concat-empty-string-and-integer {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (''), (1), ('');
@@ -359,6 +398,7 @@ expect {
     ,1,
 }
 
+@cross-check-integrity
 test group-concat-empty-string-and-blob {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (''), (x'4142'), ('');
@@ -370,6 +410,7 @@ expect {
 
 # Zero values with different types
 
+@cross-check-integrity
 test group-concat-zero-integer-and-text {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (0), ('zero'), (0);
@@ -379,6 +420,7 @@ expect {
     0,zero,0
 }
 
+@cross-check-integrity
 test group-concat-zero-real-and-text {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (0.0), ('zero');
@@ -388,6 +430,7 @@ expect {
     0.0,zero
 }
 
+@cross-check-integrity
 test group-concat-invalid-utf {
     CREATE TABLE t(s TEXT);
     INSERT INTO t VALUES (X'FF');

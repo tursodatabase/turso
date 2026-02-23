@@ -2,6 +2,7 @@
 @requires-file trigger "trigger tests require trigger support"
 
 # Basic CREATE TRIGGER
+@cross-check-integrity
 test trigger-create-basic {
     CREATE TABLE test1 (x INTEGER, y TEXT);
     CREATE TRIGGER t1 BEFORE INSERT ON test1 BEGIN INSERT INTO test1 VALUES (100, 'triggered'); END;
@@ -14,6 +15,7 @@ expect {
 }
 
 # CREATE TRIGGER IF NOT EXISTS
+@cross-check-integrity
 test trigger-create-if-not-exists {
     CREATE TABLE test2 (x INTEGER PRIMARY KEY);
     CREATE TRIGGER IF NOT EXISTS t2 BEFORE INSERT ON test2 BEGIN SELECT 1; END;
@@ -25,6 +27,7 @@ expect {
 }
 
 # DROP TRIGGER
+@cross-check-integrity
 test trigger-drop-basic {
     CREATE TABLE test3 (x INTEGER PRIMARY KEY);
     CREATE TRIGGER t3 BEFORE INSERT ON test3 BEGIN SELECT 1; END;
@@ -35,6 +38,7 @@ expect {
 }
 
 # DROP TRIGGER IF EXISTS
+@cross-check-integrity
 test trigger-drop-if-exists {
     CREATE TABLE test4 (x INTEGER PRIMARY KEY);
     DROP TRIGGER IF EXISTS nonexistent;
@@ -46,6 +50,7 @@ expect {
 }
 
 # BEFORE INSERT trigger
+@cross-check-integrity
 test trigger-before-insert {
     CREATE TABLE test5 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TRIGGER t5 BEFORE INSERT ON test5 BEGIN UPDATE test5 SET y = 'before_' || y WHERE x = NEW.x; END;
@@ -57,6 +62,7 @@ expect {
 }
 
 # AFTER INSERT trigger
+@cross-check-integrity
 test trigger-after-insert {
     CREATE TABLE test6 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log6 (x INTEGER, y TEXT);
@@ -69,6 +75,7 @@ expect {
 }
 
 # BEFORE UPDATE trigger
+@cross-check-integrity
 test trigger-before-update {
     CREATE TABLE test7 (x INTEGER PRIMARY KEY, y TEXT);
     INSERT INTO test7 VALUES (1, 'hello');
@@ -81,6 +88,7 @@ expect {
 }
 
 # AFTER UPDATE trigger
+@cross-check-integrity
 test trigger-after-update {
     CREATE TABLE test8 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log8 (old_x INTEGER, old_y TEXT, new_x INTEGER, new_y TEXT);
@@ -94,6 +102,7 @@ expect {
 }
 
 # BEFORE DELETE trigger
+@cross-check-integrity
 test trigger-before-delete {
     CREATE TABLE test9 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log9 (x INTEGER, y TEXT);
@@ -107,6 +116,7 @@ expect {
 }
 
 # AFTER DELETE trigger
+@cross-check-integrity
 test trigger-after-delete {
     CREATE TABLE test10 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log10 (x INTEGER, y TEXT);
@@ -120,6 +130,7 @@ expect {
 }
 
 # Trigger with WHEN clause
+@cross-check-integrity
 test trigger-when-clause {
     CREATE TABLE test11 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log11 (x INTEGER);
@@ -133,6 +144,7 @@ expect {
 }
 
 # Multiple triggers on same event
+@cross-check-integrity
 test trigger-multiple-same-event {
     CREATE TABLE test12 (x INTEGER PRIMARY KEY);
     CREATE TABLE log12 (msg TEXT);
@@ -147,6 +159,7 @@ expect {
 }
 
 # Triggers dropped when table is dropped
+@cross-check-integrity
 test trigger-drop-table-drops-triggers {
     CREATE TABLE test13 (x INTEGER PRIMARY KEY);
     CREATE TRIGGER t13 BEFORE INSERT ON test13 BEGIN SELECT 1; END;
@@ -157,6 +170,7 @@ expect {
 }
 
 # NEW and OLD references
+@cross-check-integrity
 test trigger-new-old-references {
     CREATE TABLE test14 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log14 (msg TEXT);
@@ -170,6 +184,7 @@ expect {
 }
 
 # Trigger with UPDATE OF clause
+@cross-check-integrity
 test trigger-update-of {
     CREATE TABLE test15 (x INTEGER PRIMARY KEY, y TEXT, z TEXT);
     CREATE TABLE log15 (msg TEXT);
@@ -185,6 +200,7 @@ expect {
 }
 
 # Recursive trigger - AFTER INSERT inserting into same table
+@cross-check-integrity
 test trigger-recursive-after-insert {
     CREATE TABLE test16 (x INTEGER PRIMARY KEY);
     CREATE TRIGGER t16 AFTER INSERT ON test16 BEGIN INSERT INTO test16 VALUES (NEW.x + 1); END;
@@ -197,6 +213,7 @@ expect {
 }
 
 # Multiple UPDATE OF columns
+@cross-check-integrity
 test trigger-update-of-multiple {
     CREATE TABLE test17 (x INTEGER PRIMARY KEY, y TEXT, z TEXT);
     CREATE TABLE log17 (msg TEXT);
@@ -213,6 +230,7 @@ expect {
 }
 
 # Complex WHEN clause with AND
+@cross-check-integrity
 test trigger-when-complex {
     CREATE TABLE test18 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log18 (x INTEGER);
@@ -227,6 +245,7 @@ expect {
 }
 
 # Nested triggers - trigger firing another trigger
+@cross-check-integrity
 test trigger-nested {
     CREATE TABLE test19 (x INTEGER PRIMARY KEY);
     CREATE TABLE test20 (x INTEGER PRIMARY KEY);
@@ -241,6 +260,7 @@ expect {
 }
 
 # BEFORE INSERT inserting into same table (recursive)
+@cross-check-integrity
 test trigger-recursive-before-insert {
     CREATE TABLE test21 (x INTEGER PRIMARY KEY);
     CREATE TRIGGER t21 BEFORE INSERT ON test21 BEGIN INSERT INTO test21 VALUES (NEW.x + 100); END;
@@ -253,6 +273,7 @@ expect {
 }
 
 # AFTER UPDATE with WHEN clause and UPDATE OF
+@cross-check-integrity
 test trigger-update-of-when {
     CREATE TABLE test22 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TRIGGER t22 AFTER UPDATE OF y ON test22 WHEN OLD.y != NEW.y BEGIN UPDATE test22 SET y = UPPER(NEW.y) WHERE x = NEW.x; END;
@@ -265,6 +286,7 @@ expect {
 }
 
 # Multiple statements in BEFORE INSERT trigger
+@cross-check-integrity
 test trigger-multiple-statements-before-insert {
     CREATE TABLE test23 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log23a (msg TEXT);
@@ -280,6 +302,7 @@ expect {
 }
 
 # Multiple statements in AFTER INSERT trigger
+@cross-check-integrity
 test trigger-multiple-statements-after-insert {
     CREATE TABLE test24 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log24a (msg TEXT);
@@ -295,6 +318,7 @@ expect {
 }
 
 # Multiple statements in BEFORE UPDATE trigger
+@cross-check-integrity
 test trigger-multiple-statements-before-update {
     CREATE TABLE test25 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log25a (msg TEXT);
@@ -311,6 +335,7 @@ expect {
 }
 
 # Multiple statements in AFTER UPDATE trigger
+@cross-check-integrity
 test trigger-multiple-statements-after-update {
     CREATE TABLE test26 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log26a (msg TEXT);
@@ -327,6 +352,7 @@ expect {
 }
 
 # Multiple statements in BEFORE DELETE trigger
+@cross-check-integrity
 test trigger-multiple-statements-before-delete {
     CREATE TABLE test27 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log27a (msg TEXT);
@@ -343,6 +369,7 @@ expect {
 }
 
 # Multiple statements in AFTER DELETE trigger
+@cross-check-integrity
 test trigger-multiple-statements-after-delete {
     CREATE TABLE test28 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log28a (msg TEXT);
@@ -359,6 +386,7 @@ expect {
 }
 
 # Multiple statements with mixed operations in BEFORE INSERT trigger
+@cross-check-integrity
 test trigger-multiple-statements-mixed-before-insert {
     CREATE TABLE test29 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE TABLE log29 (x INTEGER, y TEXT);
@@ -377,6 +405,7 @@ expect {
 }
 
 # Multiple statements with conditional logic in trigger
+@cross-check-integrity
 test trigger-multiple-statements-conditional {
     CREATE TABLE test30 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log30 (msg TEXT);
@@ -395,6 +424,7 @@ expect {
 }
 
 # Trigger that updates the same row being updated (recursive update)
+@cross-check-integrity
 test trigger-update-same-row {
     CREATE TABLE test31 (x INTEGER PRIMARY KEY, y INTEGER, z INTEGER);
     INSERT INTO test31 VALUES (1, 10, 0);
@@ -407,6 +437,7 @@ expect {
 }
 
 # Trigger that deletes the row being inserted
+@cross-check-integrity
 test trigger-delete-inserted-row {
     CREATE TABLE test32 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log32 (msg TEXT);
@@ -423,6 +454,7 @@ expect {
 }
 
 # Trigger chain: INSERT triggers UPDATE which triggers DELETE
+@cross-check-integrity
 test trigger-chain-insert-update-delete {
     CREATE TABLE test34 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log34 (msg TEXT);
@@ -440,6 +472,7 @@ expect {
 }
 
 # Trigger that inserts into the same table (recursive insert)
+@cross-check-integrity
 test trigger-recursive-insert {
     CREATE TABLE test35 (x INTEGER PRIMARY KEY, y INTEGER, depth INTEGER);
     CREATE TRIGGER t35 AFTER INSERT ON test35 WHEN NEW.depth < 3 BEGIN INSERT INTO test35 VALUES (NEW.x * 10, NEW.y + 1, NEW.depth + 1); END;
@@ -452,6 +485,7 @@ expect {
 }
 
 # Trigger that updates OLD values in BEFORE UPDATE
+@cross-check-integrity
 test trigger-update-old-reference {
     CREATE TABLE test36 (x INTEGER PRIMARY KEY, y INTEGER, z INTEGER);
     CREATE TABLE log36 (old_y INTEGER, new_y INTEGER);
@@ -467,6 +501,7 @@ expect {
 }
 
 # Trigger that causes constraint violation in another table
+@cross-check-integrity
 test trigger-constraint-violation {
     CREATE TABLE test37a (x INTEGER PRIMARY KEY);
     CREATE TABLE test37b (x INTEGER PRIMARY KEY, y INTEGER);
@@ -480,6 +515,7 @@ expect {
 }
 
 # Multiple triggers on same event with interdependencies
+@cross-check-integrity
 test trigger-multiple-interdependent {
     CREATE TABLE test38 (x INTEGER PRIMARY KEY, y INTEGER, z INTEGER);
     CREATE TRIGGER t38a AFTER INSERT ON test38 BEGIN UPDATE test38 SET y = 100 WHERE x = NEW.x; END;
@@ -492,6 +528,7 @@ expect {
 }
 
 # Trigger that references both OLD and NEW in UPDATE
+@cross-check-integrity
 test trigger-old-new-arithmetic {
     CREATE TABLE test39 (x INTEGER PRIMARY KEY, y INTEGER, delta INTEGER);
     INSERT INTO test39 VALUES (1, 10, 0);
@@ -504,6 +541,7 @@ expect {
 }
 
 # Trigger that performs DELETE based on NEW values
+@cross-check-integrity
 test trigger-delete-on-insert-condition {
     CREATE TABLE test40 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE archive40 (x INTEGER, y INTEGER);
@@ -521,6 +559,7 @@ expect {
 }
 
 # Trigger with WHEN clause that modifies the condition column
+@cross-check-integrity
 test trigger-when-clause-modification {
     CREATE TABLE test41 (x INTEGER PRIMARY KEY, y INTEGER, processed INTEGER DEFAULT 0);
     CREATE TRIGGER t41 AFTER INSERT ON test41 WHEN NEW.y > 50 BEGIN UPDATE test41 SET processed = 1 WHERE x = NEW.x; END;
@@ -536,6 +575,7 @@ expect {
 }
 
 # Trigger that creates circular dependency between two tables
+@cross-check-integrity
 test trigger-circular-dependency {
     CREATE TABLE test42a (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE test42b (x INTEGER PRIMARY KEY, y INTEGER);
@@ -552,6 +592,7 @@ expect {
 }
 
 # BEFORE trigger modifying primary key value
+@cross-check-integrity
 test trigger-before-modify-primary-key {
     CREATE TABLE test43 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TRIGGER t43 BEFORE INSERT ON test43 BEGIN UPDATE test43 SET x = NEW.x + 1000 WHERE x = NEW.x; END;
@@ -563,6 +604,7 @@ expect {
 }
 
 # UPDATE OF trigger modifying the same column it watches
+@cross-check-integrity
 test trigger-update-of-modify-same-column {
     CREATE TABLE test44 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log44 (msg TEXT);
@@ -578,6 +620,7 @@ expect {
 }
 
 # BEFORE trigger modifying column used in UPDATE OF clause
+@cross-check-integrity
 test trigger-before-modify-update-of-column {
     CREATE TABLE test45 (x INTEGER PRIMARY KEY, y INTEGER, z INTEGER);
     CREATE TABLE log45 (msg TEXT);
@@ -595,6 +638,7 @@ expect {
 }
 
 # Trigger modifying column used in WHEN clause
+@cross-check-integrity
 test trigger-modify-when-clause-column {
     CREATE TABLE test47 (x INTEGER PRIMARY KEY, y INTEGER, z INTEGER);
     CREATE TABLE log47 (msg TEXT);
@@ -610,6 +654,7 @@ expect {
 }
 
 # Trigger causing unique constraint violation with INSERT OR IGNORE
+@cross-check-integrity
 test trigger-unique-violation-ignore {
     CREATE TABLE test48 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE);
     CREATE TABLE log48 (x INTEGER);
@@ -626,6 +671,7 @@ expect {
 }
 
 # Multiple triggers modifying same column in different ways
+@cross-check-integrity
 test trigger-multiple-modify-same-column {
     CREATE TABLE test49 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TRIGGER t49a BEFORE INSERT ON test49 BEGIN UPDATE test49 SET y = y + 1 WHERE x = NEW.x; END;
@@ -639,6 +685,7 @@ expect {
 }
 
 # BEFORE trigger modifying NEW values used in WHEN clause
+@cross-check-integrity
 test trigger-before-modify-new-in-when {
     CREATE TABLE test51 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log51 (msg TEXT);
@@ -655,6 +702,7 @@ expect {
 }
 
 # UPDATE OF on non-existent column (should be silently ignored)
+@cross-check-integrity
 test trigger-update-of-nonexistent-column {
     CREATE TABLE test52 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log52 (msg TEXT);
@@ -668,6 +716,7 @@ expect {
 }
 
 # Trigger modifying same column multiple times in one trigger body
+@cross-check-integrity
 test trigger-modify-column-multiple-times {
     CREATE TABLE test53 (x INTEGER PRIMARY KEY, y INTEGER);
     INSERT INTO test53 VALUES (1, 10);
@@ -680,6 +729,7 @@ expect {
 }
 
 # Trigger that modifies rowid indirectly through updates
+@cross-check-integrity
 test trigger-modify-rowid-indirect {
     CREATE TABLE test55 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log55 (old_rowid INTEGER, new_rowid INTEGER);
@@ -697,6 +747,7 @@ expect {
 }
 
 # Trigger that references OLD.rowid and NEW.rowid with rowid alias column
+@cross-check-integrity
 test trigger-rowid-alias-old-new {
     CREATE TABLE test55b (id INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log55b (old_id INTEGER, new_id INTEGER, old_rowid INTEGER, new_rowid INTEGER);
@@ -714,6 +765,7 @@ expect {
 }
 
 # Trigger with BEFORE UPDATE that modifies rowid alias in WHEN clause
+@cross-check-integrity
 test trigger-before-update-rowid-alias-when {
     CREATE TABLE test55c (id INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log55c (msg TEXT);
@@ -729,6 +781,7 @@ expect {
 }
 
 # Trigger referencing OLD.rowid in DELETE with rowid alias column
+@cross-check-integrity
 test trigger-delete-old-rowid-alias {
     CREATE TABLE test55d (pk INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log55d (deleted_pk INTEGER, deleted_rowid INTEGER);
@@ -745,6 +798,7 @@ expect {
 }
 
 # Trigger with NEW.rowid in INSERT with rowid alias
+@cross-check-integrity
 test trigger-insert-new-rowid-alias {
     CREATE TABLE test55e (myid INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log55e (new_myid INTEGER, new_rowid INTEGER);
@@ -762,6 +816,7 @@ expect {
 }
 
 # Trigger modifying rowid through UPDATE with complex WHERE using rowid alias
+@cross-check-integrity
 test trigger-update-rowid-complex-where {
     CREATE TABLE test55f (rid INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log55f (old_rid INTEGER, new_rid INTEGER);
@@ -781,6 +836,7 @@ expect {
 }
 
 # Trigger using both rowid and rowid alias in same expression
+@cross-check-integrity
 test trigger-rowid-and-alias-mixed {
     CREATE TABLE test55g (id INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log55g (id_val INTEGER, rowid_val INTEGER, match INTEGER);
@@ -794,6 +850,7 @@ expect {
 }
 
 # Trigger that causes cascading updates through multiple tables
+@cross-check-integrity
 test trigger-cascading-updates {
     CREATE TABLE test57a (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE test57b (x INTEGER PRIMARY KEY, y INTEGER);
@@ -814,6 +871,7 @@ expect {
 }
 
 # Trigger modifying columns used in unique constraint
+@cross-check-integrity
 test trigger-modify-unique-column {
     CREATE TABLE test58 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE);
     CREATE TABLE log58 (msg TEXT);
@@ -831,6 +889,7 @@ expect {
 }
 
 # BEFORE INSERT trigger that modifies NEW.x before insertion
+@cross-check-integrity
 test trigger-before-insert-modify-new {
     CREATE TABLE test59 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TRIGGER t59 BEFORE INSERT ON test59 BEGIN UPDATE test59 SET x = NEW.x + 100 WHERE x = NEW.x; END;
@@ -842,6 +901,7 @@ expect {
 }
 
 # Trigger with UPDATE OF multiple columns, modifying one of them
+@cross-check-integrity
 test trigger-update-of-multiple-modify-one {
     CREATE TABLE test60 (x INTEGER PRIMARY KEY, y INTEGER, z INTEGER);
     CREATE TABLE log60 (msg TEXT);
@@ -862,6 +922,7 @@ expect {
 }
 
 # Trigger modifying column that's part of composite unique constraint
+@cross-check-integrity
 test trigger-modify-composite-unique {
     CREATE TABLE test62 (x INTEGER, y INTEGER, UNIQUE(x, y));
     CREATE TABLE log62 (msg TEXT);
@@ -879,6 +940,7 @@ expect {
 }
 
 # Trigger with WHEN clause that becomes false after BEFORE trigger modification
+@cross-check-integrity
 test trigger-when-becomes-false-after-before {
     CREATE TABLE test63 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TABLE log63 (msg TEXT);
@@ -895,6 +957,7 @@ expect {
 }
 
 # Trigger that inserts into same table with different rowid
+@cross-check-integrity
 test trigger-recursive-different-rowid {
     CREATE TABLE test64 (x INTEGER PRIMARY KEY, y INTEGER);
     CREATE TRIGGER t64 AFTER INSERT ON test64 WHEN NEW.y < 100 BEGIN INSERT INTO test64 VALUES (NEW.x + 1000, NEW.y + 10); END;
@@ -910,6 +973,7 @@ expect {
 }
 
 # Trigger modifying primary key through UPDATE in BEFORE trigger
+@cross-check-integrity
 test trigger-before-update-primary-key {
     CREATE TABLE test65 (x INTEGER PRIMARY KEY, y INTEGER);
     INSERT INTO test65 VALUES (1, 10);
@@ -925,6 +989,7 @@ expect {
 # The parent UPDATE's SET clause expressions (c0 = c1+1) use OLD values for columns
 # referenced in the expression (c1), but the final row gets the modified values from
 # the BEFORE trigger for columns not in the parent's SET clause (c1, c2).
+@cross-check-integrity
 test trigger-before-update-parent-expression-old-values {
     CREATE TABLE test66 (c0 INTEGER, c1 INTEGER, c2 INTEGER);
     CREATE TRIGGER tu66 BEFORE UPDATE ON test66 BEGIN UPDATE test66 SET c1=666, c2=666; END;
@@ -938,6 +1003,7 @@ expect {
 
 # Multiple BEFORE INSERT triggers - last added trigger fires first
 # SQLite evaluates triggers in reverse order of creation (LIFO)
+@cross-check-integrity
 test trigger-multiple-before-insert-lifo {
     CREATE TABLE t67(c0 INTEGER, c1 INTEGER, c2 INTEGER, whodunnit TEXT);
     CREATE TRIGGER t67_first BEFORE INSERT ON t67 BEGIN INSERT INTO t67 VALUES (NEW.c0+1, NEW.c1+2, NEW.c2+3, 't67_first'); END;
@@ -954,6 +1020,7 @@ expect {
 }
 
 # dropping table should drop triggers
+@cross-check-integrity
 test trigger-drop-make-same-table {
     create table a(id int primary key, x int);
     create table t(id int primary key, b int, d int, c int);
@@ -971,6 +1038,7 @@ expect {
     2|3000
 }
 
+@cross-check-integrity
 test trigger-cannot-create-on-system-table {
     create trigger t after insert on sqlite_master begin
     select 1;
@@ -979,6 +1047,7 @@ test trigger-cannot-create-on-system-table {
 expect error {
 }
 
+@cross-check-integrity
 test trigger-cannot-create-on-system-table-2 {
     create trigger t after insert on sqlite_master begin
     select 1;
@@ -987,6 +1056,7 @@ test trigger-cannot-create-on-system-table-2 {
 expect error {
 }
 
+@cross-check-integrity
 test trigger-col-name-trigger-subquery {
     CREATE TABLE t ( a INTEGER, b TEXT);
     CREATE TABLE t1 ( x INTEGER, y TEXT);
@@ -1005,6 +1075,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/4142
+@cross-check-integrity
 test trigger-table-qualified-where-clause {
     CREATE TABLE t1 (a REAL, b TEXT, c BLOB, d TEXT, e REAL);
     INSERT INTO t1 VALUES (-999.0, 'should_stay', X'686f6e6573745f70757269', 'original', -5858539611.591027);
@@ -1027,6 +1098,7 @@ expect @js {
 
 # https://github.com/tursodatabase/turso/issues/5177
 # NEW.rowid_alias in UPDATE trigger WHEN clause should not be NULL
+@cross-check-integrity
 test trigger-new-rowid-alias-when-clause {
     CREATE TABLE t_5177 (id INTEGER PRIMARY KEY, val TEXT, counter INTEGER DEFAULT 0);
     INSERT INTO t_5177 VALUES(1, 'a', 0), (2, 'b', 0), (3, 'c', 0);
@@ -1043,6 +1115,7 @@ expect {
 }
 
 # NEW.rowid_alias in BEFORE UPDATE trigger WHEN clause
+@cross-check-integrity
 test trigger-new-rowid-alias-when-clause-before {
     CREATE TABLE t_5177b (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE log_5177b (msg TEXT);
@@ -1060,6 +1133,7 @@ expect {
 
 # https://github.com/tursodatabase/turso/issues/5175
 # Subquery in trigger body UPDATE SET clause
+@cross-check-integrity
 test trigger-update-set-subquery {
     CREATE TABLE t1(id INTEGER PRIMARY KEY);
     CREATE TABLE counter(n INTEGER);

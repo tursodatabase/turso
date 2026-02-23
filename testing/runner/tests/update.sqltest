@@ -2,6 +2,7 @@
 
 # Basic UPDATE tests
 
+@cross-check-integrity
 test basic-update {
     CREATE TABLE temp (t1 INTEGER);
     INSERT INTO temp VALUES (1);
@@ -12,6 +13,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test update-mul {
     CREATE TABLE temp (t1 INTEGER);
     INSERT INTO temp VALUES (1),(2.0),('3'),('4.0');
@@ -25,6 +27,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test update-where {
     CREATE TABLE temp (a,b,c);
     INSERT INTO temp VALUES (1,2,33);
@@ -39,6 +42,7 @@ expect {
     1|22|33
 }
 
+@cross-check-integrity
 test update-where-2 {
     CREATE TABLE temp (a,b,c);
     INSERT INTO temp VALUES (1,22,33);
@@ -54,6 +58,7 @@ expect {
     100000
 }
 
+@cross-check-integrity
 test update-all-many {
     CREATE TABLE temp (a,b,c);
     INSERT INTO temp VALUES (1,22,33),(1,22,33),(1,22,33),(1,22,33),(1,22,33),(1,22,33),(1,22,33),(1,22,33);
@@ -64,6 +69,7 @@ expect {
     8
 }
 
+@cross-check-integrity
 test update-large-small {
     CREATE TABLE temp (a,b,c);
     INSERT INTO temp VALUES (randomblob(1024), 1, 2);
@@ -74,6 +80,7 @@ expect {
     a|1|2
 }
 
+@cross-check-integrity
 test update-null {
     CREATE TABLE temp (a,b,c);
     INSERT INTO temp VALUES (NULL, 1, 2);
@@ -86,6 +93,7 @@ expect {
     3|4|5
 }
 
+@cross-check-integrity
 test update-not-null-1 {
     CREATE TABLE temp (a,b NOT NULL,c);
     INSERT INTO temp VALUES (1, 2, 3);
@@ -96,6 +104,7 @@ expect {
     1|999|3
 }
 
+@cross-check-integrity
 test update-not-null-2 {
     CREATE TABLE temp (a,b NOT NULL,c);
     INSERT INTO temp VALUES (1, 2, 3);
@@ -104,6 +113,7 @@ test update-not-null-2 {
 expect error {
 }
 
+@cross-check-integrity
 test update-not-null-3 {
     CREATE TABLE temp (a NOT NULL, b NOT NULL, c NOT NULL);
     UPDATE temp SET a = NULL, b = NULL, c = NULL;
@@ -112,6 +122,7 @@ test update-not-null-3 {
 expect {
 }
 
+@cross-check-integrity
 test update-mixed-types {
     CREATE TABLE temp (a);
     INSERT INTO temp VALUES (1);
@@ -128,6 +139,7 @@ expect {
     updated
 }
 
+@cross-check-integrity
 test update-with-expression {
     CREATE TABLE temp (a, b);
     INSERT INTO temp VALUES (1, 10);
@@ -142,6 +154,7 @@ expect {
     45|30
 }
 
+@cross-check-integrity
 test update-self-reference {
     CREATE TABLE temp (a, b);
     INSERT INTO temp VALUES (1, 10);
@@ -154,6 +167,7 @@ expect {
     2|20
 }
 
+@cross-check-integrity
 test update-self-ref-all {
     CREATE TABLE temp (a, b, c);
     INSERT INTO temp VALUES (1, 2, 3);
@@ -166,6 +180,7 @@ expect {
     5|5|6
 }
 
+@cross-check-integrity
 test update-large-text {
     CREATE TABLE temp (a);
     INSERT INTO temp VALUES ('short');
@@ -176,6 +191,7 @@ expect {
     this is a very large text field that exceeds the default cell size and should trigger overflow handling in the btree implementation
 }
 
+@cross-check-integrity
 test update-with-null-condition {
     CREATE TABLE temp (a, b);
     INSERT INTO temp VALUES (NULL, 1);
@@ -190,6 +206,7 @@ expect {
     3|4
 }
 
+@cross-check-integrity
 test update-to-null {
     CREATE TABLE temp (a, b);
     INSERT INTO temp VALUES (1, 10);
@@ -202,6 +219,7 @@ expect {
     2|20
 }
 
+@cross-check-integrity
 test update-with-randomblob {
     CREATE TABLE temp (a, b);
     INSERT INTO temp VALUES (randomblob(100), 1);
@@ -212,6 +230,7 @@ expect {
     200
 }
 
+@cross-check-integrity
 test update-multiple-columns {
     CREATE TABLE temp (a, b, c);
     INSERT INTO temp VALUES (1, 2, 3);
@@ -224,6 +243,7 @@ expect {
     10|20|30
 }
 
+@cross-check-integrity
 test update-true-expr {
     CREATE TABLE temp (a, b, c);
     INSERT INTO temp VALUES (1, 2, 3);
@@ -237,6 +257,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/1625
+@cross-check-integrity
 test update_cache_full_regression_test_1625 {
     CREATE TABLE t (x);
     INSERT INTO t VALUES (randomblob(4096));
@@ -247,6 +268,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test update_index_regression_test {
     CREATE TABLE t (x, y);
     CREATE INDEX tx ON t (x);
@@ -268,6 +290,7 @@ expect {
 # Regression: UPDATE over expression-indexed predicate must update all matching rows,
 # not just the first one.
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+@cross-check-integrity
 test update-expression-index-json-extract-updates-all-matching-rows {
     CREATE TABLE t(id INT PRIMARY KEY, j TEXT);
     CREATE INDEX i ON t(json_extract(j, '$.x'));
@@ -288,6 +311,7 @@ expect {
 
 # Same regression with table alias in UPDATE and qualified column in expression index.
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+@cross-check-integrity
 test update-expression-index-json-extract-updates-all-matching-rows-alias {
     CREATE TABLE t(id INT PRIMARY KEY, j TEXT);
     CREATE INDEX i ON t(json_extract(j, '$.x'));
@@ -306,6 +330,7 @@ expect {
     ok
 }
 
+@cross-check-integrity
 test update_rowid_alias_index_regression_test {
     CREATE TABLE t (a INTEGER PRIMARY KEY, b);
     CREATE INDEX idx_b ON t (b);
@@ -319,6 +344,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test update_where_or_regression_test {
     CREATE TABLE t (a INTEGER);
     INSERT INTO t VALUES (1), ('hi');
@@ -330,6 +356,7 @@ expect {
     lovely_revolt
 }
 
+@cross-check-integrity
 test update_primary_key_constraint_error {
     CREATE TABLE eye (study REAL, spring BLOB, save TEXT, thank REAL, election INTEGER, PRIMARY KEY (election));
     INSERT INTO eye VALUES (183559032.521585, x'6625d092', 'Trial six should.', 2606132742.43174, 2817);
@@ -339,6 +366,7 @@ test update_primary_key_constraint_error {
 expect error {
 }
 
+@cross-check-integrity
 test update_primary_key_constraint_error_2 {
     CREATE TABLE eye (study REAL, spring BLOB, save TEXT, thank REAL, election INTEGER, PRIMARY KEY (election));
     INSERT INTO eye VALUES (183559032.521585,  x'6625d092', 'Trial six should.', 2606132742.43174, 2817);
@@ -351,6 +379,7 @@ test update_primary_key_constraint_error_2 {
 expect error {
 }
 
+@cross-check-integrity
 test update_primary_key_constraint_error_3 {
     CREATE TABLE eye (study REAL, spring BLOB, save TEXT, thank REAL, election INTEGER, PRIMARY KEY (election));
     INSERT INTO eye VALUES (183559032.521585,  x'6625d092', 'Trial six should.', 2606132742.43174, 2817);
@@ -363,6 +392,7 @@ test update_primary_key_constraint_error_3 {
 expect error {
 }
 
+@cross-check-integrity
 test update_primary_key_constraint_error_4 {
     CREATE TABLE t (a PRIMARY KEY INTEGER, b UNIQUE);
     INSERT INTO t(b) VALUES (100), (200), (300);
@@ -371,6 +401,7 @@ test update_primary_key_constraint_error_4 {
 expect error {
 }
 
+@cross-check-integrity
 test update_primary_key_unique_constraint_error {
     CREATE TABLE t (a PRIMARY KEY INTEGER, b UNIQUE);
     INSERT INTO t(b) VALUES (100), (200), (300);
@@ -379,6 +410,7 @@ test update_primary_key_unique_constraint_error {
 expect error {
 }
 
+@cross-check-integrity
 test update-single-rowid {
     CREATE TABLE t (x INTEGER PRIMARY KEY);
     INSERT INTO t VALUES (1);
@@ -389,6 +421,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test update-set-expression-missing-identifier {
     CREATE TABLE t0 (c0 INT);
     UPDATE t0 SET c0 = 1, c0 = c1;
@@ -398,6 +431,7 @@ expect error {
 
 # RETURNING clause tests for UPDATE
 
+@cross-check-integrity
 test update-returning-basic-column {
     CREATE TABLE test (id INTEGER, name TEXT, value REAL);
     INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5);
@@ -407,6 +441,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test update-returning-multiple-columns {
     CREATE TABLE test (id INTEGER, name TEXT, value REAL);
     INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5);
@@ -416,6 +451,7 @@ expect {
     1|test|20.5
 }
 
+@cross-check-integrity
 test update-returning-all-columns {
     CREATE TABLE test (id INTEGER, name TEXT, value REAL);
     INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5);
@@ -425,6 +461,7 @@ expect {
     1|test|20.5
 }
 
+@cross-check-integrity
 test update-returning-literal {
     CREATE TABLE test (id INTEGER, value INTEGER);
     INSERT INTO test (id, value) VALUES (1, 10);
@@ -434,6 +471,7 @@ expect {
     42
 }
 
+@cross-check-integrity
 test update-returning-arithmetic {
     CREATE TABLE test (id INTEGER, value INTEGER);
     INSERT INTO test (id, value) VALUES (1, 10);
@@ -443,6 +481,7 @@ expect {
     40
 }
 
+@cross-check-integrity
 test update-returning-complex-expression {
     CREATE TABLE test (id INTEGER, x INTEGER, y INTEGER);
     INSERT INTO test (id, x, y) VALUES (1, 5, 3);
@@ -452,6 +491,7 @@ expect {
     14
 }
 
+@cross-check-integrity
 test update-returning-function-call {
     CREATE TABLE test (id INTEGER, name TEXT);
     INSERT INTO test (id, name) VALUES (1, 'hello');
@@ -461,6 +501,7 @@ expect {
     WORLD
 }
 
+@cross-check-integrity
 test update-returning-mixed-expressions {
     CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
     INSERT INTO test (id, name, value) VALUES (1, 'test', 10);
@@ -470,6 +511,7 @@ expect {
     1|UPDATED|60
 }
 
+@cross-check-integrity
 test update-returning-multiple-rows {
     CREATE TABLE test (id INTEGER, name TEXT);
     INSERT INTO test (id, name) VALUES (1, 'first'), (2, 'second');
@@ -480,6 +522,7 @@ expect {
     2|updated
 }
 
+@cross-check-integrity
 test update-returning-with-where {
     CREATE TABLE test (id INTEGER, name TEXT, active INTEGER);
     INSERT INTO test (id, name, active) VALUES (1, 'first', 1), (2, 'second', 0), (3, 'third', 1);
@@ -490,6 +533,7 @@ expect {
     3|updated
 }
 
+@cross-check-integrity
 test update-returning-old-vs-new-values {
     CREATE TABLE test (id INTEGER, counter INTEGER);
     INSERT INTO test (id, counter) VALUES (1, 5);
@@ -499,6 +543,7 @@ expect {
     1|15
 }
 
+@cross-check-integrity
 test update-returning-null-values {
     CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
     INSERT INTO test (id, name, value) VALUES (1, 'test', 10);
@@ -508,6 +553,7 @@ expect {
     1||
 }
 
+@cross-check-integrity
 test basic-row-values {
     CREATE TABLE test (id INTEGER, name TEXT);
     INSERT INTO test (id, name) VALUES (1, 'test');
@@ -517,6 +563,7 @@ expect {
     2|mordor
 }
 
+@cross-check-integrity
 test parse-error-row-values {
     CREATE TABLE test (id INTEGER, name TEXT);
     INSERT INTO test (id, name) VALUES (1, 'test');
@@ -525,6 +572,7 @@ test parse-error-row-values {
 expect error {
 }
 
+@cross-check-integrity
 test row-values-repeated-values-should-take-latter {
     CREATE TABLE test (id INTEGER, name TEXT);
     INSERT INTO test (id, name) VALUES (1, 'test');
@@ -534,6 +582,7 @@ expect {
     1|shire
 }
 
+@cross-check-integrity
 test rowid-update-updates-all-indexes {
     CREATE TABLE t (a INTEGER PRIMARY KEY, b UNIQUE, c UNIQUE);
     INSERT INTO t VALUES (1,1,1);
@@ -550,6 +599,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3276
+@cross-check-integrity
 test can-update-rowid-directly {
     CREATE TABLE test (name TEXT);
     INSERT INTO test (name) VALUES ('test');
@@ -561,6 +611,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3678
+@cross-check-integrity
 test update-alias-visibility-in-where-clause {
     CREATE TABLE t(a);
     INSERT INTO t VALUES (0);
@@ -575,6 +626,7 @@ expect {
 
 # Basic UPDATE tests with indexes
 
+@cross-check-integrity
 test update-non-indexed-column {
     CREATE TABLE t (a INTEGER, b INTEGER);
     CREATE INDEX idx_a ON t(a);
@@ -588,6 +640,7 @@ expect {
     3|30
 }
 
+@cross-check-integrity
 test update-indexed-column {
     CREATE TABLE t (a INTEGER, b INTEGER);
     CREATE INDEX idx_a ON t(a);
@@ -601,6 +654,7 @@ expect {
     5|20
 }
 
+@cross-check-integrity
 test update-both-indexed-and-non-indexed {
     CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
     CREATE INDEX idx_a ON t(a);
@@ -614,6 +668,7 @@ expect {
     5|50|500
 }
 
+@cross-check-integrity
 test update-multiple-indexes {
     CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
     CREATE INDEX idx_a ON t(a);
@@ -628,6 +683,7 @@ expect {
     5|50|200
 }
 
+@cross-check-integrity
 test update-all-rows-with-index {
     CREATE TABLE t (a INTEGER, b INTEGER);
     CREATE INDEX idx_a ON t(a);
@@ -643,6 +699,7 @@ expect {
 
 # Range update tests
 
+@cross-check-integrity
 test update-range-non-indexed {
     CREATE TABLE t (a INTEGER, b INTEGER);
     CREATE INDEX idx_a ON t(a);
@@ -658,6 +715,7 @@ expect {
     5|50
 }
 
+@cross-check-integrity
 test update-range-indexed-column {
     CREATE TABLE t (a INTEGER, b INTEGER);
     CREATE INDEX idx_a ON t(a);
@@ -673,6 +731,7 @@ expect {
     103|30
 }
 
+@cross-check-integrity
 test update-range-both-columns {
     CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
     CREATE INDEX idx_a ON t(a);
@@ -688,6 +747,7 @@ expect {
     40|80|400
 }
 
+@cross-check-integrity
 test update-range-multiple-indexes {
     CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
     CREATE INDEX idx_a ON t(a);
@@ -703,6 +763,7 @@ expect {
     13|130|300
 }
 
+@cross-check-integrity
 test update-integer-pk-underflow-error {
     CREATE TABLE t (a INTEGER PRIMARY KEY);
     INSERT INTO t VALUES (-9223372036854775808);
@@ -711,6 +772,7 @@ test update-integer-pk-underflow-error {
 expect error {
 }
 
+@cross-check-integrity
 test update-integer-pk-overflow-error {
     CREATE TABLE t (a INTEGER PRIMARY KEY);
     INSERT INTO t VALUES (9223372036854775807);
@@ -721,6 +783,7 @@ expect error {
 
 # Test UPDATE with IN subquery
 
+@cross-check-integrity
 test update-in-subquery-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);
@@ -738,6 +801,7 @@ expect {
 
 # Test UPDATE with NOT IN subquery
 
+@cross-check-integrity
 test update-not-in-subquery-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);
@@ -755,6 +819,7 @@ expect {
 
 # Test UPDATE with IN subquery returning empty set
 
+@cross-check-integrity
 test update-in-subquery-empty-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);
@@ -770,6 +835,7 @@ expect {
 
 # Test UPDATE with NOT IN subquery returning empty set (should update all)
 
+@cross-check-integrity
 test update-not-in-subquery-empty-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);
@@ -785,6 +851,7 @@ expect {
 
 # Test UPDATE with EXISTS subquery
 
+@cross-check-integrity
 test update-exists-subquery-1 {
     CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
     CREATE TABLE order_items (order_id INTEGER, product TEXT);
@@ -801,6 +868,7 @@ expect {
 
 # Test UPDATE with NOT EXISTS subquery
 
+@cross-check-integrity
 test update-not-exists-subquery-1 {
     CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
     CREATE TABLE order_items (order_id INTEGER, product TEXT);
@@ -817,6 +885,7 @@ expect {
 
 # Test UPDATE with scalar comparison subquery (=)
 
+@cross-check-integrity
 test update-scalar-eq-subquery-1 {
     CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department_id INTEGER, bonus INTEGER);
     CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);
@@ -833,6 +902,7 @@ expect {
 
 # Test UPDATE with scalar comparison subquery (>)
 
+@cross-check-integrity
 test update-scalar-gt-subquery-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER, status TEXT);
     CREATE TABLE t2 (threshold INTEGER);
@@ -850,6 +920,7 @@ expect {
 
 # Test UPDATE with scalar comparison subquery (<)
 
+@cross-check-integrity
 test update-scalar-lt-subquery-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER, status TEXT);
     CREATE TABLE t2 (threshold INTEGER);
@@ -867,6 +938,7 @@ expect {
 
 # Test UPDATE with scalar subquery using aggregate
 
+@cross-check-integrity
 test update-scalar-agg-subquery-1 {
     CREATE TABLE items (id INTEGER PRIMARY KEY, score INTEGER, rating TEXT);
     INSERT INTO items VALUES (1, 10, 'unknown'), (2, 20, 'unknown'), (3, 30, 'unknown'), (4, 40, 'unknown'), (5, 50, 'unknown');
@@ -883,6 +955,7 @@ expect {
 
 # Test UPDATE with EXISTS and empty subquery result
 
+@cross-check-integrity
 test update-exists-empty-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);
@@ -896,6 +969,7 @@ expect {
     3|c
 }
 
+@cross-check-integrity
 test update-or-ignore-rowid-change-preserves-index {
     CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER);
     CREATE UNIQUE INDEX t_u ON t(u);
@@ -919,6 +993,7 @@ expect {
 
 # https://github.com/tursodatabase/turso/issues/5175
 # UPDATE SET with scalar subquery
+@cross-check-integrity
 test update-set-subquery {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER);
     CREATE TABLE t2(n INTEGER);
@@ -932,6 +1007,7 @@ expect {
 }
 
 # UPDATE SET with correlated scalar subquery
+@cross-check-integrity
 test update-set-correlated-subquery {
     CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, category_id INTEGER);
     CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT, item_count INTEGER);

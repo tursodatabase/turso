@@ -1,6 +1,7 @@
 @database :memory:
 
 @skip-if mvcc "panic: transaction should exist in txs map"
+@cross-check-integrity
 test left-join-virtual-table-matching {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t1 VALUES (0, 'alice');
@@ -15,6 +16,7 @@ expect {
 }
 
 @skip-if mvcc "panic: transaction should exist in txs map"
+@cross-check-integrity
 test left-join-virtual-table-null {
     CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t2 VALUES (0, 'alice');
@@ -29,6 +31,7 @@ expect {
 }
 
 @skip-if mvcc "panic: transaction should exist in txs map"
+@cross-check-integrity
 test left-join-virtual-table-on-left-matching {
     CREATE TABLE t3 (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t3 VALUES (0, 'alice');
@@ -43,6 +46,7 @@ expect {
 }
 
 @skip-if mvcc "panic: transaction should exist in txs map"
+@cross-check-integrity
 test left-join-virtual-table-on-left-null {
     CREATE TABLE t4 (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t4 VALUES (0, 'alice');

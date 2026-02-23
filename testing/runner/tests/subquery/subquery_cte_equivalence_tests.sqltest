@@ -607,6 +607,7 @@ expect {
 }
 
 @setup banana_report_seed
+@cross-check-integrity
 test banana-report-streak-current-subquery-rich {
 INSERT INTO peel_note(note_id, speaker_tag, created_ms) VALUES
 ('note-rich-001', 'banana-user', 1770897600000.0);
@@ -755,6 +756,7 @@ expect {
 }
 
 @setup banana_report_seed
+@cross-check-integrity
 test banana-report-streak-current-cte-rich {
 INSERT INTO peel_note(note_id, speaker_tag, created_ms) VALUES
 ('note-rich-002', 'banana-user', 1770897600000.0);

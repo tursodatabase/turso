@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test create-index-quoted-identifiers {
     CREATE TABLE "t t" ("a a");
     CREATE INDEX "idx idx" ON "t t" ("a a");
@@ -13,6 +14,7 @@ expect {
 }
 
 # single-column index key: creating unique index fails with duplicates
+@cross-check-integrity
 test create-unique-index-with-duplicates-1 {
     CREATE TABLE t1(a, b);
     INSERT INTO t1 VALUES(1, 1);
@@ -23,6 +25,7 @@ expect error {
 }
 
 # multi-column index key: creating unique index fails with duplicates
+@cross-check-integrity
 test create-unique-index-with-duplicates-2 {
     CREATE TABLE t2(a, b, c);
     INSERT INTO t2 VALUES(1, 2, 3);
@@ -33,6 +36,7 @@ expect error {
 }
 
 # single-column index key: creating unique index succeeds because NULLs are never equal
+@cross-check-integrity
 test create-unique-index-with-duplicates-3 {
     CREATE TABLE t3(a);
     INSERT INTO t3 VALUES(NULL);
@@ -45,6 +49,7 @@ expect {
 }
 
 # multi-column index key: creating unique index succeeds because NULLs are never equal
+@cross-check-integrity
 test create-unique-index-with-duplicates-4 {
     CREATE TABLE t4(a, b);
     INSERT INTO t4 VALUES(1, NULL);
@@ -57,6 +62,7 @@ expect {
 }
 
 # multi-column index key: creating unique index succeeds when all NULLs
+@cross-check-integrity
 test create-unique-index-with-duplicates-5 {
     CREATE TABLE t5(a, b);
     INSERT INTO t5 VALUES(NULL, NULL);
@@ -70,6 +76,7 @@ expect {
 
 # creating index on rowid (pseudo-column) should fail
 # SQLite: "no such column: rowid", Limbo: "invalid expression in CREATE INDEX: rowid"
+@cross-check-integrity
 test create-index-on-rowid {
     CREATE TABLE t6(x);
     CREATE INDEX idx6 ON t6(rowid);
@@ -80,6 +87,7 @@ expect error {
 
 # creating index on _rowid_ (pseudo-column alias) should fail
 # SQLite: "no such column: _rowid_", Limbo: "invalid expression in CREATE INDEX: _rowid_"
+@cross-check-integrity
 test create-index-on-rowid-alias-1 {
     CREATE TABLE t7(x);
     CREATE INDEX idx7 ON t7(_rowid_);
@@ -90,6 +98,7 @@ expect error {
 
 # creating index on oid (pseudo-column alias) should fail
 # SQLite: "no such column: oid", Limbo: "invalid expression in CREATE INDEX: oid"
+@cross-check-integrity
 test create-index-on-rowid-alias-2 {
     CREATE TABLE t8(x);
     CREATE INDEX idx8 ON t8(oid);
@@ -99,6 +108,7 @@ expect error {
 }
 
 # creating index on shadowed rowid column should succeed
+@cross-check-integrity
 test create-index-on-shadowed-rowid {
     CREATE TABLE t9(rowid int, x);
     CREATE INDEX idx9 ON t9(rowid);
@@ -109,6 +119,7 @@ expect {
 }
 
 # creating index on shadowed _rowid_ column should succeed
+@cross-check-integrity
 test create-index-on-shadowed-rowid-alias-1 {
     CREATE TABLE t10(_rowid_ int, x);
     CREATE INDEX idx10 ON t10(_rowid_);
@@ -119,6 +130,7 @@ expect {
 }
 
 # creating index on shadowed oid column should succeed
+@cross-check-integrity
 test create-index-on-shadowed-rowid-alias-2 {
     CREATE TABLE t11(oid int, x);
     CREATE INDEX idx11 ON t11(oid);
@@ -135,6 +147,7 @@ expect {
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # String literal that doesn't match a column should fail.
 # SQLite error: "no such column: literal"
+@cross-check-integrity
 test create-index-string-literal-no-such-column {
     CREATE TABLE t12(c0, c1, c2);
     CREATE INDEX idx12 ON t12('nonexistent');
@@ -144,6 +157,7 @@ expect error {
 
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # String literal that matches a column name should succeed (SQLite quirk).
+@cross-check-integrity
 test create-index-string-literal-matches-column {
     CREATE TABLE t12b(c0, c1, mycolumn);
     CREATE INDEX idx12b ON t12b('mycolumn');
@@ -155,6 +169,7 @@ expect {
 
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Numeric literal as index column is allowed (SQLite allows this).
+@cross-check-integrity
 test create-index-numeric-literal-column {
     CREATE TABLE t13(c0, c1);
     CREATE INDEX idx13 ON t13(42);
@@ -166,6 +181,7 @@ expect {
 
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Pure numeric expression (no column refs) is allowed (SQLite allows this).
+@cross-check-integrity
 test create-index-literal-expression {
     CREATE TABLE t14(c0, c1);
     CREATE INDEX idx14 ON t14(1 + 1);
@@ -177,6 +193,7 @@ expect {
 
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Expression with column reference should succeed.
+@cross-check-integrity
 test create-index-expression-with-column {
     CREATE TABLE t15(c0, c1);
     CREATE INDEX idx15 ON t15(c0 + 1);
@@ -189,6 +206,7 @@ expect {
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Multiple columns where one is a string literal not matching any column should fail.
 # SQLite error: "no such column: literal"
+@cross-check-integrity
 test create-index-mixed-string-literal-column {
     CREATE TABLE t16(c0, c1, c2);
     CREATE INDEX idx16 ON t16(c0, 'nonexistent', c1);
@@ -198,6 +216,7 @@ expect error {
 
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # String literal inside an expression is allowed.
+@cross-check-integrity
 test create-index-string-in-expression {
     CREATE TABLE t17(c0, c1);
     CREATE INDEX idx17 ON t17(c0 || 'suffix');
@@ -209,6 +228,7 @@ expect {
 
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Deeply parenthesized string literal matching column should succeed.
+@cross-check-integrity
 test create-index-parenthesized-string-matches-column {
     CREATE TABLE t18(mycol, other);
     CREATE INDEX idx18 ON t18((((('mycol')))));
@@ -220,6 +240,7 @@ expect {
 
 @skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Deeply parenthesized string literal not matching column should fail.
+@cross-check-integrity
 test create-index-parenthesized-string-no-such-column {
     CREATE TABLE t19(c0, c1);
     CREATE INDEX idx19 ON t19((((('nonexistent')))));
@@ -228,6 +249,7 @@ expect error {
 }
 
 # Ensure version functions are considered non-deterministic and cannot be used in indexes.
+@cross-check-integrity
 test create-index-sqlite-version {
     CREATE TABLE t(x);
     CREATE INDEX i ON t(sqlite_version());
@@ -236,6 +258,7 @@ expect error {
 }
 
 @skip-if sqlite "turso_version() is not available in standard SQLite"
+@cross-check-integrity
 test create-index-turso-version {
     CREATE TABLE t2(x);
     CREATE INDEX i2 ON t2(turso_version());
@@ -243,6 +266,7 @@ test create-index-turso-version {
 expect error {
 }
 
+@cross-check-integrity
 test create-index-sqlite-source-id {
     CREATE TABLE t3(x);
     CREATE INDEX i3 ON t3(sqlite_source_id());

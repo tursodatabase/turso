@@ -66,6 +66,7 @@ expect {
 
 # Test for long CTE chains - regression test for exponential re-planning issue
 # See: https://github.com/tursodatabase/turso/issues/4887
+@cross-check-integrity
 test cte-chain-long {
     CREATE TABLE t (x INT);
     INSERT INTO t VALUES (1);
@@ -192,6 +193,7 @@ expect {
 # CTE with DML statements (INSERT, UPDATE, DELETE)
 # =============================================================================
 
+@cross-check-integrity
 test cte-insert-basic {
     CREATE TABLE t(x);
     WITH c AS (SELECT 1 as x) INSERT INTO t SELECT * FROM c;
@@ -201,6 +203,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test cte-insert-union {
     CREATE TABLE t(x);
     WITH c AS (SELECT 1 UNION SELECT 2 UNION SELECT 3) INSERT INTO t SELECT * FROM c;
@@ -212,6 +215,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test cte-insert-chain {
     CREATE TABLE t(x);
     WITH a AS (SELECT 1 as x), b AS (SELECT x + 10 FROM a) INSERT INTO t SELECT * FROM b;
@@ -221,6 +225,7 @@ expect {
     11
 }
 
+@cross-check-integrity
 test cte-delete-basic {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1),(2),(3);
@@ -232,6 +237,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test cte-delete-union {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1),(2),(3),(4);
@@ -243,6 +249,7 @@ expect {
     4
 }
 
+@cross-check-integrity
 test cte-delete-chain {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1),(2),(3);
@@ -254,6 +261,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test cte-update-where {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1),(2),(3);
@@ -266,6 +274,7 @@ expect {
     11
 }
 
+@cross-check-integrity
 test cte-update-chain {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1),(2),(3);
@@ -278,6 +287,7 @@ expect {
     200
 }
 
+@cross-check-integrity
 test cte-delete-multiple-ctes {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1),(2),(3),(4),(5);
@@ -289,6 +299,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test cte-multi-ref-where {
     CREATE TABLE t(x, y);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
@@ -301,6 +312,7 @@ expect {
     3|30
 }
 
+@cross-check-integrity
 test cte-insert-returning {
     CREATE TABLE t(x);
     WITH c AS (SELECT 42 as x) INSERT INTO t SELECT * FROM c RETURNING x;
@@ -309,6 +321,7 @@ expect {
     42
 }
 
+@cross-check-integrity
 test cte-delete-returning {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1),(2),(3);
@@ -318,6 +331,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test cte-update-returning {
     CREATE TABLE t(x);
     INSERT INTO t VALUES (1),(2),(3);
@@ -337,6 +351,7 @@ expect {
 
 # Direct CTE column reference in SET clause is invalid SQL (issue #5224).
 # SQLite rejects with "no such column: c.v", we reject with "no such table: c".
+@cross-check-integrity
 test cte-update-direct-ref-keyed {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 2);
@@ -347,6 +362,7 @@ expect error {
 }
 
 # Same on non-keyed table
+@cross-check-integrity
 test cte-update-direct-ref-nonkeyed {
     CREATE TABLE t(a, b);
     INSERT INTO t VALUES(1, 2);
@@ -357,6 +373,7 @@ expect error {
 }
 
 # CTE in WHERE clause on INTEGER PRIMARY KEY table
+@cross-check-integrity
 test cte-update-keyed-where {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
@@ -370,6 +387,7 @@ expect {
 }
 
 # Chained CTEs in WHERE on keyed table
+@cross-check-integrity
 test cte-update-keyed-chained-where {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
@@ -383,6 +401,7 @@ expect {
 }
 
 # CTE with multi-row result in WHERE on keyed table
+@cross-check-integrity
 test cte-update-keyed-multirow-where {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10), (2, 20), (3, 30), (4, 40);
@@ -397,6 +416,7 @@ expect {
 }
 
 # CTE with subquery in SET clause on keyed table (updates non-PK column)
+@cross-check-integrity
 test cte-update-keyed-set-subquery {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 2);
@@ -408,6 +428,7 @@ expect {
 }
 
 # CTE with subquery in SET updating the PRIMARY KEY itself
+@cross-check-integrity
 test cte-update-keyed-set-pk-subquery {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 2);
@@ -419,6 +440,7 @@ expect {
 }
 
 # CTE used in both SET subquery and WHERE on keyed table
+@cross-check-integrity
 test cte-update-keyed-set-and-where-subquery {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 2), (3, 4);
@@ -431,6 +453,7 @@ expect {
 }
 
 # Multiple CTEs, one in WHERE one in SET subquery, keyed table
+@cross-check-integrity
 test cte-update-keyed-multiple-ctes-set-where {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 2), (3, 4);
@@ -443,6 +466,7 @@ expect {
 }
 
 # CTE with UPDATE + RETURNING on keyed table
+@cross-check-integrity
 test cte-update-keyed-returning {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 2), (3, 4);
@@ -453,6 +477,7 @@ expect {
 }
 
 # CTE updating PK with RETURNING on keyed table
+@cross-check-integrity
 test cte-update-keyed-pk-returning {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 2);
@@ -463,6 +488,7 @@ expect {
 }
 
 # CTE + UPDATE on keyed table with secondary index
+@cross-check-integrity
 test cte-update-keyed-with-index {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     CREATE INDEX idx_b ON t(b);
@@ -476,6 +502,7 @@ expect {
 }
 
 # CTE in WHERE + SET + RETURNING with text column on keyed table
+@cross-check-integrity
 test cte-update-keyed-text-returning {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t VALUES(1, 'old'), (2, 'keep');
@@ -486,6 +513,7 @@ expect {
 }
 
 # CTE referencing the table being updated, used in WHERE on keyed table
+@cross-check-integrity
 test cte-update-keyed-self-ref-where {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
@@ -499,6 +527,7 @@ expect {
 }
 
 # CTE referencing table being updated, used in SET subquery on keyed table
+@cross-check-integrity
 test cte-update-keyed-self-ref-set {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 100), (2, 200);
@@ -511,6 +540,7 @@ expect {
 }
 
 # CTE with aggregate in SET subquery on keyed table
+@cross-check-integrity
 test cte-update-keyed-aggregate-set {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
@@ -524,6 +554,7 @@ expect {
 }
 
 # CTE with LIMIT in WHERE on keyed table
+@cross-check-integrity
 test cte-update-keyed-limit-where {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
@@ -537,6 +568,7 @@ expect {
 }
 
 # CTE WHERE with no matches on keyed table (updates nothing)
+@cross-check-integrity
 test cte-update-keyed-no-match {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10), (2, 20);
@@ -549,6 +581,7 @@ expect {
 }
 
 # CTE with empty result set in WHERE on keyed table
+@cross-check-integrity
 test cte-update-keyed-empty-cte {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10);
@@ -560,6 +593,7 @@ expect {
 }
 
 # CTE setting multiple columns via subqueries on keyed table
+@cross-check-integrity
 test cte-update-keyed-multi-col-set {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b, c);
     INSERT INTO t VALUES(1, 'old_b', 'old_c');
@@ -571,6 +605,7 @@ expect {
 }
 
 # CTE DELETE on keyed table
+@cross-check-integrity
 test cte-delete-keyed-where {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
@@ -583,6 +618,7 @@ expect {
 }
 
 # CTE with UNIQUE constraint (non-PK) table
+@cross-check-integrity
 test cte-update-unique-where {
     CREATE TABLE t(a INTEGER, b TEXT UNIQUE);
     INSERT INTO t VALUES(1, 'x'), (2, 'y');
@@ -595,6 +631,7 @@ expect {
 }
 
 # CTE UPDATE all rows on keyed table (no WHERE filter)
+@cross-check-integrity
 test cte-update-keyed-all-rows {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10), (2, 20);
@@ -607,6 +644,7 @@ expect {
 }
 
 # CTE DELETE with RETURNING on keyed table
+@cross-check-integrity
 test cte-delete-keyed-returning {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b);
     INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
@@ -725,6 +763,7 @@ expect {
     6
 }
 
+@cross-check-integrity
 test cte-scalar-subquery-with-from {
     CREATE TABLE tbl(id);
     INSERT INTO tbl VALUES (1),(2);
@@ -814,6 +853,7 @@ expect {
 # CTE visibility in VALUES and RETURNING clause subqueries
 # =============================================================================
 
+@cross-check-integrity
 test cte-insert-values-subquery {
     CREATE TABLE t(a);
     WITH test AS (SELECT 99 as x) INSERT INTO t VALUES ((SELECT x FROM test));
@@ -823,6 +863,7 @@ expect {
     99
 }
 
+@cross-check-integrity
 test cte-insert-values-multi-subquery {
     CREATE TABLE t(a, b);
     WITH test AS (SELECT 1 as x, 2 as y) INSERT INTO t VALUES ((SELECT x FROM test), (SELECT y FROM test));
@@ -832,6 +873,7 @@ expect {
     1|2
 }
 
+@cross-check-integrity
 test cte-insert-values-multiple-rows {
     CREATE TABLE t(a);
     WITH test AS (SELECT 10 as x) INSERT INTO t VALUES ((SELECT x FROM test)), ((SELECT x + 1 FROM test));
@@ -842,6 +884,7 @@ expect {
     11
 }
 
+@cross-check-integrity
 test cte-insert-returning-subquery {
     CREATE TABLE t(a);
     WITH test AS (SELECT 99 as x) INSERT INTO t VALUES (1) RETURNING (SELECT x FROM test);
@@ -850,6 +893,7 @@ expect {
     99
 }
 
+@cross-check-integrity
 test cte-insert-returning-multi-subquery {
     CREATE TABLE t(a);
     WITH test AS (SELECT 1 as x, 2 as y) INSERT INTO t VALUES (100) RETURNING (SELECT x FROM test), (SELECT y FROM test);
@@ -858,6 +902,7 @@ expect {
     1|2
 }
 
+@cross-check-integrity
 test cte-delete-returning-subquery {
     CREATE TABLE t(a);
     INSERT INTO t VALUES (1), (2), (3);
@@ -867,6 +912,7 @@ expect {
     99
 }
 
+@cross-check-integrity
 test cte-update-returning-subquery {
     CREATE TABLE t(a);
     INSERT INTO t VALUES (1);
@@ -876,6 +922,7 @@ expect {
     99
 }
 
+@cross-check-integrity
 test cte-insert-values-and-returning-subquery {
     CREATE TABLE t(a);
     WITH test AS (SELECT 42 as x) INSERT INTO t VALUES ((SELECT x FROM test)) RETURNING (SELECT x + 1 FROM test);
@@ -888,6 +935,7 @@ expect {
 # CTE referenced twice in subquery with indexed table (issue #5074)
 # =============================================================================
 
+@cross-check-integrity
 test cte-dual-ref-indexed-subquery-empty {
     CREATE TABLE t(a);
     CREATE INDEX i ON t(a);
@@ -897,6 +945,7 @@ test cte-dual-ref-indexed-subquery-empty {
 expect {
 }
 
+@cross-check-integrity
 test cte-dual-ref-indexed-subquery {
     CREATE TABLE t(a);
     CREATE INDEX i ON t(a);
@@ -922,6 +971,7 @@ expect error {
     duplicate WITH table name
 }
 
+@cross-check-integrity
 test cte-duplicate-name-view {
     CREATE TABLE cte_dup_table(x);
     CREATE VIEW cte_dup_view AS
@@ -997,6 +1047,7 @@ expect error {
 
 # CTE shadows table but references different table
 @setup cte_shadow_table
+@cross-check-integrity
 test cte-shadows-table-refs-other {
     CREATE TABLE other(y TEXT);
     INSERT INTO other VALUES('from_other');
@@ -1146,6 +1197,7 @@ expect {
 }
 
 # CTE shadowing with UNION ALL across scopes
+@cross-check-integrity
 test cte-shadow-union-all {
     CREATE TABLE cte_shadow_t(x INTEGER);
     INSERT INTO cte_shadow_t VALUES(1);
@@ -1185,6 +1237,7 @@ expect {
 
 # Non-aggregate columns must be NULL when WHERE filters out all rows
 # from a CTE in a single-row aggregate query.
+@cross-check-integrity
 test cte-aggregate-empty-result-non-agg-columns {
     CREATE TABLE t(x INTEGER, y TEXT);
     INSERT INTO t VALUES (1, 'a'), (2, 'b');
@@ -1196,6 +1249,7 @@ expect {
 }
 
 # Same behavior expected with FROM-clause subquery
+@cross-check-integrity
 test subquery-aggregate-empty-result-non-agg-columns {
     CREATE TABLE t(x INTEGER, y TEXT);
     INSERT INTO t VALUES (1, 'a'), (2, 'b');
@@ -1253,6 +1307,7 @@ expect {
 # =============================================================================
 
 # CTE referenced in WHERE IN subquery with real table data
+@cross-check-integrity
 test cte-where-in-subquery {
     CREATE TABLE orders(id INT, amount INT);
     INSERT INTO orders VALUES(1,100),(2,200),(3,150);
@@ -1300,6 +1355,7 @@ expect {
 }
 
 # CTE in WHERE with DISTINCT and IN subquery
+@cross-check-integrity
 test cte-where-distinct-in {
     CREATE TABLE items(id INT, cat TEXT);
     INSERT INTO items VALUES(1,'a'),(2,'b'),(3,'a');

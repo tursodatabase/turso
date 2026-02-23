@@ -5,7 +5,9 @@ pub mod rust;
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
 use std::collections::HashSet;
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
+use std::time::Duration;
+use tempfile::NamedTempFile;
 
 /// Provides resolved paths for default databases
 pub trait DefaultDatabaseResolver: Send + Sync {
@@ -70,6 +72,35 @@ impl QueryResult {
     }
 }
 
+/// Handle returned from closing a database that preserves the file on disk.
+/// For temp file databases, the file is deleted when this handle is dropped.
+/// For memory databases, the path is None.
+pub struct DatabaseFileHandle {
+    /// Path to the database file on disk, if any
+    pub path: Option<PathBuf>,
+    /// Keeps the temp file alive until this handle is dropped
+    _temp_file: Option<NamedTempFile>,
+}
+
+impl DatabaseFileHandle {
+    /// Create a handle for a temp file database
+    pub fn temp(temp_file: NamedTempFile) -> Self {
+        let path = Some(temp_file.path().to_path_buf());
+        Self {
+            path,
+            _temp_file: Some(temp_file),
+        }
+    }
+
+    /// Create a handle with no file (memory databases)
+    pub fn none() -> Self {
+        Self {
+            path: None,
+            _temp_file: None,
+        }
+    }
+}
+
 /// Backend trait for executing SQL against a target
 #[async_trait]
 pub trait SqlBackend: Send + Sync {
@@ -122,8 +153,8 @@ pub trait DatabaseInstance: Send + Sync {
     /// For in-memory databases, this will combine any buffered setup SQL with the query.
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError>;
 
-    /// Close and cleanup the database
-    async fn close(self: Box<Self>) -> Result<(), BackendError>;
+    /// Close and cleanup the database, returning a handle that keeps the file alive
+    async fn close(self: Box<Self>) -> Result<DatabaseFileHandle, BackendError>;
 }
 
 /// Errors that can occur in backends

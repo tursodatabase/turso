@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test savepoint-basic-release {
     CREATE TABLE t(x);
     SAVEPOINT sp1;
@@ -11,6 +12,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test savepoint-release-inside-begin-does-not-commit {
     CREATE TABLE t(x);
     BEGIN;
@@ -23,6 +25,7 @@ test savepoint-release-inside-begin-does-not-commit {
 expect {
 }
 
+@cross-check-integrity
 test savepoint-nested-release-outer {
     CREATE TABLE t(x);
     SAVEPOINT outer_sp;
@@ -37,6 +40,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test savepoint-duplicate-name-shadowing {
     CREATE TABLE t(x);
     SAVEPOINT sp;
@@ -54,6 +58,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test savepoint-rollback-to-preserves-savepoint {
     CREATE TABLE t(x);
     SAVEPOINT sp;
@@ -81,6 +86,7 @@ test savepoint-rollback-missing-errors {
 expect error {
 }
 
+@cross-check-integrity
 test savepoint-rollback-to-can-be-repeated {
     CREATE TABLE t(x);
     SAVEPOINT sp;
@@ -96,6 +102,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test savepoint-case-insensitive-name-resolution {
     CREATE TABLE t(x);
     SAVEPOINT SpCase;
@@ -109,6 +116,7 @@ expect {
     2
 }
 
+@cross-check-integrity
 test savepoint-release-outer-removes-inner {
     CREATE TABLE t(x);
     SAVEPOINT outer;
@@ -122,6 +130,7 @@ expect error {
     no such savepoint
 }
 
+@cross-check-integrity
 test savepoint-rollback-to-top-level-then-release {
     CREATE TABLE t(x);
     SAVEPOINT root;
@@ -133,6 +142,7 @@ test savepoint-rollback-to-top-level-then-release {
 expect {
 }
 
+@cross-check-integrity
 test savepoint-rollback-undoes-mixed-dml {
     CREATE TABLE t(id INTEGER PRIMARY KEY, v, tag);
     INSERT INTO t VALUES (1, 10, 'a');
@@ -152,6 +162,7 @@ expect {
     3|30|c
 }
 
+@cross-check-integrity
 test savepoint-interleaved-duplicate-names {
     CREATE TABLE t(x);
     SAVEPOINT a;
@@ -202,6 +213,7 @@ expect error {
     no such savepoint
 }
 
+@cross-check-integrity
 test savepoint-rollback-to-restores-deferred-fk-counter {
     PRAGMA foreign_keys = ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -216,6 +228,7 @@ expect {
     0
 }
 
+@cross-check-integrity
 test savepoint-release-root-with-deferred-fk-fails {
     PRAGMA foreign_keys = ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -228,6 +241,7 @@ expect error {
     constraint failed
 }
 
+@cross-check-integrity
 test savepoint-not-reusable-after-transaction-boundary {
     CREATE TABLE t(x);
     SAVEPOINT s;

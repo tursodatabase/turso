@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test alter-table-rename-table {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY, u);
     ALTER TABLE t1 RENAME TO t2;
@@ -9,6 +10,7 @@ expect {
     t2
 }
 
+@cross-check-integrity
 test alter-table-rename-column {
     CREATE TABLE t (a INTEGER);
     CREATE INDEX i ON t (a);
@@ -21,6 +23,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/5246
+@cross-check-integrity
 test alter-table-rename-column-case-insensitive {
     CREATE TABLE t (a INT);
     ALTER TABLE t RENAME COLUMN A TO b;
@@ -30,6 +33,7 @@ expect {
     CREATE TABLE t (b INT)
 }
 
+@cross-check-integrity
 test alter-table-rename-quoted-column {
     CREATE TABLE t (a INTEGER);
     ALTER TABLE t RENAME a TO "ab cd";
@@ -39,6 +43,7 @@ expect {
     CREATE TABLE t ("ab cd" INTEGER)
 }
 
+@cross-check-integrity
 test alter-table-add-column {
     CREATE TABLE t (a);
     INSERT INTO t VALUES (1);
@@ -54,6 +59,7 @@ expect {
     1|
 }
 
+@cross-check-integrity
 test alter-table-add-column-typed {
     CREATE TABLE t (a);
     ALTER TABLE t ADD b DEFAULT 0;
@@ -66,6 +72,7 @@ expect {
     1|0
 }
 
+@cross-check-integrity
 test alter-table-add-column-invalid-multi-column-fk {
     CREATE TABLE t(a, c);
     CREATE TABLE s(a);
@@ -74,6 +81,7 @@ test alter-table-add-column-invalid-multi-column-fk {
 expect error {
 }
 
+@cross-check-integrity
 test alter-table-add-column-default {
     CREATE TABLE test (a);
     INSERT INTO test VALUES (1), (2), (3);
@@ -100,6 +108,7 @@ expect {
     0.1|hello
 }
 
+@cross-check-integrity
 test alter-table-add-quoted-column {
     CREATE TABLE test (a);
     ALTER TABLE test ADD COLUMN [b c];
@@ -109,6 +118,7 @@ expect {
     CREATE TABLE test (a, [b c])
 }
 
+@cross-check-integrity
 test alter-table-add-column-default-affinity-text {
     CREATE TABLE t(a INTEGER PRIMARY KEY);
     INSERT INTO t VALUES(1);
@@ -121,6 +131,7 @@ expect {
     2|text|0
 }
 
+@cross-check-integrity
 test alter-table-add-column-default-affinity-integer {
     CREATE TABLE t(a INTEGER PRIMARY KEY);
     INSERT INTO t VALUES(1);
@@ -131,6 +142,7 @@ expect {
     1|integer|5
 }
 
+@cross-check-integrity
 test alter-table-add-column-default-affinity-real {
     CREATE TABLE t(a INTEGER PRIMARY KEY);
     INSERT INTO t VALUES(1);
@@ -144,6 +156,7 @@ expect @js {
     1|real|3
 }
 
+@cross-check-integrity
 test alter-table-add-column-default-affinity-numeric {
     CREATE TABLE t(a INTEGER PRIMARY KEY);
     INSERT INTO t VALUES(1);
@@ -154,6 +167,7 @@ expect {
     1|integer|7
 }
 
+@cross-check-integrity
 test alter-table-drop-column {
     CREATE TABLE t (a, b);
     INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
@@ -174,6 +188,7 @@ expect {
     3
 }
 
+@cross-check-integrity
 test alter-table-drop-column-special-name {
     CREATE TABLE t (a, b, [c c]);
     INSERT INTO t VALUES (1, 2, 3);
@@ -187,6 +202,7 @@ expect {
     CREATE TABLE t (a, [c c])
 }
 
+@cross-check-integrity
 test fail-alter-table-drop-unique-column {
     CREATE TABLE t (a, b UNIQUE);
     ALTER TABLE t DROP b;
@@ -194,6 +210,7 @@ test fail-alter-table-drop-unique-column {
 expect error {
 }
 
+@cross-check-integrity
 test fail-alter-table-drop-unique-column-constraint {
     CREATE TABLE t (a, b, UNIQUE (b));
     ALTER TABLE t DROP b;
@@ -202,6 +219,7 @@ expect error {
 }
 
 # refer https://github.com/tursodatabase/turso/issues/3231
+@cross-check-integrity
 test fail-alter-table-add-duplicate-column {
     CREATE TABLE t1 (a);
     ALTER TABLE t1 ADD COLUMN a;
@@ -209,6 +227,7 @@ test fail-alter-table-add-duplicate-column {
 expect error {
 }
 
+@cross-check-integrity
 test fail-alter-table-add-duplicate-column-case-insensitive {
     CREATE TABLE t1 (a);
     ALTER TABLE t1 ADD COLUMN A;
@@ -216,6 +235,7 @@ test fail-alter-table-add-duplicate-column-case-insensitive {
 expect error {
 }
 
+@cross-check-integrity
 test fail-alter-table-drop-primary-key-column {
     CREATE TABLE t (a PRIMARY KEY, b);
     ALTER TABLE t DROP a;
@@ -223,6 +243,7 @@ test fail-alter-table-drop-primary-key-column {
 expect error {
 }
 
+@cross-check-integrity
 test fail-alter-table-drop-primary-key-column-constrait {
     CREATE TABLE t (a, b, PRIMARY KEY (a));
     ALTER TABLE t DROP a;
@@ -230,6 +251,7 @@ test fail-alter-table-drop-primary-key-column-constrait {
 expect error {
 }
 
+@cross-check-integrity
 test fail-alter-table-rename-to-existing-index {
     CREATE TABLE x (a);
     CREATE INDEX y ON x (a);
@@ -238,6 +260,7 @@ test fail-alter-table-rename-to-existing-index {
 expect error {
 }
 
+@cross-check-integrity
 test fail-alter-table-rename-to-existing-table {
     CREATE TABLE x (a);
     CREATE TABLE y (a);
@@ -246,6 +269,7 @@ test fail-alter-table-rename-to-existing-table {
 expect error {
 }
 
+@cross-check-integrity
 test alter-table-rename-to-quoted-identifier {
     CREATE TABLE t (a);
     CREATE INDEX idx ON t (a);
@@ -283,6 +307,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3391
+@cross-check-integrity
 test alter-table-add-notnull-col {
     CREATE TABLE t (a);
     ALTER TABLE t ADD b NOT NULL;
@@ -293,6 +318,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3448
+@cross-check-integrity
 test drop-column-regression {
     CREATE TABLE t (id, col1 BLOB, col2 UNIQUE);
     INSERT INTO t VALUES ('id', 'col1', 'col2');
@@ -304,6 +330,7 @@ expect {
 }
 
 # https://github.com/tursodatabase/turso/issues/3886
+@cross-check-integrity
 test alter-tbl-regression {
     PRAGMA foreign_keys = ON;
     CREATE TABLE p_ren1(id INTEGER PRIMARY KEY);
@@ -324,6 +351,7 @@ expect {
     20|2
 }
 
+@cross-check-integrity
 test drop-column-removes-check-constraint {
     CREATE TABLE t_check (a INTEGER PRIMARY KEY, b REAL CHECK (b BETWEEN 0.0 AND 1000.0), c INTEGER NOT NULL);
     INSERT INTO t_check VALUES (1, 500.0, 42);
@@ -336,6 +364,7 @@ expect {
     2|99
 }
 
+@cross-check-integrity
 test fail-drop-column-table-level-check-constraint {
     CREATE TABLE t_check2 (a INTEGER PRIMARY KEY, b INTEGER, c TEXT, CHECK (b > 0));
     ALTER TABLE t_check2 DROP COLUMN b;
@@ -345,6 +374,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-invalid-varchar {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b VARCHAR(100);
@@ -353,6 +383,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-invalid-datetime {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b DATETIME;
@@ -361,6 +392,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-no-type {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b;
@@ -369,6 +401,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-integer {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b INTEGER;
@@ -380,6 +413,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-text {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b TEXT;
@@ -391,6 +425,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-any {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b ANY;
@@ -402,6 +437,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-default-type-mismatch {
     CREATE TABLE t1(name TEXT) STRICT;
     INSERT INTO t1 VALUES ('alice'), ('bob');
@@ -412,6 +448,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-default-integer-from-text {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b INTEGER DEFAULT '10';
@@ -423,6 +460,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-default-real-from-text {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b REAL DEFAULT '1.25';
@@ -434,6 +472,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-default-text-from-integer {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b TEXT DEFAULT 123;
@@ -445,6 +484,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-default-integer-fractional {
     CREATE TABLE t(a INTEGER) STRICT;
     INSERT INTO t(a) VALUES (1);
@@ -455,6 +495,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-default-real-nonnumeric {
     CREATE TABLE t(a INTEGER) STRICT;
     INSERT INTO t(a) VALUES (1);
@@ -465,6 +506,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-default-text-blob {
     CREATE TABLE t(a INTEGER) STRICT;
     INSERT INTO t(a) VALUES (1);
@@ -475,6 +517,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-default-blob-text {
     CREATE TABLE t(a INTEGER) STRICT;
     INSERT INTO t(a) VALUES (1);
@@ -485,6 +528,7 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test strict-alter-add-column-default-mismatch-empty-table {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 3.14;
@@ -494,6 +538,7 @@ expect error {
     cannot store REAL value in INTEGER column t.b
 }
 
+@cross-check-integrity
 test alter-add-column-invalid-collation {
     CREATE TABLE t(c1 INTEGER);
     ALTER TABLE t ADD COLUMN c2 INTEGER COLLATE compile_options;

@@ -39,12 +39,13 @@ jobs:
         with:
           prefix-key: "v1-rust"
       - uses: "./.github/shared/setup-sccache"
+      - uses: "./.github/shared/install_sqlite"
       - name: Build tursodb
         run: make -C testing/runner build-tursodb
       - name: Build test runner
         run: make -C testing/runner build-runner
       - name: Run tests
-        run: make -C testing/runner run-cli
+        run: make -C testing/runner run-cli CROSS_CHECK_BINARY=sqlite3
       - name: Run tests (MVCC)
         run: make -C testing/runner run-cli MVCC=1
 

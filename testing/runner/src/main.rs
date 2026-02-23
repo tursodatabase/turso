@@ -80,6 +80,13 @@ enum Commands {
         /// Filter snapshot tests by name pattern
         #[arg(long)]
         snapshot_filter: Option<String>,
+
+        /// Path to binary for cross-checking integrity.
+        /// When set, tests annotated with @cross-check-integrity will run
+        /// `PRAGMA integrity_check` using this binary after the test passes.
+        /// :memory: databases are automatically upgraded to temp files for annotated tests.
+        #[arg(long)]
+        cross_check_binary: Option<PathBuf>,
     },
 
     /// Validate test file syntax and check for pending snapshots
@@ -148,6 +155,7 @@ async fn main() -> ExitCode {
             mvcc,
             snapshot_mode,
             snapshot_filter,
+            cross_check_binary,
         } => {
             run_tests(
                 paths,
@@ -162,6 +170,7 @@ async fn main() -> ExitCode {
                 mvcc,
                 snapshot_mode,
                 snapshot_filter,
+                cross_check_binary,
             )
             .await
         }
@@ -217,6 +226,7 @@ async fn run_tests(
     mvcc: bool,
     snapshot_mode: SnapshotUpdateMode,
     snapshot_filter: Option<String>,
+    cross_check_binary: Option<PathBuf>,
 ) -> ExitCode {
     // Resolve paths, trying to add .sqltest extension if missing
     let mut resolved_paths = Vec::new();
@@ -314,6 +324,9 @@ async fn run_tests(
     }
     if let Some(f) = snapshot_filter {
         config = config.with_snapshot_filter(f);
+    }
+    if let Some(binary) = cross_check_binary {
+        config = config.with_cross_check_binary(binary);
     }
 
     // Create output formatter

@@ -2,6 +2,7 @@
 
 #!/usr/bin/env tclsh
 # Basic DROP TABLE functionality
+@cross-check-integrity
 test drop-table-basic-1 {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY);
     INSERT INTO t1 VALUES (1);
@@ -14,6 +15,7 @@ expect {
 }
 
 # The table should be dropped irrespective of the case of the table name.
+@cross-check-integrity
 test drop-table-case-insensitive {
     CREATE TABLE test (x INTEGER PRIMARY KEY);
     INSERT INTO test VALUES (1);
@@ -26,6 +28,7 @@ expect {
 }
 
 # Test DROP TABLE IF EXISTS on existing table
+@cross-check-integrity
 test drop-table-if-exists-1 {
     CREATE TABLE t2 (x INTEGER PRIMARY KEY);
     DROP TABLE IF EXISTS t2;
@@ -36,6 +39,7 @@ expect {
 }
 
 # Test DROP TABLE IF EXISTS on non-existent table
+@cross-check-integrity
 test drop-table-if-exists-2 {
     DROP TABLE IF EXISTS nonexistent_table;
     SELECT 'success';
@@ -45,6 +49,7 @@ expect {
 }
 
 # Test dropping table with index
+@cross-check-integrity
 test drop-table-with-index-1 {
     CREATE TABLE t3 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE INDEX idx_t3_y ON t3(y);
@@ -57,6 +62,7 @@ expect {
 }
 
 # Test dropping table cleans up related schema entries
+@cross-check-integrity
 test drop-table-schema-cleanup-1 {
     CREATE TABLE t4 (x INTEGER PRIMARY KEY, y TEXT);
     CREATE INDEX idx1_t4 ON t4(x);
@@ -70,6 +76,7 @@ expect {
 }
 
 # Test dropping table after multiple inserts and deletes
+@cross-check-integrity
 test drop-table-after-ops-1 {
     CREATE TABLE t6 (x INTEGER PRIMARY KEY);
     INSERT INTO t6 VALUES (1);
@@ -84,6 +91,7 @@ expect {
 }
 
 # Test that DROP TABLE fails when table is referenced by foreign keys
+@cross-check-integrity
 test drop-table-fk-constraint-failed {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(a INTEGER PRIMARY KEY);
@@ -96,6 +104,7 @@ expect error {
 }
 
 # Test that DROP TABLE succeeds when foreign keys are disabled
+@cross-check-integrity
 test drop-table-fk-disabled-ok {
     PRAGMA foreign_keys=OFF;
     CREATE TABLE parent(a INTEGER PRIMARY KEY);

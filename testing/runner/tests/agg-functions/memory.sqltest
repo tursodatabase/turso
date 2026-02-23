@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test min-null-regression-test {
     CREATE TABLE t (a);
     INSERT INTO t VALUES ('abc'), (NULL);
@@ -9,6 +10,7 @@ expect {
     abc
 }
 
+@cross-check-integrity
 test max-null-regression-test {
     CREATE TABLE t (a);
     INSERT INTO t VALUES ('abc'), (NULL);
@@ -18,6 +20,7 @@ expect {
     abc
 }
 
+@cross-check-integrity
 test group-concat-null-values-test {
     CREATE TABLE t (a);
     INSERT INTO t VALUES ('a'), (''), ('b'), (NULL), ('c');
@@ -27,6 +30,7 @@ expect {
     a,,b,c
 }
 
+@cross-check-integrity
 test select-distinct-aggregate-ungrouped {
     CREATE TABLE t0 (c0 REAL);
   CREATE TABLE t1 (c0 INT);
@@ -42,6 +46,7 @@ expect {
 # When no rows match, literals should return their values, columns should return NULL,
 # and expressions like "col IS NOT NULL" should evaluate correctly.
 
+@cross-check-integrity
 test ungrouped-agg-empty-table-literal {
     CREATE TABLE t (a INT, b TEXT);
     SELECT 42, COUNT(*), 'hello' FROM t;
@@ -50,6 +55,7 @@ expect {
     42|0|hello
 }
 
+@cross-check-integrity
 test ungrouped-agg-empty-table-column-is-null {
     CREATE TABLE t (a INT);
     SELECT a IS NULL, COUNT(*) FROM t;
@@ -58,6 +64,7 @@ expect {
     1|0
 }
 
+@cross-check-integrity
 test ungrouped-agg-empty-table-column-is-not-null {
     CREATE TABLE t (a INT);
     SELECT a IS NOT NULL, COUNT(*) FROM t;
@@ -66,6 +73,7 @@ expect {
     0|0
 }
 
+@cross-check-integrity
 test ungrouped-agg-filtered-rows-literal {
     CREATE TABLE t (a INT);
     INSERT INTO t VALUES (1), (2), (3);
@@ -75,6 +83,7 @@ expect {
     99|0
 }
 
+@cross-check-integrity
 test ungrouped-agg-filtered-rows-column {
     CREATE TABLE t (a INT);
     INSERT INTO t VALUES (1), (2), (3);
@@ -84,6 +93,7 @@ expect {
     |0
 }
 
+@cross-check-integrity
 test ungrouped-agg-multiple-literals {
     CREATE TABLE t (a INT);
     SELECT NULL, 5267713247558720570, NULL, AVG(-1), 28513758867889096 FROM t;
@@ -94,6 +104,7 @@ expect {
 
 # Regression test: columns with DEFAULT values should return NULL (not the default)
 # when the table is empty and we're in an aggregate query context.
+@cross-check-integrity
 test ungrouped-agg-empty-table-column-with-default {
     CREATE TABLE t (x BLOB NOT NULL DEFAULT X'00');
     SELECT x IS NULL, typeof(x), hex(x), AVG(1) FROM t;
@@ -102,6 +113,7 @@ expect {
     1|null||
 }
 
+@cross-check-integrity
 test case-when-aggregate-returns-column-value {
     CREATE TABLE t1(a INTEGER, b TEXT);
     INSERT INTO t1 VALUES (42, 'hello');

@@ -8,6 +8,7 @@ expect {
 }
 
 @backend cli
+@cross-check-integrity
 test issue_5116_multiline_string {
     CREATE TABLE t(a);
     INSERT INTO t VALUES('a

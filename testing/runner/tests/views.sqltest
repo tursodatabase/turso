@@ -1,6 +1,7 @@
 @database :memory:
 @skip-file-if mvcc "views not supported in MVCC mode"
 
+@cross-check-integrity
 test view-basic-filtering {
     CREATE TABLE products(id INTEGER, name TEXT, price INTEGER, category TEXT);
     INSERT INTO products VALUES
@@ -22,6 +23,7 @@ expect {
     1|Laptop|1200
 }
 
+@cross-check-integrity
 test view-aggregation-groupby {
     CREATE TABLE sales(product_id INTEGER, quantity INTEGER, day INTEGER);
     INSERT INTO sales VALUES
@@ -46,6 +48,7 @@ expect {
     3|2|4
 }
 
+@cross-check-integrity
 test view-with-join {
     CREATE TABLE employees(id INTEGER, name TEXT, dept_id INTEGER);
     CREATE TABLE departments(id INTEGER, name TEXT, budget INTEGER);
@@ -78,6 +81,7 @@ expect {
     Eve|Sales
 }
 
+@cross-check-integrity
 test view-composition-with-functions {
     CREATE TABLE numbers(value INTEGER);
     INSERT INTO numbers VALUES (10), (20), (30), (40), (50);
@@ -101,6 +105,7 @@ expect {
     140|280|4|3
 }
 
+@cross-check-integrity
 test view-referencing-view {
     CREATE TABLE orders(
         order_id INTEGER,
@@ -145,6 +150,7 @@ expect {
     102|2|125
 }
 
+@cross-check-integrity
 test view-case-expression {
     CREATE TABLE transactions(
         id INTEGER,
@@ -185,6 +191,7 @@ expect {
     1002|600|3
 }
 
+@cross-check-integrity
 test view-drop-and-recreate {
     CREATE TABLE data(x INTEGER, y INTEGER);
     INSERT INTO data VALUES (1, 10), (2, 20), (3, 30);
@@ -197,6 +204,7 @@ expect {
     3|60
 }
 
+@cross-check-integrity
 test view-recreate-after-drop {
     CREATE TABLE data(x INTEGER, y INTEGER);
     
@@ -212,6 +220,7 @@ expect {
     4|30
 }
 
+@cross-check-integrity
 test view-arithmetic-expression {
     CREATE TABLE nums(a INTEGER, b INTEGER);
     INSERT INTO nums VALUES (10, 5), (20, 8), (30, 12);
@@ -232,6 +241,7 @@ expect {
     60|25|85|35|70
 }
 
+@cross-check-integrity
 test view-with-having {
     CREATE TABLE product_sales(product TEXT, region TEXT, units INTEGER);
     INSERT INTO product_sales VALUES
@@ -256,6 +266,7 @@ expect {
 }
 
 @skip-if sqlite "sqlite supports FILTER in aggregate functions"
+@cross-check-integrity
 test view-rejects-filter-clause {
     CREATE TABLE t(val INT, status TEXT);
     CREATE VIEW v AS SELECT SUM(val) FILTER (WHERE status = 'ok') FROM t;
@@ -265,6 +276,7 @@ expect error {
 }
 
 @skip-if sqlite "sqlite supports ORDER BY in aggregate functions"
+@cross-check-integrity
 test view-rejects-aggregate-order-by {
     CREATE TABLE t(val INT);
     CREATE VIEW v AS SELECT SUM(val ORDER BY val) FROM t;

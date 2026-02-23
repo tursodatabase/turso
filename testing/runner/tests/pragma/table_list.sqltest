@@ -1,5 +1,6 @@
 @database :memory:
 
+@cross-check-integrity
 test pragma-table-list-single-table {
     CREATE TABLE t1(a, b, c);
     PRAGMA table_list('t1');
@@ -8,6 +9,7 @@ expect {
     main|t1|table|3|0|0
 }
 
+@cross-check-integrity
 test pragma-table-list-equals-syntax {
     CREATE TABLE t1(x INTEGER, y TEXT);
     PRAGMA table_list=t1;
@@ -17,6 +19,7 @@ expect {
 }
 
 @skip-if mvcc "views not yet supported for mvcc"
+@cross-check-integrity
 test pragma-table-list-view {
     CREATE TABLE t1(a, b, c);
     CREATE VIEW v1 AS SELECT a, b FROM t1;
@@ -27,6 +30,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@cross-check-integrity
 test pragma-table-list-strict {
     CREATE TABLE strict_t(a INTEGER, b TEXT) STRICT;
     PRAGMA table_list('strict_t');
@@ -42,6 +46,7 @@ expect {
 }
 
 @skip-if mvcc "views not yet supported for mvcc"
+@cross-check-integrity
 test pragma-table-list-all-user-tables {
     CREATE TABLE t1(a, b, c);
     CREATE TABLE t2(x INTEGER, y TEXT);
@@ -61,6 +66,7 @@ expect {
     main|sqlite_schema|table|5|0|0
 }
 
+@cross-check-integrity
 test pragma-table-list-function-syntax {
     CREATE TABLE t1(a, b, c);
     SELECT * FROM pragma_table_list('t1');

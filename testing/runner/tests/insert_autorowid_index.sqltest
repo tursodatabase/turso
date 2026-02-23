@@ -9,6 +9,7 @@ setup schema {
 }
 
 @setup schema
+@cross-check-integrity
 test auto-rowid-upsert-index {
     INSERT INTO v0 VALUES (10, 'av3 b', 10, 'a__');
     INSERT INTO v0 (c4, c2, c2) VALUES ('v1', 18446744073709551615, 'hijklmnop')
@@ -20,6 +21,7 @@ expect {
 }
 
 @setup schema
+@cross-check-integrity
 test auto-rowid-plain-insert-index {
     INSERT INTO v0 VALUES (1, 'first', 10, 'a');
     INSERT INTO v0 (c2) VALUES ('second');
@@ -31,6 +33,7 @@ expect {
 }
 
 @setup schema
+@cross-check-integrity
 test auto-rowid-index-values-correct {
     INSERT INTO v0 VALUES (5, 'a', 1, 'x');
     INSERT INTO v0 (c2, c3) VALUES ('b', 2);

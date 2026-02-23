@@ -5,6 +5,7 @@
 # The going_upwards flag in get_prev_record was never cleared when descending
 # between interior pages, causing rightmost subtrees to be skipped.
 
+@cross-check-integrity
 test backward-scan-deep-btree {
     PRAGMA page_size = 512;
     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);

@@ -4,6 +4,7 @@
 # be optimized into multi-index union seeks, because the seek key depends
 # on the current row and cannot be evaluated before scanning.
 
+@cross-check-integrity
 test not-between-self-ref-group-by {
     CREATE TABLE t1 (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
     INSERT INTO t1 VALUES (1, 10, 100), (2, 20, 200), (3, NULL, 300), (4, 40, 400);
@@ -22,6 +23,7 @@ expect @js {
     400|40
 }
 
+@cross-check-integrity
 test not-between-self-ref-no-group-by {
     CREATE TABLE t2 (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
     INSERT INTO t2 VALUES (1, 10, 100), (2, 20, 200), (3, NULL, 300), (4, 40, 400);
@@ -34,6 +36,7 @@ expect {
     4|40|400
 }
 
+@cross-check-integrity
 test between-self-ref-group-by {
     CREATE TABLE t3 (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
     INSERT INTO t3 VALUES (1, 10, 100), (2, 20, 200), (3, NULL, 300), (4, 40, 400);
@@ -45,6 +48,7 @@ expect {
 # Regression test: multi-index OR must not be used when NOT BETWEEN bounds depend
 # on scalar subquery results. The predicate below should evaluate to NULL for every
 # row (thus filter all rows), even with ORDER BY + LIMIT/OFFSET.
+@cross-check-integrity
 test not-between-subquery-bound-orderby-offset {
     CREATE TABLE t4 (
         a INTEGER PRIMARY KEY,
