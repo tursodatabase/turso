@@ -42,7 +42,7 @@ mod rows;
 pub mod transaction;
 pub mod value;
 
-#[cfg(feature = "sync")]
+#[cfg(any(feature = "sync", feature = "sync-rustls"))]
 pub mod sync;
 
 pub use connection::Connection;
