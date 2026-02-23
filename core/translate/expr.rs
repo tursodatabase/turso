@@ -5561,7 +5561,7 @@ pub(crate) fn emit_returning_results<'a>(
             cursor: buf.cursor_id,
             key_reg: eph_rowid_reg,
             record_reg,
-            flag: InsertFlags::new(),
+            flag: InsertFlags::new().is_ephemeral_table_insert(),
             table_name: String::new(),
         });
     } else {
