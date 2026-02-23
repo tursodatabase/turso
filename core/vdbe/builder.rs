@@ -31,7 +31,7 @@ impl TableRefIdCounter {
         }
     }
 
-    #[expect(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> ast::TableInternalId {
         let id = self.next_free;
         self.next_free += 1;
@@ -158,6 +158,9 @@ pub struct ProgramBuilder {
     /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
     pub is_subprogram: bool,
     pub resolve_type: ResolveType,
+    /// Whether the resolve_type was explicitly set from a statement-level OR clause.
+    /// When false, per-constraint ON CONFLICT clauses from CREATE TABLE should be used.
+    pub has_statement_conflict: bool,
     /// When set, all triggers fired from this program should use this conflict resolution.
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
     /// clauses don't suppress errors.
@@ -406,6 +409,7 @@ impl ProgramBuilder {
             trigger,
             is_subprogram,
             resolve_type: ResolveType::Abort,
+            has_statement_conflict: false,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),

@@ -160,6 +160,7 @@ pub fn translate_create_index(
         // before translating, and it cannot reference a table alias
         where_clause: where_clause.clone(),
         index_method: index_method.clone(),
+        on_conflict: None,
     });
 
     if !idx.validate_where_expr(&table, resolver) {
