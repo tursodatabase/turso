@@ -19,27 +19,19 @@ pub fn insn_to_row(
     insn: &Insn,
 ) -> (&'static str, i64, i64, i64, Value, i64, String) {
     let mut ephemeral_cursors = HashSet::new();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (insn, _) in &program.insns {
-            match insn {
-                Insn::OpenEphemeral { cursor_id, .. } => {
-                    changed |= ephemeral_cursors.insert(*cursor_id);
-                }
-                Insn::OpenAutoindex { cursor_id } => {
-                    changed |= ephemeral_cursors.insert(*cursor_id);
-                }
-                Insn::OpenDup {
-                    new_cursor_id,
-                    original_cursor_id,
-                } => {
-                    if ephemeral_cursors.contains(original_cursor_id) {
-                        changed |= ephemeral_cursors.insert(*new_cursor_id);
-                    }
-                }
-                _ => {}
+    for (insn, _) in &program.insns {
+        match insn {
+            Insn::OpenEphemeral { cursor_id, .. } => {
+                ephemeral_cursors.insert(*cursor_id);
             }
+            Insn::OpenAutoindex { cursor_id } => {
+                ephemeral_cursors.insert(*cursor_id);
+            }
+            Insn::OpenDup { new_cursor_id, .. } => {
+                // Note: relies on invariant that OpenDup is only for ephemeral cursors
+                ephemeral_cursors.insert(*new_cursor_id);
+            }
+            _ => {}
         }
     }
 
