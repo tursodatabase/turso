@@ -104,6 +104,21 @@ expect {
 }
 
 # ============================================
+# REAL affinity: non-numeric text should remain TEXT
+# ============================================
+test affinity-real-non-numeric-text {
+    CREATE TABLE t1 (c DOUBLE);
+    INSERT INTO t1 VALUES ('23g'), ('1998-12-01'), ('.DEF'), ('3-three');
+    SELECT typeof(c), c FROM t1 ORDER BY rowid;
+}
+expect {
+    text|23g
+    text|1998-12-01
+    text|.DEF
+    text|3-three
+}
+
+# ============================================
 # IN clause with TEXT column: should apply TEXT affinity to comparison
 # ============================================
 test affinity-in-text-column {

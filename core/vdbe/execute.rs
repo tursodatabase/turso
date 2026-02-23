@@ -11023,32 +11023,39 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                 return false;
             }
 
-            Affinity::Real => {
-                if let Value::Numeric(Numeric::Integer(i)) = *value {
-                    *value = Value::from_f64(i as f64);
+            Affinity::Real => match value {
+                Value::Numeric(Numeric::Integer(i)) => {
+                    *value = Value::from_f64(*i as f64);
                     return true;
                 }
-                if let Value::Text(t) = value {
-                    let s = t.as_str();
-                    if s.starts_with("0x") {
+                Value::Numeric(Numeric::Float(_)) | Value::Null => {
+                    return true;
+                }
+                Value::Text(t) => {
+                    let text = trim_ascii_whitespace(t.as_str());
+                    if text.starts_with("0x") {
                         return false;
                     }
-                    if let Ok(num) = checked_cast_text_to_numeric(s, false) {
-                        match num {
-                            Value::Numeric(Numeric::Integer(i)) => {
-                                *value = Value::from_f64(i as f64);
-                            }
-                            other => {
-                                *value = other;
+
+                    let (parse_result, parsed_value) = try_for_float(text.as_bytes());
+                    let coerced = match parse_result {
+                        NumericParseResult::NotNumeric | NumericParseResult::ValidPrefixOnly => {
+                            return false;
+                        }
+                        NumericParseResult::PureInteger | NumericParseResult::HasDecimalOrExp => {
+                            match parsed_value {
+                                ParsedNumber::Integer(i) => Value::from_f64(i as f64),
+                                ParsedNumber::Float(f) => Value::from_f64(f),
+                                ParsedNumber::None => return false,
                             }
                         }
-                        return true;
-                    } else {
-                        return false;
-                    }
+                    };
+
+                    *value = coerced;
+                    return true;
                 }
-                return true;
-            }
+                _ => return true,
+            },
         }
     }
 
