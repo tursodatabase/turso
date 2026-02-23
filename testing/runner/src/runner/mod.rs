@@ -1,8 +1,8 @@
 use crate::backends::{BackendError, QueryResult, SqlBackend};
 use crate::comparison::{ComparisonResult, compare};
 use crate::parser::ast::{
-    Backend, Capability, DatabaseConfig, Requirement, SetupRef, Skip, SkipCondition, SnapshotCase,
-    TestCase, TestFile,
+    Backend, Capability, DatabaseConfig, DatabaseLocation, Expectation, Requirement, SetupRef,
+    Skip, SkipCondition, SnapshotCase, TestCase, TestFile,
 };
 use crate::snapshot::{SnapshotInfo, SnapshotManager, SnapshotResult, SnapshotUpdateMode};
 use async_trait::async_trait;
@@ -42,6 +42,8 @@ pub struct RunOptions {
     pub backend_is_sqlite: bool,
     /// Snapshot update mode (used by snapshots)
     pub snapshot_update_mode: SnapshotUpdateMode,
+    /// Path to binary used for cross-checking integrity (None = disabled)
+    pub cross_check_binary: Option<PathBuf>,
 }
 
 /// Trait for runnable test items (tests and snapshots)
@@ -59,6 +61,16 @@ pub trait Runnable: Clone + Send + 'static {
     /// Check if this test should be skipped due to additional conditions (e.g., capabilities)
     /// Returns Some(reason) if should skip, None if can proceed
     fn check_skip_conditions(&self, options: &RunOptions) -> Option<String>;
+
+    /// Whether this test expects an error outcome (skip cross-check for these).
+    fn expects_error(&self) -> bool {
+        false
+    }
+
+    /// Whether this test should be cross-checked with another binary's integrity_check.
+    fn cross_check_integrity(&self) -> bool {
+        false
+    }
 
     /// Get all SQL queries to execute.
     fn queries_to_execute(&self) -> Vec<String>;
@@ -102,6 +114,14 @@ impl Runnable for TestCase {
             }
         }
         None
+    }
+
+    fn expects_error(&self) -> bool {
+        matches!(self.expectations.default, Expectation::Error(_))
+    }
+
+    fn cross_check_integrity(&self) -> bool {
+        self.modifiers.cross_check_integrity
     }
 
     fn queries_to_execute(&self) -> Vec<String> {
@@ -369,11 +389,52 @@ async fn run_single<B: SqlBackend, R: Runnable>(
             }
         }
 
-        // Close database
-        let _ = db.close().await;
+        // Close database - capture the file handle to keep temp files alive
+        let file_handle = match db.close().await {
+            Ok(handle) => handle,
+            Err(e) => {
+                return TestResult {
+                    name: test.name().to_string(),
+                    file: options.file_path,
+                    database: options.db_config,
+                    outcome: TestOutcome::Error {
+                        message: format!("failed to close database: {e}"),
+                    },
+                    duration: start.elapsed(),
+                };
+            }
+        };
 
         // Evaluate results
-        let outcome = test.evaluate_results(results, &options).await;
+        let mut outcome = test.evaluate_results(results, &options).await;
+
+        // Run cross-check integrity if:
+        // - test has @cross-check-integrity annotation
+        // - cross-check binary is configured
+        // - test passed
+        // - database is not readonly (readonly DBs are pre-generated)
+        // - test doesn't expect an error
+        if test.cross_check_integrity()
+            && matches!(outcome, TestOutcome::Passed)
+            && !options.db_config.readonly
+            && !test.expects_error()
+        {
+            if let Some(ref binary) = options.cross_check_binary {
+                if let Some(ref db_path) = file_handle.path {
+                    match run_cross_check_integrity(binary, db_path).await {
+                        Ok(()) => {} // integrity check passed
+                        Err(msg) => {
+                            outcome = TestOutcome::Failed {
+                                reason: format!("cross-check integrity_check failed: {msg}"),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // file_handle is dropped here, cleaning up temp files
+        drop(file_handle);
 
         TestResult {
             name: test.name().to_string(),
@@ -654,6 +715,9 @@ pub struct RunnerConfig {
     pub snapshot_update_mode: SnapshotUpdateMode,
     /// Snapshot name filter (glob pattern)
     pub snapshot_filter: Option<String>,
+    /// Path to binary for cross-checking integrity (None = disabled).
+    /// Used by tests annotated with `@cross-check-integrity`.
+    pub cross_check_binary: Option<PathBuf>,
 }
 
 impl Default for RunnerConfig {
@@ -664,6 +728,7 @@ impl Default for RunnerConfig {
             mvcc: false,
             snapshot_update_mode: SnapshotUpdateMode::Auto,
             snapshot_filter: None,
+            cross_check_binary: None,
         }
     }
 }
@@ -691,6 +756,11 @@ impl RunnerConfig {
 
     pub fn with_snapshot_filter(mut self, filter: impl Into<String>) -> Self {
         self.snapshot_filter = Some(filter.into());
+        self
+    }
+
+    pub fn with_cross_check_binary(mut self, binary: PathBuf) -> Self {
+        self.cross_check_binary = Some(binary);
         self
     }
 }
@@ -751,9 +821,16 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 let semaphore = Arc::clone(&self.semaphore);
                 let test = test.clone();
 
+                // Upgrade :memory: to :temp: when cross-check is enabled for this test
+                let effective_db_config = maybe_upgrade_memory_to_temp(
+                    db_config,
+                    test.modifiers.cross_check_integrity,
+                    &self.config.cross_check_binary,
+                );
+
                 let options = RunOptions {
                     file_path: path.to_path_buf(),
-                    db_config: db_config.clone(),
+                    db_config: effective_db_config,
                     setups: test_file.setups.clone(),
                     mvcc: self.config.mvcc,
                     global_skip: test_file.global_skip.clone(),
@@ -763,6 +840,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     backend_is_sqlite: self.backend.is_sqlite(),
                     // Tests don't use snapshots, but we still need the field
                     snapshot_update_mode: SnapshotUpdateMode::No,
+                    cross_check_binary: self.config.cross_check_binary.clone(),
                 };
 
                 futures.push(tokio::spawn(async move {
@@ -832,6 +910,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     backend_type,
                     backend_is_sqlite: self.backend.is_sqlite(),
                     snapshot_update_mode: self.config.snapshot_update_mode,
+                    cross_check_binary: self.config.cross_check_binary.clone(),
                 };
 
                 futures.push(tokio::spawn(async move {
@@ -993,6 +1072,26 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
     }
 }
 
+/// Upgrade :memory: databases to :temp: when a test has `@cross-check-integrity`
+/// and a cross-check binary is configured, so there is a file on disk to check.
+fn maybe_upgrade_memory_to_temp(
+    config: &DatabaseConfig,
+    cross_check_integrity: bool,
+    cross_check_binary: &Option<PathBuf>,
+) -> DatabaseConfig {
+    if cross_check_integrity
+        && cross_check_binary.is_some()
+        && config.location == DatabaseLocation::Memory
+    {
+        DatabaseConfig {
+            location: DatabaseLocation::TempFile,
+            readonly: config.readonly,
+        }
+    } else {
+        config.clone()
+    }
+}
+
 /// Check if test name matches filter pattern
 fn matches_filter(name: &str, pattern: &str) -> bool {
     // Simple glob matching: * matches anything
@@ -1012,6 +1111,59 @@ fn matches_filter(name: &str, pattern: &str) -> bool {
     } else {
         // Exact match
         name == pattern
+    }
+}
+
+/// Run `PRAGMA integrity_check` on a database file using an external binary.
+/// Returns Ok(()) if the check passes ("ok"), or Err(message) with details.
+async fn run_cross_check_integrity(binary: &Path, db_path: &Path) -> Result<(), String> {
+    use tokio::process::Command;
+
+    let mut cmd = Command::new(binary);
+
+    // Detect if binary is tursodb (needs -q and list mode flags)
+    let is_turso = binary
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| name.starts_with("tursodb") || name.starts_with("turso"))
+        .unwrap_or(false);
+
+    cmd.arg(db_path);
+
+    if is_turso {
+        cmd.arg("-q");
+        cmd.arg("-m").arg("list");
+    }
+
+    cmd.arg("PRAGMA integrity_check;");
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("failed to run {}: {e}", binary.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        return Err(format!(
+            "{} exited with {}: {}{}",
+            binary.display(),
+            output.status,
+            stderr.trim(),
+            if !stdout.trim().is_empty() {
+                format!("\n{}", stdout.trim())
+            } else {
+                String::new()
+            }
+        ));
+    }
+
+    let result = stdout.trim();
+    if result == "ok" {
+        Ok(())
+    } else {
+        Err(result.to_string())
     }
 }
 

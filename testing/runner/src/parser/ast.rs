@@ -141,6 +141,9 @@ pub struct CaseModifiers {
     pub backend: Option<Backend>,
     /// Required capabilities for this case
     pub requires: Vec<Requirement>,
+    /// If true, cross-check the resulting database file with another binary's
+    /// `PRAGMA integrity_check` after the test passes.
+    pub cross_check_integrity: bool,
 }
 
 /// A snapshot test case (for EXPLAIN output)

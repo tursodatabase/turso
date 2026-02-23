@@ -47,15 +47,22 @@ endif
 # Backend selection (cli or rust)
 BACKEND ?= cli
 
+# Cross-check binary (set CROSS_CHECK_BINARY=path to enable)
+ifdef CROSS_CHECK_BINARY
+    CROSS_CHECK_FLAG := --cross-check-binary $(CROSS_CHECK_BINARY)
+else
+    CROSS_CHECK_FLAG :=
+endif
+
 # Run all tests with selected backend
 run: build
-	$(TEST_RUNNER) run tests --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG)
-	$(TEST_RUNNER) run turso-tests --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG)
+	$(TEST_RUNNER) run tests --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
+	$(TEST_RUNNER) run turso-tests --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 
 # Run tests with CLI backend (spawns tursodb subprocess)
 run-cli: build
-	$(TEST_RUNNER) run tests --backend cli --binary $(TURSODB) $(MVCC_FLAG)
-	$(TEST_RUNNER) run turso-tests --backend cli --binary $(TURSODB) $(MVCC_FLAG)
+	$(TEST_RUNNER) run tests --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
+	$(TEST_RUNNER) run turso-tests --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 
 # Run tests with Rust backend (native turso bindings)
 run-rust: build-runner

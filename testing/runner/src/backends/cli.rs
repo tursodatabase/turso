@@ -1,4 +1,6 @@
-use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend, parse_list_output};
+use super::{
+    BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend, parse_list_output,
+};
 use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
@@ -311,8 +313,10 @@ impl DatabaseInstance for CliDatabaseInstance {
         }
     }
 
-    async fn close(self: Box<Self>) -> Result<(), BackendError> {
-        // Temp file will be automatically deleted when self is dropped
-        Ok(())
+    async fn close(self: Box<Self>) -> Result<DatabaseFileHandle, BackendError> {
+        match self._temp_file {
+            Some(tf) => Ok(DatabaseFileHandle::temp(tf)),
+            None => Ok(DatabaseFileHandle::none()),
+        }
     }
 }

@@ -1,4 +1,4 @@
-use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend};
+use super::{BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend};
 use crate::{
     backends::DefaultDatabaseResolver,
     parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation},
@@ -212,10 +212,12 @@ impl DatabaseInstance for RustDatabaseInstance {
         }
     }
 
-    async fn close(self: Box<Self>) -> Result<(), BackendError> {
+    async fn close(self: Box<Self>) -> Result<DatabaseFileHandle, BackendError> {
         // Connection and database are dropped automatically
-        // Temp file will be deleted when _temp_file is dropped
-        Ok(())
+        match self._temp_file {
+            Some(tf) => Ok(DatabaseFileHandle::temp(tf)),
+            None => Ok(DatabaseFileHandle::none()),
+        }
     }
 }
 

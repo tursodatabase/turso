@@ -122,6 +122,10 @@ pub enum Token {
     #[token("@backend")]
     AtBackend,
 
+    /// `@cross-check-integrity`
+    #[token("@cross-check-integrity")]
+    AtCrossCheckIntegrity,
+
     /// `@<identifier>` - for backend-specific expect blocks (e.g., @js, @cli, @rust)
     /// Uses priority 0 so specific @ tokens like @database take precedence
     #[regex(r"@[a-zA-Z][a-zA-Z0-9_-]*", |lex| {
@@ -233,6 +237,7 @@ impl fmt::Display for Token {
             Token::Strict => write!(f, "strict"),
             Token::MaterializedViews => write!(f, "materialized_views"),
             Token::AtBackend => write!(f, "@backend"),
+            Token::AtCrossCheckIntegrity => write!(f, "@cross-check-integrity"),
             Token::AtIdentifier(s) => write!(f, "@{s}"),
             Token::Setup => write!(f, "setup"),
             Token::Test => write!(f, "test"),
@@ -297,7 +302,7 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, LexerError> {
 /// Suggest a fix for an invalid token
 fn suggest_fix(slice: &str) -> Option<String> {
     if slice.starts_with('@') {
-        Some("Valid directives are: @database, @setup, @skip, @skip-if, @skip-file, @skip-file-if, @requires, @requires-file, @backend. Did you mean one of these?".to_string())
+        Some("Valid directives are: @database, @setup, @skip, @skip-if, @skip-file, @skip-file-if, @requires, @requires-file, @backend, @cross-check-integrity. Did you mean one of these?".to_string())
     } else if slice.starts_with(':') {
         Some(
             "Database specifiers are :memory:, :temp:, :default:, or :default-no-rowidalias:"

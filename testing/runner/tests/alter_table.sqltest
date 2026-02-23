@@ -109,6 +109,7 @@ expect {
     CREATE TABLE test (a, [b c])
 }
 
+@cross-check-integrity
 test alter-table-add-column-default-affinity-text {
     CREATE TABLE t(a INTEGER PRIMARY KEY);
     INSERT INTO t VALUES(1);
@@ -121,6 +122,7 @@ expect {
     2|text|0
 }
 
+@cross-check-integrity
 test alter-table-add-column-default-affinity-integer {
     CREATE TABLE t(a INTEGER PRIMARY KEY);
     INSERT INTO t VALUES(1);
@@ -131,6 +133,7 @@ expect {
     1|integer|5
 }
 
+@cross-check-integrity
 test alter-table-add-column-default-affinity-real {
     CREATE TABLE t(a INTEGER PRIMARY KEY);
     INSERT INTO t VALUES(1);
@@ -144,6 +147,7 @@ expect @js {
     1|real|3
 }
 
+@cross-check-integrity
 test alter-table-add-column-default-affinity-numeric {
     CREATE TABLE t(a INTEGER PRIMARY KEY);
     INSERT INTO t VALUES(1);
