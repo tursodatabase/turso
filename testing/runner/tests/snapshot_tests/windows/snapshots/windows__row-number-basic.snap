@@ -55,11 +55,11 @@ addr  opcode            p1  p2  p3  p4                     p5  comment
   30      Insert         3  22  17  buffer_table_window_0   0  intkey=r[17] data=r[22]
   31    Goto             0  18   0                          0
   32    Null             0  19   0                          0  r[19]=NULL; return remaining buffered rows
-  33    Rewind           2  47   0                          0  Rewind  buffer_table_window_0
-  34      Column         2   1  13                          0  r[13]=buffer_table_window_0.emp_id
-  35      Column         2   2  14                          0  r[14]=buffer_table_window_0.name
-  36      Column         2   3  15                          0  r[15]=buffer_table_window_0.department
-  37      Column         2   0  16                          0  r[16]=buffer_table_window_0.salary
+  33    Rewind           2  47   0                          0  Rewind  ephemeral(buffer_table_window_0)
+  34      Column         2   1  13                          0  r[13]=ephemeral(buffer_table_window_0).emp_id
+  35      Column         2   2  14                          0  r[14]=ephemeral(buffer_table_window_0).name
+  36      Column         2   3  15                          0  r[15]=ephemeral(buffer_table_window_0).department
+  37      Column         2   0  16                          0  r[16]=ephemeral(buffer_table_window_0).salary
   38      AddImm        18   1   0                          0  r[18]=r[18]+1
   39      Copy          18  12   0                          0  r[12]=r[18]
   40      Copy          13   6   0                          0  r[6]=r[13]

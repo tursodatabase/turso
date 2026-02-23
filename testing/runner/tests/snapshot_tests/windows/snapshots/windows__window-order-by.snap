@@ -20,7 +20,7 @@ info:
 QUERY PLAN
 `--SCAN window_subquery_0
    |--SCAN sales USING INDEX idx_sales_date
-   `--USE TEMP B-TREE FOR ORDER BY
+   `--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4                     p5  comment
@@ -71,12 +71,12 @@ addr  opcode            p1  p2  p3  p4                     p5  comment
   44      Insert         5  33  26  buffer_table_window_0   0  intkey=r[26] data=r[33]
   45    Goto             0  31   0                          0
   46    Null             0  28   0                          0  r[28]=NULL; return remaining buffered rows
-  47    Rewind           4  63   0                          0  Rewind  buffer_table_window_0
-  48      Column         4   2  21                          0  r[21]=buffer_table_window_0.sale_id
-  49      Column         4   3  22                          0  r[22]=buffer_table_window_0.emp_id
-  50      Column         4   0  23                          0  r[23]=buffer_table_window_0.sale_date
-  51      Column         4   1  24                          0  r[24]=buffer_table_window_0.amount
-  52      Column         4   4  25                          0  r[25]=buffer_table_window_0.region
+  47    Rewind           4  63   0                          0  Rewind  ephemeral(buffer_table_window_0)
+  48      Column         4   2  21                          0  r[21]=ephemeral(buffer_table_window_0).sale_id
+  49      Column         4   3  22                          0  r[22]=ephemeral(buffer_table_window_0).emp_id
+  50      Column         4   0  23                          0  r[23]=ephemeral(buffer_table_window_0).sale_date
+  51      Column         4   1  24                          0  r[24]=ephemeral(buffer_table_window_0).amount
+  52      Column         4   4  25                          0  r[25]=ephemeral(buffer_table_window_0).region
   53      AddImm        27   1   0                          0  r[27]=r[27]+1
   54      Copy          27  20   0                          0  r[20]=r[27]
   55      Copy          21  13   0                          0  r[13]=r[21]

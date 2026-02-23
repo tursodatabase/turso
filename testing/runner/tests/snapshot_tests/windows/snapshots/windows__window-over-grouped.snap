@@ -19,7 +19,7 @@ info:
 QUERY PLAN
 `--SCAN window_subquery_0
    |--SCAN employees USING INDEX idx_employees_department
-   `--USE TEMP B-TREE FOR ORDER BY
+   `--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode                    p1  p2  p3  p4                     p5  comment
@@ -94,10 +94,10 @@ addr  opcode                    p1  p2  p3  p4                     p5  comment
   68      Insert                 5  35  30  buffer_table_window_0   0  intkey=r[30] data=r[35]
   69    Goto                     0  56   0                          0
   70    Null                     0  32   0                          0  r[32]=NULL; return remaining buffered rows
-  71    Rewind                   4  83   0                          0  Rewind  buffer_table_window_0
-  72      Column                 4   1  27                          0  r[27]=buffer_table_window_0.department
-  73      Column                 4   2  28                          0  r[28]=buffer_table_window_0.column 2
-  74      Column                 4   0  29                          0  r[29]=buffer_table_window_0.column 0
+  71    Rewind                   4  83   0                          0  Rewind  ephemeral(buffer_table_window_0)
+  72      Column                 4   1  27                          0  r[27]=ephemeral(buffer_table_window_0).department
+  73      Column                 4   2  28                          0  r[28]=ephemeral(buffer_table_window_0).column 2
+  74      Column                 4   0  29                          0  r[29]=ephemeral(buffer_table_window_0).column 0
   75      AddImm                31   1   0                          0  r[31]=r[31]+1
   76      Copy                  31  26   0                          0  r[26]=r[31]
   77      Copy                  27  21   0                          0  r[21]=r[27]
