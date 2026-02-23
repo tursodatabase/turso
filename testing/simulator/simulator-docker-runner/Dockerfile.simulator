@@ -32,6 +32,7 @@ COPY sql_generation ./sql_generation/
 COPY testing/concurrent-simulator ./testing/concurrent-simulator
 COPY testing/differential-oracle ./testing/differential-oracle/
 COPY ./testing/runner ./testing/runner/
+COPY std ./std/
 COPY sdk-kit ./sdk-kit/
 COPY sdk-kit-macros ./sdk-kit-macros/
 COPY tools ./tools/
@@ -57,6 +58,7 @@ COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/sql_generation ./sql_generation/
 COPY --from=planner /app/testing/differential-oracle ./testing/differential-oracle/
 COPY --from=planner /app/testing/runner ./testing/runner/
+COPY --from=planner /app/std ./std/
 COPY --from=planner /app/tools ./tools/
 COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
 

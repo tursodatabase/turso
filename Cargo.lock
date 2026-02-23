@@ -6141,11 +6141,13 @@ dependencies = [
  "rand_chacha 0.9.0",
  "reqwest",
  "serde_json",
+ "shuttle",
  "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "turso-std",
  "turso_sdk_kit",
  "turso_sync_sdk_kit",
 ]
@@ -6175,6 +6177,15 @@ dependencies = [
  "jni",
  "thiserror 2.0.16",
  "turso_core",
+]
+
+[[package]]
+name = "turso-std"
+version = "0.5.0-pre.13"
+dependencies = [
+ "parking_lot",
+ "shuttle",
+ "tokio",
 ]
 
 [[package]]
@@ -6285,6 +6296,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tracing",
  "tracing-subscriber",
+ "turso-std",
  "turso_ext",
  "turso_macros",
  "turso_parser",
@@ -6365,6 +6377,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "turso-std",
  "turso_core",
  "turso_sdk_kit_macros",
 ]

@@ -497,7 +497,6 @@ mod arena {
 mod shuttle_tests {
     use super::*;
     use crate::io::MemoryIO;
-    use crate::sync::*;
     use crate::thread;
     use rustc_hash::FxHashSet as HashSet;
 

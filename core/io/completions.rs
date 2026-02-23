@@ -1,11 +1,12 @@
 use crate::turso_assert_eq;
 use core::fmt::{self, Debug};
 use std::{
+    future::Future,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, OnceLock,
     },
-    task::Waker,
+    task::{Poll, Waker},
 };
 
 use crate::sync::Mutex;
@@ -25,6 +26,22 @@ pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 pub struct Completion {
     /// Optional completion state. If None, it means we are Yield in order to not allocate anything
     pub(super) inner: Option<Arc<CompletionInner>>,
+}
+
+impl Future for Completion {
+    type Output = Result<(), crate::LimboError>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        self.set_waker(cx.waker());
+        if self.finished() {
+            self.wake();
+            let res = self
+                .get_error()
+                .map_or(Ok(()), |err| Err(crate::LimboError::CompletionError(err)));
+            return Poll::Ready(res);
+        }
+        Poll::Pending
+    }
 }
 
 #[derive(Debug, Default)]

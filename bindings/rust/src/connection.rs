@@ -1,4 +1,6 @@
 use crate::assert_send_sync;
+use turso_std::sync::atomic::{AtomicU8, Ordering};
+use turso_std::sync::{Arc, Mutex};
 use crate::transaction::DropBehavior;
 use crate::transaction::TransactionBehavior;
 use crate::Error;
@@ -7,10 +9,6 @@ use crate::Row;
 use crate::Rows;
 use crate::Statement;
 use std::fmt::Debug;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::task::Waker;
 pub type Result<T> = std::result::Result<T, Error>;
 

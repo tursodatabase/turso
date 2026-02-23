@@ -24,9 +24,13 @@ sync = [
     "dep:bytes",
 ]
 
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
+
 [dependencies]
 turso_sdk_kit = { workspace = true }
 turso_sync_sdk_kit = { workspace = true }
+turso-std = { workspace = true }
 thiserror = { workspace = true }
 tracing-subscriber.workspace = true
 tracing.workspace = true
