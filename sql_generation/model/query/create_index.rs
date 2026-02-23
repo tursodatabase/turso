@@ -2,9 +2,9 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::table::Index;
+use crate::model::table::{Index, IndexColumnKind};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateIndex {
     pub index: Index,
 }
@@ -33,7 +33,10 @@ impl std::fmt::Display for CreateIndex {
             self.index
                 .columns
                 .iter()
-                .map(|(name, order)| format!("{name} {order}"))
+                .map(|col| match &col.kind {
+                    IndexColumnKind::Column { name } => format!("{name} {}", col.order),
+                    IndexColumnKind::Expr { expr } => format!("({expr}) {}", col.order),
+                })
                 .collect::<Vec<String>>()
                 .join(", ")
         )

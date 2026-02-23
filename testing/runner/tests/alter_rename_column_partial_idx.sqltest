@@ -78,3 +78,57 @@ test rename-column-partial-index-insert-after-rename {
 expect {
     1|hello
 }
+
+test rename-column-updates-partial-index-doubly-qualified-where-clause-sql {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (b) WHERE main.t.a = 1;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    SELECT sql FROM sqlite_schema WHERE type = 'index';
+}
+expect {
+    CREATE INDEX idx ON t (b) WHERE main.t.a2 = 1
+}
+
+test rename-column-updates-substr-expression-index-sql {
+    CREATE TABLE t(a,b,c);
+    CREATE INDEX i_expr ON t(substr(b,1,1));
+    INSERT INTO t VALUES(1,'bee',2);
+    ALTER TABLE t RENAME COLUMN b TO bb;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'i_expr' AND sql LIKE '%substr%bb%';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+test rename-column-updates-comparison-expression-index-sql {
+    CREATE TABLE t(a,b,c);
+    CREATE INDEX i_cmp ON t(b < 3);
+    ALTER TABLE t RENAME COLUMN b TO bb;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'i_cmp' AND sql LIKE '%bb%<%3%';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+test fail-alter-table-drop-column-expression-index {
+    CREATE TABLE t(a,b,c);
+    CREATE INDEX i_expr ON t(substr(b,1,1));
+    INSERT INTO t VALUES(1,'bee',2);
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in index i_expr after drop column: no such column: b
+}
+
+test fail-alter-table-drop-column-indexed {
+    CREATE TABLE t(a,b,c);
+    CREATE INDEX i_b ON t(b);
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    error in index i_b after drop column: no such column: b
+}

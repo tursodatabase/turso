@@ -1,4 +1,9 @@
-use std::{fmt::Display, hash::Hash, ops::Deref};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    hash::Hash,
+    ops::Deref,
+};
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -141,11 +146,592 @@ impl Display for ColumnType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Index {
     pub table_name: String,
     pub index_name: String,
-    pub columns: Vec<(String, SortOrder)>,
+    pub columns: Vec<IndexColumn>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexColumn {
+    pub kind: IndexColumnKind,
+    pub order: SortOrder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IndexColumnKind {
+    Column { name: String },
+    Expr { expr: Box<ast::Expr> },
+}
+
+impl IndexColumn {
+    pub fn referenced_columns(&self, table_columns: &[Column]) -> Vec<String> {
+        match &self.kind {
+            IndexColumnKind::Column { name } => vec![name.clone()],
+            IndexColumnKind::Expr { expr } => infer_expr_deps(expr.as_ref(), table_columns),
+        }
+    }
+
+    pub fn rename_column_refs(&mut self, from: &str, to: &str) {
+        match &mut self.kind {
+            IndexColumnKind::Column { name } => {
+                if name.eq_ignore_ascii_case(from) {
+                    *name = to.to_owned();
+                }
+            }
+            IndexColumnKind::Expr { expr } => {
+                rename_column_in_expr(expr.as_mut(), from, to);
+            }
+        }
+    }
+}
+
+impl Index {
+    pub fn referenced_columns<'a>(
+        &'a self,
+        table_columns: &'a [Column],
+    ) -> impl Iterator<Item = String> + 'a {
+        self.columns
+            .iter()
+            .flat_map(move |c| c.referenced_columns(table_columns))
+    }
+
+    pub fn rename_column_refs(&mut self, from: &str, to: &str) {
+        for col in &mut self.columns {
+            col.rename_column_refs(from, to);
+        }
+    }
+}
+
+fn rename_name_if_matches(name: &mut ast::Name, from: &str, to: &str) {
+    if name.as_str().eq_ignore_ascii_case(from) {
+        *name = ast::Name::exact(to.to_owned());
+    }
+}
+
+fn visit_expr_column_names(expr: &ast::Expr, f: &mut impl FnMut(&ast::Name)) {
+    match expr {
+        ast::Expr::Column { .. } | ast::Expr::RowId { .. } => {
+            panic!(
+                "expression visitor expects an unresolved parsed expression; got a resolved Expr::Column/Expr::RowId"
+            );
+        }
+        ast::Expr::Id(name) | ast::Expr::Name(name) => f(name),
+        ast::Expr::Qualified(_qual, col) => f(col),
+        ast::Expr::DoublyQualified(_db, _tbl, col) => f(col),
+
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            visit_expr_column_names(lhs, f);
+            visit_expr_column_names(start, f);
+            visit_expr_column_names(end, f);
+        }
+        ast::Expr::Binary(lhs, _op, rhs) => {
+            visit_expr_column_names(lhs, f);
+            visit_expr_column_names(rhs, f);
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base) = base {
+                visit_expr_column_names(base, f);
+            }
+            for (when, then) in when_then_pairs {
+                visit_expr_column_names(when, f);
+                visit_expr_column_names(then, f);
+            }
+            if let Some(else_expr) = else_expr {
+                visit_expr_column_names(else_expr, f);
+            }
+        }
+        ast::Expr::Cast { expr, .. }
+        | ast::Expr::Collate(expr, _)
+        | ast::Expr::IsNull(expr)
+        | ast::Expr::NotNull(expr)
+        | ast::Expr::Unary(_, expr) => visit_expr_column_names(expr, f),
+        ast::Expr::Parenthesized(exprs) => {
+            for e in exprs {
+                visit_expr_column_names(e, f);
+            }
+        }
+        ast::Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            for e in args {
+                visit_expr_column_names(e, f);
+            }
+            for ob in order_by {
+                visit_expr_column_names(&ob.expr, f);
+            }
+            if let Some(filter) = &filter_over.filter_clause {
+                visit_expr_column_names(filter, f);
+            }
+            visit_over_clause_column_names(filter_over.over_clause.as_ref(), f);
+        }
+        ast::Expr::FunctionCallStar { filter_over, .. } => {
+            if let Some(filter) = &filter_over.filter_clause {
+                visit_expr_column_names(filter, f);
+            }
+            visit_over_clause_column_names(filter_over.over_clause.as_ref(), f);
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            visit_expr_column_names(lhs, f);
+            for e in rhs {
+                visit_expr_column_names(e, f);
+            }
+        }
+        ast::Expr::InTable { lhs, args, .. } => {
+            visit_expr_column_names(lhs, f);
+            for e in args {
+                visit_expr_column_names(e, f);
+            }
+        }
+        ast::Expr::InSelect { lhs, .. } => {
+            // Subqueries are prohibited in index expressions and partial index WHERE clauses in
+            // SQLite. Still, it's cheap to handle the LHS name rewrite/deps.
+            visit_expr_column_names(lhs, f);
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            visit_expr_column_names(lhs, f);
+            visit_expr_column_names(rhs, f);
+            if let Some(esc) = escape {
+                visit_expr_column_names(esc, f);
+            }
+        }
+        ast::Expr::Raise(_, maybe) => {
+            if let Some(e) = maybe {
+                visit_expr_column_names(e, f);
+            }
+        }
+        ast::Expr::SubqueryResult { lhs, .. } => {
+            if let Some(lhs) = lhs {
+                visit_expr_column_names(lhs, f);
+            }
+        }
+
+        ast::Expr::Literal(_)
+        | ast::Expr::Variable(_)
+        | ast::Expr::Register(_)
+        | ast::Expr::Exists(_)
+        | ast::Expr::Subquery(_) => {}
+    }
+}
+
+fn visit_expr_column_names_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Name)) {
+    match expr {
+        ast::Expr::Column { .. } | ast::Expr::RowId { .. } => {
+            panic!(
+                "expression visitor expects an unresolved parsed expression; got a resolved Expr::Column/Expr::RowId"
+            );
+        }
+        ast::Expr::Id(name) | ast::Expr::Name(name) => f(name),
+        ast::Expr::Qualified(_qual, col) => f(col),
+        ast::Expr::DoublyQualified(_db, _tbl, col) => f(col),
+
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            visit_expr_column_names_mut(lhs, f);
+            visit_expr_column_names_mut(start, f);
+            visit_expr_column_names_mut(end, f);
+        }
+        ast::Expr::Binary(lhs, _op, rhs) => {
+            visit_expr_column_names_mut(lhs, f);
+            visit_expr_column_names_mut(rhs, f);
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base) = base {
+                visit_expr_column_names_mut(base, f);
+            }
+            for (when, then) in when_then_pairs {
+                visit_expr_column_names_mut(when, f);
+                visit_expr_column_names_mut(then, f);
+            }
+            if let Some(else_expr) = else_expr {
+                visit_expr_column_names_mut(else_expr, f);
+            }
+        }
+        ast::Expr::Cast { expr, .. }
+        | ast::Expr::Collate(expr, _)
+        | ast::Expr::IsNull(expr)
+        | ast::Expr::NotNull(expr)
+        | ast::Expr::Unary(_, expr) => visit_expr_column_names_mut(expr, f),
+        ast::Expr::Parenthesized(exprs) => {
+            for e in exprs {
+                visit_expr_column_names_mut(e, f);
+            }
+        }
+        ast::Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            for e in args {
+                visit_expr_column_names_mut(e, f);
+            }
+            for ob in order_by {
+                visit_expr_column_names_mut(&mut ob.expr, f);
+            }
+            if let Some(filter) = &mut filter_over.filter_clause {
+                visit_expr_column_names_mut(filter, f);
+            }
+            visit_over_clause_column_names_mut(filter_over.over_clause.as_mut(), f);
+        }
+        ast::Expr::FunctionCallStar { filter_over, .. } => {
+            if let Some(filter) = &mut filter_over.filter_clause {
+                visit_expr_column_names_mut(filter, f);
+            }
+            visit_over_clause_column_names_mut(filter_over.over_clause.as_mut(), f);
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            visit_expr_column_names_mut(lhs, f);
+            for e in rhs {
+                visit_expr_column_names_mut(e, f);
+            }
+        }
+        ast::Expr::InTable { lhs, args, .. } => {
+            visit_expr_column_names_mut(lhs, f);
+            for e in args {
+                visit_expr_column_names_mut(e, f);
+            }
+        }
+        ast::Expr::InSelect { lhs, .. } => {
+            visit_expr_column_names_mut(lhs, f);
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            visit_expr_column_names_mut(lhs, f);
+            visit_expr_column_names_mut(rhs, f);
+            if let Some(esc) = escape {
+                visit_expr_column_names_mut(esc, f);
+            }
+        }
+        ast::Expr::Raise(_, maybe) => {
+            if let Some(e) = maybe {
+                visit_expr_column_names_mut(e, f);
+            }
+        }
+        ast::Expr::SubqueryResult { lhs, .. } => {
+            if let Some(lhs) = lhs {
+                visit_expr_column_names_mut(lhs, f);
+            }
+        }
+
+        ast::Expr::Literal(_)
+        | ast::Expr::Variable(_)
+        | ast::Expr::Register(_)
+        | ast::Expr::Exists(_)
+        | ast::Expr::Subquery(_) => {}
+    }
+}
+
+fn visit_over_clause_column_names(over: Option<&ast::Over>, f: &mut impl FnMut(&ast::Name)) {
+    let Some(over) = over else {
+        return;
+    };
+    match over {
+        ast::Over::Window(w) => {
+            for p in &w.partition_by {
+                visit_expr_column_names(p, f);
+            }
+            for ob in &w.order_by {
+                visit_expr_column_names(&ob.expr, f);
+            }
+            if let Some(frame) = &w.frame_clause {
+                visit_frame_bound_column_names(&frame.start, f);
+                if let Some(end) = &frame.end {
+                    visit_frame_bound_column_names(end, f);
+                }
+            }
+        }
+        ast::Over::Name(_) => {}
+    }
+}
+
+fn visit_over_clause_column_names_mut(
+    over: Option<&mut ast::Over>,
+    f: &mut impl FnMut(&mut ast::Name),
+) {
+    let Some(over) = over else {
+        return;
+    };
+    match over {
+        ast::Over::Window(w) => {
+            for p in &mut w.partition_by {
+                visit_expr_column_names_mut(p, f);
+            }
+            for ob in &mut w.order_by {
+                visit_expr_column_names_mut(&mut ob.expr, f);
+            }
+            if let Some(frame) = &mut w.frame_clause {
+                visit_frame_bound_column_names_mut(&mut frame.start, f);
+                if let Some(end) = &mut frame.end {
+                    visit_frame_bound_column_names_mut(end, f);
+                }
+            }
+        }
+        ast::Over::Name(_) => {}
+    }
+}
+
+fn visit_frame_bound_column_names(bound: &ast::FrameBound, f: &mut impl FnMut(&ast::Name)) {
+    match bound {
+        ast::FrameBound::Preceding(expr) | ast::FrameBound::Following(expr) => {
+            visit_expr_column_names(expr, f);
+        }
+        ast::FrameBound::CurrentRow
+        | ast::FrameBound::UnboundedPreceding
+        | ast::FrameBound::UnboundedFollowing => {}
+    }
+}
+
+fn visit_frame_bound_column_names_mut(
+    bound: &mut ast::FrameBound,
+    f: &mut impl FnMut(&mut ast::Name),
+) {
+    match bound {
+        ast::FrameBound::Preceding(expr) | ast::FrameBound::Following(expr) => {
+            visit_expr_column_names_mut(expr, f);
+        }
+        ast::FrameBound::CurrentRow
+        | ast::FrameBound::UnboundedPreceding
+        | ast::FrameBound::UnboundedFollowing => {}
+    }
+}
+
+fn rename_column_in_expr(expr: &mut ast::Expr, from: &str, to: &str) {
+    if from.is_empty() || from == to {
+        return;
+    }
+
+    visit_expr_column_names_mut(expr, &mut |name| rename_name_if_matches(name, from, to));
+}
+
+fn maybe_push_dep(
+    col_by_norm: &HashMap<String, String>,
+    seen_norm: &mut HashSet<String>,
+    deps: &mut Vec<String>,
+    name: &ast::Name,
+) {
+    let norm = name.as_str().to_ascii_lowercase();
+    let Some(orig) = col_by_norm.get(&norm) else {
+        return;
+    };
+    if seen_norm.insert(norm) {
+        deps.push(orig.clone());
+    }
+}
+
+fn infer_expr_deps_inner(
+    expr: &ast::Expr,
+    col_by_norm: &HashMap<String, String>,
+    seen_norm: &mut HashSet<String>,
+    deps: &mut Vec<String>,
+) {
+    visit_expr_column_names(expr, &mut |name| {
+        maybe_push_dep(col_by_norm, seen_norm, deps, name)
+    });
+}
+
+/// Infer referenced columns from a parsed SQL expression.
+///
+/// This is used to conservatively avoid generating DROP COLUMN operations
+/// that would break expression indexes in the simulator.
+fn infer_expr_deps(expr: &ast::Expr, columns: &[Column]) -> Vec<String> {
+    if columns.is_empty() {
+        return Vec::new();
+    }
+
+    let mut col_by_norm: HashMap<String, String> = HashMap::with_capacity(columns.len());
+    for c in columns {
+        col_by_norm
+            .entry(c.name.to_ascii_lowercase())
+            .or_insert_with(|| c.name.clone());
+    }
+
+    let mut seen_norm: HashSet<String> = HashSet::new();
+    let mut deps: Vec<String> = Vec::new();
+    infer_expr_deps_inner(expr, &col_by_norm, &mut seen_norm, &mut deps);
+    deps
+}
+
+#[cfg(test)]
+mod expr_identifier_rewrite_tests {
+    use super::*;
+
+    fn cols(names: &[&str]) -> Vec<Column> {
+        names
+            .iter()
+            .map(|name| Column {
+                name: (*name).to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rename_column_in_expr_renames_qualified_column_part() {
+        let mut expr = ast::Expr::Binary(
+            Box::new(ast::Expr::DoublyQualified(
+                ast::Name::exact("main".to_string()),
+                ast::Name::exact("t".to_string()),
+                ast::Name::exact("a".to_string()),
+            )),
+            ast::Operator::Equals,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+        );
+        rename_column_in_expr(&mut expr, "a", "a2");
+        assert_eq!(expr.to_string(), "main.t.a2 = 1");
+    }
+
+    #[test]
+    fn rename_column_in_expr_does_not_rename_qualifier_segments() {
+        let mut expr = ast::Expr::Binary(
+            Box::new(ast::Expr::DoublyQualified(
+                ast::Name::exact("main".to_string()),
+                ast::Name::exact("t".to_string()),
+                ast::Name::exact("a".to_string()),
+            )),
+            ast::Operator::Equals,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+        );
+        let before = expr.to_string();
+        rename_column_in_expr(&mut expr, "t", "u");
+        assert_eq!(expr.to_string(), before);
+    }
+
+    #[test]
+    fn rename_column_in_expr_does_not_rename_function_names() {
+        let mut expr = ast::Expr::FunctionCall {
+            name: ast::Name::exact("substr".to_string()),
+            distinctness: None,
+            args: vec![
+                Box::new(ast::Expr::Id(ast::Name::exact("b".to_string()))),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+            ],
+            order_by: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let before = expr.to_string();
+        rename_column_in_expr(&mut expr, "substr", "sub");
+        assert_eq!(expr.to_string(), before);
+    }
+
+    #[test]
+    fn infer_expr_deps_finds_columns_in_common_expression_index_forms() {
+        let columns = cols(&["a", "b", "c"]);
+
+        let substr_b = ast::Expr::FunctionCall {
+            name: ast::Name::exact("substr".to_string()),
+            distinctness: None,
+            args: vec![
+                Box::new(ast::Expr::Id(ast::Name::exact("b".to_string()))),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+            ],
+            order_by: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let abs_b = ast::Expr::FunctionCall {
+            name: ast::Name::exact("abs".to_string()),
+            distinctness: None,
+            args: vec![Box::new(ast::Expr::Id(ast::Name::exact("b".to_string())))],
+            order_by: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let b_lt_3 = ast::Expr::Binary(
+            Box::new(ast::Expr::Id(ast::Name::exact("b".to_string()))),
+            ast::Operator::Less,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("3".to_string()))),
+        );
+        let main_t_a_eq_1 = ast::Expr::Binary(
+            Box::new(ast::Expr::DoublyQualified(
+                ast::Name::exact("main".to_string()),
+                ast::Name::exact("t".to_string()),
+                ast::Name::exact("a".to_string()),
+            )),
+            ast::Operator::Equals,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+        );
+        let a_plus_c = ast::Expr::Binary(
+            Box::new(ast::Expr::Id(ast::Name::exact("a".to_string()))),
+            ast::Operator::Add,
+            Box::new(ast::Expr::Id(ast::Name::exact("c".to_string()))),
+        );
+
+        assert_eq!(infer_expr_deps(&substr_b, &columns), vec!["b"]);
+        assert_eq!(infer_expr_deps(&abs_b, &columns), vec!["b"]);
+        assert_eq!(infer_expr_deps(&b_lt_3, &columns), vec!["b"]);
+        assert_eq!(infer_expr_deps(&main_t_a_eq_1, &columns), vec!["a"]);
+        assert_eq!(infer_expr_deps(&a_plus_c, &columns), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn rename_column_in_expr_is_ascii_case_insensitive() {
+        let mut expr = ast::Expr::Id(ast::Name::exact("A".to_string()));
+        rename_column_in_expr(&mut expr, "a", "a2");
+        assert_eq!(expr.to_string(), "a2");
+    }
+
+    #[test]
+    fn rename_column_in_index_column_is_ascii_case_insensitive() {
+        let mut col = IndexColumn {
+            kind: IndexColumnKind::Column {
+                name: "A".to_string(),
+            },
+            order: SortOrder::Asc,
+        };
+        col.rename_column_refs("a", "a2");
+        assert_eq!(
+            col,
+            IndexColumn {
+                kind: IndexColumnKind::Column {
+                    name: "a2".to_string(),
+                },
+                order: SortOrder::Asc,
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "expression visitor expects an unresolved parsed expression; got a resolved Expr::Column/Expr::RowId"
+    )]
+    fn rename_column_in_expr_panics_on_resolved_column_expr() {
+        let mut expr = ast::Expr::Column {
+            database: None,
+            table: 0usize.into(),
+            column: 0,
+            is_rowid_alias: false,
+        };
+        rename_column_in_expr(&mut expr, "a", "a2");
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

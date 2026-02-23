@@ -5,7 +5,7 @@ use sql_generation::{
     generation::Opts,
     model::{
         query::{create::Create, create_index::CreateIndex},
-        table::{Column, ColumnType, Index, Table},
+        table::{Column, ColumnType, Index, IndexColumn, IndexColumnKind, Table},
     },
 };
 use std::cell::RefCell;
@@ -966,7 +966,7 @@ fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<CreateI
             if !table.columns.is_empty() {
                 // Pick 1-3 columns for the index
                 let num_columns = rng.random_range(1..=std::cmp::min(3, table.columns.len()));
-                let mut selected_columns = Vec::new();
+                let mut selected_columns: Vec<IndexColumn> = Vec::new();
                 let mut available_columns = table.columns.clone();
 
                 for _ in 0..num_columns {
@@ -980,7 +980,10 @@ fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<CreateI
                     } else {
                         SortOrder::Desc
                     };
-                    selected_columns.push((column.name, sort_order));
+                    selected_columns.push(IndexColumn {
+                        kind: IndexColumnKind::Column { name: column.name },
+                        order: sort_order,
+                    });
                 }
 
                 if !selected_columns.is_empty() {

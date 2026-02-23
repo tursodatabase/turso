@@ -13,14 +13,21 @@ use crate::model::query::{
     Create, CreateIndex, Delete, Drop, DropIndex, Insert, OnConflict, Select, UpdateSetItem,
 };
 use crate::model::table::{
-    Column, ColumnType, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
+    Column, ColumnType, Index, IndexColumn, IndexColumnKind, JoinType, JoinedTable, Name, SimValue,
+    Table, TableContext,
 };
 use indexmap::IndexSet;
 use rand::seq::IndexedRandom;
 use rand::Rng;
-use turso_parser::ast::{ColumnConstraint, Expr, SortOrder};
+use turso_parser::ast::{
+    ColumnConstraint, Expr, FunctionTail, Literal, Name as AstName, Operator, SortOrder,
+};
 
 use super::{backtrack, pick};
+
+const EXPR_INDEX_MAX_ROWS: usize = 256;
+const EXPR_INDEX_MAX_COLS: usize = 32;
+const MAX_EXPR_TERMS_PER_INDEX: usize = 1;
 
 impl Arbitrary for Create {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
@@ -591,19 +598,77 @@ impl Arbitrary for CreateIndex {
         let num_columns_to_pick = rng.random_range(1..=table.columns.len());
         let picked_column_indices = pick_n_unique(0..table.columns.len(), num_columns_to_pick, rng);
 
-        let columns = picked_column_indices
-            .map(|i| {
-                let column = &table.columns[i];
-                (
-                    column.name.clone(),
-                    if rng.random_bool(0.5) {
-                        SortOrder::Asc
-                    } else {
-                        SortOrder::Desc
+        let expr_term_prob = env.opts().query.create_index.expr_term_prob;
+
+        // Expression index terms can be significantly more expensive to create/maintain.
+        // Keep them in the generator, but bias towards only generating them for smaller tables
+        // and cap the number of expression terms per index.
+        let allow_expr_terms = table.rows.len() <= EXPR_INDEX_MAX_ROWS
+            && table.columns.len() <= EXPR_INDEX_MAX_COLS
+            && MAX_EXPR_TERMS_PER_INDEX > 0;
+        let mut expr_budget = if allow_expr_terms {
+            MAX_EXPR_TERMS_PER_INDEX
+        } else {
+            0
+        };
+
+        let mut columns = Vec::with_capacity(num_columns_to_pick);
+        for i in picked_column_indices {
+            let column = &table.columns[i];
+            let order = if rng.random_bool(0.5) {
+                SortOrder::Asc
+            } else {
+                SortOrder::Desc
+            };
+
+            let use_expr = expr_budget > 0 && rng.random_bool(expr_term_prob);
+            let kind = if use_expr {
+                expr_budget = expr_budget.saturating_sub(1);
+
+                let k: i64 = rng.random_range(0i64..=4i64);
+                let col_ref = || Expr::Id(AstName::exact(column.name.clone()));
+                let num = |n: i64| Expr::Literal(Literal::Numeric(n.to_string()));
+
+                let expr = match rng.random_range(0u8..=3) {
+                    0 => Expr::Binary(Box::new(col_ref()), Operator::Less, Box::new(num(k))),
+                    1 => Expr::FunctionCall {
+                        name: AstName::exact("abs".to_string()),
+                        distinctness: None,
+                        args: vec![Box::new(col_ref())],
+                        order_by: vec![],
+                        filter_over: FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
                     },
-                )
-            })
-            .collect::<Vec<(String, SortOrder)>>();
+                    2 => Expr::Binary(Box::new(col_ref()), Operator::Add, Box::new(num(k))),
+                    _ => Expr::FunctionCall {
+                        name: AstName::exact("substr".to_string()),
+                        distinctness: None,
+                        args: vec![
+                            Box::new(col_ref()),
+                            Box::new(num(1)),
+                            Box::new(num(k.max(1))),
+                        ],
+                        order_by: vec![],
+                        filter_over: FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    },
+                };
+
+                IndexColumnKind::Expr {
+                    expr: Box::new(expr),
+                }
+            } else {
+                IndexColumnKind::Column {
+                    name: column.name.clone(),
+                }
+            };
+
+            columns.push(IndexColumn { kind, order });
+        }
 
         let index_name = format!(
             "idx_{}_{}_{}",
@@ -619,6 +684,109 @@ impl Arbitrary for CreateIndex {
                 columns,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod create_index_expr_term_limits_tests {
+    use rand::{rngs::StdRng, SeedableRng};
+
+    use crate::generation::opts::{GenerationContext, Opts};
+    use crate::generation::Arbitrary;
+    use crate::model::query::CreateIndex;
+    use crate::model::table::{Column, ColumnType, IndexColumnKind, Table};
+
+    #[derive(Clone)]
+    struct Ctx {
+        tables: Vec<Table>,
+        opts: Opts,
+    }
+
+    impl GenerationContext for Ctx {
+        fn tables(&self) -> &Vec<Table> {
+            &self.tables
+        }
+
+        fn opts(&self) -> &Opts {
+            &self.opts
+        }
+    }
+
+    fn col(name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            column_type: ColumnType::Integer,
+            constraints: vec![],
+        }
+    }
+
+    #[test]
+    fn create_index_caps_expression_terms_per_index() {
+        let table = Table {
+            name: "t".to_string(),
+            columns: vec![col("a"), col("b"), col("c")],
+            rows: vec![vec![]],
+            indexes: vec![],
+        };
+
+        let mut opts = Opts::default();
+        opts.query.create_index.expr_term_prob = 1.0;
+        let ctx = Ctx {
+            tables: vec![table],
+            opts,
+        };
+
+        let mut rng = StdRng::seed_from_u64(0);
+
+        // Try multiple generations until we see an index with >=2 terms.
+        for _ in 0..200 {
+            let idx = <CreateIndex as Arbitrary>::arbitrary(&mut rng, &ctx);
+            if idx.index.columns.len() < 2 {
+                continue;
+            }
+            let expr_terms = idx
+                .index
+                .columns
+                .iter()
+                .filter(|c| matches!(c.kind, IndexColumnKind::Expr { .. }))
+                .count();
+            assert!(expr_terms <= super::MAX_EXPR_TERMS_PER_INDEX);
+            return;
+        }
+
+        panic!("failed to generate a multi-term index in allotted iterations");
+    }
+
+    #[test]
+    fn create_index_disables_expression_terms_for_wide_tables() {
+        let mut columns = Vec::new();
+        for i in 0..(super::EXPR_INDEX_MAX_COLS + 1) {
+            columns.push(col(&format!("c{i}")));
+        }
+        let table = Table {
+            name: "t".to_string(),
+            columns,
+            rows: vec![vec![]],
+            indexes: vec![],
+        };
+
+        let mut opts = Opts::default();
+        opts.query.create_index.expr_term_prob = 1.0;
+        let ctx = Ctx {
+            tables: vec![table],
+            opts,
+        };
+
+        let mut rng = StdRng::seed_from_u64(1);
+        let idx = <CreateIndex as Arbitrary>::arbitrary(&mut rng, &ctx);
+
+        let expr_terms = idx
+            .index
+            .columns
+            .iter()
+            .filter(|c| matches!(c.kind, IndexColumnKind::Expr { .. }))
+            .count();
+        assert_eq!(expr_terms, 0);
     }
 }
 
@@ -765,25 +933,29 @@ const ALTER_TABLE_NO_ALTER_COL_NO_DROP: &[AlterTableTypeDiscriminants] = &[
 ];
 
 fn get_column_diff(table: &Table) -> IndexSet<&str> {
-    let mut undropable: IndexSet<&str> = table
+    // SQLite identifier matching is ASCII case-insensitive for column resolution.
+    // Keep a normalized set to avoid generating DROP COLUMN operations that would
+    // invalidate existing indexes.
+    let mut undropable_norm: IndexSet<String> = table
         .indexes
         .iter()
-        .flat_map(|idx| idx.columns.iter().map(|(name, _)| name.as_str()))
+        .flat_map(|idx| idx.referenced_columns(&table.columns))
+        .map(|name| name.to_ascii_lowercase())
         .collect();
 
-    undropable.extend(
+    undropable_norm.extend(
         table
             .columns
             .iter()
             .filter(|c| c.has_unique_or_pk())
-            .map(|c| c.name.as_str()),
+            .map(|c| c.name.to_ascii_lowercase()),
     );
 
     table
         .columns
         .iter()
         .map(|c| c.name.as_str())
-        .filter(|name| !undropable.contains(name))
+        .filter(|&name| !undropable_norm.contains(&name.to_ascii_lowercase()))
         .collect()
 }
 

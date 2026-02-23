@@ -92,6 +92,8 @@ pub struct QueryOpts {
     pub update: UpdateOpts,
     #[garde(dive)]
     pub alter_table: AlterTableOpts,
+    #[garde(dive)]
+    pub create_index: CreateIndexOpts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
@@ -221,6 +223,23 @@ impl Default for AlterTableOpts {
     fn default() -> Self {
         Self {
             alter_column: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(deny_unknown_fields, default)]
+pub struct CreateIndexOpts {
+    /// probability that an index term is an expression.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub expr_term_prob: f64,
+}
+
+impl Default for CreateIndexOpts {
+    fn default() -> Self {
+        Self {
+            // Keep non-zero by default to generate expression indexes.
+            expr_term_prob: 0.15,
         }
     }
 }

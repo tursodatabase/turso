@@ -1171,22 +1171,14 @@ impl Shadow for AlterTable {
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
                 *col = new.clone();
                 table.indexes.iter_mut().for_each(|index| {
-                    index.columns.iter_mut().for_each(|(col_name, _)| {
-                        if col_name == old {
-                            col_name.clone_from(&new.name);
-                        }
-                    });
+                    index.rename_column_refs(old, &new.name);
                 });
             }
             AlterTableType::RenameColumn { old, new } => {
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
                 col.name.clone_from(new);
                 table.indexes.iter_mut().for_each(|index| {
-                    index.columns.iter_mut().for_each(|(col_name, _)| {
-                        if col_name == old {
-                            col_name.clone_from(new);
-                        }
-                    });
+                    index.rename_column_refs(old, new);
                 });
             }
             AlterTableType::DropColumn { column_name } => {

@@ -656,11 +656,7 @@ where
                         col.name.clone_from(new_name);
                         // Update index column names
                         for index in &mut committed.indexes {
-                            for (col_name, _) in &mut index.columns {
-                                if col_name == old_name {
-                                    col_name.clone_from(new_name);
-                                }
-                            }
+                            index.rename_column_refs(old_name, new_name);
                         }
                     }
                     TxOperation::AlterColumn {
@@ -680,11 +676,7 @@ where
                         }
                         // Update index column names if the column was renamed
                         for index in &mut committed.indexes {
-                            for (col_name, _) in &mut index.columns {
-                                if col_name == old_name {
-                                    col_name.clone_from(&new_column.name);
-                                }
-                            }
+                            index.rename_column_refs(old_name, &new_column.name);
                         }
                     }
                 }
