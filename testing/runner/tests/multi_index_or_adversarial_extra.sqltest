@@ -1,0 +1,452 @@
+# Extra adversarial tests for multi-index OR in joins.
+# Covers: mixed AND/OR, multi-table OR, type coercion, nested subqueries,
+# chained CTEs with OR, aggregates over OR joins, empty tables, dedup stress.
+
+@database :memory:
+
+setup graph_5node {
+    CREATE TABLE node (id INTEGER PRIMARY KEY, label TEXT);
+    CREATE TABLE edge (id INTEGER PRIMARY KEY, src INT, dst INT);
+    CREATE INDEX idx_src ON edge(src);
+    CREATE INDEX idx_dst ON edge(dst);
+    INSERT INTO node VALUES (1,'A'),(2,'B'),(3,'C'),(4,'D'),(5,'E');
+    INSERT INTO edge VALUES (1,1,2),(2,2,3),(3,3,4),(4,4,5),(5,5,1),(6,1,3),(7,2,4),(8,3,5);
+}
+
+# LEFT JOIN with OR + additional filter in ON clause.
+# Only edges with weight > 25 match; unmatched nodes appear with NULLs.
+setup weighted_graph {
+    CREATE TABLE node (id INTEGER PRIMARY KEY, label TEXT);
+    CREATE TABLE edge (id INTEGER PRIMARY KEY, src INT, dst INT, weight INT);
+    CREATE INDEX idx_src ON edge(src);
+    CREATE INDEX idx_dst ON edge(dst);
+    INSERT INTO node VALUES (1,'A'),(2,'B'),(3,'C'),(4,'D'),(5,'E');
+    INSERT INTO edge VALUES (1,1,2,10),(2,2,3,20),(3,3,4,30),(4,4,5,40),(5,5,1,50),(6,1,3,15),(7,NULL,NULL,99),(8,1,1,5);
+}
+
+@setup weighted_graph
+test left-join-or-with-weight-filter {
+    SELECT n.id, e.id, e.weight
+    FROM node n
+    LEFT JOIN edge e ON (e.src = n.id OR e.dst = n.id) AND e.weight > 25
+    ORDER BY n.id, e.id;
+}
+expect {
+    1|5|50
+    2||
+    3|3|30
+    4|3|30
+    4|4|40
+    5|4|40
+    5|5|50
+}
+
+# Mixed AND/OR in ON clause: (t2.x = t1.a OR t2.y = t1.a) AND t1.id < t2.id
+setup mixed_and_or {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX t2_a ON t2(a);
+    CREATE INDEX t2_b ON t2(b);
+    INSERT INTO t1 VALUES (1,1,10),(2,2,20),(3,3,30),(4,NULL,40),(5,5,NULL);
+    INSERT INTO t2 VALUES (1,1,100),(2,2,200),(3,10,300),(4,20,400),(5,NULL,500);
+}
+
+@setup mixed_and_or
+test mixed-and-or-on-clause {
+    SELECT t1.id, t2.id, t1.a, t1.b, t2.a
+    FROM t1
+    JOIN t2 ON (t2.a = t1.a OR t2.a = t1.b) AND t1.id < t2.id
+    ORDER BY t1.id, t2.id;
+}
+expect {
+    1|3|1|10|10
+    2|4|2|20|20
+}
+
+# Two independent OR join conditions in the same multiway join.
+setup dual_or {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, x INT, y INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, p INT, q INT);
+    CREATE INDEX t2_x ON t2(x);
+    CREATE INDEX t2_y ON t2(y);
+    CREATE INDEX t3_p ON t3(p);
+    CREATE INDEX t3_q ON t3(q);
+    INSERT INTO t1 VALUES (1,10),(2,20);
+    INSERT INTO t2 VALUES (1,10,20),(2,20,30),(3,30,10);
+    INSERT INTO t3 VALUES (1,10,20),(2,20,10),(3,30,30);
+}
+
+@setup dual_or
+test two-independent-or-joins {
+    SELECT t1.id, t2.id, t3.id
+    FROM t1
+    JOIN t2 ON t2.x = t1.a OR t2.y = t1.a
+    JOIN t3 ON t3.p = t1.a OR t3.q = t1.a
+    ORDER BY t1.id, t2.id, t3.id;
+}
+expect {
+    1|1|1
+    1|1|2
+    1|3|1
+    1|3|2
+    2|1|1
+    2|1|2
+    2|2|1
+    2|2|2
+}
+
+# CTE-driven dedup stress: both OR branches match the same row.
+setup dedup_stress {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX t_a ON t(a);
+    CREATE INDEX t_b ON t(b);
+    INSERT INTO t VALUES (1,5,5),(2,5,10),(3,10,5),(4,10,10);
+}
+
+@setup dedup_stress
+test cte-dedup-both-branches-match {
+    WITH vals AS (SELECT 5 AS v UNION ALL SELECT 10)
+    SELECT vals.v, t.id
+    FROM vals
+    JOIN t ON t.a = vals.v OR t.b = vals.v
+    ORDER BY vals.v, t.id;
+}
+expect {
+    5|1
+    5|2
+    5|3
+    10|2
+    10|3
+    10|4
+}
+
+# All rows match both branches: must return exactly N rows, not 2N.
+@setup dedup_stress
+test all-rows-match-both-branches {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX u_a ON u(a);
+    CREATE INDEX u_b ON u(b);
+    INSERT INTO u VALUES (1,1,1),(2,1,1),(3,1,1);
+    SELECT COUNT(*) FROM u WHERE a = 1 OR b = 1;
+}
+expect {
+    3
+}
+
+# DISTINCT over OR join: duplicates from outer driving rows collapsed.
+@setup dedup_stress
+test distinct-over-or-join {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, x INT, y INT);
+    CREATE INDEX t2_x ON t2(x);
+    CREATE INDEX t2_y ON t2(y);
+    INSERT INTO t1 VALUES (1,5),(2,5);
+    INSERT INTO t2 VALUES (1,5,5),(2,5,10),(3,10,5);
+    SELECT DISTINCT t2.id FROM t1 JOIN t2 ON t2.x = t1.val OR t2.y = t1.val ORDER BY t2.id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# OR join + GROUP BY + HAVING: node degree computation.
+@setup graph_5node
+test or-join-group-by-having-degree {
+    SELECT n.id, COUNT(*) as degree
+    FROM node n
+    JOIN edge e ON e.src = n.id OR e.dst = n.id
+    GROUP BY n.id
+    HAVING COUNT(*) >= 3
+    ORDER BY degree DESC, n.id;
+}
+expect {
+    3|4
+    1|3
+    2|3
+    4|3
+    5|3
+}
+
+# Type coercion: OR join between TEXT and INT columns.
+setup type_coercion {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b TEXT);
+    CREATE INDEX t2_a ON t2(a);
+    CREATE INDEX t2_b ON t2(b);
+    INSERT INTO t1 VALUES (1,'10'),(2,'hello'),(3,'20');
+    INSERT INTO t2 VALUES (1,10,'hello'),(2,20,'world'),(3,30,'10');
+}
+
+@setup type_coercion
+test or-join-type-coercion {
+    SELECT t1.id, t1.val, t2.id
+    FROM t1
+    JOIN t2 ON t2.a = t1.val OR t2.b = t1.val
+    ORDER BY t1.id, t2.id;
+}
+expect {
+    1|10|1
+    1|10|3
+    2|hello|1
+    3|20|2
+}
+
+# OR of AND pairs: bidirectional edge matching.
+setup bidirectional {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, x INT, y INT);
+    CREATE INDEX t2_x ON t2(x);
+    CREATE INDEX t2_y ON t2(y);
+    INSERT INTO t1 VALUES (1,1,2),(2,3,4),(3,5,6);
+    INSERT INTO t2 VALUES (1,1,2),(2,2,1),(3,3,4),(4,6,5),(5,7,8);
+}
+
+@setup bidirectional
+test or-of-and-pairs-bidirectional {
+    SELECT t1.id, t2.id
+    FROM t1
+    JOIN t2 ON (t2.x = t1.a AND t2.y = t1.b) OR (t2.x = t1.b AND t2.y = t1.a)
+    ORDER BY t1.id, t2.id;
+}
+expect {
+    1|1
+    1|2
+    2|3
+    3|4
+}
+
+# Chained CTEs: CTE -> OR join -> CASE WHEN -> DISTINCT neighbor extraction.
+setup chain_graph {
+    CREATE TABLE edge(id INTEGER PRIMARY KEY, src INT, dst INT);
+    CREATE INDEX idx_src ON edge(src);
+    CREATE INDEX idx_dst ON edge(dst);
+    INSERT INTO edge VALUES (1,1,2),(2,2,3),(3,3,1),(4,1,4),(5,4,2);
+}
+
+@setup chain_graph
+test chained-ctes-or-join-neighbor-extract {
+    WITH
+      start_nodes AS (SELECT 1 AS id UNION ALL SELECT 2),
+      connected_edges AS (
+        SELECT s.id AS start_id, e.id AS edge_id, e.src, e.dst
+        FROM start_nodes s
+        JOIN edge e ON e.src = s.id OR e.dst = s.id
+      ),
+      neighbor_ids AS (
+        SELECT DISTINCT start_id,
+               CASE WHEN src = start_id THEN dst ELSE src END AS neighbor
+        FROM connected_edges
+      )
+    SELECT * FROM neighbor_ids ORDER BY start_id, neighbor;
+}
+expect {
+    1|2
+    1|3
+    1|4
+    2|1
+    2|3
+    2|4
+}
+
+# Cross-table OR: ON clause references columns from two different driving tables.
+setup cross_table_or {
+    CREATE TABLE n1(id INTEGER PRIMARY KEY);
+    CREATE TABLE n2(id INTEGER PRIMARY KEY);
+    CREATE TABLE edge(id INTEGER PRIMARY KEY, src INT, dst INT);
+    CREATE INDEX idx_src ON edge(src);
+    CREATE INDEX idx_dst ON edge(dst);
+    INSERT INTO n1 VALUES (1),(2);
+    INSERT INTO n2 VALUES (3),(4);
+    INSERT INTO edge VALUES (1,1,3),(2,2,4),(3,1,4),(4,3,2),(5,5,5);
+}
+
+@setup cross_table_or
+test cross-table-or-in-on-clause {
+    SELECT n1.id, n2.id, e.id, e.src, e.dst
+    FROM n1, n2
+    JOIN edge e ON e.src = n1.id OR e.dst = n2.id
+    ORDER BY n1.id, n2.id, e.id;
+}
+expect {
+    1|3|1|1|3
+    1|3|3|1|4
+    1|4|1|1|3
+    1|4|2|2|4
+    1|4|3|1|4
+    2|3|1|1|3
+    2|3|2|2|4
+    2|4|2|2|4
+    2|4|3|1|4
+}
+
+# Nested subquery wrapping an OR join.
+setup nested_sub {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX t_a ON t(a);
+    CREATE INDEX t_b ON t(b);
+    INSERT INTO t VALUES (1,1,10),(2,2,20),(3,3,30),(4,10,1),(5,20,2);
+}
+
+@setup nested_sub
+test nested-subquery-or-join {
+    SELECT * FROM (
+      SELECT * FROM (
+        SELECT t1.id AS id1, t2.id AS id2
+        FROM t t1
+        JOIN t t2 ON t2.a = t1.b OR t2.b = t1.a
+        WHERE t1.id < t2.id
+      ) sub
+      ORDER BY id1, id2
+    ) outer_sub;
+}
+expect {
+    1|4
+    2|5
+}
+
+# OR join with empty inner table: INNER returns 0, LEFT returns all.
+setup empty_inner {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, x INT, y INT);
+    CREATE INDEX t2_x ON t2(x);
+    CREATE INDEX t2_y ON t2(y);
+    INSERT INTO t1 VALUES (1,10),(2,20),(3,30);
+}
+
+@setup empty_inner
+test or-join-empty-inner-table {
+    SELECT t1.id, t2.id
+    FROM t1
+    LEFT JOIN t2 ON t2.x = t1.a OR t2.y = t1.a
+    ORDER BY t1.id;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+# CTE + 4-way OR join: 2-hop neighbor count via graph traversal.
+@setup graph_5node
+test four-way-or-join-two-hop-neighbors {
+    WITH seeds AS (SELECT id FROM node WHERE id <= 2)
+    SELECT s.id AS seed,
+           COUNT(DISTINCT n2.id) AS two_hop_neighbors
+    FROM seeds s
+    JOIN edge e1 ON (e1.src = s.id OR e1.dst = s.id)
+    JOIN node n1 ON (e1.src = n1.id OR e1.dst = n1.id) AND n1.id != s.id
+    JOIN edge e2 ON (e2.src = n1.id OR e2.dst = n1.id) AND e2.id != e1.id
+    JOIN node n2 ON (e2.src = n2.id OR e2.dst = n2.id) AND n2.id != n1.id AND n2.id != s.id
+    GROUP BY s.id
+    ORDER BY s.id;
+}
+expect {
+    1|4
+    2|4
+}
+
+# Subquery as driving table + OR join.
+@setup graph_5node
+test subquery-driving-or-join {
+    SELECT sq.id, e.id, sq.label
+    FROM (SELECT id, label FROM node WHERE id IN (1,3)) sq
+    JOIN edge e ON e.src = sq.id OR e.dst = sq.id
+    ORDER BY sq.id, e.id;
+}
+expect {
+    1|1|A
+    1|5|A
+    1|6|A
+    3|2|C
+    3|3|C
+    3|6|C
+    3|8|C
+}
+
+# Three-branch OR in self-join.
+setup three_branch {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT, c INT);
+    CREATE INDEX t_a ON t(a);
+    CREATE INDEX t_b ON t(b);
+    CREATE INDEX t_c ON t(c);
+    INSERT INTO t VALUES (1,10,20,30),(2,20,30,40),(3,30,40,50),(4,40,50,60),(5,NULL,NULL,NULL);
+}
+
+@setup three_branch
+test three-branch-or-self-join {
+    SELECT t1.id, t2.id
+    FROM t t1
+    JOIN t t2 ON t2.a = t1.a OR t2.b = t1.a OR t2.c = t1.a
+    WHERE t1.id <= 3
+    ORDER BY t1.id, t2.id;
+}
+expect {
+    1|1
+    2|1
+    2|2
+    3|1
+    3|2
+    3|3
+}
+
+# OR join with IN list and BETWEEN.
+setup items_tags {
+    CREATE TABLE items(id INTEGER PRIMARY KEY, category INT, price INT);
+    CREATE TABLE tags(id INTEGER PRIMARY KEY, item_id INT, tag TEXT);
+    CREATE INDEX tags_item ON tags(item_id);
+    INSERT INTO items VALUES (1,1,100),(2,1,200),(3,2,300),(4,2,400),(5,3,500);
+    INSERT INTO tags VALUES (1,1,'hot'),(2,2,'new'),(3,3,'hot'),(4,3,'sale'),(5,5,'new');
+}
+
+@setup items_tags
+test or-join-with-in-and-between {
+    SELECT i.id, i.price, t.tag
+    FROM items i
+    JOIN tags t ON (t.item_id = i.id OR t.item_id = i.category)
+    WHERE i.price BETWEEN 150 AND 450
+      AND i.id IN (2,3,4)
+    ORDER BY i.id, t.tag;
+}
+expect {
+    2|200|hot
+    2|200|new
+    3|300|hot
+    3|300|new
+    3|300|sale
+    4|400|new
+}
+
+# DELETE with multi-index OR condition.
+@setup dedup_stress
+test delete-with-or-condition {
+    CREATE TABLE del_t(id INTEGER PRIMARY KEY, a INT, b INT, val TEXT);
+    CREATE INDEX del_t_a ON del_t(a);
+    CREATE INDEX del_t_b ON del_t(b);
+    INSERT INTO del_t VALUES (1,10,20,'keep'),(2,20,30,'del'),(3,30,10,'del'),(4,40,50,'keep'),(5,10,30,'del');
+    DELETE FROM del_t WHERE a = 10 OR b = 10;
+    SELECT * FROM del_t ORDER BY id;
+}
+expect {
+    2|20|30|del
+    4|40|50|keep
+}
+
+# UPDATE with multi-index OR condition.
+@setup dedup_stress
+test update-with-or-condition {
+    CREATE TABLE upd_t(id INTEGER PRIMARY KEY, a INT, b INT, val INT);
+    CREATE INDEX upd_t_a ON upd_t(a);
+    CREATE INDEX upd_t_b ON upd_t(b);
+    INSERT INTO upd_t VALUES (1,10,20,0),(2,20,30,0),(3,30,10,0),(4,40,50,0),(5,10,30,0);
+    UPDATE upd_t SET val = val + 1 WHERE a = 10 OR b = 10;
+    SELECT * FROM upd_t ORDER BY id;
+}
+expect {
+    1|10|20|1
+    2|20|30|0
+    3|30|10|1
+    4|40|50|0
+    5|10|30|1
+}

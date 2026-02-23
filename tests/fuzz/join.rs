@@ -91,38 +91,32 @@ mod join_fuzz_tests {
 
         let _non_pk_cols = ["a", "b", "c", "d"];
 
-        // Helper to generate a derived table (FROM clause subquery) for a given table
-        let gen_derived_table = |rng: &mut ChaCha8Rng,
-                                 table: &str,
-                                 alias: &str|
-         -> (String, Vec<&str>) {
+        // Helper to generate the inner SELECT for a derived table or CTE body.
+        let gen_inner_select = |rng: &mut ChaCha8Rng, table: &str| -> (String, Vec<&str>) {
             let kind = rng.random_range(0..4);
             match kind {
                 0 => {
-                    // Simple passthrough: (SELECT * FROM t) AS alias
-                    (
-                        format!("(SELECT * FROM {table}) AS {alias}"),
-                        vec!["a", "b", "c", "d"],
-                    )
+                    // Simple passthrough
+                    (format!("SELECT * FROM {table}"), vec!["a", "b", "c", "d"])
                 }
                 1 => {
-                    // Select specific columns with expression: (SELECT a, b, c + d AS cd FROM t) AS alias
+                    // Select specific columns with expression
                     (
-                        format!("(SELECT a, b, c, d, c + d AS cd FROM {table}) AS {alias}"),
+                        format!("SELECT a, b, c, d, c + d AS cd FROM {table}"),
                         vec!["a", "b", "c", "d"],
                     )
                 }
                 2 => {
-                    // With aggregate: (SELECT a, sum(b) AS sum_b, count(*) AS cnt FROM t GROUP BY a) AS alias
+                    // With aggregate
                     (
-                        format!("(SELECT a, sum(b) AS sum_b, max(c) AS max_c, count(*) AS cnt FROM {table} GROUP BY a) AS {alias}"),
-                        vec!["a"], // Only 'a' can be used for joins
+                        format!("SELECT a, sum(b) AS sum_b, max(c) AS max_c, count(*) AS cnt FROM {table} GROUP BY a"),
+                        vec!["a"],
                     )
                 }
                 3 => {
-                    // With filter: (SELECT * FROM t WHERE a IS NOT NULL) AS alias
+                    // With filter
                     (
-                        format!("(SELECT * FROM {table} WHERE a IS NOT NULL) AS {alias}"),
+                        format!("SELECT * FROM {table} WHERE a IS NOT NULL"),
                         vec!["a", "b", "c", "d"],
                     )
                 }
@@ -143,49 +137,75 @@ mod join_fuzz_tests {
             let num_tables = rng.random_range(2..=4);
             let used_tables = &tables[..num_tables];
 
-            // Decide which tables to wrap in derived tables (30% chance each)
-            let use_derived: Vec<bool> = (0..num_tables).map(|_| rng.random_bool(0.3)).collect();
+            // Decide wrapping for each table: direct (0), derived subquery (1), or CTE (2).
+            // Probabilities: 50% direct, 20% derived, 30% CTE
+            let wrap_kind: Vec<u8> = (0..num_tables)
+                .map(|_| {
+                    let r = rng.random_range(0..10);
+                    if r < 5 {
+                        0 // direct
+                    } else if r < 7 {
+                        1 // derived subquery
+                    } else {
+                        2 // CTE
+                    }
+                })
+                .collect();
 
-            // Generate table references (either direct or derived) and track available join columns
-            let mut table_refs: Vec<(String, String, Vec<&str>)> = Vec::new(); // (from_expr, alias, joinable_cols)
+            // Generate table references and collect CTE definitions
+            // (from_expr, alias, joinable_cols, is_direct)
+            let mut table_refs: Vec<(String, String, Vec<&str>, bool)> = Vec::new();
+            let mut cte_defs: Vec<String> = Vec::new();
+
             for (i, &tname) in used_tables.iter().enumerate() {
-                if use_derived[i] {
-                    let alias = format!("sub_{tname}");
-                    let (derived, cols) = gen_derived_table(&mut rng, tname, &alias);
-                    table_refs.push((derived, alias, cols));
-                } else {
-                    table_refs.push((
-                        tname.to_string(),
-                        tname.to_string(),
-                        vec!["a", "b", "c", "d"],
-                    ));
+                match wrap_kind[i] {
+                    1 => {
+                        // Derived subquery: (SELECT ... FROM t) AS sub_t
+                        let alias = format!("sub_{tname}");
+                        let (inner, cols) = gen_inner_select(&mut rng, tname);
+                        table_refs.push((format!("({inner}) AS {alias}"), alias, cols, false));
+                    }
+                    2 => {
+                        // CTE: WITH cte_t AS [MATERIALIZED | NOT MATERIALIZED] (SELECT ...)
+                        let cte_name = format!("cte_{tname}");
+                        let (inner, cols) = gen_inner_select(&mut rng, tname);
+                        let mat_hint = match rng.random_range(0..3) {
+                            0 => " MATERIALIZED",
+                            1 => " NOT MATERIALIZED",
+                            _ => "",
+                        };
+                        cte_defs.push(format!("{cte_name} AS{mat_hint} ({inner})"));
+                        table_refs.push((cte_name.clone(), cte_name, cols, false));
+                    }
+                    _ => {
+                        // Direct table reference
+                        table_refs.push((
+                            tname.to_string(),
+                            tname.to_string(),
+                            vec!["a", "b", "c", "d"],
+                            true,
+                        ));
+                    }
                 }
             }
 
             let mut select_cols: Vec<String> = Vec::new();
-            for (_, alias, _) in table_refs.iter() {
-                // For derived tables without id column (like aggregates), we can't select id
-                // So we select the first available column for ordering
-                if alias.starts_with("sub_")
-                    && use_derived[table_refs.iter().position(|(_, a, _)| a == alias).unwrap()]
-                {
-                    // Check if this is an aggregate derived table (kind==2) by checking if only 'a' is joinable
-                    let idx = table_refs.iter().position(|(_, a, _)| a == alias).unwrap();
-                    if table_refs[idx].2.len() == 1 {
-                        select_cols.push(format!("{alias}.a"));
-                    } else {
-                        select_cols.push(format!("{alias}.a")); // Use 'a' for consistency
-                    }
-                } else {
+            for (_, alias, cols, is_direct) in table_refs.iter() {
+                if *is_direct {
                     select_cols.push(format!("{alias}.id"));
+                } else if cols.len() == 1 {
+                    // Aggregate CTE/derived — only 'a' available
+                    select_cols.push(format!("{alias}.a"));
+                } else {
+                    select_cols.push(format!("{alias}.a"));
                 }
             }
             let select_clause = select_cols.join(", ");
 
             let mut from_clause = format!("FROM {}", table_refs[0].0);
             for i in 1..num_tables {
-                let (_, left_alias, left_cols) = &table_refs[i - 1];
-                let (right_expr, right_alias, right_cols) = &table_refs[i];
+                let (_, left_alias, left_cols, _) = &table_refs[i - 1];
+                let (right_expr, right_alias, right_cols, right_direct) = &table_refs[i];
 
                 let join_type = if rng.random_bool(0.5) {
                     "JOIN"
@@ -216,7 +236,20 @@ mod join_fuzz_tests {
                 preds.sort();
                 preds.dedup();
 
-                let on_clause = preds.join(" AND ");
+                // 30% chance: join predicates with OR instead of AND.
+                // Only when indexes exist AND the right side is a direct table
+                // (not a derived/CTE), so the multi-index OR scan can use
+                // the indexes. Otherwise OR creates pathological full scans.
+                let use_or =
+                    add_indexes && *right_direct && preds.len() >= 2 && rng.random_bool(0.3);
+                let joiner = if use_or { " OR " } else { " AND " };
+                let on_clause = preds.join(joiner);
+                // 20% chance: wrap multi-predicate ON clause in parentheses
+                let on_clause = if preds.len() >= 2 && rng.random_bool(0.2) {
+                    format!("({on_clause})")
+                } else {
+                    on_clause
+                };
                 from_clause = format!("{from_clause} {join_type} {right_expr} ON {on_clause}");
             }
 
@@ -225,7 +258,7 @@ mod join_fuzz_tests {
             let num_where = rng.random_range(0..=2);
             for _ in 0..num_where {
                 let idx = rng.random_range(0..num_tables);
-                let (_, alias, cols) = &table_refs[idx];
+                let (_, alias, cols, _) = &table_refs[idx];
                 if cols.is_empty() {
                     continue;
                 }
@@ -253,10 +286,17 @@ mod join_fuzz_tests {
             };
             let order_clause = format!("ORDER BY {}", select_cols.join(", "));
             let limit = 50;
+
+            let with_clause = if cte_defs.is_empty() {
+                String::new()
+            } else {
+                format!("WITH {} ", cte_defs.join(", "))
+            };
+
             let query = format!(
-                "SELECT {select_clause} {from_clause} {where_clause} {order_clause} LIMIT {limit}",
+                "{with_clause}SELECT {select_clause} {from_clause} {where_clause} {order_clause} LIMIT {limit}",
             );
-            // Print some sample queries to verify derived table generation
+            // Print some sample queries to verify generation
             if iter < 10 {
                 println!("query[{iter}]: {query}");
             }

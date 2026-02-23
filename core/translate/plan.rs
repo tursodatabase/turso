@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
     self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
@@ -490,6 +491,9 @@ pub struct SelectPlan {
     pub window: Option<Window>,
     /// Subqueries that appear in any part of the query apart from the FROM clause
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
+    /// Estimated output rows from the optimizer's join order computation.
+    /// Used to propagate cardinality estimates for CTE/subquery tables.
+    pub estimated_output_rows: Option<f64>,
 }
 
 impl SelectPlan {
@@ -571,6 +575,40 @@ impl SelectPlan {
     }
 }
 
+/// Why an UPDATE/DELETE must gather target rowids first, then apply writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmlSafetyReason {
+    /// Triggers exist, so we lock in target rows before writing.
+    Trigger,
+    /// WHERE has a subquery, so we lock in target rows before writing.
+    SubqueryInWhere,
+    /// The plan reads rowids from multiple index branches (multi-index scan).
+    MultiIndexScan,
+    /// REPLACE may delete conflicting rows while we are scanning.
+    ReplaceMode,
+    /// The statement updates key columns used by the scan itself.
+    KeyMutation,
+}
+
+/// Safety decisions made while planning UPDATE/DELETE.
+#[derive(Debug, Clone, Default)]
+pub struct DmlSafety {
+    /// Why the safer "collect first, write later" mode was enabled.
+    pub reasons: SmallVec<[DmlSafetyReason; 2]>,
+}
+
+impl DmlSafety {
+    pub fn requires_stable_write_set(&self) -> bool {
+        !self.reasons.is_empty()
+    }
+
+    pub fn require(&mut self, reason: DmlSafetyReason) {
+        if !self.reasons.contains(&reason) {
+            self.reasons.push(reason);
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DeletePlan {
@@ -589,13 +627,14 @@ pub struct DeletePlan {
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
     pub indexes: Vec<Arc<Index>>,
-    /// If there are DELETE triggers, materialize rowids into a RowSet first.
-    /// This ensures triggers see a stable set of rows to delete.
+    /// When DELETE cannot safely write while scanning, we first collect rowids into a RowSet.
     pub rowset_plan: Option<SelectPlan>,
     /// Register ID for the RowSet (if rowset_plan is Some)
     pub rowset_reg: Option<usize>,
     /// Subqueries that appear in the WHERE clause (for non-rowset path)
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
+    /// Whether this DELETE plan uses the safer pre-materialization path, and why.
+    pub safety: DmlSafety,
 }
 
 #[derive(Debug, Clone)]
@@ -624,6 +663,8 @@ pub struct UpdatePlan {
     pub cdc_update_alter_statement: Option<String>,
     /// Subqueries that appear in the WHERE clause (for non-ephemeral path)
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
+    /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
+    pub safety: DmlSafety,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

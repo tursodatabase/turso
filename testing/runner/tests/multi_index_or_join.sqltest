@@ -1,0 +1,116 @@
+# Multi-index OR in joins and CTE cardinality estimation tests
+# Tests that multi-index union (OR-by-union) works correctly during joins,
+# not just for standalone table access.
+
+@database :memory:
+
+setup graph_schema {
+    CREATE TABLE node (id INTEGER PRIMARY KEY, label TEXT);
+    CREATE TABLE edge (id INTEGER PRIMARY KEY, source_id INTEGER, target_id INTEGER, label TEXT);
+    CREATE INDEX idx_edge_source ON edge(source_id);
+    CREATE INDEX idx_edge_target ON edge(target_id);
+
+    INSERT INTO node VALUES (1, 'A');
+    INSERT INTO node VALUES (2, 'B');
+    INSERT INTO node VALUES (3, 'C');
+    INSERT INTO node VALUES (4, 'D');
+
+    INSERT INTO edge VALUES (1, 1, 2, 'connects');
+    INSERT INTO edge VALUES (2, 2, 3, 'connects');
+    INSERT INTO edge VALUES (3, 3, 4, 'connects');
+    INSERT INTO edge VALUES (4, 4, 1, 'connects');
+}
+
+# Basic multi-index OR in join: find edges connected to a node
+@setup graph_schema
+test multi-index-or-join-basic {
+    SELECT e.id, e.source_id, e.target_id
+    FROM node n
+    JOIN edge e ON e.source_id = n.id OR e.target_id = n.id
+    WHERE n.id = 2
+    ORDER BY e.id;
+}
+expect {
+    1|1|2
+    2|2|3
+}
+
+# Multi-index OR in join with CTE
+@setup graph_schema
+test multi-index-or-join-cte {
+    WITH selected_nodes AS (
+        SELECT id FROM node WHERE id <= 2
+    )
+    SELECT e.id, e.source_id, e.target_id
+    FROM selected_nodes s
+    JOIN edge e ON e.source_id = s.id OR e.target_id = s.id
+    ORDER BY e.id;
+}
+expect {
+    1|1|2
+    1|1|2
+    2|2|3
+    4|4|1
+}
+
+# Multi-index OR in join with all nodes
+@setup graph_schema
+test multi-index-or-join-all-nodes {
+    SELECT n.id AS node_id, e.id AS edge_id
+    FROM node n
+    JOIN edge e ON e.source_id = n.id OR e.target_id = n.id
+    ORDER BY n.id, e.id;
+}
+expect {
+    1|1
+    1|4
+    2|1
+    2|2
+    3|2
+    3|3
+    4|3
+    4|4
+}
+
+# Parenthesized OR: same as basic test but with parens around the ON condition
+@setup graph_schema
+test multi-index-or-join-parenthesized {
+    SELECT e.id, e.source_id, e.target_id
+    FROM node n
+    JOIN edge e ON (e.source_id = n.id OR e.target_id = n.id)
+    WHERE n.id = 2
+    ORDER BY e.id;
+}
+expect {
+    1|1|2
+    2|2|3
+}
+
+# Snapshot test: verify multi-index OR uses SeekGE on edge indexes during join
+@setup graph_schema
+snapshot-eqp multi-index-or-in-join-plan {
+    SELECT e.id, e.source_id, e.target_id
+    FROM node n
+    JOIN edge e ON e.source_id = n.id OR e.target_id = n.id
+    WHERE n.id = 2;
+}
+
+# Snapshot test: same plan with parenthesized OR
+@setup graph_schema
+snapshot-eqp multi-index-or-in-join-parenthesized-plan {
+    SELECT e.id, e.source_id, e.target_id
+    FROM node n
+    JOIN edge e ON (e.source_id = n.id OR e.target_id = n.id)
+    WHERE n.id = 2;
+}
+
+# Snapshot test: verify CTE cardinality propagation improves join plan
+@setup graph_schema
+snapshot-eqp cte-join-with-or-plan {
+    WITH selected_nodes AS (
+        SELECT id FROM node WHERE id <= 2
+    )
+    SELECT e.id, e.source_id, e.target_id
+    FROM selected_nodes s
+    JOIN edge e ON e.source_id = s.id OR e.target_id = s.id;
+}

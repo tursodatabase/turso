@@ -13,7 +13,7 @@ use super::{
 };
 use crate::translate::{
     emitter::Resolver,
-    expr::{BindingBehavior, WalkControl},
+    expr::{unwrap_parens, BindingBehavior, WalkControl},
     plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
@@ -1868,6 +1868,11 @@ pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     predicate: &Expr,
     out_predicates: &mut Vec<T>,
 ) {
+    // Unwrap single-element parenthesized expressions recursively: ((expr)) -> expr.
+    // This is semantically equivalent since single-element Parenthesized is purely
+    // syntactic grouping. Multi-element Parenthesized (row values like (x, y)) are
+    // left as-is by unwrap_parens.
+    let predicate = unwrap_parens(predicate).unwrap_or(predicate);
     match predicate {
         Expr::Binary(left, ast::Operator::And, right) => {
             break_predicate_at_and_boundaries(left, out_predicates);

@@ -1,0 +1,19 @@
+---
+source: cte_cardinality.sqltest
+expression: |-
+  SELECT sub.id, i.name
+      FROM items i
+      JOIN (SELECT id FROM items LIMIT 3) sub ON i.id = sub.id;
+info:
+  statement_type: SELECT
+  tables:
+  - i.id
+  - items
+  setup_blocks:
+  - tables
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN sub
+|  `--SCAN items
+`--SEARCH i USING INTEGER PRIMARY KEY (rowid=?)

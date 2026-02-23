@@ -1233,6 +1233,7 @@ fn build_materialized_build_input_plan(
         values: vec![],
         window: None,
         non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
+        estimated_output_rows: None,
     };
 
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;

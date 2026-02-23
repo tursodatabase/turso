@@ -329,6 +329,7 @@ fn prepare_one_select_plan(
                 values: vec![],
                 window: None,
                 non_from_clause_subqueries: vec![],
+                estimated_output_rows: None,
             };
 
             let mut windows = Vec::with_capacity(window_clause.len());
@@ -679,6 +680,7 @@ fn prepare_one_select_plan(
                     .collect(),
                 window: None,
                 non_from_clause_subqueries,
+                estimated_output_rows: None,
             };
 
             validate_expr_correct_column_counts(&plan)?;

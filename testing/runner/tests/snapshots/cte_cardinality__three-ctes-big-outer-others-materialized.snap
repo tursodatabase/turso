@@ -1,0 +1,36 @@
+---
+source: cte_cardinality.sqltest
+expression: |-
+  WITH tiny AS (
+          SELECT id FROM items LIMIT 2
+      ),
+      medium AS (
+          SELECT id FROM items LIMIT 10
+      ),
+      big AS (
+          SELECT id FROM items LIMIT 200
+      )
+      SELECT t.id, m.id, b.id
+      FROM tiny t
+      JOIN medium m ON t.id = m.id
+      JOIN big b ON m.id = b.id;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - big
+  - items
+  - m.id
+  - medium
+  - t.id
+  - tiny
+  setup_blocks:
+  - tables
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN big AS b
+|  `--SCAN items
+|--SEARCH m USING INDEX ephemeral_subquery_t4
+|  `--SCAN items
+`--SEARCH t USING INDEX ephemeral_subquery_t2
+   `--SCAN items

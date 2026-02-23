@@ -1,0 +1,20 @@
+---
+source: multi_index_or_join.sqltest
+expression: |-
+  SELECT e.id, e.source_id, e.target_id
+      FROM node n
+      JOIN edge e ON e.source_id = n.id OR e.target_id = n.id
+      WHERE n.id = 2;
+info:
+  statement_type: SELECT
+  tables:
+  - e.source_id
+  - edge
+  - node
+  setup_blocks:
+  - graph_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH n USING INTEGER PRIMARY KEY (rowid=?)
+`--MULTI-INDEX OR e (idx_edge_source, idx_edge_target)

@@ -258,7 +258,7 @@ pub fn estimate_multi_index_scan_cost(
     base_row_count: RowCountEstimate,
     input_cardinality: f64,
     params: &CostModelParams,
-) -> Cost {
+) -> (Cost, f64) {
     let base_row_count = *base_row_count;
 
     // Total cost of all branch scans
@@ -291,7 +291,7 @@ pub fn estimate_multi_index_scan_cost(
     // Total cost
     let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
 
-    Cost(total_cost)
+    (Cost(total_cost), estimated_unique_rows)
 }
 
 /// Estimate the cost of a multi-index intersection (AND-by-intersection optimization).

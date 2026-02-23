@@ -20,7 +20,7 @@ use super::emitter::emit_program;
 use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
+    ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
 };
 use super::planner::{parse_where, plan_ctes_as_outer_refs};
 use super::subquery::{
@@ -471,6 +471,7 @@ pub fn prepare_update_plan(
         ephemeral_plan: None,
         cdc_update_alter_statement: None,
         non_from_clause_subqueries,
+        safety: DmlSafety::default(),
     }))
 }
 

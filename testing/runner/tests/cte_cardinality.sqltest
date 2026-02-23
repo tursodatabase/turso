@@ -1,0 +1,180 @@
+# CTE and subquery cardinality estimation tests
+# Tests that the optimizer correctly propagates cardinality estimates from
+# CTEs and subqueries, leading to good join ordering decisions.
+
+@database :memory:
+
+setup tables {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, category_id INTEGER);
+    CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE links (id INTEGER PRIMARY KEY, src_id INTEGER, dst_id INTEGER, kind TEXT);
+    CREATE INDEX idx_links_src ON links(src_id);
+    CREATE INDEX idx_links_dst ON links(dst_id);
+
+    -- 20 items, 5 categories, 30 links
+    INSERT INTO categories VALUES (1, 'cat_a');
+    INSERT INTO categories VALUES (2, 'cat_b');
+    INSERT INTO categories VALUES (3, 'cat_c');
+    INSERT INTO categories VALUES (4, 'cat_d');
+    INSERT INTO categories VALUES (5, 'cat_e');
+
+    INSERT INTO items VALUES (1, 'item1', 1);
+    INSERT INTO items VALUES (2, 'item2', 1);
+    INSERT INTO items VALUES (3, 'item3', 2);
+    INSERT INTO items VALUES (4, 'item4', 2);
+    INSERT INTO items VALUES (5, 'item5', 3);
+    INSERT INTO items VALUES (6, 'item6', 3);
+    INSERT INTO items VALUES (7, 'item7', 4);
+    INSERT INTO items VALUES (8, 'item8', 4);
+    INSERT INTO items VALUES (9, 'item9', 5);
+    INSERT INTO items VALUES (10, 'item10', 5);
+    INSERT INTO items VALUES (11, 'item11', 1);
+    INSERT INTO items VALUES (12, 'item12', 2);
+    INSERT INTO items VALUES (13, 'item13', 3);
+    INSERT INTO items VALUES (14, 'item14', 4);
+    INSERT INTO items VALUES (15, 'item15', 5);
+    INSERT INTO items VALUES (16, 'item16', 1);
+    INSERT INTO items VALUES (17, 'item17', 2);
+    INSERT INTO items VALUES (18, 'item18', 3);
+    INSERT INTO items VALUES (19, 'item19', 4);
+    INSERT INTO items VALUES (20, 'item20', 5);
+
+    INSERT INTO links VALUES (1, 1, 2, 'related');
+    INSERT INTO links VALUES (2, 2, 3, 'related');
+    INSERT INTO links VALUES (3, 3, 4, 'related');
+    INSERT INTO links VALUES (4, 4, 5, 'related');
+    INSERT INTO links VALUES (5, 5, 6, 'related');
+    INSERT INTO links VALUES (6, 6, 7, 'related');
+    INSERT INTO links VALUES (7, 7, 8, 'related');
+    INSERT INTO links VALUES (8, 8, 9, 'related');
+    INSERT INTO links VALUES (9, 9, 10, 'related');
+    INSERT INTO links VALUES (10, 10, 1, 'related');
+    INSERT INTO links VALUES (11, 1, 3, 'similar');
+    INSERT INTO links VALUES (12, 2, 4, 'similar');
+    INSERT INTO links VALUES (13, 3, 5, 'similar');
+    INSERT INTO links VALUES (14, 4, 6, 'similar');
+    INSERT INTO links VALUES (15, 5, 7, 'similar');
+    INSERT INTO links VALUES (16, 6, 8, 'similar');
+    INSERT INTO links VALUES (17, 7, 9, 'similar');
+    INSERT INTO links VALUES (18, 8, 10, 'similar');
+    INSERT INTO links VALUES (19, 9, 1, 'similar');
+    INSERT INTO links VALUES (20, 10, 2, 'similar');
+    INSERT INTO links VALUES (21, 1, 5, 'cross');
+    INSERT INTO links VALUES (22, 2, 6, 'cross');
+    INSERT INTO links VALUES (23, 3, 7, 'cross');
+    INSERT INTO links VALUES (24, 4, 8, 'cross');
+    INSERT INTO links VALUES (25, 5, 9, 'cross');
+    INSERT INTO links VALUES (26, 6, 10, 'cross');
+    INSERT INTO links VALUES (27, 7, 1, 'cross');
+    INSERT INTO links VALUES (28, 8, 2, 'cross');
+    INSERT INTO links VALUES (29, 9, 3, 'cross');
+    INSERT INTO links VALUES (30, 10, 4, 'cross');
+}
+
+# Large BTree table listed first in FROM, small CTE (with LIMIT) listed second.
+# LIMIT 3 gives estimated_output_rows = 3, much smaller than items table's fallback.
+# Optimizer should reorder: CTE as outer, PK seek into items.
+@setup tables
+snapshot-eqp small-cte-reordered-to-outer {
+    WITH small AS (
+        SELECT id FROM items LIMIT 3
+    )
+    SELECT s.id, i.name
+    FROM items i
+    JOIN small s ON i.id = s.id;
+}
+
+# Two CTEs with different LIMIT values. Small CTE (LIMIT 2) listed FIRST in FROM,
+# big CTE (LIMIT 100) listed SECOND. Optimizer should reorder: big CTE as outer
+# (coroutine), small CTE materialized into ephemeral index for seeking.
+# Materializing the smaller CTE is cheaper than materializing the bigger one.
+@setup tables
+snapshot-eqp small-cte-materialized-big-cte-outer {
+    WITH small AS (
+        SELECT id FROM items LIMIT 2
+    ),
+    big AS (
+        SELECT id FROM items LIMIT 100
+    )
+    SELECT s.id, b.id
+    FROM small s
+    JOIN big b ON s.id = b.id;
+}
+
+# Three CTEs with different sizes. Listed in FROM as tiny, medium, big (ascending,
+# worst naive order). Optimizer should reorder: big CTE as outer coroutine,
+# tiny and medium both materialized into ephemeral indexes for seeking.
+@setup tables
+snapshot-eqp three-ctes-big-outer-others-materialized {
+    WITH tiny AS (
+        SELECT id FROM items LIMIT 2
+    ),
+    medium AS (
+        SELECT id FROM items LIMIT 10
+    ),
+    big AS (
+        SELECT id FROM items LIMIT 200
+    )
+    SELECT t.id, m.id, b.id
+    FROM tiny t
+    JOIN medium m ON t.id = m.id
+    JOIN big b ON m.id = b.id;
+}
+
+# Large BTree table listed first in FROM, small subquery (with LIMIT) listed second.
+# Optimizer should reorder: subquery as outer, PK seek into items.
+@setup tables
+snapshot-eqp small-subquery-reordered-to-outer {
+    SELECT sub.id, i.name
+    FROM items i
+    JOIN (SELECT id FROM items LIMIT 3) sub ON i.id = sub.id;
+}
+
+# Customer-like pattern: CTE with LIMIT → multi-index OR on links → item lookup
+# (anonymized version of real customer graph traversal query)
+# The CTE is listed LAST in the FROM clause; optimizer should reorder it to outer.
+@setup tables
+snapshot-eqp cte-graph-traversal-multi-index-or {
+    WITH seed_ids AS (
+        SELECT id FROM items LIMIT 3
+    )
+    SELECT s.id AS seed_id,
+           l.kind,
+           l.src_id,
+           l.dst_id,
+           i.id AS neighbor_id,
+           i.name AS neighbor_name
+    FROM links l
+    JOIN items i ON (l.src_id = i.id OR l.dst_id = i.id)
+    JOIN seed_ids s ON (l.src_id = s.id OR l.dst_id = s.id) AND i.id != s.id;
+}
+
+# Correctness test for the graph traversal pattern
+@setup tables
+test cte-graph-traversal-correctness {
+    WITH seed_ids AS (
+        SELECT id FROM items LIMIT 2
+    )
+    SELECT s.id AS seed_id,
+           l.src_id,
+           l.dst_id,
+           i.id AS neighbor_id
+    FROM links l
+    JOIN items i ON (l.src_id = i.id OR l.dst_id = i.id)
+    JOIN seed_ids s ON (l.src_id = s.id OR l.dst_id = s.id) AND i.id != s.id
+    ORDER BY s.id, l.src_id, l.dst_id, i.id;
+}
+expect {
+    1|1|2|2
+    1|1|3|3
+    1|1|5|5
+    1|7|1|7
+    1|9|1|9
+    1|10|1|10
+    2|1|2|1
+    2|2|3|3
+    2|2|4|4
+    2|2|6|6
+    2|8|2|8
+    2|10|2|10
+}

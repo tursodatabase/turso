@@ -13,7 +13,7 @@ use crate::{
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
-            ColumnUsedMask, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
+            ColumnUsedMask, DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
             SeekKeyComponent,
         },
@@ -518,8 +518,31 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         &mut plan.offset,
     )?;
 
-    if let Some(best_join_order) = best_join_order {
+    if let Some((best_join_order, output_rows)) = best_join_order {
         plan.join_order = best_join_order;
+        let mut est = output_rows as f64;
+        // Clamp to LIMIT when it's a literal non-negative number.
+        // Negative LIMIT means "no limit" in SQLite, so we skip those.
+        if let Some(limit_expr) = &plan.limit {
+            if let Ok(val) = crate::util::parse_signed_number(limit_expr) {
+                let limit_f64 = match val {
+                    crate::types::Value::Numeric(Numeric::Integer(i)) if i >= 0 => Some(i as f64),
+                    crate::types::Value::Numeric(Numeric::Float(f)) => {
+                        let f: f64 = f.into();
+                        if f >= 0.0 {
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(limit_val) = limit_f64 {
+                    est = est.min(limit_val);
+                }
+            }
+        }
+        plan.estimated_output_rows = Some(est);
     }
 
     Ok(())
@@ -585,21 +608,34 @@ fn optimize_update_plan(
         &mut plan.offset,
     )?;
 
-    let table_ref = &mut plan.table_references.joined_tables_mut()[0];
+    if let Some(reason) = first_update_safety_reason(plan, resolver)? {
+        plan.safety.require(reason);
+    }
 
-    // An ephemeral table is required if:
-    // 1. The UPDATE modifies any column that is present in the key of the btree used to iterate over the table.
-    //    For regular table scans or seeks, this is just the rowid or the rowid alias column (INTEGER PRIMARY KEY)
-    //    For index scans and seeks, this is any column in the index used.
-    // 2. There are UPDATE triggers on the table. This is done in SQLite for all UPDATE triggers on
-    //    the affected table even if the trigger would not have an impact on the target table --
-    //    presumably due to lack of static analysis capabilities to determine whether it's safe
-    //    to skip the rowset materialization.
-    let requires_ephemeral_table = 'requires: {
+    if !plan.safety.requires_stable_write_set() {
+        return Ok(());
+    }
+
+    add_ephemeral_table_to_update_plan(program, plan)
+}
+
+fn first_update_safety_reason(
+    plan: &UpdatePlan,
+    resolver: &Resolver,
+) -> Result<Option<DmlSafetyReason>> {
+    let table_ref = &plan.table_references.joined_tables()[0];
+    let reason = 'requires: {
         let Some(btree_table_arc) = table_ref.table.btree() else {
-            break 'requires false;
+            break 'requires None;
         };
         let btree_table = btree_table_arc.as_ref();
+
+        // Multi-index scans gather rowids from multiple index branches.
+        // For UPDATE, we always use the prebuilt ephemeral-table path so writes run against
+        // that fixed rowid list (no surprises from branch/index overlap).
+        if matches!(table_ref.op, Operation::MultiIndexScan(_)) {
+            break 'requires Some(DmlSafetyReason::MultiIndexScan);
+        }
 
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
@@ -612,7 +648,7 @@ fn optimize_update_plan(
                 btree_table,
             )
         }) {
-            break 'requires true;
+            break 'requires Some(DmlSafetyReason::Trigger);
         }
 
         // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
@@ -621,7 +657,7 @@ fn optimize_update_plan(
             plan.or_conflict,
             Some(turso_parser::ast::ResolveType::Replace)
         ) {
-            break 'requires true;
+            break 'requires Some(DmlSafetyReason::ReplaceMode);
         }
 
         let Some(index) = table_ref.op.index() else {
@@ -629,16 +665,16 @@ fn optimize_update_plan(
                 accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
             });
             if rowid_alias_used {
-                break 'requires true;
+                break 'requires Some(DmlSafetyReason::KeyMutation);
             }
             let direct_rowid_update = plan
                 .set_clauses
                 .iter()
                 .any(|(idx, _)| *idx == ROWID_SENTINEL);
             if direct_rowid_update {
-                break 'requires true;
+                break 'requires Some(DmlSafetyReason::KeyMutation);
             }
-            break 'requires false;
+            break 'requires None;
         };
 
         for (set_clause_col_idx, _) in plan.set_clauses.iter() {
@@ -647,21 +683,17 @@ fn optimize_update_plan(
                     let expr_idx_cols_mask =
                         expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
                     if expr_idx_cols_mask.get(*set_clause_col_idx) {
-                        break 'requires true;
+                        break 'requires Some(DmlSafetyReason::KeyMutation);
                     }
                 } else if c.pos_in_table == *set_clause_col_idx {
-                    break 'requires true;
+                    break 'requires Some(DmlSafetyReason::KeyMutation);
                 }
             }
         }
-        break 'requires false;
+        break 'requires None;
     };
 
-    if !requires_ephemeral_table {
-        return Ok(());
-    }
-
-    add_ephemeral_table_to_update_plan(program, plan)
+    Ok(reason)
 }
 
 /// An ephemeral table is required if:
@@ -793,6 +825,7 @@ fn add_ephemeral_table_to_update_plan(
         window: None,
         // Move subqueries from the main plan to the ephemeral plan since the WHERE clause was moved
         non_from_clause_subqueries: plan.non_from_clause_subqueries.drain(..).collect(),
+        estimated_output_rows: None,
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
@@ -1000,6 +1033,45 @@ fn base_row_estimate(
             }
             RowCountEstimate::hardcoded_fallback(params)
         }
+        Table::FromClauseSubquery(subquery) => match subquery.plan.as_ref() {
+            Plan::Select(plan) => {
+                if let Some(rows) = plan.estimated_output_rows {
+                    return RowCountEstimate::AnalyzeStats(rows.max(1.0));
+                }
+                RowCountEstimate::hardcoded_fallback(params)
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                // Combine estimates from all branches according to set operation semantics.
+                // left = [(A, op1), (B, op2)], right_most = C
+                // represents: (A op1 B) op2 C
+                // We fold left-to-right: seed with A, then apply op_i with plan_{i+1}.
+                let fallback = *RowCountEstimate::hardcoded_fallback(params);
+                let est = |p: &SelectPlan| p.estimated_output_rows.unwrap_or(fallback);
+                let mut combined = left.first().map_or(
+                    right_most.estimated_output_rows.unwrap_or(fallback),
+                    |(p, _)| est(p),
+                );
+                // The estimates to the right of each operator: left[1..].est, then right_most.est
+                let rhs_estimates = left
+                    .iter()
+                    .skip(1)
+                    .map(|(p, _)| est(p))
+                    .chain(std::iter::once(est(right_most)));
+                for ((_, op), rhs) in left.iter().zip(rhs_estimates) {
+                    combined = match op {
+                        ast::CompoundOperator::UnionAll | ast::CompoundOperator::Union => {
+                            combined + rhs
+                        }
+                        ast::CompoundOperator::Intersect => combined.min(rhs),
+                        ast::CompoundOperator::Except => combined,
+                    };
+                }
+                RowCountEstimate::AnalyzeStats(combined.max(1.0))
+            }
+            _ => RowCountEstimate::hardcoded_fallback(params),
+        },
         _ => RowCountEstimate::hardcoded_fallback(params),
     }
 }
@@ -1083,7 +1155,7 @@ fn optimize_table_access(
     subqueries: &[NonFromClauseSubquery],
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
-) -> Result<Option<Vec<JoinOrderMember>>> {
+) -> Result<Option<(Vec<JoinOrderMember>, usize)>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
     #[cfg(feature = "optimizer_params")]
@@ -1280,6 +1352,8 @@ fn optimize_table_access(
     } else {
         best_plan
     };
+
+    let final_output_cardinality = best_plan.output_cardinality;
 
     let mut sort_eliminated = false;
 
@@ -1716,6 +1790,7 @@ fn optimize_table_access(
                 where_term_idx,
                 set_op,
                 additional_consumed_terms,
+                estimated_rows_per_outer_row: _,
             } => {
                 // Mark the primary WHERE clause term as consumed
                 where_clause[*where_term_idx].consumed = true;
@@ -1813,7 +1888,7 @@ fn optimize_table_access(
         }
     }
 
-    Ok(Some(best_join_order))
+    Ok(Some((best_join_order, final_output_cardinality)))
 }
 
 fn build_vtab_scan_op(

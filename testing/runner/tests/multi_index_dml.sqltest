@@ -1,0 +1,149 @@
+@database :memory:
+
+setup multi_index_dml_schema {
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        i1 INTEGER,
+        i2 INTEGER,
+        bar INTEGER
+    );
+    CREATE INDEX t_i1 ON t(i1);
+    CREATE INDEX t_i2 ON t(i2);
+
+    -- Row 3 matches both OR branches to validate dedup/stable-rowset behavior.
+    INSERT INTO t VALUES (1, 5, 0, 10);
+    INSERT INTO t VALUES (2, 0, 6, 20);
+    INSERT INTO t VALUES (3, 5, 6, 30);
+    INSERT INTO t VALUES (4, 0, 0, 40);
+}
+
+@setup multi_index_dml_schema
+snapshot-eqp multi-index-or-access-shape {
+    SELECT id FROM t WHERE i1 = 5 OR i2 = 6;
+}
+
+@setup multi_index_dml_schema
+snapshot-eqp update-multi-index-or-access-shape {
+    UPDATE t SET bar = bar + 1 WHERE i1 = 5 OR i2 = 6;
+}
+
+@setup multi_index_dml_schema
+snapshot-eqp delete-multi-index-or-access-shape {
+    DELETE FROM t WHERE i1 = 5 OR i2 = 6;
+}
+
+@setup multi_index_dml_schema
+snapshot-eqp delete-multi-index-or-two-row-subset-access-shape {
+    DELETE FROM t WHERE (i1 = 5 OR i2 = 6) AND bar <= 20;
+}
+
+@setup multi_index_dml_schema
+snapshot-eqp delete-multi-index-or-one-row-subset-access-shape {
+    DELETE FROM t WHERE (i1 = 5 OR i2 = 6) AND bar = 20;
+}
+
+@setup multi_index_dml_schema
+test update-multi-index-or-stable-write-set {
+    UPDATE t
+    SET bar = bar + 1
+    WHERE i1 = 5 OR i2 = 6;
+
+    SELECT id, bar FROM t ORDER BY id;
+}
+expect {
+    1|11
+    2|21
+    3|31
+    4|40
+}
+
+@setup multi_index_dml_schema
+test update-multi-index-or-updating-indexed-column {
+    UPDATE t
+    SET i1 = i1 + 100
+    WHERE i1 = 5 OR i2 = 6;
+
+    SELECT id, i1 FROM t ORDER BY id;
+}
+expect {
+    1|105
+    2|100
+    3|105
+    4|0
+}
+
+@setup multi_index_dml_schema
+test delete-multi-index-or-safe-materialization {
+    DELETE FROM t
+    WHERE i1 = 5 OR i2 = 6;
+
+    SELECT id, i1, i2, bar FROM t ORDER BY id;
+}
+expect {
+    4|0|0|40
+}
+
+@setup multi_index_dml_schema
+@requires trigger "requires trigger support"
+test delete-multi-index-or-with-trigger {
+    CREATE TABLE delete_log (id INTEGER);
+    CREATE TRIGGER tr_log_delete BEFORE DELETE ON t BEGIN INSERT INTO delete_log VALUES (OLD.id); END;
+
+    DELETE FROM t
+    WHERE i1 = 5 OR i2 = 6;
+
+    SELECT count(*) FROM delete_log;
+    SELECT count(*) FROM t;
+}
+expect {
+    3
+    1
+}
+
+@setup multi_index_dml_schema
+@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
+test delete-multi-index-or-limit-preserved {
+    DELETE FROM t
+    WHERE i1 = 5 OR i2 = 6
+    LIMIT 2;
+
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
+@setup multi_index_dml_schema
+@skip-if sqlite "SQLite build in CI does not enable DELETE ... LIMIT/OFFSET"
+test delete-multi-index-or-limit-offset-preserved {
+    DELETE FROM t
+    WHERE i1 = 5 OR i2 = 6
+    LIMIT 1 OFFSET 1;
+
+    SELECT count(*) FROM t;
+}
+expect {
+    3
+}
+
+@setup multi_index_dml_schema
+test delete-multi-index-or-two-row-subset-compatible {
+    DELETE FROM t
+    WHERE (i1 = 5 OR i2 = 6) AND bar <= 20;
+
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
+@setup multi_index_dml_schema
+test delete-multi-index-or-one-row-subset-compatible {
+    DELETE FROM t
+    WHERE (i1 = 5 OR i2 = 6) AND bar = 20;
+
+    SELECT count(*) FROM t;
+}
+expect {
+    3
+}
