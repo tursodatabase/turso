@@ -31,10 +31,10 @@ QUERY PLAN
    |  |  |--SCAN window_subquery_3
    |  |  |  |--SCAN employees AS e
    |  |  |  |--SEARCH s USING INDEX idx_sales_emp_id
-   |  |  |  `--USE TEMP B-TREE FOR ORDER BY
-   |  |  `--USE TEMP B-TREE FOR ORDER BY
-   |  `--USE TEMP B-TREE FOR ORDER BY
-   `--USE TEMP B-TREE FOR ORDER BY
+   |  |  |  `--USE SORTER FOR ORDER BY
+   |  |  `--USE SORTER FOR ORDER BY
+   |  `--USE SORTER FOR ORDER BY
+   `--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode                     p1   p2   p3  p4                     p5  comment
@@ -101,13 +101,13 @@ addr  opcode                     p1   p2   p3  p4                     p5  commen
   60            Insert            7   41   35  buffer_table_window_3   0  intkey=r[35] data=r[41]
   61          Goto                0   43    0                          0
   62          Null                0   38    0                          0  r[38]=NULL; return remaining buffered rows
-  63          Rewind              6   82    0                          0  Rewind  buffer_table_window_3
-  64            Column            6    2   29                          0  r[29]=buffer_table_window_3.department
-  65            Column            6    0   30                          0  r[30]=buffer_table_window_3.region
-  66            Column            6    3   31                          0  r[31]=buffer_table_window_3.salary
-  67            Column            6    4   32                          0  r[32]=buffer_table_window_3.emp_id
-  68            Column            6    5   33                          0  r[33]=buffer_table_window_3.name
-  69            Column            6    1   34                          0  r[34]=buffer_table_window_3.amount
+  63          Rewind              6   82    0                          0  Rewind  ephemeral(buffer_table_window_3)
+  64            Column            6    2   29                          0  r[29]=ephemeral(buffer_table_window_3).department
+  65            Column            6    0   30                          0  r[30]=ephemeral(buffer_table_window_3).region
+  66            Column            6    3   31                          0  r[31]=ephemeral(buffer_table_window_3).salary
+  67            Column            6    4   32                          0  r[32]=ephemeral(buffer_table_window_3).emp_id
+  68            Column            6    5   33                          0  r[33]=ephemeral(buffer_table_window_3).name
+  69            Column            6    1   34                          0  r[34]=ephemeral(buffer_table_window_3).amount
   70            AddImm           36    1    0                          0  r[36]=r[36]+1
   71            Copy             36   28    0                          0  r[28]=r[36]
   72            Copy             29   42    0                          0  r[42]=r[29]
@@ -156,15 +156,15 @@ addr  opcode                     p1   p2   p3  p4                     p5  commen
  115          AggStep             0   71   58  sum                     0  accum=r[58] step(r[71])
  116        Goto                  0  103    0                          0
  117        Null                  0   69    0                          0  r[69]=NULL; return remaining buffered rows
- 118        Rewind               10  138    0                          0  Rewind  buffer_table_window_2
+ 118        Rewind               10  138    0                          0  Rewind  ephemeral(buffer_table_window_2)
  119        AggValue              0   58   59  sum                     0  accum=r[58] dest=r[59]
- 120          Column             10    1   60                          0  r[60]=buffer_table_window_2.region
- 121          Column             10    0   61                          0  r[61]=buffer_table_window_2.department
- 122          Column             10    2   62                          0  r[62]=buffer_table_window_2.salary
- 123          Column             10    3   63                          0  r[63]=buffer_table_window_2.emp_id
- 124          Column             10    4   64                          0  r[64]=buffer_table_window_2.name
- 125          Column             10    5   65                          0  r[65]=buffer_table_window_2.amount
- 126          Column             10    6   66                          0  r[66]=buffer_table_window_2.column 6
+ 120          Column             10    1   60                          0  r[60]=ephemeral(buffer_table_window_2).region
+ 121          Column             10    0   61                          0  r[61]=ephemeral(buffer_table_window_2).department
+ 122          Column             10    2   62                          0  r[62]=ephemeral(buffer_table_window_2).salary
+ 123          Column             10    3   63                          0  r[63]=ephemeral(buffer_table_window_2).emp_id
+ 124          Column             10    4   64                          0  r[64]=ephemeral(buffer_table_window_2).name
+ 125          Column             10    5   65                          0  r[65]=ephemeral(buffer_table_window_2).amount
+ 126          Column             10    6   66                          0  r[66]=ephemeral(buffer_table_window_2).column 6
  127          Copy               60   72    0                          0  r[72]=r[60]
  128          Copy               61   73    0                          0  r[73]=r[61]
  129          Copy               62   74    0                          0  r[74]=r[62]
@@ -213,16 +213,16 @@ addr  opcode                     p1   p2   p3  p4                     p5  commen
  172        AggStep               0  104   90  avg                     0  accum=r[90] step(r[104])
  173      Goto                    0  160    0                          0
  174      Null                    0  102    0                          0  r[102]=NULL; return remaining buffered rows
- 175      Rewind                 14  197    0                          0  Rewind  buffer_table_window_1
+ 175      Rewind                 14  197    0                          0  Rewind  ephemeral(buffer_table_window_1)
  176      AggValue                0   90   91  avg                     0  accum=r[90] dest=r[91]
- 177        Column               14    1   92                          0  r[92]=buffer_table_window_1.department
- 178        Column               14    2   93                          0  r[93]=buffer_table_window_1.salary
- 179        Column               14    3   94                          0  r[94]=buffer_table_window_1.emp_id
- 180        Column               14    4   95                          0  r[95]=buffer_table_window_1.name
- 181        Column               14    5   96                          0  r[96]=buffer_table_window_1.amount
- 182        Column               14    0   97                          0  r[97]=buffer_table_window_1.region
- 183        Column               14    6   98                          0  r[98]=buffer_table_window_1.column 6
- 184        Column               14    7   99                          0  r[99]=buffer_table_window_1.column 7
+ 177        Column               14    1   92                          0  r[92]=ephemeral(buffer_table_window_1).department
+ 178        Column               14    2   93                          0  r[93]=ephemeral(buffer_table_window_1).salary
+ 179        Column               14    3   94                          0  r[94]=ephemeral(buffer_table_window_1).emp_id
+ 180        Column               14    4   95                          0  r[95]=ephemeral(buffer_table_window_1).name
+ 181        Column               14    5   96                          0  r[96]=ephemeral(buffer_table_window_1).amount
+ 182        Column               14    0   97                          0  r[97]=ephemeral(buffer_table_window_1).region
+ 183        Column               14    6   98                          0  r[98]=ephemeral(buffer_table_window_1).column 6
+ 184        Column               14    7   99                          0  r[99]=ephemeral(buffer_table_window_1).column 7
  185        Copy                 92  105    0                          0  r[105]=r[92]
  186        Copy                 93  106    0                          0  r[106]=r[93]
  187        Copy                 94  107    0                          0  r[107]=r[94]
@@ -278,16 +278,16 @@ addr  opcode                     p1   p2   p3  p4                     p5  commen
  237      Insert                 18  141  135  buffer_table_window_0   0  intkey=r[135] data=r[141]
  238    Goto                      0  220    0                          0
  239    Null                      0  138    0                          0  r[138]=NULL; return remaining buffered rows
- 240    Rewind                   17  264    0                          0  Rewind  buffer_table_window_0
- 241      Column                 17    2  126                          0  r[126]=buffer_table_window_0.emp_id
- 242      Column                 17    3  127                          0  r[127]=buffer_table_window_0.name
- 243      Column                 17    0  128                          0  r[128]=buffer_table_window_0.department
- 244      Column                 17    1  129                          0  r[129]=buffer_table_window_0.salary
- 245      Column                 17    4  130                          0  r[130]=buffer_table_window_0.amount
- 246      Column                 17    5  131                          0  r[131]=buffer_table_window_0.region
- 247      Column                 17    6  132                          0  r[132]=buffer_table_window_0.column 6
- 248      Column                 17    7  133                          0  r[133]=buffer_table_window_0.column 7
- 249      Column                 17    8  134                          0  r[134]=buffer_table_window_0.column 8
+ 240    Rewind                   17  264    0                          0  Rewind  ephemeral(buffer_table_window_0)
+ 241      Column                 17    2  126                          0  r[126]=ephemeral(buffer_table_window_0).emp_id
+ 242      Column                 17    3  127                          0  r[127]=ephemeral(buffer_table_window_0).name
+ 243      Column                 17    0  128                          0  r[128]=ephemeral(buffer_table_window_0).department
+ 244      Column                 17    1  129                          0  r[129]=ephemeral(buffer_table_window_0).salary
+ 245      Column                 17    4  130                          0  r[130]=ephemeral(buffer_table_window_0).amount
+ 246      Column                 17    5  131                          0  r[131]=ephemeral(buffer_table_window_0).region
+ 247      Column                 17    6  132                          0  r[132]=ephemeral(buffer_table_window_0).column 6
+ 248      Column                 17    7  133                          0  r[133]=ephemeral(buffer_table_window_0).column 7
+ 249      Column                 17    8  134                          0  r[134]=ephemeral(buffer_table_window_0).column 8
  250      AddImm                136    1    0                          0  r[136]=r[136]+1
  251      Copy                  136  125    0                          0  r[125]=r[136]
  252      Copy                  126  114    0                          0  r[114]=r[126]
