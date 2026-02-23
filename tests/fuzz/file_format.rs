@@ -44,8 +44,8 @@ fn quote_ident(s: &str) -> String {
 /// - BLOB (serial type >= 12, even)
 /// - Text (serial type >= 13, odd)
 ///
-/// Floats are formatted with explicit decimal point so SQLite stores them as
-/// REAL rather than converting them to INTEGER affinity.
+/// Floats are formatted with a non-zero fractional part so SQLite stores them
+/// as REAL rather than converting them to INTEGER affinity.
 fn random_value<R: Rng>(rng: &mut R, large_blob: bool) -> String {
     if large_blob {
         // Large blob forces overflow pages (chain of overflow page pointers).
@@ -65,16 +65,13 @@ fn random_value<R: Rng>(rng: &mut R, large_blob: bool) -> String {
         5 => rng
             .random_range(-1_000_000_000..=1_000_000_000_i64)
             .to_string(),
-        // REAL (serial type 7): always include decimal point so SQLite stores as REAL
+        // REAL (serial type 7): ensure a non-zero fractional part so SQLite keeps REAL
         6 => {
-            let f: f64 = rng.random_range(-10000.0..10000.0_f64);
-            // Always include a decimal point so the value is unambiguously REAL.
-            // Avoid NaN/Inf which have inconsistent textual representations.
-            if f.is_nan() || f.is_infinite() {
-                "0.0".to_string()
-            } else {
-                format!("{f:.1}")
-            }
+            // Construct a finite REAL with a guaranteed non-zero fractional part
+            // so SQLite does not convert it to INTEGER affinity.
+            let int_part: i64 = rng.random_range(-10000..=10000_i64);
+            let frac_digit: u8 = rng.random_range(1..=9_u8);
+            format!("{int_part}.{frac_digit}")
         }
         // Small blob (serial type >= 12, even)
         7 => {
@@ -135,7 +132,7 @@ fn run_sqlite_generates_turso_reads(seed: u64, page_size: u32) {
 
     // ── phase 1: SQLite generates ─────────────────────────────────────────────
     {
-        let sqlite = rusqlite::Connection::open(&db_path).expect("sqlite open");
+        let mut sqlite = rusqlite::Connection::open(&db_path).expect("sqlite open");
 
         sqlite
             .pragma_update(None, "page_size", page_size)
@@ -179,6 +176,7 @@ fn run_sqlite_generates_turso_reads(seed: u64, page_size: u32) {
             // Insert rows. 5 % chance of a large blob to trigger overflow pages.
             let n_rows = rng.random_range(50..=300_usize);
             let large_blob_prob = 0.05_f64;
+            let tx = sqlite.transaction().expect("begin transaction");
             for _ in 0..n_rows {
                 let vals: String = cols
                     .iter()
@@ -189,8 +187,9 @@ fn run_sqlite_generates_turso_reads(seed: u64, page_size: u32) {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let ins = format!("INSERT INTO {} VALUES ({});", quote_ident(&tname), vals);
-                sqlite.execute(&ins, ()).expect("INSERT");
+                tx.execute(&ins, ()).expect("INSERT");
             }
+            tx.commit().expect("commit transaction");
         }
 
         // Flush WAL back into the main file so Turso reads a complete database.
@@ -259,7 +258,7 @@ fn run_sqlite_generates_turso_reads_delete_journal(seed: u64, page_size: u32) {
 
     // ── phase 1: SQLite generates in DELETE journal mode ──────────────────────
     {
-        let sqlite = rusqlite::Connection::open(&db_path).expect("sqlite open");
+        let mut sqlite = rusqlite::Connection::open(&db_path).expect("sqlite open");
         sqlite
             .pragma_update(None, "page_size", page_size)
             .expect("set page_size");
@@ -293,19 +292,20 @@ fn run_sqlite_generates_turso_reads_delete_journal(seed: u64, page_size: u32) {
                 .expect("CREATE TABLE");
 
             let n_rows = rng.random_range(20..=150_usize);
+            let tx = sqlite.transaction().expect("begin transaction");
             for _ in 0..n_rows {
                 let vals: String = cols
                     .iter()
                     .map(|_| random_value(&mut rng, false))
                     .collect::<Vec<_>>()
                     .join(", ");
-                sqlite
-                    .execute(
-                        &format!("INSERT INTO {} VALUES ({});", quote_ident(&tname), vals),
-                        (),
-                    )
-                    .expect("INSERT");
+                tx.execute(
+                    &format!("INSERT INTO {} VALUES ({});", quote_ident(&tname), vals),
+                    (),
+                )
+                .expect("INSERT");
             }
+            tx.commit().expect("commit transaction");
         }
         // No checkpoint needed — DELETE mode writes directly to the main file.
     }
@@ -368,7 +368,7 @@ fn run_sqlite_generates_turso_reads_stress_layout(seed: u64, page_size: u32) {
 
     // ── phase 1: SQLite generates ─────────────────────────────────────────────
     {
-        let sqlite = rusqlite::Connection::open(&db_path).expect("sqlite open");
+        let mut sqlite = rusqlite::Connection::open(&db_path).expect("sqlite open");
         sqlite
             .pragma_update(None, "page_size", page_size)
             .expect("set page_size");
@@ -418,6 +418,7 @@ fn run_sqlite_generates_turso_reads_stress_layout(seed: u64, page_size: u32) {
             // Every 5th table gets a deep overflow blob (up to 256 KB).
             let n_rows = rng.random_range(10..=60_usize);
             let large_blob_prob = if t % 5 == 0 { 0.3_f64 } else { 0.0_f64 };
+            let tx = sqlite.transaction().expect("begin transaction");
             for _ in 0..n_rows {
                 // Build value list excluding the id column (auto-assigned).
                 let vals: String = extra_cols
@@ -444,26 +445,25 @@ fn run_sqlite_generates_turso_reads_stress_layout(seed: u64, page_size: u32) {
                     .join(", ");
 
                 if extra_cols.is_empty() {
-                    sqlite
-                        .execute(
-                            &format!("INSERT INTO {} DEFAULT VALUES;", quote_ident(&tname)),
-                            (),
-                        )
-                        .expect("INSERT DEFAULT VALUES");
+                    tx.execute(
+                        &format!("INSERT INTO {} DEFAULT VALUES;", quote_ident(&tname)),
+                        (),
+                    )
+                    .expect("INSERT DEFAULT VALUES");
                 } else {
-                    sqlite
-                        .execute(
-                            &format!(
-                                "INSERT INTO {} ({}) VALUES ({});",
-                                quote_ident(&tname),
-                                col_names,
-                                vals
-                            ),
-                            (),
-                        )
-                        .expect("INSERT");
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO {} ({}) VALUES ({});",
+                            quote_ident(&tname),
+                            col_names,
+                            vals
+                        ),
+                        (),
+                    )
+                    .expect("INSERT");
                 }
             }
+            tx.commit().expect("commit transaction");
         }
 
         sqlite
@@ -520,26 +520,10 @@ fn run_sqlite_generates_turso_reads_stress_layout(seed: u64, page_size: u32) {
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-/// For each supported page size, SQLite generates a complex database (WAL mode)
-/// and Turso reads it back, comparing every row of every table.
-///
-/// Related issue: <https://github.com/tursodatabase/turso/issues/2576>
-#[test]
-fn fuzz_sqlite_generated_file_format() {
-    maybe_setup_tracing();
-
-    let (mut rng, base_seed) = rng_from_time_or_env();
-    tracing::info!("fuzz_sqlite_generated_file_format base_seed={base_seed}");
-
-    for &page_size in &PAGE_SIZES {
-        let seed: u64 = rng.random();
-        tracing::info!("fuzz_sqlite_generated_file_format page_size={page_size} seed={seed}");
-        run_sqlite_generates_turso_reads(seed, page_size);
-    }
-}
-
 /// Fixed-seed regression tests: always run in CI regardless of environment,
 /// providing deterministic coverage of specific layout scenarios.
+///
+/// Related issue: <https://github.com/tursodatabase/turso/issues/2576>
 #[test]
 fn fuzz_sqlite_generated_file_format_fixed_seeds() {
     maybe_setup_tracing();
@@ -564,16 +548,38 @@ fn fuzz_sqlite_generated_file_format_fixed_seeds() {
     }
 }
 
+/// Randomized page-size sweep. Kept ignored to avoid extending default CI time.
+#[test]
+#[ignore]
+fn fuzz_long_sqlite_generated_file_format_random_page_sizes() {
+    maybe_setup_tracing();
+
+    let (mut rng, base_seed) = rng_from_time_or_env();
+    tracing::info!(
+        "fuzz_long_sqlite_generated_file_format_random_page_sizes base_seed={base_seed}"
+    );
+
+    for &page_size in &PAGE_SIZES {
+        let seed: u64 = rng.random();
+        tracing::info!(
+            "fuzz_long_sqlite_generated_file_format_random_page_sizes \
+             page_size={page_size} seed={seed}"
+        );
+        run_sqlite_generates_turso_reads(seed, page_size);
+    }
+}
+
 /// Stress test: many random iterations rotating through page sizes to maximise
 /// schema and data variety in a single run.
 #[test]
-fn fuzz_sqlite_generated_file_format_stress() {
+#[ignore]
+fn fuzz_long_sqlite_generated_file_format_stress() {
     maybe_setup_tracing();
 
     const ITERATIONS: usize = 20;
     let (mut rng, base_seed) = rng_from_time_or_env();
     tracing::info!(
-        "fuzz_sqlite_generated_file_format_stress \
+        "fuzz_long_sqlite_generated_file_format_stress \
          base_seed={base_seed} iterations={ITERATIONS}"
     );
 
@@ -581,7 +587,7 @@ fn fuzz_sqlite_generated_file_format_stress() {
         let seed: u64 = rng.random();
         let page_size = PAGE_SIZES[i % PAGE_SIZES.len()];
         tracing::info!(
-            "fuzz_sqlite_generated_file_format_stress \
+            "fuzz_long_sqlite_generated_file_format_stress \
              iter={}/{ITERATIONS} seed={seed} page_size={page_size}",
             i + 1
         );
@@ -590,14 +596,11 @@ fn fuzz_sqlite_generated_file_format_stress() {
 }
 
 /// SQLite generates databases in DELETE (rollback journal) mode and Turso
-/// reads them back.  Turso converts legacy-mode databases to WAL on first open;
-/// this test exercises that legacy→WAL conversion path across all page sizes.
+/// reads them back. Turso converts legacy-mode databases to WAL on first open;
+/// this test exercises that legacy→WAL conversion path with fixed seeds.
 #[test]
-fn fuzz_sqlite_generated_file_format_delete_journal() {
+fn fuzz_sqlite_generated_file_format_delete_journal_fixed_seeds() {
     maybe_setup_tracing();
-
-    let (mut rng, base_seed) = rng_from_time_or_env();
-    tracing::info!("fuzz_sqlite_generated_file_format_delete_journal base_seed={base_seed}");
 
     // Fixed seeds first (deterministic CI coverage).
     let fixed: &[(u64, u32)] = &[
@@ -607,17 +610,28 @@ fn fuzz_sqlite_generated_file_format_delete_journal() {
     ];
     for &(seed, page_size) in fixed {
         tracing::info!(
-            "fuzz_sqlite_generated_file_format_delete_journal \
+            "fuzz_sqlite_generated_file_format_delete_journal_fixed_seeds \
              seed={seed:#018x} page_size={page_size}"
         );
         run_sqlite_generates_turso_reads_delete_journal(seed, page_size);
     }
+}
+
+#[test]
+#[ignore]
+fn fuzz_long_sqlite_generated_file_format_delete_journal_random() {
+    maybe_setup_tracing();
+
+    let (mut rng, base_seed) = rng_from_time_or_env();
+    tracing::info!(
+        "fuzz_long_sqlite_generated_file_format_delete_journal_random base_seed={base_seed}"
+    );
 
     // Random seeds over all page sizes.
     for &page_size in &PAGE_SIZES {
         let seed: u64 = rng.random();
         tracing::info!(
-            "fuzz_sqlite_generated_file_format_delete_journal \
+            "fuzz_long_sqlite_generated_file_format_delete_journal_random \
              page_size={page_size} seed={seed}"
         );
         run_sqlite_generates_turso_reads_delete_journal(seed, page_size);
@@ -628,11 +642,8 @@ fn fuzz_sqlite_generated_file_format_delete_journal() {
 /// interior B-tree pages), deep overflow chains (multi-page blobs), and
 /// AUTOINCREMENT (exercising the `sqlite_sequence` system table).
 #[test]
-fn fuzz_sqlite_generated_file_format_complex_layout() {
+fn fuzz_sqlite_generated_file_format_complex_layout_fixed_seeds() {
     maybe_setup_tracing();
-
-    let (mut rng, base_seed) = rng_from_time_or_env();
-    tracing::info!("fuzz_sqlite_generated_file_format_complex_layout base_seed={base_seed}");
 
     // Fixed seeds for deterministic CI coverage.
     let fixed: &[(u64, u32)] = &[
@@ -642,14 +653,27 @@ fn fuzz_sqlite_generated_file_format_complex_layout() {
     ];
     for &(seed, page_size) in fixed {
         tracing::info!(
-            "fuzz_sqlite_generated_file_format_complex_layout \
+            "fuzz_sqlite_generated_file_format_complex_layout_fixed_seeds \
              seed={seed:#018x} page_size={page_size}"
         );
         run_sqlite_generates_turso_reads_stress_layout(seed, page_size);
     }
+}
+
+#[test]
+#[ignore]
+fn fuzz_long_sqlite_generated_file_format_complex_layout_random() {
+    maybe_setup_tracing();
+
+    let (mut rng, base_seed) = rng_from_time_or_env();
+    tracing::info!(
+        "fuzz_long_sqlite_generated_file_format_complex_layout_random base_seed={base_seed}"
+    );
 
     // Random seed at default page size.
     let seed: u64 = rng.random();
-    tracing::info!("fuzz_sqlite_generated_file_format_complex_layout seed={seed} page_size=4096");
+    tracing::info!(
+        "fuzz_long_sqlite_generated_file_format_complex_layout_random seed={seed} page_size=4096"
+    );
     run_sqlite_generates_turso_reads_stress_layout(seed, 4096);
 }
