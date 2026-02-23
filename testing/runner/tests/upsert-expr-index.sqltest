@@ -1,0 +1,57 @@
+@database :memory:
+
+test upsert-expr-index-basic {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE UNIQUE INDEX idx_lower ON t(lower(val));
+    INSERT INTO t VALUES(1, 'Hello');
+    INSERT INTO t(val) VALUES('HELLO') ON CONFLICT(lower(val)) DO UPDATE SET val = 'UPDATED';
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|UPDATED
+}
+
+test upsert-expr-index-binary-op {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX idx_sum ON t(a + b);
+    INSERT INTO t VALUES(1, 10, 20);
+    INSERT INTO t(a, b) VALUES(15, 15) ON CONFLICT(a + b) DO UPDATE SET a = 99;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|99|20
+}
+
+test upsert-expr-index-do-nothing {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE UNIQUE INDEX idx_lower ON t(lower(val));
+    INSERT INTO t VALUES(1, 'Hello');
+    INSERT INTO t(val) VALUES('HELLO') ON CONFLICT(lower(val)) DO NOTHING;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|Hello
+}
+
+test upsert-expr-index-mixed-columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+    CREATE UNIQUE INDEX idx_multi ON t(lower(a), b);
+    INSERT INTO t VALUES(1, 'Hello', 'world');
+    INSERT INTO t(a, b) VALUES('HELLO', 'world') ON CONFLICT(lower(a), b) DO UPDATE SET a = 'UPDATED';
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|UPDATED|world
+}
+
+test upsert-expr-index-no-conflict {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE UNIQUE INDEX idx_lower ON t(lower(val));
+    INSERT INTO t VALUES(1, 'Hello');
+    INSERT INTO t(val) VALUES('World') ON CONFLICT(lower(val)) DO UPDATE SET val = 'UPDATED';
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|Hello
+    2|World
+}
