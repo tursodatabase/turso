@@ -1,4 +1,5 @@
 @database :memory:
+@requires-file custom_types "uses custom types"
 
 # --- ERROR TESTS: types without OPERATOR '<' cannot be sorted or indexed ---
 

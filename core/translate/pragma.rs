@@ -1298,7 +1298,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok((program, TransactionMode::None))
+            Ok(TransactionMode::None)
         }
     }
 }

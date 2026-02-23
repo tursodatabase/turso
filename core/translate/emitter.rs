@@ -3597,7 +3597,7 @@ fn emit_update_insns<'a>(
                 check_generated: true,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     &btree_table,
-                    t_ctx.resolver.schema,
+                    t_ctx.resolver.schema(),
                     Some(&set_col_indices),
                 ),
             });
@@ -3619,7 +3619,7 @@ fn emit_update_insns<'a>(
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(
                     &btree_table,
-                    t_ctx.resolver.schema,
+                    t_ctx.resolver.schema(),
                 ),
             });
         }
@@ -3691,17 +3691,18 @@ fn emit_update_insns<'a>(
     // being probed against the parent's index are encoded (matching the index contents).
     if connection.foreign_keys_enabled() {
         if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx.resolver.schema.has_child_fks(table_name) {
+            if t_ctx.resolver.schema().has_child_fks(table_name) {
                 let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
                 emit_fk_child_update_counters(
                     program,
-                    &t_ctx.resolver,
                     &table_btree,
                     table_name,
                     target_table_cursor_id,
                     start,
                     rowid_new_reg,
                     &set_clauses.iter().map(|(i, _)| *i).collect::<HashSet<_>>(),
+                    update_database_id,
+                    &t_ctx.resolver,
                 )?;
             }
         }
@@ -5346,6 +5347,7 @@ pub(crate) fn emit_check_constraints<'a>(
                 table: joined_table.internal_id,
             }),
             rowid_reg,
+            false,
         ));
 
         for (col_name, register) in column_mappings.iter().copied() {
@@ -5362,6 +5364,7 @@ pub(crate) fn emit_check_constraints<'a>(
                         is_rowid_alias: col.is_rowid_alias(),
                     }),
                     register,
+                    false,
                 ));
             }
         }

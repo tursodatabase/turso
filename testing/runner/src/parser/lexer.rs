@@ -118,6 +118,10 @@ pub enum Token {
     #[token("materialized_views")]
     MaterializedViews,
 
+    /// `custom_types` capability keyword
+    #[token("custom_types")]
+    CustomTypes,
+
     /// `@backend`
     #[token("@backend")]
     AtBackend,
@@ -236,6 +240,7 @@ impl fmt::Display for Token {
             Token::Trigger => write!(f, "trigger"),
             Token::Strict => write!(f, "strict"),
             Token::MaterializedViews => write!(f, "materialized_views"),
+            Token::CustomTypes => write!(f, "custom_types"),
             Token::AtBackend => write!(f, "@backend"),
             Token::AtCrossCheckIntegrity => write!(f, "@cross-check-integrity"),
             Token::AtIdentifier(s) => write!(f, "@{s}"),

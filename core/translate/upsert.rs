@@ -573,7 +573,11 @@ pub fn emit_upsert(
                 start_reg: new_start,
                 count: num_cols,
                 check_generated: true,
-                table_reference: BTreeTable::input_type_check_table_ref(&bt, resolver.schema, None),
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    &bt,
+                    resolver.schema(),
+                    None,
+                ),
             });
 
             // Encode ALL columns. Both non-SET columns (decoded from disk above)
@@ -592,7 +596,7 @@ pub fn emit_upsert(
                 start_reg: new_start,
                 count: num_cols,
                 check_generated: true,
-                table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema),
+                table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
         } else {
             // For non-STRICT tables, apply column affinity to the values.

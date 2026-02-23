@@ -139,8 +139,6 @@ pub use vdbe::{
 /// Database index for the main database (always 0 in SQLite).
 pub const MAIN_DB_ID: usize = 0;
 
-#[cfg(feature = "cli_only")]
-pub mod dbpage;
 mod turso_types_vtab;
 
 /// Database index for the temp database (always 1 in SQLite).
@@ -162,6 +160,7 @@ pub const fn is_attached_db(database_id: usize) -> bool {
 pub struct DatabaseOpts {
     pub enable_views: bool,
     pub enable_strict: bool,
+    pub enable_custom_types: bool,
     pub enable_encryption: bool,
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
@@ -188,6 +187,11 @@ impl DatabaseOpts {
 
     pub fn with_strict(mut self, enable: bool) -> Self {
         self.enable_strict = enable;
+        self
+    }
+
+    pub fn with_custom_types(mut self, enable: bool) -> Self {
+        self.enable_custom_types = enable;
         self
     }
 
@@ -906,12 +910,12 @@ impl Database {
                     }
 
                     // Load custom types from __turso_internal_types if the table
-                    // exists and strict mode is enabled. The schema loaded by
+                    // exists and custom types are enabled. The schema loaded by
                     // make_from_btree includes the table definition but not its
                     // contents. We need to read the stored type definitions so
                     // that DECODE/ENCODE and affinity metadata are available to
                     // all subsequent connections.
-                    if opts.enable_strict {
+                    if opts.enable_custom_types {
                         let conn = state
                             .conn
                             .as_ref()
@@ -1544,6 +1548,10 @@ impl Database {
 
     pub fn experimental_strict_enabled(&self) -> bool {
         self.opts.enable_strict
+    }
+
+    pub fn experimental_custom_types_enabled(&self) -> bool {
+        self.opts.enable_custom_types
     }
 
     pub fn experimental_triggers_enabled(&self) -> bool {

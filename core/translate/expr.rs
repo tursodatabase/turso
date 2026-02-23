@@ -873,8 +873,9 @@ pub fn translate_expr(
                         referenced_tables.find_table_by_internal_id(*table_ref_id)
                     {
                         if let Some(col) = table.get_column_at(*column) {
-                            if let Some(type_def) =
-                                resolver.schema.get_type_def(&col.ty_str, table.is_strict())
+                            if let Some(type_def) = resolver
+                                .schema()
+                                .get_type_def(&col.ty_str, table.is_strict())
                             {
                                 if let Some(ref decode_expr) = type_def.decode {
                                     let skip_label = program.allocate_label();
@@ -1278,7 +1279,7 @@ pub fn translate_expr(
 
             // Check if casting to a custom type
             if let Some(ref tn) = type_name {
-                if let Some(type_def) = resolver.schema.get_type_def_unchecked(&tn.name) {
+                if let Some(type_def) = resolver.schema().get_type_def_unchecked(&tn.name) {
                     // Build ty_params from AST TypeSize so parametric types
                     // (e.g. numeric(10,2)) get their parameters passed through.
                     let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
@@ -2896,7 +2897,7 @@ pub fn translate_expr(
                             if let Some(col) = col_ref {
                                 if col.default.is_some()
                                     && resolver
-                                        .schema
+                                        .schema()
                                         .get_type_def(&col.ty_str, table.is_strict())
                                         .is_some()
                                 {
@@ -2908,7 +2909,16 @@ pub fn translate_expr(
                         let Some(column) = table.get_column_at(*column) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };
-                        maybe_apply_affinity(column.ty(), target_register, program);
+                        // Skip affinity for custom types — the stored value is
+                        // already in BASE type format; the custom type name may
+                        // produce wrong affinity (e.g. "doubled" → REAL due to "DOUB").
+                        if resolver
+                            .schema()
+                            .get_type_def(&column.ty_str, table.is_strict())
+                            .is_none()
+                        {
+                            maybe_apply_affinity(column.ty(), target_register, program);
+                        }
 
                         // Decode custom type columns (skipped when building ORDER BY sort keys
                         // for types without a `<` operator, so the sorter sorts on encoded values)
@@ -2918,7 +2928,7 @@ pub fn translate_expr(
                             // (since we suppressed the default). Load the default
                             // and encode it so decode produces the correct value.
                             if let Some(type_def) = resolver
-                                .schema
+                                .schema()
                                 .get_type_def(&column.ty_str, table.is_strict())
                             {
                                 if let Some(ref default_expr) = column.default {
@@ -6280,7 +6290,9 @@ fn expr_custom_type_info(
         let (_, table) = tables.find_table_by_internal_id(*table_ref_id)?;
         let col = table.get_column_at(*column)?;
         let type_name = &col.ty_str;
-        let type_def = resolver.schema.get_type_def(type_name, table.is_strict())?;
+        let type_def = resolver
+            .schema()
+            .get_type_def(type_name, table.is_strict())?;
         return Some(ExprCustomTypeInfo {
             type_name: type_name.to_lowercase(),
             column: col.clone(),
@@ -6480,7 +6492,7 @@ pub(crate) fn emit_user_facing_column_value(
             extra_amount: 0,
         });
     }
-    if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str, is_strict) {
+    if let Some(type_def) = resolver.schema().get_type_def(&column.ty_str, is_strict) {
         if let Some(ref decode_expr) = type_def.decode {
             let skip_label = program.allocate_label();
             program.emit_insn(Insn::IsNull {
@@ -6529,7 +6541,8 @@ pub(crate) fn decode_custom_type_registers_in_expr(
             if reg_val >= start_reg {
                 let col_idx = reg_val - start_reg;
                 if let Some(column) = columns.get(col_idx) {
-                    if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str, is_strict)
+                    if let Some(type_def) =
+                        resolver.schema().get_type_def(&column.ty_str, is_strict)
                     {
                         if type_def.decode.is_some() {
                             let decoded_reg = program.alloc_register();
@@ -6630,7 +6643,7 @@ pub(crate) fn emit_trigger_decode_registers(
         .iter()
         .enumerate()
         .map(|(i, col)| -> Result<usize> {
-            let type_def = resolver.schema.get_type_def(&col.ty_str, is_strict);
+            let type_def = resolver.schema().get_type_def(&col.ty_str, is_strict);
             if let Some(type_def) = type_def {
                 if let Some(ref decode_expr) = type_def.decode {
                     let src = source_regs(i);
@@ -6687,7 +6700,7 @@ pub(crate) fn emit_custom_type_encode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Some(type_def) = resolver.schema.get_type_def_unchecked(type_name) else {
+        let Some(type_def) = resolver.schema().get_type_def_unchecked(type_name) else {
             continue;
         };
         let Some(ref encode_expr) = type_def.encode else {
@@ -6732,7 +6745,7 @@ pub(crate) fn emit_custom_type_decode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Some(type_def) = resolver.schema.get_type_def_unchecked(type_name) else {
+        let Some(type_def) = resolver.schema().get_type_def_unchecked(type_name) else {
             continue;
         };
         let Some(ref decode_expr) = type_def.decode else {

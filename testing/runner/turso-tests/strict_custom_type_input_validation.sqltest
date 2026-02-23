@@ -1,4 +1,5 @@
 @database :memory:
+@requires-file custom_types "uses custom types"
 
 # Bug 24: STRICT table type checking bypassed for custom type columns.
 # Custom type columns should reject values whose type doesn't match the BASE type,

@@ -453,9 +453,9 @@ impl Connection {
         )?;
 
         // Load custom types from __turso_internal_types if the table exists
-        // and strict mode is enabled. Type loading errors are non-fatal: we log
+        // and custom types are enabled. Type loading errors are non-fatal: we log
         // warnings and continue with whatever types loaded successfully.
-        if self.experimental_strict_enabled()
+        if self.experimental_custom_types_enabled()
             && fresh
                 .tables
                 .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
@@ -1295,6 +1295,10 @@ impl Connection {
         self.db.experimental_strict_enabled()
     }
 
+    pub fn experimental_custom_types_enabled(&self) -> bool {
+        self.db.experimental_custom_types_enabled()
+    }
+
     pub fn experimental_triggers_enabled(&self) -> bool {
         self.db.experimental_triggers_enabled()
     }
@@ -1455,10 +1459,12 @@ impl Connection {
 
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
+        let use_custom_types = self.db.experimental_custom_types_enabled();
 
         let db_opts = DatabaseOpts::new()
             .with_views(use_views)
-            .with_strict(use_strict);
+            .with_strict(use_strict)
+            .with_custom_types(use_custom_types);
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also

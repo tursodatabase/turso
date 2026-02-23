@@ -389,6 +389,7 @@ mod tests {
             crate::DatabaseOpts {
                 enable_views: true,
                 enable_strict: false,
+                enable_custom_types: false,
                 enable_load_extension: false,
                 enable_encryption: false,
                 enable_index_method: false,

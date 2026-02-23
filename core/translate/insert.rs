@@ -1,6 +1,6 @@
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
-    schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Schema, Table},
+    schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table},
     sync::Arc,
     translate::{
         emitter::{
@@ -548,13 +548,13 @@ pub fn translate_insert(
             check_generated: true,
             table_reference: BTreeTable::input_type_check_table_ref(
                 ctx.table,
-                resolver.schema,
+                resolver.schema(),
                 None,
             ),
         });
 
         // Encode values for columns with custom types.
-        emit_custom_type_encode(&mut program, resolver, &insertion)?;
+        emit_custom_type_encode(program, resolver, &insertion)?;
 
         // Post-encode TypeCheck: validate that encode produced the correct
         // storage type (BASE).
@@ -562,7 +562,7 @@ pub fn translate_insert(
             start_reg: insertion.first_col_register(),
             count: insertion.col_mappings.len(),
             check_generated: true,
-            table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema),
+            table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
         });
     } else {
         // For non-STRICT tables, apply column affinity to the values.
@@ -1354,7 +1354,7 @@ fn emit_notnulls(
         // and check the *decoded* value. This prevents "ghost NULLs" where
         // ENCODE produces a non-NULL value but DECODE returns NULL.
         let check_reg = if let Some(type_def) = resolver
-            .schema
+            .schema()
             .get_type_def(&column_mapping.column.ty_str, ctx.table.is_strict)
         {
             if type_def.decode.is_some() {
@@ -1462,7 +1462,8 @@ fn bind_insert(
                 .filter(|c| !c.hidden())
                 .map(|c| {
                     c.default.clone().unwrap_or_else(|| {
-                        if let Some(type_def) = resolver.schema.get_type_def(&c.ty_str, is_strict) {
+                        if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict)
+                        {
                             if let Some(ref default_expr) = type_def.default {
                                 return default_expr.clone();
                             }
@@ -1803,7 +1804,7 @@ fn init_source_emission<'a>(
             let is_strict = table.is_strict();
             values.extend(table.columns().iter().map(|c| {
                 c.default.clone().unwrap_or_else(|| {
-                    if let Some(type_def) = resolver.schema.get_type_def(&c.ty_str, is_strict) {
+                    if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict) {
                         if let Some(ref default_expr) = type_def.default {
                             return default_expr.clone();
                         }
@@ -2221,7 +2222,7 @@ fn translate_column(
         });
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
-    } else if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str, is_strict) {
+    } else if let Some(type_def) = resolver.schema().get_type_def(&column.ty_str, is_strict) {
         if let Some(ref default_expr) = type_def.default {
             translate_expr(program, None, default_expr, column_register, resolver)?;
         } else {

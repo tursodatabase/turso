@@ -3012,7 +3012,7 @@ impl Column {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
             Affinity::Blob
         } else {
-            Affinity::affinity(&self.ty_str)
+            self.affinity()
         }
     }
     pub fn new_default_text(
@@ -3250,7 +3250,7 @@ impl TryFrom<&ColumnDefinition> for Column {
             },
         );
         col.ty_params = ty_params;
-        col
+        Ok(col)
     }
 }
 

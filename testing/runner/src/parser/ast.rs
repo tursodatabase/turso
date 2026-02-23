@@ -54,6 +54,8 @@ pub enum Capability {
     Strict,
     /// Support for MATERIALIZED VIEW (experimental)
     MaterializedViews,
+    /// Support for custom types (CREATE TYPE / DROP TYPE)
+    CustomTypes,
 }
 
 impl Capability {
@@ -62,6 +64,7 @@ impl Capability {
         Capability::Trigger,
         Capability::Strict,
         Capability::MaterializedViews,
+        Capability::CustomTypes,
     ];
 
     /// Get all capabilities as a HashSet (convenience for backends that support everything)
@@ -76,6 +79,7 @@ impl Display for Capability {
             Capability::Trigger => write!(f, "trigger"),
             Capability::Strict => write!(f, "strict"),
             Capability::MaterializedViews => write!(f, "materialized_views"),
+            Capability::CustomTypes => write!(f, "custom_types"),
         }
     }
 }
@@ -88,8 +92,9 @@ impl FromStr for Capability {
             "trigger" => Ok(Capability::Trigger),
             "strict" => Ok(Capability::Strict),
             "materialized_views" => Ok(Capability::MaterializedViews),
+            "custom_types" => Ok(Capability::CustomTypes),
             _ => Err(format!(
-                "unknown capability '{s}', valid capabilities are: trigger, strict, materialized_views"
+                "unknown capability '{s}', valid capabilities are: trigger, strict, materialized_views, custom_types"
             )),
         }
     }

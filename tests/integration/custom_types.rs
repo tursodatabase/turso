@@ -14,6 +14,7 @@ mod tests {
             .join("custom_types_reopen.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_strict(true)
+            .with_custom_types(true)
             .with_encryption(true);
 
         // First session: create a custom type, table, and insert data
@@ -66,6 +67,7 @@ mod tests {
             .join("custom_types_schema_change.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_strict(true)
+            .with_custom_types(true)
             .with_encryption(true);
 
         // First session: create type, table, insert data
@@ -131,6 +133,7 @@ mod tests {
             .join("custom_types_new_conn.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_strict(true)
+            .with_custom_types(true)
             .with_encryption(true);
 
         let db = TempDatabase::new_with_existent_with_opts(&path, opts);
@@ -173,6 +176,7 @@ mod tests {
             .join("custom_types_upsert.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_strict(true)
+            .with_custom_types(true)
             .with_encryption(true);
         let db = TempDatabase::new_with_existent_with_opts(&path, opts);
         let conn = db.connect_limbo();
@@ -263,6 +267,7 @@ mod tests {
             .join("custom_types_multi_update.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_strict(true)
+            .with_custom_types(true)
             .with_encryption(true);
         let db = TempDatabase::new_with_existent_with_opts(&path, opts);
         let conn = db.connect_limbo();
@@ -326,6 +331,7 @@ mod tests {
         let dest_path = path.with_file_name("custom_types_vacuum_dest.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_strict(true)
+            .with_custom_types(true)
             .with_encryption(true);
 
         // Create source database with custom type and data
@@ -383,6 +389,7 @@ mod tests {
             .join("custom_types_self_join.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_strict(true)
+            .with_custom_types(true)
             .with_encryption(true);
         let db = TempDatabase::new_with_existent_with_opts(&path, opts);
         let conn = db.connect_limbo();

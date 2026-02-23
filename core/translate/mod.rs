@@ -304,10 +304,8 @@ pub fn translate_inner(
             type_name,
             body,
         } => {
-            if !connection.experimental_strict_enabled() {
-                bail_parse_error!(
-                    "Custom types require STRICT tables. Enable them with --experimental-strict flag"
-                );
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
             schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
         }
@@ -315,10 +313,8 @@ pub fn translate_inner(
             if_exists,
             type_name,
         } => {
-            if !connection.experimental_strict_enabled() {
-                bail_parse_error!(
-                    "Custom types require STRICT tables. Enable them with --experimental-strict flag"
-                );
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
             schema::translate_drop_type(&type_name, if_exists, resolver, program)?
         }

@@ -1,4 +1,5 @@
 @database :memory:
+@requires-file custom_types "uses custom types"
 
 @requires strict "uses STRICT tables"
 test reject-nondeterministic-encode-random {

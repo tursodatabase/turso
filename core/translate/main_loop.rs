@@ -2173,10 +2173,11 @@ fn emit_loop_source<'a>(
                                 reg,
                                 &t_ctx.resolver,
                             )?;
-                            t_ctx
-                                .resolver
-                                .expr_to_reg_cache
-                                .push((Cow::Borrowed(expr), reg));
+                            t_ctx.resolver.expr_to_reg_cache.push((
+                                Cow::Borrowed(expr),
+                                reg,
+                                false,
+                            ));
                             Ok(WalkControl::SkipChildren)
                         }
                         _ => {
@@ -2817,7 +2818,7 @@ fn encode_seek_keys_for_custom_types(
             None => continue,
         };
         let type_def = match resolver
-            .schema
+            .schema()
             .get_type_def(&table_col.ty_str, table.is_strict())
         {
             Some(td) => td,

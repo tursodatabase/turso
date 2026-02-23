@@ -1,4 +1,5 @@
 @database :memory:
+@requires-file custom_types "uses custom types"
 
 # Strict type checking for CHECK constraints in STRICT tables.
 # In STRICT mode, comparisons in CHECK expressions must have compatible types.

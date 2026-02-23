@@ -233,7 +233,8 @@ mod tests {
                     .with_encryption(true)
                     .with_triggers(true)
                     .with_attach(true)
-                    .with_strict(true),
+                    .with_strict(true)
+                    .with_custom_types(true),
             )
             .build();
         let conn = db.connect_limbo();

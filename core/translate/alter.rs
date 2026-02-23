@@ -730,7 +730,7 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let mut default_type_mismatch = false;
+            let default_type_mismatch;
             {
                 let ty = column.ty_str.as_str();
                 if btree.is_strict && ty.is_empty() {
@@ -749,7 +749,9 @@ pub fn translate_alter_table(
                     // On non-STRICT tables any type name is allowed and is
                     // treated as a plain affinity hint (no encode/decode).
                     // Custom type validation only applies to STRICT tables.
-                    let type_def = resolver.schema.get_type_def_unchecked(&normalize_ident(ty));
+                    let type_def = resolver
+                        .schema()
+                        .get_type_def_unchecked(&normalize_ident(ty));
                     if type_def.is_none() {
                         return Err(LimboError::ParseError(format!(
                             "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
@@ -765,7 +767,7 @@ pub fn translate_alter_table(
             // existing rows get the type default instead of NULL.
             if column.default.is_none() {
                 if let Some(type_def) = resolver
-                    .schema
+                    .schema()
                     .get_type_def(&column.ty_str, btree.is_strict)
                 {
                     if let Some(ref type_default) = type_def.default {
@@ -891,7 +893,7 @@ pub fn translate_alter_table(
             // Check if the column has an effective default (column-level or type-level).
             let effective_default = column.default.as_ref().or_else(|| {
                 resolver
-                    .schema
+                    .schema()
                     .get_type_def(&column.ty_str, btree.is_strict)
                     .and_then(|td| td.default.as_ref())
             });

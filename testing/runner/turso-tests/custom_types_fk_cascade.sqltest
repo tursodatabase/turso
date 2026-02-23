@@ -1,4 +1,5 @@
 @database :memory:
+@requires-file custom_types "uses custom types"
 
 # FK CASCADE operations with custom type columns.
 # Tests that ON UPDATE CASCADE, ON DELETE CASCADE, SET NULL, and SET DEFAULT

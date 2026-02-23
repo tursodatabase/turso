@@ -151,9 +151,9 @@ pub fn init_order_by(
 ) -> Result<()> {
     // Block ORDER BY on custom type columns without OPERATOR '<'
     for (expr, _) in order_by.iter() {
-        if is_custom_type_without_lt(expr, referenced_tables, t_ctx.resolver.schema) {
+        if is_custom_type_without_lt(expr, referenced_tables, t_ctx.resolver.schema()) {
             if let Some((col, type_def)) =
-                result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema)
+                result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
             {
                 let col_name = col.name.as_deref().unwrap_or("?");
                 crate::bail_parse_error!(
@@ -262,7 +262,7 @@ pub fn init_order_by(
         // For types with a `<` operator, the comparator is used for correct sort ordering.
         let mut comparator_func_names: Vec<Option<String>> = order_by
             .iter()
-            .map(|(expr, _)| custom_type_lt_func(expr, referenced_tables, t_ctx.resolver.schema))
+            .map(|(expr, _)| custom_type_lt_func(expr, referenced_tables, t_ctx.resolver.schema()))
             .collect();
 
         if has_sequence {
@@ -369,7 +369,7 @@ pub fn emit_order_by(
             if let Some((col, type_def)) = result_column_custom_type_info(
                 &rc.expr,
                 &plan.table_references,
-                t_ctx.resolver.schema,
+                t_ctx.resolver.schema(),
             ) {
                 if let Some(ref decode_expr) = type_def.decode {
                     let skip_label = program.allocate_label();
@@ -468,7 +468,7 @@ pub fn order_by_sorter_insert(
             // sorter compares encoded representations, using either the base type's
             // built-in comparison (naked OPERATOR '<') or a custom comparator function.
             let is_custom =
-                result_column_custom_type_info(expr, &plan.table_references, resolver.schema)
+                result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
                     .is_some_and(|(_, td)| td.decode.is_some());
             if is_custom {
                 program.suppress_custom_type_decode = true;

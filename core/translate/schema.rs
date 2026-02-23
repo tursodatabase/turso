@@ -343,7 +343,11 @@ fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprTy
         return Ok(ty);
     }
     // Check if it's a known custom type
-    if resolver.schema.get_type_def_unchecked(type_name).is_some() {
+    if resolver
+        .schema()
+        .get_type_def_unchecked(type_name)
+        .is_some()
+    {
         return Ok(CheckExprType::CustomType(type_name.to_lowercase()));
     }
     bail_parse_error!("unknown type '{}' in CHECK constraint", type_name);
@@ -526,7 +530,7 @@ fn validate(
                     // On non-STRICT tables any type name is allowed and is
                     // treated as a plain affinity hint (no encode/decode).
                     // Custom type validation only applies to STRICT tables.
-                    let type_def = resolver.schema.get_type_def_unchecked(type_name);
+                    let type_def = resolver.schema().get_type_def_unchecked(type_name);
                     {
                         match type_def {
                             None => {
@@ -1712,8 +1716,8 @@ pub fn translate_create_type(
     body: &ast::CreateTypeBody,
     if_not_exists: bool,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> Result<()> {
     let normalized_name = normalize_ident(type_name);
 
     // Reject names that shadow SQLite base types — these are not in the
@@ -1729,12 +1733,12 @@ pub fn translate_create_type(
 
     // Check if type already exists
     if resolver
-        .schema
+        .schema()
         .get_type_def_unchecked(&normalized_name)
         .is_some()
     {
         if if_not_exists {
-            return Ok(program);
+            return Ok(());
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
@@ -1755,7 +1759,7 @@ pub fn translate_create_type(
     let types_table: Arc<BTreeTable>;
     let types_root_page: RegisterOrLiteral<i64>;
 
-    if let Some(existing) = resolver.schema.get_btree_table(TURSO_TYPES_TABLE_NAME) {
+    if let Some(existing) = resolver.schema().get_btree_table(TURSO_TYPES_TABLE_NAME) {
         types_table = existing.clone();
         types_root_page = RegisterOrLiteral::Literal(existing.root_page);
     } else {
@@ -1772,7 +1776,7 @@ pub fn translate_create_type(
         types_root_page = RegisterOrLiteral::Register(table_root_reg);
 
         // Register it in sqlite_schema so it persists
-        let schema_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+        let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
         let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
         program.emit_insn(Insn::OpenWrite {
             cursor_id: schema_cursor_id,
@@ -1780,7 +1784,7 @@ pub fn translate_create_type(
             db: 0,
         });
         emit_schema_entry(
-            &mut program,
+            program,
             resolver,
             schema_cursor_id,
             None,
@@ -1839,26 +1843,26 @@ pub fn translate_create_type(
     program.emit_insn(Insn::SetCookie {
         db: 0,
         cookie: Cookie::SchemaVersion,
-        value: (resolver.schema.schema_version + 1) as i32,
+        value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
     });
 
-    Ok(program)
+    Ok(())
 }
 
 pub fn translate_drop_type(
     type_name: &str,
     if_exists: bool,
     resolver: &Resolver,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    program: &mut ProgramBuilder,
+) -> Result<()> {
     let normalized_name = normalize_ident(type_name);
 
     // Check if type exists
-    let type_def = resolver.schema.get_type_def_unchecked(&normalized_name);
+    let type_def = resolver.schema().get_type_def_unchecked(&normalized_name);
     if type_def.is_none() {
         if if_exists {
-            return Ok(program);
+            return Ok(());
         }
         bail_parse_error!("no such type: {normalized_name}");
     }
@@ -1869,7 +1873,7 @@ pub fn translate_drop_type(
     }
 
     // Check if any table uses this type
-    for (_, table) in resolver.schema.tables.iter() {
+    for (_, table) in resolver.schema().tables.iter() {
         for col in table.columns() {
             if normalize_ident(&col.ty_str) == normalized_name {
                 bail_parse_error!(
@@ -1883,7 +1887,7 @@ pub fn translate_drop_type(
 
     // Open cursor to sqlite_turso_types table
     let types_table = resolver
-        .schema
+        .schema()
         .get_btree_table(TURSO_TYPES_TABLE_NAME)
         .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {normalized_name}")))?;
     let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
@@ -1949,9 +1953,9 @@ pub fn translate_drop_type(
     program.emit_insn(Insn::SetCookie {
         db: 0,
         cookie: Cookie::SchemaVersion,
-        value: (resolver.schema.schema_version + 1) as i32,
+        value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
     });
 
-    Ok(program)
+    Ok(())
 }

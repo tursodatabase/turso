@@ -465,7 +465,7 @@ pub fn translate_aggregation_step(
             let expr = &agg_arg_source.arg_at(0);
             emit_collseq_if_needed(program, referenced_tables, expr);
             let comparator_func_name =
-                super::order_by::custom_type_lt_func(expr, referenced_tables, resolver.schema);
+                super::order_by::custom_type_lt_func(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -484,7 +484,7 @@ pub fn translate_aggregation_step(
             let expr = &agg_arg_source.arg_at(0);
             emit_collseq_if_needed(program, referenced_tables, expr);
             let comparator_func_name =
-                super::order_by::custom_type_lt_func(expr, referenced_tables, resolver.schema);
+                super::order_by::custom_type_lt_func(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
