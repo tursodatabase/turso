@@ -3008,6 +3008,57 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
     );
 }
 
+#[test]
+fn test_read_only_commit_does_not_cache_finalized_state() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+
+    // Establish a clean baseline after schema/setup writes.
+    mvcc_store.drop_unused_row_versions();
+    let baseline = mvcc_store.finalized_tx_states.len();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&conn, "SELECT 1");
+    conn.execute("COMMIT").unwrap();
+
+    assert_eq!(
+        mvcc_store.finalized_tx_states.len(),
+        baseline,
+        "read-only commit should not add finalized tx cache entries"
+    );
+}
+
+#[test]
+fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+
+    // Establish a clean baseline after schema/setup writes.
+    mvcc_store.drop_unused_row_versions();
+    let baseline = mvcc_store.finalized_tx_states.len();
+
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    let after_write = mvcc_store.finalized_tx_states.len();
+    assert!(
+        after_write > baseline,
+        "write commit should add at least one finalized tx cache entry"
+    );
+
+    mvcc_store.drop_unused_row_versions();
+
+    assert_eq!(
+        mvcc_store.finalized_tx_states.len(),
+        baseline,
+        "GC scan should prune finalized tx cache entries with no remaining TxID references"
+    );
+}
+
 /// Test Hekaton register-and-report: speculative read increments CommitDepCounter
 /// and adds to CommitDepSet.
 #[test]
