@@ -45,11 +45,11 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   21              IdxGT          2  42  21                 0  key=[21..21]
   22              DeferredSeek   2   1   0                 0
   23              RowId          0  23   0                 0  r[23]=customers.rowid
-  24              Column         2   0  24                 0  r[24]=ephemeral_purchases_t2.customer_id
+  24              Column         2   0  24                 0  r[24]=ephemeral(ephemeral_purchases_t2).customer_id
   25              Ne            23  24  41  Binary         0  if r[23]!=r[24] goto 41
   26              RowId          0  13   0                 0  r[13]=customers.rowid
   27              Column         0   1  14                 0  r[14]=customers.name
-  28              Column         2   1  15                 0  r[15]=ephemeral_purchases_t2.amount
+  28              Column         2   1  15                 0  r[15]=ephemeral(ephemeral_purchases_t2).amount
   29              RealAffinity  15   0   0                 0
   30              Compare        7  13   1  k(1, Binary)   0  r[7..7]==r[13..13]
   31              Jump          32  36  32                 0  ; start new group if comparison is not equal

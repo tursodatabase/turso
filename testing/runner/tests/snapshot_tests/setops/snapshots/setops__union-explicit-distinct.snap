@@ -40,8 +40,8 @@ addr  opcode                  p1  p2  p3  p4      p5  comment
   15    MakeRecord             3   1   4           0  r[4]=mkrec(r[3..3]); for compound_dedupe
   16    IdxInsert              0   4   0           8  key=r[4]
   17  Next                     2  13   0           0
-  18  Rewind                   0  21   0           0  Rewind  compound_dedupe
-  19    Column                 0   0   5           0  r[5]=compound_dedupe.department
+  18  Rewind                   0  21   0           0  Rewind  ephemeral(compound_dedupe)
+  19    Column                 0   0   5           0  r[5]=ephemeral(compound_dedupe).department
   20    ResultRow              5   1   0           0  output=r[5]
   21  Next                     0  19   0           0
   22  Close                    0   0   0           0

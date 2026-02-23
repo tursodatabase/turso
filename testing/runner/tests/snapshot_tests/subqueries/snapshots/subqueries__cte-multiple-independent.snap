@@ -62,10 +62,10 @@ addr  opcode              p1  p2  p3  p4            p5  comment
   16  Once                27   0   0                 0  goto 27
   17  OpenEphemeral        0   0   0                 0  cursor=0 is_table=false
   18  OpenDup              3   1   0                 0  new_cursor=3, original_cursor=1
-  19  Rewind               3  27   0                 0  Rewind
-  20    Column             3   0  13                 0  r[13]=.column 0
-  21    Column             3   1  14                 0  r[14]=.column 1
-  22    Column             3   2  15                 0  r[15]=.column 2
+  19  Rewind               3  27   0                 0  Rewind  ephemeral()
+  20    Column             3   0  13                 0  r[13]=ephemeral().column 0
+  21    Column             3   1  14                 0  r[14]=ephemeral().column 1
+  22    Column             3   2  15                 0  r[15]=ephemeral().column 2
   23    Copy              14  16   0                 0  r[16]=r[14]
   24    MakeRecord        16   1  17                 0  r[17]=mkrec(r[16..16]); for ephemeral_index_where_sub_t4
   25    IdxInsert          0  17   0                 8  key=r[17]
@@ -77,8 +77,8 @@ addr  opcode              p1  p2  p3  p4            p5  comment
   31    Affinity          21   1   0                 0  r[21..22] = C
   32    NotFound           0  34  21                 0  if not found goto 34
   33    Goto               0  40   0                 0
-  34    Rewind             0  42   0                 0  Rewind  ephemeral_index_where_sub_t4
-  35      Column           0   0  22                 0  r[22]=ephemeral_index_where_sub_t4.customer_id
+  34    Rewind             0  42   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t4)
+  35      Column           0   0  22                 0  r[22]=ephemeral(ephemeral_index_where_sub_t4).customer_id
   36      Ne              21  22  38  Binary         0  if r[21]!=r[22] goto 38
   37      Goto             0  44   0                 0
   38    Next               0  35   0                 0
@@ -96,14 +96,14 @@ addr  opcode              p1  p2  p3  p4            p5  comment
   50  EndCoroutine        12   0   0                 0
   51  OpenDup              5   1   0                 0  new_cursor=5, original_cursor=1
   52  OpenEphemeral        6   0   0                 0  cursor=6 is_table=false
-  53  Rewind               5  64   0                 0  Rewind
-  54    Column             5   0  24                 0  r[24]=.column 0
-  55    Column             5   1  25                 0  r[25]=.column 1
-  56    Column             5   2  26                 0  r[26]=.column 2
+  53  Rewind               5  64   0                 0  Rewind  ephemeral()
+  54    Column             5   0  24                 0  r[24]=ephemeral().column 0
+  55    Column             5   1  25                 0  r[25]=ephemeral().column 1
+  56    Column             5   2  26                 0  r[26]=ephemeral().column 2
   57    Copy              25  27   0                 0  r[27]=r[25]
   58    Copy              24  28   0                 0  r[28]=r[24]
   59    Copy              26  29   0                 0  r[29]=r[26]
-  60    RowId              5  30   0                 0  r[30]=.rowid
+  60    RowId              5  30   0                 0  r[30]=ephemeral().rowid
   61    MakeRecord        27   4  23                 0  r[23]=mkrec(r[27..30]); for ephemeral_subquery_t8
   62    IdxInsert          6  23  27                 0  key=r[23]
   63  Next                 5  54   0                 0
@@ -114,11 +114,11 @@ addr  opcode              p1  p2  p3  p4            p5  comment
   68    Affinity          36   1   0                 0  r[36..37] = D
   69    SeekGE             6  79  36                 0  key=[36..36]
   70      IdxGT            6  79  36                 0  key=[36..36]
-  71      Column           6   0  31                 0  r[31]=ephemeral_subquery_t8.customer_id
-  72      Column           6   1  32                 0  r[32]=ephemeral_subquery_t8.id
-  73      Column           6   2  33                 0  r[33]=ephemeral_subquery_t8.total_amount
+  71      Column           6   0  31                 0  r[31]=ephemeral(ephemeral_subquery_t8).customer_id
+  72      Column           6   1  32                 0  r[32]=ephemeral(ephemeral_subquery_t8).id
+  73      Column           6   2  33                 0  r[33]=ephemeral(ephemeral_subquery_t8).total_amount
   74      Copy            19  34   0                 0  r[34]=r[19]
-  75      Column           6   2  35                 0  r[35]=ephemeral_subquery_t8.total_amount
+  75      Column           6   2  35                 0  r[35]=ephemeral(ephemeral_subquery_t8).total_amount
   76      RealAffinity    35   0   0                 0
   77      ResultRow       34   2   0                 0  output=r[34..35]
   78    Next               6  70   0                 0

@@ -46,13 +46,13 @@ addr  opcode           p1  p2  p3  p4     p5  comment
   29  Multiply         16  17  14          0  r[14]=r[16]*r[17]
   30  MakeRecord       12   3  18          0  r[18]=mkrec(r[12..14])
   31  NewRowid          1  19   0          0  r[19]=rowid
-  32  Insert            1  18  19          0  intkey=r[19] data=r[18]
+  32  Insert            1  18  19          4  intkey=r[19] data=r[18]
   33  Goto              0  34   0          0
   34  Goto              0  35   0          0
-  35  Rewind            1  41   0          0  Rewind  t1
-  36    Column          1   0  20          0  r[20]=t1.id
-  37    Column          1   1  21          0  r[21]=t1.name
-  38    Column          1   2  22          0  r[22]=t1.value
+  35  Rewind            1  41   0          0  Rewind  ephemeral(t1)
+  36    Column          1   0  20          0  r[20]=ephemeral(t1).id
+  37    Column          1   1  21          0  r[21]=ephemeral(t1).name
+  38    Column          1   2  22          0  r[22]=ephemeral(t1).value
   39    ResultRow      20   3   0          0  output=r[20..22]
   40  Next              1  36   0          0
   41  Halt              0   0   0          0

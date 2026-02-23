@@ -81,12 +81,12 @@ addr  opcode              p1   p2  p3  p4                     p5  comment
   49        AggStep        0   30  18  sum                     0  accum=r[18] step(r[30])
   50      Goto             0   31   0                          0
   51      Null             0   26   0                          0  r[26]=NULL; return remaining buffered rows
-  52      Rewind           5   66   0                          0  Rewind  buffer_table_window_1
+  52      Rewind           5   66   0                          0  Rewind  ephemeral(buffer_table_window_1)
   53      AggValue         0   18  19  sum                     0  accum=r[18] dest=r[19]
-  54        Column         5    1  20                          0  r[20]=buffer_table_window_1.sale_date
-  55        Column         5    2  21                          0  r[21]=buffer_table_window_1.sale_id
-  56        Column         5    0  22                          0  r[22]=buffer_table_window_1.emp_id
-  57        Column         5    3  23                          0  r[23]=buffer_table_window_1.amount
+  54        Column         5    1  20                          0  r[20]=ephemeral(buffer_table_window_1).sale_date
+  55        Column         5    2  21                          0  r[21]=ephemeral(buffer_table_window_1).sale_id
+  56        Column         5    0  22                          0  r[22]=ephemeral(buffer_table_window_1).emp_id
+  57        Column         5    3  23                          0  r[23]=ephemeral(buffer_table_window_1).amount
   58        Copy          20   31   0                          0  r[31]=r[20]
   59        Copy          21   32   0                          0  r[32]=r[21]
   60        Copy          22   33   0                          0  r[33]=r[22]
@@ -128,13 +128,13 @@ addr  opcode              p1   p2  p3  p4                     p5  comment
   96      AggStep          0   54  42  sum                     0  accum=r[42] step(r[54])
   97    Goto               0   83   0                          0
   98    Null               0   50   0                          0  r[50]=NULL; return remaining buffered rows
-  99    Rewind             8  114   0                          0  Rewind  buffer_table_window_0
+  99    Rewind             8  114   0                          0  Rewind  ephemeral(buffer_table_window_0)
  100    AggValue           0   42  43  sum                     0  accum=r[42] dest=r[43]
- 101      Column           8    1  44                          0  r[44]=buffer_table_window_0.sale_id
- 102      Column           8    2  45                          0  r[45]=buffer_table_window_0.emp_id
- 103      Column           8    0  46                          0  r[46]=buffer_table_window_0.sale_date
- 104      Column           8    3  47                          0  r[47]=buffer_table_window_0.amount
- 105      Column           8    4  48                          0  r[48]=buffer_table_window_0.column 4
+ 101      Column           8    1  44                          0  r[44]=ephemeral(buffer_table_window_0).sale_id
+ 102      Column           8    2  45                          0  r[45]=ephemeral(buffer_table_window_0).emp_id
+ 103      Column           8    0  46                          0  r[46]=ephemeral(buffer_table_window_0).sale_date
+ 104      Column           8    3  47                          0  r[47]=ephemeral(buffer_table_window_0).amount
+ 105      Column           8    4  48                          0  r[48]=ephemeral(buffer_table_window_0).column 4
  106      Copy            44   36   0                          0  r[36]=r[44]
  107      Copy            45   37   0                          0  r[37]=r[45]
  108      Copy            46   38   0                          0  r[38]=r[46]

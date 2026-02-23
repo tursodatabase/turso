@@ -79,10 +79,10 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   44    RowId                    3  22   0                 0  r[22]=customers.rowid
   45    SeekGE                   0  53  22                 0  key=[22..22]
   46      IdxGT                  0  53  22                 0  key=[22..22]
-  47      Column                 0   0   2                 0  r[2]=ephemeral_subquery_t3.customer_id
-  48      Column                 0   1   3                 0  r[3]=ephemeral_subquery_t3.total_spent
+  47      Column                 0   0   2                 0  r[2]=ephemeral(ephemeral_subquery_t3).customer_id
+  48      Column                 0   1   3                 0  r[3]=ephemeral(ephemeral_subquery_t3).total_spent
   49      Column                 3   1  20                 0  r[20]=customers.name
-  50      Column                 0   1  21                 0  r[21]=ephemeral_subquery_t3.total_spent
+  50      Column                 0   1  21                 0  r[21]=ephemeral(ephemeral_subquery_t3).total_spent
   51      Yield                  1   0   0                 0
   52    Next                     0  46   0                 0
   53  Next                       3  44   0                 0

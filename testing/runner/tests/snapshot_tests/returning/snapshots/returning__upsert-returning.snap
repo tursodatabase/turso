@@ -39,7 +39,7 @@ addr  opcode         p1  p2  p3  p4   p5  comment
   20  Copy            5   9   0        0  r[9]=r[5]
   21  MakeRecord      7   3  10        0  r[10]=mkrec(r[7..9])
   22  NewRowid        0  11   0        0  r[11]=rowid
-  23  Insert          0  10  11        0  intkey=r[11] data=r[10]
+  23  Insert          0  10  11        4  intkey=r[11] data=r[10]
   24  Goto            0  43   0        0
   25  SeekRowid       1   1  43        0  if (r[1]!=cursor 1 for table t2.rowid) goto 43
   26  RowId           1  12   0        0  r[12]=t2.rowid
@@ -57,13 +57,13 @@ addr  opcode         p1  p2  p3  p4   p5  comment
   38  Copy           17  23   0        0  r[23]=r[17]
   39  MakeRecord     21   3  24        0  r[24]=mkrec(r[21..23])
   40  NewRowid        0  25   0        0  r[25]=rowid
-  41  Insert          0  24  25        0  intkey=r[25] data=r[24]
+  41  Insert          0  24  25        4  intkey=r[25] data=r[24]
   42  Goto            0  43   0        0
   43  Goto            0  44   0        0
-  44  Rewind          0  50   0        0  Rewind  t2
-  45    Column        0   0  26        0  r[26]=t2.id
-  46    Column        0   1  27        0  r[27]=t2.name
-  47    Column        0   2  28        0  r[28]=t2.counter
+  44  Rewind          0  50   0        0  Rewind  ephemeral(t2)
+  45    Column        0   0  26        0  r[26]=ephemeral(t2).id
+  46    Column        0   1  27        0  r[27]=ephemeral(t2).name
+  47    Column        0   2  28        0  r[28]=ephemeral(t2).counter
   48    ResultRow    26   3   0        0  output=r[26..28]
   49  Next            0  45   0        0
   50  Halt            0   0   0        0

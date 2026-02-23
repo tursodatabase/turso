@@ -43,10 +43,10 @@ addr  opcode            p1  p2  p3  p4          p5  comment
   19      IdxGT          2  29  10               0  key=[10..10]
   20      DeferredSeek   2   1   0               0
   21      RowId          0  12   0               0  r[12]=customers.rowid
-  22      Column         2   0  13               0  r[13]=ephemeral_purchases_t2.customer_id
+  22      Column         2   0  13               0  r[13]=ephemeral(ephemeral_purchases_t2).customer_id
   23      Ne            12  13  28  Binary       0  if r[12]!=r[13] goto 28
   24      Column         0   1   1               0  r[1]=customers.name
-  25      Column         2   1   2               0  r[2]=ephemeral_purchases_t2.amount
+  25      Column         2   1   2               0  r[2]=ephemeral(ephemeral_purchases_t2).amount
   26      RealAffinity   2   0   0               0
   27      ResultRow      1   2   0               0  output=r[1..2]
   28    Next             2  19   0               0

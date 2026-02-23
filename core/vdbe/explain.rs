@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use turso_parser::ast::SortOrder;
 
 use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
@@ -16,9 +18,34 @@ pub fn insn_to_row(
     program: &PreparedProgram,
     insn: &Insn,
 ) -> (&'static str, i64, i64, i64, Value, i64, String) {
-    let get_table_or_index_name = |cursor_id: usize| {
+    let mut ephemeral_cursors = HashSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (insn, _) in &program.insns {
+            match insn {
+                Insn::OpenEphemeral { cursor_id, .. } => {
+                    changed |= ephemeral_cursors.insert(*cursor_id);
+                }
+                Insn::OpenAutoindex { cursor_id } => {
+                    changed |= ephemeral_cursors.insert(*cursor_id);
+                }
+                Insn::OpenDup {
+                    new_cursor_id,
+                    original_cursor_id,
+                } => {
+                    if ephemeral_cursors.contains(original_cursor_id) {
+                        changed |= ephemeral_cursors.insert(*new_cursor_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let get_table_or_index_name = |cursor_id: usize| -> String {
         let cursor_type = &program.cursor_ref[cursor_id].1;
-        match cursor_type {
+        let name = match cursor_type {
             CursorType::BTreeTable(table) => table.name.as_str(),
             CursorType::BTreeIndex(index) => index.name.as_str(),
             CursorType::IndexMethod(descriptor) => descriptor.definition().index_name,
@@ -26,6 +53,11 @@ pub fn insn_to_row(
             CursorType::VirtualTable(virtual_table) => virtual_table.name.as_str(),
             CursorType::MaterializedView(table, _) => table.name.as_str(),
             CursorType::Sorter => "sorter",
+        };
+        if ephemeral_cursors.contains(&cursor_id) {
+            format!("ephemeral({name})")
+        } else {
+            name.to_string()
         }
     };
     match insn {

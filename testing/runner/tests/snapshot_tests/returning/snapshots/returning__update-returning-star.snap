@@ -43,12 +43,12 @@ addr  opcode          p1  p2  p3  p4     p5  comment
   25    Copy           5  14   0          0  r[14]=r[5]
   26    MakeRecord    12   3  15          0  r[15]=mkrec(r[12..14])
   27    NewRowid       0  16   0          0  r[16]=rowid
-  28    Insert         0  15  16          0  intkey=r[16] data=r[15]
+  28    Insert         0  15  16          4  intkey=r[16] data=r[15]
   29  Next             2   6   0          0
-  30  Rewind           0  36   0          0  Rewind  t1
-  31    Column         0   0  17          0  r[17]=t1.id
-  32    Column         0   1  18          0  r[18]=t1.name
-  33    Column         0   2  19          0  r[19]=t1.value
+  30  Rewind           0  36   0          0  Rewind  ephemeral(t1)
+  31    Column         0   0  17          0  r[17]=ephemeral(t1).id
+  32    Column         0   1  18          0  r[18]=ephemeral(t1).name
+  33    Column         0   2  19          0  r[19]=ephemeral(t1).value
   34    ResultRow     17   3   0          0  output=r[17..19]
   35  Next             0  31   0          0
   36  Halt             0   0   0          0
