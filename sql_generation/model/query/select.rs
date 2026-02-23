@@ -188,15 +188,45 @@ pub enum SelectTable {
     Select(Select),
 }
 
+/// Convert a table name string to a QualifiedName, handling attached DB prefixes.
+/// Names like "aux0.t1" become `QualifiedName::fullname("aux0", "t1")`,
+/// while plain names like "t1" become `QualifiedName::single("t1")`.
+fn table_qualified_name(table: &str) -> ast::QualifiedName {
+    if let Some((db, tbl)) = table.split_once('.') {
+        ast::QualifiedName::fullname(ast::Name::from_string(db), ast::Name::from_string(tbl))
+    } else {
+        ast::QualifiedName::single(ast::Name::from_string(table))
+    }
+}
+
+/// Convert a column name string to a qualified Expr, handling attached DB prefixes.
+/// - "column" → `Id(column)`
+/// - "table.column" → `Qualified(table, column)`
+/// - "db.table.column" → `DoublyQualified(db, table, column)`
+fn column_qualified_expr(name: &str) -> ast::Expr {
+    match name.rsplit_once('.') {
+        None => ast::Expr::Id(ast::Name::exact(name.to_owned())),
+        Some((prefix, col)) => {
+            if let Some((db, tbl)) = prefix.split_once('.') {
+                ast::Expr::DoublyQualified(
+                    ast::Name::from_string(db),
+                    ast::Name::from_string(tbl),
+                    ast::Name::from_string(col),
+                )
+            } else {
+                ast::Expr::Qualified(ast::Name::from_string(prefix), ast::Name::from_string(col))
+            }
+        }
+    }
+}
+
 impl FromClause {
     fn to_sql_ast(&self) -> ast::FromClause {
         ast::FromClause {
             select: Box::new(match &self.table {
-                SelectTable::Table(table) => ast::SelectTable::Table(
-                    ast::QualifiedName::single(ast::Name::from_string(table)),
-                    None,
-                    None,
-                ),
+                SelectTable::Table(table) => {
+                    ast::SelectTable::Table(table_qualified_name(table), None, None)
+                }
                 SelectTable::Select(select) => ast::SelectTable::Select(select.to_sql_ast(), None),
             }),
             joins: self
@@ -211,7 +241,7 @@ impl FromClause {
                         JoinType::Cross => ast::JoinOperator::TypedJoin(Some(ast::JoinType::CROSS)),
                     },
                     table: Box::new(ast::SelectTable::Table(
-                        ast::QualifiedName::single(ast::Name::from_string(&join.table)),
+                        table_qualified_name(&join.table),
                         None,
                         None,
                     )),
@@ -305,7 +335,7 @@ impl Select {
                             }
                             ResultColumn::Star => ast::ResultColumn::Star,
                             ResultColumn::Column(name) => ast::ResultColumn::Expr(
-                                ast::Expr::Id(ast::Name::exact(name.clone())).into_boxed(),
+                                column_qualified_expr(name).into_boxed(),
                                 None,
                             ),
                         })

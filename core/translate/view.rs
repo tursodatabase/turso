@@ -32,10 +32,10 @@ pub fn translate_create_materialized_view(
     let database_id = resolver.resolve_database_id(view_name)?;
     // The DBSP incremental maintenance runtime (populate_from_table, etc.) assumes
     // the main database pager/schema. Block attached databases until that is fixed.
-    if database_id != 0 {
+    if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
@@ -264,7 +264,7 @@ pub fn translate_create_view(
         ));
     }
     let database_id = resolver.resolve_database_id(view_name)?;
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
@@ -348,7 +348,7 @@ pub fn translate_drop_view(
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }

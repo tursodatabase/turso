@@ -141,9 +141,13 @@ pub struct ProgramBuilder {
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
-    write_databases: std::collections::HashSet<usize>,
+    write_databases: HashSet<usize>,
+    /// Set of attached database IDs that need read transactions.
+    read_databases: HashSet<usize>,
     /// Schema cookies for attached databases at prepare time.
-    write_database_cookies: std::collections::HashMap<usize, u32>,
+    write_database_cookies: HashMap<usize, u32>,
+    /// Schema cookies for attached databases opened for reading.
+    read_database_cookies: HashMap<usize, u32>,
     rollback: bool,
     /// The mode in which the query is being executed.
     query_mode: QueryMode,
@@ -397,8 +401,10 @@ impl ProgramBuilder {
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
             txn_mode: TransactionMode::None,
-            write_databases: std::collections::HashSet::new(),
-            write_database_cookies: std::collections::HashMap::new(),
+            write_databases: HashSet::default(),
+            read_databases: HashSet::default(),
+            write_database_cookies: HashMap::default(),
+            read_database_cookies: HashMap::default(),
             rollback: false,
             query_mode,
             current_parent_explain_idx: None,
@@ -1344,6 +1350,18 @@ impl ProgramBuilder {
         }
     }
 
+    /// Begin a read operation on a specific attached database.
+    /// This ensures a Transaction instruction is emitted for the attached pager
+    /// so that a WAL read lock is acquired.
+    pub fn begin_read_on_database(&mut self, database_id: usize, schema_cookie: u32) {
+        self.begin_read_operation();
+        if crate::is_attached_db(database_id) {
+            self.read_databases.insert(database_id);
+            self.read_database_cookies
+                .insert(database_id, schema_cookie);
+        }
+    }
+
     pub fn begin_concurrent_operation(&mut self) {
         self.txn_mode = TransactionMode::Concurrent;
     }
@@ -1376,15 +1394,15 @@ impl ProgramBuilder {
             self.preassign_label_to_next_insn(self.init_label);
 
             if !matches!(self.txn_mode, TransactionMode::None) {
-                // Emit Transaction for main database (db 0) always
+                // Emit Transaction for main database always
                 self.emit_insn(Insn::Transaction {
-                    db: 0,
+                    db: crate::MAIN_DB_ID,
                     tx_mode: self.txn_mode,
                     schema_cookie: schema.schema_version,
                 });
                 // Emit Transaction for each attached database that needs a write
                 for &db_id in &self.write_databases.clone() {
-                    if db_id >= 2 {
+                    if crate::is_attached_db(db_id) {
                         let cookie = self
                             .write_database_cookies
                             .get(&db_id)
@@ -1393,6 +1411,18 @@ impl ProgramBuilder {
                         self.emit_insn(Insn::Transaction {
                             db: db_id,
                             tx_mode: self.txn_mode,
+                            schema_cookie: cookie,
+                        });
+                    }
+                }
+                // Emit Transaction for each attached database that only needs a read
+                // (skip databases already covered by write_databases)
+                for &db_id in &self.read_databases.clone() {
+                    if !self.write_databases.contains(&db_id) {
+                        let cookie = self.read_database_cookies.get(&db_id).copied().unwrap_or(0);
+                        self.emit_insn(Insn::Transaction {
+                            db: db_id,
+                            tx_mode: TransactionMode::Read,
                             schema_cookie: cookie,
                         });
                     }
@@ -1569,6 +1599,7 @@ impl ProgramBuilder {
             resolve_type: self.resolve_type,
             prepare_context,
             write_databases: self.write_databases,
+            read_databases: self.read_databases,
         };
         Ok(prepared)
     }

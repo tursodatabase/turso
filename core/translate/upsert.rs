@@ -686,11 +686,12 @@ pub fn emit_upsert(
     if let Some(before) = before_start {
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
-                .schema()
-                .get_index(table.get_name(), idx_name)
+                .with_schema(ctx.database_id, |s| {
+                    s.get_index(table.get_name(), idx_name).cloned()
+                })
                 .expect("index exists");
 
-            if !upsert_index_is_affected(table, idx_meta, &changed_cols, rowid_changed) {
+            if !upsert_index_is_affected(table, &idx_meta, &changed_cols, rowid_changed) {
                 continue; // skip untouched index completely
             }
             let k = idx_meta.columns.len();
@@ -698,14 +699,14 @@ pub fn emit_upsert(
             let before_pred_reg = eval_partial_pred_for_row_image(
                 program,
                 table,
-                idx_meta,
+                &idx_meta,
                 before,
                 ctx.conflict_rowid_reg,
                 resolver,
             );
             let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_pred_reg = eval_partial_pred_for_row_image(
-                program, table, idx_meta, new_start, new_rowid, resolver,
+                program, table, &idx_meta, new_start, new_rowid, resolver,
             );
 
             // Skip delete if BEFORE predicate false/NULL
@@ -868,7 +869,7 @@ pub fn emit_upsert(
                     flags: CmpInsFlags::default(),
                     collation: program.curr_collation(),
                 });
-                let description = format_unique_violation_desc(table.get_name(), idx_meta);
+                let description = format_unique_violation_desc(table.get_name(), &idx_meta);
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,

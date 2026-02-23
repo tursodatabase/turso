@@ -2327,24 +2327,33 @@ pub fn op_transaction_inner(
                                 .to_string(),
                         ));
                     }
-                    // For attached databases (db >= 2), always start read+write
+                    // For attached databases (db >= 2), always start read/write
                     // transactions on the attached pager, since the connection-level
-                    // transaction state may already be Write from the main database.
-                    let is_attached = *db >= 2;
-                    if is_attached && matches!(tx_mode, TransactionMode::Write) {
+                    // transaction state may already be Read/Write from the main database.
+                    let is_attached = crate::is_attached_db(*db);
+                    if is_attached {
                         // If the pager already holds a read lock (e.g., after
-                        // SchemaUpdated reprepare), skip to schema cookie check
-                        // since locks persist across reprepare.
+                        // SchemaUpdated reprepare or prior write tx), skip
+                        // locks that are already held.
                         if pager.holds_read_lock() {
+                            if matches!(tx_mode, TransactionMode::Write)
+                                && !pager.holds_write_lock()
+                            {
+                                state.op_transaction_state =
+                                    OpTransactionState::AttachedBeginWriteTx;
+                                continue;
+                            }
                             state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                             continue;
                         }
                         pager.begin_read_tx()?;
-                        // Transition to AttachedBeginWriteTx to handle begin_write_tx
-                        // separately, so if it returns IO we don't re-call begin_read_tx
-                        // on re-entry.
-                        state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
-                        continue;
+                        if matches!(tx_mode, TransactionMode::Write) {
+                            // Transition to AttachedBeginWriteTx to handle begin_write_tx
+                            // separately, so if it returns IO we don't re-call begin_read_tx
+                            // on re-entry.
+                            state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
+                            continue;
+                        }
                     } else if updated && matches!(current_state, TransactionState::None) {
                         turso_assert!(
                             !conn.is_nested_stmt(),
@@ -2444,15 +2453,29 @@ pub fn op_transaction_inner(
                 state.op_transaction_state = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                // Only begin statement subtransactions for the main database (db 0).
-                // Attached databases (db >= 2) don't manage their own statement
-                // subtransactions; the main pager's end_statement handles cleanup.
-                if *db == 0 && program.needs_stmt_subtransactions.load(Ordering::Relaxed) {
+                if *db == crate::MAIN_DB_ID
+                    && program.needs_stmt_subtransactions.load(Ordering::Relaxed)
+                {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
+                } else if crate::is_attached_db(*db)
+                    && matches!(tx_mode, TransactionMode::Write)
+                    && program.needs_stmt_subtransactions.load(Ordering::Relaxed)
+                {
+                    // Open a savepoint on the attached pager for statement rollback.
+                    let db_size =
+                        return_if_io!(pager.with_header(|header| header.database_size.get()));
+                    pager.open_subjournal()?;
+                    pager.try_use_subjournal()?;
+                    let result = pager.open_savepoint(db_size);
+                    if result.is_err() {
+                        pager.stop_use_subjournal();
+                    }
+                    result?;
+                    state.attached_savepoint_pagers.push(pager.clone());
                 }
 
                 state.pc += 1;
@@ -2483,7 +2506,12 @@ pub fn op_auto_commit(
     let had_autocommit = conn.auto_commit.load(Ordering::SeqCst); // true, not in tx
 
     // Drive any multi-step commit/rollback that's already in progress.
-    if matches!(state.commit_state, CommitState::Committing) {
+    // This handles both main DB commits (Committing) and attached DB commits
+    // (CommittingAttached) that yielded on IO and need re-entry.
+    if matches!(
+        state.commit_state,
+        CommitState::Committing | CommitState::CommittingAttached
+    ) {
         let res = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
             .map(Into::into);
@@ -2512,7 +2540,6 @@ pub fn op_auto_commit(
     let requested_rollback = *rollback;
     let changed = requested_autocommit != had_autocommit;
     let is_txn_end_eq = changed && requested_autocommit;
-
     // what the requested operation is
     let is_begin_req = had_autocommit && !requested_autocommit && !requested_rollback;
     let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
@@ -2534,9 +2561,15 @@ pub fn op_auto_commit(
             } else {
                 pager.rollback_tx(&conn);
             }
-            // Also rollback all attached database pagers
-            for attached_pager in conn.get_all_attached_pagers() {
-                attached_pager.rollback_attached();
+            // Also rollback all attached database pagers and discard
+            // any connection-local schema changes so post-rollback queries
+            // see the committed (pre-transaction) schema.
+            {
+                let attached_pagers = conn.get_all_attached_pagers_with_index();
+                for (db_id, attached_pager) in attached_pagers {
+                    conn.database_schemas().write().remove(&db_id);
+                    attached_pager.rollback_attached();
+                }
             }
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
@@ -8287,7 +8320,7 @@ pub fn op_destroy(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let destroy_pager = if *db > 0 {
+    let destroy_pager = if *db != crate::MAIN_DB_ID {
         program.get_pager_from_database_index(db)
     } else {
         pager.clone()
@@ -8537,7 +8570,7 @@ pub fn op_parse_schema(
 
     let enable_triggers = conn.experimental_triggers_enabled();
     // For attached databases, qualify the sqlite_schema table with the database name
-    let schema_table = if *db >= 2 {
+    let schema_table = if crate::is_attached_db(*db) {
         let db_name = conn
             .get_database_name_by_index(*db)
             .unwrap_or_else(|| "main".to_string());
@@ -8866,7 +8899,7 @@ pub fn op_set_cookie(
                 Cookie::SchemaVersion => {
                     // Only mark schema_did_change on connection for main database (db 0).
                     // Attached databases track their schema independently.
-                    if *db == 0 {
+                    if *db == crate::MAIN_DB_ID {
                         match program.connection.get_tx_state() {
                             TransactionState::Write { .. } => {
                                 program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
@@ -9610,6 +9643,7 @@ pub fn op_integrity_check(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IntegrityCk {
+            db,
             max_errors,
             roots,
             message_register,
@@ -9618,22 +9652,31 @@ pub fn op_integrity_check(
     );
 
     let mv_store = program.connection.mv_store();
+    // Use the correct pager for the target database (main or attached)
+    let target_pager = if *db == crate::MAIN_DB_ID {
+        pager.clone()
+    } else {
+        program.get_pager_from_database_index(db)
+    };
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
-            let (freelist_trunk_page, db_size) =
-                return_if_io!(with_header(pager, mv_store.as_ref(), program, |header| (
-                    header.freelist_trunk_page.get(),
-                    header.database_size.get()
-                )));
+            let (freelist_trunk_page, db_size) = return_if_io!(with_header(
+                &target_pager,
+                mv_store.as_ref(),
+                program,
+                |header| (header.freelist_trunk_page.get(), header.database_size.get())
+            ));
             let mut errors = Vec::new();
             let mut integrity_check_state = IntegrityCheckState::new(db_size as usize);
             let mut current_root_idx = 0;
 
             if freelist_trunk_page > 0 {
-                let expected_freelist_count =
-                    return_if_io!(with_header(pager, mv_store.as_ref(), program, |header| {
-                        header.freelist_pages.get()
-                    }));
+                let expected_freelist_count = return_if_io!(with_header(
+                    &target_pager,
+                    mv_store.as_ref(),
+                    program,
+                    |header| { header.freelist_pages.get() }
+                ));
                 integrity_check_state.set_expected_freelist_count(expected_freelist_count as usize);
                 integrity_check_state.start(
                     freelist_trunk_page as i64,
@@ -9659,7 +9702,7 @@ pub fn op_integrity_check(
             return_if_io!(integrity_check(
                 integrity_check_state,
                 errors,
-                pager,
+                &target_pager,
                 mv_store.as_ref()
             ));
 
@@ -9693,7 +9736,7 @@ pub fn op_integrity_check(
 
             #[cfg(not(feature = "omit_autovacuum"))]
             let skip_page_never_used = !matches!(
-                pager.get_auto_vacuum_mode(),
+                target_pager.get_auto_vacuum_mode(),
                 crate::storage::pager::AutoVacuumMode::None
             );
             #[cfg(feature = "omit_autovacuum")]
@@ -9705,12 +9748,12 @@ pub fn op_integrity_check(
                         .page_reference
                         .contains_key(&(page_number as i64))
                     {
-                        if pager.pending_byte_page_id() != Some(page_number as u32) {
+                        if target_pager.pending_byte_page_id() != Some(page_number as u32) {
                             errors.push(IntegrityCheckError::PageNeverUsed {
                                 page_id: page_number as i64,
                             });
                         }
-                    } else if pager.pending_byte_page_id() == Some(page_number as u32) {
+                    } else if target_pager.pending_byte_page_id() == Some(page_number as u32) {
                         errors.push(IntegrityCheckError::PendingBytePageUsed {
                             page_id: page_number as i64,
                         })

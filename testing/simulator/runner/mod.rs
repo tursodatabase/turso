@@ -15,6 +15,11 @@ pub const FAULT_ERROR_MSG: &str = "Injected Fault";
 pub trait SimIO: turso_core::IO {
     fn inject_fault(&self, fault: bool);
 
+    /// Inject faults selectively per database file.
+    /// Each entry in `faults` is `(path_stem, should_fault)`.
+    /// Files whose path contains a given stem get that fault setting.
+    fn inject_fault_selective(&self, faults: &[(&str, bool)]);
+
     fn print_stats(&self);
 
     fn syncing(&self) -> bool;

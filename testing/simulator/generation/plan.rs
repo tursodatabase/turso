@@ -110,7 +110,20 @@ impl InteractionPlan {
                 Interactions::new(conn_index, InteractionsType::Query(query))
             } else {
                 let conn_ctx = &env.connection_context(conn_index);
-                Interactions::arbitrary_from(rng, conn_ctx, (env, self.stats(), conn_index))
+                let mut interactions =
+                    Interactions::arbitrary_from(rng, conn_ctx, (env, self.stats(), conn_index));
+
+                // With 30% probability, redirect CREATE TABLE to an attached database
+                if let InteractionsType::Query(Query::Create(ref mut create)) =
+                    interactions.interactions
+                {
+                    if !env.attached_dbs.is_empty() && rng.random_bool(0.3) {
+                        let db = &env.attached_dbs[rng.random_range(0..env.attached_dbs.len())];
+                        create.table.name = format!("{}.{}", db, create.table.name);
+                    }
+                }
+
+                interactions
             };
 
             tracing::debug!(

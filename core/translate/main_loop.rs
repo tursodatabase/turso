@@ -170,6 +170,13 @@ pub fn init_loop(
         if !required_tables.contains(&table_index) {
             continue;
         }
+        // Ensure attached databases have a Transaction instruction for read access
+        if crate::is_attached_db(table.database_id) {
+            let schema_cookie = t_ctx
+                .resolver
+                .with_schema(table.database_id, |s| s.schema_version);
+            program.begin_read_on_database(table.database_id, schema_cookie);
+        }
         // Initialize bookkeeping for OUTER JOIN
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {
@@ -258,15 +265,21 @@ pub fn init_loop(
                             program.emit_insn(Insn::OpenWrite {
                                 cursor_id: target_table_cursor_id,
                                 root_page: target_table.btree().unwrap().root_page.into(),
-                                db: table.database_id,
+                                db: target_table.database_id,
                             });
                         }
                     }
+                    let write_db_id = match &update_mode {
+                        UpdateRowSource::PrebuiltEphemeralTable { target_table, .. } => {
+                            target_table.database_id
+                        }
+                        _ => table.database_id,
+                    };
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: index_cursor_id,
                             root_page: index.as_ref().unwrap().root_page.into(),
-                            db: table.database_id,
+                            db: write_db_id,
                         });
                     }
                 }
@@ -1405,7 +1418,7 @@ pub fn open_loop(
                     )?;
                 }
                 program.emit_insn(Insn::IndexMethodQuery {
-                    db: 0,
+                    db: crate::MAIN_DB_ID,
                     cursor_id: index_cursor_id.expect("IndexMethod requires a index cursor"),
                     start_reg,
                     count_reg: query.arguments.len() + 1,

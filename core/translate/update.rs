@@ -222,7 +222,7 @@ pub fn prepare_update_plan(
             body.tbl_name.name.as_str()
         );
     }
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }

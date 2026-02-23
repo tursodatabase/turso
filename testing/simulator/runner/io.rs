@@ -66,6 +66,17 @@ impl SimIO for SimulatorIO {
         }
     }
 
+    fn inject_fault_selective(&self, faults: &[(&str, bool)]) {
+        for file in self.files.borrow().iter() {
+            for (stem, fault) in faults {
+                if file.path.contains(stem) {
+                    file.inject_fault(*fault);
+                    break;
+                }
+            }
+        }
+    }
+
     fn print_stats(&self) {
         for file in self.files.borrow().iter() {
             if file.path.contains("ephemeral") {

@@ -583,7 +583,7 @@ fn execute_trigger_commands(
 
     // For triggers on attached databases, resolve the database name so unqualified
     // table references in the trigger body are correctly qualified to the trigger's database.
-    let db_name = if database_id == 0 {
+    let db_name = if database_id == crate::MAIN_DB_ID {
         None
     } else {
         resolver

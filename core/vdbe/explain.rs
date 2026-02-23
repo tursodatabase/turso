@@ -1821,6 +1821,7 @@ pub fn insn_to_row(
                 format!("r[{}]={}", *out_reg, *value),
             ),
             Insn::IntegrityCk {
+                db,
                 max_errors,
                 roots,
                 message_register,
@@ -1831,7 +1832,7 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!("roots={roots:?} message_register={message_register}"),
+                format!("db={db} roots={roots:?} message_register={message_register}"),
             ),
             Insn::RowData { cursor_id, dest } => (
                 "RowData",

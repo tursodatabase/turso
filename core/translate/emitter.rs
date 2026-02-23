@@ -132,9 +132,6 @@ impl<'a> Resolver<'a> {
     const MAIN_DB: &'static str = "main";
     const TEMP_DB: &'static str = "temp";
 
-    const MAIN_DB_ID: usize = 0;
-    const TEMP_DB_ID: usize = 1;
-
     pub(crate) fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
@@ -200,21 +197,18 @@ impl<'a> Resolver<'a> {
 
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
-        if database_id == Self::MAIN_DB_ID {
-            // Main database - use connection's schema which should be kept in sync
-            f(self.schema)
-        } else if database_id == Self::TEMP_DB_ID {
-            // Temp database - uses same schema as main for now, but this will change later.
+        if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
             f(self.schema)
         } else {
-            // Attached database - check cache first, then load from database
-            let mut schemas = self.database_schemas.write();
-
-            if let Some(cached_schema) = schemas.get(&database_id) {
-                return f(cached_schema);
+            // Attached database: prefer the connection-local copy (which may contain
+            // uncommitted schema changes from this connection's transaction), falling
+            // back to the shared Database schema (last committed state).
+            let schemas = self.database_schemas.read();
+            if let Some(local_schema) = schemas.get(&database_id) {
+                return f(local_schema);
             }
+            drop(schemas);
 
-            // Schema not cached, load it lazily from the attached database
             let attached_dbs = self.attached_databases.read();
             let (db, _pager) = attached_dbs
                 .index_to_data
@@ -222,10 +216,6 @@ impl<'a> Resolver<'a> {
                 .expect("Database ID should be valid after resolve_database_id");
 
             let schema = db.schema.lock().clone();
-
-            // Cache the schema for future use
-            schemas.insert(database_id, schema.clone());
-
             f(&schema)
         }
     }
@@ -269,8 +259,8 @@ impl<'a> Resolver<'a> {
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
         match index {
-            0 => Some(Self::MAIN_DB.to_string()),
-            1 => Some(Self::TEMP_DB.to_string()),
+            crate::MAIN_DB_ID => Some(Self::MAIN_DB.to_string()),
+            crate::TEMP_DB_ID => Some(Self::TEMP_DB.to_string()),
             _ => self.attached_databases.read().get_name_by_index(index),
         }
     }
@@ -2461,9 +2451,9 @@ fn emit_program_for_update(
     )?;
 
     // Prepare index cursors
-    // Use target_table.database_id instead of plan.table_references because when the UPDATE
-    // uses an ephemeral table, plan.table_references.first() points to the ephemeral scratch
-    // table (db=0) rather than the actual target table (which may be in an attached database).
+    // Use target_table.database_id because in the PrebuiltEphemeralTable case,
+    // plan.table_references contains the ephemeral table (database_id=0),
+    // not the actual target table.
     let target_database_id = target_table.database_id;
     let mut index_cursors = Vec::with_capacity(plan.indexes_to_update.len());
     for index in &plan.indexes_to_update {
@@ -4243,7 +4233,7 @@ pub fn prepare_cdc_if_necessary(
     program.emit_insn(Insn::OpenWrite {
         cursor_id,
         root_page: cdc_btree.root_page.into(),
-        db: 0, // CDC table always lives in the main database
+        db: crate::MAIN_DB_ID, // CDC table always lives in the main database
     });
     Ok(Some((cursor_id, cdc_btree)))
 }

@@ -3,6 +3,7 @@ use crate::common::{
 };
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
+use rusqlite::types::Value as RValue;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::vdbe::StepResult;
@@ -1675,6 +1676,88 @@ fn test_matview_row_loss_during_btree_split(tmp_db: TempDatabase) -> anyhow::Res
         "Materialized view row count ({view_count}) doesn't match table row count ({table_count}). \
          Rows were lost during btree page splits.",
     );
+
+    Ok(())
+}
+
+/// Regression test for simulator seed 867: UPDATE on an attached database table
+/// that changes the primary key (rowid) while a UNIQUE index exists would use
+/// the wrong database_id (0 instead of the attached db) for OpenWrite cursors,
+/// causing "short read on page" or "IdxDelete: no matching index entry found".
+#[turso_macros::test]
+fn test_update_pk_on_attached_table_with_unique_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("aux.db")
+        .to_string_lossy()
+        .to_string();
+    conn.execute(format!("ATTACH '{aux_path}' AS aux1"))?;
+    conn.execute("CREATE TABLE aux1.t1 (pk INTEGER PRIMARY KEY, extra TEXT UNIQUE)")?;
+    conn.execute("INSERT INTO aux1.t1 VALUES (1, 'a'), (2, 'b')")?;
+    conn.execute("UPDATE aux1.t1 SET pk = 100 WHERE pk = 2")?;
+
+    let rows = limbo_exec_rows(&conn, "SELECT pk, extra FROM aux1.t1 ORDER BY pk");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec![RValue::Integer(1), RValue::Text("a".into())]);
+    assert_eq!(
+        rows[1],
+        vec![RValue::Integer(100), RValue::Text("b".into())]
+    );
+
+    Ok(())
+}
+
+/// Regression test: when a statement writes to the main DB and reads from an
+/// attached DB, the attached pager's read lock must be released after commit.
+/// Without the fix, the stale read lock would cause subsequent statements on
+/// the attached DB to use a stale WAL snapshot, missing data committed by
+/// other connections.
+#[turso_macros::test]
+fn test_attached_read_lock_released_after_main_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("aux_readlock.db")
+        .to_string_lossy()
+        .to_string();
+
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    // Set up: conn1 creates a main table and an attached table with initial data.
+    conn1.execute("CREATE TABLE main_t (id INTEGER PRIMARY KEY, val TEXT)")?;
+    conn1.execute(format!("ATTACH '{aux_path}' AS aux1"))?;
+    conn1.execute("CREATE TABLE aux1.t1 (x INTEGER)")?;
+    conn1.execute("INSERT INTO aux1.t1 VALUES (1)")?;
+
+    // conn2 attaches the same DB file.
+    conn2.execute(format!("ATTACH '{aux_path}' AS aux1"))?;
+
+    // conn2 writes to main DB and reads from attached DB in the same statement.
+    // This gives main pager a Write lock and attached pager a Read lock.
+    // After auto-commit, the attached Read lock must be released.
+    conn2.execute(
+        "INSERT INTO main_t (id, val) VALUES (1, (SELECT CAST(x AS TEXT) FROM aux1.t1 LIMIT 1))",
+    )?;
+
+    // conn1 inserts more data into the attached table.
+    conn1.execute("INSERT INTO aux1.t1 VALUES (2)")?;
+
+    // conn2 reads from the attached table. With the bug, it would use a stale
+    // snapshot and only see 1 row instead of 2.
+    let rows = limbo_exec_rows(&conn2, "SELECT x FROM aux1.t1 ORDER BY x");
+    assert_eq!(
+        rows.len(),
+        2,
+        "conn2 should see both rows after conn1's commit"
+    );
+    assert_eq!(rows[0], vec![RValue::Integer(1)]);
+    assert_eq!(rows[1], vec![RValue::Integer(2)]);
 
     Ok(())
 }

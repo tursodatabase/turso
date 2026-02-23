@@ -15,7 +15,7 @@ addr  opcode        p1   p2   p3  p4                                       p5  c
    0  Init           0  159    0                                            0  Start at 159
    1  Integer       99    2    0                                            0  r[2]=99
    2  Integer        0    3    0                                            0  r[3]=0
-   3  IntegrityCk  100    0    0                                            0  roots=[5, 7, 6, 2, 4, 3, 1] message_register=4
+   3  IntegrityCk  100    0    0                                            0  db=0 roots=[5, 7, 6, 2, 4, 3, 1] message_register=4
    4  IsNull         4   11    0                                            0  if (r[4]==NULL) goto 11
    5  String8        0    5    0  *** in database main ***
                  0  r[5]='*** in database main ***

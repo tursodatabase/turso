@@ -209,7 +209,7 @@ fn emit_add_column_default_type_validation(
     program.emit_insn(Insn::OpenRead {
         cursor_id: check_cursor_id,
         root_page: original_btree.root_page,
-        db: 0,
+        db: crate::MAIN_DB_ID,
     });
 
     let skip_check_label = program.allocate_label();
@@ -358,12 +358,18 @@ pub fn translate_alter_table(
         body: alter_table,
     } = alter;
     let database_id = resolver.resolve_database_id(&qualified_name)?;
-    if database_id >= 2 {
+    if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     program.begin_write_operation();
     let table_name = qualified_name.name.as_str();
+    // For attached databases, qualify sqlite_schema with the database name
+    // so that the UPDATE targets the correct database's schema table.
+    let qualified_schema_table = match &qualified_name.db_name {
+        Some(db_name) => format!("{}.{}", db_name.as_str(), SQLITE_TABLEID),
+        None => SQLITE_TABLEID.to_string(),
+    };
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     validate(&alter_table, table_name)?;
 
@@ -573,7 +579,7 @@ pub fn translate_alter_table(
 
             let stmt = format!(
                 r#"
-                    UPDATE {SQLITE_TABLEID}
+                    UPDATE {qualified_schema_table}
                     SET sql = '{sql}'
                     WHERE name = '{table_name}' COLLATE NOCASE AND type = 'table'
                 "#,
@@ -823,7 +829,7 @@ pub fn translate_alter_table(
 
             let stmt = format!(
                 r#"
-                    UPDATE {SQLITE_TABLEID}
+                    UPDATE {qualified_schema_table}
                     SET sql = '{escaped}'
                     WHERE name = '{table_name}' COLLATE NOCASE AND type = 'table'
                 "#,
@@ -954,8 +960,7 @@ pub fn translate_alter_table(
             };
 
             let sqlite_schema = resolver
-                .schema()
-                .get_btree_table(SQLITE_TABLEID)
+                .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
                 .ok_or_else(|| {
                     LimboError::ParseError("sqlite_schema table not found in schema".to_string())
                 })?;
@@ -1232,8 +1237,7 @@ pub fn translate_alter_table(
             }
 
             let sqlite_schema = resolver
-                .schema()
-                .get_btree_table(SQLITE_TABLEID)
+                .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
                 .ok_or_else(|| {
                     LimboError::ParseError("sqlite_schema table not found in schema".to_string())
                 })?;
@@ -1315,7 +1319,7 @@ pub fn translate_alter_table(
                 let escaped_sql = new_sql.replace('\'', "''");
                 let update_stmt = format!(
                     r#"
-                        UPDATE {SQLITE_TABLEID}
+                        UPDATE {qualified_schema_table}
                         SET sql = '{escaped_sql}'
                         WHERE name = '{trigger_name}' COLLATE NOCASE AND type = 'trigger'
                     "#,

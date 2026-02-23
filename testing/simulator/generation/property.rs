@@ -790,17 +790,23 @@ impl Property {
                             Ok(success) => Ok(Err(format!(
                                 "expected table creation to fail but it succeeded: {success:?}"
                             ))),
-                            Err(e) => match e {
-                                e if e
-                                    .to_string()
-                                    .contains(&format!("no such table: {table_name}")) =>
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                // Match both qualified ("no such table: aux1.foo")
+                                // and bare ("no such table: foo") error messages
+                                let bare_name = table_name
+                                    .split_once('.')
+                                    .map_or(table_name.as_str(), |(_, n)| n);
+                                if err_str.contains(&format!("no such table: {table_name}"))
+                                    || err_str.contains(&format!("no such table: {bare_name}"))
                                 {
                                     Ok(Ok(()))
+                                } else {
+                                    Ok(Err(format!(
+                                        "expected table does not exist error, got: {e}"
+                                    )))
                                 }
-                                _ => Ok(Err(format!(
-                                    "expected table does not exist error, got: {e}"
-                                ))),
-                            },
+                            }
                         }
                     },
                     vec![table.clone()],

@@ -605,9 +605,16 @@ impl Arbitrary for CreateIndex {
             })
             .collect::<Vec<(String, SortOrder)>>();
 
+        // Strip database prefix (e.g., "aux0.") from table name for the index name,
+        // since index names must not contain dots.
+        let bare_table_name = table
+            .name
+            .rsplit_once('.')
+            .map(|(_, name)| name)
+            .unwrap_or(&table.name);
         let index_name = format!(
             "idx_{}_{}_{}",
-            table.name,
+            bare_table_name,
             gen_random_text(rng).chars().take(8).collect::<String>(),
             rng.random_range(0..1000000)
         );

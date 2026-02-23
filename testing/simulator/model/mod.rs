@@ -1121,9 +1121,17 @@ impl Shadow for AlterTable {
         // Record operations BEFORE applying them to current_tables.
         // This ensures the operation is recorded with the correct state (e.g., column index
         // before any changes happen).
+        // For attached databases, table names are qualified (e.g., "aux1.foo").
+        // Extract the database prefix so we can preserve it during renames.
+        let db_prefix = self.table_name.split_once('.').map(|(p, _)| p);
+
         match &self.alter_table_type {
             AlterTableType::RenameTo { new_name } => {
-                tables.record_rename_table(self.table_name.clone(), new_name.clone());
+                let qualified_new = match db_prefix {
+                    Some(prefix) => format!("{prefix}.{new_name}"),
+                    None => new_name.clone(),
+                };
+                tables.record_rename_table(self.table_name.clone(), qualified_new);
             }
             AlterTableType::AddColumn { column } => {
                 tables.record_add_column(self.table_name.clone(), column.clone());
@@ -1159,7 +1167,11 @@ impl Shadow for AlterTable {
 
         match &self.alter_table_type {
             AlterTableType::RenameTo { new_name } => {
-                table.name.clone_from(new_name);
+                // Preserve the database prefix (e.g., "aux1.") for attached tables
+                table.name = match db_prefix {
+                    Some(prefix) => format!("{prefix}.{new_name}"),
+                    None => new_name.clone(),
+                };
             }
             AlterTableType::AddColumn { column } => {
                 table.columns.push(column.clone());

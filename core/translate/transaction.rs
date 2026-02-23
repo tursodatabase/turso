@@ -28,7 +28,7 @@ pub fn translate_tx_begin(
         }
         TransactionType::Immediate | TransactionType::Exclusive => {
             program.emit_insn(Insn::Transaction {
-                db: 0,
+                db: crate::MAIN_DB_ID,
                 tx_mode: TransactionMode::Write,
                 schema_cookie: schema.schema_version,
             });
@@ -40,7 +40,7 @@ pub fn translate_tx_begin(
         }
         TransactionType::Concurrent => {
             program.emit_insn(Insn::Transaction {
-                db: 0,
+                db: crate::MAIN_DB_ID,
                 tx_mode: TransactionMode::Concurrent,
                 schema_cookie: schema.schema_version,
             });
