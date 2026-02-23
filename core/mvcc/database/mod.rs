@@ -1605,12 +1605,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
-                // transaction. Please note that when we move to lockless, the
-                // invariant doesn't necessarily hold anymore because another thread
-                // might have speculatively read a version that we want to remove.
-                // But that's a problem for another day.
-                // FIXME: it actually just become a problem for today!!!
-                // TODO: test that reproduces this failure, and then a fix
+                // transaction.
                 mvcc_store.remove_tx(self.tx_id);
 
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
