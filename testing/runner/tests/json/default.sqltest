@@ -274,6 +274,20 @@ expect raw {
 # } {{{
 #   "x": 1
 # }}}
+test json_array_postive-expo {
+    SELECT json_array(-1e99, +2e100);
+}
+expect {
+    [-1.0e+99,2.0e+100]
+}
+
+test json_array_negative-expo {
+    SELECT json_array(-1e-99, +2e-100);
+}
+expect {
+    [-1.0e-99,2.0e-100]
+}
+
 test json_array_str {
     SELECT json_array('a')
 }
@@ -1557,6 +1571,27 @@ expect {
     {"user":{"profile":{"name":"Alice","age":25}}}
 }
 
+test json_set_type {
+    SELECT typeof(json_set(-1e99));
+}
+expect {
+    text
+}
+
+test json_set_postive-expo {
+    SELECT json_set(-1e99);
+}
+expect {
+    -1.0e+99
+}
+
+test json_set_negative-expo {
+    SELECT json_set(-1e-99);
+}
+expect {
+    -1.0e-99
+}
+
 test json_set_notation {
 		SELECT json_set(X'45312e652b', '$.x', 3);
 }
@@ -1670,6 +1705,27 @@ expect {
 }
 
 # Tests for json_insert() function
+test json_insert_type {
+    SELECT typeof(json_insert(-1e99));
+}
+expect {
+    text
+}
+
+test json_insert_postive-expo {
+    SELECT json_insert(-1e99);
+}
+expect {
+    -1.0e+99
+}
+
+test json_insert_negative-expo {
+    SELECT json_insert(-1e-99);
+}
+expect {
+    -1.0e-99
+}
+
 test json_insert_notation {
 		SELECT json_insert(X'45312e652b', '$.a', 1);
 }

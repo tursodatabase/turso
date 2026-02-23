@@ -216,7 +216,28 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                     .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
             } else {
                 let mut buff = ryu::Buffer::new();
-                Jsonb::from_str(buff.format(float))
+                let s_ryu = buff.format(float);
+                let mut s = Cow::Borrowed(s_ryu);
+
+                if let Some(e_idx) = s_ryu.find('e') {
+                    // Scientific notation case
+                    s = Cow::Owned(String::with_capacity(s_ryu.len() + 4));
+                    let inner = s.to_mut();
+                    let mantissa = &s_ryu[..e_idx];
+                    let exponent = &s_ryu[e_idx + 1..];
+
+                    inner.push_str(mantissa);
+                    if !mantissa.contains('.') {
+                        inner.push_str(".0");
+                    }
+                    inner.push('e');
+                    if !exponent.starts_with('-') && !exponent.starts_with('+') {
+                        inner.push('+');
+                    }
+                    inner.push_str(exponent);
+                }
+
+                Jsonb::from_str(&s)
                     .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
             }
         }
