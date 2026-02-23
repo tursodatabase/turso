@@ -12,7 +12,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode        p1   p2   p3  p4                                       p5  comment
-   0  Init           0  163    0                                            0  Start at 163
+   0  Init           0  159    0                                            0  Start at 159
    1  Integer       99    2    0                                            0  r[2]=99
    2  Integer        0    3    0                                            0  r[3]=0
    3  IntegrityCk  100    0    0                                            0  roots=[5, 7, 6, 2, 4, 3, 1] message_register=4
@@ -31,7 +31,7 @@ addr  opcode        p1   p2   p3  p4                                       p5  c
   14  OpenRead       2    6    0  k(2,B)                                    0  =idx_t2_y, root=6, iDb=0
   15  Integer        0    7    0                                            0  r[7]=0
   16  Integer        0    8    0                                            0  r[8]=0
-  17  Rewind         0   65    0                                            0  Rewind table t2
+  17  Rewind         0   63    0                                            0  Rewind table t2
   18    AddImm       8    1    0                                            0  r[8]=r[8]+1
   19    Column       0    1    9                                            0  r[9]=t2.y
   20    NotNull      9   26    0                                            0  r[9]!=NULL -> goto 26
@@ -51,132 +51,128 @@ addr  opcode        p1   p2   p3  p4                                       p5  c
   34    Column       0    1   15                                            0  r[15]=t2.y
   35    Function     0   15   13  lower                                     0  r[13]=func(r[15])
   36    RowId        0   14    0                                            0  r[14]=t2.rowid
-  37    Affinity    13    1    0                                            0  r[13..14] = A
-  38    Found        1   49   13                                            0  if found goto 49
-  39    String8      0    4    0  row                                       0  r[4]='row '
-  40    Concat       8    4    4                                            0  r[4]=r[4] + r[8]
-  41    String8      0    5    0   missing from index                       0  r[5]=' missing from index '
-  42    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
-  43    String8      0    5    0  idx_t2_expr                               0  r[5]='idx_t2_expr'
-  44    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
-  45    Integer      1    3    0                                            0  r[3]=1
-  46    ResultRow    4    1    0                                            0  output=r[4]
-  47    IfPos        2   49    1                                            0  r[2]>0 -> r[2]-=1, goto 49
-  48    Halt         0    0    0                                            0
-  49    AddImm       7    1    0                                            0  r[7]=r[7]+1
-  50    Column       0    1   16                                            0  r[16]=t2.y
-  51    RowId        0   17    0                                            0  r[17]=t2.rowid
-  52    Affinity    16    1    0                                            0  r[16..17] = B
-  53    Found        2   64   16                                            0  if found goto 64
-  54    String8      0    4    0  row                                       0  r[4]='row '
-  55    Concat       8    4    4                                            0  r[4]=r[4] + r[8]
-  56    String8      0    5    0   missing from index                       0  r[5]=' missing from index '
+  37    Found        1   48   13                                            0  if found goto 48
+  38    String8      0    4    0  row                                       0  r[4]='row '
+  39    Concat       8    4    4                                            0  r[4]=r[4] + r[8]
+  40    String8      0    5    0   missing from index                       0  r[5]=' missing from index '
+  41    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
+  42    String8      0    5    0  idx_t2_expr                               0  r[5]='idx_t2_expr'
+  43    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
+  44    Integer      1    3    0                                            0  r[3]=1
+  45    ResultRow    4    1    0                                            0  output=r[4]
+  46    IfPos        2   48    1                                            0  r[2]>0 -> r[2]-=1, goto 48
+  47    Halt         0    0    0                                            0
+  48    AddImm       7    1    0                                            0  r[7]=r[7]+1
+  49    Column       0    1   16                                            0  r[16]=t2.y
+  50    RowId        0   17    0                                            0  r[17]=t2.rowid
+  51    Found        2   62   16                                            0  if found goto 62
+  52    String8      0    4    0  row                                       0  r[4]='row '
+  53    Concat       8    4    4                                            0  r[4]=r[4] + r[8]
+  54    String8      0    5    0   missing from index                       0  r[5]=' missing from index '
+  55    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
+  56    String8      0    5    0  idx_t2_y                                  0  r[5]='idx_t2_y'
   57    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
-  58    String8      0    5    0  idx_t2_y                                  0  r[5]='idx_t2_y'
-  59    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
-  60    Integer      1    3    0                                            0  r[3]=1
-  61    ResultRow    4    1    0                                            0  output=r[4]
-  62    IfPos        2   64    1                                            0  r[2]>0 -> r[2]-=1, goto 64
-  63    Halt         0    0    0                                            0
-  64  Next           0   18    0                                            0
-  65  Count          1   18    0                                            0
-  66  Eq            18    6   72                                            0  if r[18]==r[6] goto 72
-  67  String8        0    4    0  wrong # of entries in index idx_t2_expr   0  r[4]='wrong # of entries in index idx_t2_expr'
-  68  Integer        1    3    0                                            0  r[3]=1
-  69  ResultRow      4    1    0                                            0  output=r[4]
-  70  IfPos          2   72    1                                            0  r[2]>0 -> r[2]-=1, goto 72
-  71  Halt           0    0    0                                            0
-  72  Close          1    0    0                                            0
-  73  Count          2   19    0                                            0
-  74  Eq            19    7   80                                            0  if r[19]==r[7] goto 80
-  75  String8        0    4    0  wrong # of entries in index idx_t2_y      0  r[4]='wrong # of entries in index idx_t2_y'
-  76  Integer        1    3    0                                            0  r[3]=1
-  77  ResultRow      4    1    0                                            0  output=r[4]
-  78  IfPos          2   80    1                                            0  r[2]>0 -> r[2]-=1, goto 80
-  79  Halt           0    0    0                                            0
-  80  Close          2    0    0                                            0
-  81  Close          0    0    0                                            0
-  82  OpenRead       3    2    0  k(2,B,B)                                  0  table=t1, root=2, iDb=0
-  83  OpenRead       4    4    0  k(2,B)                                    0  =idx_t1_b_u, root=4, iDb=0
-  84  Integer        0   20    0                                            0  r[20]=0
-  85  OpenRead       5    3    0  k(2,B)                                    0  =idx_t1_b, root=3, iDb=0
-  86  Integer        0   21    0                                            0  r[21]=0
-  87  Integer        0   22    0                                            0  r[22]=0
-  88  Rewind         3  136    0                                            0  Rewind table t1
-  89    AddImm      22    1    0                                            0  r[22]=r[22]+1
-  90    Column       3    1   23                                            0  r[23]=t1.b
-  91    NotNull     23   97    0                                            0  r[23]!=NULL -> goto 97
-  92    String8      0    4    0  NULL value in t1.b                        0  r[4]='NULL value in t1.b'
-  93    Integer      1    3    0                                            0  r[3]=1
-  94    ResultRow    4    1    0                                            0  output=r[4]
-  95    IfPos        2   97    1                                            0  r[2]>0 -> r[2]-=1, goto 97
-  96    Halt         0    0    0                                            0
-  97    AddImm      20    1    0                                            0  r[20]=r[20]+1
-  98    Column       3    1   24                                            0  r[24]=t1.b
-  99    RowId        3   25    0                                            0  r[25]=t1.rowid
- 100    Affinity    24    1    0                                            0  r[24..25] = B
- 101    Found        4  112   24                                            0  if found goto 112
- 102    String8      0    4    0  row                                       0  r[4]='row '
- 103    Concat      22    4    4                                            0  r[4]=r[4] + r[22]
- 104    String8      0    5    0   missing from index                       0  r[5]=' missing from index '
- 105    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
- 106    String8      0    5    0  idx_t1_b_u                                0  r[5]='idx_t1_b_u'
- 107    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
- 108    Integer      1    3    0                                            0  r[3]=1
- 109    ResultRow    4    1    0                                            0  output=r[4]
- 110    IfPos        2  112    1                                            0  r[2]>0 -> r[2]-=1, goto 112
- 111    Halt         0    0    0                                            0
- 112    Next         4  114    0                                            0
- 113    Goto         0  120    0                                            0
- 114    IdxGT        4  120   24                                            0  key=[24..24]
- 115    String8      0    4    0  non-unique entry in index idx_t1_b_u      0  r[4]='non-unique entry in index idx_t1_b_u'
- 116    Integer      1    3    0                                            0  r[3]=1
- 117    ResultRow    4    1    0                                            0  output=r[4]
- 118    IfPos        2  120    1                                            0  r[2]>0 -> r[2]-=1, goto 120
- 119    Halt         0    0    0                                            0
- 120    AddImm      21    1    0                                            0  r[21]=r[21]+1
- 121    Column       3    1   26                                            0  r[26]=t1.b
- 122    RowId        3   27    0                                            0  r[27]=t1.rowid
- 123    Affinity    26    1    0                                            0  r[26..27] = B
- 124    Found        5  135   26                                            0  if found goto 135
- 125    String8      0    4    0  row                                       0  r[4]='row '
- 126    Concat      22    4    4                                            0  r[4]=r[4] + r[22]
- 127    String8      0    5    0   missing from index                       0  r[5]=' missing from index '
- 128    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
- 129    String8      0    5    0  idx_t1_b                                  0  r[5]='idx_t1_b'
- 130    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
- 131    Integer      1    3    0                                            0  r[3]=1
- 132    ResultRow    4    1    0                                            0  output=r[4]
- 133    IfPos        2  135    1                                            0  r[2]>0 -> r[2]-=1, goto 135
- 134    Halt         0    0    0                                            0
- 135  Next           3   89    0                                            0
- 136  Count          4   28    0                                            0
- 137  Eq            28   20  143                                            0  if r[28]==r[20] goto 143
- 138  String8        0    4    0  wrong # of entries in index idx_t1_b_u    0  r[4]='wrong # of entries in index idx_t1_b_u'
- 139  Integer        1    3    0                                            0  r[3]=1
- 140  ResultRow      4    1    0                                            0  output=r[4]
- 141  IfPos          2  143    1                                            0  r[2]>0 -> r[2]-=1, goto 143
- 142  Halt           0    0    0                                            0
- 143  Close          4    0    0                                            0
- 144  Count          5   29    0                                            0
- 145  Eq            29   21  151                                            0  if r[29]==r[21] goto 151
- 146  String8        0    4    0  wrong # of entries in index idx_t1_b      0  r[4]='wrong # of entries in index idx_t1_b'
- 147  Integer        1    3    0                                            0  r[3]=1
- 148  ResultRow      4    1    0                                            0  output=r[4]
- 149  IfPos          2  151    1                                            0  r[2]>0 -> r[2]-=1, goto 151
- 150  Halt           0    0    0                                            0
- 151  Close          5    0    0                                            0
- 152  Close          3    0    0                                            0
- 153  OpenRead       6    1    0  k(6,B,B,B,B,B)                            0  table=sqlite_schema, root=1, iDb=0
- 154  Integer        0   30    0                                            0  r[30]=0
- 155  Rewind         6  158    0                                            0  Rewind table sqlite_schema
- 156    AddImm      30    1    0                                            0  r[30]=r[30]+1
- 157  Next           6  156    0                                            0
- 158  Close          6    0    0                                            0
- 159  If             3  162    0                                            0  if r[3] goto 162
- 160  String8        0    4    0  ok                                        0  r[4]='ok'
- 161  ResultRow      4    1    0                                            0  output=r[4]
- 162  Halt           0    0    0                                            0
- 163  Transaction    0    1    6                                            0  iDb=0 tx_mode=Read
- 164  Integer        0   12    0                                            0  r[12]=0
- 165  Goto           0    1    0                                            0
+  58    Integer      1    3    0                                            0  r[3]=1
+  59    ResultRow    4    1    0                                            0  output=r[4]
+  60    IfPos        2   62    1                                            0  r[2]>0 -> r[2]-=1, goto 62
+  61    Halt         0    0    0                                            0
+  62  Next           0   18    0                                            0
+  63  Count          1   18    0                                            0
+  64  Eq            18    6   70                                            0  if r[18]==r[6] goto 70
+  65  String8        0    4    0  wrong # of entries in index idx_t2_expr   0  r[4]='wrong # of entries in index idx_t2_expr'
+  66  Integer        1    3    0                                            0  r[3]=1
+  67  ResultRow      4    1    0                                            0  output=r[4]
+  68  IfPos          2   70    1                                            0  r[2]>0 -> r[2]-=1, goto 70
+  69  Halt           0    0    0                                            0
+  70  Close          1    0    0                                            0
+  71  Count          2   19    0                                            0
+  72  Eq            19    7   78                                            0  if r[19]==r[7] goto 78
+  73  String8        0    4    0  wrong # of entries in index idx_t2_y      0  r[4]='wrong # of entries in index idx_t2_y'
+  74  Integer        1    3    0                                            0  r[3]=1
+  75  ResultRow      4    1    0                                            0  output=r[4]
+  76  IfPos          2   78    1                                            0  r[2]>0 -> r[2]-=1, goto 78
+  77  Halt           0    0    0                                            0
+  78  Close          2    0    0                                            0
+  79  Close          0    0    0                                            0
+  80  OpenRead       3    2    0  k(2,B,B)                                  0  table=t1, root=2, iDb=0
+  81  OpenRead       4    4    0  k(2,B)                                    0  =idx_t1_b_u, root=4, iDb=0
+  82  Integer        0   20    0                                            0  r[20]=0
+  83  OpenRead       5    3    0  k(2,B)                                    0  =idx_t1_b, root=3, iDb=0
+  84  Integer        0   21    0                                            0  r[21]=0
+  85  Integer        0   22    0                                            0  r[22]=0
+  86  Rewind         3  132    0                                            0  Rewind table t1
+  87    AddImm      22    1    0                                            0  r[22]=r[22]+1
+  88    Column       3    1   23                                            0  r[23]=t1.b
+  89    NotNull     23   95    0                                            0  r[23]!=NULL -> goto 95
+  90    String8      0    4    0  NULL value in t1.b                        0  r[4]='NULL value in t1.b'
+  91    Integer      1    3    0                                            0  r[3]=1
+  92    ResultRow    4    1    0                                            0  output=r[4]
+  93    IfPos        2   95    1                                            0  r[2]>0 -> r[2]-=1, goto 95
+  94    Halt         0    0    0                                            0
+  95    AddImm      20    1    0                                            0  r[20]=r[20]+1
+  96    Column       3    1   24                                            0  r[24]=t1.b
+  97    RowId        3   25    0                                            0  r[25]=t1.rowid
+  98    Found        4  109   24                                            0  if found goto 109
+  99    String8      0    4    0  row                                       0  r[4]='row '
+ 100    Concat      22    4    4                                            0  r[4]=r[4] + r[22]
+ 101    String8      0    5    0   missing from index                       0  r[5]=' missing from index '
+ 102    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
+ 103    String8      0    5    0  idx_t1_b_u                                0  r[5]='idx_t1_b_u'
+ 104    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
+ 105    Integer      1    3    0                                            0  r[3]=1
+ 106    ResultRow    4    1    0                                            0  output=r[4]
+ 107    IfPos        2  109    1                                            0  r[2]>0 -> r[2]-=1, goto 109
+ 108    Halt         0    0    0                                            0
+ 109    Next         4  111    0                                            0
+ 110    Goto         0  117    0                                            0
+ 111    IdxGT        4  117   24                                            0  key=[24..24]
+ 112    String8      0    4    0  non-unique entry in index idx_t1_b_u      0  r[4]='non-unique entry in index idx_t1_b_u'
+ 113    Integer      1    3    0                                            0  r[3]=1
+ 114    ResultRow    4    1    0                                            0  output=r[4]
+ 115    IfPos        2  117    1                                            0  r[2]>0 -> r[2]-=1, goto 117
+ 116    Halt         0    0    0                                            0
+ 117    AddImm      21    1    0                                            0  r[21]=r[21]+1
+ 118    Column       3    1   26                                            0  r[26]=t1.b
+ 119    RowId        3   27    0                                            0  r[27]=t1.rowid
+ 120    Found        5  131   26                                            0  if found goto 131
+ 121    String8      0    4    0  row                                       0  r[4]='row '
+ 122    Concat      22    4    4                                            0  r[4]=r[4] + r[22]
+ 123    String8      0    5    0   missing from index                       0  r[5]=' missing from index '
+ 124    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
+ 125    String8      0    5    0  idx_t1_b                                  0  r[5]='idx_t1_b'
+ 126    Concat       5    4    4                                            0  r[4]=r[4] + r[5]
+ 127    Integer      1    3    0                                            0  r[3]=1
+ 128    ResultRow    4    1    0                                            0  output=r[4]
+ 129    IfPos        2  131    1                                            0  r[2]>0 -> r[2]-=1, goto 131
+ 130    Halt         0    0    0                                            0
+ 131  Next           3   87    0                                            0
+ 132  Count          4   28    0                                            0
+ 133  Eq            28   20  139                                            0  if r[28]==r[20] goto 139
+ 134  String8        0    4    0  wrong # of entries in index idx_t1_b_u    0  r[4]='wrong # of entries in index idx_t1_b_u'
+ 135  Integer        1    3    0                                            0  r[3]=1
+ 136  ResultRow      4    1    0                                            0  output=r[4]
+ 137  IfPos          2  139    1                                            0  r[2]>0 -> r[2]-=1, goto 139
+ 138  Halt           0    0    0                                            0
+ 139  Close          4    0    0                                            0
+ 140  Count          5   29    0                                            0
+ 141  Eq            29   21  147                                            0  if r[29]==r[21] goto 147
+ 142  String8        0    4    0  wrong # of entries in index idx_t1_b      0  r[4]='wrong # of entries in index idx_t1_b'
+ 143  Integer        1    3    0                                            0  r[3]=1
+ 144  ResultRow      4    1    0                                            0  output=r[4]
+ 145  IfPos          2  147    1                                            0  r[2]>0 -> r[2]-=1, goto 147
+ 146  Halt           0    0    0                                            0
+ 147  Close          5    0    0                                            0
+ 148  Close          3    0    0                                            0
+ 149  OpenRead       6    1    0  k(6,B,B,B,B,B)                            0  table=sqlite_schema, root=1, iDb=0
+ 150  Integer        0   30    0                                            0  r[30]=0
+ 151  Rewind         6  154    0                                            0  Rewind table sqlite_schema
+ 152    AddImm      30    1    0                                            0  r[30]=r[30]+1
+ 153  Next           6  152    0                                            0
+ 154  Close          6    0    0                                            0
+ 155  If             3  158    0                                            0  if r[3] goto 158
+ 156  String8        0    4    0  ok                                        0  r[4]='ok'
+ 157  ResultRow      4    1    0                                            0  output=r[4]
+ 158  Halt           0    0    0                                            0
+ 159  Transaction    0    1    6                                            0  iDb=0 tx_mode=Read
+ 160  Integer        0   12    0                                            0  r[12]=0
+ 161  Goto           0    1    0                                            0

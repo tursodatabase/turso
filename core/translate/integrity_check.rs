@@ -1,5 +1,3 @@
-use std::num::NonZeroUsize;
-
 use crate::{
     schema::{Index, Schema, Table},
     translate::{
@@ -8,11 +6,9 @@ use crate::{
             bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
             BindingBehavior, ConditionMetadata, NoConstantOptReason,
         },
-        fkeys::build_index_affinity_string,
         plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
     },
     vdbe::{
-        affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{CmpInsFlags, Insn},
     },
@@ -35,7 +31,6 @@ struct BoundIntegrityIndex {
     where_expr: Option<ast::Expr>,
     columns: Vec<BoundIndexColumn>,
     unique_nullable: Vec<bool>,
-    affinity: String,
 }
 
 /// Translate PRAGMA integrity_check.
@@ -272,22 +267,6 @@ fn translate_integrity_check_impl(
                     }
                 }
 
-                let affinity = if index.columns.iter().any(|c| c.expr.is_some()) {
-                    index
-                        .columns
-                        .iter()
-                        .map(|c| {
-                            if c.expr.is_some() {
-                                Affinity::Blob.aff_mask()
-                            } else {
-                                btree_table.columns[c.pos_in_table].affinity().aff_mask()
-                            }
-                        })
-                        .collect::<String>()
-                } else {
-                    build_index_affinity_string(index, btree_table)
-                };
-
                 bound_indexes.push(BoundIntegrityIndex {
                     index: index.clone(),
                     cursor_id,
@@ -295,7 +274,6 @@ fn translate_integrity_check_impl(
                     where_expr,
                     columns,
                     unique_nullable,
-                    affinity,
                 });
             }
         }
@@ -438,14 +416,6 @@ fn translate_integrity_check_impl(
                 cursor_id: table_cursor_id,
                 dest: rowid_reg,
             });
-
-            if let Some(count) = NonZeroUsize::new(bound_index.columns.len()) {
-                program.emit_insn(Insn::Affinity {
-                    start_reg: key_start_reg,
-                    count,
-                    affinities: bound_index.affinity.clone(),
-                });
-            }
 
             if !quick {
                 let found_label = program.allocate_label();
