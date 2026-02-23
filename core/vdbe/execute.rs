@@ -2957,7 +2957,14 @@ pub fn op_program(
                 // so we must not call it again after the loop.
                 let mut subprogram_aborted = false;
                 loop {
+                    if let Err(err) = program.connection.start_subprogram_execution() {
+                        if is_trigger {
+                            program.connection.end_trigger_execution();
+                        }
+                        return Err(err);
+                    }
                     let res = statement.step();
+                    program.connection.end_subprogram_execution();
                     match res {
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,

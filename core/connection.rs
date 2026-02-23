@@ -120,6 +120,14 @@ pub struct Connection {
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
     pub(super) executing_triggers: RwLock<Vec<Arc<Trigger>>>,
+    /// Current depth of nested Program opcode execution (trigger/FK subprogram calls).
+    pub(super) executing_subprogram_depth: AtomicI32,
+    /// Stack of FK action subprograms currently being compiled.
+    /// Used to break recursive FK subprogram compilation cycles.
+    pub(super) compiling_fk_actions: RwLock<Vec<String>>,
+    /// Current FK action subprogram compilation depth.
+    /// Self-referential and cyclic CASCADE actions recursively compile nested subprograms.
+    pub(super) compiling_fk_actions_depth: AtomicI32,
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
@@ -198,6 +206,83 @@ impl Connection {
     /// ends nested program execution
     pub fn end_nested(&self) {
         self.nestedness.fetch_add(-1, Ordering::SeqCst);
+    }
+
+    /// SQLite default trigger recursion limit (SQLITE_MAX_TRIGGER_DEPTH).
+    /// FK CASCADE actions compile into trigger-like subprograms and follow the same limit.
+    const MAX_TRIGGER_RECURSION_DEPTH: i32 = 1000;
+
+    pub(crate) fn start_fk_action_compilation(&self, key: &str) -> Result<()> {
+        let depth = self
+            .compiling_fk_actions_depth
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+
+        if depth > Self::MAX_TRIGGER_RECURSION_DEPTH {
+            self.compiling_fk_actions_depth
+                .fetch_add(-1, Ordering::SeqCst);
+            return Err(LimboError::ParseError(
+                "too many levels of trigger recursion".to_string(),
+            ));
+        }
+
+        let mut compiling_fk_actions = self.compiling_fk_actions.write();
+        if compiling_fk_actions.iter().any(|active| active == key) {
+            self.compiling_fk_actions_depth
+                .fetch_add(-1, Ordering::SeqCst);
+            return Err(LimboError::ParseError(
+                "too many levels of trigger recursion".to_string(),
+            ));
+        }
+        compiling_fk_actions.push(key.to_string());
+
+        Ok(())
+    }
+
+    pub(crate) fn end_fk_action_compilation(&self, expected_key: &str) {
+        let popped = self.compiling_fk_actions.write().pop();
+        debug_assert_eq!(
+            popped.as_deref(),
+            Some(expected_key),
+            "fk action compilation stack out of sync"
+        );
+
+        let prev = self
+            .compiling_fk_actions_depth
+            .fetch_add(-1, Ordering::SeqCst);
+
+        debug_assert!(
+            prev > 0,
+            "end_fk_action_compilation called without matching start"
+        );
+    }
+
+    pub(crate) fn start_subprogram_execution(&self) -> Result<()> {
+        let depth = self
+            .executing_subprogram_depth
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+
+        if depth > Self::MAX_TRIGGER_RECURSION_DEPTH {
+            self.executing_subprogram_depth
+                .fetch_add(-1, Ordering::SeqCst);
+            return Err(LimboError::ParseError(
+                "too many levels of trigger recursion".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn end_subprogram_execution(&self) {
+        let prev = self
+            .executing_subprogram_depth
+            .fetch_add(-1, Ordering::SeqCst);
+
+        debug_assert!(
+            prev > 0,
+            "end_subprogram_execution called without matching start"
+        );
     }
 
     /// Check if a specific trigger is currently compiling (for recursive trigger prevention)
