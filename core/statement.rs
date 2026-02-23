@@ -582,7 +582,14 @@ impl Statement {
                 // (in-memory) + Halt. Commit the transaction via halt().
                 let mut halt_completed = false;
                 loop {
-                    match vdbe::execute::halt(&self.program, &mut self.state, &self.pager, 0, "") {
+                    match vdbe::execute::halt(
+                        &self.program,
+                        &mut self.state,
+                        &self.pager,
+                        0,
+                        "",
+                        None,
+                    ) {
                         Ok(vdbe::execute::InsnFunctionStepResult::Done) => {
                             halt_completed = true;
                             break;

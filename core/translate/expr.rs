@@ -1,8 +1,9 @@
+use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
+use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, UnaryOperator};
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
@@ -2946,7 +2947,63 @@ pub fn translate_expr(
         ast::Expr::Qualified(_, _) => {
             unreachable!("Qualified should be resolved to a Column before translation")
         }
-        ast::Expr::Raise(_, _) => crate::bail_parse_error!("RAISE is not supported"),
+        ast::Expr::Raise(resolve_type, msg_expr) => {
+            let in_trigger = program.trigger.is_some();
+            match resolve_type {
+                ResolveType::Ignore => {
+                    if !in_trigger {
+                        crate::bail_parse_error!(
+                            "RAISE() may only be used within a trigger-program"
+                        );
+                    }
+                    // RAISE(IGNORE): halt the trigger subprogram and skip the triggering row
+                    program.emit_insn(Insn::Halt {
+                        err_code: 0,
+                        description: String::new(),
+                        on_error: Some(ResolveType::Ignore),
+                    });
+                }
+                ResolveType::Fail => {
+                    crate::bail_parse_error!(
+                        "RAISE(FAIL) is not yet supported (requires statement savepoints)"
+                    );
+                }
+                ResolveType::Abort | ResolveType::Rollback => {
+                    if !in_trigger && *resolve_type != ResolveType::Abort {
+                        crate::bail_parse_error!(
+                            "RAISE() may only be used within a trigger-program"
+                        );
+                    }
+                    let msg = match msg_expr {
+                        Some(e) => match e.as_ref() {
+                            ast::Expr::Literal(ast::Literal::String(s)) => sanitize_string(s),
+                            _ => {
+                                crate::bail_parse_error!(
+                                    "RAISE error message must be a string literal"
+                                );
+                            }
+                        },
+                        None => {
+                            crate::bail_parse_error!("RAISE requires an error message");
+                        }
+                    };
+                    let err_code = if in_trigger {
+                        SQLITE_CONSTRAINT_TRIGGER
+                    } else {
+                        SQLITE_ERROR
+                    };
+                    program.emit_insn(Insn::Halt {
+                        err_code,
+                        description: msg,
+                        on_error: Some(*resolve_type),
+                    });
+                }
+                ResolveType::Replace => {
+                    crate::bail_parse_error!("REPLACE is not valid for RAISE");
+                }
+            }
+            Ok(target_register)
+        }
         ast::Expr::Subquery(_) => {
             crate::bail_parse_error!("Subquery is not supported in this position")
         }
@@ -5744,7 +5801,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         }
         Expr::Parenthesized(exprs) => exprs.len(),
         Expr::Qualified(..) => 1,
-        Expr::Raise(..) => crate::bail_parse_error!("RAISE is not supported"),
+        Expr::Raise(..) => 1,
         Expr::Subquery(_) => {
             crate::bail_parse_error!("Scalar subquery is not supported in this context")
         }

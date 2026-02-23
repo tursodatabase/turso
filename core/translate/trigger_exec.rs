@@ -5,8 +5,9 @@ use crate::translate::expr::translate_expr;
 use crate::translate::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
+use crate::vdbe::BranchOffset;
+use crate::HashSet;
 use crate::{bail_parse_error, QueryMode, Result};
-use rustc_hash::FxHashSet as HashSet;
 use std::num::NonZero;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
@@ -550,6 +551,7 @@ fn execute_trigger_commands(
     ctx: &TriggerContext,
     connection: &Arc<crate::Connection>,
     database_id: usize,
+    ignore_jump_target: BranchOffset,
 ) -> Result<bool> {
     if connection.trigger_is_compiling(trigger) {
         // Do not recursively compile the same trigger
@@ -651,6 +653,7 @@ fn execute_trigger_commands(
     program.emit_insn(Insn::Program {
         params,
         program: built_subprogram.prepared().clone(),
+        ignore_jump_target,
     });
     connection.end_trigger_compilation();
 
@@ -755,6 +758,7 @@ pub fn fire_trigger(
     ctx: &TriggerContext,
     connection: &Arc<crate::Connection>,
     database_id: usize,
+    ignore_jump_target: BranchOffset,
 ) -> Result<()> {
     // Evaluate WHEN clause if present
     if let Some(mut when_expr) = trigger.when_clause.clone() {
@@ -772,12 +776,28 @@ pub fn fire_trigger(
         });
 
         // Execute trigger commands if WHEN clause is true
-        execute_trigger_commands(program, resolver, &trigger, ctx, connection, database_id)?;
+        execute_trigger_commands(
+            program,
+            resolver,
+            &trigger,
+            ctx,
+            connection,
+            database_id,
+            ignore_jump_target,
+        )?;
 
         program.preassign_label_to_next_insn(skip_label);
     } else {
         // No WHEN clause - always execute
-        execute_trigger_commands(program, resolver, &trigger, ctx, connection, database_id)?;
+        execute_trigger_commands(
+            program,
+            resolver,
+            &trigger,
+            ctx,
+            connection,
+            database_id,
+            ignore_jump_target,
+        )?;
     }
 
     Ok(())

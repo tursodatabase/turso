@@ -1619,12 +1619,12 @@ impl Program {
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
             if err.is_some() && !pager.is_checkpointing() {
-                // For FAIL resolve type with non-FK constraint errors, do NOT rollback the statement
-                // savepoint - changes made by the statement prior to the error should persist.
+                // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
+                // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
-                let should_rollback_stmt = !(self.resolve_type == ResolveType::Fail
-                    && matches!(err, Some(LimboError::Constraint(_))));
-                if should_rollback_stmt {
+                let is_fail_constraint = matches!(err, Some(LimboError::Constraint(_)))
+                    && self.resolve_type == ResolveType::Fail;
+                if !is_fail_constraint {
                     if let Err(end_stmt_err) = state.end_statement(
                         &self.connection,
                         pager,
@@ -1661,21 +1661,27 @@ impl Program {
                         self.rollback_current_txn(pager);
                     }
                 }
-                // Non-FK constraint errors: behavior depends on resolve_type
+                // Constraint and RAISE errors: behavior depends on the effective resolve type.
+                // For normal constraints, the resolve type comes from the statement (ON CONFLICT).
+                // For RAISE errors, the resolve type is embedded in the error variant itself.
                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
                 // - FAIL: don't rollback anything - changes persist, transaction stays active
-                Some(LimboError::Constraint(_)) => {
-                    match self.resolve_type {
+                // - ABORT (default): rollback statement, rollback txn if autocommit
+                Some(LimboError::Constraint(_))
+                | Some(LimboError::RaiseAbort(_))
+                | Some(LimboError::RaiseRollback(_)) => {
+                    let effective_resolve = match err {
+                        Some(LimboError::RaiseAbort(_)) => ResolveType::Abort,
+                        Some(LimboError::RaiseRollback(_)) => ResolveType::Rollback,
+                        _ => self.resolve_type,
+                    };
+                    match effective_resolve {
                         ResolveType::Rollback => {
-                            // ROLLBACK always rolls back the entire transaction
                             self.rollback_current_txn(pager);
                         }
                         ResolveType::Fail => {
-                            // FAIL: Don't rollback the transaction. Changes made before the error persist.
-                            // For autocommit mode, the commit was already handled in halt() before
-                            // the error was returned, so nothing more to do here.
-                            // For non-autocommit mode, release the savepoint so changes become part
-                            // of the outer transaction.
+                            // ON CONFLICT FAIL: Don't rollback the transaction.
+                            // Changes made before the error persist.
                             if !self.connection.get_auto_commit() {
                                 if let Err(end_stmt_err) = state.end_statement(
                                     &self.connection,
@@ -1692,11 +1698,19 @@ impl Program {
                         }
                         _ => {
                             if self.connection.get_auto_commit() {
-                                // ABORT in autocommit: rollback the implicit transaction
                                 self.rollback_current_txn(pager);
                             }
                         }
                     }
+                }
+                Some(LimboError::RaiseIgnore) => {
+                    tracing::error!(
+                        "BUG: RaiseIgnore reached abort() - should be caught by op_program"
+                    );
+                    debug_assert!(
+                        false,
+                        "RaiseIgnore should be caught by op_program, not reach abort"
+                    );
                 }
                 _ => {
                     if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {

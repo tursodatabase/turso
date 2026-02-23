@@ -1078,3 +1078,376 @@ expect {
     2
 }
 
+# RAISE(ABORT) in BEFORE INSERT trigger prevents insertion
+test trigger-raise-abort-before-insert {
+    CREATE TABLE raise_t1 (x INTEGER, y TEXT);
+    CREATE TRIGGER raise_tr1 BEFORE INSERT ON raise_t1 BEGIN
+        SELECT RAISE(ABORT, 'insert blocked');
+    END;
+    INSERT INTO raise_t1 VALUES (1, 'hello');
+}
+expect error {
+    insert blocked
+}
+
+# RAISE(ABORT) in AFTER INSERT trigger rolls back the insert
+test trigger-raise-abort-after-insert {
+    CREATE TABLE raise_t2 (x INTEGER, y TEXT);
+    CREATE TRIGGER raise_tr2 AFTER INSERT ON raise_t2 BEGIN
+        SELECT RAISE(ABORT, 'after insert blocked');
+    END;
+    INSERT INTO raise_t2 VALUES (1, 'hello');
+}
+expect error {
+    after insert blocked
+}
+
+# RAISE(ABORT) with WHEN clause - conditional: allowed value goes through
+test trigger-raise-abort-conditional-pass {
+    CREATE TABLE raise_t3 (x INTEGER);
+    CREATE TRIGGER raise_tr3 BEFORE INSERT ON raise_t3
+    WHEN NEW.x > 10
+    BEGIN
+        SELECT RAISE(ABORT, 'value too large');
+    END;
+    INSERT INTO raise_t3 VALUES (5);
+    SELECT * FROM raise_t3;
+}
+expect {
+    5
+}
+
+# RAISE(ABORT) with WHEN clause - blocked value fails
+test trigger-raise-abort-conditional-fail {
+    CREATE TABLE raise_t3b (x INTEGER);
+    CREATE TRIGGER raise_tr3b BEFORE INSERT ON raise_t3b
+    WHEN NEW.x > 10
+    BEGIN
+        SELECT RAISE(ABORT, 'value too large');
+    END;
+    INSERT INTO raise_t3b VALUES (15);
+}
+expect error {
+    value too large
+}
+
+# RAISE(ROLLBACK) in trigger - error is reported
+test trigger-raise-rollback {
+    CREATE TABLE raise_t5 (x INTEGER);
+    INSERT INTO raise_t5 VALUES (100);
+    CREATE TRIGGER raise_tr5 BEFORE INSERT ON raise_t5
+    WHEN NEW.x = 2
+    BEGIN
+        SELECT RAISE(ROLLBACK, 'rollback triggered');
+    END;
+    BEGIN;
+    INSERT INTO raise_t5 VALUES (1);
+    INSERT INTO raise_t5 VALUES (2);
+}
+expect error {
+    rollback triggered
+}
+
+# RAISE(IGNORE) in BEFORE INSERT trigger - skips the row (matches SQLite)
+test trigger-raise-ignore-before-insert {
+    CREATE TABLE raise_t6 (x INTEGER, y TEXT);
+    CREATE TRIGGER raise_tr6 BEFORE INSERT ON raise_t6 BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    INSERT INTO raise_t6 VALUES (1, 'hello');
+    SELECT count(*) FROM raise_t6;
+}
+expect {
+    0
+}
+
+# RAISE(IGNORE) in BEFORE UPDATE trigger - skips the update
+test trigger-raise-ignore-before-update {
+    CREATE TABLE raise_t6b (x INTEGER, y TEXT);
+    INSERT INTO raise_t6b VALUES (1, 'original');
+    CREATE TRIGGER raise_tr6b BEFORE UPDATE ON raise_t6b BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    UPDATE raise_t6b SET y = 'modified' WHERE x = 1;
+    SELECT * FROM raise_t6b;
+}
+expect {
+    1|original
+}
+
+# RAISE(IGNORE) in BEFORE DELETE trigger - skips the delete
+test trigger-raise-ignore-before-delete {
+    CREATE TABLE raise_t6c (x INTEGER, y TEXT);
+    INSERT INTO raise_t6c VALUES (1, 'keep me');
+    CREATE TRIGGER raise_tr6c BEFORE DELETE ON raise_t6c BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    DELETE FROM raise_t6c WHERE x = 1;
+    SELECT * FROM raise_t6c;
+}
+expect {
+    1|keep me
+}
+
+# RAISE(IGNORE) conditional - only matching rows skipped
+test trigger-raise-ignore-conditional {
+    CREATE TABLE raise_t6d (x INTEGER);
+    CREATE TRIGGER raise_tr6d BEFORE INSERT ON raise_t6d
+    WHEN NEW.x > 5
+    BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    INSERT INTO raise_t6d VALUES (3);
+    INSERT INTO raise_t6d VALUES (7);
+    INSERT INTO raise_t6d VALUES (4);
+    SELECT * FROM raise_t6d ORDER BY x;
+}
+expect {
+    3
+    4
+}
+
+# RAISE(IGNORE) in multi-row INSERT - only triggered rows are skipped
+test trigger-raise-ignore-multi-row {
+    CREATE TABLE raise_t6e (x INTEGER);
+    CREATE TRIGGER raise_tr6e BEFORE INSERT ON raise_t6e
+    WHEN NEW.x = 2
+    BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    INSERT INTO raise_t6e VALUES (1), (2), (3);
+    SELECT * FROM raise_t6e ORDER BY x;
+}
+expect {
+    1
+    3
+}
+
+# RAISE(IGNORE) in AFTER INSERT trigger - insert already persists (unlike BEFORE)
+test trigger-raise-ignore-after-insert {
+    CREATE TABLE raise_after_t (x INTEGER);
+    CREATE TRIGGER raise_after_tr AFTER INSERT ON raise_after_t BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    INSERT INTO raise_after_t VALUES (1);
+    SELECT count(*) FROM raise_after_t;
+}
+expect {
+    1
+}
+
+# RAISE(IGNORE) in AFTER INSERT must not skip index updates
+test trigger-raise-ignore-after-no-skip-postwork {
+    CREATE TABLE raise_post (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX raise_post_idx ON raise_post(name);
+    CREATE TRIGGER raise_post_tr AFTER INSERT ON raise_post BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    INSERT INTO raise_post VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
+    SELECT id FROM raise_post WHERE name = 'bob';
+}
+expect {
+    2
+}
+
+# RAISE in CASE expression inside trigger - allowed value goes through
+test trigger-raise-in-case-pass {
+    CREATE TABLE raise_t7 (x INTEGER);
+    CREATE TRIGGER raise_tr7 BEFORE INSERT ON raise_t7 BEGIN
+        SELECT CASE WHEN NEW.x < 0 THEN RAISE(ABORT, 'negative value')
+                    ELSE 1 END;
+    END;
+    INSERT INTO raise_t7 VALUES (5);
+    SELECT * FROM raise_t7;
+}
+expect {
+    5
+}
+
+# RAISE in CASE expression inside trigger - blocked value fails
+test trigger-raise-in-case-fail {
+    CREATE TABLE raise_t7b (x INTEGER);
+    CREATE TRIGGER raise_tr7b BEFORE INSERT ON raise_t7b BEGIN
+        SELECT CASE WHEN NEW.x < 0 THEN RAISE(ABORT, 'negative value')
+                    ELSE 1 END;
+    END;
+    INSERT INTO raise_t7b VALUES (-1);
+}
+expect error {
+    negative value
+}
+
+# RAISE outside trigger context returns error (FAIL not allowed)
+test fail-raise-fail-outside-trigger {
+    SELECT RAISE(FAIL, 'should fail');
+}
+expect error {
+    .*
+}
+
+# RAISE outside trigger context returns error (ROLLBACK not allowed)
+test fail-raise-rollback-outside-trigger {
+    SELECT RAISE(ROLLBACK, 'should fail');
+}
+expect error {
+    .*
+}
+
+# RAISE outside trigger context returns error (IGNORE not allowed)
+test fail-raise-ignore-outside-trigger {
+    SELECT RAISE(IGNORE);
+}
+expect error {
+    .*
+}
+
+# RAISE(ABORT) in BEFORE UPDATE trigger
+test trigger-raise-abort-before-update {
+    CREATE TABLE raise_t8 (x INTEGER, y TEXT);
+    INSERT INTO raise_t8 VALUES (1, 'original');
+    CREATE TRIGGER raise_tr8 BEFORE UPDATE ON raise_t8 BEGIN
+        SELECT RAISE(ABORT, 'update blocked');
+    END;
+    UPDATE raise_t8 SET y = 'modified' WHERE x = 1;
+}
+expect error {
+    update blocked
+}
+
+# RAISE(ABORT) in BEFORE DELETE trigger
+test trigger-raise-abort-before-delete {
+    CREATE TABLE raise_t9 (x INTEGER, y TEXT);
+    INSERT INTO raise_t9 VALUES (1, 'keep me');
+    CREATE TRIGGER raise_tr9 BEFORE DELETE ON raise_t9 BEGIN
+        SELECT RAISE(ABORT, 'delete blocked');
+    END;
+    DELETE FROM raise_t9 WHERE x = 1;
+}
+expect error {
+    delete blocked
+}
+
+# RAISE('message') shorthand — defaults to ABORT
+test trigger-raise-shorthand {
+    CREATE TABLE raise_sh1 (x INTEGER);
+    CREATE TRIGGER raise_sh_tr BEFORE INSERT ON raise_sh1 BEGIN
+        SELECT RAISE('shorthand abort');
+    END;
+    INSERT INTO raise_sh1 VALUES (1);
+}
+expect error {
+    shorthand abort
+}
+
+# RAISE('message') shorthand in normal query (outside trigger)
+test raise-shorthand-normal-query {
+    SELECT RAISE('normal query error');
+}
+expect error {
+    normal query error
+}
+
+# RAISE(IGNORE) in AFTER trigger with multiple triggers - remaining triggers skipped
+test trigger-raise-ignore-after-multi {
+    CREATE TABLE raise_multi (x INTEGER);
+    CREATE TABLE raise_multi_log (msg TEXT);
+    -- Create tr2 first, then tr1 with RAISE(IGNORE).
+    -- Triggers fire in reverse creation order (LIFO), so tr1 fires first.
+    CREATE TRIGGER raise_multi_tr2 AFTER INSERT ON raise_multi BEGIN
+        INSERT INTO raise_multi_log VALUES ('should not fire');
+    END;
+    CREATE TRIGGER raise_multi_tr1 AFTER INSERT ON raise_multi BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    INSERT INTO raise_multi VALUES (1);
+    SELECT count(*) FROM raise_multi;
+    SELECT count(*) FROM raise_multi_log;
+}
+expect {
+    1
+    0
+}
+
+# Nested triggers with RAISE - inner trigger RAISE propagates to outer
+test trigger-raise-nested {
+    CREATE TABLE raise_outer (x INTEGER);
+    CREATE TABLE raise_inner (x INTEGER);
+    CREATE TRIGGER raise_nested_outer AFTER INSERT ON raise_outer BEGIN
+        INSERT INTO raise_inner VALUES (NEW.x);
+    END;
+    CREATE TRIGGER raise_nested_inner BEFORE INSERT ON raise_inner
+    WHEN NEW.x = 2
+    BEGIN
+        SELECT RAISE(ABORT, 'nested raise');
+    END;
+    INSERT INTO raise_outer VALUES (1);
+    INSERT INTO raise_outer VALUES (2);
+}
+expect error {
+    nested raise
+}
+
+# Verify nested triggers work: successful insert propagates through both tables
+test trigger-raise-nested-success {
+    CREATE TABLE raise_nouter2 (x INTEGER);
+    CREATE TABLE raise_ninner2 (x INTEGER);
+    CREATE TRIGGER raise_nested_outer2 AFTER INSERT ON raise_nouter2 BEGIN
+        INSERT INTO raise_ninner2 VALUES (NEW.x);
+    END;
+    CREATE TRIGGER raise_nested_inner2 BEFORE INSERT ON raise_ninner2
+    WHEN NEW.x = 99
+    BEGIN
+        SELECT RAISE(ABORT, 'should not fire');
+    END;
+    INSERT INTO raise_nouter2 VALUES (1);
+    INSERT INTO raise_nouter2 VALUES (2);
+    SELECT * FROM raise_nouter2 ORDER BY x;
+    SELECT * FROM raise_ninner2 ORDER BY x;
+}
+expect {
+    1
+    2
+    1
+    2
+}
+
+# Nested triggers with RAISE(IGNORE) - inner IGNORE skips inner row only
+test trigger-raise-nested-ignore {
+    CREATE TABLE raise_nouter (x INTEGER);
+    CREATE TABLE raise_ninner (x INTEGER);
+    CREATE TRIGGER raise_nignore_outer AFTER INSERT ON raise_nouter BEGIN
+        INSERT INTO raise_ninner VALUES (NEW.x);
+    END;
+    CREATE TRIGGER raise_nignore_inner BEFORE INSERT ON raise_ninner
+    WHEN NEW.x = 2
+    BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    INSERT INTO raise_nouter VALUES (1);
+    INSERT INTO raise_nouter VALUES (2);
+    INSERT INTO raise_nouter VALUES (3);
+    SELECT * FROM raise_nouter ORDER BY x;
+    SELECT * FROM raise_ninner ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+    1
+    3
+}
+
+# RAISE(IGNORE) with UPSERT DO UPDATE trigger
+test trigger-raise-ignore-upsert {
+    CREATE TABLE raise_upsert (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO raise_upsert VALUES (1, 'original');
+    CREATE TRIGGER raise_upsert_tr BEFORE UPDATE ON raise_upsert BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    INSERT INTO raise_upsert VALUES (1, 'updated') ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    SELECT * FROM raise_upsert;
+}
+expect {
+    1|original
+}
+

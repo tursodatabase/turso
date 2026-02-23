@@ -567,6 +567,7 @@ pub fn emit_upsert(
                     &trigger_ctx,
                     connection,
                     upsert_database_id,
+                    ctx.loop_labels.row_done,
                 )?;
             }
 
@@ -873,6 +874,7 @@ pub fn emit_upsert(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,
+                    on_error: None,
                 });
                 program.preassign_label_to_next_insn(ok);
             }
@@ -938,6 +940,7 @@ pub fn emit_upsert(
                     .and_then(|c| c.name.as_deref())
                     .unwrap_or("rowid")
             ),
+            on_error: None,
         });
         program.preassign_label_to_next_insn(ok);
 
@@ -1111,6 +1114,9 @@ pub fn emit_upsert(
                 ast::ResolveType::Abort,
             );
 
+            // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
+            // not skip post-row work (RETURNING).
+            let after_trigger_done = program.allocate_label();
             for trigger in relevant_triggers {
                 fire_trigger(
                     program,
@@ -1119,8 +1125,10 @@ pub fn emit_upsert(
                     &trigger_ctx_after,
                     connection,
                     upsert_database_id,
+                    after_trigger_done,
                 )?;
             }
+            program.preassign_label_to_next_insn(after_trigger_done);
         }
     }
 

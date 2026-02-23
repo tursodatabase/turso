@@ -474,6 +474,7 @@ pub fn translate_create_index(
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(tbl_name.as_str(), &idx),
+                on_error: None,
             });
             program.preassign_label_to_next_insn(label_after_sorter_compare);
         } else {

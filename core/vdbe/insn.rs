@@ -22,7 +22,7 @@ use crate::{
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{ResolveType, SortOrder};
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
@@ -560,6 +560,8 @@ pub enum Insn {
     Halt {
         err_code: usize,
         description: String,
+        /// Override the program's resolve_type for error handling (used by RAISE).
+        on_error: Option<ResolveType>,
     },
 
     /// Halt the program if P3 is null.
@@ -617,6 +619,9 @@ pub enum Insn {
     Program {
         params: Vec<Value>,
         program: Arc<PreparedProgram>,
+        /// Jump target when RAISE(IGNORE) fires in the subprogram.
+        /// Points to the "skip this row" address in the parent program.
+        ignore_jump_target: BranchOffset,
     },
 
     /// Write an integer value into a register.

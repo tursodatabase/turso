@@ -42,8 +42,9 @@ use crate::vector::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
-        SQLITE_CONSTRAINT_PRIMARYKEY,
+        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
+        SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
+        SQLITE_ERROR,
     },
     ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
@@ -1897,6 +1898,7 @@ pub fn halt(
     pager: &Arc<Pager>,
     err_code: usize,
     description: &str,
+    on_error: Option<ResolveType>,
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
@@ -1918,6 +1920,31 @@ pub fn halt(
         vtab_rollback_all(&program.connection)?;
     }
 
+    // Handle RAISE errors - these carry their own resolve type
+    if let Some(resolve_type) = on_error {
+        // RAISE(IGNORE) signals the parent to skip the current row
+        if resolve_type == ResolveType::Ignore {
+            return Err(LimboError::RaiseIgnore);
+        }
+        if err_code > 0 {
+            let error = match resolve_type {
+                ResolveType::Abort => LimboError::RaiseAbort(description.to_string()),
+                ResolveType::Rollback => LimboError::RaiseRollback(description.to_string()),
+                ResolveType::Fail => unreachable!("RAISE(FAIL) rejected at translate time"),
+                ResolveType::Ignore => unreachable!("handled above"),
+                ResolveType::Replace => unreachable!("Replace not valid for RAISE"),
+            };
+
+            // Trigger subprograms must not commit — just propagate the error.
+            // The parent program's abort() handles transaction state.
+            if program.is_trigger_subprogram() {
+                return Err(error);
+            }
+
+            return Err(error);
+        }
+    }
+
     // Determine the constraint error (if any) based on error code
     let constraint_error = match err_code {
         0 => None,
@@ -1933,6 +1960,13 @@ pub fn halt(
         SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
             "UNIQUE constraint failed: {description} (19)"
         ))),
+        SQLITE_CONSTRAINT_FOREIGNKEY => {
+            Some(LimboError::ForeignKeyConstraint(description.to_string()))
+        }
+        SQLITE_CONSTRAINT_TRIGGER => Some(LimboError::Constraint(description.to_string())),
+        // SQLITE_ERROR is a generic error (e.g. ALTER TABLE validation), not a constraint.
+        // Use InternalError so abort() doesn't apply ON CONFLICT resolution to it.
+        SQLITE_ERROR => Some(LimboError::InternalError(description.to_string())),
         _ => Some(LimboError::Constraint(format!(
             "undocumented halt error code {description}"
         ))),
@@ -2116,10 +2150,11 @@ pub fn op_halt(
         Halt {
             err_code,
             description,
+            on_error,
         },
         insn
     );
-    halt(program, state, pager, *err_code, description)
+    halt(program, state, pager, *err_code, description, *on_error)
 }
 
 pub fn op_halt_if_null(
@@ -2137,7 +2172,7 @@ pub fn op_halt_if_null(
         insn
     );
     if state.registers[*target_reg].get_value() == &Value::Null {
-        halt(program, state, pager, *err_code, description)
+        halt(program, state, pager, *err_code, description, None)
     } else {
         state.pc += 1;
         Ok(InsnFunctionStepResult::Step)
@@ -2859,6 +2894,7 @@ pub fn op_program(
         Program {
             params,
             program: subprogram,
+            ignore_jump_target,
         },
         insn
     );
@@ -2915,6 +2951,11 @@ pub fn op_program(
                 statement,
             } => {
                 let is_trigger = *is_trigger;
+                let mut raise_ignore = false;
+                // Track whether the subprogram aborted with an error. When abort()
+                // runs inside the subprogram, it already calls end_trigger_execution(),
+                // so we must not call it again after the loop.
+                let mut subprogram_aborted = false;
                 loop {
                     let res = statement.step();
                     match res {
@@ -2934,6 +2975,12 @@ pub fn op_program(
                             if program.resolve_type != ResolveType::Ignore {
                                 return Err(LimboError::Constraint(constraint_err));
                             }
+                            subprogram_aborted = true;
+                            break;
+                        }
+                        Err(LimboError::RaiseIgnore) => {
+                            raise_ignore = true;
+                            subprogram_aborted = true;
                             break;
                         }
                         Err(err) => {
@@ -2942,13 +2989,19 @@ pub fn op_program(
                     }
                 }
 
-                // Only end trigger execution if this was a trigger subprogram
-                if is_trigger {
+                // Only end trigger execution for normal completion. Error paths
+                // already called end_trigger_execution() via abort() in the subprogram.
+                if is_trigger && !subprogram_aborted {
                     program.connection.end_trigger_execution();
                 }
 
                 state.op_program_state = OpProgramState::Start;
-                state.pc += 1;
+                if raise_ignore {
+                    // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
+                    state.pc = ignore_jump_target.as_offset_int();
+                } else {
+                    state.pc += 1;
+                }
                 return Ok(InsnFunctionStepResult::Step);
             }
         }

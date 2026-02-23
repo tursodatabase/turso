@@ -1480,16 +1480,20 @@ impl<'a> Parser<'a> {
                 eat_assert!(self, TK_RAISE);
                 eat_expect!(self, TK_LP);
 
-                let resolve = match self.peek_no_eof()?.token_type {
+                let (resolve, shorthand) = match self.peek_no_eof()?.token_type {
                     TK_IGNORE => {
                         eat_assert!(self, TK_IGNORE);
-                        ResolveType::Ignore
+                        (ResolveType::Ignore, false)
                     }
-                    _ => self.parse_raise_type()?,
+                    // RAISE('message') shorthand — defaults to ABORT
+                    TK_STRING => (ResolveType::Abort, true),
+                    _ => (self.parse_raise_type()?, false),
                 };
 
                 let expr = if resolve != ResolveType::Ignore {
-                    eat_expect!(self, TK_COMMA);
+                    if !shorthand {
+                        eat_expect!(self, TK_COMMA);
+                    }
                     Some(self.parse_expr(0)?)
                 } else {
                     None
@@ -5198,6 +5202,33 @@ mod tests {
             ),
             (
                 b"SELECT RAISE (ABORT, 'error')".as_slice(),
+                vec![Cmd::Stmt(Stmt::Select(Select {
+                    with: None,
+                    body: SelectBody {
+                        select: OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![ResultColumn::Expr(
+                                Box::new(Expr::Raise(
+                                    ResolveType::Abort,
+                                    Some(Box::new(Expr::Literal(Literal::String(
+                                        "'error'".to_owned(),
+                                    )))),
+                                )),
+                                None,
+                            )],
+                            from: None,
+                            where_clause: None,
+                            group_by: None,
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                }))],
+            ),
+            (
+                b"SELECT RAISE ('error')".as_slice(),
                 vec![Cmd::Stmt(Stmt::Select(Select {
                     with: None,
                     body: SelectBody {
