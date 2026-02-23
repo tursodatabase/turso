@@ -221,6 +221,7 @@ fn emit_add_column_default_type_validation(
     program.emit_insn(Insn::Halt {
         err_code: 1,
         description: "type mismatch on DEFAULT".to_string(),
+        on_error: None,
     });
 
     program.resolve_label(skip_check_label, program.offset());
