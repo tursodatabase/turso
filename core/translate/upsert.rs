@@ -32,7 +32,7 @@ use crate::{
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
     },
-    util::normalize_ident,
+    util::{exprs_are_equivalent, normalize_ident},
     vdbe::{
         affinity::Affinity,
         builder::ProgramBuilder,
@@ -108,6 +108,20 @@ fn extract_target_key(e: &ast::Expr) -> Option<ConflictTarget> {
             })
         }
         _ => None,
+    }
+}
+
+/// For an ON CONFLICT target that is an expression (not a simple column),
+/// extract the inner expression and an optional COLLATE annotation.
+/// E.g. `lower(val) COLLATE nocase` -> (lower(val), Some("nocase"))
+fn extract_target_expr(e: &ast::Expr) -> (&ast::Expr, Option<String>) {
+    match e {
+        ast::Expr::Collate(inner, c) => {
+            let (expr, _) = extract_target_expr(inner.as_ref());
+            (expr, Some(c.as_str().to_ascii_lowercase()))
+        }
+        ast::Expr::Parenthesized(v) if v.len() == 1 => extract_target_expr(&v[0]),
+        _ => (e, None),
     }
 }
 
@@ -254,47 +268,63 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
         return false;
     }
 
-    // Build a multiset of index columns: (normalized name, effective collation)
-    // effective collation = index collation if set, else table column default, else "binary"
-    let mut idx_cols: Vec<(String, String)> = index
-        .columns
-        .iter()
-        .map(|ic| {
-            (
-                normalize_ident(&ic.name),
-                effective_collation_for_index_col(ic, table),
-            )
-        })
-        .collect();
-    // For each target key, locate a matching index column (name equal ignoring case,
-    // and collation equal iff the target specifies one). Consume each match once.
+    // Track which index columns have been matched (consumed).
+    let mut matched = vec![false; index.columns.len()];
+
     for te in &target.targets {
-        let Some(tk) = extract_target_key(&te.expr) else {
-            return false;
-        };
-        let tname = tk.col_name;
         let mut found = None;
 
-        for (i, (iname, icoll)) in idx_cols.iter().enumerate() {
-            if tname.eq_ignore_ascii_case(iname)
-                && match tk.collate.as_ref() {
-                    Some(c) => c.eq_ignore_ascii_case(icoll),
-                    None => true, // unspecified collation -> accept any
+        if let Some(tk) = extract_target_key(&te.expr) {
+            // Simple column reference target: match by name and collation.
+            let tname = &tk.col_name;
+            for (i, ic) in index.columns.iter().enumerate() {
+                if matched[i] || ic.expr.is_some() {
+                    continue;
                 }
-            {
-                found = Some(i);
-                break;
+                let iname = normalize_ident(&ic.name);
+                let icoll = effective_collation_for_index_col(ic, table);
+                if tname.eq_ignore_ascii_case(&iname)
+                    && match tk.collate.as_ref() {
+                        Some(c) => c.eq_ignore_ascii_case(&icoll),
+                        None => true, // unspecified collation -> accept any
+                    }
+                {
+                    found = Some(i);
+                    break;
+                }
+            }
+        } else {
+            // Expression target (e.g. lower(val)): match against expression index
+            // columns using semantic equivalence.
+            let (target_expr, target_collate) = extract_target_expr(&te.expr);
+            for (i, ic) in index.columns.iter().enumerate() {
+                if matched[i] {
+                    continue;
+                }
+                if let Some(idx_expr) = &ic.expr {
+                    if exprs_are_equivalent(target_expr, idx_expr) {
+                        // If target specifies a collation, it must match the index column's.
+                        if let Some(ref tc) = target_collate {
+                            let icoll = effective_collation_for_index_col(ic, table);
+                            if !tc.eq_ignore_ascii_case(&icoll) {
+                                continue;
+                            }
+                        }
+                        found = Some(i);
+                        break;
+                    }
+                }
             }
         }
+
         if let Some(i) = found {
-            // consume this index column once (multiset match)
-            idx_cols.swap_remove(i);
+            matched[i] = true;
         } else {
             return false;
         }
     }
-    // All target columns matched exactly once
-    idx_cols.is_empty()
+    // All target columns matched exactly once, and all index columns consumed
+    matched.iter().all(|&m| m)
 }
 
 #[derive(Clone, Debug)]
