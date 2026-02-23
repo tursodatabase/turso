@@ -2486,8 +2486,10 @@ fn emit_program_for_update(
         })
         .collect::<Vec<_>>();
 
-    // Evaluate uncorrelated subqueries as early as possible (only for normal path without ephemeral table)
-    // For the ephemeral path, subqueries are handled by emit_program_for_select on the ephemeral_plan.
+    // Evaluate uncorrelated subqueries as early as possible (only for normal path without ephemeral table).
+    // For the ephemeral path, WHERE clause subqueries are handled by emit_program_for_select
+    // on the ephemeral_plan. SET clause subqueries remain in the main plan and are emitted
+    // inside the update loop (after open_loop) where the write cursor is correctly positioned.
     if !has_ephemeral_table {
         for subquery in plan
             .non_from_clause_subqueries
@@ -2509,6 +2511,17 @@ fn emit_program_for_update(
             )?;
         }
     }
+
+    // For the ephemeral path, SET clause subqueries remain in plan.non_from_clause_subqueries
+    // (WHERE clause subqueries were moved to the ephemeral plan by the optimizer).
+    // These SET clause subqueries must be emitted inside the update loop, after NotExists
+    // positions the write cursor, so correlated references resolve to the correct cursor.
+    // Drain them into a separate Vec so init_loop/open_loop don't try to evaluate them.
+    let mut update_subqueries = if has_ephemeral_table {
+        plan.non_from_clause_subqueries.drain(..).collect()
+    } else {
+        Vec::new()
+    };
 
     // Initialize the main loop
     init_loop(
@@ -2652,6 +2665,7 @@ fn emit_program_for_update(
         target_table,
         resolver,
         returning_buffer.as_ref(),
+        &mut update_subqueries,
     )?;
 
     // Close the main loop
@@ -2926,6 +2940,7 @@ fn emit_update_insns<'a>(
     target_table: Arc<JoinedTable>,
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
+    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     let internal_id = target_table.internal_id;
@@ -3034,6 +3049,24 @@ fn emit_update_insns<'a>(
             reg: beg,
             target_pc: t_ctx.label_main_loop_end.unwrap(),
         });
+    }
+
+    // Emit remaining SET clause subqueries inside the loop, after the write cursor
+    // is positioned via NotExists. In the ephemeral path, these subqueries were kept
+    // in the main plan (not moved to the ephemeral plan) and need the write cursor
+    // to be positioned so correlated references resolve correctly.
+    for subquery in non_from_clause_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+        emit_non_from_clause_subquery(
+            program,
+            &t_ctx.resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
     }
 
     if is_virtual {

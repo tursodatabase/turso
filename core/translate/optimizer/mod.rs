@@ -696,6 +696,33 @@ fn first_update_safety_reason(
     Ok(reason)
 }
 
+/// Collect SubqueryResult IDs referenced in SET clause and RETURNING expressions.
+/// These subqueries must stay in the main update plan (evaluated during the update phase),
+/// not be moved to the ephemeral plan (which only collects rowids).
+fn collect_update_phase_subquery_ids(
+    plan: &UpdatePlan,
+) -> HashSet<turso_parser::ast::TableInternalId> {
+    use crate::translate::expr::walk_expr;
+    use crate::translate::expr::WalkControl;
+
+    let mut ids = HashSet::default();
+    let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
+            ids.insert(*subquery_id);
+        }
+        Ok(WalkControl::Continue)
+    };
+    for (_, expr) in plan.set_clauses.iter() {
+        let _ = walk_expr(expr, &mut collector);
+    }
+    if let Some(returning) = &plan.returning {
+        for rc in returning {
+            let _ = walk_expr(&rc.expr, &mut collector);
+        }
+    }
+    ids
+}
+
 /// An ephemeral table is required if:
 /// 1. The UPDATE modifies any column that is present in the key of the btree used to iterate over the table.
 ///    For regular table scans or seeks, the key is the rowid or the rowid alias column (INTEGER PRIMARY KEY).
@@ -823,9 +850,26 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        // Move subqueries from the main plan to the ephemeral plan since the WHERE clause was moved
-        non_from_clause_subqueries: plan.non_from_clause_subqueries.drain(..).collect(),
         estimated_output_rows: None,
+        // Only move WHERE clause subqueries to the ephemeral plan.
+        // SET clause and RETURNING clause subqueries must remain in the main update plan
+        // because they compute new column values during the update phase (second pass),
+        // not during row collection (first pass). Moving them here would cause correlated
+        // subqueries in SET to evaluate with wrong cursor positions.
+        non_from_clause_subqueries: {
+            let update_phase_ids = collect_update_phase_subquery_ids(plan);
+            let mut ephemeral_subs = Vec::new();
+            let mut remaining = Vec::new();
+            for sq in plan.non_from_clause_subqueries.drain(..) {
+                if update_phase_ids.contains(&sq.internal_id) {
+                    remaining.push(sq);
+                } else {
+                    ephemeral_subs.push(sq);
+                }
+            }
+            plan.non_from_clause_subqueries = remaining;
+            ephemeral_subs
+        },
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);

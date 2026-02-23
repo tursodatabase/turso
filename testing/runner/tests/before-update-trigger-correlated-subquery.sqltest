@@ -1,0 +1,119 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES('before'); END;
+    INSERT INTO t VALUES(1,100),(2,200),(3,300);
+}
+
+@setup schema
+test before-update-trigger-correlated-subquery-basic {
+    -- The original reproducer: correlated subquery in SET with BEFORE UPDATE trigger.
+    -- Without the fix, the outer cursor position was corrupted by the trigger.
+    UPDATE t SET val = (SELECT SUM(t2.val) FROM t t2 WHERE t2.id != t.id) WHERE id <= 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|500
+    2|800
+    3|300
+}
+
+setup schema2 {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES('before'); END;
+    INSERT INTO t VALUES(1,100),(2,200),(3,300);
+}
+
+@setup schema2
+test before-update-trigger-correlated-subquery-all-rows {
+    -- Update all rows, not just a subset.
+    -- Each row sees the latest values (earlier rows already updated).
+    UPDATE t SET val = (SELECT SUM(t2.val) FROM t t2 WHERE t2.id != t.id);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|500
+    2|800
+    3|1300
+}
+
+setup schema3 {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES('before'); END;
+    INSERT INTO t VALUES(1,100);
+}
+
+@setup schema3
+test before-update-trigger-correlated-subquery-single-row {
+    -- Single row: the correlated subquery returns NULL (no other rows)
+    UPDATE t SET val = (SELECT SUM(t2.val) FROM t t2 WHERE t2.id != t.id);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|
+}
+
+setup schema4 {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES('before'); END;
+    INSERT INTO t VALUES(1,100),(2,200),(3,300);
+}
+
+@setup schema4
+test before-update-trigger-uncorrelated-subquery {
+    -- Uncorrelated subquery in SET with BEFORE UPDATE trigger
+    UPDATE t SET val = (SELECT SUM(val) FROM t) WHERE id <= 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|600
+    2|600
+    3|300
+}
+
+setup schema_where_and_set {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE u(uid INT PRIMARY KEY);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES('before'); END;
+    INSERT INTO t VALUES(1,100),(2,200),(3,300);
+    INSERT INTO u VALUES(1),(2);
+}
+
+@setup schema_where_and_set
+test before-update-trigger-subquery-in-where-and-set {
+    -- Subquery in both WHERE and SET: WHERE subquery goes to ephemeral plan,
+    -- SET subquery stays in the main update plan.
+    UPDATE t SET val = (SELECT SUM(t2.val) FROM t t2 WHERE t2.id != t.id) WHERE id IN (SELECT uid FROM u);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|500
+    2|800
+    3|300
+}
+
+setup schema5 {
+    CREATE TABLE t(id INT PRIMARY KEY, val INT);
+    CREATE TABLE log(x TEXT);
+    CREATE TRIGGER tr1 BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES('before'); END;
+    CREATE TRIGGER tr2 AFTER UPDATE ON t BEGIN INSERT INTO log VALUES('after'); END;
+    INSERT INTO t VALUES(1,100),(2,200),(3,300);
+}
+
+@setup schema5
+test before-and-after-update-trigger-correlated-subquery {
+    -- Both BEFORE and AFTER triggers with correlated subquery
+    UPDATE t SET val = (SELECT SUM(t2.val) FROM t t2 WHERE t2.id != t.id) WHERE id <= 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|500
+    2|800
+    3|300
+}
