@@ -1,5 +1,4 @@
 use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
-use crate::sync::Arc;
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 
