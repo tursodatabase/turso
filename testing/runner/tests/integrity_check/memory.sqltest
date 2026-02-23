@@ -126,3 +126,46 @@ expect {
     ok
 }
 
+# Test integrity_check after ALTER TABLE ADD COLUMN with type-mismatched default
+# and CREATE INDEX. Rows inserted before ADD COLUMN have the raw default value
+# (integer 0) while the column affinity is TEXT. The integrity check must not
+# apply affinity to the column values when verifying index membership, matching
+# SQLite's behavior.
+test integrity-check-alter-table-default-index {
+    CREATE TABLE t6(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t6 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    ALTER TABLE t6 ADD COLUMN c TEXT DEFAULT 0;
+    CREATE INDEX idx_t6_c ON t6(c);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Same test but with a composite index including DESC ordering
+test integrity-check-alter-table-default-desc-index {
+    CREATE TABLE t7(a INTEGER PRIMARY KEY, b TEXT, c NUMERIC NOT NULL);
+    INSERT INTO t7 VALUES (1, 'x', 10), (2, 'y', 20), (3, 'z', 30);
+    ALTER TABLE t7 ADD COLUMN d TEXT DEFAULT 0;
+    CREATE INDEX idx_t7_composite ON t7(b, c DESC, d DESC);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Test with rows inserted both before and after ALTER TABLE ADD COLUMN
+test integrity-check-alter-table-mixed-rows {
+    CREATE TABLE t8(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t8 VALUES (1, 'old1'), (2, 'old2');
+    ALTER TABLE t8 ADD COLUMN c TEXT DEFAULT 0;
+    INSERT INTO t8 VALUES (3, 'new1', 'hello');
+    INSERT INTO t8 VALUES (4, 'new2', NULL);
+    INSERT INTO t8(a, b) VALUES (5, 'new3');
+    CREATE INDEX idx_t8_c ON t8(c);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
