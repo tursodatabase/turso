@@ -1,0 +1,167 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    INSERT INTO t VALUES (1, NULL), (2, 3), (3, 1), (4, NULL), (5, 2);
+}
+
+@setup schema
+test desc-nulls-first {
+    SELECT * FROM t ORDER BY val DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    2|3
+    5|2
+    3|1
+}
+
+@setup schema
+test asc-nulls-last {
+    SELECT * FROM t ORDER BY val NULLS LAST, id;
+}
+expect {
+    3|1
+    5|2
+    2|3
+    1|
+    4|
+}
+
+@setup schema
+test asc-nulls-first-default {
+    SELECT * FROM t ORDER BY val ASC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    3|1
+    5|2
+    2|3
+}
+
+@setup schema
+test desc-nulls-last-default {
+    SELECT * FROM t ORDER BY val DESC NULLS LAST, id;
+}
+expect {
+    2|3
+    5|2
+    3|1
+    1|
+    4|
+}
+
+@setup schema
+test asc-default-nulls {
+    SELECT * FROM t ORDER BY val ASC, id;
+}
+expect {
+    1|
+    4|
+    3|1
+    5|2
+    2|3
+}
+
+@setup schema
+test desc-default-nulls {
+    SELECT * FROM t ORDER BY val DESC, id;
+}
+expect {
+    2|3
+    5|2
+    3|1
+    1|
+    4|
+}
+
+setup text-schema {
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t2 VALUES (1, NULL), (2, 'banana'), (3, 'apple'), (4, NULL), (5, 'cherry');
+}
+
+@setup text-schema
+test text-desc-nulls-first {
+    SELECT * FROM t2 ORDER BY name DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    5|cherry
+    2|banana
+    3|apple
+}
+
+@setup text-schema
+test text-asc-nulls-last {
+    SELECT * FROM t2 ORDER BY name ASC NULLS LAST, id;
+}
+expect {
+    3|apple
+    2|banana
+    5|cherry
+    1|
+    4|
+}
+
+setup all-nulls {
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, val INT);
+    INSERT INTO t3 VALUES (1, NULL), (2, NULL), (3, NULL);
+}
+
+@setup all-nulls
+test all-nulls-desc-nulls-first {
+    SELECT * FROM t3 ORDER BY val DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+setup single-null {
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, val INT);
+    INSERT INTO t4 VALUES (1, NULL);
+}
+
+@setup single-null
+test single-null-desc-nulls-first {
+    SELECT * FROM t4 ORDER BY val DESC NULLS FIRST;
+}
+expect {
+    1|
+}
+
+setup no-nulls {
+    CREATE TABLE t5(id INTEGER PRIMARY KEY, val INT);
+    INSERT INTO t5 VALUES (1, 10), (2, 30), (3, 20);
+}
+
+@setup no-nulls
+test no-nulls-desc-nulls-first {
+    SELECT * FROM t5 ORDER BY val DESC NULLS FIRST;
+}
+expect {
+    2|30
+    3|20
+    1|10
+}
+
+setup multi-col {
+    CREATE TABLE t6(id INTEGER PRIMARY KEY, a INT, b INT);
+    INSERT INTO t6 VALUES (1, NULL, 1), (2, NULL, NULL), (3, 1, NULL), (4, 1, 2), (5, 2, NULL);
+}
+
+@setup multi-col
+test multi-col-nulls-first-desc {
+    SELECT * FROM t6 ORDER BY a DESC NULLS FIRST, b ASC NULLS LAST, id;
+}
+expect {
+    1||1
+    2||
+    5|2|
+    4|1|2
+    3|1|
+}

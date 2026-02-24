@@ -91,12 +91,14 @@ impl Sorter {
     pub fn new(
         order: &[SortOrder],
         collations: Vec<CollationSeq>,
+        nulls_first: &[bool],
         max_buffer_size_bytes: usize,
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
         temp_store: crate::TempStore,
     ) -> Self {
         turso_assert_eq!(order.len(), collations.len());
+        turso_assert_eq!(order.len(), nulls_first.len());
         Self {
             arena: Bump::new(),
             records: Vec::new(),
@@ -106,9 +108,11 @@ impl Sorter {
                 order
                     .iter()
                     .zip(collations)
-                    .map(|(order, collation)| KeyInfo {
+                    .zip(nulls_first.iter())
+                    .map(|((order, collation), &nulls_first)| KeyInfo {
                         sort_order: *order,
                         collation,
+                        nulls_first,
                     })
                     .collect(),
             ),
@@ -794,6 +798,50 @@ impl ArenaSortableRecord {
     }
 }
 
+/// Compares two values respecting sort order and null ordering.
+/// NULL ordering is handled independently of ASC/DESC: when one value is NULL,
+/// the result is determined solely by `nulls_first`, not reversed by DESC.
+#[inline]
+fn compare_values_with_nulls(
+    left: ValueRef<'_>,
+    right: ValueRef<'_>,
+    key_info: &KeyInfo,
+) -> Ordering {
+    // Handle NULLs independently of sort direction
+    match (left, right) {
+        (ValueRef::Null, ValueRef::Null) => return Ordering::Equal,
+        (ValueRef::Null, _) => {
+            return if key_info.nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        (_, ValueRef::Null) => {
+            return if key_info.nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        _ => {}
+    }
+
+    // Non-NULL comparison: apply collation for text, then sort direction
+    let cmp = match (left, right) {
+        (ValueRef::Text(l), ValueRef::Text(r)) => key_info.collation.compare_strings(&l, &r),
+        _ => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+    };
+    if cmp != Ordering::Equal {
+        match key_info.sort_order {
+            SortOrder::Asc => cmp,
+            SortOrder::Desc => cmp.reverse(),
+        }
+    } else {
+        Ordering::Equal
+    }
+}
+
 impl Ord for ArenaSortableRecord {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -807,17 +855,9 @@ impl Ord for ArenaSortableRecord {
             .zip(other_values.iter())
             .zip(index_key_info.iter())
         {
-            let cmp = match (self_val, other_val) {
-                (ValueRef::Text(left), ValueRef::Text(right)) => {
-                    key_info.collation.compare_strings(&left, &right)
-                }
-                _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-            };
-            if cmp != Ordering::Equal {
-                return match key_info.sort_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
+            let ord = compare_values_with_nulls(self_val, other_val, key_info);
+            if ord != Ordering::Equal {
+                return ord;
             }
         }
         Ordering::Equal
@@ -901,17 +941,9 @@ impl Ord for BoxedSortableRecord {
             .zip(other.key_values.iter())
             .zip(self.index_key_info.iter())
         {
-            let cmp = match (self_val, other_val) {
-                (ValueRef::Text(left), ValueRef::Text(right)) => {
-                    key_info.collation.compare_strings(&left, &right)
-                }
-                _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-            };
-            if cmp != Ordering::Equal {
-                return match key_info.sort_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
+            let ord = compare_values_with_nulls(self_val, other_val, key_info);
+            if ord != Ordering::Equal {
+                return ord;
             }
         }
         Ordering::Equal
@@ -980,6 +1012,7 @@ mod tests {
             let mut sorter = Sorter::new(
                 &[SortOrder::Asc],
                 vec![CollationSeq::Binary],
+                &[true],
                 256,
                 64,
                 io.clone(),

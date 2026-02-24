@@ -373,7 +373,7 @@ pub fn prepare_update_plan(
                 resolver,
                 BindingBehavior::ResultColumnsNotAllowed,
             );
-            (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
+            (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc), o.nulls)
         })
         .collect();
 

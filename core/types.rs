@@ -1774,6 +1774,15 @@ impl<'a> Ord for ValueRef<'a> {
 pub struct KeyInfo {
     pub sort_order: SortOrder,
     pub collation: CollationSeq,
+    pub nulls_first: bool,
+}
+
+impl KeyInfo {
+    /// Returns the default nulls_first value for the given sort order.
+    /// ASC → NULLs first, DESC → NULLs last (matching SQLite defaults).
+    pub fn default_nulls_first(sort_order: SortOrder) -> bool {
+        sort_order == SortOrder::Asc
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1814,12 +1823,14 @@ impl IndexInfo {
                     .map(|c| KeyInfo {
                         sort_order: c.order,
                         collation: c.collation.unwrap_or_default(),
+                        nulls_first: KeyInfo::default_nulls_first(c.order),
                     })
                     .collect();
                 if index.has_rowid {
                     key_info.push(KeyInfo {
                         sort_order: SortOrder::Asc,
                         collation: CollationSeq::Binary,
+                        nulls_first: true,
                     });
                 }
                 key_info
@@ -1859,14 +1870,10 @@ where
     );
     let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
     for (i, (l, r)) in l.zip(r).enumerate() {
-        let column_order = column_info[i].sort_order;
-        let collation = column_info[i].collation;
-        let cmp = compare_immutable_single(l, r, collation);
+        let key_info = &column_info[i];
+        let cmp = compare_immutable_single_with_nulls(l, r, key_info);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => cmp,
-                SortOrder::Desc => cmp.reverse(),
-            };
+            return cmp;
         }
     }
     std::cmp::Ordering::Equal
@@ -1891,14 +1898,9 @@ where
             Some(v) => v,
             None => break,
         };
-        let column_order = col_info.sort_order;
-        let collation = col_info.collation;
-        let cmp = compare_immutable_single(l?, r?, collation);
+        let cmp = compare_immutable_single_with_nulls(l?, r?, col_info);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => Ok(cmp),
-                SortOrder::Desc => Ok(cmp.reverse()),
-            };
+            return Ok(cmp);
         }
     }
     Ok(std::cmp::Ordering::Equal)
@@ -1914,6 +1916,51 @@ where
     match (l, r) {
         (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
         _ => l.cmp(&r),
+    }
+}
+
+/// Like `compare_immutable_single` but handles NULL ordering independently of ASC/DESC.
+fn compare_immutable_single_with_nulls<V1, V2>(
+    l: V1,
+    r: V2,
+    key_info: &KeyInfo,
+) -> std::cmp::Ordering
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    let l = l.as_value_ref();
+    let r = r.as_value_ref();
+    match (l, r) {
+        (ValueRef::Null, ValueRef::Null) => std::cmp::Ordering::Equal,
+        (ValueRef::Null, _) => {
+            if key_info.nulls_first {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
+        (_, ValueRef::Null) => {
+            if key_info.nulls_first {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        }
+        (ValueRef::Text(left), ValueRef::Text(right)) => {
+            let cmp = key_info.collation.compare_strings(&left, &right);
+            match key_info.sort_order {
+                SortOrder::Asc => cmp,
+                SortOrder::Desc => cmp.reverse(),
+            }
+        }
+        _ => {
+            let cmp = l.cmp(&r);
+            match key_info.sort_order {
+                SortOrder::Asc => cmp,
+                SortOrder::Desc => cmp.reverse(),
+            }
+        }
     }
 }
 
@@ -2300,17 +2347,39 @@ where
             }
         };
 
-        let comparison = match (&lhs_value, rhs_value) {
-            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => index_info.key_info[field_idx]
-                .collation
-                .compare_strings(lhs_text, rhs_text),
+        let key_info = &index_info.key_info[field_idx];
 
-            _ => lhs_value.cmp(rhs_value),
-        };
-
-        let final_comparison = match index_info.key_info[field_idx].sort_order {
-            SortOrder::Asc => comparison,
-            SortOrder::Desc => comparison.reverse(),
+        // Handle NULLs independently of sort direction
+        let final_comparison = match (&lhs_value, rhs_value) {
+            (ValueRef::Null, ValueRef::Null) => std::cmp::Ordering::Equal,
+            (ValueRef::Null, _) => {
+                if key_info.nulls_first {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            }
+            (_, ValueRef::Null) => {
+                if key_info.nulls_first {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
+            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => {
+                let cmp = key_info.collation.compare_strings(lhs_text, rhs_text);
+                match key_info.sort_order {
+                    SortOrder::Asc => cmp,
+                    SortOrder::Desc => cmp.reverse(),
+                }
+            }
+            _ => {
+                let cmp = lhs_value.cmp(rhs_value);
+                match key_info.sort_order {
+                    SortOrder::Asc => cmp,
+                    SortOrder::Desc => cmp.reverse(),
+                }
+            }
         };
 
         if final_comparison != std::cmp::Ordering::Equal {
@@ -3066,6 +3135,7 @@ mod tests {
                 .map(|(sort_order, collation)| KeyInfo {
                     sort_order,
                     collation,
+                    nulls_first: KeyInfo::default_nulls_first(sort_order),
                 })
                 .collect(),
             has_rowid: false,

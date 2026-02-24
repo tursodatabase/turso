@@ -2,7 +2,8 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
-    self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
+    self, FrameBound, FrameClause, FrameExclude, FrameMode, NullsOrder, ResolveType, SortOrder,
+    SubqueryType,
 };
 
 use crate::{
@@ -248,7 +249,7 @@ pub enum Plan {
         right_most: SelectPlan,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+        order_by: Option<Vec<(ast::Expr, SortOrder, Option<NullsOrder>)>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),
@@ -471,7 +472,7 @@ pub struct SelectPlan {
     /// group by clause
     pub group_by: Option<GroupBy>,
     /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<NullsOrder>)>,
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause
@@ -618,7 +619,7 @@ pub struct DeletePlan {
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Vec<WhereTerm>,
     /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<NullsOrder>)>,
     /// limit clause
     pub limit: Option<Box<Expr>>,
     /// offset clause
@@ -645,7 +646,7 @@ pub struct UpdatePlan {
     // (colum index, new value) pairs
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<NullsOrder>)>,
     pub limit: Option<Box<Expr>>,
     pub offset: Option<Box<Expr>>,
     // TODO: optional RETURNING clause

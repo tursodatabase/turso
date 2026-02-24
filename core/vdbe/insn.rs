@@ -814,8 +814,8 @@ pub enum Insn {
     SorterOpen {
         cursor_id: CursorID, // P1
         columns: usize,      // P2
-        /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
-        order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
+        /// Combined order, collation, and nulls_first per column.
+        order_and_collations: Vec<(SortOrder, Option<CollationSeq>, bool)>,
     },
 
     /// Insert a row into the sorter.

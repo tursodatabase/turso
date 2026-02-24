@@ -73,7 +73,7 @@ impl OrderTarget {
 /// TODO: this does not currently handle the case where we definitely cannot eliminate
 /// the ORDER BY sorter, but we could still eliminate the GROUP BY sorter.
 pub fn compute_order_target(
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     group_by_opt: Option<&mut GroupBy>,
     tables: &TableReferences,
 ) -> Option<OrderTarget> {
@@ -82,7 +82,9 @@ pub fn compute_order_target(
         (true, None) => None,
         // Only ORDER BY - we would like the joined result rows to be in the order specified by the ORDER BY
         (false, None) => OrderTarget::maybe_from_iterator(
-            order_by.iter().map(|(expr, order)| (expr.as_ref(), *order)),
+            order_by
+                .iter()
+                .map(|(expr, order, _)| (expr.as_ref(), *order)),
             tables,
             EliminatesSortBy::Order,
         ),
@@ -103,7 +105,7 @@ pub fn compute_order_target(
         // however in this case we must take the ASC/DESC from ORDER BY into account.
         (false, Some(group_by)) => {
             // Does the group by contain all expressions in the order by?
-            let group_by_contains_all = order_by.iter().all(|(expr, _)| {
+            let group_by_contains_all = order_by.iter().all(|(expr, _, _)| {
                 group_by
                     .exprs
                     .iter()
@@ -122,7 +124,7 @@ pub fn compute_order_target(
             group_by.exprs.sort_by_key(|expr| {
                 order_by
                     .iter()
-                    .position(|(order_by_expr, _)| exprs_are_equivalent(expr, order_by_expr))
+                    .position(|(order_by_expr, _, _)| exprs_are_equivalent(expr, order_by_expr))
                     .map_or(usize::MAX, |i| i)
             });
 
@@ -135,7 +137,7 @@ pub fn compute_order_target(
                 .sort_order
                 .as_mut()
                 .expect("GROUP BY should have a sort order before optimization is run");
-            for (i, (_, order_by_dir)) in order_by.iter().enumerate() {
+            for (i, (_, order_by_dir, _)) in order_by.iter().enumerate() {
                 sort_order[i] = *order_by_dir;
             }
             // The sort_by_key above reordered group_by.exprs but not sort_order,

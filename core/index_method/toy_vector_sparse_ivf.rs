@@ -395,6 +395,7 @@ fn key_info() -> KeyInfo {
     KeyInfo {
         collation: CollationSeq::Binary,
         sort_order: SortOrder::Asc,
+        nulls_first: true,
     }
 }
 

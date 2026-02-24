@@ -121,7 +121,7 @@ fn try_match_index_method_pattern(
     pattern: &ast::Select,
     table: &JoinedTable,
     query_where_terms: &[WhereTerm],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)],
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
     pattern_idx: usize,
@@ -206,7 +206,7 @@ fn try_match_index_method_pattern(
 
     // Match ORDER BY if pattern has it
     if pattern_has_order_by {
-        for (pattern_column, (query_column, query_order)) in
+        for (pattern_column, (query_column, query_order, _)) in
             pattern.order_by.iter().zip(order_by.iter())
         {
             if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
@@ -331,7 +331,7 @@ fn collect_index_method_candidates(
     table_references: &TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &[WhereTerm],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)],
     group_by: &Option<GroupBy>,
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
@@ -870,7 +870,7 @@ fn optimize_table_access_with_custom_modules(
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_query: &mut [WhereTerm],
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     group_by: &mut Option<GroupBy>,
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
@@ -991,14 +991,14 @@ fn optimize_table_access_with_custom_modules(
 fn register_expression_index_usages_for_plan(
     table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)],
     group_by: Option<&GroupBy>,
 ) {
     table_references.reset_expression_index_usages();
     for rc in result_columns {
         table_references.register_expression_index_usage(&rc.expr);
     }
-    for (expr, _) in order_by {
+    for (expr, _, _) in order_by {
         table_references.register_expression_index_usage(expr);
     }
     if let Some(group_by) = group_by {
@@ -1150,7 +1150,7 @@ fn optimize_table_access(
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     group_by: &mut Option<GroupBy>,
     subqueries: &[NonFromClauseSubquery],
     limit: &mut Option<Box<Expr>>,

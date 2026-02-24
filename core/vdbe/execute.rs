@@ -4677,14 +4677,19 @@ pub fn op_sorter_open(
     } else {
         (cache_size as usize) * page_size
     };
-    let (order, collations): (Vec<_>, Vec<_>) = order_and_collations
-        .iter()
-        .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
-        .unzip();
+    let mut order = Vec::with_capacity(order_and_collations.len());
+    let mut collations = Vec::with_capacity(order_and_collations.len());
+    let mut nulls_first = Vec::with_capacity(order_and_collations.len());
+    for (ord, coll, nf) in order_and_collations.iter() {
+        order.push(*ord);
+        collations.push(coll.unwrap_or_default());
+        nulls_first.push(*nf);
+    }
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
+        &nulls_first,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),

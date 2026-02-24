@@ -22,13 +22,13 @@ use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
-use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
+use turso_parser::ast::{self, Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 
 struct WindowSubqueryContext<'a> {
     resolver: &'a Resolver<'a>,
-    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder)>,
+    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder, Option<ast::NullsOrder>)>,
     subquery_result_columns: &'a mut Vec<ResultSetColumn>,
     subquery_id: &'a TableInternalId,
 }
@@ -169,7 +169,7 @@ fn prepare_window_subquery(
             &mut ctx,
         )?;
     }
-    for (expr, _) in outer_plan.order_by.iter_mut() {
+    for (expr, _, _) in outer_plan.order_by.iter_mut() {
         rewrite_terminal_expr(
             &mut outer_plan.aggregates,
             expr,
@@ -255,7 +255,7 @@ fn append_order_by(
     ctx: &mut WindowSubqueryContext,
 ) -> crate::Result<()> {
     ctx.subquery_order_by
-        .push((Box::new(expr.clone()), *sort_order));
+        .push((Box::new(expr.clone()), *sort_order, None));
 
     let contains_aggregates =
         resolve_window_and_aggregate_functions(expr, ctx.resolver, &mut plan.aggregates, None)?;
@@ -476,7 +476,7 @@ pub fn init_window<'a>(
     window: &'a Window,
     plan: &SelectPlan,
     result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<Expr>, SortOrder)],
+    order_by: &'a [(Box<Expr>, SortOrder, Option<ast::NullsOrder>)],
 ) -> crate::Result<()> {
     let joined_tables = &plan.joined_tables();
     turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
@@ -600,7 +600,7 @@ fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Optio
 
 fn collect_expressions_referencing_subquery<'a>(
     result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<Expr>, SortOrder)],
+    order_by: &'a [(Box<Expr>, SortOrder, Option<ast::NullsOrder>)],
     subquery_id: &TableInternalId,
 ) -> crate::Result<Vec<(&'a Expr, usize)>> {
     let mut expressions_referencing_subquery: Vec<(&'a Expr, usize)> = Vec::new();
@@ -608,7 +608,7 @@ fn collect_expressions_referencing_subquery<'a>(
     for root_expr in result_columns
         .iter()
         .map(|col| &col.expr)
-        .chain(order_by.iter().map(|(e, _)| e.as_ref()))
+        .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
     {
         walk_expr(
             root_expr,
@@ -715,6 +715,7 @@ fn emit_flush_buffer_if_new_partition(
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
+                nulls_first: true,
             })
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info
@@ -827,6 +828,7 @@ fn emit_flush_buffer_if_not_peer(
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
+                nulls_first: true,
             })
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info

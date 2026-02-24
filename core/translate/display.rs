@@ -53,7 +53,7 @@ impl Display for Plan {
                 }
                 if let Some(order_by) = order_by {
                     writeln!(f, "ORDER BY:")?;
-                    for (expr, dir) in order_by {
+                    for (expr, dir, _) in order_by {
                         writeln!(
                             f,
                             "  - {} {}",
@@ -373,7 +373,7 @@ impl fmt::Display for UpdatePlan {
         }
         if !self.order_by.is_empty() {
             writeln!(f, "ORDER BY:")?;
-            for (expr, dir) in &self.order_by {
+            for (expr, dir, _) in &self.order_by {
                 writeln!(
                     f,
                     "  - {} {}",
@@ -466,11 +466,13 @@ impl ToTokens for Plan {
                     s.append(TokenType::TK_BY, None)?;
 
                     s.comma(
-                        order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                            expr: expr.clone().into(),
-                            order: Some(*order),
-                            nulls: None,
-                        }),
+                        order_by
+                            .iter()
+                            .map(|(expr, order, nulls)| ast::SortedColumn {
+                                expr: expr.clone().into(),
+                                order: Some(*order),
+                                nulls: *nulls,
+                            }),
                         context,
                     )?;
                 }
@@ -652,11 +654,13 @@ impl ToTokens for SelectPlan {
             s.append(TokenType::TK_BY, None)?;
 
             s.comma(
-                self.order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                    expr: expr.clone(),
-                    order: Some(*order),
-                    nulls: None,
-                }),
+                self.order_by
+                    .iter()
+                    .map(|(expr, order, nulls)| ast::SortedColumn {
+                        expr: expr.clone(),
+                        order: Some(*order),
+                        nulls: *nulls,
+                    }),
                 context,
             )?;
         }
@@ -714,11 +718,13 @@ impl ToTokens for DeletePlan {
             s.append(TokenType::TK_BY, None)?;
 
             s.comma(
-                self.order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                    expr: expr.clone(),
-                    order: Some(*order),
-                    nulls: None,
-                }),
+                self.order_by
+                    .iter()
+                    .map(|(expr, order, nulls)| ast::SortedColumn {
+                        expr: expr.clone(),
+                        order: Some(*order),
+                        nulls: *nulls,
+                    }),
                 context,
             )?;
         }
@@ -795,11 +801,13 @@ impl ToTokens for UpdatePlan {
             s.append(TokenType::TK_BY, None)?;
 
             s.comma(
-                self.order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                    expr: expr.clone(),
-                    order: Some(*order),
-                    nulls: None,
-                }),
+                self.order_by
+                    .iter()
+                    .map(|(expr, order, nulls)| ast::SortedColumn {
+                        expr: expr.clone(),
+                        order: Some(*order),
+                        nulls: *nulls,
+                    }),
                 context,
             )?;
         }

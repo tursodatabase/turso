@@ -1,3 +1,4 @@
+use crate::types::KeyInfo;
 use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
 use crate::HashSet;
 use turso_parser::ast::{ResolveType, SortOrder};
@@ -1045,15 +1046,23 @@ pub fn insn_to_row(
             } => {
                 let to_print: Vec<String> = order_and_collations
                     .iter()
-                    .map(|(order, collation)| {
+                    .map(|(order, collation, nulls_first)| {
                         let sign = match order {
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
+                        // Non-default null ordering: ASC defaults to nulls_first=true,
+                        // DESC defaults to nulls_first=false.
+                        let nulls_flag =
+                            if *nulls_first != KeyInfo::default_nulls_first(*order) {
+                                "N."
+                            } else {
+                                ""
+                            };
                         if let Some(coll) = collation {
-                            format!("{sign}{coll}")
+                            format!("{sign}{nulls_flag}{coll}")
                         } else {
-                            format!("{sign}B")
+                            format!("{sign}{nulls_flag}B")
                         }
                     })
                     .collect();

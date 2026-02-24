@@ -91,7 +91,7 @@ pub fn init_group_by<'a>(
     group_by: &'a GroupBy,
     plan: &SelectPlan,
     result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<ast::Expr>, ast::SortOrder)],
+    order_by: &'a [(Box<ast::Expr>, ast::SortOrder, Option<ast::NullsOrder>)],
 ) -> Result<()> {
     collect_non_aggregate_expressions(
         &mut t_ctx.non_aggregate_expressions,
@@ -142,13 +142,13 @@ pub fn init_group_by<'a>(
          * then the collating sequence of the column is used to determine sort order.
          * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
          */
-        let order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = group_by
+        let order_and_collations: Vec<(SortOrder, Option<CollationSeq>, bool)> = group_by
             .exprs
             .iter()
             .zip(sort_order.iter())
             .map(|(expr, ord)| {
                 let collation = get_collseq_from_expr(expr, &plan.table_references)?;
-                Ok((*ord, collation))
+                Ok((*ord, collation, KeyInfo::default_nulls_first(*ord)))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -262,7 +262,7 @@ pub fn is_orderby_agg_or_const(resolver: &Resolver, e: &ast::Expr, aggs: &[Aggre
 /// appears in ORDER BY, and the remaining keys default to `ASC`.
 pub fn compute_group_by_sort_order(
     group_by_exprs: &[ast::Expr],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)],
     aggs: &[Aggregate],
     resolver: &Resolver,
 ) -> Vec<SortOrder> {
@@ -272,7 +272,7 @@ pub fn compute_group_by_sort_order(
     }
     let only_agg_or_const = order_by
         .iter()
-        .all(|(e, _)| is_orderby_agg_or_const(resolver, e, aggs));
+        .all(|(e, _, _)| is_orderby_agg_or_const(resolver, e, aggs));
 
     if only_agg_or_const {
         let first_direction = order_by[0].1;
@@ -281,9 +281,9 @@ pub fn compute_group_by_sort_order(
 
     let mut result = vec![SortOrder::Asc; groupby_len];
     for (idx, groupby_expr) in group_by_exprs.iter().enumerate() {
-        if let Some((_, direction)) = order_by
+        if let Some((_, direction, _)) = order_by
             .iter()
-            .find(|(expr, _)| exprs_are_equivalent(expr, groupby_expr))
+            .find(|(expr, _, _)| exprs_are_equivalent(expr, groupby_expr))
         {
             result[idx] = *direction;
         }
@@ -296,13 +296,13 @@ fn collect_non_aggregate_expressions<'a>(
     group_by: &'a GroupBy,
     plan: &SelectPlan,
     root_result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<ast::Expr>, ast::SortOrder)],
+    order_by: &'a [(Box<ast::Expr>, ast::SortOrder, Option<ast::NullsOrder>)],
 ) -> Result<()> {
     let mut result_columns = Vec::new();
     for expr in root_result_columns
         .iter()
         .map(|col| &col.expr)
-        .chain(order_by.iter().map(|(e, _)| e.as_ref()))
+        .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
         .chain(group_by.having.iter().flatten())
     {
         collect_result_columns(expr, plan, &mut result_columns)?;
@@ -526,6 +526,7 @@ pub fn group_by_process_single_group(
         .map(|_| KeyInfo {
             sort_order: SortOrder::Asc,
             collation: CollationSeq::default(),
+            nulls_first: true,
         })
         .collect::<Vec<_>>();
     for (i, c) in compare_key_info

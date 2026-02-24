@@ -1,6 +1,6 @@
 use crate::sync::Arc;
 
-use turso_parser::ast::{self, SortOrder};
+use turso_parser::ast::{self, NullsOrder, SortOrder};
 
 use crate::{
     emit_explain,
@@ -10,6 +10,7 @@ use crate::{
         group_by::is_orderby_agg_or_const,
         plan::Aggregate,
     },
+    types::KeyInfo,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -24,6 +25,16 @@ use super::{
     plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
+
+/// Computes the effective nulls_first value from sort order and explicit NULLS clause.
+/// Defaults: ASC → NULLS FIRST, DESC → NULLS LAST (per SQLite spec).
+fn nulls_first_for(sort_order: SortOrder, nulls: Option<NullsOrder>) -> bool {
+    match nulls {
+        Some(NullsOrder::First) => true,
+        Some(NullsOrder::Last) => false,
+        None => KeyInfo::default_nulls_first(sort_order),
+    }
+}
 
 // Metadata for handling ORDER BY operations
 #[derive(Debug)]
@@ -51,7 +62,7 @@ pub fn init_order_by(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     result_columns: &[ResultSetColumn],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<NullsOrder>)],
     referenced_tables: &TableReferences,
     has_group_by: bool,
     has_distinct: bool,
@@ -59,7 +70,7 @@ pub fn init_order_by(
 ) -> Result<()> {
     let only_aggs = order_by
         .iter()
-        .all(|(e, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
+        .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
     let use_heap_sort = !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some();
 
@@ -70,7 +81,7 @@ pub fn init_order_by(
     let sort_cursor = if use_heap_sort {
         let index_name = format!("heap_sort_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
         let mut index_columns = Vec::with_capacity(order_by.len() + result_columns.len());
-        for (column, order) in order_by {
+        for (column, order, _nulls) in order_by {
             let collation = get_collseq_from_expr(column, referenced_tables)?;
             let pos_in_table = index_columns.len();
             index_columns.push(IndexColumn {
@@ -139,17 +150,18 @@ pub fn init_order_by(
          * then the collating sequence of the column is used to determine sort order.
          * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
          */
-        let mut order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = order_by
+        let mut order_and_collations: Vec<(SortOrder, Option<CollationSeq>, bool)> = order_by
             .iter()
-            .map(|(expr, dir)| {
+            .map(|(expr, dir, nulls)| {
                 let collation = get_collseq_from_expr(expr, referenced_tables)?;
-                Ok((*dir, collation))
+                let nulls_first = nulls_first_for(*dir, *nulls);
+                Ok((*dir, collation, nulls_first))
             })
             .collect::<Result<Vec<_>>>()?;
 
         if has_sequence {
-            // sequence column: ascending with BINARY collation
-            order_and_collations.push((SortOrder::Asc, Some(CollationSeq::default())));
+            // sequence column: ascending with BINARY collation, default nulls
+            order_and_collations.push((SortOrder::Asc, Some(CollationSeq::default()), true));
         }
 
         let key_len = order_and_collations.len();
@@ -295,7 +307,7 @@ pub fn order_by_sorter_insert(
             - result_columns_to_skip_len;
 
     let start_reg = program.alloc_registers(orderby_sorter_column_count);
-    for (i, (expr, _)) in order_by.iter().enumerate() {
+    for (i, (expr, _, _)) in order_by.iter().enumerate() {
         let key_reg = start_reg + i;
 
         // Check if this ORDER BY expression matches a finalized aggregate
@@ -522,7 +534,7 @@ pub struct OrderByRemapping {
 /// If we skip a result column, we need to keep track what index in the ORDER BY sorter the result columns have,
 /// because the result columns should be emitted in the SELECT clause order, not the ORDER BY clause order.
 pub fn order_by_deduplicate_result_columns(
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<NullsOrder>)],
     result_columns: &[ResultSetColumn],
     has_sequence: bool,
 ) -> Vec<OrderByRemapping> {
@@ -537,7 +549,7 @@ pub fn order_by_deduplicate_result_columns(
         let found = order_by
             .iter()
             .enumerate()
-            .find(|(_, (expr, _))| exprs_are_equivalent(expr, &rc.expr));
+            .find(|(_, (expr, _, _))| exprs_are_equivalent(expr, &rc.expr));
         if let Some((j, _)) = found {
             result_column_remapping.push(OrderByRemapping {
                 orderby_sorter_idx: j,
