@@ -278,7 +278,7 @@ fn test_wal_file_deleted_after_multiple_writes() {
     conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
     for i in 0..100 {
-        conn.execute(&format!("INSERT INTO t1 VALUES ({i})"))
+        conn.execute(format!("INSERT INTO t1 VALUES ({i})"))
             .unwrap();
     }
     conn.execute("INSERT INTO t2 VALUES (1, 'test')").unwrap();
