@@ -3279,7 +3279,7 @@ pub fn translate_expr(
                     });
                 }
                 ResolveType::Fail | ResolveType::Abort | ResolveType::Rollback => {
-                    if !in_trigger && *resolve_type != ResolveType::Abort {
+                    if !in_trigger {
                         crate::bail_parse_error!(
                             "RAISE() may only be used within a trigger-program"
                         );
