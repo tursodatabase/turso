@@ -1596,18 +1596,30 @@ fn fire_fk_cascade_update(
 
 /// Fire FK actions for DELETE on parent table using Program opcode.
 /// This is called after the DELETE is performed but before AFTER triggers.
-pub fn fire_fk_delete_actions(
+/// Holds a prepared FK cascade/set-null/set-default action whose parent key
+/// values have already been read into registers.
+pub struct PreparedFkDeleteAction {
+    fk_ref: ResolvedFkRef,
+    ctx: FkActionContext,
+}
+
+/// Phase 1 of FK delete actions: build parent keys into registers and handle
+/// NoAction/Restrict checks. Returns prepared actions for CASCADE/SetNull/
+/// SetDefault that must be fired AFTER the parent row is deleted (step 4 per
+/// SQLite docs: delete parent row first, then perform FK cascade actions).
+pub fn prepare_fk_delete_actions(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     parent_table_name: &str,
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
-    connection: &Arc<Connection>,
     database_id: usize,
-) -> Result<()> {
+) -> Result<Vec<PreparedFkDeleteAction>> {
     let parent_bt = resolver
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
+
+    let mut prepared = Vec::new();
 
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
@@ -1641,15 +1653,57 @@ pub fn fire_fk_delete_actions(
                     resolver,
                 )?;
             }
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
+                prepared.push(PreparedFkDeleteAction { fk_ref, ctx });
+            }
+        }
+    }
+
+    Ok(prepared)
+}
+
+/// Phase 2 of FK delete actions: fire CASCADE/SetNull/SetDefault sub-programs.
+/// Must be called AFTER the parent row is deleted from the B-tree.
+pub fn fire_prepared_fk_delete_actions(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    prepared: Vec<PreparedFkDeleteAction>,
+    connection: &Arc<Connection>,
+    database_id: usize,
+) -> Result<()> {
+    for action in prepared {
+        match action.fk_ref.fk.on_delete {
             RefAct::Cascade => {
-                fire_fk_cascade_delete(program, resolver, &fk_ref, connection, &ctx, database_id)?;
+                fire_fk_cascade_delete(
+                    program,
+                    resolver,
+                    &action.fk_ref,
+                    connection,
+                    &action.ctx,
+                    database_id,
+                )?;
             }
             RefAct::SetNull => {
-                fire_fk_set_null(program, resolver, &fk_ref, connection, &ctx, database_id)?;
+                fire_fk_set_null(
+                    program,
+                    resolver,
+                    &action.fk_ref,
+                    connection,
+                    &action.ctx,
+                    database_id,
+                )?;
             }
             RefAct::SetDefault => {
-                fire_fk_set_default(program, resolver, &fk_ref, connection, &ctx, database_id)?;
+                fire_fk_set_default(
+                    program,
+                    resolver,
+                    &action.fk_ref,
+                    connection,
+                    &action.ctx,
+                    database_id,
+                )?;
             }
+            _ => unreachable!(),
         }
     }
 
