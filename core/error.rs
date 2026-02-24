@@ -53,6 +53,8 @@ pub enum LimboError {
     RaiseAbort(String),
     #[error("Runtime error: {0}")]
     RaiseRollback(String),
+    #[error("Runtime error: {0}")]
+    RaiseFail(String),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     #[error("Extension error: {0}")]
