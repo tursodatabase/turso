@@ -1236,6 +1236,7 @@ impl Database {
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
             executing_subprogram_depth: AtomicI32::new(0),
+            trigger_recursion_limit: AtomicI32::new(Connection::default_trigger_recursion_limit()),
             compiling_fk_actions: RwLock::new(Vec::new()),
             compiling_fk_actions_depth: AtomicI32::new(0),
             encryption_key: RwLock::new(encryption_key),

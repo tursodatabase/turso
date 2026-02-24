@@ -41,6 +41,8 @@
 
 #define SQLITE_CHECKPOINT_TRUNCATE 3
 
+#define SQLITE_LIMIT_TRIGGER_DEPTH 10
+
 #define SQLITE_INTEGER  1
 #define SQLITE_FLOAT    2
 #define SQLITE_BLOB     4
@@ -313,7 +315,7 @@ int libsql_wal_frame_count(sqlite3 *db, uint32_t *p_frame_count);
 
 /**
  * Return meta information about a specific column of a database table.
- * 
+ *
  * @param db Connection handle
  * @param zDbName Database name or NULL for main database
  * @param zTableName Table name
