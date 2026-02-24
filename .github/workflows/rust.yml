@@ -246,7 +246,7 @@ jobs:
             args: "--io-backend=experimental_win_iocp --maximum-tests 1000 --differential"
           - name: Differential
             iterations: 10
-            args: "--maximum-tests 1000 --differential --io-backend=memory"
+            args: "--maximum-tests 5000 --differential --io-backend=memory"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -264,7 +264,6 @@ jobs:
                 exit $LASTEXITCODE
             }
           }
-
 
   # TODO: for now leave this commented out, as it always fails
   # differential-fuzzer:
