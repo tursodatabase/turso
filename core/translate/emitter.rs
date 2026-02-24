@@ -4159,6 +4159,24 @@ fn emit_update_insns<'a>(
             )?;
         }
 
+        // Emit RETURNING results BEFORE firing AFTER triggers, so that
+        // RETURNING reflects the UPDATE's own values, not trigger modifications.
+        // Per SQLite docs: "the RETURNING clause emits the original values that
+        // are computed before those [AFTER] triggers run."
+        if let Some(returning_columns) = &returning {
+            if !returning_columns.is_empty() {
+                emit_returning_results(
+                    program,
+                    table_references,
+                    returning_columns,
+                    start,
+                    rowid_set_clause_reg.unwrap_or(beg),
+                    &mut t_ctx.resolver,
+                    returning_buffer,
+                )?;
+            }
+        }
+
         // Fire AFTER UPDATE triggers
         if let Some(btree_table) = target_table.table.btree() {
             let updated_column_indices: HashSet<usize> =
@@ -4201,7 +4219,7 @@ fn emit_update_insns<'a>(
                     };
 
                 // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
-                // not skip post-row work (RETURNING, CDC).
+                // not skip post-row work (CDC).
                 let after_trigger_done = program.allocate_label();
                 for trigger in relevant_triggers {
                     fire_trigger(
@@ -4215,21 +4233,6 @@ fn emit_update_insns<'a>(
                     )?;
                 }
                 program.preassign_label_to_next_insn(after_trigger_done);
-            }
-        }
-
-        // Emit RETURNING results if specified
-        if let Some(returning_columns) = &returning {
-            if !returning_columns.is_empty() {
-                emit_returning_results(
-                    program,
-                    table_references,
-                    returning_columns,
-                    start,
-                    rowid_set_clause_reg.unwrap_or(beg),
-                    &mut t_ctx.resolver,
-                    returning_buffer,
-                )?;
             }
         }
 

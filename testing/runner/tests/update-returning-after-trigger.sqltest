@@ -1,0 +1,122 @@
+@database :memory:
+@requires-file trigger "trigger tests require trigger support"
+
+# Tests for UPDATE RETURNING with AFTER triggers.
+# Per SQLite docs, RETURNING should reflect the UPDATE's own values,
+# not values modified by AFTER triggers.
+
+# Basic: AFTER UPDATE trigger modifies same row, RETURNING * shows pre-trigger values
+@cross-check-integrity
+test update-returning-after-trigger-basic {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c TEXT);
+    CREATE TRIGGER t1_au AFTER UPDATE ON t1 BEGIN
+      UPDATE t1 SET c = 'trigger_modified' WHERE a = NEW.a;
+    END;
+    INSERT INTO t1 VALUES(1, 10, 'original');
+    UPDATE t1 SET b = 20 WHERE a = 1 RETURNING *;
+}
+expect {
+    1|20|original
+}
+
+# Verify the trigger still actually modifies the data
+@cross-check-integrity
+test update-returning-after-trigger-data-modified {
+    CREATE TABLE t2(a INTEGER PRIMARY KEY, b INTEGER, c TEXT);
+    CREATE TRIGGER t2_au AFTER UPDATE ON t2 BEGIN
+      UPDATE t2 SET c = 'trigger_modified' WHERE a = NEW.a;
+    END;
+    INSERT INTO t2 VALUES(1, 10, 'original');
+    UPDATE t2 SET b = 20 WHERE a = 1;
+    SELECT * FROM t2;
+}
+expect {
+    1|20|trigger_modified
+}
+
+# RETURNING specific columns, not just *
+@cross-check-integrity
+test update-returning-after-trigger-specific-columns {
+    CREATE TABLE t3(a INTEGER PRIMARY KEY, b INTEGER, c TEXT);
+    CREATE TRIGGER t3_au AFTER UPDATE ON t3 BEGIN
+      UPDATE t3 SET c = 'trigger_modified' WHERE a = NEW.a;
+    END;
+    INSERT INTO t3 VALUES(1, 10, 'original');
+    UPDATE t3 SET b = 20 WHERE a = 1 RETURNING c, b;
+}
+expect {
+    original|20
+}
+
+# Multiple rows updated with AFTER trigger
+@cross-check-integrity
+test update-returning-after-trigger-multiple-rows {
+    CREATE TABLE t4(a INTEGER PRIMARY KEY, b INTEGER, c TEXT);
+    CREATE TRIGGER t4_au AFTER UPDATE ON t4 BEGIN
+      UPDATE t4 SET c = 'trigger_modified' WHERE a = NEW.a;
+    END;
+    INSERT INTO t4 VALUES(1, 10, 'orig1');
+    INSERT INTO t4 VALUES(2, 20, 'orig2');
+    INSERT INTO t4 VALUES(3, 30, 'orig3');
+    UPDATE t4 SET b = b + 100 WHERE a <= 3 RETURNING *;
+}
+expect {
+    1|110|orig1
+    2|120|orig2
+    3|130|orig3
+}
+
+# AFTER trigger modifies same column that UPDATE sets
+@cross-check-integrity
+test update-returning-after-trigger-same-column {
+    CREATE TABLE t5(a INTEGER PRIMARY KEY, b INTEGER);
+    CREATE TRIGGER t5_au AFTER UPDATE ON t5 BEGIN
+      UPDATE t5 SET b = 999 WHERE a = NEW.a;
+    END;
+    INSERT INTO t5 VALUES(1, 10);
+    UPDATE t5 SET b = 20 WHERE a = 1 RETURNING *;
+}
+expect {
+    1|20
+}
+
+# INSERT RETURNING with AFTER trigger still works correctly
+@cross-check-integrity
+test insert-returning-after-trigger {
+    CREATE TABLE t6(a INTEGER PRIMARY KEY, b INTEGER, c TEXT);
+    CREATE TRIGGER t6_ai AFTER INSERT ON t6 BEGIN
+      UPDATE t6 SET c = 'trigger_set' WHERE a = NEW.a;
+    END;
+    INSERT INTO t6 VALUES(1, 10, 'original') RETURNING *;
+}
+expect {
+    1|10|original
+}
+
+# RETURNING with expression involving trigger-modified column
+@cross-check-integrity
+test update-returning-after-trigger-expression {
+    CREATE TABLE t7(a INTEGER PRIMARY KEY, b INTEGER, c TEXT);
+    CREATE TRIGGER t7_au AFTER UPDATE ON t7 BEGIN
+      UPDATE t7 SET c = 'trigger_modified' WHERE a = NEW.a;
+    END;
+    INSERT INTO t7 VALUES(1, 10, 'original');
+    UPDATE t7 SET b = 20 WHERE a = 1 RETURNING a, b * 2, c || '_suffix';
+}
+expect {
+    1|40|original_suffix
+}
+
+# NULL values: AFTER trigger sets column to NULL
+@cross-check-integrity
+test update-returning-after-trigger-null {
+    CREATE TABLE t8(a INTEGER PRIMARY KEY, b INTEGER, c TEXT);
+    CREATE TRIGGER t8_au AFTER UPDATE ON t8 BEGIN
+      UPDATE t8 SET c = NULL WHERE a = NEW.a;
+    END;
+    INSERT INTO t8 VALUES(1, 10, 'original');
+    UPDATE t8 SET b = 20 WHERE a = 1 RETURNING *;
+}
+expect {
+    1|20|original
+}
