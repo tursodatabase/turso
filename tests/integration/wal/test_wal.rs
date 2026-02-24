@@ -226,3 +226,132 @@ fn test_wal_write_lock_released_on_conn_drop() {
         .execute("CREATE TABLE t (id integer primary key)")
         .unwrap();
 }
+
+/// Test that the WAL file is deleted when the last connection closes.
+/// This matches SQLite behavior: when the last connection to a WAL-mode
+/// database closes, the WAL is checkpointed and the file is removed.
+#[test]
+fn test_wal_file_deleted_on_last_connection_close() {
+    maybe_setup_tracing();
+    let tmp_db = TempDatabase::new("test_wal_deleted_on_close.db");
+    let db_path = tmp_db.path.clone();
+    let wal_path = db_path.with_extension("db-wal");
+
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+
+    // WAL file should exist after writes
+    assert!(wal_path.exists(), "WAL file should exist after writes");
+
+    // Close the connection (last connection)
+    conn.close().unwrap();
+
+    // WAL file should be deleted after the last connection closes
+    assert!(
+        !wal_path.exists(),
+        "WAL file should be deleted after last connection close"
+    );
+
+    // DB file should still exist with data
+    assert!(db_path.exists(), "DB file should still exist");
+
+    // Verify data is intact by reopening the database
+    let tmp_db2 = TempDatabase::new_with_existent(&db_path);
+    let conn2 = tmp_db2.connect_limbo();
+    let result = execute_and_get_strings(&conn2, "SELECT val FROM t WHERE id = 1").unwrap();
+    assert_eq!(result, vec!["hello"]);
+}
+
+/// Test that WAL file is deleted even with multiple statements and data.
+#[test]
+fn test_wal_file_deleted_after_multiple_writes() {
+    maybe_setup_tracing();
+    let tmp_db = TempDatabase::new("test_wal_deleted_multi_writes.db");
+    let db_path = tmp_db.path.clone();
+    let wal_path = db_path.with_extension("db-wal");
+
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    for i in 0..100 {
+        conn.execute(&format!("INSERT INTO t1 VALUES ({i})"))
+            .unwrap();
+    }
+    conn.execute("INSERT INTO t2 VALUES (1, 'test')").unwrap();
+
+    conn.close().unwrap();
+
+    assert!(
+        !wal_path.exists(),
+        "WAL file should be deleted after close with multiple writes"
+    );
+
+    // Verify all data is intact
+    let tmp_db2 = TempDatabase::new_with_existent(&db_path);
+    let conn2 = tmp_db2.connect_limbo();
+    let count = execute_and_get_ints(&conn2, "SELECT COUNT(*) FROM t1").unwrap();
+    assert_eq!(count, vec![100]);
+    let name = execute_and_get_strings(&conn2, "SELECT name FROM t2").unwrap();
+    assert_eq!(name, vec!["test"]);
+}
+
+/// Test that WAL file is NOT deleted when other connections are still open.
+#[test]
+fn test_wal_file_kept_when_other_connections_open() {
+    maybe_setup_tracing();
+    let tmp_db = TempDatabase::new("test_wal_kept_other_conns.db");
+    let db = tmp_db.limbo_database();
+    let db_path = tmp_db.path.clone();
+    let wal_path = db_path.with_extension("db-wal");
+
+    let conn1 = db.connect().unwrap();
+    let conn2 = db.connect().unwrap();
+
+    conn1
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    // Close conn1 but conn2 is still open
+    conn1.close().unwrap();
+
+    // WAL file should still exist since conn2 is open
+    assert!(
+        wal_path.exists(),
+        "WAL file should still exist when other connections are open"
+    );
+
+    // Close conn2 (last connection)
+    conn2.close().unwrap();
+
+    // Now WAL file should be deleted
+    assert!(
+        !wal_path.exists(),
+        "WAL file should be deleted after ALL connections close"
+    );
+}
+
+/// Test that WAL file deletion works correctly for an empty database
+/// (only schema, no data rows).
+#[test]
+fn test_wal_file_deleted_empty_table() {
+    maybe_setup_tracing();
+    let tmp_db = TempDatabase::new("test_wal_deleted_empty.db");
+    let db_path = tmp_db.path.clone();
+    let wal_path = db_path.with_extension("db-wal");
+
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.close().unwrap();
+
+    assert!(
+        !wal_path.exists(),
+        "WAL file should be deleted even for empty tables"
+    );
+}

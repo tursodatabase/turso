@@ -4131,6 +4131,7 @@ impl Pager {
         &self,
         wal_auto_checkpoint_disabled: bool,
         sync_mode: crate::SyncMode,
+        wal_path: &str,
     ) -> Result<()> {
         let mut attempts = 0;
         {
@@ -4145,24 +4146,38 @@ impl Pager {
             self.io.wait_for_completion(c)?;
         }
         if !wal_auto_checkpoint_disabled {
-            while let Err(LimboError::Busy) = self.blocking_checkpoint(
-                CheckpointMode::Truncate {
-                    upper_bound_inclusive: None,
-                },
-                sync_mode,
-            ) {
-                if attempts == 3 {
-                    // don't return error on `close` if we are unable to checkpoint, we can silently fail
-                    tracing::warn!(
-                        "Failed to checkpoint WAL on shutdown after 3 attempts, giving up"
-                    );
-                    return Ok(());
+            let checkpoint_succeeded = loop {
+                match self.blocking_checkpoint(
+                    CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    },
+                    sync_mode,
+                ) {
+                    Ok(_) => break true,
+                    Err(LimboError::Busy) => {
+                        if attempts == 3 {
+                            tracing::warn!(
+                                "Failed to checkpoint WAL on shutdown after 3 attempts, giving up"
+                            );
+                            break false;
+                        }
+                        attempts += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Checkpoint failed on shutdown: {e}");
+                        break false;
+                    }
                 }
-                attempts += 1;
+            };
+            // Delete the WAL file after successful truncate checkpoint.
+            // This matches SQLite behavior: when the last connection closes,
+            // the WAL is checkpointed and the file is removed.
+            if checkpoint_succeeded {
+                if let Err(e) = self.io.remove_file(wal_path) {
+                    tracing::warn!("Failed to remove WAL file on shutdown: {e}");
+                }
             }
         }
-        // TODO: delete the WAL file here after truncate checkpoint, but *only* if we are sure that
-        // no other connections have opened since.
         Ok(())
     }
 

@@ -987,6 +987,7 @@ impl Connection {
             self.pager.load().checkpoint_shutdown(
                 self.is_wal_auto_checkpoint_disabled(),
                 self.get_sync_mode(),
+                &self.db.wal_path,
             )?;
         };
         Ok(())

@@ -347,7 +347,7 @@ pub struct Database {
     schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
-    wal_path: String,
+    pub(crate) wal_path: String,
     pub io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
     // Shared structures of a Database are the parts that are common to multiple threads that might
