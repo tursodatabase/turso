@@ -263,3 +263,24 @@ test create-index-sqlite-source-id {
 }
 expect error {
 }
+
+# SQLite prohibits the "." operator in index expressions.
+@cross-check-integrity
+@skip-if mvcc "expression indexes not supported"
+test create-index-qualified-column-prohibited {
+    CREATE TABLE t4(a, b, c);
+    CREATE INDEX i_expr ON t4(substr(t4.b, 1, 1));
+}
+expect error {
+    the "\." operator prohibited in index expressions
+}
+
+@cross-check-integrity
+@skip-if mvcc "expression indexes not supported"
+test create-index-direct-qualified-column-prohibited {
+    CREATE TABLE t5(a, b, c);
+    CREATE INDEX i_expr2 ON t5(t5.b);
+}
+expect error {
+    the "\." operator prohibited in index expressions
+}
