@@ -2099,10 +2099,7 @@ pub fn halt(
         if program.resolve_type == ResolveType::Fail && auto_commit {
             // Check for immediate FK violations - FK errors don't respect ON CONFLICT
             if program.connection.foreign_keys_enabled()
-                && state
-                    .fk_immediate_violations_during_stmt
-                    .load(Ordering::Acquire)
-                    > 0
+                && state.get_fk_immediate_violations_during_stmt() > 0
             {
                 return Err(LimboError::ForeignKeyConstraint(
                     "immediate foreign key constraint failed".to_string(),
@@ -2135,10 +2132,7 @@ pub fn halt(
     // Check for immediate foreign key violations.
     // Any immediate violation causes the statement subtransaction to roll back.
     if program.connection.foreign_keys_enabled()
-        && state
-            .fk_immediate_violations_during_stmt
-            .load(Ordering::Acquire)
-            > 0
+        && state.get_fk_immediate_violations_during_stmt() > 0
     {
         return Err(LimboError::ForeignKeyConstraint(
             "immediate foreign key constraint failed".to_string(),
@@ -10831,15 +10825,12 @@ pub fn op_fk_counter(
         insn
     );
     if !*deferred {
-        state
-            .fk_immediate_violations_during_stmt
-            .fetch_add(*increment_value, Ordering::AcqRel);
+        state.increment_fk_immediate_violations_during_stmt(*increment_value);
     } else {
         // Transaction-level counter: add/subtract for deferred FKs.
         program
             .connection
-            .fk_deferred_violations
-            .fetch_add(*increment_value, Ordering::AcqRel);
+            .increment_deferred_foreign_key_violations(*increment_value);
     }
 
     state.pc += 1;
@@ -10872,9 +10863,7 @@ pub fn op_fk_if_zero(
     let v = if *deferred {
         program.connection.get_deferred_foreign_key_violations()
     } else {
-        state
-            .fk_immediate_violations_during_stmt
-            .load(Ordering::Acquire)
+        state.get_fk_immediate_violations_during_stmt()
     };
 
     state.pc = if v == 0 {
@@ -10899,9 +10888,7 @@ pub fn op_fk_check(
     let v = if *deferred {
         program.connection.get_deferred_foreign_key_violations()
     } else {
-        state
-            .fk_immediate_violations_during_stmt
-            .load(Ordering::Acquire)
+        state.get_fk_immediate_violations_during_stmt()
     };
     if v > 0 {
         return Err(LimboError::ForeignKeyConstraint(
