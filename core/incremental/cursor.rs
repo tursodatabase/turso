@@ -396,6 +396,7 @@ mod tests {
                 enable_triggers: false,
                 enable_attach: false,
                 unsafe_testing: false,
+                locking_mode: Default::default(),
             },
             None,
         )?;

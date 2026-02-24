@@ -5,10 +5,7 @@ use crate::io::common;
 use crate::io::FileSyncType;
 use crate::Result;
 use crate::sync::Mutex;
-use rustix::{
-    fd::{AsFd, AsRawFd},
-    fs::{self, FlockOperation},
-};
+use rustix::fd::{AsFd, AsRawFd};
 use std::os::fd::RawFd;
 
 use std::{io::ErrorKind, sync::Arc};
@@ -111,7 +108,10 @@ impl IO for UnixIO {
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             && !flags.contains(OpenFlags::ReadOnly)
         {
-            unix_file.lock_file(true)?;
+            // SharedLock flag means shared fcntl lock (for multi-process modes).
+            // Otherwise exclusive lock (default, single-process).
+            let shared = flags.contains(OpenFlags::SharedLock);
+            unix_file.lock_file(!shared)?;
         }
         Ok(unix_file)
     }
@@ -134,41 +134,12 @@ pub struct UnixFile {
 impl File for UnixFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.lock();
-        let fd = fd.as_fd();
-        // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
-        // or the process exits or after an explicit unlock.
-        fs::fcntl_lock(
-            fd,
-            if exclusive {
-                FlockOperation::NonBlockingLockExclusive
-            } else {
-                FlockOperation::NonBlockingLockShared
-            },
-        )
-        .map_err(|e| {
-            let io_error = std::io::Error::from(e);
-            let message = match io_error.kind() {
-                ErrorKind::WouldBlock => {
-                    "Failed locking file. File is locked by another process".to_string()
-                }
-                _ => format!("Failed locking file, {io_error}"),
-            };
-            LimboError::LockingError(message)
-        })?;
-
-        Ok(())
+        common::fcntl_lock(fd.as_fd(), exclusive)
     }
 
     fn unlock_file(&self) -> Result<()> {
         let fd = self.file.lock();
-        let fd = fd.as_fd();
-        fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
-            LimboError::LockingError(format!(
-                "Failed to release file lock: {}",
-                std::io::Error::from(e)
-            ))
-        })?;
-        Ok(())
+        common::fcntl_unlock(fd.as_fd())
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
@@ -377,6 +348,26 @@ mod tests {
 
     #[test]
     fn test_multiple_processes_cannot_open_file() {
+        // Default locking mode is exclusive, so a second process should
+        // fail to open the same database file.
         common::tests::test_multiple_processes_cannot_open_file(UnixIO::new);
+    }
+
+    #[test]
+    fn test_exclusive_blocks_shared() {
+        // Process holding exclusive lock must block a process trying shared lock.
+        common::tests::test_exclusive_blocks_shared(UnixIO::new);
+    }
+
+    #[test]
+    fn test_shared_blocks_exclusive() {
+        // Process holding shared lock must block a process trying exclusive lock.
+        common::tests::test_shared_blocks_exclusive(UnixIO::new);
+    }
+
+    #[test]
+    fn test_shared_allows_shared() {
+        // Two processes with shared locks should coexist.
+        common::tests::test_shared_allows_shared(UnixIO::new);
     }
 }

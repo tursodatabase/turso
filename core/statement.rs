@@ -324,7 +324,23 @@ impl Statement {
             }
         }
 
-        *conn.schema.write() = conn.db.clone_schema();
+        // Check if the DB-level schema is stale (e.g., another process created
+        // a table, incrementing the schema cookie on disk). If so, reparse
+        // from sqlite_schema on disk so we get the new table definitions.
+        // In MVCC mode, read from MvStore (the authoritative source) to match
+        // what the Transaction opcode sees and avoid infinite recursion.
+        let on_disk_cookie = conn.effective_schema_cookie().unwrap_or_else(|e| {
+            tracing::warn!("effective_schema_cookie failed during reprepare: {e}");
+            0
+        });
+        let db_cookie = conn.db.schema.lock().schema_version;
+        if on_disk_cookie != db_cookie {
+            conn.reparse_schema()?;
+            let schema = conn.schema.read().clone();
+            conn.db.update_schema_if_newer(schema);
+        } else {
+            *conn.schema.write() = conn.db.clone_schema();
+        }
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;

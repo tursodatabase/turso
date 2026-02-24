@@ -40,6 +40,7 @@ Welcome to Turso database manual!
     - [WAL manipulation](#wal-manipulation)
       - [`libsql_wal_frame_count`](#libsql_wal_frame_count)
   - [Journal Mode](#journal-mode)
+  - [Multi-Process Access](#multi-process-access)
   - [Encryption](#encryption)
   - [Vector search](#vector-search)
   - [Full-Text Search](#full-text-search-experimental)
@@ -96,13 +97,14 @@ hello, world
 Turso aims towards full SQLite compatibility but has the following limitations:
 
 * Query result ordering is not guaranteed to be the same (see [#2964](https://github.com/tursodatabase/turso/issues/2964) for more discussion)
-* No multi-process access
 * No multi-threading
 * No savepoints
 * No triggers
 * No views
 * No vacuum
 * UTF-8 is the only supported character encoding
+
+Multi-process access is supported via `PRAGMA locking_mode` or the `?locking=` URI parameter. See [Multi-Process Access](#multi-process-access) for details.
 
 For more detailed list of SQLite compatibility, please refer to [COMPAT.md](../COMPAT.md).
 
@@ -634,6 +636,35 @@ turso> PRAGMA journal_mode = experimental_mvcc;
 - Switching journal modes triggers a checkpoint to ensure all pending changes are persisted before the mode change.
 - When switching from MVCC to WAL mode, the MVCC log file is cleared after checkpointing.
 - Legacy SQLite databases are automatically converted to WAL mode when opened.
+
+## Multi-Process Access
+
+By default, Turso opens databases in exclusive mode where only a single process can access the database. To allow multiple processes to read from or write to the same database, use `PRAGMA locking_mode` or the `?locking=` URI parameter.
+
+### Locking Modes
+
+| Mode | Description |
+|------|-------------|
+| `exclusive` | Single-process exclusive access (default). No shared memory overhead. |
+| `shared_reads` | Multiple processes can read, but only one process writes. The writing process acquires a permanent write lock at startup. |
+| `shared_writes` | Full multi-process read and write access. Write locks are acquired and released per transaction. |
+| `normal` | Alias for `shared_writes`, provided for SQLite compatibility. |
+
+### Usage
+
+**Set via PRAGMA:**
+
+```sql
+PRAGMA locking_mode = shared_writes;
+```
+
+**Set via URI parameter:**
+
+```bash
+tursodb "file:database.db?locking=shared_writes"
+```
+
+All processes accessing the same database must use the same locking mode. When a shared locking mode is active, Turso creates a shared memory file (`database.db-tshm`) alongside the database to coordinate reader slots and writer state across processes.
 
 ## Encryption
 

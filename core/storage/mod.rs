@@ -16,6 +16,14 @@ pub(crate) mod checksum;
 pub mod database;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;
+#[cfg(test)]
+#[cfg(all(unix, target_pointer_width = "64"))]
+mod mp_generative_tests;
+#[cfg(test)]
+#[cfg(all(unix, target_pointer_width = "64"))]
+mod mp_tests;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub(crate) mod multi_process_wal;
 pub(crate) mod page_cache;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;
@@ -24,6 +32,8 @@ pub(super) mod slot_bitmap;
 pub mod sqlite3_ondisk;
 mod state_machines;
 pub(crate) mod subjournal;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub(crate) mod tshm;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod wal;
 

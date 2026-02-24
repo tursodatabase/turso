@@ -524,6 +524,37 @@ fn update_pragma(
             connection.set_temp_store(temp_store);
             Ok(TransactionMode::None)
         }
+        PragmaName::LockingMode => {
+            let name_bytes = match &value {
+                Expr::Literal(Literal::Keyword(name)) => name.as_bytes(),
+                Expr::Name(name) | Expr::Id(name) => name.as_str().as_bytes(),
+                Expr::Literal(Literal::String(s)) => s.as_bytes(),
+                _ => bail_parse_error!(
+                    "locking_mode must be EXCLUSIVE, SHARED_READS, SHARED_WRITES, or NORMAL"
+                ),
+            };
+            let mode = match_ignore_ascii_case!(match name_bytes {
+                b"EXCLUSIVE" => crate::LockingMode::Exclusive,
+                b"SHARED_READS" => crate::LockingMode::SharedReads,
+                b"SHARED_WRITES" | b"NORMAL" => crate::LockingMode::SharedWrites,
+                _ => bail_parse_error!(
+                    "locking_mode must be EXCLUSIVE, SHARED_READS, SHARED_WRITES, or NORMAL"
+                ),
+            });
+            let current = connection.db.locking_mode;
+            if mode != current {
+                return Err(crate::LimboError::InternalError(format!(
+                    "cannot change locking_mode from {current} to {mode} on an open database. \
+                     Set before opening with: file:database.db?locking={mode}"
+                )));
+            }
+            // Mode matches — return it as confirmation.
+            let register = program.alloc_register();
+            program.emit_string8(mode.to_string(), register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
         PragmaName::FunctionList => query_pragma(
             PragmaName::FunctionList,
             resolver,
@@ -659,6 +690,14 @@ fn query_pragma(
                 program.emit_result_row(register, 1);
             }
 
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::LockingMode => {
+            let mode = connection.db.locking_mode;
+            let register = program.alloc_register();
+            program.emit_string8(mode.to_string(), register);
+            program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
