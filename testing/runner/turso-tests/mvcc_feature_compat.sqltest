@@ -21,15 +21,6 @@ expect error {
     Partial indexes are not supported in MVCC mode
 }
 
-test mvcc-rejects-expression-index {
-    PRAGMA journal_mode = 'experimental_mvcc';
-    CREATE TABLE t3 (id INTEGER PRIMARY KEY, name TEXT);
-    CREATE INDEX idx_expr ON t3(UPPER(name));
-}
-expect error {
-    Expression indexes are not supported in MVCC mode
-}
-
 test mvcc-rejects-cdc {
     PRAGMA journal_mode = 'experimental_mvcc';
     CREATE TABLE t4 (id INTEGER PRIMARY KEY, val TEXT);

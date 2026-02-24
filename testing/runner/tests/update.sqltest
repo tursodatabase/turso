@@ -289,7 +289,6 @@ expect {
 
 # Regression: UPDATE over expression-indexed predicate must update all matching rows,
 # not just the first one.
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 @cross-check-integrity
 test update-expression-index-json-extract-updates-all-matching-rows {
     CREATE TABLE t(id INT PRIMARY KEY, j TEXT);
@@ -310,7 +309,6 @@ expect {
 }
 
 # Same regression with table alias in UPDATE and qualified column in expression index.
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 @cross-check-integrity
 test update-expression-index-json-extract-updates-all-matching-rows-alias {
     CREATE TABLE t(id INT PRIMARY KEY, j TEXT);

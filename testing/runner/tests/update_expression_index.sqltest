@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "expression indexes are not supported with mvcc"
 
 # Regression tests for expression index UPDATE correctness.
 # Verifies that UPDATE properly deletes old index entries and inserts new ones.

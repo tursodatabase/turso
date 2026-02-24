@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "expression indexes are not supported in mvcc"
 
 
 test upsert-expr-index-basic {

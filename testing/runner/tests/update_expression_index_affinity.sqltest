@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "expression indexes are not supported with mvcc"
 
 # Tests for expression index key computation during UPDATE.
 # The expression index key must be computed from post-affinity values

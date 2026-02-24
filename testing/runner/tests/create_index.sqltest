@@ -142,9 +142,7 @@ expect {
 
 # SQLite interprets single-quoted strings in index expressions as column names
 # (for backwards compatibility), not as string literals. We match this behavior.
-# Expression indexes are not currently enabled in MVCC.
 
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # String literal that doesn't match a column should fail.
 # SQLite error: "no such column: literal"
 @cross-check-integrity
@@ -155,7 +153,6 @@ test create-index-string-literal-no-such-column {
 expect error {
 }
 
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # String literal that matches a column name should succeed (SQLite quirk).
 @cross-check-integrity
 test create-index-string-literal-matches-column {
@@ -167,7 +164,6 @@ expect {
     idx12b
 }
 
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Numeric literal as index column is allowed (SQLite allows this).
 @cross-check-integrity
 test create-index-numeric-literal-column {
@@ -179,7 +175,6 @@ expect {
     idx13
 }
 
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Pure numeric expression (no column refs) is allowed (SQLite allows this).
 @cross-check-integrity
 test create-index-literal-expression {
@@ -191,7 +186,6 @@ expect {
     idx14
 }
 
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Expression with column reference should succeed.
 @cross-check-integrity
 test create-index-expression-with-column {
@@ -203,7 +197,6 @@ expect {
     idx15
 }
 
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Multiple columns where one is a string literal not matching any column should fail.
 # SQLite error: "no such column: literal"
 @cross-check-integrity
@@ -214,7 +207,6 @@ test create-index-mixed-string-literal-column {
 expect error {
 }
 
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # String literal inside an expression is allowed.
 @cross-check-integrity
 test create-index-string-in-expression {
@@ -226,7 +218,6 @@ expect {
     idx17
 }
 
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Deeply parenthesized string literal matching column should succeed.
 @cross-check-integrity
 test create-index-parenthesized-string-matches-column {
@@ -238,7 +229,6 @@ expect {
     idx18
 }
 
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 # Deeply parenthesized string literal not matching column should fail.
 @cross-check-integrity
 test create-index-parenthesized-string-no-such-column {
