@@ -192,6 +192,9 @@ impl DatabaseOpts {
 
     pub fn with_custom_types(mut self, enable: bool) -> Self {
         self.enable_custom_types = enable;
+        if enable {
+            self.enable_strict = true;
+        }
         self
     }
 
@@ -477,7 +480,7 @@ impl Database {
             path: path.into(),
             wal_path: wal_path.into(),
             schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
-                opts.enable_strict,
+                opts.enable_custom_types,
             )))),
             _shared_page_cache: shared_page_cache,
             shared_wal,

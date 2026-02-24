@@ -461,7 +461,7 @@ impl Schema {
         Self::with_options(false)
     }
 
-    pub fn with_options(enable_strict: bool) -> Self {
+    pub fn with_options(enable_custom_types: bool) -> Self {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
@@ -470,7 +470,7 @@ impl Schema {
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
-        for function in VirtualTable::builtin_functions(enable_strict) {
+        for function in VirtualTable::builtin_functions(enable_custom_types) {
             tables.insert(
                 function.name.to_owned(),
                 Arc::new(Table::Virtual(Arc::new((*function).clone()))),
@@ -499,7 +499,7 @@ impl Schema {
             dropped_root_pages: HashSet::default(),
             type_registry: {
                 let mut registry = HashMap::default();
-                if enable_strict {
+                if enable_custom_types {
                     bootstrap_builtin_types(&mut registry);
                 }
                 registry

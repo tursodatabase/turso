@@ -418,7 +418,7 @@ impl Connection {
             .get();
 
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::with_options(self.experimental_strict_enabled());
+        let mut fresh = Schema::with_options(self.experimental_custom_types_enabled());
         fresh.schema_version = cookie;
 
         // Preserve existing views to avoid expensive repopulation.
