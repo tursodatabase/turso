@@ -1,14 +1,14 @@
-use crate::{
-    types::{AsValueRef, Value},
-    ValueRef,
-};
-
 use super::{
     convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_path_from_db_value,
     json_string_to_db_type,
     jsonb::{DeleteOperation, InsertOperation, ReplaceOperation},
     Conv, JsonCacheCell, OutputVariant,
 };
+use crate::{
+    types::{AsValueRef, Value},
+    ValueRef,
+};
+use std::str::FromStr;
 
 /// The function follows RFC 7386 JSON Merge Patch semantics:
 /// * If the patch is null, the target is replaced with null
@@ -22,6 +22,7 @@ pub fn json_patch(
 ) -> crate::Result<Value> {
     let (target, patch) = (target.as_value_ref(), patch.as_value_ref());
     match (target, patch) {
+        (ValueRef::Null, _) | (_, ValueRef::Null) => return Ok(Value::Null),
         (ValueRef::Blob(_), _) | (_, ValueRef::Blob(_)) => {
             crate::bail_constraint_error!("blob is not supported!");
         }
@@ -32,11 +33,18 @@ pub fn json_patch(
     let make_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let patch = cache.get_or_insert_with(patch, make_jsonb)?;
 
-    target.patch(&patch)?;
+    if patch.element_type()? != super::jsonb::ElementType::OBJECT {
+        target = patch;
+    } else {
+        if target.element_type()? != super::jsonb::ElementType::OBJECT {
+            target = super::jsonb::Jsonb::from_str("{}").unwrap();
+        }
+        target.patch(&patch)?;
+    }
 
     let element_type = target.element_type()?;
 
-    json_string_to_db_type(target, element_type, OutputVariant::ElementType)
+    json_string_to_db_type(target, element_type, OutputVariant::String)
 }
 
 pub fn jsonb_patch(
@@ -46,6 +54,7 @@ pub fn jsonb_patch(
 ) -> crate::Result<Value> {
     let (target, patch) = (target.as_value_ref(), patch.as_value_ref());
     match (target, patch) {
+        (ValueRef::Null, _) | (_, ValueRef::Null) => return Ok(Value::Null),
         (ValueRef::Blob(_), _) | (_, ValueRef::Blob(_)) => {
             crate::bail_constraint_error!("blob is not supported!");
         }
@@ -56,7 +65,14 @@ pub fn jsonb_patch(
     let make_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let patch = cache.get_or_insert_with(patch, make_jsonb)?;
 
-    target.patch(&patch)?;
+    if patch.element_type()? != super::jsonb::ElementType::OBJECT {
+        target = patch;
+    } else {
+        if target.element_type()? != super::jsonb::ElementType::OBJECT {
+            target = super::jsonb::Jsonb::from_str("{}").unwrap();
+        }
+        target.patch(&patch)?;
+    }
 
     let element_type = target.element_type()?;
 
