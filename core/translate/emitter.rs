@@ -1691,7 +1691,10 @@ fn emit_program_for_delete(
     }
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
+    // FkCheck must come before the scan-back so that FK violations prevent
+    // RETURNING rows from being emitted (matching SQLite behavior).
     if let Some(ref buf) = returning_buffer {
+        program.emit_insn(Insn::FkCheck { deferred: false });
         emit_returning_scan_back(program, buf);
     }
     // Finalize program
@@ -2709,7 +2712,10 @@ fn emit_program_for_update(
     }
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
+    // FkCheck must come before the scan-back so that FK violations prevent
+    // RETURNING rows from being emitted (matching SQLite behavior).
     if let Some(ref buf) = returning_buffer {
+        program.emit_insn(Insn::FkCheck { deferred: false });
         emit_returning_scan_back(program, buf);
     }
     after(program);

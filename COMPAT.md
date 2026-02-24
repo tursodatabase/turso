@@ -805,6 +805,7 @@ Modifiers:
 | Eq             | ✅ Yes    |         |
 | Expire         | ❌ No     |         |
 | Explain        | ❌ No     |         |
+| FkCheck        | ✅ Yes    |         |
 | FkCounter      | ✅ Yes    |         |
 | FkIfZero       | ✅ Yes    |         |
 | Found          | ✅ Yes    |         |

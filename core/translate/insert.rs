@@ -956,7 +956,10 @@ fn emit_epilogue(
     }
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
+    // FkCheck must come before the scan-back so that FK violations prevent
+    // RETURNING rows from being emitted (matching SQLite behavior).
     if let Some(ref buf) = ctx.returning_buffer {
+        program.emit_insn(Insn::FkCheck { deferred: false });
         emit_returning_scan_back(program, buf);
     }
     program.resolve_label(ctx.halt_label, program.offset());

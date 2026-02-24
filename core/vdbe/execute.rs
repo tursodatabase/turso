@@ -10885,6 +10885,33 @@ pub fn op_fk_if_zero(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_fk_check(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(FkCheck { deferred }, insn);
+    if !program.connection.foreign_keys_enabled() {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let v = if *deferred {
+        program.connection.get_deferred_foreign_key_violations()
+    } else {
+        state
+            .fk_immediate_violations_during_stmt
+            .load(Ordering::Acquire)
+    };
+    if v > 0 {
+        return Err(LimboError::ForeignKeyConstraint(
+            "immediate foreign key constraint failed".to_string(),
+        ));
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_hash_build(
     program: &Program,
     state: &mut ProgramState,

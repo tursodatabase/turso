@@ -1398,6 +1398,13 @@ pub enum Insn {
         deferred: bool,
         target_pc: BranchOffset,
     },
+    // Check if there are any unresolved foreign key constraint violations.
+    // If P1 is zero, check the statement constraint-counter (immediate FK violations).
+    // If P1 is non-zero, check the database constraint-counter (deferred FK violations).
+    // If violations exist, throw SQLITE_CONSTRAINT_FOREIGNKEY.
+    FkCheck {
+        deferred: bool,
+    },
 
     /// Build a hash table from a cursor for hash join.
     HashBuild {
@@ -1692,6 +1699,7 @@ impl InsnVariants {
             InsnVariants::SequenceTest => execute::op_sequence_test,
             InsnVariants::FkCounter => execute::op_fk_counter,
             InsnVariants::FkIfZero => execute::op_fk_if_zero,
+            InsnVariants::FkCheck => execute::op_fk_check,
             InsnVariants::VBegin => execute::op_vbegin,
             InsnVariants::VRename => execute::op_vrename,
             InsnVariants::FilterAdd => execute::op_filter_add,
