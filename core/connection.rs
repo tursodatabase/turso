@@ -736,6 +736,10 @@ impl Connection {
         self.fk_deferred_violations.load(Ordering::Acquire)
     }
 
+    pub(crate) fn increment_deferred_foreign_key_violations(&self, v: isize) {
+        self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
+    }
+
     /// Query the CREATE TYPE SQL definitions stored in __turso_internal_types.
     /// The connection's schema must already contain the table definitions so
     /// that `prepare` can resolve the table name. Returns an empty Vec if the

@@ -633,7 +633,7 @@ impl ProgramState {
         );
         // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
         self.fk_immediate_violations_during_stmt
-            .store(0, Ordering::SeqCst);
+            .store(0, Ordering::Release);
         Ok(IOResult::Done(()))
     }
 
@@ -738,6 +738,16 @@ impl ProgramState {
     /// Checks if a bloom filter exists for the given cursor ID.
     pub fn has_bloom_filter(&self, cursor_id: usize) -> bool {
         self.bloom_filters.contains_key(&cursor_id)
+    }
+
+    pub fn get_fk_immediate_violations_during_stmt(&self) -> isize {
+        self.fk_immediate_violations_during_stmt
+            .load(Ordering::Acquire)
+    }
+
+    pub fn increment_fk_immediate_violations_during_stmt(&self, v: isize) {
+        self.fk_immediate_violations_during_stmt
+            .fetch_add(v, Ordering::AcqRel);
     }
 }
 

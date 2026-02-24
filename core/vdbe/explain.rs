@@ -2034,6 +2034,15 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
+        Insn::FkCheck{ deferred } => (
+        "FkCheck",
+            *deferred as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
         Insn::HashBuild { data } => {
             let payload_info = if let Some(p_reg) = data.payload_start_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + data.num_payload - 1)

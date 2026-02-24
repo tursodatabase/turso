@@ -14,7 +14,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode           p1  p2  p3  p4     p5  comment
-   0  Init              0  45   0          0  Start at 45
+   0  Init              0  46   0          0  Start at 46
    1  OpenEphemeral     1   1   0          0  cursor=1 is_table=true
    2  OpenWrite         2   2   0          0  root=2; iDb=0
    3  Integer           1   2   0          0  r[2]=1
@@ -52,12 +52,13 @@ addr  opcode           p1  p2  p3  p4     p5  comment
   35  Insert            1  21  22          4  intkey=r[22] data=r[21]
   36  Goto              0  37   0          0
   37  Goto              0  38   0          0
-  38  Rewind            1  44   0          0  Rewind  ephemeral(t1)
-  39    Column          1   0  23          0  r[23]=ephemeral(t1).id
-  40    Column          1   1  24          0  r[24]=ephemeral(t1).name
-  41    Column          1   2  25          0  r[25]=ephemeral(t1).value
-  42    ResultRow      23   3   0          0  output=r[23..25]
-  43  Next              1  39   0          0
-  44  Halt              0   0   0          0
-  45  Transaction       0   2   2          0  iDb=0 tx_mode=Write
-  46  Goto              0   1   0          0
+  38  FkCheck           0   0   0          0
+  39  Rewind            1  45   0          0  Rewind  ephemeral(t1)
+  40    Column          1   0  23          0  r[23]=ephemeral(t1).id
+  41    Column          1   1  24          0  r[24]=ephemeral(t1).name
+  42    Column          1   2  25          0  r[25]=ephemeral(t1).value
+  43    ResultRow      23   3   0          0  output=r[23..25]
+  44  Next              1  40   0          0
+  45  Halt              0   0   0          0
+  46  Transaction       0   2   2          0  iDb=0 tx_mode=Write
+  47  Goto              0   1   0          0
