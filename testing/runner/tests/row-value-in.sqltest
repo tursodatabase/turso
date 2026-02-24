@@ -1,0 +1,79 @@
+@database :memory:
+
+# Regression tests for row value (tuple) IN expression.
+# Previously crashed with "insufficient registers allocated for expression vector write".
+
+setup schema {
+    CREATE TABLE t(a INT, b INT, c TEXT);
+    INSERT INTO t VALUES (1,10,'x'),(2,20,'y'),(1,20,'z'),(3,30,'w');
+}
+
+test row-value-in-literal {
+    SELECT (1,2) IN ((1,2),(3,4));
+}
+expect {
+    1
+}
+
+test row-value-in-literal-no-match {
+    SELECT (1,2) IN ((3,4),(5,6));
+}
+expect {
+    0
+}
+
+@setup schema
+test row-value-in-where-clause {
+    SELECT * FROM t WHERE (a, b) IN ((1,10),(2,20)) ORDER BY a, b;
+}
+expect {
+    1|10|x
+    2|20|y
+}
+
+@setup schema
+test row-value-in-where-no-match {
+    SELECT * FROM t WHERE (a, b) IN ((9,9),(8,8)) ORDER BY a, b;
+}
+expect {
+}
+
+@setup schema
+test row-value-in-single-element-list {
+    SELECT * FROM t WHERE (a, b) IN ((1,10)) ORDER BY a, b;
+}
+expect {
+    1|10|x
+}
+
+@setup schema
+test row-value-not-in {
+    SELECT * FROM t WHERE (a, b) NOT IN ((1,10),(2,20)) ORDER BY a, b;
+}
+expect {
+    1|20|z
+    3|30|w
+}
+
+test row-value-in-three-columns {
+    SELECT (1,2,3) IN ((1,2,3),(4,5,6));
+}
+expect {
+    1
+}
+
+test row-value-in-three-columns-no-match {
+    SELECT (1,2,3) IN ((1,2,4),(4,5,6));
+}
+expect {
+    0
+}
+
+@setup schema
+test row-value-in-or-condition {
+    SELECT * FROM t WHERE (a, b) IN ((1,10)) OR c = 'w' ORDER BY a, b;
+}
+expect {
+    1|10|x
+    3|30|w
+}

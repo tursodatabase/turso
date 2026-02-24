@@ -282,11 +282,8 @@ fn translate_in_list(
     // dest if null should be in ConditionMetadata
     resolver: &Resolver,
 ) -> Result<()> {
-    let lhs_reg = if let Expr::Parenthesized(v) = lhs {
-        program.alloc_registers(v.len())
-    } else {
-        program.alloc_register()
-    };
+    let lhs_arity = expr_vector_size(lhs)?;
+    let lhs_reg = program.alloc_registers(lhs_arity);
     let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
     let mut check_null_reg = 0;
     let label_ok = program.allocate_label();
@@ -307,7 +304,7 @@ fn translate_in_list(
 
     for (i, expr) in rhs.iter().enumerate() {
         let last_condition = i == rhs.len() - 1;
-        let rhs_reg = program.alloc_register();
+        let rhs_reg = program.alloc_registers(lhs_arity);
         let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
 
         if check_null_reg != 0 && expr.can_be_null() {
@@ -318,36 +315,96 @@ fn translate_in_list(
             });
         }
 
-        if !last_condition
-            || condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null
-        {
-            if lhs_reg != rhs_reg {
-                program.emit_insn(Insn::Eq {
+        if lhs_arity == 1 {
+            // Scalar comparison path
+            if !last_condition
+                || condition_metadata.jump_target_when_false
+                    != condition_metadata.jump_target_when_null
+            {
+                if lhs_reg != rhs_reg {
+                    program.emit_insn(Insn::Eq {
+                        lhs: lhs_reg,
+                        rhs: rhs_reg,
+                        target_pc: label_ok,
+                        flags: cmp_flags,
+                        collation: program.curr_collation(),
+                    });
+                } else {
+                    program.emit_insn(Insn::NotNull {
+                        reg: lhs_reg,
+                        target_pc: label_ok,
+                    });
+                }
+            } else if lhs_reg != rhs_reg {
+                program.emit_insn(Insn::Ne {
                     lhs: lhs_reg,
                     rhs: rhs_reg,
-                    target_pc: label_ok,
-                    flags: cmp_flags,
+                    target_pc: condition_metadata.jump_target_when_false,
+                    flags: cmp_flags.jump_if_null(),
                     collation: program.curr_collation(),
                 });
             } else {
-                program.emit_insn(Insn::NotNull {
+                program.emit_insn(Insn::IsNull {
                     reg: lhs_reg,
-                    target_pc: label_ok,
+                    target_pc: condition_metadata.jump_target_when_false,
                 });
             }
-        } else if lhs_reg != rhs_reg {
-            program.emit_insn(Insn::Ne {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                target_pc: condition_metadata.jump_target_when_false,
-                flags: cmp_flags.jump_if_null(),
-                collation: program.curr_collation(),
-            });
         } else {
-            program.emit_insn(Insn::IsNull {
-                reg: lhs_reg,
-                target_pc: condition_metadata.jump_target_when_false,
-            });
+            // Row-valued comparison path: compare each component
+            if !last_condition
+                || condition_metadata.jump_target_when_false
+                    != condition_metadata.jump_target_when_null
+            {
+                // If all components match, jump to label_ok; otherwise skip to next RHS item
+                let skip_label = program.allocate_label();
+                for j in 0..lhs_arity {
+                    let (aff, collation) = row_component_affinity_collation(
+                        lhs,
+                        expr,
+                        j,
+                        referenced_tables,
+                        Some(resolver),
+                    )?;
+                    let flags = CmpInsFlags::default().with_affinity(aff);
+                    if j < lhs_arity - 1 {
+                        program.emit_insn(Insn::Ne {
+                            lhs: lhs_reg + j,
+                            rhs: rhs_reg + j,
+                            target_pc: skip_label,
+                            flags,
+                            collation,
+                        });
+                    } else {
+                        program.emit_insn(Insn::Eq {
+                            lhs: lhs_reg + j,
+                            rhs: rhs_reg + j,
+                            target_pc: label_ok,
+                            flags,
+                            collation,
+                        });
+                    }
+                }
+                program.preassign_label_to_next_insn(skip_label);
+            } else {
+                // Last condition, simple case: jump to false if any component doesn't match
+                for j in 0..lhs_arity {
+                    let (aff, collation) = row_component_affinity_collation(
+                        lhs,
+                        expr,
+                        j,
+                        referenced_tables,
+                        Some(resolver),
+                    )?;
+                    let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
+                    program.emit_insn(Insn::Ne {
+                        lhs: lhs_reg + j,
+                        rhs: rhs_reg + j,
+                        target_pc: condition_metadata.jump_target_when_false,
+                        flags,
+                        collation,
+                    });
+                }
+            }
         }
     }
 
