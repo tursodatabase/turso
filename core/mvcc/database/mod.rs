@@ -1880,6 +1880,10 @@ pub struct RowidAllocator {
     /// last_rowid is the last rowid that was allocated.
     max_rowid: RwLock<Option<i64>>,
     initialized: AtomicBool,
+    /// Count of rowids allocated (via NewRowid) but not yet inserted.
+    /// Used to detect in-flight allocations from other threads during
+    /// ReadingMaxRowid, preventing duplicate rowid assignment.
+    pending_inserts: AtomicI64,
 }
 
 /// A multi-version concurrency control database.
@@ -4573,6 +4577,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 lock: TursoRwLock::new(),
                 max_rowid: RwLock::new(None),
                 initialized: AtomicBool::new(false),
+                pending_inserts: AtomicI64::new(0),
             });
             map.insert(*table_id, allocator.clone());
             allocator
@@ -4647,6 +4652,24 @@ impl RowidAllocator {
 
     pub fn invalidate(&self) {
         self.initialized.store(false, Ordering::SeqCst);
+    }
+
+    /// Read current max_rowid without modifying state.
+    /// Caller must hold the allocator lock.
+    pub fn current_max_rowid(&self) -> Option<i64> {
+        *self.max_rowid.read()
+    }
+
+    pub fn increment_pending(&self) {
+        self.pending_inserts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn decrement_pending(&self) {
+        self.pending_inserts.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.pending_inserts.load(Ordering::SeqCst) > 0
     }
 
     pub fn lock(&self) -> bool {
