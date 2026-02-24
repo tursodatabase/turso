@@ -660,10 +660,22 @@ pub fn generate_create_table<C: Capabilities>(
         }
     };
 
+    let strict = ctx.gen_bool_with_prob(create_table_config.strict_probability);
+
+    // STRICT tables don't allow untyped (Null) columns — convert to Integer.
+    if strict {
+        for col in &mut columns {
+            if col.data_type == DataType::Null {
+                col.data_type = DataType::Integer;
+            }
+        }
+    }
+
     Ok(Stmt::CreateTable(CreateTableStmt {
         table: qualified_table_name,
         columns,
         if_not_exists: ctx.gen_bool_with_prob(create_table_config.if_not_exists_probability),
+        strict,
     }))
 }
 

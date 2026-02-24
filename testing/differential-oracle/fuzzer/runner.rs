@@ -196,8 +196,9 @@ impl Fuzzer {
 
         // Create Turso in-memory database using MemorySimIO
         let io = Arc::new(MemorySimIO::new(config.seed));
-        let mut opts = turso_core::DatabaseOpts::new();
-        opts = opts.with_attach(true);
+        let opts = turso_core::DatabaseOpts::new()
+            .with_attach(true)
+            .with_strict(true);
 
         let turso_db = Database::open_file_with_flags(
             io.clone(),
@@ -519,13 +520,22 @@ impl Fuzzer {
             );
         }
 
-        // Verify each table's columns match
+        // Verify each table's columns and strict flags match
         for turso_table in turso_schema.tables.iter() {
             let sqlite_table = sqlite_schema
                 .tables
                 .iter()
                 .find(|t| t.name == turso_table.name && t.database == turso_table.database)
                 .expect("Table should exist in SQLite schema");
+
+            if turso_table.strict != sqlite_table.strict {
+                bail!(
+                    "STRICT mismatch in table '{}': Turso strict={}, SQLite strict={}",
+                    turso_table.name,
+                    turso_table.strict,
+                    sqlite_table.strict
+                );
+            }
 
             let turso_cols: Vec<_> = turso_table.columns.iter().map(|c| &c.name).collect();
             let sqlite_cols: Vec<_> = sqlite_table.columns.iter().map(|c| &c.name).collect();

@@ -85,6 +85,7 @@ pub fn insert_for_table(
 ) -> BoxedStrategy<InsertStatement> {
     let table_name = table.qualified_name();
     let columns = table.columns.clone();
+    let is_strict = table.strict;
     let functions = builtin_functions();
 
     // Extract profile values from the InsertProfile
@@ -101,9 +102,24 @@ pub fn insert_for_table(
         .with_aggregates(allow_aggregates)
         .with_profile(expr_profile);
 
+    let profile_clone = profile.clone();
     let value_strategies: Vec<BoxedStrategy<Expression>> = columns
         .iter()
-        .map(|c| crate::expression::expression_for_type(Some(&c.data_type), &ctx))
+        .map(|c| {
+            if is_strict {
+                // For STRICT tables, use only literal values. expression_for_type
+                // targets a type via SQL affinity rules, but STRICT tables enforce
+                // runtime type checking that rejects values whose storage class doesn't
+                // match (e.g., `1 + 0.5` yields REAL for an INTEGER column, or
+                // `CAST('abc' AS INTEGER)` yields 0). Literal values guarantee the
+                // storage class matches the column type.
+                crate::value::value_for_type(&c.data_type, c.nullable, &profile_clone)
+                    .prop_map(Expression::Value)
+                    .boxed()
+            } else {
+                crate::expression::expression_for_type(Some(&c.data_type), &ctx)
+            }
+        })
         .collect();
 
     value_strategies

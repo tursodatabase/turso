@@ -122,6 +122,7 @@ pub struct Table {
     /// `None` means the main database.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
+    pub strict: bool,
 }
 
 impl Table {
@@ -130,6 +131,16 @@ impl Table {
             name: name.into(),
             columns,
             database: None,
+            strict: false,
+        }
+    }
+
+    pub fn new_strict(name: impl Into<String>, columns: Vec<ColumnDef>) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            database: None,
+            strict: true,
         }
     }
 

@@ -800,6 +800,7 @@ pub struct CreateTableStmt {
     pub table: String,
     pub columns: Vec<ColumnDefStmt>,
     pub if_not_exists: bool,
+    pub strict: bool,
 }
 
 impl fmt::Display for CreateTableStmt {
@@ -817,7 +818,13 @@ impl fmt::Display for CreateTableStmt {
             write!(f, "{col}")?;
         }
 
-        write!(f, ")")
+        write!(f, ")")?;
+
+        if self.strict {
+            write!(f, " STRICT")?;
+        }
+
+        Ok(())
     }
 }
 

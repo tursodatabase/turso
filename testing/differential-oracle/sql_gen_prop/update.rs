@@ -93,6 +93,7 @@ pub fn update_for_table(
 ) -> BoxedStrategy<UpdateStatement> {
     let table_name = table.qualified_name();
     let updatable: Vec<ColumnDef> = table.updatable_columns().cloned().collect();
+    let is_strict = table.strict;
     let functions = builtin_functions();
 
     // Extract profile values from the UpdateProfile
@@ -129,6 +130,7 @@ pub fn update_for_table(
 
     let col_indices: Vec<usize> = (0..updatable.len()).collect();
     let updatable_clone = updatable.clone();
+    let profile_for_strict = profile.clone();
 
     (
         proptest::sample::subsequence(col_indices, 1..=updatable.len()),
@@ -142,9 +144,16 @@ pub fn update_for_table(
                 .iter()
                 .map(|c| {
                     let name = c.name.clone();
-                    crate::expression::expression_for_type(Some(&c.data_type), &ctx)
-                        .prop_map(move |expr| (name.clone(), expr))
-                        .boxed()
+                    if is_strict {
+                        // For STRICT tables, use only literal values (see insert.rs for rationale)
+                        crate::value::value_for_type(&c.data_type, c.nullable, &profile_for_strict)
+                            .prop_map(move |v| (name.clone(), Expression::Value(v)))
+                            .boxed()
+                    } else {
+                        crate::expression::expression_for_type(Some(&c.data_type), &ctx)
+                            .prop_map(move |expr| (name.clone(), expr))
+                            .boxed()
+                    }
                 })
                 .collect();
 
