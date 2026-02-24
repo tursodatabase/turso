@@ -2,7 +2,7 @@
 
 This document describes the SQLAlchemy dialect implementation for pyturso.
 
-## Status: Implemented ✅
+## Status: Implemented
 
 The SQLAlchemy dialect is fully implemented with two dialects:
 - `sqlite+turso://` - Basic local database connections
@@ -123,6 +123,11 @@ Query parameters:
 - `isolation_level` - Transaction isolation level
 - `experimental_features` - Comma-separated feature flags
 
+URL validation:
+- Username/password in URL raises `ValueError` (use `auth_token` instead)
+- Host/port in URL raises `ValueError` (use `remote_url` query param instead)
+- Unrecognized query parameters emit a `UserWarning`
+
 ## Sync Operations
 
 The `get_sync_connection()` helper provides access to sync-specific methods:
@@ -148,45 +153,76 @@ with engine.connect() as conn:
     print(f"Network received: {stats.network_received_bytes} bytes")
 ```
 
+`get_sync_connection()` raises `TypeError` if called on a non-sync connection (e.g. a plain `sqlite+turso://` or standard `sqlite://` engine).
+
 ## Architecture
 
 ```
-SQLiteDialect_pysqlite (SQLAlchemy built-in)
+_TursoDialectMixin (reflection overrides)
         │
+        │   SQLiteDialect_pysqlite (SQLAlchemy built-in)
+        │           │
+        ├───────────┤
+        │           │
         ├── TursoDialect (sqlite+turso://)
-        │       └── uses turso.connect()
+        │       ├── uses turso.connect()
+        │       └── pool: SingletonThreadPool (:memory:) / QueuePool (file)
         │
         └── TursoSyncDialect (sqlite+turso_sync://)
-                └── uses turso.sync.connect()
-                        └── ConnectionSync (pull/push/checkpoint/stats)
+                ├── uses turso.sync.connect()
+                ├── pool: SingletonThreadPool (:memory:) / QueuePool (file)
+                └── get_sync_connection() → ConnectionSync (pull/push/checkpoint/stats)
 ```
+
+Both dialects use Python MRO: `_TursoDialectMixin` provides PRAGMA-related overrides, `SQLiteDialect_pysqlite` provides core SQLite dialect behavior.
 
 ## What Pyturso Provides
 
 | Requirement | Status |
 |-------------|--------|
-| `apilevel = "2.0"` | ✅ |
-| `threadsafety = 1` | ✅ |
-| `paramstyle = "qmark"` | ✅ |
-| `sqlite_version` | ✅ |
-| `sqlite_version_info` | ✅ |
-| `connect()` function | ✅ |
-| `Connection` class | ✅ |
-| `Cursor` class | ✅ |
-| Exception hierarchy | ✅ |
+| `apilevel = "2.0"` | Provided |
+| `threadsafety = 1` | Provided |
+| `paramstyle = "qmark"` | Provided |
+| `sqlite_version` | Provided |
+| `sqlite_version_info` | Provided |
+| `connect()` function | Provided |
+| `Connection` class | Provided |
+| `Cursor` class | Provided |
+| Exception hierarchy | Provided |
+
+Both `turso` and `turso.sync` modules expose the full DB-API 2.0 interface including exception hierarchy (`Warning`, `Error`, `InterfaceError`, `DatabaseError`, `DataError`, `OperationalError`, `IntegrityError`, `InternalError`, `ProgrammingError`, `NotSupportedError`).
 
 ## Dialect Overrides
 
-The dialects override several methods from `SQLiteDialect_pysqlite`:
+Both dialects share these overrides via `_TursoDialectMixin` and direct method implementations:
 
-- `import_dbapi()` - Return `turso` or `turso.sync` module
-- `create_connect_args()` - Parse URL to connection arguments
-- `on_connect()` - Disabled (turso doesn't support `create_function`)
-- `get_isolation_level()` - Return SERIALIZABLE (turso doesn't support PRAGMA read_uncommitted)
-- `set_isolation_level()` - No-op (isolation set at connection time)
-- `get_foreign_keys()` - Returns empty (PRAGMA foreign_key_list not supported)
-- `get_indexes()` - Returns empty (PRAGMA index_list not supported)
-- `get_unique_constraints()` - Returns empty (relies on unsupported PRAGMA)
+### Class Attributes
+
+- `supports_statement_cache = True` - Enables SQLAlchemy statement caching for performance
+- `supports_native_datetime = False` - Turso handles datetime as strings, not native types
+
+### Method Overrides
+
+- `import_dbapi()` - Returns `turso` or `turso.sync` module
+- `create_connect_args()` - Parses URL to connection arguments
+- `on_connect()` - Returns `None` (skips REGEXP function setup that pysqlite does, since turso doesn't support `create_function`)
+- `get_isolation_level()` - Returns `SERIALIZABLE` (turso doesn't support `PRAGMA read_uncommitted`)
+- `set_isolation_level()` - No-op (isolation set at connection time via `isolation_level` param)
+- `get_pool_class()` - Returns `SingletonThreadPool` for `:memory:`, `QueuePool` for file databases
+
+### Reflection Overrides (via `_TursoDialectMixin`)
+
+Single-table methods (return empty list):
+- `get_foreign_keys()` - `PRAGMA foreign_key_list` not supported
+- `get_indexes()` - `PRAGMA index_list` not supported
+- `get_unique_constraints()` - Relies on `PRAGMA index_list`
+- `get_check_constraints()` - `sqlite_master` parsing not fully supported
+
+Multi-table methods (return empty dict):
+- `get_multi_indexes()`
+- `get_multi_unique_constraints()`
+- `get_multi_foreign_keys()`
+- `get_multi_check_constraints()`
 
 ## Limitations
 
@@ -199,18 +235,35 @@ Turso doesn't support some SQLite PRAGMAs used for table reflection:
 This means:
 - `inspector.get_foreign_keys()` returns empty list
 - `inspector.get_indexes()` returns empty list
-- Foreign keys and indexes still **work** at runtime, just can't be introspected
+- `inspector.get_unique_constraints()` returns empty list
+- `inspector.get_check_constraints()` returns empty list
+- Foreign keys, indexes, and constraints still **work** at runtime, just can't be introspected
+- `inspector.get_table_names()` and `inspector.get_columns()` work normally
 
 This doesn't affect normal usage including:
 - Pandas `df.to_sql()` with `if_exists='replace'`
 - SQLAlchemy ORM operations
 - Alembic migrations (when using `--autogenerate`, manually verify FK/index changes)
 
+### Native Datetime
+
+`supports_native_datetime` is set to `False`. Datetime columns should use `String` type and store ISO format strings. SQLAlchemy's `DateTime` type will still work but values are stored/retrieved as strings.
+
+## Entry Points
+
+Dialects are registered via `pyproject.toml` entry points:
+
+```toml
+[project.entry-points."sqlalchemy.dialects"]
+"sqlite.turso" = "turso.sqlalchemy:TursoDialect"
+"sqlite.turso_sync" = "turso.sqlalchemy:TursoSyncDialect"
+```
+
 ## Files
 
-- `turso/sqlalchemy/__init__.py` - Module exports
-- `turso/sqlalchemy/dialect.py` - Dialect implementations
-- `tests/test_sqlalchemy.py` - Tests
+- `turso/sqlalchemy/__init__.py` - Module exports (`TursoDialect`, `TursoSyncDialect`, `get_sync_connection`)
+- `turso/sqlalchemy/dialect.py` - Dialect implementations and `_TursoDialectMixin`
+- `tests/test_sqlalchemy.py` - Tests (28 tests across 8 test classes)
 
 ## References
 
