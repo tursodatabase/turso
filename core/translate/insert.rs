@@ -16,7 +16,8 @@ use crate::{
         },
         fkeys::{
             build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
-            fire_fk_delete_actions, index_probe, open_read_index, open_read_table,
+            fire_prepared_fk_delete_actions, index_probe, open_read_index, open_read_table,
+            prepare_fk_delete_actions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -2976,17 +2977,15 @@ fn emit_replace_delete_conflicting_row(
         target_pc: ctx.halt_label,
     });
 
-    // OR REPLACE + foreign keys:
-    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for the row being deleted.
-    // This handles all FK action types including NO ACTION/RESTRICT.
-    if connection.foreign_keys_enabled() {
-        fire_fk_delete_actions(
+    // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
+    // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
+    let prepared_fk_actions = if connection.foreign_keys_enabled() {
+        let prepared = prepare_fk_delete_actions(
             program,
             resolver,
             ctx.table.name.as_str(),
             ctx.cursor_id,
             ctx.conflict_rowid_reg,
-            connection,
             ctx.database_id,
         )?;
         if resolver.schema().has_child_fks(ctx.table.name.as_str()) {
@@ -3000,7 +2999,10 @@ fn emit_replace_delete_conflicting_row(
                 resolver,
             )?;
         }
-    }
+        prepared
+    } else {
+        Vec::new()
+    };
 
     let table = &ctx.table;
     let table_name = table.name.as_str();
@@ -3112,6 +3114,18 @@ fn emit_replace_delete_conflicting_row(
         table_name: table_name.to_string(),
         is_part_of_update: true,
     });
+
+    // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
+    if !prepared_fk_actions.is_empty() {
+        fire_prepared_fk_delete_actions(
+            program,
+            resolver,
+            prepared_fk_actions,
+            connection,
+            ctx.database_id,
+        )?;
+    }
+
     Ok(())
 }
 

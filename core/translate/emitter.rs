@@ -43,8 +43,8 @@ use crate::translate::expr::{
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters, emit_fk_update_parent_actions,
-    emit_guarded_fk_decrement, fire_fk_delete_actions, fire_fk_update_actions, open_read_index,
-    open_read_table, stabilize_new_row_for_fk,
+    emit_guarded_fk_decrement, fire_fk_update_actions, fire_prepared_fk_delete_actions,
+    open_read_index, open_read_table, prepare_fk_delete_actions, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{
     DeletePlan, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinedTable, NonFromClauseSubquery,
@@ -2024,24 +2024,26 @@ fn emit_delete_row_common(
     let internal_id = unsafe { (*table_reference).internal_id };
     let table_name = unsafe { &*table_reference }.table.get_name();
 
-    if connection.foreign_keys_enabled() {
+    // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
+    // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
+    let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let delete_db_id = unsafe { (*table_reference).database_id };
         if let Some(table) = unsafe { &*table_reference }.btree() {
-            if t_ctx
+            let prepared = if t_ctx
                 .resolver
                 .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
             {
-                // Use sub-program based FK actions (CASCADE, SET NULL, SET DEFAULT, and NO ACTION)
-                fire_fk_delete_actions(
+                prepare_fk_delete_actions(
                     program,
                     &mut t_ctx.resolver,
                     table_name,
                     main_table_cursor_id,
                     rowid_reg,
-                    connection,
                     delete_db_id,
-                )?;
-            }
+                )?
+            } else {
+                Vec::new()
+            };
             if t_ctx
                 .resolver
                 .with_schema(delete_db_id, |s| s.has_child_fks(table_name))
@@ -2056,8 +2058,13 @@ fn emit_delete_row_common(
                     &t_ctx.resolver,
                 )?;
             }
+            prepared
+        } else {
+            Vec::new()
         }
-    }
+    } else {
+        Vec::new()
+    };
 
     if unsafe { &*table_reference }.virtual_table().is_some() {
         let conflict_action = 0u16;
@@ -2195,6 +2202,20 @@ fn emit_delete_row_common(
             table_name: table_name.to_string(),
             is_part_of_update: false,
         });
+    }
+
+    // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
+    // Per SQLite docs, the parent row must be deleted before FK cascade actions fire,
+    // so triggers during cascade see the parent row as already deleted.
+    if !prepared_fk_actions.is_empty() {
+        let delete_db_id = unsafe { (*table_reference).database_id };
+        fire_prepared_fk_delete_actions(
+            program,
+            &mut t_ctx.resolver,
+            prepared_fk_actions,
+            connection,
+            delete_db_id,
+        )?;
     }
 
     Ok(())
