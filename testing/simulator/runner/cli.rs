@@ -22,6 +22,7 @@ pub enum IoBackend {
     /// Use io_uring backend (linux only)
     #[cfg(target_os = "linux")]
     IoUring,
+    /// Use win_iocp backend (windows only)
     #[cfg(target_os = "windows")]
     WindowsIOCP,
 }

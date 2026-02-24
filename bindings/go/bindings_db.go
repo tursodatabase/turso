@@ -109,6 +109,7 @@ type TursoDatabaseConfig struct {
 	// - "memory": in-memory backend
 	// - "syscall": generic syscall backend
 	// - "io_uring": IO uring (supported only on Linux)
+	// - "experimental_win_iocp": Windows IOCP [experimental](supported only on Windows)
 	Vfs string
 	// optional encryption parameters
 	// as encryption is experimental - ExperimentalFeatures must have "encryption" in the list

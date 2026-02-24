@@ -592,7 +592,7 @@ impl TursoDatabase {
                                 })?)
                             }
                             #[cfg(all(target_os = "windows", not(miri)))]
-                            Some("win_iocp") => {
+                            Some("experimental_win_iocp") => {
                                 Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
                                     TursoError::Error(format!(
                                         "unable to create win_iocp backend: {e}"
@@ -606,7 +606,7 @@ impl TursoDatabase {
                                 ));
                             }
                             #[cfg(any(not(target_os = "windows"), miri))]
-                            Some("win_iocp") => {
+                            Some("experimental_win_iocp") => {
                                 return Err(TursoError::Error(
                                     "win_iocp is only available on Windows targets".to_string(),
                                 ));

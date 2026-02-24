@@ -26,7 +26,7 @@ path = "plan_to_test.rs"
 turso_core = { workspace = true, features = [
     "simulator",
     "io_uring",
-    "win_iocp",
+    "experimental_win_iocp",
 ] }
 rand = { workspace = true }
 rand_chacha = { workspace = true }

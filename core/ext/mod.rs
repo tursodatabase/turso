@@ -13,7 +13,7 @@ use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Mutex;
 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
-#[cfg(all(target_os = "windows", feature = "win_iocp", not(miri)))]
+#[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
 use crate::WindowsIOCP;
 
 use crate::{function::ExternalFunc, Connection, Database};
@@ -172,8 +172,8 @@ impl Database {
             "syscall" => Arc::new(SyscallIO::new()?),
             #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
             "io_uring" => Arc::new(UringIO::new()?),
-            #[cfg(all(target_os = "windows", feature = "win_iocp", not(miri)))]
-            "win_iocp" => Arc::new(WindowsIOCP::new()?),
+            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
+            "experimental_win_iocp" => Arc::new(WindowsIOCP::new()?),
             other => match get_vfs_modules().iter().find(|v| v.0 == vfs) {
                 Some((_, vfs)) => vfs.clone(),
                 None => {

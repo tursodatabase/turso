@@ -27,7 +27,7 @@ cfg_block! {
         pub use PlatformIO as SyscallIO;
     }
 
-    #[cfg(all(target_os = "windows", feature = "win_iocp", not(miri)))] {
+    #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))] {
         mod win_iocp;
         #[cfg(feature = "fs")]
         pub use win_iocp::WindowsIOCP;
@@ -608,12 +608,22 @@ mod shuttle_tests {
         }
     }
 
-    #[cfg(all(target_os = "windows", feature = "win_iocp", feature = "fs", not(miri)))]
+    #[cfg(all(
+        target_os = "windows",
+        feature = "experimental_win_iocp",
+        feature = "fs",
+        not(miri)
+    ))]
     struct WinIOCPFactory {
         temp_dir: tempfile::TempDir,
     }
 
-    #[cfg(all(target_os = "windows", feature = "win_iocp", feature = "fs", not(miri)))]
+    #[cfg(all(
+        target_os = "windows",
+        feature = "experimental_win_iocp",
+        feature = "fs",
+        not(miri)
+    ))]
     impl WinIOCPFactory {
         fn new() -> Self {
             Self {
@@ -622,7 +632,12 @@ mod shuttle_tests {
         }
     }
 
-    #[cfg(all(target_os = "windows", feature = "win_iocp", feature = "fs", not(miri)))]
+    #[cfg(all(
+        target_os = "windows",
+        feature = "experimental_win_iocp",
+        feature = "fs",
+        not(miri)
+    ))]
     impl IOFactory for WinIOCPFactory {
         fn create(&self) -> Arc<dyn IO> {
             Arc::new(WindowsIOCP::new().unwrap())
@@ -654,7 +669,7 @@ mod shuttle_tests {
                     shuttle::check_random(|| $test_impl(UringIOFactory::new()), 1000);
                 }
 
-                #[cfg(all(target_os = "windows", feature = "win_iocp", feature = "fs", not(miri)))]
+                #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", feature = "fs", not(miri)))]
                 #[test]
                 fn [<shuttle_ $test_name _win_iocp>]() {
                     shuttle::check_random(|| $test_impl(WinIOCPFactory::new()), 1000);

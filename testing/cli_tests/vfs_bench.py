@@ -20,7 +20,7 @@ if platform.system() == "Linux":
     vfs_list.append("io_uring")
 
 if platform.system() == "Windows":
-    vfs_list.append("win_iocp")
+    vfs_list.append("experimental_win_iocp")
 
 
 def append_time(times, start, perf_counter):

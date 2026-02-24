@@ -19,7 +19,7 @@ pub enum Io {
     Syscall,
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
     IoUring,
-    #[cfg(all(target_os = "windows", feature = "win_iocp"))]
+    #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
     WindowsIOCP,
     External(String),
     Memory,
@@ -32,8 +32,8 @@ impl Display for Io {
             Io::Syscall => write!(f, "syscall"),
             #[cfg(all(target_os = "linux", feature = "io_uring"))]
             Io::IoUring => write!(f, "io_uring"),
-            #[cfg(all(target_os = "windows", feature = "win_iocp"))]
-            Io::WindowsIOCP => write!(f, "win_iocp"),
+            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+            Io::WindowsIOCP => write!(f, "experimental_win_iocp"),
             Io::External(str) => write!(f, "{str}"),
         }
     }
@@ -111,8 +111,8 @@ impl From<Opts> for Settings {
                 "syscall" => Io::Syscall,
                 #[cfg(all(target_os = "linux", feature = "io_uring"))]
                 "io_uring" => Io::IoUring,
-                #[cfg(all(target_os = "windows", feature = "win_iocp"))]
-                "win_iocp" => Io::WindowsIOCP,
+                #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+                "experimental_win_iocp" => Io::WindowsIOCP,
                 "" => Io::default(),
                 vfs => Io::External(vfs.to_string()),
             },
@@ -184,8 +184,8 @@ pub fn get_io(db_location: DbLocation, io_choice: &str) -> anyhow::Result<Arc<dy
                 // We are building for Linux and io_uring backend has been selected
                 #[cfg(all(target_os = "linux", feature = "io_uring"))]
                 "io_uring" => Arc::new(turso_core::UringIO::new()?),
-                #[cfg(all(target_os = "windows", feature = "win_iocp"))]
-                "win_iocp" => Arc::new(turso_core::WindowsIOCP::new()?),
+                #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+                "experimental_win_iocp" => Arc::new(turso_core::WindowsIOCP::new()?),
                 _ => Arc::new(turso_core::PlatformIO::new()?),
             }
         }

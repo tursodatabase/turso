@@ -824,7 +824,7 @@ impl Connection {
             return Ok(false);
         };
         match self.get_pager().io.wait_for_completion(c) {
-            #[cfg(all(target_os = "windows", feature = "win_iocp"))]
+            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
             Err(LimboError::CompletionError(CompletionError::IOError(
                 std::io::ErrorKind::UnexpectedEof,
             ))) => {
@@ -1187,9 +1187,9 @@ impl Connection {
             {
                 all_vfs.push("io_uring".to_string());
             }
-            #[cfg(all(target_os = "windows", feature = "win_iocp"))]
+            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
             {
-                all_vfs.push("win_iocp".to_string());
+                all_vfs.push("experimental_win_iocp".to_string());
             }
             all_vfs.extend(crate::ext::list_vfs_modules());
         }

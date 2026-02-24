@@ -123,7 +123,7 @@ pub struct turso_database_config_t {
     pub path: *const ::std::os::raw::c_char,
     #[doc = " Optional comma separated list of experimental features to enable\n zero-terminated C string or null pointer"]
     pub experimental_features: *const ::std::os::raw::c_char,
-    #[doc = " optional VFS parameter explicitly specifying FS backend for the database.\n Available options are:\n - \"memory\": in-memory backend\n - \"syscall\": generic syscall backend\n - \"io_uring\": IO uring (supported only on Linux)"]
+    #[doc = " optional VFS parameter explicitly specifying FS backend for the database.\n Available options are:\n - \"memory\": in-memory backend\n - \"syscall\": generic syscall backend\n - \"io_uring\": IO uring (supported only on Linux)\n - \"experimental_win_iocp\": Windows IOCP [experimental](supported only on Windows)"]
     pub vfs: *const ::std::os::raw::c_char,
     #[doc = " optional encryption cipher\n as encryption is experimental - experimental_features must have \"encryption\" in the list"]
     pub encryption_cipher: *const ::std::os::raw::c_char,
