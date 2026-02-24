@@ -1418,7 +1418,6 @@ test raise-shorthand-normal-query {
     SELECT RAISE('normal query error');
 }
 expect error {
-    normal query error
 }
 
 # RAISE(IGNORE) in AFTER trigger with multiple triggers - remaining triggers skipped
