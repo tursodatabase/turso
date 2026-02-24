@@ -582,3 +582,24 @@ test fail-alter-table-drop-column-expr-index-multi-col {
 expect error {
 }
 
+@cross-check-integrity
+test alter-table-rename-column-substr-expression-index {
+    CREATE TABLE t(a,b,c);
+    CREATE INDEX i_expr ON t(substr(b,1,1));
+    INSERT INTO t VALUES(1,'bee',2);
+    ALTER TABLE t RENAME COLUMN b TO bb;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@cross-check-integrity
+test alter-table-rename-column-to-same-name-noop {
+    CREATE TABLE t(a);
+    ALTER TABLE t RENAME COLUMN a TO a;
+    SELECT name FROM pragma_table_info('t');
+}
+expect {
+    a
+}
