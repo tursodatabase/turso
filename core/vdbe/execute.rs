@@ -1146,6 +1146,8 @@ pub fn op_vupdate(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    #[cfg(not(feature = "cli_only"))]
+    let _ = pager;
     load_insn!(
         VUpdate {
             cursor_id,
@@ -1163,8 +1165,17 @@ pub fn op_vupdate(
     let CursorType::VirtualTable(virtual_table) = cursor_type else {
         panic!("VUpdate on non-virtual table cursor");
     };
-    let allow_dbpage_write = virtual_table.name == crate::dbpage::DBPAGE_TABLE_NAME
-        && program.connection.db.opts.unsafe_testing;
+    let allow_dbpage_write = {
+        #[cfg(feature = "cli_only")]
+        {
+            virtual_table.name == crate::dbpage::DBPAGE_TABLE_NAME
+                && program.connection.db.opts.unsafe_testing
+        }
+        #[cfg(not(feature = "cli_only"))]
+        {
+            false
+        }
+    };
     if virtual_table.readonly() && !allow_dbpage_write {
         return Err(LimboError::ReadOnly);
     }
@@ -1186,7 +1197,14 @@ pub fn op_vupdate(
         }
     }
     let result = if allow_dbpage_write {
-        crate::dbpage::update_dbpage(pager, &argv)
+        #[cfg(feature = "cli_only")]
+        {
+            crate::dbpage::update_dbpage(pager, &argv)
+        }
+        #[cfg(not(feature = "cli_only"))]
+        {
+            unreachable!("sqlite_dbpage writes require cli_only feature");
+        }
     } else {
         virtual_table.update(&argv)
     };

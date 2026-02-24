@@ -2464,8 +2464,19 @@ fn translate_virtual_table_insert(
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let allow_dbpage_write =
-        virtual_table.name == crate::dbpage::DBPAGE_TABLE_NAME && connection.db.opts.unsafe_testing;
+    #[cfg(not(feature = "cli_only"))]
+    let _ = connection;
+    let allow_dbpage_write = {
+        #[cfg(feature = "cli_only")]
+        {
+            virtual_table.name == crate::dbpage::DBPAGE_TABLE_NAME
+                && connection.db.opts.unsafe_testing
+        }
+        #[cfg(not(feature = "cli_only"))]
+        {
+            false
+        }
+    };
     if virtual_table.readonly() && !allow_dbpage_write {
         crate::bail_constraint_error!("Table is read-only: {}", virtual_table.name);
     }

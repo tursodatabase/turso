@@ -279,8 +279,16 @@ pub fn init_loop(
                             | OperationMode::UPDATE { .. }
                             | OperationMode::DELETE
                     );
-                    let allow_dbpage_write =
-                        t_ctx.unsafe_testing && tbl.name == crate::dbpage::DBPAGE_TABLE_NAME;
+                    let allow_dbpage_write = {
+                        #[cfg(feature = "cli_only")]
+                        {
+                            t_ctx.unsafe_testing && tbl.name == crate::dbpage::DBPAGE_TABLE_NAME
+                        }
+                        #[cfg(not(feature = "cli_only"))]
+                        {
+                            false
+                        }
+                    };
                     if is_write && tbl.readonly() && !allow_dbpage_write {
                         return Err(crate::LimboError::ReadOnly);
                     }
