@@ -1,0 +1,260 @@
+@database :memory:
+
+# Tests for MIN/MAX bare column optimization (issue #5545).
+# When a query has a single MIN/MAX aggregate with bare (non-aggregate) columns,
+# the bare columns should take their values from the row that contains the
+# minimum or maximum value.
+
+setup base-table {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES (1,10,'first'),(2,30,'second'),(3,20,'third');
+}
+
+@setup base-table
+@cross-check-integrity
+test max-bare-cols-basic {
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    2|second|30
+}
+
+@setup base-table
+@cross-check-integrity
+test min-bare-cols-basic {
+    SELECT id, name, MIN(val) FROM t;
+}
+expect {
+    1|first|10
+}
+
+@setup base-table
+@cross-check-integrity
+test max-bare-cols-with-count {
+    SELECT id, name, MAX(val), COUNT(*) FROM t;
+}
+expect {
+    2|second|30|3
+}
+
+@setup base-table
+@cross-check-integrity
+test min-bare-cols-with-count {
+    SELECT id, name, MIN(val), COUNT(*) FROM t;
+}
+expect {
+    1|first|10|3
+}
+
+# Single row table: bare columns come from that single row
+setup single-row {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES (1,42,'only');
+}
+
+@setup single-row
+@cross-check-integrity
+test max-single-row {
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    1|only|42
+}
+
+@setup single-row
+@cross-check-integrity
+test min-single-row {
+    SELECT id, name, MIN(val) FROM t;
+}
+expect {
+    1|only|42
+}
+
+# Empty table: bare columns should be NULL
+setup empty-table {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+}
+
+@setup empty-table
+@cross-check-integrity
+test max-empty-table {
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    ||
+}
+
+@setup empty-table
+@cross-check-integrity
+test min-empty-table {
+    SELECT id, name, MIN(val) FROM t;
+}
+expect {
+    ||
+}
+
+# NULL values in the aggregate column should be ignored
+setup with-nulls {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES (1,NULL,'first'),(2,30,'second'),(3,NULL,'third');
+}
+
+@setup with-nulls
+@cross-check-integrity
+test max-with-nulls {
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    2|second|30
+}
+
+@setup with-nulls
+@cross-check-integrity
+test min-with-nulls {
+    SELECT id, name, MIN(val) FROM t;
+}
+expect {
+    2|second|30
+}
+
+# MAX value at the last row (not the first)
+setup max-at-end {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES (1,10,'alpha'),(2,20,'beta'),(3,50,'gamma');
+}
+
+@setup max-at-end
+@cross-check-integrity
+test max-at-last-row {
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    3|gamma|50
+}
+
+# MIN value at the last row
+setup min-at-end {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES (1,30,'alpha'),(2,20,'beta'),(3,5,'gamma');
+}
+
+@setup min-at-end
+@cross-check-integrity
+test min-at-last-row {
+    SELECT id, name, MIN(val) FROM t;
+}
+expect {
+    3|gamma|5
+}
+
+# Text comparison for MIN/MAX
+setup text-values {
+    CREATE TABLE t(id INT, val TEXT, name TEXT);
+    INSERT INTO t VALUES (1,'banana','first'),(2,'apple','second'),(3,'cherry','third');
+}
+
+@setup text-values
+@cross-check-integrity
+test max-text-values {
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    3|third|cherry
+}
+
+@setup text-values
+@cross-check-integrity
+test min-text-values {
+    SELECT id, name, MIN(val) FROM t;
+}
+expect {
+    2|second|apple
+}
+
+# Negative numbers
+setup negative-values {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES (1,-10,'neg'),(2,5,'pos'),(3,-20,'more_neg');
+}
+
+@setup negative-values
+@cross-check-integrity
+test max-negative-values {
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    2|pos|5
+}
+
+@setup negative-values
+@cross-check-integrity
+test min-negative-values {
+    SELECT id, name, MIN(val) FROM t;
+}
+expect {
+    3|more_neg|-20
+}
+
+# Multiple bare columns with expressions
+@setup base-table
+@cross-check-integrity
+test max-with-expression {
+    SELECT id, id + 1, name, MAX(val) FROM t;
+}
+expect {
+    2|3|second|30
+}
+
+# All NULL values in aggregate column
+setup all-nulls {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES (1,NULL,'a'),(2,NULL,'b'),(3,NULL,'c');
+}
+
+@setup all-nulls
+@cross-check-integrity
+test max-all-nulls {
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    3|c|
+}
+
+# Duplicate max values: bare cols from first encountered max row
+setup duplicate-max {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES (1,30,'first'),(2,30,'second'),(3,10,'third');
+}
+
+@setup duplicate-max
+@cross-check-integrity
+test max-duplicate-values {
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    1|first|30
+}
+
+# Float values
+setup float-values {
+    CREATE TABLE t(id INT, val REAL, name TEXT);
+    INSERT INTO t VALUES (1,1.5,'a'),(2,3.7,'b'),(3,2.1,'c');
+}
+
+@setup float-values
+@cross-check-integrity
+test max-float-values {
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    2|b|3.7
+}
+
+@setup float-values
+@cross-check-integrity
+test min-float-values {
+    SELECT id, name, MIN(val) FROM t;
+}
+expect {
+    1|a|1.5
+}

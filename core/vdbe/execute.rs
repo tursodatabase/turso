@@ -4167,13 +4167,17 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
 /// - **Min/Max**: `[current_extreme: Value]` - tracks min/max seen so far
 /// - **GroupConcat/StringAgg**: `[accumulated: Null|Text]` - Null until first value, then Text
 /// - **JsonGroup***: `[raw_jsonb: Blob]` - accumulated raw JSONB bytes
+/// For MIN/MAX aggregates, returns whether the value was updated:
+///   Ok(true)  — value was updated, bare columns should be copied
+///   Ok(false) — value was NOT updated (or arg was NULL), bare columns should be skipped
+/// For non-MIN/MAX aggregates, always returns Ok(false).
 fn update_agg_payload(
     func: &AggFunc,
     arg: Value,                // most agg functions take one argument
     maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut [Value],
     collation: CollationSeq,
-) -> Result<()> {
+) -> Result<bool> {
     match func {
         AggFunc::Count => {
             // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
@@ -4199,7 +4203,7 @@ fn update_agg_payload(
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
             let [sum_val, r_err_val, count_val, ..] = payload else {
@@ -4324,11 +4328,16 @@ fn update_agg_payload(
         }
         AggFunc::Min | AggFunc::Max => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                // NULL args don't update the aggregate. Return true (copy
+                // bare cols) only if no non-NULL value has been accumulated
+                // yet — we need bare cols from some row. Once we have a real
+                // min/max value, return false (skip) to keep the bare cols
+                // from the row that set the current min/max.
+                return Ok(matches!(payload[0], Value::Null));
             }
             if matches!(payload[0], Value::Null) {
                 payload[0] = arg;
-                return Ok(());
+                return Ok(true);
             }
             use std::cmp::Ordering;
             // Borrow payload[0] only for comparison, then drop before assignment
@@ -4341,10 +4350,11 @@ fn update_agg_payload(
             if should_update {
                 payload[0] = arg;
             }
+            return Ok(should_update);
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let delimiter = maybe_arg2.unwrap_or_else(|| Value::build_text(","));
             let acc = &mut payload[0];
@@ -4398,7 +4408,7 @@ fn update_agg_payload(
             vec.append(&mut data);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Convert the intermediate aggregate state in `payload` into the final result value.
@@ -4507,6 +4517,7 @@ pub fn op_agg_step(
             col,
             delimiter,
             func,
+            flag_reg,
         },
         insn
     );
@@ -4538,7 +4549,7 @@ pub fn op_agg_step(
     }
 
     // Step the aggregate
-    match func {
+    let value_updated = match func {
         AggFunc::External(_) => {
             // External aggregates use FFI and need special handling
             let (step_fn, state_ptr, argc) = {
@@ -4564,6 +4575,7 @@ pub fn op_agg_step(
                     unsafe { ext_value.__free_internal_type() };
                 }
             }
+            false
         }
         _ => {
             let arg = state.registers[*col].get_value().clone();
@@ -4588,9 +4600,17 @@ pub fn op_agg_step(
                 );
             };
             let payload = agg.payload_mut();
-            update_agg_payload(func, arg, maybe_arg2, payload, collation)?;
+            update_agg_payload(func, arg, maybe_arg2, payload, collation)?
         }
     };
+
+    // For MIN/MAX bare column optimization: set flag_reg to indicate whether
+    // bare columns should be skipped (1) or copied (0).
+    if let Some(flag) = flag_reg {
+        // flag = 1 means "skip bare cols" (value NOT updated)
+        // flag = 0 means "copy bare cols" (value WAS updated)
+        state.registers[*flag] = Register::Value(Value::from_i64(!value_updated as i64));
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

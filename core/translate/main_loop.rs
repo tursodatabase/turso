@@ -22,6 +22,7 @@ use super::{
 };
 use crate::{
     emit_explain,
+    function::AggFunc,
     schema::{Index, Table},
     translate::{
         collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
@@ -2058,18 +2059,42 @@ fn emit_loop_source<'a>(
                 .reg_agg_start
                 .expect("aggregate registers must be initialized");
 
+            // Detect MIN/MAX bare column optimization: when there is at least one
+            // MIN or MAX aggregate with bare (non-aggregate) columns, bare columns
+            // should be updated whenever the MIN/MAX value changes, not just once.
+            // Per SQLite docs, this applies when there is a single min() or max()
+            // aggregate (other non-min/max aggregates may coexist).
+            let has_bare_cols = t_ctx.reg_nonagg_emit_once_flag.is_some();
+            let minmax_count = plan
+                .aggregates
+                .iter()
+                .filter(|a| matches!(a.func, AggFunc::Min | AggFunc::Max))
+                .count();
+            let minmax_flag_reg = if has_bare_cols && minmax_count >= 1 {
+                Some(program.alloc_register())
+            } else {
+                None
+            };
+
             // In planner.rs, we have collected all aggregates from the SELECT clause, including ones where the aggregate is embedded inside
             // a more complex expression. Some examples: length(sum(x)), sum(x) + avg(y), sum(x) + 1, etc.
             // The result of those more complex expressions depends on the final result of the aggregate, so we don't translate the complete expressions here.
             // Instead, we accumulate the intermediate results of all aggreagates, and evaluate any expressions that do not contain aggregates.
             for (i, agg) in plan.aggregates.iter().enumerate() {
                 let reg = start_reg + i;
+                // Pass the MIN/MAX flag register only to MIN/MAX aggregates
+                let flag_for_agg = if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
+                    minmax_flag_reg
+                } else {
+                    None
+                };
                 translate_aggregation_step(
                     program,
                     &plan.table_references,
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
+                    flag_for_agg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -2079,10 +2104,15 @@ fn emit_loop_source<'a>(
                 }
             }
 
+            // Guard bare column copying:
+            // - For MIN/MAX bare col optimization: use flag set by AggStep (copies
+            //   bare cols whenever MIN/MAX changes)
+            // - For other aggregates: use once-flag (copy only from first row)
             let label_emit_nonagg_only_once = if let Some(flag) = t_ctx.reg_nonagg_emit_once_flag {
+                let guard_reg = minmax_flag_reg.unwrap_or(flag);
                 let if_label = program.allocate_label();
                 program.emit_insn(Insn::If {
-                    reg: flag,
+                    reg: guard_reg,
                     target_pc: if_label,
                     jump_if_null: false,
                 });

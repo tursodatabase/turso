@@ -794,6 +794,10 @@ pub enum Insn {
         col: usize,
         delimiter: usize,
         func: AggFunc,
+        /// For MIN/MAX bare column optimization: when set, this register is
+        /// written to 1 if the aggregate value was NOT updated (skip bare cols),
+        /// or 0 if it WAS updated (copy bare cols from current row).
+        flag_reg: Option<usize>,
     },
 
     AggFinal {

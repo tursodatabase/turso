@@ -1011,13 +1011,14 @@ pub fn insn_to_row(
                 acc_reg,
                 delimiter: _,
                 col,
+                flag_reg,
             } => (
                 "AggStep",
-                0,
+                flag_reg.unwrap_or(0) as i64,
                 *col as i64,
                 *acc_reg as i64,
                 Value::build_text(func.as_str()),
-                0,
+                if flag_reg.is_some() { 1 } else { 0 },
                 format!("accum=r[{}] step(r[{}])", *acc_reg, *col),
             ),
             Insn::AggFinal { register, func } => (
