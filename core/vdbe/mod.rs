@@ -1632,8 +1632,9 @@ impl Program {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
-                let is_fail_constraint = matches!(err, Some(LimboError::Constraint(_)))
-                    && self.resolve_type == ResolveType::Fail;
+                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
+                    && self.resolve_type == ResolveType::Fail)
+                    || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
                 if !is_fail_constraint {
                     if let Err(end_stmt_err) = state.end_statement(
                         &self.connection,
@@ -1677,12 +1678,9 @@ impl Program {
                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
                 // - FAIL: don't rollback anything - changes persist, transaction stays active
                 // - ABORT (default): rollback statement, rollback txn if autocommit
-                Some(LimboError::Constraint(_))
-                | Some(LimboError::RaiseAbort(_))
-                | Some(LimboError::RaiseRollback(_)) => {
+                Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
                     let effective_resolve = match err {
-                        Some(LimboError::RaiseAbort(_)) => ResolveType::Abort,
-                        Some(LimboError::RaiseRollback(_)) => ResolveType::Rollback,
+                        Some(LimboError::Raise(rt, _)) => *rt,
                         _ => self.resolve_type,
                     };
                     match effective_resolve {
@@ -1690,19 +1688,64 @@ impl Program {
                             self.rollback_current_txn(pager);
                         }
                         ResolveType::Fail => {
-                            // ON CONFLICT FAIL: Don't rollback the transaction.
+                            // FAIL: Don't rollback the transaction.
                             // Changes made before the error persist.
-                            if !self.connection.get_auto_commit() {
-                                if let Err(end_stmt_err) = state.end_statement(
-                                    &self.connection,
-                                    pager,
-                                    EndStatement::ReleaseSavepoint,
-                                ) {
+                            if let Err(end_stmt_err) = state.end_statement(
+                                &self.connection,
+                                pager,
+                                EndStatement::ReleaseSavepoint,
+                            ) {
+                                capture_abort_error(
+                                    &mut abort_error,
+                                    end_stmt_err,
+                                    "Failed to release statement savepoint during abort",
+                                );
+                            }
+                            if self.connection.get_auto_commit() {
+                                // Autocommit FAIL: commit partial changes.
+                                // This matches halt()'s FAIL+autocommit path.
+                                let mv_store = self.connection.mv_store();
+                                if let Err(e) = execute::vtab_commit_all(&self.connection) {
                                     capture_abort_error(
                                         &mut abort_error,
-                                        end_stmt_err,
-                                        "Failed to release statement savepoint during abort",
+                                        e,
+                                        "vtab_commit_all failed during FAIL abort",
                                     );
+                                }
+                                if let Err(e) = execute::index_method_pre_commit_all(state, pager) {
+                                    capture_abort_error(
+                                        &mut abort_error,
+                                        e,
+                                        "index_method_pre_commit_all failed during FAIL abort",
+                                    );
+                                }
+                                loop {
+                                    match self.commit_txn(
+                                        pager.clone(),
+                                        state,
+                                        mv_store.as_ref(),
+                                        false,
+                                    ) {
+                                        Ok(IOResult::Done(_)) => break,
+                                        Ok(IOResult::IO(io)) => {
+                                            if let Err(e) = io.wait(pager.io.as_ref()) {
+                                                capture_abort_error(
+                                                    &mut abort_error,
+                                                    e,
+                                                    "IO error during FAIL commit in abort",
+                                                );
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            capture_abort_error(
+                                                &mut abort_error,
+                                                e,
+                                                "commit_txn failed during FAIL abort",
+                                            );
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }

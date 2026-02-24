@@ -3278,12 +3278,7 @@ pub fn translate_expr(
                         on_error: Some(ResolveType::Ignore),
                     });
                 }
-                ResolveType::Fail => {
-                    crate::bail_parse_error!(
-                        "RAISE(FAIL) is not yet supported (requires statement savepoints)"
-                    );
-                }
-                ResolveType::Abort | ResolveType::Rollback => {
+                ResolveType::Fail | ResolveType::Abort | ResolveType::Rollback => {
                     if !in_trigger && *resolve_type != ResolveType::Abort {
                         crate::bail_parse_error!(
                             "RAISE() may only be used within a trigger-program"

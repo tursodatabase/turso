@@ -49,10 +49,8 @@ pub enum LimboError {
     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
     ForeignKeyConstraint(String),
-    #[error("Runtime error: {0}")]
-    RaiseAbort(String),
-    #[error("Runtime error: {0}")]
-    RaiseRollback(String),
+    #[error("Runtime error: {1}")]
+    Raise(turso_parser::ast::ResolveType, String),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     #[error("Extension error: {0}")]

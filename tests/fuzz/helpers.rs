@@ -190,3 +190,56 @@ pub fn verify_tables_match(
         );
     }
 }
+
+pub fn random_dml(rng: &mut ChaCha8Rng, table: &str, col1: &str, col2: &str) -> String {
+    match rng.random_range(0..6) {
+        // Single-row INSERT
+        0 => {
+            let x = rng.random_range(1..=10);
+            let y = rng.random_range(1..=100);
+            format!("INSERT INTO {table} ({col1}, {col2}) VALUES ({x}, {y})")
+        }
+        // Multi-row INSERT
+        1 => {
+            let count = rng.random_range(2..=5);
+            let values: Vec<String> = (0..count)
+                .map(|_| {
+                    let x = rng.random_range(1..=10);
+                    let y = rng.random_range(1..=100);
+                    format!("({x}, {y})")
+                })
+                .collect();
+            format!(
+                "INSERT INTO {table} ({col1}, {col2}) VALUES {}",
+                values.join(", ")
+            )
+        }
+        // INSERT OR IGNORE
+        2 => {
+            let x = rng.random_range(1..=10);
+            let y = rng.random_range(1..=100);
+            format!("INSERT OR IGNORE INTO {table} ({col1}, {col2}) VALUES ({x}, {y})")
+        }
+        // UPDATE
+        3 => {
+            let new_y = rng.random_range(1..=100);
+            let target = rng.random_range(1..=10);
+            format!("UPDATE {table} SET {col2} = {new_y} WHERE {col1} = {target}")
+        }
+        // UPDATE all rows
+        4 => {
+            let new_y = rng.random_range(1..=100);
+            format!("UPDATE {table} SET {col2} = {new_y}")
+        }
+        // DELETE
+        5 => {
+            let target = rng.random_range(1..=10);
+            if rng.random_bool(0.2) {
+                format!("DELETE FROM {table}")
+            } else {
+                format!("DELETE FROM {table} WHERE {col1} = {target}")
+            }
+        }
+        _ => unreachable!(),
+    }
+}

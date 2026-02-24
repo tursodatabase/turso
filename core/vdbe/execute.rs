@@ -2071,9 +2071,9 @@ pub fn halt(
         }
         if err_code > 0 {
             let error = match resolve_type {
-                ResolveType::Abort => LimboError::RaiseAbort(description.to_string()),
-                ResolveType::Rollback => LimboError::RaiseRollback(description.to_string()),
-                ResolveType::Fail => unreachable!("RAISE(FAIL) rejected at translate time"),
+                ResolveType::Abort | ResolveType::Rollback | ResolveType::Fail => {
+                    LimboError::Raise(resolve_type, description.to_string())
+                }
                 ResolveType::Ignore => unreachable!("handled above"),
                 ResolveType::Replace => unreachable!("Replace not valid for RAISE"),
             };
@@ -2223,7 +2223,7 @@ pub fn halt(
 }
 
 /// Call xCommit on all virtual tables that participated in the current transaction.
-fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
+pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
     if set.is_empty() {
         return Ok(());
@@ -2241,7 +2241,10 @@ fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
 
 /// Flush pending writes on all index method cursors before transaction commit.
 /// This ensures index method writes are persisted as part of the transaction.
-fn index_method_pre_commit_all(state: &mut ProgramState, pager: &Arc<Pager>) -> crate::Result<()> {
+pub(crate) fn index_method_pre_commit_all(
+    state: &mut ProgramState,
+    pager: &Arc<Pager>,
+) -> crate::Result<()> {
     for cursor_opt in state.cursors.iter_mut().flatten() {
         let Cursor::IndexMethod(cursor) = cursor_opt else {
             continue;

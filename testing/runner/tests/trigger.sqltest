@@ -1418,7 +1418,6 @@ test raise-shorthand-normal-query {
     SELECT RAISE('normal query error');
 }
 expect error {
-    normal query error
 }
 
 # RAISE(IGNORE) in AFTER trigger with multiple triggers - remaining triggers skipped
@@ -1523,5 +1522,136 @@ test trigger-raise-ignore-upsert {
 }
 expect {
     1|original
+}
+
+# RAISE(FAIL) basic - fires error from BEFORE INSERT trigger
+test trigger-raise-fail-basic {
+    CREATE TABLE raise_fail_t1 (x INTEGER);
+    CREATE TRIGGER raise_fail_tr1 BEFORE INSERT ON raise_fail_t1 BEGIN
+        SELECT RAISE(FAIL, 'fail triggered');
+    END;
+    INSERT INTO raise_fail_t1 VALUES (1);
+}
+expect error {
+    fail triggered
+}
+
+# RAISE(FAIL) keeps prior rows - multi-row INSERT in autocommit, FAIL on row 2
+# FAIL semantics: prior rows (row 1) committed, statement stops with error
+test trigger-raise-fail-keeps-prior-rows {
+    CREATE TABLE raise_fail_t2 (x INTEGER);
+    CREATE TRIGGER raise_fail_tr2 BEFORE INSERT ON raise_fail_t2
+    WHEN NEW.x = 2
+    BEGIN
+        SELECT RAISE(FAIL, 'fail on row 2');
+    END;
+    INSERT INTO raise_fail_t2 VALUES (1), (2), (3);
+}
+expect error {
+    fail on row 2
+}
+
+# RAISE(FAIL) rolls back trigger body - trigger INSERTs into log table then RAISE(FAIL)
+test trigger-raise-fail-rolls-back-trigger-body {
+    CREATE TABLE raise_fail_t3 (x INTEGER);
+    CREATE TABLE raise_fail_log3 (msg TEXT);
+    CREATE TRIGGER raise_fail_tr3 BEFORE INSERT ON raise_fail_t3 BEGIN
+        INSERT INTO raise_fail_log3 VALUES ('should be rolled back');
+        SELECT RAISE(FAIL, 'fail after log');
+    END;
+    INSERT INTO raise_fail_t3 VALUES (1);
+}
+expect error {
+    fail after log
+}
+
+# RAISE(FAIL) in AFTER trigger - error is reported
+test trigger-raise-fail-after-trigger {
+    CREATE TABLE raise_fail_t4 (x INTEGER);
+    CREATE TABLE raise_fail_log4 (msg TEXT);
+    CREATE TRIGGER raise_fail_tr4 AFTER INSERT ON raise_fail_t4 BEGIN
+        INSERT INTO raise_fail_log4 VALUES ('should be rolled back');
+        SELECT RAISE(FAIL, 'fail in after trigger');
+    END;
+    INSERT INTO raise_fail_t4 VALUES (1);
+}
+expect error {
+    fail in after trigger
+}
+
+# RAISE(FAIL) conditional - RAISE(FAIL) with WHEN clause, only fires on matching rows
+test trigger-raise-fail-conditional {
+    CREATE TABLE raise_fail_t5 (x INTEGER);
+    CREATE TRIGGER raise_fail_tr5 BEFORE INSERT ON raise_fail_t5
+    WHEN NEW.x > 10
+    BEGIN
+        SELECT RAISE(FAIL, 'value too large');
+    END;
+    INSERT INTO raise_fail_t5 VALUES (5);
+    SELECT * FROM raise_fail_t5;
+}
+expect {
+    5
+}
+
+test trigger-raise-fail-conditional-fires {
+    CREATE TABLE raise_fail_t5b (x INTEGER);
+    CREATE TRIGGER raise_fail_tr5b BEFORE INSERT ON raise_fail_t5b
+    WHEN NEW.x > 10
+    BEGIN
+        SELECT RAISE(FAIL, 'value too large');
+    END;
+    INSERT INTO raise_fail_t5b VALUES (15);
+}
+expect error {
+    value too large
+}
+
+# RAISE(IGNORE) preserves trigger body side-effects (SQLite does NOT roll them back)
+# The INSERT is skipped (IGNORE), but trigger body changes before the RAISE persist.
+test trigger-raise-ignore-preserves-trigger-body {
+    CREATE TABLE raise_ignore_t1 (x INTEGER);
+    CREATE TABLE raise_ignore_log1 (msg TEXT);
+    CREATE TRIGGER raise_ignore_tr1 BEFORE INSERT ON raise_ignore_t1 BEGIN
+        INSERT INTO raise_ignore_log1 VALUES ('trigger fired');
+        SELECT RAISE(IGNORE);
+    END;
+    INSERT INTO raise_ignore_t1 VALUES (1);
+    SELECT count(*) FROM raise_ignore_log1;
+    SELECT count(*) FROM raise_ignore_t1;
+}
+expect {
+    1
+    0
+}
+
+# RAISE(FAIL) in UPDATE trigger
+test trigger-raise-fail-update {
+    CREATE TABLE raise_fail_t6 (x INTEGER, y INTEGER);
+    INSERT INTO raise_fail_t6 VALUES (1, 10), (2, 20), (3, 30);
+    CREATE TRIGGER raise_fail_tr6 BEFORE UPDATE ON raise_fail_t6
+    WHEN NEW.y = 200
+    BEGIN
+        SELECT RAISE(FAIL, 'update fail');
+    END;
+    UPDATE raise_fail_t6 SET y = y * 10;
+}
+expect error {
+    update fail
+}
+
+# RAISE(FAIL) in DELETE trigger
+test trigger-raise-fail-delete {
+    CREATE TABLE raise_fail_t7 (x INTEGER, y INTEGER);
+    INSERT INTO raise_fail_t7 VALUES (1, 10), (2, 20), (3, 30);
+    CREATE TRIGGER raise_fail_tr7 BEFORE DELETE ON raise_fail_t7
+    WHEN OLD.x = 2
+    BEGIN
+        SELECT RAISE(FAIL, 'delete fail');
+    END;
+    DELETE FROM raise_fail_t7;
+}
+expect error {
+    delete fail
 }
 

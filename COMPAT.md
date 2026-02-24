@@ -67,7 +67,6 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 ### Limitations
 
 * ⛔️ Concurrent access from multiple processes is not supported.
-* ⛔️ Savepoints are not supported.
 * ⛔️ Vacuum is not supported.
 
 ## SQLite query language
@@ -101,11 +100,11 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | INSERT ... ON CONFLICT (UPSERT) | ✅ Yes |                                                                                   |
 | ON CONFLICT clause        | ✅ Yes     |                                                                                   |
 | REINDEX                   | ❌ No      |                                                                                   |
-| RELEASE SAVEPOINT         | ❌ No      |                                                                                   |
+| RELEASE SAVEPOINT         | ✅ No      |                                                                                   |
 | REPLACE                   | ✅ Yes     |                                                                                   |
 | RETURNING clause          | ✅ Yes     |                                                                                   |
 | ROLLBACK TRANSACTION      | ✅ Yes     |                                                                                   |
-| SAVEPOINT                 | ❌ No      |                                                                                   |
+| SAVEPOINT                 | ✅ No      |                                                                                   |
 | SELECT                    | ✅ Yes     |                                                                                   |
 | SELECT ... WHERE          | ✅ Yes     |                                                                                   |
 | SELECT ... WHERE ... LIKE | ✅ Yes     |                                                                                   |
@@ -231,7 +230,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | (NOT) EXISTS (SELECT...)   | ✅ Yes      |                                          |
 | x <operator> (SELECT...))   | 🚧 Partial  | Only scalar subqueries supported, i.e. not (x,y) = (SELECT...)
 | CASE WHEN THEN ELSE END   | ✅ Yes     |                                          |
-| RAISE                     | 🚧 Partial | `RAISE('msg')` and `RAISE(ABORT, 'msg')` also work outside triggers. `RAISE(FAIL)` is not yet supported (requires statement savepoints). |
+| RAISE                     | ✅ Yes | `RAISE('msg')` and `RAISE(ABORT, 'msg')` also work outside triggers. |
 
 ### SQL functions
 
@@ -891,7 +890,7 @@ Modifiers:
 | RowSetTest     | ✅ Yes     |         |
 | Rowid          | ✅ Yes    |         |
 | SCopy          | ❌ No     |         |
-| Savepoint      | ❌ No     |         |
+| Savepoint      | ✅ No     |         |
 | Seek           | ❌ No     |         |
 | SeekGe         | ✅ Yes    |         |
 | SeekGt         | ✅ Yes    |         |
