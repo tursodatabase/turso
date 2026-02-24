@@ -559,6 +559,12 @@ pub fn resolve_sorted_columns(
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref())?;
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
+
+        // SQLite prohibits the "." operator in index expressions.
+        if contains_dot_operator_in_index_expr(unwrapped_expr) {
+            crate::bail_parse_error!("the \".\" operator prohibited in index expressions");
+        }
+
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
             let collation = explicit_collation.or_else(|| column.collation_opt());
             resolved.push(IndexColumn {
@@ -615,9 +621,6 @@ fn resolve_index_column<'a>(
             let unquoted = col_name.trim_matches('\'');
             table.get_column(unquoted)?
         }
-        Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-            table.get_column(col.as_str())?
-        }
         Expr::RowId { .. } => table.get_rowid_alias_column()?,
         _ => return None,
     };
@@ -649,7 +652,6 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         return false;
     }
 
-    let tbl_norm = normalize_ident(table.name.as_str());
     let has_col = |name: &str| {
         let n = normalize_ident(name);
         table
@@ -657,7 +659,6 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             .iter()
             .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
     };
-    let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
     let is_deterministic_fn = |name: &str, argc: usize| {
         let n = normalize_ident(name);
         Func::resolve_function(&n, argc).is_ok_and(|f| f.is_deterministic())
@@ -679,11 +680,8 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
                     ok = false;
                 }
             }
-            // Qualified: qualifier must match this index's table, column must exist
-            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-                if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
-                    ok = false;
-                }
+            Expr::Qualified(..) | Expr::DoublyQualified(..) => {
+                ok = false;
             }
             Expr::FunctionCall {
                 name, filter_over, ..
@@ -722,6 +720,23 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         })
     });
     ok
+}
+
+fn contains_dot_operator_in_index_expr(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+        if found {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            Expr::Qualified(..) | Expr::DoublyQualified(..) => {
+                found = true;
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    });
+    found
 }
 
 fn emit_index_column_value_from_cursor(
