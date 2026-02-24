@@ -13,14 +13,31 @@ use crate::model::query::{
     Create, CreateIndex, Delete, Drop, DropIndex, Insert, OnConflict, Select, UpdateSetItem,
 };
 use crate::model::table::{
-    Column, ColumnType, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
+    Column, ColumnType, Index, IndexColumn, IndexColumnKind, JoinType, JoinedTable, Name, SimValue,
+    Table, TableContext,
 };
 use indexmap::IndexSet;
 use rand::seq::IndexedRandom;
-use rand::Rng;
-use turso_parser::ast::{ColumnConstraint, Expr, SortOrder};
+use rand::{Rng, SeedableRng};
+use turso_parser::ast::{
+    ColumnConstraint, Expr, FunctionTail, Literal, Name as AstName, Operator, SortOrder,
+};
 
 use super::{backtrack, pick};
+
+/// Build a simple function call expression with no DISTINCT, ORDER BY, or FILTER/OVER.
+fn simple_fn_call(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::FunctionCall {
+        name: AstName::exact(name.into()),
+        distinctness: None,
+        args: args.into_iter().map(Box::new).collect(),
+        order_by: vec![],
+        filter_over: FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
 
 impl Arbitrary for Create {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
@@ -591,19 +608,45 @@ impl Arbitrary for CreateIndex {
         let num_columns_to_pick = rng.random_range(1..=table.columns.len());
         let picked_column_indices = pick_n_unique(0..table.columns.len(), num_columns_to_pick, rng);
 
-        let columns = picked_column_indices
-            .map(|i| {
-                let column = &table.columns[i];
-                (
-                    column.name.clone(),
-                    if rng.random_bool(0.5) {
-                        SortOrder::Asc
-                    } else {
-                        SortOrder::Desc
-                    },
-                )
-            })
-            .collect::<Vec<(String, SortOrder)>>();
+        let create_index_opts = &env.opts().query.create_index;
+        let mut expr_budget = create_index_opts.max_expr_terms;
+
+        let mut expr_rng = rand::rngs::StdRng::seed_from_u64(rng.random());
+
+        let mut columns = Vec::with_capacity(num_columns_to_pick);
+        for i in picked_column_indices {
+            let column = &table.columns[i];
+            let order = if rng.random_bool(0.5) {
+                SortOrder::Asc
+            } else {
+                SortOrder::Desc
+            };
+
+            let use_expr =
+                expr_budget > 0 && expr_rng.random_bool(create_index_opts.expr_term_prob);
+            let kind = if use_expr {
+                expr_budget -= 1;
+                let col_ref = || Expr::Id(AstName::exact(column.name.clone()));
+                let num = |n: i64| Expr::Literal(Literal::Numeric(n.to_string()));
+                let k: i64 = expr_rng.random_range(0..=4);
+
+                let expr = match expr_rng.random_range(0u8..=3) {
+                    0 => Expr::Binary(Box::new(col_ref()), Operator::Multiply, Box::new(num(k))),
+                    1 => simple_fn_call("abs", vec![col_ref()]),
+                    2 => Expr::Binary(Box::new(col_ref()), Operator::Add, Box::new(num(k))),
+                    _ => simple_fn_call("substr", vec![col_ref(), num(1), num(k.max(1))]),
+                };
+                IndexColumnKind::Expr {
+                    expr: Box::new(expr),
+                }
+            } else {
+                IndexColumnKind::Column {
+                    name: column.name.clone(),
+                }
+            };
+
+            columns.push(IndexColumn { kind, order });
+        }
 
         // Strip database prefix (e.g., "aux0.") from table name for the index name,
         // since index names must not contain dots.
@@ -772,25 +815,26 @@ const ALTER_TABLE_NO_ALTER_COL_NO_DROP: &[AlterTableTypeDiscriminants] = &[
 ];
 
 fn get_column_diff(table: &Table) -> IndexSet<&str> {
-    let mut undropable: IndexSet<&str> = table
+    let mut undropable_norm: IndexSet<String> = table
         .indexes
         .iter()
-        .flat_map(|idx| idx.columns.iter().map(|(name, _)| name.as_str()))
+        .flat_map(|idx| idx.referenced_columns(&table.columns))
+        .map(|name| name.to_ascii_lowercase())
         .collect();
 
-    undropable.extend(
+    undropable_norm.extend(
         table
             .columns
             .iter()
             .filter(|c| c.has_unique_or_pk())
-            .map(|c| c.name.as_str()),
+            .map(|c| c.name.to_ascii_lowercase()),
     );
 
     table
         .columns
         .iter()
         .map(|c| c.name.as_str())
-        .filter(|name| !undropable.contains(name))
+        .filter(|&name| !undropable_norm.contains(&name.to_ascii_lowercase()))
         .collect()
 }
 
