@@ -8093,6 +8093,9 @@ fn new_rowid_inner(
                                 new_rowid,
                                 prev_rowid,
                             } => {
+                                // Mark pending BEFORE releasing lock so other threads
+                                // see the pending count when they acquire the lock.
+                                mvcc_cursor.mark_pending_rowid();
                                 // we allocated a rowid, so no need to hold lock anymore
                                 mvcc_cursor.end_new_rowid();
                                 // mvcc allocator for table ws initialized, we can set result inmediatly
@@ -8163,38 +8166,67 @@ fn new_rowid_inner(
                 };
 
                 // Initialize table's max rowid in MVCC if enabled.
-                // For concurrent transactions, initialize to the *allocated* rowid
-                // (current_max + 1) so that another concurrent thread calling
-                // get_next_rowid() won't get the same value. For other modes,
-                // initialize to current_max to match SQLite's rowid behavior.
-                if mv_store.is_some() {
+                // When there are in-flight rowid allocations from other threads
+                // (pending_inserts > 0), we must account for them by taking
+                // max(cursor_max, allocator_max) to avoid re-issuing a rowid.
+                let effective_max = if mv_store.is_some() {
                     let is_concurrent = matches!(
                         program.connection.get_mv_tx(),
                         Some((_, TransactionMode::Concurrent))
                     );
-                    let init_value = if is_concurrent || program.connection.get_auto_commit()
-                    {
-                        match current_max {
-                            Some(rowid) if rowid < MAX_ROWID => Some(rowid + 1),
-                            None => Some(1),
-                            _ => current_max,
-                        }
-                    } else {
-                        current_max
-                    };
+                    let use_alloc_max = is_concurrent || program.connection.get_auto_commit();
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                        let effective = if is_concurrent
+                            || (use_alloc_max && mvcc_cursor.has_pending_inserts())
+                        {
+                            // In concurrent mode, ALWAYS consult the allocator's max_rowid.
+                            // Between INSERT and COMMIT, a thread's row is invisible to other
+                            // snapshots but the pending counter is already cleared (cursor
+                            // lifetime < transaction lifetime). The allocator's preserved
+                            // max_rowid is the only reliable source.
+                            //
+                            // In autocommit mode, only consult alloc_max when there are
+                            // in-flight allocations (pending > 0) to preserve SQLite rowid
+                            // compatibility in single-threaded mode.
+                            let alloc_max = mvcc_cursor.get_allocator_max_rowid();
+                            match (current_max, alloc_max) {
+                                (Some(a), Some(b)) => Some(a.max(b)),
+                                (a @ Some(_), None) | (None, a @ Some(_)) => a,
+                                (None, None) => None,
+                            }
+                        } else {
+                            current_max
+                        };
+                        let init_value = if use_alloc_max {
+                            match effective {
+                                Some(rowid) if rowid < MAX_ROWID => Some(rowid + 1),
+                                None => Some(1),
+                                _ => effective,
+                            }
+                        } else {
+                            current_max
+                        };
                         mvcc_cursor.initialize_max_rowid(init_value)?;
-                    };
-                }
+                        mvcc_cursor.mark_pending_rowid();
+                        effective
+                    } else {
+                        current_max
+                    }
+                } else {
+                    current_max
+                };
 
                 if *prev_largest_reg > 0 {
                     state.registers[*prev_largest_reg] =
                         Register::Value(Value::from_i64(current_max.unwrap_or(0)));
                 }
 
-                match current_max {
+                // For concurrent/autocommit with MVCC and in-flight allocations,
+                // use effective_max (accounts for other threads' pending rowids).
+                // Otherwise use cursor_max as usual.
+                match effective_max {
                     Some(rowid) if rowid < MAX_ROWID => {
                         // Can use sequential
                         state.registers[*rowid_reg] = Register::Value(Value::from_i64(rowid + 1));
