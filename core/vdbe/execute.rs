@@ -1144,7 +1144,7 @@ pub fn op_vupdate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         VUpdate {
@@ -1163,7 +1163,9 @@ pub fn op_vupdate(
     let CursorType::VirtualTable(virtual_table) = cursor_type else {
         panic!("VUpdate on non-virtual table cursor");
     };
-    if virtual_table.readonly() {
+    let allow_dbpage_write = virtual_table.name == crate::dbpage::DBPAGE_TABLE_NAME
+        && program.connection.db.opts.unsafe_testing;
+    if virtual_table.readonly() && !allow_dbpage_write {
         return Err(LimboError::ReadOnly);
     }
 
@@ -1183,7 +1185,11 @@ pub fn op_vupdate(
             )));
         }
     }
-    let result = virtual_table.update(&argv);
+    let result = if allow_dbpage_write {
+        crate::dbpage::update_dbpage(pager, &argv)
+    } else {
+        virtual_table.update(&argv)
+    };
     match result {
         Ok(Some(new_rowid)) => {
             if *conflict_action == 5 {

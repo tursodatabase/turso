@@ -1216,6 +1216,7 @@ pub fn emit_from_clause_subquery(
                 meta_window: None,
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
+                unsafe_testing: t_ctx.unsafe_testing,
             };
             emit_query(program, select_plan, &mut metadata)?
         }
@@ -1313,6 +1314,7 @@ fn emit_materialized_cte(
                 meta_window: None,
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
+                unsafe_testing: t_ctx.unsafe_testing,
             };
             emit_query(program, select_plan, &mut metadata)?;
         }
@@ -1400,6 +1402,7 @@ fn emit_indexed_materialized_subquery(
                 meta_window: None,
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
+                unsafe_testing: t_ctx.unsafe_testing,
             };
             emit_query(program, select_plan, &mut metadata)?;
         }

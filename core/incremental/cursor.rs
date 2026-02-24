@@ -395,6 +395,7 @@ mod tests {
                 enable_autovacuum: false,
                 enable_triggers: false,
                 enable_attach: false,
+                unsafe_testing: false,
             },
             None,
         )?;

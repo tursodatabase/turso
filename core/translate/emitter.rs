@@ -424,10 +424,16 @@ pub struct TranslateCtx<'a> {
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
     pub meta_window: Option<WindowMetadata<'a>>,
+    pub unsafe_testing: bool,
 }
 
 impl<'a> TranslateCtx<'a> {
-    pub fn new(program: &mut ProgramBuilder, resolver: Resolver<'a>, table_count: usize) -> Self {
+    pub fn new(
+        program: &mut ProgramBuilder,
+        resolver: Resolver<'a>,
+        table_count: usize,
+        unsafe_testing: bool,
+    ) -> Self {
         TranslateCtx {
             labels_main_loop: (0..table_count).map(|_| LoopLabels::new(program)).collect(),
             label_main_loop_end: None,
@@ -446,6 +452,7 @@ impl<'a> TranslateCtx<'a> {
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
             meta_window: None,
+            unsafe_testing,
         }
     }
 }
@@ -531,6 +538,7 @@ fn emit_program_for_select_with_inputs(
         program,
         resolver.fork(),
         plan.table_references.joined_tables().len(),
+        false,
     );
     t_ctx.materialized_build_inputs = materialized_build_inputs;
 
@@ -1466,6 +1474,7 @@ fn emit_program_for_delete(
         program,
         resolver.fork(),
         plan.table_references.joined_tables().len(),
+        connection.db.opts.unsafe_testing,
     );
 
     let after_main_loop_label = program.allocate_label();
@@ -2341,6 +2350,7 @@ fn emit_program_for_update(
         program,
         resolver.fork(),
         plan.table_references.joined_tables().len(),
+        connection.db.opts.unsafe_testing,
     );
 
     let after_main_loop_label = program.allocate_label();

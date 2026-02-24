@@ -146,6 +146,7 @@ pub struct DatabaseOpts {
     pub enable_autovacuum: bool,
     pub enable_triggers: bool,
     pub enable_attach: bool,
+    pub unsafe_testing: bool,
     enable_load_extension: bool,
 }
 
@@ -192,6 +193,11 @@ impl DatabaseOpts {
 
     pub fn with_attach(mut self, enable: bool) -> Self {
         self.enable_attach = enable;
+        self
+    }
+
+    pub fn with_unsafe_testing(mut self, enable: bool) -> Self {
+        self.unsafe_testing = enable;
         self
     }
 }

@@ -108,6 +108,43 @@ fn sql_argument_empty_string_returns_zero() {
     assert_eq!(status.code(), Some(0));
 }
 
+/// A8: sqlite_dbpage updates require unsafe testing mode
+#[test]
+fn sqlite_dbpage_update_requires_unsafe_testing() {
+    let sql = "create table t(x); update sqlite_dbpage set data = data where pgno = 1; select 'after_update';";
+    let output = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .arg(sql)
+        .output()
+        .expect("failed to run tursodb");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("after_update"),
+        "query after sqlite_dbpage update should not execute without unsafe testing"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// A9: sqlite_dbpage updates succeed with unsafe testing mode
+#[test]
+fn sqlite_dbpage_update_allows_unsafe_testing() {
+    let sql = "create table t(x); update sqlite_dbpage set data = data where pgno = 1; select 'after_update';";
+    let output = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg("--unsafe-testing")
+        .arg(":memory:")
+        .arg(sql)
+        .output()
+        .expect("failed to run tursodb");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("after_update"),
+        "expected query after update to run"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
 // ---------------------------------------------------------------------------
 // B. Piped stdin mode
 // ---------------------------------------------------------------------------
