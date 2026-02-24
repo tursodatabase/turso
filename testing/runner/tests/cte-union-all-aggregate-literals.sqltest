@@ -55,6 +55,12 @@ expect {
     avg|20.0
     count|3
 }
+expect @js {
+    min|10
+    max|30
+    avg|20
+    count|3    
+}
 
 setup empty_table {
     CREATE TABLE empty_t(id INT, val INT);
