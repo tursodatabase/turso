@@ -583,6 +583,7 @@ expect error {
 }
 
 @cross-check-integrity
+@skip-if mvcc "expression indexes not supported"
 test alter-table-rename-column-substr-expression-index {
     CREATE TABLE t(a,b,c);
     CREATE INDEX i_expr ON t(substr(b,1,1));
