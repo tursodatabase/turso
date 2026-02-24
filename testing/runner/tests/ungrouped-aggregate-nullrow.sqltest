@@ -72,6 +72,10 @@ test ungrouped-agg-some-match {
 expect {
     2|2|30.0
 }
+# JS Number.isInteger(30.0) is true, so whole-number floats lose the .0 suffix
+expect @js {
+    2|2|30
+}
 
 # --- Variant: empty table ---
 
