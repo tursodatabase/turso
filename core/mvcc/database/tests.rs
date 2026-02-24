@@ -6834,3 +6834,65 @@ fn test_partial_commit_visibility_bug() {
         );
     }
 }
+
+/// Two concurrent transactions delete the same B-tree-resident row that has a
+/// UNIQUE index. Both DELETEs succeed at execute time because tombstones
+/// (begin: None) are invisible to is_visible_to(), so both transactions
+/// create independent tombstones. However, commit-time validation in
+/// check_version_conflicts detects the other transaction's tombstone as a
+/// write lock (via its end: TxID field) and rejects the second committer
+/// with WriteWriteConflict.
+#[test]
+fn test_double_delete_btree_resident_row_with_unique_index() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, uniq TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 10, 'a')").unwrap();
+    conn.execute("INSERT INTO t VALUES(2, 20, 'b')").unwrap();
+
+    // Checkpoint so rows are only in B-tree, not in MVCC store
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(conn);
+
+    // Two transactions both try to delete the same B-tree-resident row
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+
+    // T1 deletes row 1 — creates tombstone (begin: None, end: TxID(T1))
+    conn1.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    // T2 deletes the same row — creates a second tombstone at execute time
+    // (is_visible_to still returns false for tombstones, so operation-time
+    // conflict detection is bypassed — that's a separate issue)
+    conn2.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    // T1 commits first — stamps its tombstones with Timestamp
+    conn1.execute("COMMIT").unwrap();
+
+    // T2's commit should fail: check_version_conflicts now detects T1's
+    // committed tombstone (end: Timestamp >= T2.begin_ts)
+    assert!(
+        conn2.execute("COMMIT").is_err(),
+        "T2's COMMIT should fail with WriteWriteConflict when T1 already \
+         committed a tombstone for the same row"
+    );
+    drop(conn1);
+    drop(conn2);
+
+    // Checkpoint: only T1's delete should have gone through
+    let conn = db.connect();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        &rows[0][0].to_string(),
+        "ok",
+        "Index corruption after concurrent double-delete of B-tree-resident row"
+    );
+}
