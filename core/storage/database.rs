@@ -125,9 +125,13 @@ impl DatabaseStorage for DatabaseFile {
                 let original_c = c.clone();
                 let decrypt_complete =
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-                        let Ok((buf, bytes_read)) = res else {
-                            tracing::error!(err = ?res.unwrap_err());
-                            return None;
+                        let (buf, bytes_read) = match res {
+                            Ok((buf, bytes_read)) => (buf, bytes_read),
+                            Err(err) => {
+                                tracing::error!(err = ?err);
+                                original_c.error(err);
+                                return original_c.get_error();
+                            }
                         };
                         turso_assert_greater_than!(
                             bytes_read, 0,
@@ -139,7 +143,7 @@ impl DatabaseStorage for DatabaseFile {
                                 let original_buf = original_c.as_read().buf();
                                 original_buf.as_mut_slice().copy_from_slice(&decrypted_data);
                                 original_c.complete(bytes_read);
-                                None
+                                original_c.get_error()
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -150,7 +154,7 @@ impl DatabaseStorage for DatabaseFile {
                                     "Original completion already has an error"
                                 );
                                 original_c.error(CompletionError::DecryptionError { page_idx });
-                                Some(CompletionError::DecryptionError { page_idx })
+                                original_c.get_error()
                             }
                         }
                     });
@@ -164,18 +168,22 @@ impl DatabaseStorage for DatabaseFile {
 
                 let verify_complete =
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-                        let Ok((buf, bytes_read)) = res else {
-                            return None;
+                        let (buf, bytes_read) = match res {
+                            Ok((buf, bytes_read)) => (buf, bytes_read),
+                            Err(err) => {
+                                original_c.error(err);
+                                return original_c.get_error();
+                            }
                         };
                         if bytes_read <= 0 {
                             tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
                             original_c.complete(bytes_read);
-                            return None;
+                            return original_c.get_error();
                         }
                         match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
                             Ok(_) => {
                                 original_c.complete(bytes_read);
-                                None
+                                original_c.get_error()
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -186,7 +194,7 @@ impl DatabaseStorage for DatabaseFile {
                                     "Original completion already has an error"
                                 );
                                 original_c.error(e);
-                                Some(e)
+                                original_c.get_error()
                             }
                         }
                     });
@@ -288,4 +296,119 @@ fn checksum_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &ChecksumContext) 
     ctx.add_checksum_to_page(buffer.as_mut_slice(), page_idx)
         .unwrap();
     buffer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{MemoryIO, IO};
+    use crate::{File, LimboError};
+
+    struct MockFile {
+        read_result: std::result::Result<i32, CompletionError>,
+    }
+
+    impl File for MockFile {
+        fn lock_file(&self, _exclusive: bool) -> Result<()> {
+            Ok(())
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn pread(&self, _pos: u64, c: Completion) -> Result<Completion> {
+            match self.read_result {
+                Ok(bytes_read) => c.complete(bytes_read),
+                Err(err) => c.error(err),
+            }
+            Ok(c)
+        }
+
+        fn pwrite(&self, _pos: u64, _buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            c.complete(0);
+            Ok(c)
+        }
+
+        fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
+            c.complete(0);
+            Ok(c)
+        }
+
+        fn size(&self) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn truncate(&self, _len: u64, c: Completion) -> Result<Completion> {
+            c.complete(0);
+            Ok(c)
+        }
+    }
+
+    #[cfg(feature = "checksum")]
+    #[test]
+    fn checksum_read_wrapper_propagates_callback_errors() {
+        let db_file = DatabaseFile {
+            file: Arc::new(MockFile { read_result: Ok(0) }),
+        };
+        let io_ctx = IOContext::default();
+        let page_idx = 1usize;
+        let expected = 4096usize;
+        let buf = Arc::new(Buffer::new_temporary(expected));
+        let original = Completion::new_read(buf, move |res| {
+            let (_, bytes_read) = res.expect("mock read should complete");
+            if bytes_read == 0 {
+                Some(CompletionError::ShortRead {
+                    page_idx,
+                    expected,
+                    actual: 0,
+                })
+            } else {
+                None
+            }
+        });
+
+        let wrapped = db_file
+            .read_page(page_idx, &io_ctx, original.clone())
+            .unwrap();
+        let io = MemoryIO::new();
+        let err = io
+            .wait_for_completion(wrapped)
+            .expect_err("wrapped completion must fail");
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::ShortRead { .. })
+        ));
+        assert!(matches!(
+            original.get_error(),
+            Some(CompletionError::ShortRead { .. })
+        ));
+    }
+
+    #[cfg(feature = "checksum")]
+    #[test]
+    fn checksum_read_wrapper_propagates_transport_errors_to_original_completion() {
+        let db_file = DatabaseFile {
+            file: Arc::new(MockFile {
+                read_result: Err(CompletionError::Aborted),
+            }),
+        };
+        let io_ctx = IOContext::default();
+        let page_idx = 1usize;
+        let buf = Arc::new(Buffer::new_temporary(4096));
+        let original = Completion::new_read(buf, |_res| None);
+
+        let wrapped = db_file
+            .read_page(page_idx, &io_ctx, original.clone())
+            .unwrap();
+        let io = MemoryIO::new();
+        let err = io
+            .wait_for_completion(wrapped)
+            .expect_err("wrapped completion must fail");
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::Aborted)
+        ));
+        assert_eq!(original.get_error(), Some(CompletionError::Aborted));
+    }
 }
