@@ -1,6 +1,5 @@
 @database database/integrity_missing_expression_index_entry.db readonly
 
-@skip-file-if mvcc "not supported in MVCC mode"
 
 test integrity-check-corrupt-missing-expression-index-entry {
     PRAGMA integrity_check;

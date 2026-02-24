@@ -25,7 +25,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
 test expression-index-on-non-orderable-type-allowed {
     CREATE TYPE noorder3 BASE text ENCODE upper(value) DECODE value;
     CREATE TABLE t14(id INTEGER PRIMARY KEY, val noorder3) STRICT;

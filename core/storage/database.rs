@@ -1,9 +1,8 @@
-use crate::error::LimboError;
 use crate::io::FileSyncType;
 use crate::storage::checksum::ChecksumContext;
 use crate::storage::encryption::EncryptionContext;
 use crate::sync::Arc;
-use crate::{io::Completion, Buffer, CompletionError, Result};
+use crate::{io::Completion, Buffer, CompletionError, LimboError, Result};
 use crate::{
     turso_assert, turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
     turso_assert_less_than_or_equal,
@@ -301,8 +300,7 @@ fn checksum_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &ChecksumContext) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{MemoryIO, IO};
-    use crate::{File, LimboError};
+    use crate::{File, LimboError, MemoryIO, IO};
 
     struct MockFile {
         read_result: std::result::Result<i32, CompletionError>,

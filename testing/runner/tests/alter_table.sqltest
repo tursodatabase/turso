@@ -549,7 +549,6 @@ expect error {
 
 # https://github.com/tursodatabase/turso/issues/5481
 @cross-check-integrity
-@skip-if mvcc "expression indexes not supported"
 test fail-alter-table-drop-column-expr-index-substr {
     CREATE TABLE t(a, b, c);
     CREATE INDEX i_expr ON t(substr(b, 1, 1));
@@ -560,7 +559,6 @@ expect error {
 }
 
 @cross-check-integrity
-@skip-if mvcc "expression indexes not supported"
 test fail-alter-table-drop-column-expr-index-arithmetic {
     CREATE TABLE t(a, b, c);
     CREATE INDEX i_expr ON t(a + b);
@@ -570,7 +568,6 @@ expect error {
 }
 
 @cross-check-integrity
-@skip-if mvcc "expression indexes not supported"
 test fail-alter-table-drop-column-expr-index-arithmetic-first-col {
     CREATE TABLE t(a, b, c);
     CREATE INDEX i_expr ON t(a + b);
@@ -580,7 +577,6 @@ expect error {
 }
 
 @cross-check-integrity
-@skip-if mvcc "expression indexes not supported"
 test alter-table-drop-column-expr-index-unreferenced {
     CREATE TABLE t(a, b, c);
     CREATE INDEX i_expr ON t(substr(b, 1, 1));
@@ -593,7 +589,6 @@ expect {
 }
 
 @cross-check-integrity
-@skip-if mvcc "expression indexes not supported"
 test fail-alter-table-drop-column-expr-index-multi-col {
     CREATE TABLE t(a, b, c);
     CREATE INDEX i_expr ON t(a + c, substr(b, 1, 1));
