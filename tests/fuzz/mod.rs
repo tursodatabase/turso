@@ -1,5 +1,6 @@
 pub mod cte;
 pub mod custom_types;
+pub mod expression_index;
 pub mod grammar_generator;
 pub mod helpers;
 pub mod join;
