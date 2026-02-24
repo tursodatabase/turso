@@ -1,0 +1,86 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(id INT, val INT);
+    INSERT INTO t VALUES (1,10),(2,20),(3,30);
+}
+
+@setup schema
+test cte-union-all-string-literals {
+    WITH c AS (
+      SELECT 'a' as label, MIN(val) as v FROM t
+      UNION ALL
+      SELECT 'b', MAX(val) FROM t
+    )
+    SELECT * FROM c;
+}
+expect {
+    a|10
+    b|30
+}
+
+@setup schema
+test cte-union-all-numeric-literals-three-branches {
+    WITH c AS (
+      SELECT 1 as label, MIN(val) as v FROM t
+      UNION ALL
+      SELECT 2, MAX(val) FROM t
+      UNION ALL
+      SELECT 3, SUM(val) FROM t
+    )
+    SELECT * FROM c;
+}
+expect {
+    1|10
+    2|30
+    3|60
+}
+
+@setup schema
+test cte-union-all-mixed-agg-functions {
+    WITH c AS (
+      SELECT 'min' as fn, MIN(val) as v FROM t
+      UNION ALL
+      SELECT 'max', MAX(val) FROM t
+      UNION ALL
+      SELECT 'avg', AVG(val) FROM t
+      UNION ALL
+      SELECT 'count', COUNT(val) FROM t
+    )
+    SELECT * FROM c;
+}
+expect {
+    min|10
+    max|30
+    avg|20.0
+    count|3
+}
+
+setup empty_table {
+    CREATE TABLE empty_t(id INT, val INT);
+}
+
+@setup empty_table
+test cte-union-all-empty-table {
+    WITH c AS (
+      SELECT 'a' as label, MIN(val) as v FROM empty_t
+      UNION ALL
+      SELECT 'b', MAX(val) FROM empty_t
+    )
+    SELECT * FROM c;
+}
+expect {
+    a|
+    b|
+}
+
+@setup schema
+test union-all-aggregates-no-cte {
+    SELECT 'a' as label, MIN(val) as v FROM t
+    UNION ALL
+    SELECT 'b', MAX(val) FROM t;
+}
+expect {
+    a|10
+    b|30
+}
