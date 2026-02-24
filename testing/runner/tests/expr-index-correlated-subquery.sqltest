@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if mvcc "expression indexes are not supported with mvcc"
 
 test expr-index-correlated-exists {
     CREATE TABLE t(b, c);
