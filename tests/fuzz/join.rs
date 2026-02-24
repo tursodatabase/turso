@@ -333,11 +333,11 @@ mod join_fuzz_tests {
 
     #[turso_macros::test(mvcc)]
     pub fn join_fuzz_unindexed_keys(db: TempDatabase) {
-        join_fuzz_inner(db, false, 2000, 200);
+        join_fuzz_inner(db, false, helpers::fuzz_iterations(2000), 200);
     }
 
     #[turso_macros::test(mvcc)]
     pub fn join_fuzz_indexed_keys(db: TempDatabase) {
-        join_fuzz_inner(db, true, 2000, 200);
+        join_fuzz_inner(db, true, helpers::fuzz_iterations(2000), 200);
     }
 }

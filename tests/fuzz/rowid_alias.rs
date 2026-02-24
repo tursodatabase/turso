@@ -1,3 +1,4 @@
+use super::helpers;
 use core_tester::common::{limbo_exec_rows, try_limbo_exec_rows, TempDatabase};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -75,7 +76,7 @@ pub fn rowid_alias_differential_fuzz() {
     let num_queries = if let Ok(num) = std::env::var("FUZZ_NUM_QUERIES") {
         num.parse::<usize>().unwrap_or(1000)
     } else {
-        1000
+        helpers::fuzz_iterations(1000)
     };
 
     // Create two Limbo databases with indexes enabled

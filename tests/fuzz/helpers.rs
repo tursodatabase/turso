@@ -7,6 +7,19 @@ use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::sync::Arc;
 
+/// Read the `FUZZ_MULTIPLIER` env var (default 1.0) and scale `base` by it.
+/// Returns at least 1 so loops always execute at least once.
+pub fn fuzz_iterations(base: usize) -> usize {
+    static MULTIPLIER: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let m = *MULTIPLIER.get_or_init(|| {
+        std::env::var("FUZZ_MULTIPLIER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0)
+    });
+    ((base as f64 * m) as usize).max(1)
+}
+
 /// Initialize a fuzz test: set up env_logger, create an RNG, and print the seed.
 /// Returns `(rng, seed)`.
 pub fn init_fuzz_test(name: &str) -> (ChaCha8Rng, u64) {
