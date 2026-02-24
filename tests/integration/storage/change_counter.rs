@@ -190,7 +190,7 @@ fn test_change_counter_multiple_ddl_operations() {
 
     let mut prev_cc = 0u32;
     for i in 0..5 {
-        conn.execute(&format!("CREATE TABLE t{i} (id INTEGER PRIMARY KEY)"))
+        conn.execute(format!("CREATE TABLE t{i} (id INTEGER PRIMARY KEY)"))
             .unwrap();
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
