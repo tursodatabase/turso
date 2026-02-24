@@ -1,0 +1,48 @@
+@database :memory:
+
+# Test that sqlite_schema and sqlite_master are both valid names for the schema table
+
+@cross-check-integrity
+test sqlite-schema-basic {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'hello');
+    SELECT type, name, tbl_name FROM sqlite_schema WHERE name = 't1';
+}
+expect {
+    table|t1|t1
+}
+
+@cross-check-integrity
+test sqlite-master-basic {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'hello');
+    SELECT type, name, tbl_name FROM sqlite_master WHERE name = 't1';
+}
+expect {
+    table|t1|t1
+}
+
+@cross-check-integrity
+test sqlite-master-case-insensitive {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT type, name, tbl_name FROM SQLITE_MASTER WHERE name = 't1';
+}
+expect {
+    table|t1|t1
+}
+
+test sqlite-schema-all-columns {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema WHERE name = 't1';
+}
+expect {
+    table|t1|t1|2|CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)
+}
+
+test sqlite-master-all-columns {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master WHERE name = 't1';
+}
+expect {
+    table|t1|t1|2|CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)
+}

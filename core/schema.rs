@@ -149,6 +149,8 @@ use turso_parser::{
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
+const SCHEMA_TEMP_TABLE_NAME: &str = "sqlite_temp_schema";
+const SCHEMA_TEMP_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
@@ -231,7 +233,16 @@ pub fn can_write_to_table(table_name: &str) -> bool {
     let normalized = table_name.to_lowercase();
     !(normalized == SCHEMA_TABLE_NAME
         || normalized == SCHEMA_TABLE_NAME_ALT
+        || normalized == SCHEMA_TEMP_TABLE_NAME
+        || normalized == SCHEMA_TEMP_TABLE_NAME_ALT
         || normalized.starts_with(TURSO_INTERNAL_PREFIX))
+}
+
+/// Returns true if the table name is an alias that implicitly refers to the
+/// temp database's schema table (sqlite_temp_schema or sqlite_temp_master).
+pub fn is_temp_schema_alias(table_name: &str) -> bool {
+    table_name.eq_ignore_ascii_case(SCHEMA_TEMP_TABLE_NAME)
+        || table_name.eq_ignore_ascii_case(SCHEMA_TEMP_TABLE_NAME_ALT)
 }
 
 /// Type of schema object for conflict checking
@@ -539,7 +550,10 @@ impl Schema {
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
         let name = normalize_ident(name);
-        let name = if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT) {
+        let name = if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT)
+            || name.eq_ignore_ascii_case(SCHEMA_TEMP_TABLE_NAME)
+            || name.eq_ignore_ascii_case(SCHEMA_TEMP_TABLE_NAME_ALT)
+        {
             SCHEMA_TABLE_NAME
         } else {
             &name

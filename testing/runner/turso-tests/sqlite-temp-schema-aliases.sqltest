@@ -1,0 +1,98 @@
+@database :memory:
+
+# Test that sqlite_temp_schema and sqlite_temp_master are recognized as valid
+# names for the schema table. In tursodb, main and temp currently share the same
+# schema, so these return the same results as sqlite_schema.
+
+test sqlite-temp-schema-basic {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT type, name, tbl_name FROM sqlite_temp_schema WHERE name = 't1';
+}
+expect {
+    table|t1|t1
+}
+
+test sqlite-temp-master-basic {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT type, name, tbl_name FROM sqlite_temp_master WHERE name = 't1';
+}
+expect {
+    table|t1|t1
+}
+
+test sqlite-temp-schema-case-insensitive {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT type, name, tbl_name FROM SQLITE_TEMP_SCHEMA WHERE name = 't1';
+}
+expect {
+    table|t1|t1
+}
+
+test sqlite-temp-master-case-insensitive {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT type, name, tbl_name FROM SQLite_Temp_Master WHERE name = 't1';
+}
+expect {
+    table|t1|t1
+}
+
+test sqlite-temp-schema-all-columns {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT type, name, tbl_name, rootpage, sql FROM sqlite_temp_schema WHERE name = 't1';
+}
+expect {
+    table|t1|t1|2|CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)
+}
+
+test sqlite-temp-schema-count {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY);
+    CREATE TABLE t2 (val TEXT);
+    SELECT count(*) FROM sqlite_temp_schema WHERE type = 'table';
+}
+expect {
+    2
+}
+
+test sqlite-temp-schema-no-match {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY);
+    SELECT count(*) FROM sqlite_temp_schema WHERE name = 'nonexistent';
+}
+expect {
+    0
+}
+
+# temp.sqlite_temp_schema should also work (explicit temp prefix)
+
+test temp-qualified-sqlite-temp-schema {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT type, name, tbl_name FROM temp.sqlite_temp_schema WHERE name = 't1';
+}
+expect {
+    table|t1|t1
+}
+
+test temp-qualified-sqlite-temp-master {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT type, name, tbl_name FROM temp.sqlite_temp_master WHERE name = 't1';
+}
+expect {
+    table|t1|t1
+}
+
+# main.sqlite_temp_schema should be an error
+
+test main-qualified-sqlite-temp-schema-error {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT * FROM main.sqlite_temp_schema;
+}
+expect error {
+    no such table: main.sqlite_temp_schema
+}
+
+test main-qualified-sqlite-temp-master-error {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    SELECT * FROM main.sqlite_temp_master;
+}
+expect error {
+    no such table: main.sqlite_temp_master
+}

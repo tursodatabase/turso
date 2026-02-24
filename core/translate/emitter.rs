@@ -224,13 +224,16 @@ impl<'a> Resolver<'a> {
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
         use crate::util::normalize_ident;
 
+        let table_name = normalize_ident(qualified_name.name.as_str());
+        let is_temp_alias = crate::schema::is_temp_schema_alias(&table_name);
+
         // Check if this is a qualified name (database.table) or unqualified
         if let Some(db_name) = &qualified_name.db_name {
             let db_name_normalized = normalize_ident(db_name.as_str());
             let name_bytes = db_name_normalized.as_bytes();
-            match_ignore_ascii_case!(match name_bytes {
-                b"main" => Ok(0),
-                b"temp" => Ok(1),
+            let database_id = match_ignore_ascii_case!(match name_bytes {
+                b"main" => Ok(crate::MAIN_DB_ID),
+                b"temp" => Ok(crate::TEMP_DB_ID),
                 _ => {
                     // Look up attached database
                     if let Some((idx, _attached_db)) =
@@ -243,10 +246,23 @@ impl<'a> Resolver<'a> {
                         )))
                     }
                 }
-            })
+            })?;
+
+            // sqlite_temp_schema / sqlite_temp_master only work for the temp database
+            if is_temp_alias && database_id != crate::TEMP_DB_ID {
+                return Err(LimboError::ParseError(format!(
+                    "no such table: {db_name_normalized}.{table_name}"
+                )));
+            }
+
+            Ok(database_id)
+        } else if is_temp_alias {
+            // Unqualified sqlite_temp_schema / sqlite_temp_master implicitly
+            // refers to the temp database
+            Ok(crate::TEMP_DB_ID)
         } else {
             // Unqualified table name - use main database
-            Ok(0)
+            Ok(crate::MAIN_DB_ID)
         }
     }
 
