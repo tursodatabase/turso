@@ -804,15 +804,24 @@ impl SimulatorEnv {
             std::fs::remove_file(&wal_path).unwrap();
         }
 
+        let log_path = db_path.with_extension("db-log");
+        if log_path.exists() {
+            std::fs::remove_file(&log_path).unwrap();
+        }
+
         // Remove attached database files
         for name in &self.attached_dbs {
             let aux_path = self.paths.aux_db(&self.type_, &self.phase, name);
             if aux_path.exists() {
                 std::fs::remove_file(&aux_path).unwrap();
             }
-            let aux_wal = aux_path.with_extension(format!("{name}.db-wal"));
+            let aux_wal = aux_path.with_extension("db-wal");
             if aux_wal.exists() {
                 std::fs::remove_file(&aux_wal).unwrap();
+            }
+            let aux_log = aux_path.with_extension("db-log");
+            if aux_log.exists() {
+                std::fs::remove_file(&aux_log).unwrap();
             }
         }
 
@@ -923,15 +932,24 @@ impl SimulatorEnv {
             std::fs::remove_file(&wal_path).unwrap();
         }
 
+        let log_path = db_path.with_extension("db-log");
+        if log_path.exists() {
+            std::fs::remove_file(&log_path).unwrap();
+        }
+
         // Remove attached database files if they exist
         for name in &attached_dbs {
             let aux_path = paths.aux_db(&simulation_type, &SimulationPhase::Test, name);
             if aux_path.exists() {
                 std::fs::remove_file(&aux_path).unwrap();
             }
-            let aux_wal = aux_path.with_extension(format!("{name}.db-wal"));
+            let aux_wal = aux_path.with_extension("db-wal");
             if aux_wal.exists() {
                 std::fs::remove_file(&aux_wal).unwrap();
+            }
+            let aux_log = aux_path.with_extension("db-log");
+            if aux_log.exists() {
+                std::fs::remove_file(&aux_log).unwrap();
             }
         }
 
