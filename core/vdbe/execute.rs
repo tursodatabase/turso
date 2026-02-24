@@ -2071,9 +2071,9 @@ pub fn halt(
         }
         if err_code > 0 {
             let error = match resolve_type {
-                ResolveType::Abort => LimboError::RaiseAbort(description.to_string()),
-                ResolveType::Rollback => LimboError::RaiseRollback(description.to_string()),
-                ResolveType::Fail => LimboError::RaiseFail(description.to_string()),
+                ResolveType::Abort | ResolveType::Rollback | ResolveType::Fail => {
+                    LimboError::Raise(resolve_type, description.to_string())
+                }
                 ResolveType::Ignore => unreachable!("handled above"),
                 ResolveType::Replace => unreachable!("Replace not valid for RAISE"),
             };
