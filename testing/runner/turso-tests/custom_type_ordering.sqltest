@@ -1,0 +1,411 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+# --- ERROR TESTS: types without OPERATOR '<' cannot be sorted or indexed ---
+
+@requires strict "uses STRICT tables"
+test order-by-blocked-for-non-orderable-type {
+    CREATE TYPE noorder BASE text ENCODE value DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val noorder) STRICT;
+    INSERT INTO t1 VALUES (1, 'a');
+    SELECT val FROM t1 ORDER BY val;
+}
+expect error {
+    cannot ORDER BY column 'val' of type 'noorder': type does not declare OPERATOR '<'
+}
+
+@requires strict "uses STRICT tables"
+test create-index-blocked-for-non-orderable-type {
+    CREATE TYPE noorder2 BASE text ENCODE value DECODE value;
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, val noorder2) STRICT;
+    CREATE INDEX idx2 ON t2(val);
+}
+expect error {
+    cannot create index on column 'val' of type 'noorder2': type does not declare OPERATOR '<'
+}
+
+@requires strict "uses STRICT tables"
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expression-index-on-non-orderable-type-allowed {
+    CREATE TYPE noorder3 BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE t14(id INTEGER PRIMARY KEY, val noorder3) STRICT;
+    CREATE INDEX idx14 ON t14(length(val));
+    INSERT INTO t14 VALUES (1, 'hello');
+    SELECT val FROM t14;
+}
+expect {
+    HELLO
+}
+
+# --- NAKED OPERATOR '<': sort on encoded (on-disk) values with base type comparison ---
+
+# Identity encode/decode: encoded = decoded, so sort order matches alphabetical.
+@requires strict "uses STRICT tables"
+test naked-lt-identity-encoding {
+    CREATE TYPE orderable BASE text ENCODE value DECODE value OPERATOR '<';
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, val orderable) STRICT;
+    INSERT INTO t3 VALUES (1, 'banana');
+    INSERT INTO t3 VALUES (2, 'apple');
+    INSERT INTO t3 VALUES (3, 'cherry');
+    SELECT val FROM t3 ORDER BY val;
+}
+expect {
+    apple
+    banana
+    cherry
+}
+
+# Same query with an index — must produce identical results.
+@requires strict "uses STRICT tables"
+test naked-lt-identity-encoding-with-index {
+    CREATE TYPE orderable2 BASE text ENCODE value DECODE value OPERATOR '<';
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, val orderable2) STRICT;
+    CREATE INDEX idx4 ON t4(val);
+    INSERT INTO t4 VALUES (1, 'banana');
+    INSERT INTO t4 VALUES (2, 'apple');
+    INSERT INTO t4 VALUES (3, 'cherry');
+    SELECT val FROM t4 ORDER BY val;
+}
+expect {
+    apple
+    banana
+    cherry
+}
+
+# ENCODE value * 10 is a monotonic transform: 10→100, 20→200, 30→300.
+# Sorting encoded integers preserves numeric order.
+@requires strict "uses STRICT tables"
+test naked-lt-monotonic-integer {
+    CREATE TYPE myint BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TABLE t5(id INTEGER PRIMARY KEY, val myint) STRICT;
+    INSERT INTO t5 VALUES (1, 30);
+    INSERT INTO t5 VALUES (2, 10);
+    INSERT INTO t5 VALUES (3, 20);
+    SELECT val FROM t5 ORDER BY val;
+}
+expect {
+    10
+    20
+    30
+}
+
+@requires strict "uses STRICT tables"
+test naked-lt-monotonic-integer-with-index {
+    CREATE TYPE myint1b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TABLE t5b(id INTEGER PRIMARY KEY, val myint1b) STRICT;
+    CREATE INDEX idx5b ON t5b(val);
+    INSERT INTO t5b VALUES (1, 30);
+    INSERT INTO t5b VALUES (2, 10);
+    INSERT INTO t5b VALUES (3, 20);
+    SELECT val FROM t5b ORDER BY val;
+}
+expect {
+    10
+    20
+    30
+}
+
+@requires strict "uses STRICT tables"
+test naked-lt-desc-order {
+    CREATE TYPE myint2 BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TABLE t6(id INTEGER PRIMARY KEY, val myint2) STRICT;
+    INSERT INTO t6 VALUES (1, 30);
+    INSERT INTO t6 VALUES (2, 10);
+    INSERT INTO t6 VALUES (3, 20);
+    SELECT val FROM t6 ORDER BY val DESC;
+}
+expect {
+    30
+    20
+    10
+}
+
+@requires strict "uses STRICT tables"
+test naked-lt-desc-order-with-index {
+    CREATE TYPE myint2b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TABLE t6b(id INTEGER PRIMARY KEY, val myint2b) STRICT;
+    CREATE INDEX idx6b ON t6b(val);
+    INSERT INTO t6b VALUES (1, 30);
+    INSERT INTO t6b VALUES (2, 10);
+    INSERT INTO t6b VALUES (3, 20);
+    SELECT val FROM t6b ORDER BY val DESC;
+}
+expect {
+    30
+    20
+    10
+}
+
+# string_reverse is NOT a monotonic transform: the encoded text sort order
+# differs from the decoded text sort order.
+# Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
+# Naked '<' sorts encoded text: ananab < elppa < yrrehc → display: banana, apple, cherry.
+@requires strict "uses STRICT tables"
+test naked-lt-non-monotonic-encoding {
+    CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TABLE t_rev(id INTEGER PRIMARY KEY, val rev) STRICT;
+    INSERT INTO t_rev VALUES (1, 'apple');
+    INSERT INTO t_rev VALUES (2, 'banana');
+    INSERT INTO t_rev VALUES (3, 'cherry');
+    SELECT val FROM t_rev ORDER BY val;
+}
+expect {
+    banana
+    apple
+    cherry
+}
+
+# Same query with an index — must produce identical results.
+@requires strict "uses STRICT tables"
+test naked-lt-non-monotonic-encoding-with-index {
+    CREATE TYPE rev2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TABLE t_rev2(id INTEGER PRIMARY KEY, val rev2) STRICT;
+    CREATE INDEX idx_rev2 ON t_rev2(val);
+    INSERT INTO t_rev2 VALUES (1, 'apple');
+    INSERT INTO t_rev2 VALUES (2, 'banana');
+    INSERT INTO t_rev2 VALUES (3, 'cherry');
+    SELECT val FROM t_rev2 ORDER BY val;
+}
+expect {
+    banana
+    apple
+    cherry
+}
+
+# DESC with non-monotonic encoding.
+# DESC encoded: yrrehc > elppa > ananab → display: cherry, apple, banana.
+@requires strict "uses STRICT tables"
+test naked-lt-non-monotonic-desc {
+    CREATE TYPE rev3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TABLE t_rev3(id INTEGER PRIMARY KEY, val rev3) STRICT;
+    INSERT INTO t_rev3 VALUES (1, 'apple');
+    INSERT INTO t_rev3 VALUES (2, 'banana');
+    INSERT INTO t_rev3 VALUES (3, 'cherry');
+    SELECT val FROM t_rev3 ORDER BY val DESC;
+}
+expect {
+    cherry
+    apple
+    banana
+}
+
+@requires strict "uses STRICT tables"
+test naked-lt-non-monotonic-desc-with-index {
+    CREATE TYPE rev4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TABLE t_rev4(id INTEGER PRIMARY KEY, val rev4) STRICT;
+    CREATE INDEX idx_rev4 ON t_rev4(val);
+    INSERT INTO t_rev4 VALUES (1, 'apple');
+    INSERT INTO t_rev4 VALUES (2, 'banana');
+    INSERT INTO t_rev4 VALUES (3, 'cherry');
+    SELECT val FROM t_rev4 ORDER BY val DESC;
+}
+expect {
+    cherry
+    apple
+    banana
+}
+
+# --- OPERATOR '<' WITH CUSTOM COMPARATOR ---
+# OPERATOR '<' string_reverse: the comparator reverses encoded values before comparing,
+# recovering the original alphabetical order.
+# Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
+# Comparator: string_reverse(elppa)=apple, string_reverse(ananab)=banana, string_reverse(yrrehc)=cherry.
+# Sort: apple < banana < cherry → display: apple, banana, cherry.
+
+@requires strict "uses STRICT tables"
+test custom-comparator-recovers-alphabetical {
+    CREATE TYPE rev_cmp BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
+    CREATE TABLE t_cmp(id INTEGER PRIMARY KEY, val rev_cmp) STRICT;
+    INSERT INTO t_cmp VALUES (1, 'apple');
+    INSERT INTO t_cmp VALUES (2, 'banana');
+    INSERT INTO t_cmp VALUES (3, 'cherry');
+    SELECT val FROM t_cmp ORDER BY val;
+}
+expect {
+    apple
+    banana
+    cherry
+}
+
+@requires strict "uses STRICT tables"
+test custom-comparator-recovers-alphabetical-with-index {
+    CREATE TYPE rev_cmp2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
+    CREATE TABLE t_cmp2(id INTEGER PRIMARY KEY, val rev_cmp2) STRICT;
+    CREATE INDEX idx_cmp2 ON t_cmp2(val);
+    INSERT INTO t_cmp2 VALUES (1, 'apple');
+    INSERT INTO t_cmp2 VALUES (2, 'banana');
+    INSERT INTO t_cmp2 VALUES (3, 'cherry');
+    SELECT val FROM t_cmp2 ORDER BY val;
+}
+expect {
+    apple
+    banana
+    cherry
+}
+
+@requires strict "uses STRICT tables"
+test custom-comparator-desc {
+    CREATE TYPE rev_cmp3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
+    CREATE TABLE t_cmp3(id INTEGER PRIMARY KEY, val rev_cmp3) STRICT;
+    INSERT INTO t_cmp3 VALUES (1, 'apple');
+    INSERT INTO t_cmp3 VALUES (2, 'banana');
+    INSERT INTO t_cmp3 VALUES (3, 'cherry');
+    SELECT val FROM t_cmp3 ORDER BY val DESC;
+}
+expect {
+    cherry
+    banana
+    apple
+}
+
+@requires strict "uses STRICT tables"
+test custom-comparator-desc-with-index {
+    CREATE TYPE rev_cmp4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
+    CREATE TABLE t_cmp4(id INTEGER PRIMARY KEY, val rev_cmp4) STRICT;
+    CREATE INDEX idx_cmp4 ON t_cmp4(val);
+    INSERT INTO t_cmp4 VALUES (1, 'apple');
+    INSERT INTO t_cmp4 VALUES (2, 'banana');
+    INSERT INTO t_cmp4 VALUES (3, 'cherry');
+    SELECT val FROM t_cmp4 ORDER BY val DESC;
+}
+expect {
+    cherry
+    banana
+    apple
+}
+
+# --- BUILT-IN TYPES: all have OPERATOR '<' and sort correctly ---
+
+@requires strict "uses STRICT tables"
+test builtin-date-order-by {
+    CREATE TABLE t7(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t7 VALUES (1, '2024-03-15');
+    INSERT INTO t7 VALUES (2, '2024-01-01');
+    INSERT INTO t7 VALUES (3, '2024-06-30');
+    SELECT d FROM t7 ORDER BY d;
+}
+expect {
+    2024-01-01
+    2024-03-15
+    2024-06-30
+}
+
+@requires strict "uses STRICT tables"
+test builtin-date-with-index {
+    CREATE TABLE t7b(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE INDEX idx7b ON t7b(d);
+    INSERT INTO t7b VALUES (1, '2024-03-15');
+    INSERT INTO t7b VALUES (2, '2024-01-01');
+    INSERT INTO t7b VALUES (3, '2024-06-30');
+    SELECT d FROM t7b ORDER BY d;
+}
+expect {
+    2024-01-01
+    2024-03-15
+    2024-06-30
+}
+
+@requires strict "uses STRICT tables"
+test builtin-time-order-by {
+    CREATE TABLE t8(id INTEGER PRIMARY KEY, t time) STRICT;
+    INSERT INTO t8 VALUES (1, '14:30:00');
+    INSERT INTO t8 VALUES (2, '08:00:00');
+    INSERT INTO t8 VALUES (3, '23:59:59');
+    SELECT t FROM t8 ORDER BY t;
+}
+expect {
+    08:00:00
+    14:30:00
+    23:59:59
+}
+
+@requires strict "uses STRICT tables"
+test builtin-timestamp-order-by {
+    CREATE TABLE t9(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO t9 VALUES (1, '2024-03-15 14:30:00');
+    INSERT INTO t9 VALUES (2, '2024-01-01 00:00:00');
+    INSERT INTO t9 VALUES (3, '2024-06-30 23:59:59');
+    SELECT ts FROM t9 ORDER BY ts;
+}
+expect {
+    2024-01-01 00:00:00
+    2024-03-15 14:30:00
+    2024-06-30 23:59:59
+}
+
+@requires strict "uses STRICT tables"
+test builtin-varchar-order-by {
+    CREATE TABLE t10(id INTEGER PRIMARY KEY, name varchar(50)) STRICT;
+    INSERT INTO t10 VALUES (1, 'Charlie');
+    INSERT INTO t10 VALUES (2, 'Alice');
+    INSERT INTO t10 VALUES (3, 'Bob');
+    SELECT name FROM t10 ORDER BY name;
+}
+expect {
+    Alice
+    Bob
+    Charlie
+}
+
+@requires strict "uses STRICT tables"
+test builtin-smallint-order-by {
+    CREATE TABLE t11(id INTEGER PRIMARY KEY, val smallint) STRICT;
+    INSERT INTO t11 VALUES (1, 300);
+    INSERT INTO t11 VALUES (2, 100);
+    INSERT INTO t11 VALUES (3, 200);
+    SELECT val FROM t11 ORDER BY val;
+}
+expect {
+    100
+    200
+    300
+}
+
+@requires strict "uses STRICT tables"
+test builtin-boolean-order-by {
+    CREATE TABLE t12(id INTEGER PRIMARY KEY, flag boolean) STRICT;
+    INSERT INTO t12 VALUES (1, true);
+    INSERT INTO t12 VALUES (2, false);
+    INSERT INTO t12 VALUES (3, true);
+    SELECT id, flag FROM t12 ORDER BY flag, id;
+}
+expect {
+    2|0
+    1|1
+    3|1
+}
+
+# --- MISC ---
+
+@requires strict "uses STRICT tables"
+test naked-lt-with-other-operators {
+    CREATE TYPE mytype BASE text ENCODE value DECODE value OPERATOR '<' OPERATOR '=' DECODE value;
+    CREATE TABLE t15(id INTEGER PRIMARY KEY, val mytype) STRICT;
+    INSERT INTO t15 VALUES (1, 'b');
+    INSERT INTO t15 VALUES (2, 'a');
+    INSERT INTO t15 VALUES (3, 'c');
+    SELECT val FROM t15 ORDER BY val;
+}
+expect {
+    a
+    b
+    c
+}
+
+@requires strict "uses STRICT tables"
+test naked-lt-roundtrips-through-sql {
+    CREATE TYPE rt_type BASE text ENCODE value DECODE value OPERATOR '<';
+    SELECT sql FROM sqlite_turso_types WHERE name = 'rt_type';
+}
+expect {
+    CREATE TYPE rt_type BASE text ENCODE value DECODE value OPERATOR '<'
+}
+
+@requires strict "uses STRICT tables"
+test custom-comparator-roundtrips-through-sql {
+    CREATE TYPE rt_type2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
+    SELECT sql FROM sqlite_turso_types WHERE name = 'rt_type2';
+}
+expect {
+    CREATE TYPE rt_type2 BASE text ENCODE string_reverse (value) DECODE string_reverse (value) OPERATOR '<' string_reverse
+}

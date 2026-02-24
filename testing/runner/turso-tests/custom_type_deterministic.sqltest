@@ -1,0 +1,55 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+@requires strict "uses STRICT tables"
+test reject-nondeterministic-encode-random {
+    CREATE TYPE rand_salt BASE integer
+        ENCODE value + abs(random() % 1000000)
+        DECODE value;
+}
+expect error {
+    non-deterministic functions prohibited in ENCODE expressions: random
+}
+
+@requires strict "uses STRICT tables"
+test reject-nondeterministic-encode-changes {
+    CREATE TYPE bad BASE integer
+        ENCODE value + changes()
+        DECODE value;
+}
+expect error {
+    non-deterministic functions prohibited in ENCODE expressions: changes
+}
+
+@requires strict "uses STRICT tables"
+test reject-nondeterministic-decode {
+    CREATE TYPE bad BASE integer
+        ENCODE value
+        DECODE value + abs(random());
+}
+expect error {
+    non-deterministic functions prohibited in DECODE expressions: random
+}
+
+@requires strict "uses STRICT tables"
+test accept-deterministic-encode {
+    CREATE TYPE good BASE integer
+        ENCODE value * 100 + abs(value)
+        DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val good) STRICT;
+    INSERT INTO t1 VALUES (1, 5);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|5
+}
+
+@requires strict "uses STRICT tables"
+test reject-nondeterministic-last-insert-rowid {
+    CREATE TYPE bad BASE integer
+        ENCODE value + last_insert_rowid()
+        DECODE value;
+}
+expect error {
+    non-deterministic functions prohibited in ENCODE expressions: last_insert_rowid
+}

@@ -1011,6 +1011,7 @@ pub fn insn_to_row(
                 acc_reg,
                 delimiter: _,
                 col,
+                comparator_func_name: _,
             } => (
                 "AggStep",
                 0,
@@ -1042,6 +1043,7 @@ pub fn insn_to_row(
                 cursor_id,
                 columns,
                 order_and_collations,
+                ..
             } => {
                 let to_print: Vec<String> = order_and_collations
                     .iter()
@@ -1475,6 +1477,24 @@ pub fn insn_to_row(
                 Value::build_text(trigger_name.clone()),
                 0,
                 format!("DROP TRIGGER {trigger_name}"),
+            ),
+            Insn::DropType { db, type_name } => (
+                "DropType",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(type_name.clone()),
+                0,
+                format!("DROP TYPE {type_name}"),
+            ),
+            Insn::AddType { db, sql } => (
+                "AddType",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(sql.clone()),
+                0,
+                "ADD TYPE".to_string(),
             ),
             Insn::DropView { db, view_name } => (
                 "DropView",

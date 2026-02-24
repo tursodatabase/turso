@@ -139,6 +139,8 @@ pub use vdbe::{
 /// Database index for the main database (always 0 in SQLite).
 pub const MAIN_DB_ID: usize = 0;
 
+mod turso_types_vtab;
+
 /// Database index for the temp database (always 1 in SQLite).
 pub const TEMP_DB_ID: usize = 1;
 
@@ -158,6 +160,7 @@ pub const fn is_attached_db(database_id: usize) -> bool {
 pub struct DatabaseOpts {
     pub enable_views: bool,
     pub enable_strict: bool,
+    pub enable_custom_types: bool,
     pub enable_encryption: bool,
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
@@ -184,6 +187,11 @@ impl DatabaseOpts {
 
     pub fn with_strict(mut self, enable: bool) -> Self {
         self.enable_strict = enable;
+        self
+    }
+
+    pub fn with_custom_types(mut self, enable: bool) -> Self {
+        self.enable_custom_types = enable;
         self
     }
 
@@ -468,7 +476,9 @@ impl Database {
             mv_store,
             path: path.into(),
             wal_path: wal_path.into(),
-            schema: Arc::new(Mutex::new(Arc::new(Schema::new()))),
+            schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
+                opts.enable_strict,
+            )))),
             _shared_page_cache: shared_page_cache,
             shared_wal,
             db_file,
@@ -897,6 +907,38 @@ impl Database {
                             tracing::warn!("open warning, failed to load extension: {e}");
                         }
                         Err(e) => return Err(e),
+                    }
+
+                    // Load custom types from __turso_internal_types if the table
+                    // exists and custom types are enabled. The schema loaded by
+                    // make_from_btree includes the table definition but not its
+                    // contents. We need to read the stored type definitions so
+                    // that DECODE/ENCODE and affinity metadata are available to
+                    // all subsequent connections.
+                    if opts.enable_custom_types {
+                        let conn = state
+                            .conn
+                            .as_ref()
+                            .expect("conn must be initialized in Init phase");
+                        // Sync the connection's schema from the database so it
+                        // can query __turso_internal_types.
+                        conn.maybe_update_schema();
+                        let load_result: Result<()> = (|| {
+                            let type_sqls = conn.query_stored_type_definitions()?;
+                            if !type_sqls.is_empty() {
+                                let db = state
+                                    .db
+                                    .as_ref()
+                                    .expect("db must be initialized in Init phase");
+                                db.with_schema_mut(|schema| {
+                                    schema.load_type_definitions(&type_sqls)
+                                })?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(e) = load_result {
+                            tracing::warn!("Failed to load custom types during open: {}", e);
+                        }
                     }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
@@ -1506,6 +1548,10 @@ impl Database {
 
     pub fn experimental_strict_enabled(&self) -> bool {
         self.opts.enable_strict
+    }
+
+    pub fn experimental_custom_types_enabled(&self) -> bool {
+        self.opts.enable_custom_types
     }
 
     pub fn experimental_triggers_enabled(&self) -> bool {

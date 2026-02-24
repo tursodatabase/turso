@@ -70,6 +70,11 @@ pub struct Opts {
     pub experimental_views: bool,
     #[clap(long, help = "Enable experimental strict schema mode")]
     pub experimental_strict: bool,
+    #[clap(
+        long,
+        help = "Enable experimental custom types (CREATE TYPE / DROP TYPE)"
+    )]
+    pub experimental_custom_types: bool,
     #[clap(short = 't', long, help = "specify output file for log traces")]
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
@@ -208,6 +213,7 @@ impl Limbo {
         let db_opts = turso_core::DatabaseOpts::new()
             .with_views(opts.experimental_views)
             .with_strict(opts.experimental_strict)
+            .with_custom_types(opts.experimental_custom_types)
             .with_encryption(opts.experimental_encryption)
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
@@ -1656,6 +1662,9 @@ impl Limbo {
         // FIXME: At this point, SQLite executes the following:
         // sqlite3_exec(p->db, "SAVEPOINT dump; PRAGMA writable_schema=ON", 0, 0, 0);
         // we don't have those yet, so don't.
+        // Emit CREATE TYPE statements from __turso_internal_types before table DDL,
+        // so that tables referencing custom types can be restored correctly.
+        Self::dump_custom_types(&conn, out)?;
         let q_tables = r#"
         SELECT name, sql
         FROM sqlite_schema
@@ -1665,8 +1674,8 @@ impl Limbo {
         if let Some(mut rows) = conn.query(q_tables)? {
             rows.run_with_row_callback(|row| {
                 let name: &str = row.get::<&str>(0)?;
-                // Skip sqlite_sequence table
-                if name == "sqlite_sequence" {
+                // Skip sqlite_sequence and internal types metadata table
+                if name == "sqlite_sequence" || name == turso_core::schema::TURSO_TYPES_TABLE_NAME {
                     return Ok(());
                 }
                 let ddl: &str = row.get::<&str>(1)?;
@@ -1734,6 +1743,36 @@ impl Limbo {
                     Self::write_sql_value_from_value(out, v).map_err(|e| io_error(e, "write"))?;
                 }
                 out.write_all(b");\n").map_err(|e| io_error(e, "write"))?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dump_custom_types<W: Write>(conn: &Arc<Connection>, out: &mut W) -> anyhow::Result<()> {
+        // Check if the internal types table exists before querying it.
+        let check = format!(
+            "SELECT 1 FROM sqlite_schema WHERE name='{}' AND type='table'",
+            turso_core::schema::TURSO_TYPES_TABLE_NAME
+        );
+        let mut has_types = false;
+        if let Some(mut rows) = conn.query(&check)? {
+            rows.run_with_row_callback(|_| {
+                has_types = true;
+                Ok(())
+            })?;
+        }
+        if !has_types {
+            return Ok(());
+        }
+        let q = format!(
+            "SELECT sql FROM {} ORDER BY rowid",
+            turso_core::schema::TURSO_TYPES_TABLE_NAME
+        );
+        if let Some(mut rows) = conn.query(&q)? {
+            rows.run_with_row_callback(|row| {
+                let sql: &str = row.get::<&str>(0)?;
+                writeln!(out, "{sql};").map_err(|e| io_error(e, "write"))?;
                 Ok(())
             })?;
         }

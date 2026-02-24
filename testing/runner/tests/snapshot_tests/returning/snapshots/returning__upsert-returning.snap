@@ -16,7 +16,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode         p1  p2  p3  p4   p5  comment
-   0  Init            0  51   0        0  Start at 51
+   0  Init            0  57   0        0  Start at 57
    1  OpenEphemeral   0   1   0        0  cursor=0 is_table=true
    2  OpenWrite       1   2   0        0  root=2; iDb=0
    3  Integer         1   2   0        0  r[2]=1
@@ -31,41 +31,47 @@ addr  opcode         p1  p2  p3  p4   p5  comment
   12  Affinity        3   3   0        0  r[3..6] = D, B, D
   13  NotExists       1  16   2        0
   14  Copy            2   1   0        0  r[1]=r[2]
-  15  Goto            0  25   0        0
+  15  Goto            0  28   0        0
   16  MakeRecord      3   3   6        0  r[6]=mkrec(r[3..5])
   17  Insert          1   6   2  t2    0  intkey=r[2] data=r[6]
   18  Copy            2   7   0        0  r[7]=r[2]
   19  Copy            4   8   0        0  r[8]=r[4]
   20  Copy            5   9   0        0  r[9]=r[5]
-  21  MakeRecord      7   3  10        0  r[10]=mkrec(r[7..9])
-  22  NewRowid        0  11   0        0  r[11]=rowid
-  23  Insert          0  10  11        4  intkey=r[11] data=r[10]
-  24  Goto            0  43   0        0
-  25  SeekRowid       1   1  43        0  if (r[1]!=cursor 1 for table t2.rowid) goto 43
-  26  RowId           1  12   0        0  r[12]=t2.rowid
-  27  Column          1   1  13        0  r[13]=t2.name
-  28  Column          1   2  14        0  r[14]=t2.counter
-  29  Copy           12  15   2        0  r[15]=r[12]
-  30  Copy           14  18   0        0  r[18]=r[14]
-  31  Integer         1  19   0        0  r[19]=1
-  32  Add            18  19  17        0  r[17]=r[18]+r[19]
-  33  Affinity       15   3   0        0  r[15..18] = D, B, D
-  34  MakeRecord     15   3  20        0  r[20]=mkrec(r[15..17])
-  35  Insert          1  20   1  t2    8  intkey=r[1] data=r[20]
-  36  Copy            1  21   0        0  r[21]=r[1]
-  37  Copy           16  22   0        0  r[22]=r[16]
-  38  Copy           17  23   0        0  r[23]=r[17]
-  39  MakeRecord     21   3  24        0  r[24]=mkrec(r[21..23])
-  40  NewRowid        0  25   0        0  r[25]=rowid
-  41  Insert          0  24  25        4  intkey=r[25] data=r[24]
-  42  Goto            0  43   0        0
-  43  Goto            0  44   0        0
-  44  Rewind          0  50   0        0  Rewind  ephemeral(t2)
-  45    Column        0   0  26        0  r[26]=ephemeral(t2).id
-  46    Column        0   1  27        0  r[27]=ephemeral(t2).name
-  47    Column        0   2  28        0  r[28]=ephemeral(t2).counter
-  48    ResultRow    26   3   0        0  output=r[26..28]
-  49  Next            0  45   0        0
-  50  Halt            0   0   0        0
-  51  Transaction     0   2   1        0  iDb=0 tx_mode=Write
-  52  Goto            0   1   0        0
+  21  Copy            7  10   0        0  r[10]=r[7]
+  22  Copy            8  11   0        0  r[11]=r[8]
+  23  Copy            9  12   0        0  r[12]=r[9]
+  24  MakeRecord     10   3  13        0  r[13]=mkrec(r[10..12])
+  25  NewRowid        0  14   0        0  r[14]=rowid
+  26  Insert          0  13  14        4  intkey=r[14] data=r[13]
+  27  Goto            0  49   0        0
+  28  SeekRowid       1   1  49        0  if (r[1]!=cursor 1 for table t2.rowid) goto 49
+  29  RowId           1  15   0        0  r[15]=t2.rowid
+  30  Column          1   1  16        0  r[16]=t2.name
+  31  Column          1   2  17        0  r[17]=t2.counter
+  32  Copy           15  18   2        0  r[18]=r[15]
+  33  Copy           17  21   0        0  r[21]=r[17]
+  34  Integer         1  22   0        0  r[22]=1
+  35  Add            21  22  20        0  r[20]=r[21]+r[22]
+  36  Affinity       18   3   0        0  r[18..21] = D, B, D
+  37  MakeRecord     18   3  23        0  r[23]=mkrec(r[18..20])
+  38  Insert          1  23   1  t2    8  intkey=r[1] data=r[23]
+  39  Copy            1  24   0        0  r[24]=r[1]
+  40  Copy           19  25   0        0  r[25]=r[19]
+  41  Copy           20  26   0        0  r[26]=r[20]
+  42  Copy           24  27   0        0  r[27]=r[24]
+  43  Copy           25  28   0        0  r[28]=r[25]
+  44  Copy           26  29   0        0  r[29]=r[26]
+  45  MakeRecord     27   3  30        0  r[30]=mkrec(r[27..29])
+  46  NewRowid        0  31   0        0  r[31]=rowid
+  47  Insert          0  30  31        4  intkey=r[31] data=r[30]
+  48  Goto            0  49   0        0
+  49  Goto            0  50   0        0
+  50  Rewind          0  56   0        0  Rewind  ephemeral(t2)
+  51    Column        0   0  32        0  r[32]=ephemeral(t2).id
+  52    Column        0   1  33        0  r[33]=ephemeral(t2).name
+  53    Column        0   2  34        0  r[34]=ephemeral(t2).counter
+  54    ResultRow    32   3   0        0  output=r[32..34]
+  55  Next            0  51   0        0
+  56  Halt            0   0   0        0
+  57  Transaction     0   2   1        0  iDb=0 tx_mode=Write
+  58  Goto            0   1   0        0

@@ -140,7 +140,7 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, SortOrder,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, SortOrder, TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -150,8 +150,129 @@ use turso_parser::{
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
+pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+
+/// Quote a SQL identifier with double quotes if it needs quoting.
+/// Quotes when the name contains non-alphanumeric characters (except underscore),
+/// starts with a digit, or is empty. Simple names like "test_uint" are left unquoted.
+fn quote_ident(name: &str) -> String {
+    let needs_quoting = name.is_empty()
+        || name.as_bytes()[0].is_ascii_digit()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || turso_parser::lexer::is_keyword(name.as_bytes());
+    if needs_quoting {
+        let escaped = name.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Escape a string literal for SQL single-quote context.
+/// The value goes inside the surrounding quotes already present in the format string.
+fn quote_string_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Custom type definition, loaded from sqlite_turso_types
+#[derive(Debug, Clone)]
+pub struct TypeDef {
+    pub name: String,
+    pub params: Vec<turso_parser::ast::TypeParam>,
+    pub base: String,
+    pub encode: Option<Box<turso_parser::ast::Expr>>,
+    pub decode: Option<Box<turso_parser::ast::Expr>>,
+    pub operators: Vec<TypeOperator>,
+    pub default: Option<Box<turso_parser::ast::Expr>>,
+    pub is_builtin: bool,
+}
+
+impl TypeDef {
+    /// Construct a TypeDef from a parsed CREATE TYPE statement.
+    pub fn from_create_type(
+        type_name: &str,
+        body: &turso_parser::ast::CreateTypeBody,
+        is_builtin: bool,
+    ) -> Self {
+        Self {
+            name: type_name.to_string(),
+            params: body.params.clone(),
+            base: body.base.clone(),
+            encode: body.encode.clone(),
+            decode: body.decode.clone(),
+            operators: body.operators.clone(),
+            default: body.default.clone(),
+            is_builtin,
+        }
+    }
+
+    /// The expected input type for `value` in this custom type.
+    /// Looks for a `value` parameter with a type annotation.
+    /// Falls back to `self.base` if `value` is not declared.
+    pub fn value_input_type(&self) -> &str {
+        for p in &self.params {
+            if p.name.eq_ignore_ascii_case("value") {
+                return p.ty.as_deref().unwrap_or(&self.base);
+            }
+        }
+        &self.base
+    }
+
+    /// The non-value params (user-provided at column declaration time).
+    pub fn user_params(&self) -> impl Iterator<Item = &turso_parser::ast::TypeParam> {
+        self.params
+            .iter()
+            .filter(|p| !p.name.eq_ignore_ascii_case("value"))
+    }
+
+    /// Reconstruct the CREATE TYPE SQL string from this definition.
+    pub fn to_sql(&self) -> String {
+        let mut sql = if self.params.is_empty() {
+            format!(
+                "CREATE TYPE {} BASE {}",
+                quote_ident(&self.name),
+                quote_ident(&self.base)
+            )
+        } else {
+            let params: Vec<String> = self
+                .params
+                .iter()
+                .map(|p| match &p.ty {
+                    Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
+                    None => quote_ident(&p.name),
+                })
+                .collect();
+            format!(
+                "CREATE TYPE {}({}) BASE {}",
+                quote_ident(&self.name),
+                params.join(", "),
+                quote_ident(&self.base)
+            )
+        };
+        if let Some(ref encode) = self.encode {
+            sql.push_str(&format!(" ENCODE {encode}"));
+        }
+        if let Some(ref decode) = self.decode {
+            sql.push_str(&format!(" DECODE {decode}"));
+        }
+        if let Some(ref default) = self.default {
+            sql.push_str(&format!(" DEFAULT {default}"));
+        }
+        for op in &self.operators {
+            match &op.func_name {
+                Some(func_name) => sql.push_str(&format!(
+                    " OPERATOR '{}' {}",
+                    quote_string_literal(&op.op),
+                    quote_ident(func_name)
+                )),
+                None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op),)),
+            }
+        }
+        sql
+    }
+}
 
 /// Accumulators for schema loading - kept separate to avoid moving through state variants
 struct MakeFromBtreeAccumulators {
@@ -275,6 +396,9 @@ pub struct Schema {
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
     /// integrity_check needs to know about these pages to avoid false positives about "page never used".
     pub dropped_root_pages: HashSet<i64>,
+
+    /// Custom type registry, loaded from sqlite_turso_types
+    pub type_registry: HashMap<String, Arc<TypeDef>>,
 }
 
 impl Default for Schema {
@@ -283,8 +407,61 @@ impl Default for Schema {
     }
 }
 
+fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
+    use turso_parser::ast::{Cmd, Stmt};
+    use turso_parser::parser::Parser;
+
+    let type_sqls: &[&str] = &[
+        #[cfg(feature = "uuid")]
+        "CREATE TYPE uuid(value text) BASE blob ENCODE uuid_blob(value) DECODE uuid_str(value) DEFAULT uuid4_str() OPERATOR '<'",
+        "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+        #[cfg(feature = "json")]
+        "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
+        #[cfg(feature = "json")]
+        "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
+        "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
+        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE time(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE datetime(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
+        "CREATE TYPE bigint(value integer) BASE integer",
+        "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
+        "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
+        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+    ];
+
+    for sql in type_sqls {
+        let mut parser = Parser::new(sql.as_bytes());
+        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            panic!("Failed to parse built-in type SQL: {sql}");
+        };
+
+        let type_def = TypeDef::from_create_type(&type_name, &body, true);
+        registry.insert(type_name.to_lowercase(), Arc::new(type_def));
+    }
+
+    // Register aliases
+    let aliases: &[(&str, &str)] = &[
+        ("bool", "boolean"),
+        ("int2", "smallint"),
+        ("int8", "bigint"),
+    ];
+    for (alias, target) in aliases {
+        if let Some(type_def) = registry.get(*target).cloned() {
+            registry.insert(alias.to_string(), type_def);
+        }
+    }
+}
+
 impl Schema {
     pub fn new() -> Self {
+        Self::with_options(false)
+    }
+
+    pub fn with_options(enable_strict: bool) -> Self {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
@@ -293,7 +470,7 @@ impl Schema {
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
-        for function in VirtualTable::builtin_functions() {
+        for function in VirtualTable::builtin_functions(enable_strict) {
             tables.insert(
                 function.name.to_owned(),
                 Arc::new(Table::Virtual(Arc::new((*function).clone()))),
@@ -320,6 +497,100 @@ impl Schema {
             table_to_materialized_views,
             incompatible_views,
             dropped_root_pages: HashSet::default(),
+            type_registry: {
+                let mut registry = HashMap::default();
+                if enable_strict {
+                    bootstrap_builtin_types(&mut registry);
+                }
+                registry
+            },
+        }
+    }
+
+    /// Look up a custom type definition by name.
+    /// Custom types are only valid on STRICT tables; pass `is_strict` from the
+    /// owning table so that non-STRICT tables never resolve a custom type.
+    pub fn get_type_def(&self, type_name: &str, is_strict: bool) -> Option<&Arc<TypeDef>> {
+        if !is_strict {
+            return None;
+        }
+        self.type_registry.get(&type_name.to_lowercase())
+    }
+
+    /// Look up a custom type definition by name without a strictness check.
+    /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
+    /// CREATE TABLE validation, CAST).
+    pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
+        self.type_registry.get(&type_name.to_lowercase())
+    }
+
+    pub fn remove_type(&mut self, type_name: &str) {
+        self.type_registry.remove(&type_name.to_lowercase());
+    }
+
+    /// Parse a CREATE TYPE SQL string and add the type to the in-memory registry.
+    pub fn add_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
+        use turso_parser::ast::{Cmd, Stmt};
+        use turso_parser::parser::Parser;
+
+        let mut parser = Parser::new(sql.as_bytes());
+        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            return Err(crate::LimboError::ParseError(format!(
+                "invalid type sql: {sql}"
+            )));
+        };
+
+        let type_def = TypeDef::from_create_type(&type_name, &body, false);
+        self.type_registry
+            .insert(type_name.to_lowercase(), Arc::new(type_def));
+        Ok(())
+    }
+
+    /// Load type definitions from CREATE TYPE SQL strings and resolve custom
+    /// type affinities on all STRICT tables. This is the shared entry point
+    /// used by both initial database open and schema reparse.
+    pub fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
+        for sql in type_sqls {
+            self.add_type_from_sql(sql)?;
+        }
+        self.resolve_all_custom_type_affinities();
+        Ok(())
+    }
+
+    /// Resolve custom type affinities for all STRICT tables in the schema.
+    /// Call this after loading user-defined types from __turso_internal_types
+    /// so that columns declared with custom types use the BASE type's affinity.
+    pub fn resolve_all_custom_type_affinities(&mut self) {
+        let table_names: Vec<String> = self
+            .tables
+            .iter()
+            .filter_map(|(name, t)| {
+                if let Table::BTree(bt) = t.as_ref() {
+                    if bt.is_strict {
+                        return Some(name.clone());
+                    }
+                }
+                None
+            })
+            .collect();
+        for name in table_names {
+            if let Some(table_arc) = self.tables.get(&name) {
+                if let Table::BTree(bt) = table_arc.as_ref() {
+                    let needs_fixup = bt
+                        .columns
+                        .iter()
+                        .any(|c| self.get_type_def_unchecked(&c.ty_str).is_some());
+                    if needs_fixup {
+                        let mut modified = (**bt).clone();
+                        modified.resolve_custom_type_affinities(self);
+                        self.tables
+                            .insert(name, Arc::new(Table::BTree(Arc::new(modified))));
+                    }
+                }
+            }
         }
     }
 
@@ -1064,6 +1335,8 @@ impl Schema {
                         }
                     }
 
+                    let mut table = table;
+                    table.resolve_custom_type_affinities(self);
                     self.add_btree_table(Arc::new(table))?;
                 }
             }
@@ -1218,6 +1491,7 @@ impl Schema {
                     tbl_name.name.as_str(),
                 )?;
             }
+            // Types are stored in sqlite_turso_types, not sqlite_schema
             _ => {}
         };
 
@@ -1595,6 +1869,7 @@ impl Clone for Schema {
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
             dropped_root_pages: self.dropped_root_pages.clone(),
+            type_registry: self.type_registry.clone(),
         }
     }
 }
@@ -1660,6 +1935,14 @@ impl Table {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
+        }
+    }
+
+    pub fn is_strict(&self) -> bool {
+        match self {
+            Self::BTree(table) => table.is_strict,
+            Self::Virtual(_) => false,
+            Self::FromClauseSubquery(_) => false,
         }
     }
 
@@ -1744,6 +2027,76 @@ pub struct BTreeTable {
 }
 
 impl BTreeTable {
+    /// Create a table reference for TypeCheck where custom type columns have
+    /// their `ty_str` replaced with the base type name. This ensures TypeCheck
+    /// validates the encoded value against the correct base type (e.g., BLOB)
+    /// rather than accepting any STRICT type via the wildcard arm.
+    pub fn type_check_table_ref(table: &Arc<BTreeTable>, schema: &Schema) -> Arc<BTreeTable> {
+        let has_custom = table
+            .columns
+            .iter()
+            .any(|c| schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+        if !has_custom {
+            return Arc::clone(table);
+        }
+        let mut modified = (**table).clone();
+        for col in &mut modified.columns {
+            if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+                col.ty_str = type_def.base.to_uppercase();
+            }
+        }
+        Arc::new(modified)
+    }
+
+    /// Create a table ref for pre-encode TypeCheck that validates user input
+    /// against the type's declared `value` input type (or base if not declared).
+    /// For UPDATE, `only_columns` limits which columns are checked — non-SET
+    /// columns hold encoded values and must be skipped (set to ANY).
+    pub fn input_type_check_table_ref(
+        table: &Arc<BTreeTable>,
+        schema: &Schema,
+        only_columns: Option<&std::collections::HashSet<usize>>,
+    ) -> Arc<BTreeTable> {
+        let has_custom = table
+            .columns
+            .iter()
+            .any(|c| schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+        if !has_custom {
+            return Arc::clone(table);
+        }
+        let mut modified = (**table).clone();
+        for (i, col) in modified.columns.iter_mut().enumerate() {
+            if let Some(only) = only_columns {
+                if !only.contains(&i) {
+                    // Non-SET column in UPDATE: holds encoded value, skip check
+                    col.ty_str = "ANY".to_string();
+                    continue;
+                }
+            }
+            if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+                col.ty_str = type_def.value_input_type().to_uppercase();
+            }
+        }
+        Arc::new(modified)
+    }
+
+    /// Override column type metadata for custom type columns so that
+    /// SQLite's name-based type/affinity rules use the BASE type
+    /// instead of the custom type name (e.g. "doubled" contains "DOUB"
+    /// which would incorrectly map to REAL instead of INTEGER).
+    pub fn resolve_custom_type_affinities(&mut self, schema: &Schema) {
+        if !self.is_strict {
+            return;
+        }
+        for col in &mut self.columns {
+            if let Some(type_def) = schema.get_type_def_unchecked(&col.ty_str) {
+                let (base_ty, _) = type_from_name(&type_def.base);
+                col.set_ty(base_ty);
+                col.set_base_affinity(Affinity::affinity(&type_def.base));
+            }
+        }
+    }
+
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
         self.columns
             .iter()
@@ -2167,6 +2520,18 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     .map(|ast::Type { name, .. }| name)
                     .unwrap_or_default();
 
+                let ty_params: Vec<Box<Expr>> = match col_type {
+                    Some(ast::Type {
+                        size: Some(ast::TypeSize::MaxSize(ref expr)),
+                        ..
+                    }) => vec![expr.clone()],
+                    Some(ast::Type {
+                        size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
+                        ..
+                    }) => vec![e1.clone(), e2.clone()],
+                    _ => Vec::new(),
+                };
+
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
                     Some(data_type) => {
@@ -2328,7 +2693,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
-                cols.push(Column::new(
+                let mut col = Column::new(
                     Some(normalize_ident(&name)),
                     ty_str,
                     default,
@@ -2344,7 +2709,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         unique,
                         hidden: false,
                     },
-                ));
+                );
+                col.ty_params = ty_params;
+                cols.push(col);
             }
 
             if options.contains_without_rowid() {
@@ -2578,6 +2945,7 @@ impl ResolvedFkRef {
 pub struct Column {
     pub name: Option<String>,
     pub ty_str: String,
+    pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     pub generated: Option<Box<Expr>>,
     raw: u16,
@@ -2605,15 +2973,46 @@ const TYPE_MASK: u16 = 0b111 << TYPE_SHIFT;
 const COLL_SHIFT: u16 = TYPE_SHIFT + 3;
 const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
 
+// Bits 10-12: base type affinity override for custom type columns.
+// 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1
+const BASE_AFF_SHIFT: u16 = COLL_SHIFT + 2;
+const BASE_AFF_MASK: u16 = 0b111 << BASE_AFF_SHIFT;
+
 impl Column {
     pub fn affinity(&self) -> Affinity {
-        Affinity::affinity(&self.ty_str)
+        let v = ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) as u8;
+        if v > 0 {
+            // Custom type column: use the base type's affinity
+            match v {
+                1 => Affinity::Integer,
+                2 => Affinity::Text,
+                3 => Affinity::Blob,
+                4 => Affinity::Real,
+                _ => Affinity::Numeric,
+            }
+        } else {
+            Affinity::affinity(&self.ty_str)
+        }
+    }
+
+    /// Set the base type affinity override for a custom type column.
+    /// This ensures affinity rules use the custom type's BASE type
+    /// rather than applying SQLite name-based rules to the type name.
+    pub fn set_base_affinity(&mut self, affinity: Affinity) {
+        let v: u16 = match affinity {
+            Affinity::Integer => 1,
+            Affinity::Text => 2,
+            Affinity::Blob => 3,
+            Affinity::Real => 4,
+            Affinity::Numeric => 5,
+        };
+        self.raw = (self.raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
     }
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
             Affinity::Blob
         } else {
-            Affinity::affinity(&self.ty_str)
+            self.affinity()
         }
     }
     pub fn new_default_text(
@@ -2647,7 +3046,7 @@ impl Column {
         )
     }
     #[inline]
-    pub const fn new(
+    pub fn new(
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
@@ -2679,6 +3078,7 @@ impl Column {
         Self {
             name,
             ty_str,
+            ty_params: Vec::new(),
             default,
             generated,
             raw,
@@ -2820,9 +3220,21 @@ impl TryFrom<&ColumnDefinition> for Column {
             .map(|t| t.name.to_string())
             .unwrap_or_default();
 
+        let ty_params: Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
+            Some(ast::Type {
+                size: Some(ast::TypeSize::MaxSize(ref expr)),
+                ..
+            }) => vec![expr.clone()],
+            Some(ast::Type {
+                size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
+                ..
+            }) => vec![e1.clone(), e2.clone()],
+            _ => Vec::new(),
+        };
+
         let hidden = ty_str.contains("HIDDEN");
 
-        Ok(Column::new(
+        let mut col = Column::new(
             Some(normalize_ident(name)),
             ty_str,
             default,
@@ -2836,7 +3248,9 @@ impl TryFrom<&ColumnDefinition> for Column {
                 unique,
                 hidden,
             },
-        ))
+        );
+        col.ty_params = ty_params;
+        Ok(col)
     }
 }
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{IndexColumn, ROWID_SENTINEL};
+use crate::schema::{BTreeTable, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, UpdateRowSource};
 use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -444,16 +444,76 @@ pub fn emit_upsert(
         extra_amount: num_cols - 1,
     });
 
+    // For STRICT tables with custom types, values loaded from disk (current_start)
+    // are in encoded form. We need decoded copies so that:
+    // - WHERE clause expressions see user-facing values (Bug 13)
+    // - SET expressions referencing t1.column see user-facing values
+    // - excluded.column references also see decoded values (Bug 7)
+    // current_start itself stays encoded for trigger OLD registers and before_start.
+    // After SET evaluation, we encode ALL columns in new_start before writing to disk.
+    let (decoded_current_start, excluded_decoded_start) = if let Some(bt) = table.btree() {
+        if bt.is_strict {
+            // Create decoded copy of current_start for WHERE/SET expressions
+            let decoded_current = program.alloc_registers(num_cols);
+            program.emit_insn(Insn::Copy {
+                src_reg: current_start,
+                dst_reg: decoded_current,
+                extra_amount: num_cols - 1,
+            });
+            crate::translate::expr::emit_custom_type_decode_columns(
+                program,
+                resolver,
+                &bt.columns,
+                decoded_current,
+                None,
+            )?;
+            // Decode new_start in-place (was copied from encoded current_start;
+            // after SET applies decoded values, we encode ALL columns)
+            crate::translate::expr::emit_custom_type_decode_columns(
+                program,
+                resolver,
+                &bt.columns,
+                new_start,
+                None,
+            )?;
+            // Create decoded copies of excluded (insertion) registers so that
+            // excluded.column references see user-facing values
+            let decoded_excluded = program.alloc_registers(num_cols);
+            program.emit_insn(Insn::Copy {
+                src_reg: insertion.first_col_register(),
+                dst_reg: decoded_excluded,
+                extra_amount: num_cols - 1,
+            });
+            crate::translate::expr::emit_custom_type_decode_columns(
+                program,
+                resolver,
+                &bt.columns,
+                decoded_excluded,
+                None,
+            )?;
+            (Some(decoded_current), Some(decoded_excluded))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    // For WHERE and SET, use decoded_current_start if available (STRICT with custom types),
+    // otherwise fall back to current_start (already decoded or non-custom-type).
+    let expr_current_start = decoded_current_start.unwrap_or(current_start);
+
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {
         rewrite_expr_to_registers(
             pred,
             table,
-            current_start,
+            expr_current_start,
             ctx.conflict_rowid_reg,
             Some(table.get_name()),
             Some(insertion),
             true,
+            excluded_decoded_start,
         )?;
         let pr = program.alloc_register();
         translate_expr(program, None, pred, pr, resolver)?;
@@ -470,11 +530,12 @@ pub fn emit_upsert(
         rewrite_expr_to_registers(
             expr,
             table,
-            current_start,
+            expr_current_start,
             ctx.conflict_rowid_reg,
             Some(table.get_name()),
             Some(insertion),
             true,
+            excluded_decoded_start,
         )?;
         translate_expr_no_constant_opt(
             program,
@@ -507,11 +568,35 @@ pub fn emit_upsert(
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
+            // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
                 count: num_cols,
                 check_generated: true,
-                table_reference: Arc::clone(&bt),
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    &bt,
+                    resolver.schema(),
+                    None,
+                ),
+            });
+
+            // Encode ALL columns. Both non-SET columns (decoded from disk above)
+            // and SET columns (user-facing values from expressions) need encoding
+            // before being written to disk.
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                resolver,
+                &bt.columns,
+                new_start,
+                None,
+            )?;
+
+            // Post-encode TypeCheck: validate encoded values match storage type.
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: new_start,
+                count: num_cols,
+                check_generated: true,
+                table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
         } else {
             // For non-STRICT tables, apply column affinity to the values.
@@ -573,7 +658,9 @@ pub fn emit_upsert(
             .chain(std::iter::once(ctx.conflict_rowid_reg))
             .collect();
         if !relevant_before_update_triggers.is_empty() {
-            // NEW row values are in new_start registers
+            // NEW row values are in new_start registers. At this point they are
+            // encoded (post-encode for STRICT custom types). Mark new_encoded=true
+            // so fire_trigger's decode_trigger_registers will decode them.
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_registers: Vec<usize> = (0..num_cols)
                 .map(|i| new_start + i)
@@ -582,7 +669,8 @@ pub fn emit_upsert(
 
             // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
             // clauses should not suppress errors. Override conflict resolution to Abort.
-            let trigger_ctx = TriggerContext::new_with_override_conflict(
+            // Use new_after variant because NEW values are encoded at this point.
+            let trigger_ctx = TriggerContext::new_after_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers),
                 Some(old_registers.clone()),
@@ -764,6 +852,7 @@ pub fn emit_upsert(
                         Some(table.get_name()),
                         None,
                         false,
+                        None,
                     )?;
                     translate_expr_no_constant_opt(
                         program,
@@ -821,6 +910,7 @@ pub fn emit_upsert(
                         Some(table.get_name()),
                         None,
                         false,
+                        None,
                     )?;
                     translate_expr_no_constant_opt(
                         program,
@@ -1137,7 +1227,8 @@ pub fn emit_upsert(
 
             // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
             // clauses should not suppress errors. Override conflict resolution to Abort.
-            let trigger_ctx_after = TriggerContext::new_with_override_conflict(
+            // NEW values are encoded at this point; fire_trigger will decode them.
+            let trigger_ctx_after = TriggerContext::new_after_with_override_conflict(
                 btree_table,
                 Some(new_registers_after),
                 Some(old_regs),
@@ -1242,6 +1333,7 @@ fn eval_partial_pred_for_row_image(
         &mut e, table, row_start, rowid_reg, None,  // table_name
         None,  // insertion
         false, // dont allow EXCLUDED
+        None,  // no decoded excluded
     )
     .ok()?;
     let r = prg.alloc_register();
@@ -1264,8 +1356,12 @@ fn eval_partial_pred_for_row_image(
 ///   rowid-alias) mapped to `rowid_reg`.
 /// - If `allow_excluded` and `insertion` are provided, `EXCLUDED.x` resolves to the
 ///   insertion registers (and `EXCLUDED.rowid` resolves to `insertion.key_register()`).
+///   When `excluded_decoded_start` is provided, excluded column references resolve to
+///   decoded registers at `excluded_decoded_start + col_idx` instead of the raw
+///   (encoded) insertion registers. This prevents double-encoding in UPSERT.
 /// - If `table_name` is `None`, qualified refs never match
 /// - Leaves names from other tables/namespaces untouched.
+#[allow(clippy::too_many_arguments)]
 fn rewrite_expr_to_registers(
     e: &mut ast::Expr,
     table: &Table,
@@ -1274,6 +1370,7 @@ fn rewrite_expr_to_registers(
     table_name: Option<&str>,
     insertion: Option<&Insertion>,
     allow_excluded: bool,
+    excluded_decoded_start: Option<usize>,
 ) -> crate::Result<WalkControl> {
     use ast::Expr;
     let table_name_norm = table_name.map(normalize_ident);
@@ -1304,7 +1401,15 @@ fn rewrite_expr_to_registers(
                             if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
                                 *expr = Expr::Register(ins.key_register());
                             } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
-                                *expr = Expr::Register(cm.register);
+                                // Use decoded excluded registers when available
+                                // to prevent double-encoding of custom type values
+                                if let Some(decoded_start) = excluded_decoded_start {
+                                    let (col_idx, _) =
+                                        table.get_column_by_name(&c).expect("column exists");
+                                    *expr = Expr::Register(decoded_start + col_idx);
+                                } else {
+                                    *expr = Expr::Register(cm.register);
+                                }
                             } else {
                                 bail_parse_error!("no such column in EXCLUDED: {}", c);
                             }

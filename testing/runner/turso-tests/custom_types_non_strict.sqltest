@@ -1,0 +1,123 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+# Tests for custom types on non-STRICT tables.
+# On non-STRICT tables any type name (including registered custom type names)
+# is accepted and treated as a plain affinity hint. No encode/decode is applied.
+# Custom type encode/decode only activates on STRICT tables.
+
+# User-created custom type on non-STRICT table: accepted but no encode/decode.
+# The value is stored raw (affinity only), not passed through the encode function.
+@requires strict "uses STRICT tables"
+test non-strict-user-type-no-encode {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val test_uint);
+    INSERT INTO t VALUES (1, 42);
+    SELECT val, typeof(val) FROM t;
+}
+expect {
+    42|integer
+}
+
+# ALTER TABLE ADD COLUMN with user-created custom type on non-STRICT table:
+# accepted, no encode/decode applied.
+@requires strict "uses STRICT tables"
+test non-strict-alter-add-user-type-no-encode {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b test_uint;
+    UPDATE t SET b = 99;
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    99|integer
+}
+
+# Built-in boolean on non-STRICT table should store raw value, no encode/decode
+test non-strict-boolean-stores-raw-integer {
+    CREATE TABLE t_ns_bool(x boolean);
+    INSERT INTO t_ns_bool VALUES (42);
+    SELECT x, typeof(x) FROM t_ns_bool;
+}
+expect {
+    42|integer
+}
+
+# Built-in type names are allowed as affinity hints on non-STRICT tables
+test non-strict-numeric-affinity {
+    CREATE TABLE t_ns_num(x numeric);
+    INSERT INTO t_ns_num VALUES ('123.45');
+    SELECT x, typeof(x) FROM t_ns_num;
+}
+expect {
+    123.45|real
+}
+
+# Non-STRICT table with a type name that is NOT a registered custom type is fine
+test non-strict-unknown-type-ok {
+    CREATE TABLE t(x FAKETYPE);
+    INSERT INTO t VALUES (42);
+    SELECT x FROM t;
+}
+expect {
+    42
+}
+
+# ORDER BY on non-STRICT boolean column should use standard numeric ordering
+test non-strict-standard-order-by {
+    CREATE TABLE t_ns_ord(x boolean);
+    INSERT INTO t_ns_ord VALUES (3);
+    INSERT INTO t_ns_ord VALUES (1);
+    INSERT INTO t_ns_ord VALUES (2);
+    SELECT x FROM t_ns_ord ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+# GROUP BY on non-STRICT boolean column should use standard grouping
+test non-strict-group-by {
+    CREATE TABLE t_ns_grp(x boolean, v INTEGER);
+    INSERT INTO t_ns_grp VALUES (1, 10);
+    INSERT INTO t_ns_grp VALUES (1, 20);
+    INSERT INTO t_ns_grp VALUES (0, 30);
+    SELECT x, SUM(v) FROM t_ns_grp GROUP BY x ORDER BY x;
+}
+expect {
+    0|30
+    1|30
+}
+
+# MIN/MAX on non-STRICT table should use standard numeric comparison
+test non-strict-min-max {
+    CREATE TABLE t_ns_mm(x boolean);
+    INSERT INTO t_ns_mm VALUES (5);
+    INSERT INTO t_ns_mm VALUES (1);
+    INSERT INTO t_ns_mm VALUES (9);
+    INSERT INTO t_ns_mm VALUES (3);
+    SELECT MIN(x), MAX(x) FROM t_ns_mm;
+}
+expect {
+    1|9
+}
+
+# CAST(x AS type) always works for non-parametric custom types even outside
+# STRICT tables, because CAST is an explicit user request, not column-scoped.
+@requires strict "uses custom type CAST"
+test non-strict-cast-explicit {
+    SELECT CAST(1 AS boolean);
+}
+expect {
+    1
+}
+
+# CAST(x AS numeric) without params falls through to standard SQLite CAST
+test non-strict-cast-parametric-fallthrough {
+    SELECT CAST('123.45' AS numeric), typeof(CAST('123.45' AS numeric));
+}
+expect {
+    123.45|real
+}

@@ -185,6 +185,15 @@ pub enum Stmt {
 
     /// `CREATE VIRTUAL TABLE`
     CreateVirtualTable(CreateVirtualTable),
+    /// `CREATE TYPE`
+    CreateType {
+        /// `IF NOT EXISTS`
+        if_not_exists: bool,
+        /// type name
+        type_name: String,
+        /// type body
+        body: CreateTypeBody,
+    },
     /// `DELETE`
     Delete {
         /// CTE
@@ -234,6 +243,13 @@ pub enum Stmt {
         if_exists: bool,
         /// view name
         view_name: QualifiedName,
+    },
+    /// `DROP TYPE`
+    DropType {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// type name
+        type_name: String,
     },
     /// `INSERT`
     Insert {
@@ -1155,6 +1171,44 @@ pub enum AlterTableBody {
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
 }
 
+/// Operator mapping in a `CREATE TYPE` body
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeOperator {
+    /// operator symbol: "+", "-", "*", "/", "<", "=", etc.
+    pub op: String,
+    /// function name to call, or None for naked operators (use base type comparison)
+    pub func_name: Option<String>,
+}
+
+/// A parameter in a `CREATE TYPE` definition, with an optional type annotation.
+/// e.g. `value text` or `maxlen integer` or just `maxlen` (untyped, backward compat).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeParam {
+    pub name: String,
+    /// Type annotation. None means untyped (backward compat).
+    pub ty: Option<String>,
+}
+
+/// Body of a `CREATE TYPE` statement
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreateTypeBody {
+    /// type parameters, e.g. `(value text, maxlen integer)` for varchar
+    pub params: Vec<TypeParam>,
+    /// base storage type: "text", "integer", "real", "blob"
+    pub base: String,
+    /// encode expression (called on write), uses `value` placeholder for input
+    pub encode: Option<Box<Expr>>,
+    /// decode expression (called on read), uses `value` placeholder for input
+    pub decode: Option<Box<Expr>>,
+    /// operator-to-function mappings
+    pub operators: Vec<TypeOperator>,
+    /// default expression for columns of this type
+    pub default: Option<Box<Expr>>,
+}
+
 /// `CREATE TABLE` body
 // https://sqlite.org/lang_createtable.html
 // https://sqlite.org/syntax/create-table-stmt.html
@@ -1598,6 +1652,8 @@ pub enum PragmaName {
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
+    /// List all available types (built-in and custom)
+    ListTypes,
 }
 
 /// `CREATE TRIGGER` time

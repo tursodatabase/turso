@@ -538,11 +538,31 @@ pub fn translate_insert(
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
     if ctx.table.is_strict {
+        // Pre-encode TypeCheck: validate input types match the custom type's
+        // declared value type BEFORE encoding. This catches type mismatches
+        // (e.g. TEXT into an INTEGER-based custom type) that would otherwise
+        // be silently converted by the encode expression.
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.col_mappings.len(),
             check_generated: true,
-            table_reference: Arc::clone(ctx.table),
+            table_reference: BTreeTable::input_type_check_table_ref(
+                ctx.table,
+                resolver.schema(),
+                None,
+            ),
+        });
+
+        // Encode values for columns with custom types.
+        emit_custom_type_encode(program, resolver, &insertion)?;
+
+        // Post-encode TypeCheck: validate that encode produced the correct
+        // storage type (BASE).
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: insertion.first_col_register(),
+            count: insertion.col_mappings.len(),
+            check_generated: true,
+            table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
         });
     } else {
         // For non-STRICT tables, apply column affinity to the values.
@@ -727,36 +747,38 @@ pub fn translate_insert(
         .collect()
     });
     if !relevant_after_triggers.is_empty() {
-        // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
+        // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
+        // fire_trigger will decode them via decode_trigger_registers.
+        let key_reg = insertion.key_register();
         let new_registers_after: Vec<usize> = insertion
             .col_mappings
             .iter()
-            .map(|col_mapping| {
-                if col_mapping.column.is_rowid_alias() {
-                    insertion.key_register()
+            .map(|cm| {
+                if cm.column.is_rowid_alias() {
+                    key_reg
                 } else {
-                    col_mapping.register
+                    cm.register
                 }
             })
-            .chain(std::iter::once(insertion.key_register()))
+            .chain(std::iter::once(key_reg))
             .collect();
         // Determine the conflict resolution to propagate to AFTER triggers (same logic as BEFORE)
         let trigger_ctx_after = if let Some(override_conflict) = program.trigger_conflict_override {
-            TriggerContext::new_with_override_conflict(
+            TriggerContext::new_after_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),
                 None,
                 override_conflict,
             )
         } else if matches!(ctx.on_conflict, ResolveType::Ignore) {
-            TriggerContext::new_with_override_conflict(
+            TriggerContext::new_after_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),
                 None,
                 ResolveType::Ignore,
             )
         } else {
-            TriggerContext::new(btree_table.clone(), Some(new_registers_after), None)
+            TriggerContext::new_after(btree_table.clone(), Some(new_registers_after), None)
         };
         // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
         // not skip post-row work (FK counters, autoincrement, CDC, RETURNING).
@@ -1007,6 +1029,7 @@ fn emit_commit_phase(
                 program,
                 resolver,
                 insertion,
+                ctx.table,
                 idx_col,
                 idx_start_reg + i,
             )?;
@@ -1058,6 +1081,7 @@ fn translate_rows_and_open_tables(
             select_result_start_reg,
             resolver,
             &ctx.temp_table_ctx,
+            ctx.table.is_strict,
         )?;
     } else {
         // Single row - populate registers directly
@@ -1067,7 +1091,7 @@ fn translate_rows_and_open_tables(
             db: ctx.database_id,
         });
 
-        translate_rows_single(program, values, insertion, resolver)?;
+        translate_rows_single(program, values, insertion, resolver, ctx.table.is_strict)?;
     }
 
     // Open all the index btrees for writing
@@ -1325,15 +1349,41 @@ fn emit_notnulls(
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
         }
 
+        // Determine which register to check: for custom type columns with
+        // a DECODE expression, decode the encoded value into a temp register
+        // and check the *decoded* value. This prevents "ghost NULLs" where
+        // ENCODE produces a non-NULL value but DECODE returns NULL.
+        let check_reg = if let Some(type_def) = resolver
+            .schema()
+            .get_type_def(&column_mapping.column.ty_str, ctx.table.is_strict)
+        {
+            if type_def.decode.is_some() {
+                let decoded_reg = program.alloc_register();
+                crate::translate::expr::emit_user_facing_column_value(
+                    program,
+                    column_mapping.register,
+                    decoded_reg,
+                    column_mapping.column,
+                    ctx.table.is_strict,
+                    resolver,
+                )?;
+                decoded_reg
+            } else {
+                column_mapping.register
+            }
+        } else {
+            column_mapping.register
+        };
+
         // For INSERT OR IGNORE, skip to the next row if NULL
         if on_ignore {
             program.emit_insn(Insn::IsNull {
-                reg: column_mapping.register,
+                reg: check_reg,
                 target_pc: ctx.loop_labels.row_done,
             });
         } else {
             program.emit_insn(Insn::HaltIfNull {
-                target_reg: column_mapping.register,
+                target_reg: check_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: {
                     let mut description = String::with_capacity(
@@ -1403,15 +1453,23 @@ fn bind_insert(
     let mut inserting_multiple_rows = false;
     match body {
         InsertBody::DefaultValues => {
-            // Generate default values for the table
+            // Generate default values for the table.
+            // Check column-level default first, then type-level default.
+            let is_strict = table.is_strict();
             values = table
                 .columns()
                 .iter()
                 .filter(|c| !c.hidden())
                 .map(|c| {
-                    c.default
-                        .clone()
-                        .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                    c.default.clone().unwrap_or_else(|| {
+                        if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict)
+                        {
+                            if let Some(ref default_expr) = type_def.default {
+                                return default_expr.clone();
+                            }
+                        }
+                        Box::new(ast::Expr::Literal(ast::Literal::Null))
+                    })
                 })
                 .collect();
         }
@@ -1743,10 +1801,16 @@ fn init_source_emission<'a>(
         }
         InsertBody::DefaultValues => {
             let num_values = table.columns().len();
+            let is_strict = table.is_strict();
             values.extend(table.columns().iter().map(|c| {
-                c.default
-                    .clone()
-                    .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                c.default.clone().unwrap_or_else(|| {
+                    if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict) {
+                        if let Some(ref default_expr) = type_def.default {
+                            return default_expr.clone();
+                        }
+                    }
+                    Box::new(ast::Expr::Literal(ast::Literal::Null))
+                })
             }));
             (
                 num_values,
@@ -1769,21 +1833,23 @@ pub struct AutoincMeta {
     table_name_reg: usize,
 }
 
-pub const ROWID_COLUMN: Column = Column::new(
-    None,          // name
-    String::new(), // type string
-    None,          // default
-    None,          // generated
-    schema::Type::Integer,
-    None,
-    ColDef {
-        primary_key: true,
-        rowid_alias: true,
-        notnull: true,
-        hidden: false,
-        unique: false,
-    },
-);
+pub static ROWID_COLUMN: std::sync::LazyLock<Column> = std::sync::LazyLock::new(|| {
+    Column::new(
+        None,          // name
+        String::new(), // type string
+        None,          // default
+        None,          // generated
+        schema::Type::Integer,
+        None,
+        ColDef {
+            primary_key: true,
+            rowid_alias: true,
+            notnull: true,
+            hidden: false,
+            unique: false,
+        },
+    )
+});
 
 /// Represents how a table should be populated during an INSERT.
 #[derive(Debug)]
@@ -2008,6 +2074,7 @@ fn translate_rows_multiple<'short, 'long: 'short>(
     yield_reg: usize,
     resolver: &Resolver,
     temp_table_ctx: &Option<TempTableCtx>,
+    is_strict: bool,
 ) -> Result<()> {
     if let Some(ref temp_table_ctx) = temp_table_ctx {
         // Rewind loop to read from ephemeral table
@@ -2035,7 +2102,7 @@ fn translate_rows_multiple<'short, 'long: 'short>(
             }
             Ok(())
         };
-    translate_rows_base(program, insertion, translate_value_fn, resolver)
+    translate_rows_base(program, insertion, translate_value_fn, resolver, is_strict)
 }
 /// Populates the column registers with values for a single row
 fn translate_rows_single(
@@ -2043,6 +2110,7 @@ fn translate_rows_single(
     value: &[Box<Expr>],
     insertion: &Insertion,
     resolver: &Resolver,
+    is_strict: bool,
 ) -> Result<()> {
     let translate_value_fn =
         |prg: &mut ProgramBuilder, value_index: usize, column_register: usize| -> Result<()> {
@@ -2058,7 +2126,7 @@ fn translate_rows_single(
             )?;
             Ok(())
         };
-    translate_rows_base(program, insertion, translate_value_fn, resolver)
+    translate_rows_base(program, insertion, translate_value_fn, resolver, is_strict)
 }
 
 /// Translate the key and the columns of the insertion.
@@ -2071,8 +2139,15 @@ fn translate_rows_base<'short, 'long: 'short>(
     insertion: &'short Insertion<'long>,
     mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
+    is_strict: bool,
 ) -> Result<()> {
-    translate_key(program, insertion, &mut translate_value_fn, resolver)?;
+    translate_key(
+        program,
+        insertion,
+        &mut translate_value_fn,
+        resolver,
+        is_strict,
+    )?;
     for col in insertion.col_mappings.iter() {
         translate_column(
             program,
@@ -2081,6 +2156,7 @@ fn translate_rows_base<'short, 'long: 'short>(
             col.value_index,
             &mut translate_value_fn,
             resolver,
+            is_strict,
         )?;
     }
 
@@ -2093,6 +2169,7 @@ fn translate_key(
     insertion: &Insertion,
     mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
+    is_strict: bool,
 ) -> Result<()> {
     match &insertion.key {
         InsertionKey::RowidAlias(rowid_alias_column) => translate_column(
@@ -2102,6 +2179,7 @@ fn translate_key(
             rowid_alias_column.value_index,
             &mut translate_value_fn,
             resolver,
+            is_strict,
         ),
         InsertionKey::LiteralRowid {
             value_index,
@@ -2113,6 +2191,7 @@ fn translate_key(
             *value_index,
             &mut translate_value_fn,
             resolver,
+            is_strict,
         ),
         InsertionKey::Autogenerated { .. } => Ok(()), // will be populated later
     }
@@ -2125,6 +2204,7 @@ fn translate_column(
     value_index: Option<usize>,
     translate_value_fn: &mut impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
+    is_strict: bool,
 ) -> Result<()> {
     if let Some(value_index) = value_index {
         translate_value_fn(program, value_index, column_register)?;
@@ -2142,6 +2222,15 @@ fn translate_column(
         });
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
+    } else if let Some(type_def) = resolver.schema().get_type_def(&column.ty_str, is_strict) {
+        if let Some(ref default_expr) = type_def.default {
+            translate_expr(program, None, default_expr, column_register, resolver)?;
+        } else {
+            program.emit_insn(Insn::Null {
+                dest: column_register,
+                dest_end: None,
+            });
+        }
     } else {
         let nullable = !column.notnull() && !column.primary_key();
         if !nullable {
@@ -2265,6 +2354,7 @@ fn emit_index_uniqueness_check(
             program,
             resolver,
             insertion,
+            ctx.table,
             idx_col,
             idx_start_reg + i,
         )?;
@@ -2534,7 +2624,7 @@ fn translate_virtual_table_insert(
      * */
     let insertion = build_insertion(program, &table, &columns, num_values)?;
 
-    translate_rows_single(program, &value, &insertion, resolver)?;
+    translate_rows_single(program, &value, &insertion, resolver, false)?;
     let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
 
     program.emit_insn(Insn::VUpdate {
@@ -2789,12 +2879,25 @@ fn emit_index_column_value_for_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     insertion: &Insertion,
+    table: &BTreeTable,
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
         rewrite_index_expr_for_insertion(&mut expr, insertion)?;
+        // After rewrite, Expr::Register nodes reference encoded column registers.
+        // Decode custom type registers so the expression evaluates on user-facing
+        // values, matching what SELECT / CREATE INDEX see.
+        crate::translate::expr::decode_custom_type_registers_in_expr(
+            program,
+            resolver,
+            &mut expr,
+            &table.columns,
+            insertion.first_col_register(),
+            Some(insertion.key_register()),
+            table.is_strict,
+        )?;
         translate_expr_no_constant_opt(
             program,
             Some(&TableReferences::new_empty()),
@@ -3517,4 +3620,26 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         }
     }
     Ok(())
+}
+
+/// Emit encode expressions for columns with custom types.
+/// For each column that has a custom type with an encode expression,
+/// evaluates the expression with `value` bound to the column register.
+fn emit_custom_type_encode(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    insertion: &Insertion,
+) -> Result<()> {
+    let columns: Vec<_> = insertion
+        .col_mappings
+        .iter()
+        .map(|m| m.column.clone())
+        .collect();
+    crate::translate::expr::emit_custom_type_encode_columns(
+        program,
+        resolver,
+        &columns,
+        insertion.first_col_register(),
+        None, // INSERT: encode all columns
+    )
 }

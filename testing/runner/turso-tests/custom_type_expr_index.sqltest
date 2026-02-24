@@ -1,0 +1,237 @@
+@database :memory:
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-basic-lookup {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_val_times_2 ON t1(val * 2);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 50);
+    SELECT * FROM t1 WHERE val * 2 = 100;
+}
+expect {
+    3|50
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-basic-lookup-2 {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_val_times_2 ON t1(val * 2);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 50);
+    SELECT * FROM t1 WHERE val * 2 = 40;
+}
+expect {
+    2|20
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-delete-no-corruption {
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t2_val_times_2 ON t2(val * 2);
+    INSERT INTO t2 VALUES (1, 10), (2, 20), (3, 50);
+    DELETE FROM t2 WHERE val * 2 = 100;
+    SELECT * FROM t2 ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-delete-multiple {
+    CREATE TABLE t2b(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t2b ON t2b(val * 2);
+    INSERT INTO t2b VALUES (1, 10), (2, 20), (3, 50);
+    DELETE FROM t2b WHERE val * 2 = 100;
+    DELETE FROM t2b WHERE val * 2 = 20;
+    SELECT * FROM t2b ORDER BY id;
+}
+expect {
+    2|20
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-update {
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t3_expr ON t3(val * 2);
+    INSERT INTO t3 VALUES (1, 10), (2, 20), (3, 50);
+    UPDATE t3 SET val = 100 WHERE id = 1;
+    SELECT * FROM t3 WHERE val * 2 = 200;
+}
+expect {
+    1|100
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-update-old-gone {
+    CREATE TABLE t3b(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t3b ON t3b(val * 2);
+    INSERT INTO t3b VALUES (1, 10), (2, 20), (3, 50);
+    UPDATE t3b SET val = 100 WHERE id = 1;
+    SELECT * FROM t3b WHERE val * 2 = 20;
+}
+expect {
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-update-others-unaffected {
+    CREATE TABLE t3c(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t3c ON t3c(val * 2);
+    INSERT INTO t3c VALUES (1, 10), (2, 20), (3, 50);
+    UPDATE t3c SET val = 100 WHERE id = 1;
+    SELECT * FROM t3c WHERE val * 2 = 40;
+}
+expect {
+    2|20
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-negative-values {
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t4_expr ON t4(val * 2);
+    INSERT INTO t4 VALUES (1, -10), (2, -20.5), (3, 50);
+    SELECT * FROM t4 WHERE val * 2 = -20;
+}
+expect {
+    1|-10
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-negative-lookup-2 {
+    CREATE TABLE t4b(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t4b ON t4b(val * 2);
+    INSERT INTO t4b VALUES (1, -10), (2, -20.5), (3, 50);
+    SELECT * FROM t4b WHERE val * 2 = -41;
+}
+expect {
+    2|-20.5
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-negative-delete {
+    CREATE TABLE t4c(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t4c ON t4c(val * 2);
+    INSERT INTO t4c VALUES (1, -10), (2, -20.5), (3, 50);
+    DELETE FROM t4c WHERE val * 2 = -20;
+    SELECT * FROM t4c ORDER BY id;
+}
+expect {
+    2|-20.5
+    3|50
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-decimal-values {
+    CREATE TABLE t5(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t5_expr ON t5(val + 0.5);
+    INSERT INTO t5 VALUES (1, 10.5), (2, 20.25), (3, -5.75);
+    SELECT * FROM t5 WHERE val + 0.5 = 11.0;
+}
+expect {
+    1|10.5
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-decimal-lookup-2 {
+    CREATE TABLE t5b(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t5b ON t5b(val + 0.5);
+    INSERT INTO t5b VALUES (1, 10.5), (2, 20.25), (3, -5.75);
+    SELECT * FROM t5b WHERE val + 0.5 = 20.75;
+}
+expect {
+    2|20.25
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-multiple-indexes {
+    CREATE TABLE t6(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t6_times2 ON t6(val * 2);
+    CREATE INDEX idx_t6_plus10 ON t6(val + 10);
+    INSERT INTO t6 VALUES (1, 5), (2, 15), (3, 25);
+    SELECT * FROM t6 WHERE val * 2 = 10;
+}
+expect {
+    1|5
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-multiple-indexes-2 {
+    CREATE TABLE t6b(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t6b_times2 ON t6b(val * 2);
+    CREATE INDEX idx_t6b_plus10 ON t6b(val + 10);
+    INSERT INTO t6b VALUES (1, 5), (2, 15), (3, 25);
+    SELECT * FROM t6b WHERE val + 10 = 25;
+}
+expect {
+    2|15
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-multiple-indexes-delete {
+    CREATE TABLE t6c(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t6c_times2 ON t6c(val * 2);
+    CREATE INDEX idx_t6c_plus10 ON t6c(val + 10);
+    INSERT INTO t6c VALUES (1, 5), (2, 15), (3, 25);
+    DELETE FROM t6c WHERE id = 2;
+    SELECT * FROM t6c WHERE val * 2 = 30;
+}
+expect {
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-mixed-columns {
+    CREATE TABLE t7(id INTEGER PRIMARY KEY, val numeric(10,2), factor INTEGER);
+    CREATE INDEX idx_t7_mixed ON t7(val * factor);
+    INSERT INTO t7 VALUES (1, 10, 3), (2, 20, 2), (3, 5, 10);
+    SELECT * FROM t7 WHERE val * factor = 30;
+}
+expect {
+    1|10|3
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-mixed-columns-delete {
+    CREATE TABLE t7b(id INTEGER PRIMARY KEY, val numeric(10,2), factor INTEGER);
+    CREATE INDEX idx_t7b ON t7b(val * factor);
+    INSERT INTO t7b VALUES (1, 10, 3), (2, 20, 2), (3, 5, 10);
+    DELETE FROM t7b WHERE val * factor = 40;
+    SELECT * FROM t7b ORDER BY id;
+}
+expect {
+    1|10|3
+    3|5|10
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-bulk-operations {
+    CREATE TABLE t8(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t8_expr ON t8(val * 3);
+    INSERT INTO t8 VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+    SELECT * FROM t8 WHERE val * 3 = 90;
+}
+expect {
+    3|30
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-bulk-delete {
+    CREATE TABLE t8b(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t8b ON t8b(val * 3);
+    INSERT INTO t8b VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+    DELETE FROM t8b WHERE val * 3 >= 90;
+    SELECT * FROM t8b ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+@skip-if mvcc "Expression indexes are not currently enabled in MVCC"
+test expr-idx-bulk-update {
+    CREATE TABLE t8c(id INTEGER PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX idx_t8c ON t8c(val * 3);
+    INSERT INTO t8c VALUES (1, 10), (2, 20);
+    UPDATE t8c SET val = 100 WHERE id = 1;
+    SELECT * FROM t8c WHERE val * 3 = 300;
+}
+expect {
+    1|100
+}

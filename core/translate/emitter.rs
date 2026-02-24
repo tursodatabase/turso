@@ -118,7 +118,10 @@ pub struct Resolver<'a> {
     attached_databases: &'a RwLock<DatabaseCatalog>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
-    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize)>,
+    /// Cache entries: (expression, register, needs_custom_type_decode).
+    /// The `needs_custom_type_decode` flag is true for hash-join payload registers
+    /// that contain raw encoded values and need DECODE applied when read.
+    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize, bool)>,
     /// Maps register indices to column affinities for expression index evaluation.
     /// Populated temporarily during UPDATE new-image expression index key computation,
     /// where column references have been rewritten to Expr::Register and comparison
@@ -179,17 +182,18 @@ impl<'a> Resolver<'a> {
         self.expr_to_reg_cache_enabled = true;
     }
 
-    /// Returns the register for a previously translated expression, if caching is enabled.
+    /// Returns the register and decode flag for a previously translated expression.
     ///
     /// We scan from newest to oldest so later translations win when equivalent
     /// expressions are seen multiple times in the same translation pass.
-    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<usize> {
+    /// Returns `(register, needs_custom_type_decode)`.
+    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<(usize, bool)> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()
                 .rev()
-                .find(|(e, _)| exprs_are_equivalent(expr, e))
-                .map(|(_, reg)| *reg)
+                .find(|(e, _, _)| exprs_are_equivalent(expr, e))
+                .map(|(_, reg, needs_decode)| (*reg, *needs_decode))
         } else {
             None
         }
@@ -2785,13 +2789,36 @@ fn emit_update_column_values<'a>(
 
                     program.emit_null(target_reg, None);
                 } else {
-                    translate_expr(
-                        program,
-                        Some(table_references),
-                        expr,
-                        target_reg,
-                        &t_ctx.resolver,
-                    )?;
+                    // Columns with custom type encode must not have their
+                    // SET expressions hoisted as constants. See the doc
+                    // comment on NoConstantOptReason::CustomTypeEncode.
+                    let has_custom_encode = {
+                        let ty = &table_column.ty_str;
+                        !ty.is_empty()
+                            && t_ctx
+                                .resolver
+                                .schema
+                                .get_type_def_unchecked(ty)
+                                .is_some_and(|td| td.encode.is_some())
+                    };
+                    if has_custom_encode {
+                        translate_expr_no_constant_opt(
+                            program,
+                            Some(table_references),
+                            expr,
+                            target_reg,
+                            &t_ctx.resolver,
+                            NoConstantOptReason::CustomTypeEncode,
+                        )?;
+                    } else {
+                        translate_expr(
+                            program,
+                            Some(table_references),
+                            expr,
+                            target_reg,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                     if table_column.notnull() {
                         match or_conflict {
                             ResolveType::Ignore => {
@@ -3322,24 +3349,10 @@ fn emit_update_insns<'a>(
                 start,
                 rowid_new_reg,
             )?;
-            if t_ctx
-                .resolver
-                .with_schema(update_database_id, |s| s.has_child_fks(table_name))
-            {
-                // Child-side checks:
-                // this ensures updated row still satisfies child FKs that point OUT from this table
-                emit_fk_child_update_counters(
-                    program,
-                    &table_btree,
-                    table_name,
-                    target_table_cursor_id,
-                    start,
-                    rowid_new_reg,
-                    &set_clauses.iter().map(|(i, _)| *i).collect::<HashSet<_>>(),
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
-            }
+            // Child-side FK checks are deferred to AFTER custom type encoding (see below).
+            // This is because child FK checks probe the parent's index which contains
+            // encoded values, so the NEW values must also be encoded.
+
             // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
             // This checks that no child rows reference the old parent key values.
             // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
@@ -3415,6 +3428,7 @@ fn emit_update_insns<'a>(
                     rowid_reg,
                     col,
                     idx_start_reg + i,
+                    target_table.table.is_strict(),
                 )?;
             }
 
@@ -3572,11 +3586,41 @@ fn emit_update_insns<'a>(
     // This ensures that if a constraint fails, indexes remain consistent.
     if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
+            let set_col_indices: std::collections::HashSet<usize> =
+                set_clauses.iter().map(|(idx, _)| *idx).collect();
+
+            // Pre-encode TypeCheck: validate SET column input types.
+            // Non-SET columns hold encoded values from disk, so skip them (ANY).
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
                 count: col_len,
                 check_generated: true,
-                table_reference: Arc::clone(&btree_table),
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    &btree_table,
+                    t_ctx.resolver.schema(),
+                    Some(&set_col_indices),
+                ),
+            });
+
+            // Encode only SET clause columns. Non-SET columns were read from disk
+            // and are already encoded; re-encoding them would corrupt data.
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                &t_ctx.resolver,
+                &btree_table.columns,
+                start,
+                Some(&set_col_indices),
+            )?;
+
+            // Post-encode TypeCheck: validate encoded values match storage type.
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: start,
+                count: col_len,
+                check_generated: true,
+                table_reference: BTreeTable::type_check_table_ref(
+                    &btree_table,
+                    t_ctx.resolver.schema(),
+                ),
             });
         }
 
@@ -3640,6 +3684,27 @@ fn emit_update_insns<'a>(
                 skip_row_label,
                 Some(&check_constraint_tables),
             )?;
+        }
+    }
+
+    // Child-side FK checks must run AFTER custom type encoding so that NEW values
+    // being probed against the parent's index are encoded (matching the index contents).
+    if connection.foreign_keys_enabled() {
+        if let Some(table_btree) = target_table.table.btree() {
+            if t_ctx.resolver.schema().has_child_fks(table_name) {
+                let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
+                emit_fk_child_update_counters(
+                    program,
+                    &table_btree,
+                    table_name,
+                    target_table_cursor_id,
+                    start,
+                    rowid_new_reg,
+                    &set_clauses.iter().map(|(i, _)| *i).collect::<HashSet<_>>(),
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
+            }
         }
     }
 
@@ -3765,6 +3830,7 @@ fn emit_update_insns<'a>(
                 rowid_reg,
                 col,
                 idx_start_reg + i,
+                target_table.table.is_strict(),
             )?;
         }
         // last register is the rowid
@@ -4196,7 +4262,9 @@ fn emit_update_insns<'a>(
             });
             if !relevant_triggers.is_empty() {
                 let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
-                let new_registers_after = (0..col_len)
+                // Build raw NEW registers. Values are encoded at this point;
+                // fire_trigger will decode them via decode_trigger_registers.
+                let new_registers_after: Vec<usize> = (0..col_len)
                     .map(|i| start + i)
                     .chain(std::iter::once(new_rowid_reg))
                     .collect();
@@ -4207,14 +4275,14 @@ fn emit_update_insns<'a>(
                 // If the program has a trigger_conflict_override, propagate it to the trigger context.
                 let trigger_ctx_after =
                     if let Some(override_conflict) = program.trigger_conflict_override {
-                        TriggerContext::new_with_override_conflict(
+                        TriggerContext::new_after_with_override_conflict(
                             btree_table,
                             Some(new_registers_after),
                             old_registers_after, // OLD values preserved from BEFORE trigger
                             override_conflict,
                         )
                     } else {
-                        TriggerContext::new(
+                        TriggerContext::new_after(
                             btree_table,
                             Some(new_registers_after),
                             old_registers_after, // OLD values preserved from BEFORE trigger
@@ -5065,6 +5133,7 @@ fn emit_index_column_value_old_image(
 
 /// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
 /// Handling expression indexes and regular columns
+#[allow(clippy::too_many_arguments)]
 fn emit_index_column_value_new_image(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -5073,6 +5142,7 @@ fn emit_index_column_value_new_image(
     rowid_reg: usize,
     idx_col: &IndexColumn,
     dest_reg: usize,
+    is_strict: bool,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
@@ -5081,6 +5151,18 @@ fn emit_index_column_value_new_image(
         // comparison instructions in the expression get the correct column
         // affinity even though column references have been rewritten to
         // Expr::Register.
+        // After rewrite, Expr::Register nodes reference encoded column registers.
+        // Decode custom type registers so the expression evaluates on user-facing
+        // values, matching what SELECT / CREATE INDEX see.
+        crate::translate::expr::decode_custom_type_registers_in_expr(
+            program,
+            resolver,
+            &mut expr,
+            columns,
+            columns_start_reg,
+            Some(rowid_reg),
+            is_strict,
+        )?;
         translate_expr_no_constant_opt(
             program,
             None,
@@ -5232,14 +5314,14 @@ pub(crate) fn emit_check_constraints<'a>(
         let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(rowid_expr), rowid_reg));
+            .push((Cow::Owned(rowid_expr), rowid_reg, false));
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(rowid_name.to_string()),
         );
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), rowid_reg));
+            .push((Cow::Owned(qualified_expr), rowid_reg, false));
     }
 
     // Map each column to its register (both unqualified and qualified forms).
@@ -5247,14 +5329,14 @@ pub(crate) fn emit_check_constraints<'a>(
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(column_expr), register));
+            .push((Cow::Owned(column_expr), register, false));
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(col_name.to_string()),
         );
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), register));
+            .push((Cow::Owned(qualified_expr), register, false));
     }
 
     if let Some(joined_table) = referenced_tables.and_then(|tables| tables.joined_tables().first())
@@ -5265,6 +5347,7 @@ pub(crate) fn emit_check_constraints<'a>(
                 table: joined_table.internal_id,
             }),
             rowid_reg,
+            false,
         ));
 
         for (col_name, register) in column_mappings.iter().copied() {
@@ -5281,6 +5364,7 @@ pub(crate) fn emit_check_constraints<'a>(
                         is_rowid_alias: col.is_rowid_alias(),
                     }),
                     register,
+                    false,
                 ));
             }
         }

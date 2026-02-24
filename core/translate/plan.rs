@@ -999,6 +999,25 @@ impl TableReferences {
             })
     }
 
+    /// Returns an immutable reference to the first [Table] whose underlying
+    /// table name matches `name`. Unlike [find_table_by_identifier], this
+    /// searches by the base table name (e.g. "t1") rather than the alias
+    /// (e.g. "a"). This is needed when looking up column metadata for
+    /// ephemeral auto-indexes, whose `table_name` field stores the base name
+    /// while the table reference may be aliased.
+    pub fn find_table_by_table_name(&self, name: &str) -> Option<&Table> {
+        self.joined_tables
+            .iter()
+            .find(|t| t.table.get_name() == name)
+            .map(|t| &t.table)
+            .or_else(|| {
+                self.outer_query_refs
+                    .iter()
+                    .find(|t| t.table.get_name() == name)
+                    .map(|t| &t.table)
+            })
+    }
+
     /// Returns an immutable reference to the [OuterQueryReference] with the given identifier,
     /// where identifier is either the literal name of the table or an alias.
     pub fn find_outer_query_ref_by_identifier(

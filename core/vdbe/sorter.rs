@@ -22,6 +22,11 @@ use crate::{
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
 
+/// A custom comparison function for sorting custom type columns.
+/// Takes two value references and returns an Ordering.
+/// Used when a custom type defines a `<` operator for correct sort behavior.
+pub type SortComparator = Arc<dyn Fn(&ValueRef, &ValueRef) -> Ordering + Send + Sync>;
+
 #[derive(Debug, Clone, Copy)]
 enum SortState {
     Start,
@@ -56,6 +61,9 @@ pub struct Sorter {
     key_len: usize,
     /// The key info.
     pub index_key_info: Rc<Vec<KeyInfo>>,
+    /// Per-column custom comparators for custom type ordering.
+    /// When present, used instead of standard ValueRef comparison for that column.
+    comparators: Rc<Vec<Option<SortComparator>>>,
     /// Sorted chunks stored on disk.
     chunks: Vec<SortedChunk>,
     /// The heap of records consumed from the chunks and their corresponding chunk index.
@@ -91,6 +99,7 @@ impl Sorter {
     pub fn new(
         order: &[SortOrder],
         collations: Vec<CollationSeq>,
+        comparators: Vec<Option<SortComparator>>,
         max_buffer_size_bytes: usize,
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
@@ -112,6 +121,7 @@ impl Sorter {
                     })
                     .collect(),
             ),
+            comparators: Rc::new(comparators),
             chunks: Vec::new(),
             chunk_heap: BinaryHeap::new(),
             max_buffer_size: max_buffer_size_bytes,
@@ -273,6 +283,7 @@ impl Sorter {
                         record,
                         self.key_len,
                         &self.index_key_info,
+                        &self.comparators,
                     )?;
                     let record_ref = self.arena.alloc(sortable_record);
                     // SAFETY: arena.alloc returns a valid, aligned, non-null pointer
@@ -378,6 +389,7 @@ impl Sorter {
                         record,
                         self.key_len,
                         self.index_key_info.clone(),
+                        self.comparators.clone(),
                     )?)),
                     chunk_idx,
                 ));
@@ -740,6 +752,8 @@ struct ArenaSortableRecord {
     /// Shared KeyInfo owned by Sorter. Avoids Rc refcount overhead that would
     /// leak when arena.reset() skips Drop.
     index_key_info: NonNull<[KeyInfo]>,
+    /// Shared comparators owned by Sorter. Same safety model as index_key_info.
+    comparators: NonNull<[Option<SortComparator>]>,
 }
 
 impl ArenaSortableRecord {
@@ -748,6 +762,7 @@ impl ArenaSortableRecord {
         record: &ImmutableRecord,
         key_len: usize,
         index_key_info: &[KeyInfo],
+        comparators: &[Option<SortComparator>],
     ) -> Result<Self> {
         let payload = arena.alloc_slice_copy(record.get_payload());
 
@@ -770,6 +785,7 @@ impl ArenaSortableRecord {
             payload: NonNull::from(payload),
             key_values: NonNull::from(key_values.into_bump_slice()),
             index_key_info: NonNull::from(index_key_info),
+            comparators: NonNull::from(comparators),
         })
     }
 
@@ -799,19 +815,25 @@ impl Ord for ArenaSortableRecord {
     fn cmp(&self, other: &Self) -> Ordering {
         let self_values = self.key_values();
         let other_values = other.key_values();
-        // SAFETY: index_key_info points to Sorter-owned data that outlives all records.
+        // SAFETY: index_key_info and comparators point to Sorter-owned data that outlives all records.
         let index_key_info = unsafe { self.index_key_info.as_ref() };
+        let comparators = unsafe { self.comparators.as_ref() };
 
-        for ((&self_val, &other_val), key_info) in self_values
+        for (i, ((&self_val, &other_val), key_info)) in self_values
             .iter()
             .zip(other_values.iter())
             .zip(index_key_info.iter())
+            .enumerate()
         {
-            let cmp = match (self_val, other_val) {
-                (ValueRef::Text(left), ValueRef::Text(right)) => {
-                    key_info.collation.compare_strings(&left, &right)
+            let cmp = if let Some(Some(comparator)) = comparators.get(i) {
+                comparator(&self_val, &other_val)
+            } else {
+                match (self_val, other_val) {
+                    (ValueRef::Text(left), ValueRef::Text(right)) => {
+                        key_info.collation.compare_strings(&left, &right)
+                    }
+                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
-                _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
             };
             if cmp != Ordering::Equal {
                 return match key_info.sort_order {
@@ -844,6 +866,7 @@ struct BoxedSortableRecord {
     record: ImmutableRecord,
     key_values: Vec<ValueRef<'static>>,
     index_key_info: Rc<Vec<KeyInfo>>,
+    comparators: Rc<Vec<Option<SortComparator>>>,
     deserialization_error: Option<LimboError>,
 }
 
@@ -852,6 +875,7 @@ impl BoxedSortableRecord {
         record: ImmutableRecord,
         key_len: usize,
         index_key_info: Rc<Vec<KeyInfo>>,
+        comparators: Rc<Vec<Option<SortComparator>>>,
     ) -> Result<Self> {
         let mut value_iterator = record.iter()?;
         let mut key_values = Vec::with_capacity(key_len);
@@ -883,6 +907,7 @@ impl BoxedSortableRecord {
             record,
             key_values,
             index_key_info,
+            comparators,
             deserialization_error,
         })
     }
@@ -895,17 +920,22 @@ impl Ord for BoxedSortableRecord {
             return Ordering::Equal;
         }
 
-        for ((&self_val, &other_val), key_info) in self
+        for (i, ((&self_val, &other_val), key_info)) in self
             .key_values
             .iter()
             .zip(other.key_values.iter())
             .zip(self.index_key_info.iter())
+            .enumerate()
         {
-            let cmp = match (self_val, other_val) {
-                (ValueRef::Text(left), ValueRef::Text(right)) => {
-                    key_info.collation.compare_strings(&left, &right)
+            let cmp = if let Some(Some(comparator)) = self.comparators.get(i) {
+                comparator(&self_val, &other_val)
+            } else {
+                match (self_val, other_val) {
+                    (ValueRef::Text(left), ValueRef::Text(right)) => {
+                        key_info.collation.compare_strings(&left, &right)
+                    }
+                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
-                _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
             };
             if cmp != Ordering::Equal {
                 return match key_info.sort_order {
@@ -980,6 +1010,7 @@ mod tests {
             let mut sorter = Sorter::new(
                 &[SortOrder::Asc],
                 vec![CollationSeq::Binary],
+                vec![None],
                 256,
                 64,
                 io.clone(),

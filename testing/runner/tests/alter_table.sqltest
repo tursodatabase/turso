@@ -377,7 +377,7 @@ expect error {
 @cross-check-integrity
 test strict-alter-add-column-invalid-varchar {
     CREATE TABLE t(a INTEGER) STRICT;
-    ALTER TABLE t ADD COLUMN b VARCHAR(100);
+    ALTER TABLE t ADD COLUMN b FAKETYPE;
 }
 expect error {
 }

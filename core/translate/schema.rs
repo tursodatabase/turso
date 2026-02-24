@@ -2,10 +2,10 @@ use crate::sync::Arc;
 
 use crate::ast;
 use crate::ext::VTabImpl;
-use crate::function::Func;
+use crate::function::{Deterministic, Func};
 use crate::schema::{
     create_table, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
-    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
+    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -21,7 +21,7 @@ use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
-    to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn},
+    to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
 use crate::Connection;
 use crate::{bail_parse_error, CaptureDataChangesExt, Result};
@@ -109,6 +109,352 @@ pub(crate) fn validate_check_expr(
     Ok(())
 }
 
+/// Resolved type of an expression node for strict type checking of CHECK constraints.
+/// In STRICT tables, every comparison operand must have a determinable, compatible type.
+/// If a type cannot be determined (e.g. function calls), the user must use an explicit CAST.
+#[derive(Debug, Clone, PartialEq)]
+enum CheckExprType {
+    Integer,
+    Real,
+    Text,
+    Blob,
+    Any,
+    Null,
+    CustomType(String),
+}
+
+impl CheckExprType {
+    fn is_numeric(&self) -> bool {
+        matches!(self, Self::Integer | Self::Real)
+    }
+
+    fn is_compatible_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, _) | (_, Self::Null) => true,
+            (Self::Any, _) | (_, Self::Any) => true,
+            (a, b) if a == b => true,
+            (a, b) if a.is_numeric() && b.is_numeric() => true,
+            _ => false,
+        }
+    }
+
+    fn display_name(&self) -> &str {
+        match self {
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+            Self::Any => "ANY",
+            Self::Null => "NULL",
+            Self::CustomType(name) => name.as_str(),
+        }
+    }
+}
+
+/// Resolve the type of an expression node in a CHECK constraint.
+/// Returns an error if the type cannot be determined — the user must use CAST.
+fn resolve_check_expr_type(
+    expr: &ast::Expr,
+    columns: &[&ast::ColumnDefinition],
+    resolver: &Resolver,
+) -> Result<CheckExprType> {
+    use ast::{Literal, Operator, UnaryOperator};
+    match expr {
+        ast::Expr::Id(name) | ast::Expr::Name(name) => {
+            let n = normalize_ident(name.as_str());
+            // rowid/oid/_rowid_ are INTEGER
+            if ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&n)) {
+                return Ok(CheckExprType::Integer);
+            }
+            for col in columns {
+                if normalize_ident(col.col_name.as_str()) == n {
+                    return resolve_column_type(col, resolver);
+                }
+            }
+            bail_parse_error!("no such column: {}", name.as_str());
+        }
+        ast::Expr::Qualified(_tbl, col) => {
+            let cn = normalize_ident(col.as_str());
+            if ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&cn)) {
+                return Ok(CheckExprType::Integer);
+            }
+            for c in columns {
+                if normalize_ident(c.col_name.as_str()) == cn {
+                    return resolve_column_type(c, resolver);
+                }
+            }
+            bail_parse_error!("no such column: {}", col.as_str());
+        }
+        ast::Expr::Literal(lit) => match lit {
+            Literal::Numeric(s) => {
+                if s.contains('.') || s.contains('e') || s.contains('E') {
+                    Ok(CheckExprType::Real)
+                } else {
+                    Ok(CheckExprType::Integer)
+                }
+            }
+            Literal::String(_) => Ok(CheckExprType::Text),
+            Literal::Blob(_) => Ok(CheckExprType::Blob),
+            Literal::Null => Ok(CheckExprType::Null),
+            Literal::True | Literal::False => Ok(CheckExprType::Integer),
+            Literal::CurrentDate | Literal::CurrentTime | Literal::CurrentTimestamp => {
+                Ok(CheckExprType::Text)
+            }
+            Literal::Keyword(s) => {
+                bail_parse_error!(
+                    "cannot determine type of '{}' in CHECK constraint; use CAST",
+                    s
+                );
+            }
+        },
+        ast::Expr::Parenthesized(exprs) => {
+            if exprs.len() == 1 {
+                resolve_check_expr_type(&exprs[0], columns, resolver)
+            } else {
+                bail_parse_error!(
+                    "cannot determine type of expression in CHECK constraint; use CAST"
+                );
+            }
+        }
+        ast::Expr::Cast { type_name, .. } => {
+            if let Some(ref tn) = type_name {
+                resolve_type_name(&tn.name, resolver)
+            } else {
+                bail_parse_error!(
+                    "cannot determine type of CAST in CHECK constraint; use CAST with explicit type"
+                );
+            }
+        }
+        ast::Expr::Unary(op, inner) => match op {
+            UnaryOperator::Negative | UnaryOperator::Positive => {
+                let inner_ty = resolve_check_expr_type(inner, columns, resolver)?;
+                if !inner_ty.is_numeric() && inner_ty != CheckExprType::Null {
+                    bail_parse_error!(
+                        "unary minus/plus requires a numeric type, got {}",
+                        inner_ty.display_name()
+                    );
+                }
+                Ok(inner_ty)
+            }
+            UnaryOperator::BitwiseNot => Ok(CheckExprType::Integer),
+            UnaryOperator::Not => Ok(CheckExprType::Integer),
+        },
+        ast::Expr::Binary(lhs, op, rhs) => {
+            match op {
+                // Arithmetic: both must be numeric, result follows promotion rules
+                Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide => {
+                    let lty = resolve_check_expr_type(lhs, columns, resolver)?;
+                    let rty = resolve_check_expr_type(rhs, columns, resolver)?;
+                    if lty == CheckExprType::Null || rty == CheckExprType::Null {
+                        return Ok(CheckExprType::Null);
+                    }
+                    if !lty.is_numeric() || !rty.is_numeric() {
+                        bail_parse_error!(
+                            "arithmetic requires numeric types, got {} and {}",
+                            lty.display_name(),
+                            rty.display_name()
+                        );
+                    }
+                    if lty == CheckExprType::Real || rty == CheckExprType::Real {
+                        Ok(CheckExprType::Real)
+                    } else {
+                        Ok(CheckExprType::Integer)
+                    }
+                }
+                Operator::Modulus => Ok(CheckExprType::Integer),
+                Operator::Concat => Ok(CheckExprType::Text),
+                Operator::BitwiseAnd
+                | Operator::BitwiseOr
+                | Operator::LeftShift
+                | Operator::RightShift => Ok(CheckExprType::Integer),
+                // Logical: recurse to find nested comparisons
+                Operator::And | Operator::Or => {
+                    // The result of AND/OR is boolean (integer), but we need to
+                    // recurse to validate any comparisons inside.
+                    validate_check_types_in_expr(lhs, columns, resolver)?;
+                    validate_check_types_in_expr(rhs, columns, resolver)?;
+                    Ok(CheckExprType::Integer)
+                }
+                // Comparison operators: validate type compatibility and return Integer (boolean)
+                Operator::Equals
+                | Operator::NotEquals
+                | Operator::Less
+                | Operator::LessEquals
+                | Operator::Greater
+                | Operator::GreaterEquals => {
+                    let lty = resolve_check_expr_type(lhs, columns, resolver)?;
+                    let rty = resolve_check_expr_type(rhs, columns, resolver)?;
+                    if !lty.is_compatible_with(&rty) {
+                        bail_parse_error!(
+                            "type mismatch in CHECK constraint: cannot compare {} with {}",
+                            lty.display_name(),
+                            rty.display_name()
+                        );
+                    }
+                    Ok(CheckExprType::Integer)
+                }
+                // IS/IS NOT are NULL-checking operators, skip type validation
+                Operator::Is | Operator::IsNot => Ok(CheckExprType::Integer),
+                _ => {
+                    bail_parse_error!(
+                        "cannot determine type of expression in CHECK constraint; use CAST"
+                    );
+                }
+            }
+        }
+        ast::Expr::NotNull(_) | ast::Expr::IsNull(_) => Ok(CheckExprType::Integer),
+        ast::Expr::FunctionCall { name, .. } | ast::Expr::FunctionCallStar { name, .. } => {
+            bail_parse_error!(
+                "cannot determine return type of function {}() in CHECK constraint; \
+                 wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
+                name.as_str(),
+                name.as_str()
+            );
+        }
+        _ => {
+            bail_parse_error!("cannot determine type of expression in CHECK constraint; use CAST");
+        }
+    }
+}
+
+/// Resolve a column's type from its definition.
+fn resolve_column_type(col: &ast::ColumnDefinition, resolver: &Resolver) -> Result<CheckExprType> {
+    if let Some(ref col_type) = col.col_type {
+        resolve_type_name(&col_type.name, resolver)
+    } else {
+        // No type specified — in STRICT tables this would be caught elsewhere,
+        // but treat as ANY for CHECK validation purposes.
+        Ok(CheckExprType::Any)
+    }
+}
+
+/// Resolve a type name string to a CheckExprType.
+fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprType> {
+    let name_bytes = type_name.as_bytes();
+    let result = turso_macros::match_ignore_ascii_case!(match name_bytes {
+        b"INT" | b"INTEGER" => Some(CheckExprType::Integer),
+        b"REAL" | b"FLOAT" | b"DOUBLE" => Some(CheckExprType::Real),
+        b"TEXT" => Some(CheckExprType::Text),
+        b"BLOB" => Some(CheckExprType::Blob),
+        b"ANY" => Some(CheckExprType::Any),
+        _ => None,
+    });
+    if let Some(ty) = result {
+        return Ok(ty);
+    }
+    // Check if it's a known custom type
+    if resolver
+        .schema()
+        .get_type_def_unchecked(type_name)
+        .is_some()
+    {
+        return Ok(CheckExprType::CustomType(type_name.to_lowercase()));
+    }
+    bail_parse_error!("unknown type '{}' in CHECK constraint", type_name);
+}
+
+/// Walk a CHECK expression and validate that all comparisons have compatible types.
+/// Only called for STRICT tables.
+fn validate_check_types_in_expr(
+    expr: &ast::Expr,
+    columns: &[&ast::ColumnDefinition],
+    resolver: &Resolver,
+) -> Result<()> {
+    use ast::Operator;
+    match expr {
+        ast::Expr::Binary(lhs, op, rhs) => {
+            match op {
+                Operator::Equals
+                | Operator::NotEquals
+                | Operator::Less
+                | Operator::LessEquals
+                | Operator::Greater
+                | Operator::GreaterEquals => {
+                    let lty = resolve_check_expr_type(lhs, columns, resolver)?;
+                    let rty = resolve_check_expr_type(rhs, columns, resolver)?;
+                    if !lty.is_compatible_with(&rty) {
+                        bail_parse_error!(
+                            "type mismatch in CHECK constraint: cannot compare {} with {}",
+                            lty.display_name(),
+                            rty.display_name()
+                        );
+                    }
+                }
+                Operator::And | Operator::Or => {
+                    validate_check_types_in_expr(lhs, columns, resolver)?;
+                    validate_check_types_in_expr(rhs, columns, resolver)?;
+                }
+                // Arithmetic, concat, bitwise — recurse to find nested comparisons
+                _ => {
+                    validate_check_types_in_expr(lhs, columns, resolver)?;
+                    validate_check_types_in_expr(rhs, columns, resolver)?;
+                }
+            }
+        }
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            let lty = resolve_check_expr_type(lhs, columns, resolver)?;
+            let sty = resolve_check_expr_type(start, columns, resolver)?;
+            let ety = resolve_check_expr_type(end, columns, resolver)?;
+            if !lty.is_compatible_with(&sty) {
+                bail_parse_error!(
+                    "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
+                    lty.display_name(),
+                    sty.display_name()
+                );
+            }
+            if !lty.is_compatible_with(&ety) {
+                bail_parse_error!(
+                    "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
+                    lty.display_name(),
+                    ety.display_name()
+                );
+            }
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            let lty = resolve_check_expr_type(lhs, columns, resolver)?;
+            for item in rhs {
+                let ity = resolve_check_expr_type(item, columns, resolver)?;
+                if !lty.is_compatible_with(&ity) {
+                    bail_parse_error!(
+                        "type mismatch in CHECK IN list: cannot compare {} with {}",
+                        lty.display_name(),
+                        ity.display_name()
+                    );
+                }
+            }
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            for e in exprs {
+                validate_check_types_in_expr(e, columns, resolver)?;
+            }
+        }
+        ast::Expr::Unary(_, inner) => {
+            validate_check_types_in_expr(inner, columns, resolver)?;
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(op) = base {
+                validate_check_types_in_expr(op, columns, resolver)?;
+            }
+            for (when_expr, then_expr) in when_then_pairs {
+                validate_check_types_in_expr(when_expr, columns, resolver)?;
+                validate_check_types_in_expr(then_expr, columns, resolver)?;
+            }
+            if let Some(else_e) = else_expr {
+                validate_check_types_in_expr(else_e, columns, resolver)?;
+            }
+        }
+        // Leaf nodes and other expressions: no nested comparisons to validate
+        _ => {}
+    }
+    Ok(())
+}
+
 fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
@@ -166,6 +512,76 @@ fn validate(
         for constraint in constraints {
             if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
                 validate_check_expr(expr, table_name, &column_names, resolver)?;
+            }
+        }
+
+        let is_strict = options.contains_strict();
+
+        for c in columns {
+            if let Some(ref col_type) = c.col_type {
+                let type_name = &col_type.name;
+                let name_bytes = type_name.as_bytes();
+                let is_builtin = turso_macros::match_ignore_ascii_case!(match name_bytes {
+                    b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+                    _ => false,
+                });
+
+                if !is_builtin && is_strict {
+                    // On non-STRICT tables any type name is allowed and is
+                    // treated as a plain affinity hint (no encode/decode).
+                    // Custom type validation only applies to STRICT tables.
+                    let type_def = resolver.schema().get_type_def_unchecked(type_name);
+                    {
+                        match type_def {
+                            None => {
+                                bail_parse_error!(
+                                    "unknown datatype for {}.{}: \"{}\"",
+                                    table_name,
+                                    c.col_name,
+                                    type_name
+                                );
+                            }
+                            Some(td) if td.user_params().next().is_some() => {
+                                // Parametric type: verify the column provides the right
+                                // number of user parameters (excluding `value`).
+                                let provided = match &col_type.size {
+                                    Some(ast::TypeSize::TypeSize(_, _)) => 2,
+                                    Some(ast::TypeSize::MaxSize(_)) => 1,
+                                    None => 0,
+                                };
+                                let expected = td.user_params().count();
+                                if provided != expected {
+                                    bail_parse_error!(
+                                        "type \"{}\" requires {} parameter(s), got {}",
+                                        type_name,
+                                        expected,
+                                        provided
+                                    );
+                                }
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // In STRICT tables, validate that CHECK constraint comparisons have
+        // compatible types. This catches type mismatches at CREATE TABLE time
+        // rather than producing wrong results at INSERT/UPDATE time.
+        if is_strict {
+            let col_refs: Vec<&ast::ColumnDefinition> = columns.iter().collect();
+            for col in columns {
+                for constraint in &col.constraints {
+                    if let ast::ColumnConstraint::Check(expr) = &constraint.constraint {
+                        validate_check_types_in_expr(expr, &col_refs, resolver)?;
+                    }
+                }
+            }
+            for constraint in constraints {
+                if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
+                    validate_check_types_in_expr(expr, &col_refs, resolver)?;
+                }
             }
         }
     }
@@ -1240,6 +1656,304 @@ pub fn translate_drop_table(
         db: database_id,
         cookie: Cookie::SchemaVersion,
         value: current_schema_version as i32 + 1,
+        p5: 0,
+    });
+
+    Ok(())
+}
+
+/// Validate an encode or decode expression for safety.
+/// Rejects subqueries, aggregates, and window functions.
+fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Result<()> {
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+                bail_parse_error!("subqueries prohibited in {kind} expressions");
+            }
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => {
+                if filter_over.over_clause.is_some() {
+                    bail_parse_error!("window functions prohibited in {kind} expressions");
+                }
+                if let Some(func) = resolver.resolve_function(name.as_str(), args.len()) {
+                    if matches!(func, Func::Agg(..)) {
+                        bail_parse_error!(
+                            "aggregate functions prohibited in {kind} expressions: {}",
+                            name.as_str()
+                        );
+                    }
+                    // Reject known non-deterministic built-in functions.
+                    // External functions are excluded from this check since
+                    // they default to non-deterministic but may actually be
+                    // deterministic (e.g. uuid_blob).
+                    if !matches!(func, Func::External(_)) && !func.is_deterministic() {
+                        bail_parse_error!(
+                            "non-deterministic functions prohibited in {kind} expressions: {}",
+                            name.as_str()
+                        );
+                    }
+                }
+            }
+            ast::Expr::FunctionCallStar { name, .. } => {
+                bail_parse_error!(
+                    "aggregate functions prohibited in {kind} expressions: {}",
+                    name.as_str()
+                );
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+pub fn translate_create_type(
+    type_name: &str,
+    body: &ast::CreateTypeBody,
+    if_not_exists: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let normalized_name = normalize_ident(type_name);
+
+    // Reject names that shadow SQLite base types — these are not in the
+    // type_registry but are handled by the column type system. Allowing
+    // them would create confusion and undropable types.
+    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+        _ => false,
+    });
+    if is_base_type {
+        bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
+    }
+
+    // Check if type already exists
+    if resolver
+        .schema()
+        .get_type_def_unchecked(&normalized_name)
+        .is_some()
+    {
+        if if_not_exists {
+            return Ok(());
+        }
+        bail_parse_error!("type {normalized_name} already exists");
+    }
+
+    // Validate encode/decode expressions for safety
+    if let Some(ref encode) = body.encode {
+        validate_type_expr(encode, "ENCODE", resolver)?;
+    }
+    if let Some(ref decode) = body.decode {
+        validate_type_expr(decode, "DECODE", resolver)?;
+    }
+
+    // Reconstruct the SQL string (without IF NOT EXISTS) using TypeDef::to_sql()
+    let type_def = crate::schema::TypeDef::from_create_type(&normalized_name, body, false);
+    let sql = type_def.to_sql();
+
+    // Ensure sqlite_turso_types table exists (lazy creation)
+    let types_table: Arc<BTreeTable>;
+    let types_root_page: RegisterOrLiteral<i64>;
+
+    if let Some(existing) = resolver.schema().get_btree_table(TURSO_TYPES_TABLE_NAME) {
+        types_table = existing.clone();
+        types_root_page = RegisterOrLiteral::Literal(existing.root_page);
+    } else {
+        // Create the sqlite_turso_types btree
+        let table_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: 0,
+            root: table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        let create_sql =
+            format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)");
+        types_table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
+        types_root_page = RegisterOrLiteral::Register(table_root_reg);
+
+        // Register it in sqlite_schema so it persists
+        let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+        let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: schema_cursor_id,
+            root_page: 1i64.into(),
+            db: 0,
+        });
+        emit_schema_entry(
+            program,
+            resolver,
+            schema_cursor_id,
+            None,
+            SchemaEntryType::Table,
+            TURSO_TYPES_TABLE_NAME,
+            TURSO_TYPES_TABLE_NAME,
+            table_root_reg,
+            Some(create_sql),
+        )?;
+
+        // Parse schema to register the new table in-memory
+        program.emit_insn(Insn::ParseSchema {
+            db: schema_cursor_id,
+            where_clause: Some(format!(
+                "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
+            )),
+        });
+    }
+
+    // Open sqlite_turso_types for writing
+    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: types_cursor_id,
+        root_page: types_root_page,
+        db: 0,
+    });
+
+    // Insert (name, sql) record
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: types_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    let name_reg = program.emit_string8_new_reg(normalized_name);
+    program.emit_string8_new_reg(sql.clone());
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(name_reg),
+        count: to_u16(2),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: types_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+    });
+
+    // Add the type to the in-memory registry
+    program.emit_insn(Insn::AddType { db: 0, sql });
+
+    program.emit_insn(Insn::SetCookie {
+        db: 0,
+        cookie: Cookie::SchemaVersion,
+        value: (resolver.schema().schema_version + 1) as i32,
+        p5: 0,
+    });
+
+    Ok(())
+}
+
+pub fn translate_drop_type(
+    type_name: &str,
+    if_exists: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let normalized_name = normalize_ident(type_name);
+
+    // Check if type exists
+    let type_def = resolver.schema().get_type_def_unchecked(&normalized_name);
+    if type_def.is_none() {
+        if if_exists {
+            return Ok(());
+        }
+        bail_parse_error!("no such type: {normalized_name}");
+    }
+
+    // Check if built-in type
+    if type_def.unwrap().is_builtin {
+        bail_parse_error!("cannot drop built-in type: {normalized_name}");
+    }
+
+    // Check if any table uses this type
+    for (_, table) in resolver.schema().tables.iter() {
+        for col in table.columns() {
+            if normalize_ident(&col.ty_str) == normalized_name {
+                bail_parse_error!(
+                    "cannot drop type {normalized_name}: used by column {} in table {}",
+                    col.name.as_deref().unwrap_or("?"),
+                    table.get_name()
+                );
+            }
+        }
+    }
+
+    // Open cursor to sqlite_turso_types table
+    let types_table = resolver
+        .schema()
+        .get_btree_table(TURSO_TYPES_TABLE_NAME)
+        .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {normalized_name}")))?;
+    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: types_cursor_id,
+        root_page: types_table.root_page.into(),
+        db: 0,
+    });
+
+    // Search for matching row: name=type_name (col 0)
+    let name_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: name_reg,
+        value: normalized_name.clone(),
+    });
+
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: types_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    // Read name (col 0)
+    let col0_reg = program.alloc_register();
+    program.emit_column_or_rowid(types_cursor_id, 0, col0_reg);
+
+    let skip_delete_label = program.allocate_label();
+
+    // Check name=type_name
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+
+    // Delete matching row
+    program.emit_insn(Insn::Delete {
+        cursor_id: types_cursor_id,
+        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+        is_part_of_update: false,
+    });
+
+    program.resolve_label(skip_delete_label, program.offset());
+
+    program.emit_insn(Insn::Next {
+        cursor_id: types_cursor_id,
+        pc_if_next: loop_start_label,
+    });
+
+    program.preassign_label_to_next_insn(end_loop_label);
+
+    // Remove from in-memory schema
+    program.emit_insn(Insn::DropType {
+        db: 0,
+        type_name: normalized_name,
+    });
+
+    program.emit_insn(Insn::SetCookie {
+        db: 0,
+        cookie: Cookie::SchemaVersion,
+        value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
     });
 

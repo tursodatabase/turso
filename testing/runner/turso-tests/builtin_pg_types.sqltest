@@ -1,0 +1,378 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+@requires strict "uses STRICT tables"
+test boolean-insert-text {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val boolean) STRICT;
+    INSERT INTO t1 VALUES (1, 'true');
+    INSERT INTO t1 VALUES (2, 'false');
+    INSERT INTO t1 VALUES (3, 't');
+    INSERT INTO t1 VALUES (4, 'f');
+    INSERT INTO t1 VALUES (5, 'yes');
+    INSERT INTO t1 VALUES (6, 'no');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|1
+    2|0
+    3|1
+    4|0
+    5|1
+    6|0
+}
+
+@requires strict "uses STRICT tables"
+test boolean-insert-int {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val boolean) STRICT;
+    INSERT INTO t1 VALUES (1, 1);
+    INSERT INTO t1 VALUES (2, 0);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|1
+    2|0
+}
+
+@requires strict "uses STRICT tables"
+test boolean-alias-bool {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val bool) STRICT;
+    INSERT INTO t1 VALUES (1, 'on');
+    INSERT INTO t1 VALUES (2, 'off');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|1
+    2|0
+}
+
+@requires strict "uses STRICT tables"
+test boolean-invalid {
+    CREATE TABLE t1(val boolean) STRICT;
+    INSERT INTO t1 VALUES ('maybe');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test boolean-null {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val boolean) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+    SELECT id, COALESCE(val, 'IS_NULL') FROM t1;
+}
+expect {
+    1|IS_NULL
+}
+
+@requires strict "uses STRICT tables"
+test varchar-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name varchar(10)) STRICT;
+    INSERT INTO t1 VALUES (1, 'hello');
+    INSERT INTO t1 VALUES (2, 'world12345');
+    SELECT id, name FROM t1;
+}
+expect {
+    1|hello
+    2|world12345
+}
+
+@requires strict "uses STRICT tables"
+test varchar-too-long {
+    CREATE TABLE t1(name varchar(3)) STRICT;
+    INSERT INTO t1 VALUES ('toolong');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test varchar-null {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name varchar(5)) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+    SELECT id, COALESCE(name, 'IS_NULL') FROM t1;
+}
+expect {
+    1|IS_NULL
+}
+
+@requires strict "uses STRICT tables"
+test date-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-01-15');
+    SELECT id, d FROM t1;
+}
+expect {
+    1|2024-01-15
+}
+
+@requires strict "uses STRICT tables"
+test time-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, t time) STRICT;
+    INSERT INTO t1 VALUES (1, '14:30:00');
+    SELECT id, t FROM t1;
+}
+expect {
+    1|14:30:00
+}
+
+@requires strict "uses STRICT tables"
+test timestamp-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-01-15 14:30:00');
+    SELECT id, ts FROM t1;
+}
+expect {
+    1|2024-01-15 14:30:00
+}
+
+@requires strict "uses STRICT tables"
+test smallint-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val smallint) STRICT;
+    INSERT INTO t1 VALUES (1, 32767);
+    INSERT INTO t1 VALUES (2, -32768);
+    INSERT INTO t1 VALUES (3, 0);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|32767
+    2|-32768
+    3|0
+}
+
+@requires strict "uses STRICT tables"
+test smallint-overflow {
+    CREATE TABLE t1(val smallint) STRICT;
+    INSERT INTO t1 VALUES (32768);
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test smallint-underflow {
+    CREATE TABLE t1(val smallint) STRICT;
+    INSERT INTO t1 VALUES (-32769);
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test smallint-alias-int2 {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val int2) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|100
+}
+
+@requires strict "uses STRICT tables"
+test bigint-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val bigint) STRICT;
+    INSERT INTO t1 VALUES (1, 9223372036854775807);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|9223372036854775807
+}
+
+@requires strict "uses STRICT tables"
+test bigint-alias-int8 {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val int8) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|42
+}
+
+@requires strict "uses STRICT tables"
+test inet-valid-ipv4 {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, addr inet) STRICT;
+    INSERT INTO t1 VALUES (1, '192.168.1.1');
+    INSERT INTO t1 VALUES (2, '10.0.0.1');
+    SELECT id, addr FROM t1;
+}
+expect {
+    1|192.168.1.1
+    2|10.0.0.1
+}
+
+@requires strict "uses STRICT tables"
+test inet-valid-ipv6 {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, addr inet) STRICT;
+    INSERT INTO t1 VALUES (1, '::1');
+    SELECT id, addr FROM t1;
+}
+expect {
+    1|::1
+}
+
+@requires strict "uses STRICT tables"
+test inet-invalid {
+    CREATE TABLE t1(addr inet) STRICT;
+    INSERT INTO t1 VALUES ('not-an-ip');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test bytea-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, data bytea) STRICT;
+    INSERT INTO t1 VALUES (1, x'DEADBEEF');
+    SELECT id, hex(data) FROM t1;
+}
+expect {
+    1|DEADBEEF
+}
+
+@requires strict "uses STRICT tables"
+test drop-builtin-type-fails {
+    DROP TYPE boolean;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test create-conflicting-type-fails {
+    CREATE TYPE boolean BASE text;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test create-if-not-exists-builtin-ok {
+    CREATE TYPE IF NOT EXISTS boolean BASE integer;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test numeric-insert-select {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, '123.45');
+    INSERT INTO t1 VALUES (2, '0.99');
+    INSERT INTO t1 VALUES (3, '-42.10');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|123.45
+    2|0.99
+    3|-42.10
+}
+
+@requires strict "uses STRICT tables"
+test numeric-insert-integer {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(5,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    INSERT INTO t1 VALUES (2, 0);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|42.00
+    2|0.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-precision-overflow {
+    CREATE TABLE t1(val numeric(5,2)) STRICT;
+    INSERT INTO t1 VALUES ('12345.67');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test numeric-null {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+    SELECT id, COALESCE(val, 'IS_NULL') FROM t1;
+}
+expect {
+    1|IS_NULL
+}
+
+@requires strict "uses STRICT tables"
+test numeric-addition {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('100.50');
+    INSERT INTO t1 VALUES ('200.25');
+    SELECT val + val FROM t1;
+}
+expect {
+    201.00
+    400.50
+}
+
+@requires strict "uses STRICT tables"
+test numeric-subtraction {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('100.50');
+    SELECT val - val FROM t1;
+}
+expect {
+    0.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-multiplication {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('3.00');
+    INSERT INTO t1 VALUES ('7.50');
+    SELECT val * val FROM t1;
+}
+expect {
+    9.0000
+    56.2500
+}
+
+@requires strict "uses STRICT tables"
+test numeric-division {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('10.00');
+    SELECT val / val FROM t1;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test numeric-less-than {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1.00');
+    INSERT INTO t1 VALUES ('2.00');
+    INSERT INTO t1 VALUES ('3.00');
+    SELECT val FROM t1 WHERE val < '2.50';
+}
+expect {
+    1.00
+    2.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-equals {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1.00');
+    INSERT INTO t1 VALUES ('2.00');
+    INSERT INTO t1 VALUES ('3.00');
+    SELECT val FROM t1 WHERE val = '2.00';
+}
+expect {
+    2.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-large-precision {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(100,10)) STRICT;
+    INSERT INTO t1 VALUES (1, '123456789012345678901234567890.1234567890');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|123456789012345678901234567890.1234567890
+}
+
+@requires strict "uses STRICT tables"
+test numeric-invalid-input {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('not-a-number');
+}
+expect error {
+}

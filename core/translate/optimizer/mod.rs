@@ -747,7 +747,7 @@ fn add_ephemeral_table_to_update_plan(
         has_rowid: true,
         has_autoincrement: false,
         primary_key_columns: vec![],
-        columns: vec![ROWID_COLUMN],
+        columns: vec![(*ROWID_COLUMN).clone()],
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
@@ -1465,6 +1465,7 @@ fn optimize_table_access(
             &access_methods_arena,
             table_references.joined_tables_mut(),
             order_target,
+            schema,
         );
         if satisfies_order_target {
             match order_target.1 {

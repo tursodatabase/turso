@@ -624,6 +624,7 @@ impl TursoDatabase {
                                 "views" => opts.with_views(true),
                                 "index_method" => opts.with_index_method(true),
                                 "strict" => opts.with_strict(true),
+                                "custom_types" => opts.with_custom_types(true),
                                 "autovacuum" => opts.with_autovacuum(true),
                                 "triggers" => opts.with_triggers(true),
                                 "encryption" => opts.with_encryption(true),

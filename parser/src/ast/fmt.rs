@@ -703,6 +703,74 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::CreateType {
+                if_not_exists,
+                type_name,
+                body,
+            } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_TYPE, None)?;
+                if *if_not_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(type_name))?;
+                // Parameters
+                if !body.params.is_empty() {
+                    s.append(TK_LP, None)?;
+                    for (i, param) in body.params.iter().enumerate() {
+                        if i > 0 {
+                            s.append(TK_COMMA, None)?;
+                        }
+                        s.append(TK_ID, Some(&param.name))?;
+                        if let Some(ref ty) = param.ty {
+                            s.append(TK_ID, Some(ty))?;
+                        }
+                    }
+                    s.append(TK_RP, None)?;
+                }
+                // BASE
+                s.append(TK_ID, Some("BASE"))?;
+                s.append(TK_ID, Some(&body.base))?;
+                // ENCODE
+                if let Some(ref encode) = body.encode {
+                    s.append(TK_ID, Some("ENCODE"))?;
+                    encode.to_tokens(s, context)?;
+                }
+                // DECODE
+                if let Some(ref decode) = body.decode {
+                    s.append(TK_ID, Some("DECODE"))?;
+                    decode.to_tokens(s, context)?;
+                }
+                // DEFAULT
+                if let Some(ref default) = body.default {
+                    s.append(TK_ID, Some("DEFAULT"))?;
+                    default.to_tokens(s, context)?;
+                }
+                // OPERATOR clauses
+                for op in &body.operators {
+                    s.append(TK_ID, Some("OPERATOR"))?;
+                    s.append(TK_STRING, Some(&format!("'{}'", op.op)))?;
+                    if let Some(ref func_name) = op.func_name {
+                        s.append(TK_ID, Some(func_name))?;
+                    }
+                }
+                Ok(())
+            }
+            Self::DropType {
+                if_exists,
+                type_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_TYPE, None)?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(type_name))?;
+                Ok(())
+            }
         }
     }
 }

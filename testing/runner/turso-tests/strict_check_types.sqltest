@@ -1,0 +1,502 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+# Strict type checking for CHECK constraints in STRICT tables.
+# In STRICT mode, comparisons in CHECK expressions must have compatible types.
+# If the type of an expression cannot be determined, use CAST.
+
+# ============================================================================
+# Base type mismatches — must be rejected at CREATE TABLE time
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test integer-vs-text-error {
+    CREATE TABLE t(a INTEGER CHECK(a < 'hello')) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test integer-vs-blob-error {
+    CREATE TABLE t(a INTEGER CHECK(a < x'FF')) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test text-vs-integer-error {
+    CREATE TABLE t(a TEXT CHECK(a > 42)) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test text-vs-real-error {
+    CREATE TABLE t(a TEXT CHECK(a < 3.14)) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test blob-vs-text-error {
+    CREATE TABLE t(a BLOB CHECK(a = 'text')) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test blob-vs-integer-error {
+    CREATE TABLE t(a BLOB CHECK(a < 5)) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test real-vs-text-error {
+    CREATE TABLE t(a REAL CHECK(a < 'hello')) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test cross-column-type-mismatch {
+    CREATE TABLE t(a INTEGER, b TEXT, CHECK(a = b)) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+# ============================================================================
+# Valid base type comparisons — must succeed
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test integer-vs-integer-valid {
+    CREATE TABLE t(a INTEGER CHECK(a >= 18)) STRICT;
+    INSERT INTO t VALUES(25);
+    SELECT a FROM t;
+}
+expect {
+    25
+}
+
+@requires strict "uses STRICT tables"
+test integer-vs-real-valid {
+    CREATE TABLE t(a INTEGER CHECK(a < 3.14)) STRICT;
+    INSERT INTO t VALUES(2);
+    SELECT a FROM t;
+}
+expect {
+    2
+}
+
+@requires strict "uses STRICT tables"
+test real-vs-integer-valid {
+    CREATE TABLE t(a REAL CHECK(a > 0)) STRICT;
+    INSERT INTO t VALUES(1.5);
+    SELECT a FROM t;
+}
+expect {
+    1.5
+}
+
+@requires strict "uses STRICT tables"
+test text-vs-text-valid {
+    CREATE TABLE t(a TEXT CHECK(a != 'bad')) STRICT;
+    INSERT INTO t VALUES('good');
+    SELECT a FROM t;
+}
+expect {
+    good
+}
+
+@requires strict "uses STRICT tables"
+test compound-and-valid {
+    CREATE TABLE t(a INTEGER CHECK(a > 0 AND a < 100)) STRICT;
+    INSERT INTO t VALUES(50);
+    SELECT a FROM t;
+}
+expect {
+    50
+}
+
+@requires strict "uses STRICT tables"
+test compound-or-valid {
+    CREATE TABLE t(a INTEGER CHECK(a < 10 OR a > 90)) STRICT;
+    INSERT INTO t VALUES(5);
+    INSERT INTO t VALUES(95);
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    5
+    95
+}
+
+@requires strict "uses STRICT tables"
+test between-valid {
+    CREATE TABLE t(a INTEGER CHECK(a BETWEEN 1 AND 100)) STRICT;
+    INSERT INTO t VALUES(50);
+    SELECT a FROM t;
+}
+expect {
+    50
+}
+
+@requires strict "uses STRICT tables"
+test in-list-valid {
+    CREATE TABLE t(a INTEGER CHECK(a IN (1, 2, 3))) STRICT;
+    INSERT INTO t VALUES(2);
+    SELECT a FROM t;
+}
+expect {
+    2
+}
+
+@requires strict "uses STRICT tables"
+test is-not-null-valid {
+    CREATE TABLE t(a INTEGER CHECK(a IS NOT NULL)) STRICT;
+    INSERT INTO t VALUES(42);
+    SELECT a FROM t;
+}
+expect {
+    42
+}
+
+@requires strict "uses STRICT tables"
+test null-comparison-valid {
+    CREATE TABLE t(a INTEGER CHECK(a != NULL)) STRICT;
+    INSERT INTO t VALUES(42);
+    SELECT a FROM t;
+}
+expect {
+    42
+}
+
+@requires strict "uses STRICT tables"
+test arithmetic-valid {
+    CREATE TABLE t(a INTEGER, b INTEGER, CHECK(a + b < 100)) STRICT;
+    INSERT INTO t VALUES(30, 40);
+    SELECT a, b FROM t;
+}
+expect {
+    30|40
+}
+
+@requires strict "uses STRICT tables"
+test mixed-numeric-arithmetic {
+    CREATE TABLE t(a INTEGER CHECK(a * 2.0 < 10.0)) STRICT;
+    INSERT INTO t VALUES(3);
+    SELECT a FROM t;
+}
+expect {
+    3
+}
+
+@requires strict "uses STRICT tables"
+test rowid-in-check-valid {
+    CREATE TABLE t(a INTEGER CHECK(rowid > 0)) STRICT;
+    INSERT INTO t VALUES(42);
+    SELECT a FROM t;
+}
+expect {
+    42
+}
+
+@requires strict "uses STRICT tables"
+test any-column-compatible {
+    CREATE TABLE t(a ANY CHECK(a = 42)) STRICT;
+    INSERT INTO t VALUES(42);
+    SELECT a FROM t;
+}
+expect {
+    42
+}
+
+@requires strict "uses STRICT tables"
+test boolean-literal-vs-integer-valid {
+    CREATE TABLE t(a INTEGER CHECK(a = true)) STRICT;
+    INSERT INTO t VALUES(1);
+    SELECT a FROM t;
+}
+expect {
+    1
+}
+
+# ============================================================================
+# BETWEEN and IN with mismatched types — must error
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test between-type-mismatch-start {
+    CREATE TABLE t(a INTEGER CHECK(a BETWEEN 'low' AND 100)) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test between-type-mismatch-end {
+    CREATE TABLE t(a INTEGER CHECK(a BETWEEN 1 AND 'high')) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test in-list-type-mismatch {
+    CREATE TABLE t(a INTEGER CHECK(a IN (1, 'two', 3))) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+# ============================================================================
+# Custom type mismatches — must error
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test custom-type-vs-integer-error {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount < 50)) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-vs-text-error {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount = 'hello')) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test different-custom-types-error {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE score BASE integer ENCODE value * 10 DECODE value / 10;
+    CREATE TABLE t(a cents, b score, CHECK(a < b)) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+# ============================================================================
+# Custom type with CAST — valid, and CHECK works correctly
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test custom-type-cast-valid-insert {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
+    INSERT INTO t VALUES(1, 42);
+    SELECT id, amount FROM t;
+}
+expect {
+    1|42
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-cast-check-violation {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
+    INSERT INTO t VALUES(60);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-cast-greater-than-zero {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount > CAST(0 AS cents))) STRICT;
+    INSERT INTO t VALUES(10);
+    SELECT amount FROM t;
+}
+expect {
+    10
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-cast-greater-than-zero-violation {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount > CAST(0 AS cents))) STRICT;
+    INSERT INTO t VALUES(-5);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-same-column-comparison {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(a cents, b cents, CHECK(a < b)) STRICT;
+    INSERT INTO t VALUES(10, 20);
+    SELECT a, b FROM t;
+}
+expect {
+    10|20
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-between-cast {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount BETWEEN CAST(0 AS cents) AND CAST(100 AS cents))) STRICT;
+    INSERT INTO t VALUES(50);
+    SELECT amount FROM t;
+}
+expect {
+    50
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-in-list-cast {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount IN (CAST(10 AS cents), CAST(20 AS cents), CAST(30 AS cents)))) STRICT;
+    INSERT INTO t VALUES(20);
+    SELECT amount FROM t;
+}
+expect {
+    20
+}
+
+# ============================================================================
+# Function calls in CHECK — must require CAST
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test function-call-unknown-type-error {
+    CREATE TABLE t(a TEXT CHECK(length(a) < 10)) STRICT;
+}
+expect error {
+    cannot determine return type of function
+}
+
+@requires strict "uses STRICT tables"
+test function-call-with-cast-valid {
+    CREATE TABLE t(a TEXT CHECK(CAST(length(a) AS INTEGER) < 10)) STRICT;
+    INSERT INTO t VALUES('hello');
+    SELECT a FROM t;
+}
+expect {
+    hello
+}
+
+@requires strict "uses STRICT tables"
+test function-call-with-cast-violation {
+    CREATE TABLE t(a TEXT CHECK(CAST(length(a) AS INTEGER) < 5)) STRICT;
+    INSERT INTO t VALUES('toolong');
+}
+expect error {
+    CHECK constraint failed
+}
+
+# ============================================================================
+# Non-STRICT tables — no type checking applied
+# ============================================================================
+
+test non-strict-integer-vs-text-ok {
+    CREATE TABLE t(a INTEGER CHECK(a < 'hello'));
+    INSERT INTO t VALUES(42);
+    SELECT a FROM t;
+}
+expect {
+    42
+}
+
+test non-strict-custom-type-ok {
+    CREATE TABLE t(a FAKETYPE CHECK(a < 'hello'));
+    INSERT INTO t VALUES(42);
+    SELECT a FROM t;
+}
+expect {
+    42
+}
+
+# ============================================================================
+# Edge cases
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test not-expression-valid {
+    CREATE TABLE t(a INTEGER CHECK(NOT (a < 0))) STRICT;
+    INSERT INTO t VALUES(5);
+    SELECT a FROM t;
+}
+expect {
+    5
+}
+
+@requires strict "uses STRICT tables"
+test unary-minus-valid {
+    CREATE TABLE t(a INTEGER CHECK(a > -10)) STRICT;
+    INSERT INTO t VALUES(5);
+    SELECT a FROM t;
+}
+expect {
+    5
+}
+
+@requires strict "uses STRICT tables"
+test parenthesized-valid {
+    CREATE TABLE t(a INTEGER CHECK((a) > 0)) STRICT;
+    INSERT INTO t VALUES(5);
+    SELECT a FROM t;
+}
+expect {
+    5
+}
+
+@requires strict "uses STRICT tables"
+test table-level-check-mismatch {
+    CREATE TABLE t(a INTEGER, b TEXT, CHECK(a < b)) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test column-level-check-mismatch {
+    CREATE TABLE t(a INTEGER CHECK(a < 'text')) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test concat-produces-text {
+    CREATE TABLE t(a TEXT, b TEXT, CHECK(a || b != 'bad')) STRICT;
+    INSERT INTO t VALUES('go', 'od');
+    SELECT a, b FROM t;
+}
+expect {
+    go|od
+}
+
+@requires strict "uses STRICT tables"
+test modulus-produces-integer {
+    CREATE TABLE t(a INTEGER CHECK(a % 2 = 0)) STRICT;
+    INSERT INTO t VALUES(4);
+    SELECT a FROM t;
+}
+expect {
+    4
+}
+
+@requires strict "uses STRICT tables"
+test bitwise-produces-integer {
+    CREATE TABLE t(a INTEGER CHECK((a & 1) = 0)) STRICT;
+    INSERT INTO t VALUES(4);
+    SELECT a FROM t;
+}
+expect {
+    4
+}

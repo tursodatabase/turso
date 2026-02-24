@@ -704,7 +704,7 @@ pub fn translate_alter_table(
                 ));
             }
             let constraints = col_def.constraints.clone();
-            let column = Column::try_from(&col_def)?;
+            let mut column = Column::try_from(&col_def)?;
 
             // SQLite is very strict about what constitutes a "constant" default for
             // ALTER TABLE ADD COLUMN. It only allows literals and signed literals,
@@ -730,27 +730,50 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let mut default_type_mismatch = false;
-            if btree.is_strict {
+            let default_type_mismatch;
+            {
                 let ty = column.ty_str.as_str();
-                if ty.is_empty() {
+                if btree.is_strict && ty.is_empty() {
                     return Err(LimboError::ParseError(format!(
                         "missing datatype for {table_name}.{new_column_name}"
                     )));
                 }
-                if !ty.eq_ignore_ascii_case("INT")
-                    && !ty.eq_ignore_ascii_case("INTEGER")
-                    && !ty.eq_ignore_ascii_case("REAL")
-                    && !ty.eq_ignore_ascii_case("TEXT")
-                    && !ty.eq_ignore_ascii_case("BLOB")
-                    && !ty.eq_ignore_ascii_case("ANY")
-                {
-                    return Err(LimboError::ParseError(format!(
-                        "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
-                    )));
+                let is_builtin = ty.is_empty()
+                    || ty.eq_ignore_ascii_case("INT")
+                    || ty.eq_ignore_ascii_case("INTEGER")
+                    || ty.eq_ignore_ascii_case("REAL")
+                    || ty.eq_ignore_ascii_case("TEXT")
+                    || ty.eq_ignore_ascii_case("BLOB")
+                    || ty.eq_ignore_ascii_case("ANY");
+                if !is_builtin && btree.is_strict {
+                    // On non-STRICT tables any type name is allowed and is
+                    // treated as a plain affinity hint (no encode/decode).
+                    // Custom type validation only applies to STRICT tables.
+                    let type_def = resolver
+                        .schema()
+                        .get_type_def_unchecked(&normalize_ident(ty));
+                    if type_def.is_none() {
+                        return Err(LimboError::ParseError(format!(
+                            "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
+                        )));
+                    }
                 }
 
                 default_type_mismatch = strict_default_type_mismatch(&column)?;
+            }
+
+            // If a column has no explicit DEFAULT but its custom type defines
+            // one, propagate the type-level DEFAULT to the column so that
+            // existing rows get the type default instead of NULL.
+            if column.default.is_none() {
+                if let Some(type_def) = resolver
+                    .schema()
+                    .get_type_def(&column.ty_str, btree.is_strict)
+                {
+                    if let Some(ref type_default) = type_def.default {
+                        column.default = Some(type_default.clone());
+                    }
+                }
             }
 
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
@@ -867,11 +890,15 @@ pub fn translate_alter_table(
             //    all existing rows via pragma_quick_check. We take a stricter approach and
             //    reject the ALTER if the table has any rows, since we don't yet support
             //    scanning existing data for constraint validation.
+            // Check if the column has an effective default (column-level or type-level).
+            let effective_default = column.default.as_ref().or_else(|| {
+                resolver
+                    .schema()
+                    .get_type_def(&column.ty_str, btree.is_strict)
+                    .and_then(|td| td.default.as_ref())
+            });
             let needs_notnull_check = column.notnull()
-                && column
-                    .default
-                    .as_ref()
-                    .is_none_or(|default| crate::util::expr_contains_null(default));
+                && effective_default.is_none_or(|default| crate::util::expr_contains_null(default));
 
             let needs_nondeterministic_check = column
                 .default

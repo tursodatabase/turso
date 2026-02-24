@@ -1173,6 +1173,30 @@ impl FkSubprogramContext {
     }
 }
 
+/// Decode FK key registers in-place for custom type columns.
+/// FK action subprograms are compiled as normal SQL (via translate_inner), which
+/// means column reads in the WHERE clause apply decode automatically. Therefore,
+/// the parameter values passed to subprograms must also be in decoded (user-facing)
+/// form for the comparison to match.
+fn decode_fk_key_registers(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    parent_bt: &BTreeTable,
+    parent_cols: &[String],
+    key_start: usize,
+) -> Result<()> {
+    for (i, pcol) in parent_cols.iter().enumerate() {
+        if let Some((_, col)) = parent_bt.get_column(pcol) {
+            let reg = key_start + i;
+            super::expr::emit_user_facing_column_value(
+                program, reg, reg, col, true, // custom types require STRICT tables
+                resolver,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Get the parent column names for an FK reference.
 /// Uses primary key columns if parent_columns is empty.
 #[inline]
@@ -1637,9 +1661,6 @@ pub fn prepare_fk_delete_actions(
             key_regs_start,
         )?;
 
-        let old_key_registers: Vec<usize> = (key_regs_start..key_regs_start + ncols).collect();
-        let ctx = FkActionContext::new_for_delete(old_key_registers);
-
         match fk_ref.fk.on_delete {
             RefAct::NoAction | RefAct::Restrict => {
                 emit_fk_delete_parent_existence_check_single(
@@ -1654,6 +1675,17 @@ pub fn prepare_fk_delete_actions(
                 )?;
             }
             RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
+                // Decode encoded values so they match the subprogram's decoded column reads
+                decode_fk_key_registers(
+                    program,
+                    resolver,
+                    &parent_bt,
+                    &parent_cols,
+                    key_regs_start,
+                )?;
+                let old_key_registers: Vec<usize> =
+                    (key_regs_start..key_regs_start + ncols).collect();
+                let ctx = FkActionContext::new_for_delete(old_key_registers);
                 prepared.push(PreparedFkDeleteAction { fk_ref, ctx });
             }
         }
@@ -1755,6 +1787,10 @@ pub fn fire_fk_update_actions(
             new_rowid_reg,
             new_key_start,
         )?;
+
+        // Decode encoded values so they match the subprogram's decoded column reads
+        decode_fk_key_registers(program, resolver, &parent_bt, &parent_cols, old_key_start)?;
+        decode_fk_key_registers(program, resolver, &parent_bt, &parent_cols, new_key_start)?;
 
         let old_key_registers: Vec<usize> = (old_key_start..old_key_start + ncols).collect();
         let new_key_registers: Vec<usize> = (new_key_start..new_key_start + ncols).collect();
@@ -1926,6 +1962,9 @@ pub fn emit_fk_drop_table_check(
             current_rowid_reg,
             key_regs_start,
         )?;
+
+        // Decode encoded values so they match the subprogram's decoded column reads
+        decode_fk_key_registers(program, resolver, &parent_tbl, &parent_cols, key_regs_start)?;
 
         let old_key_registers: Vec<usize> = (key_regs_start..key_regs_start + ncols).collect();
         let ctx = FkActionContext::new_for_delete(old_key_registers);

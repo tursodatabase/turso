@@ -1,0 +1,81 @@
+@database :memory:
+
+@requires strict "uses STRICT tables"
+test valid-date-accepted {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-01-15');
+    INSERT INTO t1 VALUES (2, '2024-12-31');
+    SELECT id, d FROM t1 ORDER BY id;
+}
+expect {
+    1|2024-01-15
+    2|2024-12-31
+}
+
+@requires strict "uses STRICT tables"
+test invalid-date-rejected {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, 'not-a-date');
+}
+expect error {
+    invalid date value
+}
+
+@requires strict "uses STRICT tables"
+test invalid-date-format-rejected {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, '15/01/2024');
+}
+expect error {
+    invalid date value
+}
+
+@requires strict "uses STRICT tables"
+test null-date-accepted {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+    SELECT id, d, typeof(d) FROM t1;
+}
+expect {
+    1||null
+}
+
+@requires strict "uses STRICT tables"
+test valid-time-accepted {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, t time) STRICT;
+    INSERT INTO t1 VALUES (1, '14:30:00');
+    INSERT INTO t1 VALUES (2, '23:59:59');
+    SELECT id, t FROM t1 ORDER BY id;
+}
+expect {
+    1|14:30:00
+    2|23:59:59
+}
+
+@requires strict "uses STRICT tables"
+test invalid-time-rejected {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, t time) STRICT;
+    INSERT INTO t1 VALUES (1, 'not-a-time');
+}
+expect error {
+    invalid time value
+}
+
+@requires strict "uses STRICT tables"
+test valid-timestamp-accepted {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-01-15 14:30:00');
+    SELECT id, ts FROM t1;
+}
+expect {
+    1|2024-01-15 14:30:00
+}
+
+@requires strict "uses STRICT tables"
+test invalid-timestamp-rejected {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO t1 VALUES (1, 'not-a-timestamp');
+}
+expect error {
+    invalid timestamp value
+}

@@ -139,6 +139,7 @@ pub struct Builder {
     enable_triggers: bool,
     enable_attach: bool,
     enable_strict: bool,
+    enable_custom_types: bool,
     enable_index_method: bool,
     enable_materialized_views: bool,
     vfs: Option<String>,
@@ -154,6 +155,7 @@ impl Builder {
             enable_triggers: false,
             enable_attach: false,
             enable_strict: false,
+            enable_custom_types: false,
             enable_index_method: false,
             enable_materialized_views: false,
             vfs: None,
@@ -186,6 +188,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_custom_types(mut self, custom_types_enabled: bool) -> Self {
+        self.enable_custom_types = custom_types_enabled;
+        self
+    }
+
     pub fn experimental_index_method(mut self, index_method_enabled: bool) -> Self {
         self.enable_index_method = index_method_enabled;
         self
@@ -213,6 +220,9 @@ impl Builder {
         }
         if self.enable_strict {
             features.push("strict");
+        }
+        if self.enable_custom_types {
+            features.push("custom_types");
         }
         if self.enable_index_method {
             features.push("index_method");

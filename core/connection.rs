@@ -418,7 +418,7 @@ impl Connection {
             .get();
 
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::new();
+        let mut fresh = Schema::with_options(self.experimental_strict_enabled());
         fresh.schema_version = cookie;
 
         // Preserve existing views to avoid expensive repopulation.
@@ -451,6 +451,29 @@ impl Connection {
             existing_views,
             self.experimental_triggers_enabled(),
         )?;
+
+        // Load custom types from __turso_internal_types if the table exists
+        // and custom types are enabled. Type loading errors are non-fatal: we log
+        // warnings and continue with whatever types loaded successfully.
+        if self.experimental_custom_types_enabled()
+            && fresh
+                .tables
+                .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+        {
+            // Temporarily install the schema so we can prepare a query against it
+            self.with_schema_mut(|schema| {
+                *schema = fresh.clone();
+            });
+            let load_result: Result<()> = (|| {
+                let type_sqls = self.query_stored_type_definitions()?;
+                fresh.load_type_definitions(&type_sqls)?;
+                Ok(())
+            })();
+            if let Err(e) = load_result {
+                tracing::warn!("Failed to load custom types: {}", e);
+            }
+        }
+
         // Best-effort load stats if sqlite_stat1 is present and DB is initialized.
         refresh_analyze_stats(self);
 
@@ -711,6 +734,30 @@ impl Connection {
 
     pub(crate) fn get_deferred_foreign_key_violations(&self) -> isize {
         self.fk_deferred_violations.load(Ordering::Acquire)
+    }
+
+    /// Query the CREATE TYPE SQL definitions stored in __turso_internal_types.
+    /// The connection's schema must already contain the table definitions so
+    /// that `prepare` can resolve the table name. Returns an empty Vec if the
+    /// types table does not exist.
+    pub(crate) fn query_stored_type_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
+        let has_types_table = {
+            let s = self.schema.read();
+            s.tables.contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+        };
+        if !has_types_table {
+            return Ok(Vec::new());
+        }
+        let mut type_stmt = self.prepare(format!(
+            "SELECT name, sql FROM {}",
+            crate::schema::TURSO_TYPES_TABLE_NAME
+        ))?;
+        let mut type_rows = Vec::new();
+        type_stmt.run_with_row_callback(|row| {
+            type_rows.push(row.get::<&str>(1)?.to_string());
+            Ok(())
+        })?;
+        Ok(type_rows)
     }
 
     pub fn maybe_update_schema(&self) {
@@ -1248,6 +1295,10 @@ impl Connection {
         self.db.experimental_strict_enabled()
     }
 
+    pub fn experimental_custom_types_enabled(&self) -> bool {
+        self.db.experimental_custom_types_enabled()
+    }
+
     pub fn experimental_triggers_enabled(&self) -> bool {
         self.db.experimental_triggers_enabled()
     }
@@ -1408,10 +1459,12 @@ impl Connection {
 
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
+        let use_custom_types = self.db.experimental_custom_types_enabled();
 
         let db_opts = DatabaseOpts::new()
             .with_views(use_views)
-            .with_strict(use_strict);
+            .with_strict(use_strict)
+            .with_custom_types(use_custom_types);
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also
