@@ -2132,12 +2132,16 @@ fn emit_loop_source<'a>(
             for (i, rc) in non_agg_columns {
                 let reg = col_start + i;
 
-                translate_expr(
+                // Must use no_constant_opt to prevent constant hoisting: in compound
+                // selects (UNION ALL), all branches share the same result registers,
+                // so hoisted constants from the last branch overwrite earlier branches.
+                translate_expr_no_constant_opt(
                     program,
                     Some(&plan.table_references),
                     &rc.expr,
                     reg,
                     &t_ctx.resolver,
+                    NoConstantOptReason::RegisterReuse,
                 )?;
             }
 
