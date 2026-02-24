@@ -2476,13 +2476,11 @@ impl Jsonb {
         delta: isize,
     ) -> Result<()> {
         let mut delta = delta;
-        let mut is_prev_arr = false;
         for parent in stack.iter().rev() {
             let (JsonbHeader(el_type, el_size), el_header_len) =
                 self.read_header(parent.field_value_index)?;
 
-            if el_type == ElementType::ARRAY && !is_prev_arr {
-                is_prev_arr = true;
+            if el_type == ElementType::ARRAY {
                 let arr_element_idx = parent.get_array_index().ok_or_else(|| {
                     LimboError::InternalError("array element should have index".to_string())
                 })?;
@@ -2497,8 +2495,6 @@ impl Jsonb {
                 )?;
 
                 delta += (new_arr_el_header_len - arr_el_header_len) as isize;
-            } else {
-                is_prev_arr = false;
             }
             let new_size = el_size as isize + delta;
             let new_header_size = self.write_element_header(
@@ -2559,7 +2555,7 @@ impl Jsonb {
                                     .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
 
                                 return Ok(JsonTraversalResult::with_array_index(
-                                    pos + root_header_size,
+                                    pos,
                                     JsonLocationKind::ArrayEntry,
                                     placeholder_bytes.len() as isize,
                                     arr_pos,
