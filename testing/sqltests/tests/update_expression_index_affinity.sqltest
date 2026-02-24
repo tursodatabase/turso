@@ -145,3 +145,21 @@ expect {
     world
     ok
 }
+
+# INSERT path: comparison expression index with TEXT affinity column.
+# This specifically catches cases where INSERT computes expression index keys
+# without applying the column's affinity (e.g. TEXT vs NUMERIC comparison rules).
+@cross-check-integrity
+test comparison-expr-index-text-affinity-insert {
+    CREATE TABLE t7 (c0 TEXT);
+    CREATE UNIQUE INDEX i7 ON t7 (c0 < 2);
+    INSERT INTO t7 VALUES ('10');
+    INSERT INTO t7 VALUES ('20');
+    SELECT c0, c0 < 2 FROM t7 ORDER BY c0;
+    PRAGMA integrity_check;
+}
+expect {
+    10|1
+    20|0
+    ok
+}
