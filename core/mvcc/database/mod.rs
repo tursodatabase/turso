@@ -45,6 +45,7 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use tracing::instrument;
 use tracing::Level;
+use turso_macros::turso_assert_unreachable;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};
@@ -1108,6 +1109,9 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         // Other tx aborted - no conflict
                         Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => {}
                         None => {
+                            // TODO: an aborted txn should not affect another one.. properly handle
+                            // this case, but for now be conservative and treat as conflict to avoid
+                            // potential correctness issues
                             tracing::debug!(
                                 "check_version_conflicts: missing tx {} for row version {:?}; conservatively treating as conflict",
                                 other_tx_id,
@@ -4896,6 +4900,23 @@ fn lookup_tx_state(
         .or_else(|| finalized_tx_states.get(&tx_id).map(|entry| *entry.value()))
 }
 
+fn lookup_finalized_tx_state(
+    finalized_tx_states: &SkipMap<TxID, TransactionState>,
+    tx_id: TxID,
+) -> Option<TransactionState> {
+    finalized_tx_states.get(&tx_id).map(|entry| {
+        let state = *entry.value();
+        turso_assert!(
+            !matches!(
+                state,
+                TransactionState::Active | TransactionState::Preparing(_)
+            ),
+            "finalized_tx_states contains non-final state for tx {tx_id}: {state:?}"
+        );
+        state
+    })
+}
+
 fn is_begin_visible(
     txs: &SkipMap<TxID, Transaction>,
     finalized_tx_states: &SkipMap<TxID, TransactionState>,
@@ -4938,15 +4959,14 @@ fn is_begin_visible(
                     );
                     visible
                 }
-                None => match lookup_tx_state(txs, finalized_tx_states, rv_begin) {
+                None => match lookup_finalized_tx_state(finalized_tx_states, rv_begin) {
                     Some(TransactionState::Committed(committed_ts)) => tx.begin_ts >= committed_ts,
                     Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => false,
                     Some(TransactionState::Active) | Some(TransactionState::Preparing(_)) => {
-                        tracing::debug!(
+                        unreachable!(
                             "is_begin_visible: live tx {} missing from txs but present in finalized cache",
                             rv_begin
                         );
-                        false
                     }
                     None => {
                         // Transaction was removed from the map after converting its TxID refs
@@ -5008,17 +5028,15 @@ fn is_end_visible(
                     );
                     visible
                 }
-                None => match lookup_tx_state(txs, finalized_tx_states, rv_end) {
+                None => match lookup_finalized_tx_state(finalized_tx_states, rv_end) {
                     Some(TransactionState::Committed(committed_ts)) => {
                         current_tx.begin_ts < committed_ts
                     }
                     Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => true,
                     Some(TransactionState::Active) | Some(TransactionState::Preparing(_)) => {
-                        tracing::debug!(
-                            "is_end_visible: live tx {} missing from txs but present in finalized cache",
-                            rv_end
+                        unreachable!(
+                            "is_end_visible: live tx {rv_end} missing from txs but present in finalized cache"
                         );
-                        true
                     }
                     None => {
                         // Transaction was removed after converting its TxID refs to Timestamps.
