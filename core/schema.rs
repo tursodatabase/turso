@@ -1077,13 +1077,8 @@ impl Schema {
                 unparsed_sql_from_index.root_page,
                 table.as_ref(),
             )?;
-            if mvcc_enabled {
-                if index.where_clause.is_some() {
-                    crate::bail_parse_error!("Partial indexes are not supported with MVCC");
-                }
-                if index.index_method.is_some() {
-                    crate::bail_parse_error!("Custom index modules are not supported with MVCC");
-                }
+            if mvcc_enabled && index.index_method.is_some() {
+                crate::bail_parse_error!("Custom index modules are not supported with MVCC");
             }
             self.add_index(Arc::new(index))?;
         }

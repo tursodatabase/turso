@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "partial indexes not fully supported in MVCC mode"
 
 @cross-check-integrity
 test partial-index-unique-basic {

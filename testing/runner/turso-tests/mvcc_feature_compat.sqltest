@@ -12,15 +12,6 @@ expect error {
     Views are not supported in MVCC mode
 }
 
-test mvcc-rejects-partial-index {
-    PRAGMA journal_mode = 'experimental_mvcc';
-    CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER);
-    CREATE INDEX idx_partial ON t2(val) WHERE val > 0;
-}
-expect error {
-    Partial indexes are not supported in MVCC mode
-}
-
 test mvcc-rejects-cdc {
     PRAGMA journal_mode = 'experimental_mvcc';
     CREATE TABLE t4 (id INTEGER PRIMARY KEY, val TEXT);

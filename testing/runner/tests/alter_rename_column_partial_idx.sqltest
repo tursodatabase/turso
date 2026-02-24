@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "partial indexes not fully supported in MVCC mode"
 
 # https://github.com/tursodatabase/turso/issues/5432
 
