@@ -436,6 +436,7 @@ pub fn translate_alter_table(
             // The column is a PRIMARY KEY or part of one.
             // The column has a UNIQUE constraint.
             // The column is indexed.
+            // The column is referenced in an expression index.
             // The column is named in the WHERE clause of a partial index.
             // The column is named in a table or column CHECK constraint not associated with the column being dropped.
             // The column is used in a foreign key constraint.
@@ -460,6 +461,7 @@ pub fn translate_alter_table(
                 )));
             }
 
+            let col_normalized = normalize_ident(column_name);
             for index in table_indexes.iter() {
                 // Referenced in regular index
                 let maybe_indexed_col = index
@@ -472,6 +474,17 @@ pub fn translate_alter_table(
                         "cannot drop column \"{column_name}\": it is referenced in the index {}; position in index is {pos_in_index}, position in table is {}",
                         index.name, indexed_col.pos_in_table
                     )));
+                }
+                // Referenced in expression index
+                for idx_col in &index.columns {
+                    if let Some(expr) = &idx_col.expr {
+                        if check_expr_references_column(expr, &col_normalized) {
+                            return Err(LimboError::ParseError(format!(
+                                "error in index {} after drop column: no such column: {column_name}",
+                                index.name
+                            )));
+                        }
+                    }
                 }
                 // Referenced in partial index
                 if index.where_clause.is_some() {
@@ -527,7 +540,6 @@ pub fn translate_alter_table(
             // Handle CHECK constraints:
             // - Column-level CHECK constraints for the dropped column are silently removed
             // - Table-level CHECK constraints referencing the dropped column cause an error
-            let col_normalized = normalize_ident(column_name);
             for check in &btree.check_constraints {
                 if check.column.is_some() {
                     // Column-level constraint: will be removed below
