@@ -825,8 +825,9 @@ impl Connection {
         };
         match self.get_pager().io.wait_for_completion(c) {
             #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
-            Err(LimboError::CompletionError(CompletionError::IOError(
+            Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
                 std::io::ErrorKind::UnexpectedEof,
+                _,
             ))) => {
                 return Ok(false);
             }

@@ -37,12 +37,12 @@
 // - in Sync, IO Pakcet should not be touched, it should be handled in -and only in-
 //  `process_packet_from_iocp`
 
+use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::sync::Arc;
-
 use crate::sync::Mutex;
-use crate::{Clock, Completion, File, IO, LimboError, OpenFlags, Result};
+use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
 
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
@@ -50,27 +50,28 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr::NonNull;
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
-    FormatMessageW,
-};
 use windows_sys::core::BOOL;
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    FormatMessageW, FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM,
+    FORMAT_MESSAGE_IGNORE_INSERTS,
+};
 
 use std::{io, mem, ptr};
-use tracing::{Level, debug, instrument, trace, warn};
+use tracing::{debug, instrument, trace, warn, Level};
 
 use super::FileSyncType;
 use crate::io::completions::CompletionInner;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ,
-    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, TRUE, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, LocalFree, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
+    ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_END_OF_FILE_INFO, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
-    FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LOCKFILE_EXCLUSIVE_LOCK,
-    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
-    SetFileInformationByHandle, UnlockFileEx, WriteFile,
+    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
+    SetFileInformationByHandle, UnlockFileEx, WriteFile, FILE_END_OF_FILE_INFO,
+    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    OPEN_ALWAYS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
@@ -310,7 +311,7 @@ impl IO for WindowsIOCP {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn remove_file(&self, file_path: &str) -> Result<()> {
         trace!("remove_file(path = {})", file_path);
-        Ok(std::fs::remove_file(file_path)?)
+        std::fs::remove_file(file_path).map_err(|e| io_error(e, "remove-file"))
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
@@ -573,7 +574,10 @@ impl InnerWindowsIOCP {
                     get_unique_key_from_completion(&completion).addr()
                 );
 
-                completion.error(error.into());
+                completion.error(CompletionError::IOError(
+                    error.kind(),
+                    "io-error-completion",
+                ));
             }
             (_, _) => unreachable!(),
         }
@@ -589,7 +593,7 @@ impl InnerWindowsIOCP {
                 Err(GetIOCPPacketError::SystemError(e)) => {
                     let error = e.try_into().map_err(get_limboerror_from_std_error)?;
                     let err = std::io::Error::from_raw_os_error(error);
-                    return Err(err.into());
+                    return Err(io_error(err, "process-io-packet-sys-error"));
                 }
                 Err(GetIOCPPacketError::InvalidIO) | Ok(()) => {}
             }
@@ -880,8 +884,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
+        io::{win_iocp::get_generic_limboerror_from_os_err, TempFile},
         Buffer, Completion, IO,
-        io::{TempFile, win_iocp::get_generic_limboerror_from_os_err},
     };
 
     use super::WindowsIOCP;
