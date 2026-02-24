@@ -20,6 +20,7 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT a, b FROM t;
@@ -30,6 +31,7 @@ expect {
     CREATE VIEW v AS SELECT a, c FROM t
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-qualified {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT t.a, t.b FROM t;
@@ -40,6 +42,7 @@ expect {
     CREATE VIEW v AS SELECT t.a, t.c FROM t
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-star {
     CREATE TABLE t (a INT, b TEXT);
     CREATE VIEW v AS SELECT * FROM t;
@@ -52,6 +55,7 @@ expect {
 }
 
 # SQLite does not rewrite dependent views (view-on-view) on RENAME COLUMN.
+@skip-if mvcc "views not supported in MVCC mode"
 @skip-if sqlite "sqlite does not rewrite dependent views on RENAME COLUMN"
 test alter-table-rename-column-view-on-view {
     CREATE TABLE t (a, b);
@@ -66,6 +70,7 @@ expect {
     CREATE VIEW v2 AS SELECT c FROM v1
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-subquery {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.b = 1);
@@ -76,6 +81,7 @@ expect {
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.c = 1)
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-correlated-subquery {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 WHERE t.b = 1);
@@ -86,6 +92,7 @@ expect {
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 WHERE t.c = 1)
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-correlated-outer-shadow {
     CREATE TABLE t (a, b);
     CREATE TABLE u (b);
@@ -97,6 +104,7 @@ expect {
     CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE c = 1)
 }
 
+@skip-if mvcc "ATTACH is not supported in MVCC mode"
 @skip-if sqlite "sqlite views cannot reference attached databases"
 test alter-table-rename-column-view-attached-db-qualified {
     ATTACH ':memory:' AS aux;
