@@ -59,6 +59,9 @@ mod vtab;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 
+#[cfg(feature = "simulator")]
+pub use translate::expr::{walk_expr, walk_expr_mut, WalkControl};
+
 use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     incremental::view::AllViewsTxState,
