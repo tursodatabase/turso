@@ -934,21 +934,33 @@ impl Connection {
 
     pub fn checkpoint(self: &Arc<Self>, mode: CheckpointMode) -> Result<CheckpointResult> {
         use crate::mvcc::database::CheckpointStateMachine;
-        use crate::state_machine::StateMachine;
+        use crate::state_machine::{StateTransition, TransitionResult};
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         if let Some(mv_store) = self.mv_store().as_ref() {
             let pager = self.pager.load().clone();
             let io = pager.io.clone();
-            let mut ckpt_sm = StateMachine::new(CheckpointStateMachine::new(
+            let mut ckpt_sm = CheckpointStateMachine::new(
                 pager,
                 mv_store.clone(),
                 self.clone(),
                 true,
                 self.get_sync_mode(),
-            ));
-            io.as_ref().block(|| ckpt_sm.step(&()))
+            );
+            loop {
+                match ckpt_sm.step(&()) {
+                    Ok(TransitionResult::Continue) => {}
+                    Ok(TransitionResult::Done(result)) => return Ok(result),
+                    Ok(TransitionResult::Io(iocompletions)) => {
+                        if let Err(err) = iocompletions.wait(io.as_ref()) {
+                            ckpt_sm.cleanup_after_external_io_error();
+                            return Err(err);
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
         } else {
             self.pager
                 .load()

@@ -237,6 +237,39 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         )
     }
 
+    /// Cleanup path for I/O errors that happen while waiting on completions outside
+    /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
+    /// checkpoint bookkeeping.
+    pub fn cleanup_after_external_io_error(&mut self) {
+        if self.lock_states.pager_write_tx {
+            self.pager.rollback_tx(self.connection.as_ref());
+            if self.update_transaction_state {
+                self.connection.set_tx_state(TransactionState::None);
+            }
+            self.lock_states.pager_write_tx = false;
+            self.lock_states.pager_read_tx = false;
+        } else if self.lock_states.pager_read_tx {
+            self.pager.end_read_tx();
+            if self.update_transaction_state {
+                self.connection.set_tx_state(TransactionState::None);
+            }
+            self.lock_states.pager_read_tx = false;
+        }
+
+        // MVCC checkpointing drives WAL checkpoint directly; on errors we must
+        // explicitly reset both pager and WAL checkpoint states.
+        self.pager.clear_checkpoint_state();
+        if let Some(wal) = self.pager.wal.as_ref() {
+            wal.abort_checkpoint();
+        }
+
+        // Release the checkpoint lock only after checkpoint state has been reset.
+        if self.lock_states.blocking_checkpoint_lock_held {
+            self.checkpoint_lock.unlock();
+            self.lock_states.blocking_checkpoint_lock_held = false;
+        }
+    }
+
     /// Determine whether the newest valid version of a row should be checkpointed.
     /// Returns the version to checkpoint if it should be checkpointed, otherwise None.
     fn maybe_get_checkpointable_version(
@@ -1475,20 +1508,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
         match res {
             Err(err) => {
                 tracing::debug!("Error in checkpoint state machine: {err}");
-                if self.lock_states.pager_write_tx {
-                    self.pager.rollback_tx(self.connection.as_ref());
-                    if self.update_transaction_state {
-                        self.connection.set_tx_state(TransactionState::None);
-                    }
-                } else if self.lock_states.pager_read_tx {
-                    self.pager.end_read_tx();
-                    if self.update_transaction_state {
-                        self.connection.set_tx_state(TransactionState::None);
-                    }
-                }
-                if self.lock_states.blocking_checkpoint_lock_held {
-                    self.checkpoint_lock.unlock();
-                }
+                self.cleanup_after_external_io_error();
                 Err(err)
             }
             Ok(result) => Ok(result),
