@@ -503,6 +503,28 @@ pub struct HashBuildPayloadInfo {
     pub allow_seek: bool,
 }
 
+/// Check whether an expression references any outer query table.
+/// Returns true if any `Column` or `RowId` node in the expression tree refers
+/// to a table that lives in an outer query scope.
+fn expr_references_outer_query(expr: &Expr, table_references: &TableReferences) -> bool {
+    let mut has_outer_ref = false;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        match e {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                if table_references
+                    .find_outer_query_ref_by_internal_id(*table)
+                    .is_some()
+                {
+                    has_outer_ref = true;
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    has_outer_ref
+}
+
 /// Emit the hash table build phase for a hash join operation.
 ///
 /// This scans the build input (either the base table or a materialized input)
@@ -728,6 +750,13 @@ fn emit_hash_build_phase(
             if !mask.contains_table(hash_join_op.build_table_idx)
                 || !build_only_mask.contains_all(&mask)
             {
+                continue;
+            }
+            // Skip correlated predicates that reference outer query tables.
+            // The hash build is guarded by Once and only executes on the first
+            // outer-loop iteration. Predicates that depend on outer cursor values
+            // would produce a stale filter for subsequent iterations.
+            if expr_references_outer_query(&cond.expr, table_references) {
                 continue;
             }
             let jump_target_when_true = program.allocate_label();
