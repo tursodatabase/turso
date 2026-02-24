@@ -482,18 +482,31 @@ pub fn op_checkpoint(
                 "Only TRUNCATE checkpoint mode is supported for MVCC".to_string(),
             ));
         }
-        let mut ckpt_sm = StateMachine::new(CheckpointStateMachine::new(
+        use crate::state_machine::{StateTransition, TransitionResult};
+        let mut ckpt_sm = CheckpointStateMachine::new(
             pager.clone(),
             mv_store.clone(),
             program.connection.clone(),
             true,
             program.connection.get_sync_mode(),
-        ));
+        );
         let CheckpointResult {
             wal_max_frame,
             wal_total_backfilled,
             ..
-        } = pager.io.block(|| ckpt_sm.step(&()))?;
+        } = loop {
+            match ckpt_sm.step(&()) {
+                Ok(TransitionResult::Continue) => {}
+                Ok(TransitionResult::Done(result)) => break result,
+                Ok(TransitionResult::Io(iocompletions)) => {
+                    if let Err(err) = iocompletions.wait(pager.io.as_ref()) {
+                        ckpt_sm.cleanup_after_external_io_error();
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        };
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint
         // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
         state.registers[*dest] = Register::Value(Value::from_i64(0));

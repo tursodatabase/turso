@@ -65,16 +65,24 @@ impl Operation {
         match self.op {
             OperationType::Read { completion, offset } => {
                 let file = files.get(fd.as_str()).unwrap();
-                let file_buf = file.buffer.borrow_mut();
+                let file_buf = file.buffer.borrow();
                 let buffer = completion.as_read().buf.clone();
-                let buf_size = {
+                let bytes_read = {
                     let buf = buffer.as_mut_slice();
-                    // TODO: check for sector faults here
-
-                    buf.copy_from_slice(&file_buf[offset..][0..buf.len()]);
-                    buf.len() as i32
+                    if buf.is_empty() || offset >= file_buf.len() {
+                        0
+                    } else {
+                        let available = file_buf.len() - offset;
+                        let to_copy = available.min(buf.len());
+                        buf[..to_copy].copy_from_slice(&file_buf[offset..offset + to_copy]);
+                        if to_copy < buf.len() {
+                            // Keep deterministic behavior for unread tail bytes.
+                            buf[to_copy..].fill(0);
+                        }
+                        to_copy as i32
+                    }
                 };
-                completion.complete(buf_size);
+                completion.complete(bytes_read);
             }
             OperationType::Write {
                 buffer,
