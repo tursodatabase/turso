@@ -1,0 +1,149 @@
+@database :memory:
+
+test expr-index-correlated-exists {
+    CREATE TABLE t(b, c);
+    CREATE UNIQUE INDEX idx ON t(c, c + b);
+    INSERT INTO t VALUES(10, 20);
+    INSERT INTO t VALUES(30, 40);
+    INSERT INTO t VALUES(50, 60);
+    SELECT c + b FROM t WHERE EXISTS (SELECT 1 FROM t AS t2 WHERE t.b = t2.b);
+}
+expect {
+    30
+    70
+    110
+}
+
+test expr-index-correlated-exists-select-non-indexed-col {
+    CREATE TABLE t(b, c);
+    CREATE UNIQUE INDEX idx ON t(c, c + b);
+    INSERT INTO t VALUES(10, 20);
+    INSERT INTO t VALUES(30, 40);
+    INSERT INTO t VALUES(50, 60);
+    SELECT b FROM t WHERE EXISTS (SELECT 1 FROM t AS t2 WHERE t.b = t2.b);
+}
+expect {
+    10
+    30
+    50
+}
+
+test expr-index-correlated-exists-mixed-select {
+    CREATE TABLE t(b, c);
+    CREATE UNIQUE INDEX idx ON t(c, c + b);
+    INSERT INTO t VALUES(10, 20);
+    INSERT INTO t VALUES(30, 40);
+    INSERT INTO t VALUES(50, 60);
+    SELECT b, c, c + b FROM t WHERE EXISTS (SELECT 1 FROM t AS t2 WHERE t.b = t2.b);
+}
+expect {
+    10|20|30
+    30|40|70
+    50|60|110
+}
+
+test expr-index-correlated-not-exists {
+    CREATE TABLE t(b, c);
+    CREATE UNIQUE INDEX idx ON t(c, c + b);
+    INSERT INTO t VALUES(10, 20);
+    INSERT INTO t VALUES(30, 40);
+    INSERT INTO t VALUES(50, 60);
+    SELECT c + b FROM t WHERE NOT EXISTS (SELECT 1 FROM t AS t2 WHERE t2.b = t.b AND t2.c > 100);
+}
+expect {
+    30
+    70
+    110
+}
+
+test expr-index-correlated-in-subquery {
+    CREATE TABLE t(b, c);
+    CREATE UNIQUE INDEX idx ON t(c, c + b);
+    INSERT INTO t VALUES(10, 20);
+    INSERT INTO t VALUES(30, 40);
+    INSERT INTO t VALUES(50, 60);
+    SELECT c + b FROM t WHERE b IN (SELECT t2.b FROM t AS t2 WHERE t2.c = t.c);
+}
+expect {
+    30
+    70
+    110
+}
+
+test expr-index-correlated-exists-empty {
+    CREATE TABLE t_empty(b, c);
+    CREATE UNIQUE INDEX idx_empty ON t_empty(c, c + b);
+    SELECT c + b FROM t_empty WHERE EXISTS (SELECT 1 FROM t_empty AS t2 WHERE t_empty.b = t2.b);
+}
+expect {
+}
+
+test complex-expr-index-correlated-exists {
+    CREATE TABLE t2(a, b, c);
+    CREATE INDEX idx2 ON t2(a, a * b + c);
+    INSERT INTO t2 VALUES(2, 3, 4);
+    INSERT INTO t2 VALUES(5, 6, 7);
+    SELECT a * b + c FROM t2 WHERE EXISTS (SELECT 1 FROM t2 AS x WHERE x.b = t2.b);
+}
+expect {
+    10
+    37
+}
+
+test expr-index-multiple-correlated-cols {
+    CREATE TABLE t(b, c);
+    CREATE UNIQUE INDEX idx ON t(c, c + b);
+    INSERT INTO t VALUES(10, 20);
+    INSERT INTO t VALUES(30, 40);
+    INSERT INTO t VALUES(50, 60);
+    SELECT c + b FROM t WHERE EXISTS (SELECT 1 FROM t AS t2 WHERE t2.b = t.b AND t2.c = t.c);
+}
+expect {
+    30
+    70
+    110
+}
+
+test expr-index-scalar-correlated-subquery {
+    CREATE TABLE t(b, c);
+    CREATE UNIQUE INDEX idx ON t(c, c + b);
+    INSERT INTO t VALUES(10, 20);
+    INSERT INTO t VALUES(30, 40);
+    INSERT INTO t VALUES(50, 60);
+    SELECT c + b, (SELECT COUNT(*) FROM t AS t2 WHERE t2.b = t.b) FROM t;
+}
+expect {
+    30|1
+    70|1
+    110|1
+}
+
+test expr-index-multiple-correlated-subqueries {
+    CREATE TABLE t(b, c);
+    CREATE UNIQUE INDEX idx ON t(c, c + b);
+    INSERT INTO t VALUES(10, 20);
+    INSERT INTO t VALUES(30, 40);
+    INSERT INTO t VALUES(50, 60);
+    SELECT c + b FROM t
+      WHERE EXISTS (SELECT 1 FROM t AS t2 WHERE t2.b = t.b)
+        AND EXISTS (SELECT 1 FROM t AS t3 WHERE t3.c = t.c);
+}
+expect {
+    30
+    70
+    110
+}
+
+test expr-index-non-unique {
+    CREATE TABLE t(b, c);
+    CREATE INDEX idx ON t(c, c + b);
+    INSERT INTO t VALUES(10, 20);
+    INSERT INTO t VALUES(30, 40);
+    INSERT INTO t VALUES(50, 60);
+    SELECT c + b FROM t WHERE EXISTS (SELECT 1 FROM t AS t2 WHERE t.b = t2.b);
+}
+expect {
+    30
+    70
+    110
+}
