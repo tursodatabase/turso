@@ -580,6 +580,7 @@ pub fn resolve_sorted_columns(
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref())?;
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
+
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
             let collation = explicit_collation.or_else(|| column.collation_opt());
             let expr = match column.generated_type() {
@@ -596,8 +597,14 @@ pub fn resolve_sorted_columns(
             });
             continue;
         }
-        if !validate_index_expression(unwrapped_expr, table) {
-            crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
+        match validate_index_expression(unwrapped_expr, table) {
+            Ok(()) => {}
+            Err(IndexExpressionValidationError::DotOperator) => {
+                crate::bail_parse_error!("the \".\" operator prohibited in index expressions");
+            }
+            Err(IndexExpressionValidationError::Invalid) => {
+                crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
+            }
         }
         resolved.push(IndexColumn {
             name: sc.expr.to_string(),
@@ -640,9 +647,6 @@ fn resolve_index_column<'a>(
             let unquoted = col_name.trim_matches('\'');
             table.get_column(unquoted)?
         }
-        Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-            table.get_column(col.as_str())?
-        }
         Expr::RowId { .. } => table.get_rowid_alias_column()?,
         _ => return None,
     };
@@ -665,16 +669,23 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+enum IndexExpressionValidationError {
+    DotOperator,
+    Invalid,
+}
+
+fn validate_index_expression(
+    expr: &Expr,
+    table: &BTreeTable,
+) -> Result<(), IndexExpressionValidationError> {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
     // Note: extract_collation already unwraps parentheses, so we check the unwrapped expr.
     if matches!(expr, Expr::Literal(ast::Literal::String(_))) {
-        return false;
+        return Err(IndexExpressionValidationError::Invalid);
     }
 
-    let tbl_norm = normalize_ident(table.name.as_str());
     let has_col = |name: &str| {
         let n = normalize_ident(name);
         table
@@ -682,16 +693,15 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             .iter()
             .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
     };
-    let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
         Func::resolve_function(&n, args.len())
             .is_ok_and(|f| f.is_some_and(|f| is_valid_index_function_call(&f, args)))
     };
 
-    let mut ok = true;
+    let mut invalid = None;
     let _ = walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
-        if !ok {
+        if invalid.is_some() {
             return Ok(WalkControl::SkipChildren);
         }
         match e {
@@ -703,20 +713,17 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
                 | ast::Literal::CurrentTime
                 | ast::Literal::CurrentTimestamp,
             ) => {
-                ok = false;
+                invalid = Some(IndexExpressionValidationError::Invalid);
             }
             Expr::Literal(_) | Expr::RowId { .. } => {}
             // must be a column of the target table
             Expr::Id(n) | Expr::Name(n) => {
                 if !has_col(n.as_str()) {
-                    ok = false;
+                    invalid = Some(IndexExpressionValidationError::Invalid);
                 }
             }
-            // Qualified: qualifier must match this index's table, column must exist
-            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-                if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
-                    ok = false;
-                }
+            Expr::Qualified(..) | Expr::DoublyQualified(..) => {
+                invalid = Some(IndexExpressionValidationError::DotOperator);
             }
             Expr::FunctionCall {
                 name, filter_over, ..
@@ -726,7 +733,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             } => {
                 // reject windowed
                 if filter_over.over_clause.is_some() {
-                    ok = false;
+                    invalid = Some(IndexExpressionValidationError::Invalid);
                 } else {
                     let argc = match e {
                         Expr::FunctionCall { args, .. } => args.as_slice(),
@@ -734,7 +741,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
                         _ => unreachable!(),
                     };
                     if !is_deterministic_fn(name.as_str(), argc) {
-                        ok = false;
+                        invalid = Some(IndexExpressionValidationError::Invalid);
                     }
                 }
             }
@@ -744,17 +751,20 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             | Expr::Subquery(_)
             | Expr::Raise { .. }
             | Expr::Variable(_) => {
-                ok = false;
+                invalid = Some(IndexExpressionValidationError::Invalid);
             }
             _ => {}
         }
-        Ok(if ok {
+        Ok(if invalid.is_none() {
             WalkControl::Continue
         } else {
             WalkControl::SkipChildren
         })
     });
-    ok
+    match invalid {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn is_valid_index_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
