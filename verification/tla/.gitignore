@@ -1,0 +1,7 @@
+# TLA+ tooling (download from https://github.com/tlaplus/tlaplus/releases)
+tla2tools.jar
+
+# TLC model-checker output
+states/
+*_TTrace_*.tla
+*_TTrace_*.bin

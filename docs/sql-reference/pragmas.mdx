@@ -318,6 +318,67 @@ PRAGMA ignore_check_constraints = 1;   -- disable CHECK constraints
 PRAGMA ignore_check_constraints = 0;   -- enable CHECK constraints
 ```
 
+## Multi-Process Access
+
+<Info>
+**Turso Extension**: Multi-process database access is a Turso-specific feature that allows multiple processes to safely read from and write to the same database file.
+</Info>
+
+### locking_mode
+
+Returns or sets the locking mode, which controls how multiple processes coordinate access to the database file.
+
+```sql
+PRAGMA locking_mode;
+PRAGMA locking_mode = shared_writes;
+```
+
+| Mode | Description |
+|------|-------------|
+| `exclusive` | Single-process exclusive access (default). No shared memory overhead. Only one process can open the database. |
+| `shared_reads` | Multiple processes can read, but only one process can write. The writing process acquires a permanent write lock at startup. |
+| `shared_writes` | Full multi-process read and write access. Write locks are acquired and released per transaction. |
+| `normal` | Alias for `shared_writes`, provided for SQLite compatibility. |
+
+All processes accessing the same database must use the same locking mode. Attempting to open a database with a different locking mode than the one already in use returns an error.
+
+When a shared locking mode is active, Turso creates a shared memory file (`database.db-tshm`) alongside the database. This file coordinates reader slots and writer state across processes.
+
+#### URI Parameter
+
+The locking mode can also be set via a URI parameter when opening the database:
+
+```sql
+.open file:database.db?locking=shared_writes
+```
+
+```bash
+tursodb "file:database.db?locking=shared_reads"
+```
+
+Valid values: `exclusive`, `shared_reads`, `shared_writes`, `normal`.
+
+#### Example
+
+```sql
+-- Process 1: Open with shared writes
+PRAGMA locking_mode = shared_writes;
+
+CREATE TABLE t(x);
+INSERT INTO t VALUES (1), (2), (3);
+
+-- Process 2: Open same database with shared writes
+PRAGMA locking_mode = shared_writes;
+
+SELECT * FROM t;
+-- Returns rows written by Process 1
+```
+
+#### SharedReads vs SharedWrites
+
+- **`shared_reads`**: Best when you have one writer and multiple readers. The writer holds a permanent lock, so there is no lock acquisition overhead per transaction. Other processes can read concurrently but cannot write.
+- **`shared_writes`**: Best when multiple processes need to write. Each write transaction acquires and releases the lock, so there is per-transaction lock overhead, but any process can write.
+
 ## Integrity Checks
 
 ### integrity_check

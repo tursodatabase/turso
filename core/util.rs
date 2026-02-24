@@ -162,7 +162,7 @@ pub fn parse_schema_rows(
 
     // TODO: How do we ensure that the I/O we submitted to
     // read the schema is actually complete?
-    rows.run_with_row_callback(|row| {
+    rows.run_with_row_callback_no_reprepare(|row| {
         let ty = row.get::<&str>(0)?;
         let name = row.get::<&str>(1)?;
         let table_name = row.get::<&str>(2)?;
@@ -910,6 +910,8 @@ pub struct OpenOptions<'a> {
     pub cipher: Option<String>,
     // The encryption key in hex format
     pub hexkey: Option<String>,
+    /// Multi-process locking mode: exclusive, shared_reads, or shared_writes
+    pub locking: Option<crate::LockingMode>,
 }
 
 pub const MEMORY_PATH: &str = ":memory:";
@@ -1063,6 +1065,14 @@ fn parse_query_params(query: &str, opts: &mut OpenOptions) -> Result<()> {
                 "vfs" => opts.vfs = Some(decoded_value),
                 "cipher" => opts.cipher = Some(decoded_value),
                 "hexkey" => opts.hexkey = Some(decoded_value),
+                "locking" => {
+                    opts.locking = Some(decoded_value.parse().map_err(|_| {
+                        crate::LimboError::InvalidArgument(format!(
+                                "Invalid locking mode: '{decoded_value}'. \
+                                 Expected 'exclusive', 'shared_reads', 'shared_writes', or 'normal'"
+                            ))
+                    })?)
+                }
                 _ => {}
             }
         }
@@ -2435,6 +2445,68 @@ pub mod tests {
         let opts = OpenOptions::parse(uri).unwrap();
         assert_eq!(opts.path, "/home/user/db.sqlite");
         assert_eq!(opts.vfs, None);
+    }
+
+    #[test]
+    fn test_uri_with_locking_shared_reads() {
+        let uri = "file:/home/user/db.sqlite?locking=shared_reads";
+        let opts = OpenOptions::parse(uri).unwrap();
+        assert_eq!(opts.path, "/home/user/db.sqlite");
+        assert_eq!(opts.locking, Some(crate::LockingMode::SharedReads));
+    }
+
+    #[test]
+    fn test_uri_with_locking_shared_writes() {
+        let uri = "file:/home/user/db.sqlite?locking=shared_writes";
+        let opts = OpenOptions::parse(uri).unwrap();
+        assert_eq!(opts.locking, Some(crate::LockingMode::SharedWrites));
+    }
+
+    #[test]
+    fn test_uri_with_locking_exclusive() {
+        let uri = "file:/home/user/db.sqlite?locking=exclusive";
+        let opts = OpenOptions::parse(uri).unwrap();
+        assert_eq!(opts.locking, Some(crate::LockingMode::Exclusive));
+    }
+
+    #[test]
+    fn test_uri_with_locking_normal() {
+        let uri = "file:/home/user/db.sqlite?locking=normal";
+        let opts = OpenOptions::parse(uri).unwrap();
+        assert_eq!(opts.locking, Some(crate::LockingMode::SharedWrites));
+    }
+
+    #[test]
+    fn test_uri_with_invalid_locking() {
+        let uri = "file:/home/user/db.sqlite?locking=bogus";
+        assert!(OpenOptions::parse(uri).is_err());
+    }
+
+    #[test]
+    fn test_uri_with_locking_and_other_params() {
+        let uri = "file:/home/user/db.sqlite?mode=rw&locking=shared_writes&cache=shared";
+        let opts = OpenOptions::parse(uri).unwrap();
+        assert_eq!(opts.mode, OpenMode::ReadWrite);
+        assert_eq!(opts.locking, Some(crate::LockingMode::SharedWrites));
+        assert_eq!(opts.cache, CacheMode::Shared);
+    }
+
+    #[test]
+    fn test_uri_without_locking_defaults_to_none() {
+        let uri = "file:/home/user/db.sqlite?mode=rw";
+        let opts = OpenOptions::parse(uri).unwrap();
+        assert_eq!(opts.locking, None);
+    }
+
+    #[test]
+    fn test_no_file_prefix_ignores_query_params() {
+        // Without file: prefix, the entire string becomes the path.
+        // Query parameters are NOT parsed. This prevents silently
+        // creating a different file when the user forgets the prefix.
+        let uri = "test.db?locking=shared_reads";
+        let opts = OpenOptions::parse(uri).unwrap();
+        assert_eq!(opts.path, "test.db?locking=shared_reads");
+        assert_eq!(opts.locking, None);
     }
 
     #[test]

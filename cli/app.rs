@@ -94,6 +94,11 @@ pub struct Opts {
     pub experimental_attach: bool,
     #[clap(
         long,
+        help = "Enable experimental shared access (multi-process) feature"
+    )]
+    pub experimental_shared_access: bool,
+    #[clap(
+        long,
         help = "Enable unsafe testing features (e.g. sqlite_dbpage writes)"
     )]
     pub unsafe_testing: bool,
@@ -221,6 +226,7 @@ impl Limbo {
             .with_autovacuum(opts.experimental_autovacuum)
             .with_triggers(opts.experimental_triggers)
             .with_attach(opts.experimental_attach)
+            .with_shared_access(opts.experimental_shared_access)
             .with_unsafe_testing(opts.unsafe_testing);
 
         // Normalize path?key=val to file:path?key=val so query parameters

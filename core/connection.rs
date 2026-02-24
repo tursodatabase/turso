@@ -270,11 +270,23 @@ impl Connection {
         self.executing_triggers.write().pop();
     }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        self._prepare(sql)
+        // Check if the on-disk schema cookie differs from our in-memory
+        // schema (e.g. another process created/dropped/altered a table).
+        // Must be called outside any transaction because it starts its own
+        // read tx internally.
+        self.maybe_update_schema()?;
+        self.prepare_no_schema_check(sql)
     }
 
+    /// Prepare without checking the schema cookie. Used by reparse_schema
+    /// and helpers it calls (query_stored_type_definitions, refresh_analyze_stats)
+    /// which are already rebuilding the schema — calling maybe_update_schema
+    /// there would recurse back into reparse_schema.
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+    pub(crate) fn prepare_no_schema_check(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+    ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -300,7 +312,6 @@ impl Connection {
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        self.maybe_update_schema();
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
@@ -327,7 +338,7 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.maybe_update_schema();
+        self.maybe_update_schema()?;
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let mode = QueryMode::Normal;
@@ -363,13 +374,31 @@ impl Connection {
             .store(true, Ordering::SeqCst);
     }
 
+    /// Read the schema cookie from the pager header (page 1).
+    pub(crate) fn effective_schema_cookie(&self) -> Result<u32> {
+        let pager = self.pager.load();
+        pager
+            .io
+            .block(|| pager.with_header(|header| header.schema_cookie))
+            .map(|v| v.get())
+    }
+
     /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page
     /// This function must be called outside of any transaction because internally it will start transaction session by itself
-    #[allow(dead_code)]
     fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
+        // MVCC tracks its own schema versioning through MvStore, not through
+        // the on-disk page 1 cookie. Comparing on-disk vs in-memory would
+        // falsely trigger reparse because MvStore changes aren't checkpointed
+        // to page 1 yet. Multi-process access is already incompatible with
+        // MVCC (guarded in header_validation), so external schema changes
+        // cannot happen.
+        if self.mvcc_enabled() {
+            return Ok(());
+        }
         let pager = self.pager.load().clone();
 
         // first, quickly read schema_version from the root page in order to check if schema changed
+        // (e.g. another process created/dropped/altered a table).
         pager.begin_read_tx()?;
         let on_disk_schema_version = pager
             .io
@@ -433,13 +462,12 @@ impl Connection {
     }
 
     pub(crate) fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.load().clone();
-
-        // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
-        let cookie = pager
-            .io
-            .block(|| pager.with_header(|header| header.schema_cookie))?
-            .get();
+        // Read the on-disk schema cookie so the fresh schema carries the
+        // current version, avoiding spurious SchemaUpdated → reprepare loops.
+        let cookie = self.effective_schema_cookie().unwrap_or_else(|e| {
+            tracing::warn!("effective_schema_cookie failed in reparse_schema: {e}");
+            0
+        });
 
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(self.experimental_custom_types_enabled());
@@ -458,7 +486,7 @@ impl Connection {
             *schema = fresh.clone();
         });
 
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+        let stmt = self.prepare_no_schema_check("SELECT * FROM sqlite_schema")?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -522,7 +550,7 @@ impl Connection {
                 "The supplied SQL string contains no statements".to_string(),
             ));
         }
-        self.maybe_update_schema();
+        self.maybe_update_schema()?;
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
@@ -556,7 +584,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema();
+        self.maybe_update_schema()?;
         tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -609,7 +637,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema();
+        self.maybe_update_schema()?;
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let syms = self.syms.read();
@@ -671,6 +699,11 @@ impl Connection {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
+        let db_opts = if let Some(locking) = opts.locking {
+            db_opts.with_locking_mode(locking)
+        } else {
+            db_opts
+        };
         if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
             let io = Arc::new(MemoryIO::new());
             let db = Database::open_file_with_flags(io.clone(), MEMORY_PATH, flags, db_opts, None)?;
@@ -742,6 +775,11 @@ impl Connection {
         if encryption_opts.is_some() {
             db_opts = db_opts.with_encryption(true);
         }
+        let db_opts = if let Some(locking) = opts.locking {
+            db_opts.with_locking_mode(locking)
+        } else {
+            db_opts
+        };
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
         let db = Database::open_file_with_flags(
             io.clone(),
@@ -799,26 +837,35 @@ impl Connection {
         if !has_types_table {
             return Ok(Vec::new());
         }
-        let mut type_stmt = self.prepare(format!(
+        let mut type_stmt = self.prepare_no_schema_check(format!(
             "SELECT name, sql FROM {}",
             crate::schema::TURSO_TYPES_TABLE_NAME
         ))?;
         let mut type_rows = Vec::new();
-        type_stmt.run_with_row_callback(|row| {
+        type_stmt.run_with_row_callback_no_reprepare(|row| {
             type_rows.push(row.get::<&str>(1)?.to_string());
             Ok(())
         })?;
         Ok(type_rows)
     }
 
-    pub fn maybe_update_schema(&self) {
+    pub fn maybe_update_schema(self: &Arc<Connection>) -> Result<()> {
+        if self.get_tx_state() != TransactionState::None {
+            return Ok(());
+        }
+        // In shared locking modes another process may have changed the
+        // schema (CREATE/DROP/ALTER TABLE). Check the on-disk cookie and
+        // reparse if it differs. In exclusive mode no external changes are
+        // possible so skip the (potentially Busy) begin_read_tx call.
+        if self.db.locking_mode.is_shared() {
+            self.maybe_reparse_schema()?;
+        }
         let current_schema_version = self.schema.read().schema_version;
         let schema = self.db.schema.lock();
-        if matches!(self.get_tx_state(), TransactionState::None)
-            && current_schema_version != schema.schema_version
-        {
+        if current_schema_version != schema.schema_version {
             *self.schema.write() = schema.clone();
         }
+        Ok(())
     }
 
     /// Read schema version at current transaction

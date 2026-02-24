@@ -34,7 +34,7 @@ Checkpoint types:
 - **TRUNCATE**: Like RESTART, also truncates WAL file to zero length
 
 ### WAL-Index
-SQLite uses a shared memory file (`-shm`) for WAL index. **Turso does not** - it uses in-memory data structures (`frame_cache` hashmap, atomic read marks) since multi-process access is not supported.
+In exclusive mode (the default), Turso uses in-memory data structures (`frame_cache` hashmap, atomic read marks) instead of SQLite's shared memory file (`-shm`). In shared locking modes (`shared_reads`, `shared_writes`), Turso uses its own shared memory file (`-tshm`) that embeds both a coordination page and the WAL index segments for cross-process frame lookup.
 
 ## Concurrency Rules
 
