@@ -1,0 +1,12 @@
+@database :memory:
+@skip-file-if mvcc "expression indexes are not supported in mvcc"
+
+test expr-index-between-insert {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    CREATE INDEX idx ON t(a BETWEEN 1 AND 10);
+    INSERT INTO t VALUES(5, 5);
+    SELECT * FROM t;
+}
+expect {
+    5|5
+}

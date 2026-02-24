@@ -2732,6 +2732,7 @@ pub fn rewrite_partial_index_where(
 
 /// For an index expression, rewrite column references to use the insertion registers.
 fn rewrite_index_expr_for_insertion(expr: &mut ast::Expr, insertion: &Insertion) -> Result<()> {
+    rewrite_between_expr(expr);
     let mut missing_column = None;
     let col_reg = |name: &str| -> Option<usize> {
         if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
