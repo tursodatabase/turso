@@ -112,7 +112,11 @@ mod raise_tests {
     ) -> String {
         let raise_call = match raise_type {
             RaiseType::Ignore => "SELECT RAISE(IGNORE)".to_string(),
-            rt => format!("SELECT RAISE({}, 'raise_{}')", rt.sql(), rt.sql().to_lowercase()),
+            rt => format!(
+                "SELECT RAISE({}, 'raise_{}')",
+                rt.sql(),
+                rt.sql().to_lowercase()
+            ),
         };
 
         let when = when_threshold
@@ -130,57 +134,6 @@ mod raise_tests {
             timing.sql(),
             event.sql(),
         )
-    }
-
-    /// Generate a DML statement that targets the main table.
-    fn random_dml(rng: &mut ChaCha8Rng, table: &str) -> String {
-        match rng.random_range(0..6) {
-            // Single-row INSERT
-            0 => {
-                let x = rng.random_range(1..=10);
-                let y = rng.random_range(1..=100);
-                format!("INSERT INTO {table} VALUES ({x}, {y})")
-            }
-            // Multi-row INSERT
-            1 => {
-                let count = rng.random_range(2..=5);
-                let values: Vec<String> = (0..count)
-                    .map(|_| {
-                        let x = rng.random_range(1..=10);
-                        let y = rng.random_range(1..=100);
-                        format!("({x}, {y})")
-                    })
-                    .collect();
-                format!("INSERT INTO {table} VALUES {}", values.join(", "))
-            }
-            // INSERT OR IGNORE
-            2 => {
-                let x = rng.random_range(1..=10);
-                let y = rng.random_range(1..=100);
-                format!("INSERT OR IGNORE INTO {table} VALUES ({x}, {y})")
-            }
-            // UPDATE
-            3 => {
-                let new_y = rng.random_range(1..=100);
-                let target = rng.random_range(1..=10);
-                format!("UPDATE {table} SET y = {new_y} WHERE x = {target}")
-            }
-            // UPDATE all rows
-            4 => {
-                let new_y = rng.random_range(1..=100);
-                format!("UPDATE {table} SET y = {new_y}")
-            }
-            // DELETE
-            5 => {
-                let target = rng.random_range(1..=10);
-                if rng.random_bool(0.2) {
-                    format!("DELETE FROM {table}")
-                } else {
-                    format!("DELETE FROM {table} WHERE x = {target}")
-                }
-            }
-            _ => unreachable!(),
-        }
     }
 
     /// Main differential fuzz test for RAISE() in triggers.
@@ -203,32 +156,25 @@ mod raise_tests {
             "CREATE TABLE t (x INTEGER, y INTEGER)",
             "CREATE TABLE log (msg TEXT)",
         ] {
-            limbo_conn.execute(schema).unwrap();
-            sqlite_conn.execute(schema, params![]).unwrap();
+            helpers::execute_on_both(&limbo_conn, &sqlite_conn, schema, "");
         }
 
         // Seed initial data
         for x in 1..=5 {
             let stmt = format!("INSERT INTO t VALUES ({x}, {})", x * 10);
-            limbo_conn.execute(&stmt).unwrap();
-            sqlite_conn.execute(&stmt, params![]).unwrap();
+            helpers::execute_on_both(&limbo_conn, &sqlite_conn, &stmt, "");
         }
-
         let verify_queries = [
             ("t", "SELECT x, y FROM t ORDER BY x, y"),
             ("log", "SELECT msg FROM log ORDER BY msg"),
         ];
-
         const STEPS: usize = 500;
         let mut history = Vec::with_capacity(STEPS + 64);
         let mut trigger_counter = 0u32;
         let mut active_triggers: Vec<String> = Vec::new();
-
         for step in 0..STEPS {
             helpers::log_progress("raise_differential_fuzz", step, STEPS, 8);
-
             let action = rng.random_range(0..100);
-
             let stmt = if action < 10 && !active_triggers.is_empty() {
                 // Drop a random trigger (10% of the time if triggers exist)
                 let idx = rng.random_range(0..active_triggers.len());
@@ -265,60 +211,25 @@ mod raise_tests {
                 "DELETE FROM log".to_string()
             } else {
                 // DML on the main table (60% of the time)
-                random_dml(&mut rng, "t")
+                helpers::random_dml(&mut rng, "t", "x", "y")
             };
 
             history.push(stmt.clone());
 
-            // Execute on SQLite
             let sqlite_res = sqlite_conn.execute(&stmt, params![]);
-
-            // Execute on Turso (with panic catching)
             let limbo_res = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 limbo_exec_rows_fallible(&db, &limbo_conn, &stmt)
-            }));
-            let limbo_res = match limbo_res {
-                Ok(res) => res,
-                Err(_) => {
-                    panic!(
-                        "turso panicked while executing statement\nseed: {seed}\nstep: {step}\nstmt: {stmt}\nrecent statements:\n{}",
-                        helpers::history_tail(&history, 50)
-                    );
-                }
-            };
-
-            // Assert outcome parity: both succeed or both fail
-            match (&sqlite_res, &limbo_res) {
-                (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
-                (sqlite_outcome, limbo_outcome) => {
-                    panic!(
-                        "RAISE outcome mismatch\nseed: {seed}\nstep: {step}\nstmt: {stmt}\nsqlite: {sqlite_outcome:?}\nturso: {limbo_outcome:?}\nrecent statements:\n{}",
-                        helpers::history_tail(&history, 50)
-                    );
-                }
-            }
-
+            }))
+            .unwrap();
+            helpers::assert_outcome_parity(
+                &sqlite_res,
+                &limbo_res,
+                &stmt,
+                &format!("SEED=({seed})"),
+            );
             // After each step, verify both engines have identical table state
             for (label, verify_query) in verify_queries {
-                let sqlite_rows = sqlite_exec_rows(&sqlite_conn, verify_query);
-                let limbo_rows = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    limbo_exec_rows(&limbo_conn, verify_query)
-                }));
-                let limbo_rows = match limbo_rows {
-                    Ok(rows) => rows,
-                    Err(_) => {
-                        panic!(
-                            "turso panicked while verifying state ({label})\nseed: {seed}\nstep: {step}\nstmt: {stmt}\nrecent statements:\n{}",
-                            helpers::history_tail(&history, 50)
-                        );
-                    }
-                };
-                assert_eq!(
-                    limbo_rows,
-                    sqlite_rows,
-                    "RAISE state mismatch ({label})\nseed: {seed}\nstep: {step}\nstmt: {stmt}\nrecent statements:\n{}",
-                    helpers::history_tail(&history, 50)
-                );
+                helpers::assert_differential(&limbo_conn, &sqlite_conn, verify_query, label);
             }
         }
     }
@@ -344,24 +255,20 @@ mod raise_tests {
                 "CREATE TABLE t (x INTEGER, y INTEGER)",
                 "CREATE TABLE log (msg TEXT)",
             ] {
-                limbo_conn.execute(stmt).unwrap();
-                sqlite_conn.execute(stmt, params![]).unwrap();
+                helpers::execute_on_both(&limbo_conn, &sqlite_conn, stmt, "");
             }
 
             // Seed some rows
             let seed_count = rng.random_range(3..=8);
             for i in 1..=seed_count {
                 let stmt = format!("INSERT INTO t VALUES ({i}, {})", i * 10);
-                limbo_conn.execute(&stmt).unwrap();
-                sqlite_conn.execute(&stmt, params![]).unwrap();
+                helpers::execute_on_both(&limbo_conn, &sqlite_conn, &stmt, "");
             }
-
             // Pick a random row to trigger FAIL on
             let fail_target = rng.random_range(1..=seed_count);
             let timing = random_timing(&mut rng);
             let event = random_event(&mut rng);
             let with_side_effects = rng.random_bool(0.5);
-
             let trigger_sql = create_trigger_sql(
                 "fail_tr",
                 timing,
@@ -371,15 +278,12 @@ mod raise_tests {
                 Some(fail_target),
                 with_side_effects,
             );
-            limbo_conn.execute(&trigger_sql).unwrap();
-            sqlite_conn.execute(&trigger_sql, params![]).unwrap();
-
+            helpers::execute_on_both(&limbo_conn, &sqlite_conn, &trigger_sql, "");
             // Wrap in explicit transaction so FAIL doesn't autocommit partial changes
             // (both engines should behave identically either way)
             let use_txn = rng.random_bool(0.5);
             if use_txn {
-                limbo_conn.execute("BEGIN").unwrap();
-                sqlite_conn.execute("BEGIN", params![]).unwrap();
+                helpers::execute_on_both(&limbo_conn, &sqlite_conn, "BEGIN", "");
             }
 
             // Generate a DML that touches multiple rows to exercise FAIL
@@ -391,40 +295,29 @@ mod raise_tests {
                     format!("INSERT INTO t VALUES {}", values.join(", "))
                 }
                 TriggerEvent::Update => {
-                    format!(
-                        "UPDATE t SET y = {}",
-                        rng.random_range(1..=100)
-                    )
+                    format!("UPDATE t SET y = {}", rng.random_range(1..=100))
                 }
                 TriggerEvent::Delete => "DELETE FROM t".to_string(),
             };
 
             let sqlite_res = sqlite_conn.execute(&dml, params![]);
             let limbo_res = limbo_exec_rows_fallible(&db, &limbo_conn, &dml);
-
-            // Outcome parity
-            assert!(
-                sqlite_res.is_ok() == limbo_res.is_ok(),
-                "RAISE(FAIL) outcome mismatch in round {round}\nseed: {seed}\ndml: {dml}\ntrigger: {trigger_sql}\nsqlite: {sqlite_res:?}\nturso: {limbo_res:?}"
+            helpers::assert_outcome_parity(
+                &sqlite_res,
+                &limbo_res,
+                &dml,
+                &format!("RAISE(FAIL) parity in round {round} (SEED=({seed}))"),
             );
-
             // State parity
             for (label, query) in [
                 ("t", "SELECT x, y FROM t ORDER BY x, y"),
                 ("log", "SELECT msg FROM log ORDER BY msg"),
             ] {
-                let sqlite_rows = sqlite_exec_rows(&sqlite_conn, query);
-                let limbo_rows = limbo_exec_rows(&limbo_conn, query);
-                assert_eq!(
-                    limbo_rows, sqlite_rows,
-                    "RAISE(FAIL) state mismatch ({label}) in round {round}\nseed: {seed}\ndml: {dml}\ntrigger: {trigger_sql}"
-                );
+                helpers::assert_differential(&limbo_conn, &sqlite_conn, query, label);
             }
-
             if use_txn {
                 // Rollback to clean up for next round
-                let _ = sqlite_conn.execute("ROLLBACK", params![]);
-                let _ = limbo_conn.execute("ROLLBACK");
+                helpers::execute_on_both(&limbo_conn, &sqlite_conn, "ROLLBACK", "");
             }
         }
     }
@@ -449,20 +342,16 @@ mod raise_tests {
                 "CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)",
                 "CREATE TABLE log (msg TEXT)",
             ] {
-                limbo_conn.execute(stmt).unwrap();
-                sqlite_conn.execute(stmt, params![]).unwrap();
+                helpers::execute_on_both(&limbo_conn, &sqlite_conn, stmt, "");
             }
 
             // Seed
             for i in 1..=3 {
                 let stmt = format!("INSERT INTO t VALUES ({i}, {})", i * 10);
-                limbo_conn.execute(&stmt).unwrap();
-                sqlite_conn.execute(&stmt, params![]).unwrap();
+                helpers::execute_on_both(&limbo_conn, &sqlite_conn, &stmt, "");
             }
-
             let raise_type = random_raise_type(&mut rng);
             let timing = random_timing(&mut rng);
-
             // Trigger that inserts into log, then RAISEs — log should be rolled back
             let trigger_sql = create_trigger_sql(
                 "body_tr",
@@ -479,19 +368,25 @@ mod raise_tests {
             // Use explicit transaction for ROLLBACK type to avoid full rollback
             let use_txn = matches!(raise_type, RaiseType::Rollback) || rng.random_bool(0.5);
             if use_txn {
-                limbo_conn.execute("BEGIN").unwrap();
-                sqlite_conn.execute("BEGIN", params![]).unwrap();
+                helpers::execute_on_both(&limbo_conn, &sqlite_conn, "BEGIN", "");
             }
 
-            let dml = format!("INSERT INTO t VALUES ({}, {})", rng.random_range(10..=20), rng.random_range(1..=100));
+            let dml = format!(
+                "INSERT INTO t VALUES ({}, {})",
+                rng.random_range(10..=20),
+                rng.random_range(1..=100)
+            );
 
             let sqlite_res = sqlite_conn.execute(&dml, params![]);
             let limbo_res = limbo_exec_rows_fallible(&db, &limbo_conn, &dml);
-
-            assert!(
-                sqlite_res.is_ok() == limbo_res.is_ok(),
-                "RAISE({}) outcome mismatch in round {round}\nseed: {seed}\ndml: {dml}\ntrigger: {trigger_sql}\nsqlite: {sqlite_res:?}\nturso: {limbo_res:?}",
-                raise_type.sql()
+            helpers::assert_outcome_parity(
+                &sqlite_res,
+                &limbo_res,
+                &dml,
+                &format!(
+                    "RAISE({}) trigger body rollback parity in round {round} (SEED=({seed}))",
+                    raise_type.sql()
+                ),
             );
 
             // Verify log table: trigger body side-effects should be rolled back
@@ -511,7 +406,6 @@ mod raise_tests {
                 "RAISE({}) main table mismatch in round {round}\nseed: {seed}\ndml: {dml}\ntrigger: {trigger_sql}",
                 raise_type.sql()
             );
-
             if use_txn {
                 let _ = sqlite_conn.execute("ROLLBACK", params![]);
                 let _ = limbo_conn.execute("ROLLBACK");
