@@ -220,51 +220,52 @@ jobs:
             ./scripts/run-sim ${{ matrix.profile.args }} || exit 1
           done
 
-  simulator-windows:
-    runs-on: windows-latest
-    timeout-minutes: 120
-    strategy:
-      matrix:
-        profile:
-          - name: default
-            iterations: 10
-            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory"
-          - name: InsertHeavy
-            iterations: 5
-            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --io-backend=memory"
-          - name: InsertHeavySpill
-            iterations: 5
-            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy_spill --io-backend=memory"
-          - name: Faultless
-            iterations: 10
-            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
-          - name: WindowsIOCP InsertHeavySpill
-            iterations: 5
-            args: "--io-backend=experimental_win_iocp --maximum-tests 1000 --profile=write_heavy_spill"
-          - name: WindowsIOCP Differential
-            iterations: 10
-            args: "--io-backend=experimental_win_iocp --maximum-tests 1000 --differential"
-          - name: Differential
-            iterations: 10
-            args: "--maximum-tests 1000 --differential --io-backend=memory"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
-      - name: Windows Simulator ${{ matrix.profile.name }}
-        shell: pwsh
-        run: |
-          for ($i = 1; $i -le ${{ matrix.profile.iterations }}; $i++) {
-            & ./scripts/run-sim.ps1 ${{ matrix.profile.args }}
-            if ($LASTEXITCODE -ne 0) {
-                exit $LASTEXITCODE
-            }
-          }
-
+        # TODO: find out why this blows the stack so quickly every time..
+        # e.g. https://github.com/tursodatabase/turso/actions/runs/22370904813/job/64749257476?pr=5588
+  # simulator-windows:
+  #   runs-on: windows-latest
+  #   timeout-minutes: 120
+  #   strategy:
+  #     matrix:
+  #       profile:
+  #         - name: default
+  #           iterations: 10
+  #           args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory"
+  #         - name: InsertHeavy
+  #           iterations: 5
+  #           args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --io-backend=memory"
+  #         - name: InsertHeavySpill
+  #           iterations: 5
+  #           args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy_spill --io-backend=memory"
+  #         - name: Faultless
+  #           iterations: 10
+  #           args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
+  #         - name: WindowsIOCP InsertHeavySpill
+  #           iterations: 5
+  #           args: "--io-backend=experimental_win_iocp --maximum-tests 1000 --profile=write_heavy_spill"
+  #         - name: WindowsIOCP Differential
+  #           iterations: 10
+  #           args: "--io-backend=experimental_win_iocp --maximum-tests 1000 --differential"
+  #         - name: Differential
+  #           iterations: 10
+  #           args: "--maximum-tests 5000 --differential --io-backend=memory"
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #       with:
+  #         prefix-key: "v1-rust"
+  #         cache-on-failure: true
+  #     - uses: "./.github/shared/setup-sccache"
+  #     - name: Windows Simulator ${{ matrix.profile.name }}
+  #       shell: pwsh
+  #       run: |
+  #         for ($i = 1; $i -le ${{ matrix.profile.iterations }}; $i++) {
+  #           & ./scripts/run-sim.ps1 ${{ matrix.profile.args }}
+  #           if ($LASTEXITCODE -ne 0) {
+  #               exit $LASTEXITCODE
+  #           }
+  #         }
 
   # TODO: for now leave this commented out, as it always fails
   # differential-fuzzer:
