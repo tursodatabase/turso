@@ -455,12 +455,7 @@ fn validate_check_types_in_expr(
     Ok(())
 }
 
-fn validate(
-    body: &ast::CreateTableBody,
-    table_name: &str,
-    connection: &Connection,
-    resolver: &Resolver,
-) -> Result<()> {
+fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) -> Result<()> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
         options,
         columns,
@@ -469,11 +464,6 @@ fn validate(
     {
         if options.contains_without_rowid() {
             bail_parse_error!("WITHOUT ROWID tables are not supported");
-        }
-        if options.contains_strict() && !connection.experimental_strict_enabled() {
-            bail_parse_error!(
-                "STRICT tables are an experimental feature. Enable them with --experimental-strict flag"
-            );
         }
         let column_names: Vec<&str> = columns.iter().map(|c| c.col_name.as_str()).collect();
         for i in 0..columns.len() {
@@ -606,7 +596,7 @@ pub fn translate_create_table(
     if temporary {
         bail_parse_error!("TEMPORARY table not supported yet");
     }
-    validate(&body, &normalized_tbl_name, connection, resolver)?;
+    validate(&body, &normalized_tbl_name, resolver)?;
 
     let opts = ProgramBuilderOpts {
         num_cursors: 1,

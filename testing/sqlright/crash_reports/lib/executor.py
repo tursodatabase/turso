@@ -47,7 +47,6 @@ class CrashExecutor:
                     "-q",  # Quiet mode
                     "-m", "list",  # List mode
                     "--experimental-views",
-                    "--experimental-strict",
                     "--experimental-triggers",
                     "--experimental-index-method",
                     "--experimental-autovacuum",

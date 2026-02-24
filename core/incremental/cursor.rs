@@ -388,7 +388,6 @@ mod tests {
             OpenFlags::default(),
             crate::DatabaseOpts {
                 enable_views: true,
-                enable_strict: false,
                 enable_custom_types: false,
                 enable_load_extension: false,
                 enable_encryption: false,

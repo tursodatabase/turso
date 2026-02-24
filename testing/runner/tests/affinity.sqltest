@@ -477,7 +477,6 @@ expect {
     1a|text
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test affinity-any-strict {
     CREATE TABLE t1 (c1 ANY) STRICT;

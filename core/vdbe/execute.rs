@@ -12176,8 +12176,7 @@ fn op_vacuum_into_inner(
                 let dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
                     .with_triggers(source_db.experimental_triggers_enabled())
-                    .with_index_method(source_db.experimental_index_method_enabled())
-                    .with_strict(source_db.experimental_strict_enabled());
+                    .with_index_method(source_db.experimental_index_method_enabled());
 
                 program.connection.execute("BEGIN")?;
                 // lets set the same meta values as source db

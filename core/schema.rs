@@ -458,7 +458,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
 
 impl Schema {
     pub fn new() -> Self {
-        Self::with_options(false)
+        Self::with_options(true)
     }
 
     pub fn with_options(enable_custom_types: bool) -> Self {

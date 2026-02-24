@@ -40,7 +40,7 @@ for testcase in "$CORPUS_DIR"/*; do
 
     LLVM_PROFILE_FILE="$COV_PROFILE_DIR/turso_${COUNT}.profraw" \
         timeout 5 "$COV_BINARY" -q -m list \
-        --experimental-views --experimental-strict --experimental-triggers \
+        --experimental-views --experimental-triggers \
         --experimental-index-method --experimental-autovacuum --experimental-attach \
         < "$testcase" > /dev/null 2>&1 || true
 

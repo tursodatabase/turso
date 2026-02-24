@@ -1345,10 +1345,6 @@ impl Connection {
         self.db.experimental_index_method_enabled()
     }
 
-    pub fn experimental_strict_enabled(&self) -> bool {
-        self.db.experimental_strict_enabled()
-    }
-
     pub fn experimental_custom_types_enabled(&self) -> bool {
         self.db.experimental_custom_types_enabled()
     }
@@ -1512,12 +1508,10 @@ impl Connection {
         }
 
         let use_views = self.db.experimental_views_enabled();
-        let use_strict = self.db.experimental_strict_enabled();
         let use_custom_types = self.db.experimental_custom_types_enabled();
 
         let db_opts = DatabaseOpts::new()
             .with_views(use_views)
-            .with_strict(use_strict)
             .with_custom_types(use_custom_types);
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO

@@ -220,7 +220,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
             for feature in experimental {
                 core_opts = match feature.as_str() {
                     "views" => core_opts.with_views(true),
-                    "strict" => core_opts.with_strict(true),
+                    "strict" => core_opts, // strict is always enabled, kept for backwards compatibility
                     "custom_types" => core_opts.with_custom_types(true),
                     "encryption" => core_opts.with_encryption(true),
                     "index_method" => core_opts.with_index_method(true),

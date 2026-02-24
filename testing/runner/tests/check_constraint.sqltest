@@ -213,7 +213,6 @@ expect error {
 }
 
 # STRICT tables with CHECK constraints
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test check_constraint_strict_table_basic {
     CREATE TABLE employees (
@@ -241,7 +240,6 @@ test check_constraint_strict_type_violation {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test check_constraint_strict_numeric_string_coercion {
     CREATE TABLE employees (
@@ -256,7 +254,6 @@ expect {
     1|25|integer
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test check_constraint_strict_check_violation_after_coercion {
     CREATE TABLE employees (
