@@ -3,6 +3,7 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::{
+    connection::FkActionCompileKey,
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
@@ -1382,8 +1383,13 @@ const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts {
     approx_num_labels: 4,
 };
 
-fn fk_action_compile_key(fk_ref: &ResolvedFkRef, action_kind: &'static str) -> String {
-    format!("{action_kind}:{:p}", Arc::as_ptr(&fk_ref.fk))
+type FkActionCompileKeyCtor = fn(usize) -> FkActionCompileKey;
+
+fn fk_action_compile_key(
+    fk_ref: &ResolvedFkRef,
+    key_ctor: FkActionCompileKeyCtor,
+) -> FkActionCompileKey {
+    key_ctor(Arc::as_ptr(&fk_ref.fk) as usize)
 }
 
 /// Compile and emit an FK action as a sub-program.
@@ -1393,7 +1399,7 @@ fn emit_fk_action_subprogram(
     resolver: &mut Resolver,
     connection: &Arc<Connection>,
     stmt: ast::Stmt,
-    compile_key: &str,
+    compile_key: FkActionCompileKey,
     ctx: &FkActionContext,
     description: &'static str,
 ) -> Result<()> {
@@ -1644,13 +1650,13 @@ fn fire_fk_cascade_delete(
         &subprog_ctx,
         db_name.as_deref(),
     );
-    let compile_key = fk_action_compile_key(fk_ref, "on_delete:cascade");
+    let compile_key = fk_action_compile_key(fk_ref, FkActionCompileKey::OnDeleteCascade);
     emit_fk_action_subprogram(
         program,
         resolver,
         connection,
         stmt,
-        &compile_key,
+        compile_key,
         ctx,
         "fk cascade delete",
     )
@@ -1665,7 +1671,7 @@ fn fire_fk_set_null(
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
     database_id: usize,
-    action_kind: &'static str,
+    action_key_ctor: FkActionCompileKeyCtor,
 ) -> Result<()> {
     let db_name = if database_id != crate::MAIN_DB_ID {
         resolver.get_database_name_by_index(database_id)
@@ -1680,13 +1686,13 @@ fn fire_fk_set_null(
         &subprog_ctx,
         db_name.as_deref(),
     );
-    let compile_key = fk_action_compile_key(fk_ref, action_kind);
+    let compile_key = fk_action_compile_key(fk_ref, action_key_ctor);
     emit_fk_action_subprogram(
         program,
         resolver,
         connection,
         stmt,
-        &compile_key,
+        compile_key,
         ctx,
         "fk set null",
     )
@@ -1701,7 +1707,7 @@ fn fire_fk_set_default(
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
     database_id: usize,
-    action_kind: &'static str,
+    action_key_ctor: FkActionCompileKeyCtor,
 ) -> Result<()> {
     let db_name = if database_id != crate::MAIN_DB_ID {
         resolver.get_database_name_by_index(database_id)
@@ -1716,13 +1722,13 @@ fn fire_fk_set_default(
         &subprog_ctx,
         db_name.as_deref(),
     );
-    let compile_key = fk_action_compile_key(fk_ref, action_kind);
+    let compile_key = fk_action_compile_key(fk_ref, action_key_ctor);
     emit_fk_action_subprogram(
         program,
         resolver,
         connection,
         stmt,
-        &compile_key,
+        compile_key,
         ctx,
         "fk set default",
     )
@@ -1752,13 +1758,13 @@ fn fire_fk_cascade_update(
         &subprog_ctx,
         db_name.as_deref(),
     );
-    let compile_key = fk_action_compile_key(fk_ref, "on_update:cascade");
+    let compile_key = fk_action_compile_key(fk_ref, FkActionCompileKey::OnUpdateCascade);
     emit_fk_action_subprogram(
         program,
         resolver,
         connection,
         stmt,
-        &compile_key,
+        compile_key,
         ctx,
         "fk cascade update",
     )
@@ -1987,7 +1993,7 @@ pub fn fire_fk_update_actions(
                     connection,
                     &ctx,
                     database_id,
-                    "on_update:set_null",
+                    FkActionCompileKey::OnUpdateSetNull,
                 )?;
             }
             RefAct::SetDefault => {
@@ -1998,7 +2004,7 @@ pub fn fire_fk_update_actions(
                     connection,
                     &ctx,
                     database_id,
-                    "on_update:set_default",
+                    FkActionCompileKey::OnUpdateSetDefault,
                 )?;
             }
         }
@@ -2157,7 +2163,7 @@ pub fn emit_fk_drop_table_check(
                     connection,
                     &ctx,
                     database_id,
-                    "on_delete:set_null",
+                    FkActionCompileKey::OnDeleteSetNull,
                 )?;
             }
             RefAct::SetDefault => {
@@ -2168,7 +2174,7 @@ pub fn emit_fk_drop_table_check(
                     connection,
                     &ctx,
                     database_id,
-                    "on_delete:set_default",
+                    FkActionCompileKey::OnDeleteSetDefault,
                 )?;
             }
             RefAct::NoAction | RefAct::Restrict => {
