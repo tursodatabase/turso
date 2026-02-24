@@ -398,6 +398,7 @@ pub fn emit_upsert(
     returning: &mut [ResultSetColumn],
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
+    correlated_returning_subqueries: &mut [crate::translate::plan::NonFromClauseSubquery],
 ) -> crate::Result<()> {
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
@@ -1160,6 +1161,18 @@ pub fn emit_upsert(
             }
             program.preassign_label_to_next_insn(after_trigger_done);
         }
+    }
+
+    // Emit correlated subqueries for RETURNING (must happen after Update so values are current)
+    if !returning.is_empty() {
+        crate::translate::insert::emit_correlated_returning_subqueries(
+            program,
+            resolver,
+            table_references,
+            correlated_returning_subqueries,
+            new_start,
+            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+        )?;
     }
 
     // RETURNING from NEW image + final rowid

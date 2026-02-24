@@ -1,0 +1,106 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE lookup(k INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO lookup VALUES(1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five');
+}
+
+setup schema_t2 {
+    CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE lookup2(k INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO lookup2 VALUES(1, 'one');
+    INSERT INTO t2 VALUES(1, 'orig');
+}
+
+setup schema_exists {
+    CREATE TABLE t3(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t4(x INTEGER PRIMARY KEY);
+    INSERT INTO t4 VALUES(1), (3), (5);
+}
+
+@setup schema
+test single-row-insert-returning-correlated-subquery {
+    INSERT INTO t1 VALUES(1, 'x') RETURNING a, (SELECT v FROM lookup WHERE k = a) as val;
+}
+expect {
+    1|one
+}
+
+@setup schema
+test multi-row-insert-returning-correlated-subquery {
+    INSERT INTO t1 VALUES(2, 'y'), (3, 'z')
+    RETURNING a, (SELECT v FROM lookup WHERE k = a) as val;
+}
+expect {
+    2|two
+    3|three
+}
+
+@setup schema
+test multi-row-insert-returning-correlated-many-rows {
+    INSERT INTO t1 VALUES(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')
+    RETURNING a, b, (SELECT v FROM lookup WHERE k = a) as val;
+}
+expect {
+    1|a|one
+    2|b|two
+    3|c|three
+    4|d|four
+    5|e|five
+}
+
+@setup schema_t2
+test upsert-returning-correlated-subquery {
+    INSERT INTO t2 VALUES(1, 'new') ON CONFLICT(a) DO UPDATE SET b = 'upserted'
+    RETURNING a, (SELECT v FROM lookup2 WHERE k = a) as val;
+}
+expect {
+    1|one
+}
+
+@setup schema_exists
+test exists-correlated-subquery-in-returning {
+    INSERT INTO t3 VALUES(1, 'a'), (2, 'b'), (3, 'c')
+    RETURNING a, b, EXISTS(SELECT 1 FROM t4 WHERE x = a) as has_match;
+}
+expect {
+    1|a|1
+    2|b|0
+    3|c|1
+}
+
+@setup schema
+test correlated-subquery-no-match-returns-null {
+    INSERT INTO t1 VALUES(99, 'z') RETURNING a, (SELECT v FROM lookup WHERE k = a) as val;
+}
+expect {
+    99|
+}
+
+@setup schema
+test correlated-subquery-referencing-non-rowid-column {
+    INSERT INTO t1 VALUES(1, 'one')
+    RETURNING a, b, (SELECT k FROM lookup WHERE v = b) as matched_k;
+}
+expect {
+    1|one|1
+}
+
+@setup schema_t2
+test upsert-no-conflict-returning-correlated-subquery {
+    INSERT INTO t2 VALUES(2, 'brand-new') ON CONFLICT(a) DO UPDATE SET b = 'upserted'
+    RETURNING a, (SELECT v FROM lookup2 WHERE k = a) as val;
+}
+expect {
+    2|
+}
+
+@setup schema
+test mixed-correlated-uncorrelated-subqueries {
+    INSERT INTO t1 VALUES(1, 'x')
+    RETURNING a, (SELECT v FROM lookup WHERE k = a) as correlated_val, (SELECT COUNT(*) FROM lookup) as total_count;
+}
+expect {
+    1|one|5
+}

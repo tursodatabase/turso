@@ -20,8 +20,8 @@ use crate::{
             prepare_fk_delete_actions,
         },
         plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
+            ColumnUsedMask, EvalAt, JoinedTable, NonFromClauseSubquery, Operation,
+            QueryDestination, ResultSetColumn, TableReferences,
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
@@ -416,10 +416,12 @@ pub fn translate_insert(
         inserting_multiple_rows,
     )?;
 
-    // Emit subqueries for RETURNING clause (uncorrelated subqueries are evaluated once)
+    // Emit uncorrelated subqueries for RETURNING clause (evaluated once before the loop).
+    // Correlated subqueries are skipped here and emitted later, after the Insert instruction,
+    // so that cursor-based reads and register values reflect the newly inserted row.
     for subquery in returning_subqueries
         .iter_mut()
-        .filter(|s| !s.has_been_evaluated())
+        .filter(|s| !s.has_been_evaluated() && !s.correlated)
     {
         let eval_at = subquery.get_eval_at(&[], Some(&table_references))?;
         if eval_at != EvalAt::BeforeLoop {
@@ -435,6 +437,19 @@ pub fn translate_insert(
             subquery.correlated,
         )?;
     }
+
+    // Clone correlated subqueries for the upsert path (each path needs its own copy
+    // of the bytecode, just like SQLite emits the subquery separately in each branch).
+    let correlated_returning_subqueries_for_upsert: Vec<NonFromClauseSubquery> =
+        if !upsert_actions.is_empty() {
+            returning_subqueries
+                .iter()
+                .filter(|s| !s.has_been_evaluated() && s.correlated)
+                .cloned()
+                .collect()
+        } else {
+            vec![]
+        };
 
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 
@@ -849,6 +864,19 @@ pub fn translate_insert(
         )?;
     }
 
+    // Emit correlated subqueries for RETURNING (must happen after Insert so the cursor
+    // is positioned on the new row and register values are available).
+    if !result_columns.is_empty() {
+        emit_correlated_returning_subqueries(
+            program,
+            resolver,
+            &table_references,
+            &mut returning_subqueries,
+            insertion.first_col_register(),
+            insertion.key_register(),
+        )?;
+    }
+
     // Emit RETURNING results if specified
     if !result_columns.is_empty() {
         emit_returning_results(
@@ -875,6 +903,7 @@ pub fn translate_insert(
             &mut result_columns,
             connection,
             &mut table_references,
+            correlated_returning_subqueries_for_upsert,
         )?;
     }
 
@@ -1172,6 +1201,7 @@ fn resolve_upserts(
     result_columns: &mut [ResultSetColumn],
     connection: &Arc<crate::Connection>,
     table_references: &mut TableReferences,
+    mut correlated_returning_subqueries: Vec<NonFromClauseSubquery>,
 ) -> Result<()> {
     for (_, label, upsert) in upsert_actions {
         program.preassign_label_to_next_insn(*label);
@@ -1195,6 +1225,7 @@ fn resolve_upserts(
                 result_columns,
                 connection,
                 table_references,
+                &mut correlated_returning_subqueries,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -3516,5 +3547,79 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             program.emit_insn(Insn::Close { cursor_id: ccur });
         }
     }
+    Ok(())
+}
+
+/// Emit correlated subqueries for a RETURNING clause.
+///
+/// Correlated subqueries in RETURNING must be emitted **after** the Insert/Update instruction
+/// so that cursor reads and register values reflect the newly inserted/updated row.
+/// The `expr_to_reg_cache` is temporarily populated so that the subquery's outer references
+/// to the target table resolve to the register-based values (matching SQLite's behavior)
+/// rather than cursor-based reads.
+pub(crate) fn emit_correlated_returning_subqueries(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
+    subqueries: &mut [NonFromClauseSubquery],
+    reg_columns_start: usize,
+    rowid_reg: usize,
+) -> Result<()> {
+    let has_correlated = subqueries
+        .iter()
+        .any(|s| !s.has_been_evaluated() && s.correlated);
+    if !has_correlated {
+        return Ok(());
+    }
+
+    let table = table_references
+        .joined_tables()
+        .first()
+        .expect("RETURNING targets a single table");
+
+    // Temporarily set up the expr_to_reg_cache so the subquery's outer references
+    // to the target table resolve to register values instead of cursor reads.
+    resolver.enable_expr_to_reg_cache();
+    let cache_len = resolver.expr_to_reg_cache.len();
+
+    resolver.expr_to_reg_cache.push((
+        std::borrow::Cow::Owned(Expr::RowId {
+            database: None,
+            table: table.internal_id,
+        }),
+        rowid_reg,
+    ));
+    for (i, column) in table.columns().iter().enumerate() {
+        let reg = if column.is_rowid_alias() {
+            rowid_reg
+        } else {
+            reg_columns_start + i
+        };
+        resolver.expr_to_reg_cache.push((
+            std::borrow::Cow::Owned(Expr::Column {
+                database: None,
+                table: table.internal_id,
+                column: i,
+                is_rowid_alias: column.is_rowid_alias(),
+            }),
+            reg,
+        ));
+    }
+
+    for subquery in subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated() && s.correlated)
+    {
+        let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
+    }
+
+    resolver.expr_to_reg_cache.truncate(cache_len);
     Ok(())
 }
