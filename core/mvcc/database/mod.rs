@@ -1073,7 +1073,41 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 }
             }
 
-            // Skip deleted versions
+            // B-tree tombstones (begin: None, end: TxID) act as write locks.
+            // When another transaction has created a tombstone to delete a
+            // B-tree-resident row, that tombstone is effectively a write lock
+            // on the row — same as Hekaton's End field. We must detect this
+            // as a write-write conflict using the same state-based logic used
+            // for begin: TxID checks below.
+            if version.begin.is_none() {
+                // Committed tombstones (end: Timestamp) are already handled by
+                // the check above at lines 1070-1074. Here we only need to check
+                // in-flight tombstones (end: TxID) from other transactions.
+                if let Some(TxTimestampOrID::TxID(other_tx_id)) = version.end {
+                    if other_tx_id != self.tx_id {
+                        let other_tx = mvcc_store.txs.get(&other_tx_id).expect(
+                            "check_version_conflicts: tombstone end TxID not found in txn map",
+                        );
+                        let other_tx = other_tx.value();
+                        match other_tx.state.load() {
+                            TransactionState::Committed(_) => {
+                                return Err(LimboError::WriteWriteConflict);
+                            }
+                            TransactionState::Preparing(other_end_ts) => {
+                                if other_end_ts < end_ts {
+                                    return Err(LimboError::WriteWriteConflict);
+                                }
+                            }
+                            TransactionState::Active => {}
+                            TransactionState::Aborted | TransactionState::Terminated => {}
+                        }
+                    }
+                }
+                // Tombstones have no meaningful begin field — skip begin checks
+                continue;
+            }
+
+            // Skip non-tombstone deleted versions, we check these at `delete` via atomic update of `end` field.
             if version.end.is_some() {
                 continue;
             }
