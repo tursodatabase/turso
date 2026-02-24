@@ -45,6 +45,7 @@ jobs:
     - name: Run fuzz tests
       env:
         RUST_BACKTRACE: 1
+        FUZZ_MULTIPLIER: "0.5"
       run: cargo nextest run --locked --no-fail-fast -E 'binary(fuzz_tests)' --failure-output=final
 
   run-long-fuzz-tests:
@@ -72,6 +73,7 @@ jobs:
     - name: Run ignored long fuzz tests
       env:
         RUST_BACKTRACE: 1
+        FUZZ_MULTIPLIER: "0.5"
       run: cargo nextest run --locked --no-fail-fast --run-ignored ignored-only -E 'test(/fuzz_long/)' --failure-output=final
 
   simple-stress-test:

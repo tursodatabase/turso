@@ -344,13 +344,13 @@ mod fuzz_tests {
 
         const ORDER_BY: [Option<&str>; 3] = [None, Some("DESC"), Some("ASC")];
 
-        const ITERATIONS: usize = 10000;
-        for i in 0..ITERATIONS {
-            if i % (ITERATIONS / 1000) == 0 {
+        let iterations = helpers::fuzz_iterations(10000);
+        for i in 0..iterations {
+            if i % (iterations / 1000).max(1) == 0 {
                 println!(
                     "index_scan_compound_key_fuzz: iteration {}/{}",
                     i + 1,
-                    ITERATIONS
+                    iterations
                 );
             }
             // let's choose random columns from the table
@@ -2778,12 +2778,12 @@ mod fuzz_tests {
 
         let builder = helpers::builder_from_db(&db);
 
-        const OUTER_ITERATIONS: usize = 30;
-        for i in 0..OUTER_ITERATIONS {
+        let outer_iterations = helpers::fuzz_iterations(30);
+        for i in 0..outer_iterations {
             println!(
                 "table_index_mutation_fuzz iteration {}/{}",
                 i + 1,
-                OUTER_ITERATIONS
+                outer_iterations
             );
             let limbo_db = builder.clone().build();
             // For the sqlite comparison database, use a separate builder without MVCC init_sql
@@ -3043,9 +3043,9 @@ mod fuzz_tests {
             }
 
             const COMPARISONS: [&str; 3] = ["=", "<", ">"];
-            const INNER_ITERATIONS: usize = 20;
+            let inner_iterations = helpers::fuzz_iterations(20);
 
-            for _ in 0..INNER_ITERATIONS {
+            for _ in 0..inner_iterations {
                 let do_update = rng.random_range(0..2) == 0;
 
                 let comparison = COMPARISONS[rng.random_range(0..COMPARISONS.len())];
@@ -3565,7 +3565,7 @@ mod fuzz_tests {
         const MIN_TABLES: usize = 1;
         const MAX_ROWS_PER_TABLE: usize = 40;
         const MIN_ROWS_PER_TABLE: usize = 5;
-        const NUM_FUZZ_ITERATIONS: usize = 2000;
+        let num_fuzz_iterations = helpers::fuzz_iterations(2000);
         // How many more SELECTs than tables can be in a UNION (e.g., if 2 tables, max 2+2=4 SELECTs)
         const MAX_SELECTS_IN_UNION_EXTRA: usize = 2;
         const MAX_LIMIT_VALUE: usize = 50;
@@ -3602,7 +3602,7 @@ mod fuzz_tests {
             table_names.push(table_name);
         }
 
-        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+        for iter_num in 0..num_fuzz_iterations {
             // Number of SELECT clauses
             let num_selects_in_union =
                 rng.random_range(1..=(table_names.len() + MAX_SELECTS_IN_UNION_EXTRA));
@@ -3668,7 +3668,7 @@ mod fuzz_tests {
                 &format!(
                     "Iteration: {}/{}, seed: {seed}",
                     iter_num + 1,
-                    NUM_FUZZ_ITERATIONS
+                    num_fuzz_iterations
                 ),
             );
         }
@@ -3679,7 +3679,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("distinct_fuzz");
 
         const NUM_ROWS: usize = 200;
-        const NUM_ITERS: usize = 1000;
+        let num_iters = helpers::fuzz_iterations(1000);
         const COLS: [&str; 3] = ["a", "b", "c"];
 
         let limbo_conn = db.connect_limbo();
@@ -3728,7 +3728,7 @@ mod fuzz_tests {
             helpers::execute_on_both(&limbo_conn, &sqlite_conn, &insert_sql, "");
         }
 
-        for iter in 0..NUM_ITERS {
+        for iter in 0..num_iters {
             let num_cols = rng.random_range(1..=COLS.len());
             let cols = COLS
                 .choose_multiple(&mut rng, num_cols)
@@ -3763,11 +3763,11 @@ mod fuzz_tests {
     #[turso_macros::test(mvcc)]
     pub fn ddl_compatibility_fuzz(db: TempDatabase) {
         let (mut rng, seed) = helpers::init_fuzz_test("ddl_compatibility_fuzz");
-        const ITERATIONS: usize = 1000;
+        let iterations = helpers::fuzz_iterations(1000);
 
         let builder = helpers::builder_from_db(&db);
 
-        for i in 0..ITERATIONS {
+        for i in 0..iterations {
             let db = builder.clone().build();
             let conn = db.connect_limbo();
             let num_cols = rng.random_range(1..=5);
@@ -3933,7 +3933,7 @@ mod fuzz_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        for _ in 0..1024 {
+        for _ in 0..helpers::fuzz_iterations(1024) {
             let query = g.generate(&mut rng, sql, 50);
             helpers::assert_differential(&limbo_conn, &sqlite_conn, &query, "");
         }
@@ -4038,7 +4038,7 @@ mod fuzz_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        for _ in 0..1024 {
+        for _ in 0..helpers::fuzz_iterations(1024) {
             let query = g.generate(&mut rng, sql, 50);
             let limbo = limbo_exec_rows(&limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
@@ -4193,7 +4193,7 @@ mod fuzz_tests {
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
-        for _ in 0..1024 {
+        for _ in 0..helpers::fuzz_iterations(1024) {
             let query = g.generate(&mut rng, sql, 50);
             helpers::assert_differential(
                 &limbo_conn,
@@ -4563,7 +4563,7 @@ mod fuzz_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        for _ in 0..1024 {
+        for _ in 0..helpers::fuzz_iterations(1024) {
             let query = g.generate(&mut rng, sql, 50);
             log::info!("query: {query}");
             helpers::assert_differential(
@@ -4615,7 +4615,7 @@ mod fuzz_tests {
 
         let builder = helpers::builder_from_db(&db);
 
-        for _ in 0..1000 {
+        for _ in 0..helpers::fuzz_iterations(1000) {
             // Create table with random datatype
             let datatype = datatypes[rng.random_range(0..datatypes.len())];
             let create_table = format!("CREATE TABLE t (x {datatype})");
@@ -4666,7 +4666,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("affinity_fuzz");
         let builder = helpers::builder_from_db(&db);
 
-        for iteration in 0..500 {
+        for iteration in 0..helpers::fuzz_iterations(500) {
             let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -4766,7 +4766,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("sum_agg_fuzz_floats");
         let builder = helpers::builder_from_db(&db);
 
-        for _ in 0..100 {
+        for _ in 0..helpers::fuzz_iterations(100) {
             let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -4813,7 +4813,7 @@ mod fuzz_tests {
 
         let builder = helpers::builder_from_db(&db);
 
-        for _ in 0..100 {
+        for _ in 0..helpers::fuzz_iterations(100) {
             let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -4862,7 +4862,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("concat_ws_fuzz");
         let builder = helpers::builder_from_db(&db);
 
-        for _ in 0..100 {
+        for _ in 0..helpers::fuzz_iterations(100) {
             let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -4906,7 +4906,7 @@ mod fuzz_tests {
     pub fn total_agg_fuzz(db: TempDatabase) {
         let (mut rng, seed) = helpers::init_fuzz_test("total_agg_fuzz");
         let builder = helpers::builder_from_db(&db);
-        for _ in 0..100 {
+        for _ in 0..helpers::fuzz_iterations(100) {
             let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -5021,7 +5021,7 @@ mod fuzz_tests {
             .push(expr)
             .build();
 
-        for _ in 0..1024 {
+        for _ in 0..helpers::fuzz_iterations(1024) {
             let query = g.generate(&mut rng, sql, 50);
             log::info!("query: {query}");
             let limbo = limbo_exec_rows(&limbo_conn, &query);
@@ -5081,7 +5081,7 @@ mod fuzz_tests {
         }
 
         // Test different DISTINCT + ORDER BY combinations
-        for _ in 0..300 {
+        for _ in 0..helpers::fuzz_iterations(300) {
             // Randomly select columns for DISTINCT
             let num_distinct_cols = rng.random_range(1..=columns.len());
             let mut available_cols = columns.to_vec();
@@ -5135,7 +5135,7 @@ mod fuzz_tests {
 
         let mut stmts = vec![];
 
-        for iteration in 0..2000 {
+        for iteration in 0..helpers::fuzz_iterations(2000) {
             println!("iteration: {iteration} (seed: {seed})");
             let operation = rng.random_range(0..100); // 0: create, 1: drop, 2: alter, 3: alter rename
 
@@ -5345,7 +5345,7 @@ mod fuzz_tests {
 
         let builder = helpers::builder_from_db(&db);
 
-        for _ in 0..10 {
+        for _ in 0..helpers::fuzz_iterations(10) {
             // generate a random pending page that is smaller than the 100 MB mark
 
             let pending_byte_pgno = rng.random_range(2..MAX_PAGENO);
@@ -5392,7 +5392,7 @@ mod fuzz_tests {
         let (mut rng, _seed) = helpers::init_fuzz_test("table_subquery_fuzz");
 
         // Constants for fuzzing parameters
-        const NUM_FUZZ_ITERATIONS: usize = 2000;
+        let num_fuzz_iterations = helpers::fuzz_iterations(2000);
         const MAX_ROWS_PER_TABLE: usize = 100;
         const MIN_ROWS_PER_TABLE: usize = 5;
         const MAX_SUBQUERY_DEPTH: usize = 4;
@@ -6083,7 +6083,7 @@ mod fuzz_tests {
             clause
         }
 
-        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+        for iter_num in 0..num_fuzz_iterations {
             let main_table = ["t1", "t2", "t3"][rng.random_range(0..3)];
 
             let query_type = rng.random_range(0..8); // Add GROUP BY/HAVING variants
@@ -6394,7 +6394,7 @@ mod fuzz_tests {
                 &sqlite_conn,
                 &query,
                 &format!(
-                    "Iteration {}/{NUM_FUZZ_ITERATIONS}: Query: {query}",
+                    "Iteration {}/{num_fuzz_iterations}: Query: {query}",
                     iter_num + 1,
                 ),
             );
@@ -6408,7 +6408,7 @@ mod fuzz_tests {
     pub fn dml_subquery_fuzz(db: TempDatabase) {
         let (mut rng, _seed) = helpers::init_fuzz_test("dml_subquery_fuzz");
 
-        const NUM_FUZZ_ITERATIONS: usize = 500;
+        let num_fuzz_iterations = helpers::fuzz_iterations(500);
         const MAX_ROWS_PER_TABLE: usize = 500;
         const MIN_ROWS_PER_TABLE: usize = 50;
 
@@ -6480,7 +6480,7 @@ mod fuzz_tests {
 
         log::info!("DDL/DML to reproduce manually:\n{debug_ddl_dml_string}");
 
-        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+        for iter_num in 0..num_fuzz_iterations {
             let query_type = rng.random_range(0..14);
             let query = match query_type {
                 0 => {
@@ -6596,7 +6596,7 @@ mod fuzz_tests {
             };
 
             log::info!(
-                "Iteration {}/{NUM_FUZZ_ITERATIONS}: Query: {query}",
+                "Iteration {}/{num_fuzz_iterations}: Query: {query}",
                 iter_num + 1,
             );
 
@@ -6650,7 +6650,7 @@ mod fuzz_tests {
     pub fn update_or_conflict_fuzz(db: TempDatabase) {
         let (mut rng, seed) = helpers::init_fuzz_test("update_or_conflict_fuzz");
 
-        const NUM_FUZZ_ITERATIONS: usize = 200;
+        let num_fuzz_iterations = helpers::fuzz_iterations(200);
         const ROWS_PER_TABLE: usize = 500;
 
         let limbo_conn = db.connect_limbo();
@@ -6717,7 +6717,7 @@ mod fuzz_tests {
 
         log::info!("DDL/DML to reproduce manually:\n{debug_ddl_dml_string}");
 
-        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+        for iter_num in 0..num_fuzz_iterations {
             let query_type = rng.random_range(0..10);
             let query = match query_type {
                 0 => {
@@ -6799,7 +6799,7 @@ mod fuzz_tests {
             };
 
             log::info!(
-                "Iteration {}/{NUM_FUZZ_ITERATIONS}: Query: {query}",
+                "Iteration {}/{num_fuzz_iterations}: Query: {query}",
                 iter_num + 1,
             );
 

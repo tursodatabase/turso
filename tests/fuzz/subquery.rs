@@ -49,9 +49,9 @@ mod subquery_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 100;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("subquery_in_function_args", i, ITERATIONS, 4);
+        let iterations = helpers::fuzz_iterations(100);
+        for i in 0..iterations {
+            helpers::log_progress("subquery_in_function_args", i, iterations, 4);
 
             let (func_name, arg_count) =
                 SCALAR_FUNCTIONS[rng.random_range(0..SCALAR_FUNCTIONS.len())];
@@ -81,9 +81,9 @@ mod subquery_tests {
         const OPS: &[&str] = &["+", "-", "*", "/", "%", "|", "&", "<<", ">>"];
         const INTEGERS: &[i32] = &[1, 2, 3, 5, 7, 10, 42, 100];
 
-        const ITERATIONS: usize = 100;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("subquery_in_arithmetic", i, ITERATIONS, 4);
+        let iterations = helpers::fuzz_iterations(100);
+        for i in 0..iterations {
+            helpers::log_progress("subquery_in_arithmetic", i, iterations, 4);
 
             let op = OPS[rng.random_range(0..OPS.len())];
             let v1 = INTEGERS[rng.random_range(0..INTEGERS.len())];
@@ -123,9 +123,9 @@ mod subquery_tests {
         const COMP_OPS: &[&str] = &["=", "!=", "<>", "<", ">", "<=", ">=", "IS", "IS NOT"];
         const VALUES: &[&str] = &["1", "2", "NULL", "'a'", "'b'"];
 
-        const ITERATIONS: usize = 100;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("subquery_in_comparisons", i, ITERATIONS, 4);
+        let iterations = helpers::fuzz_iterations(100);
+        for i in 0..iterations {
+            helpers::log_progress("subquery_in_comparisons", i, iterations, 4);
 
             let op = COMP_OPS[rng.random_range(0..COMP_OPS.len())];
             let v1 = VALUES[rng.random_range(0..VALUES.len())];
@@ -149,9 +149,9 @@ mod subquery_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 100;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("subquery_in_case", i, ITERATIONS, 4);
+        let iterations = helpers::fuzz_iterations(100);
+        for i in 0..iterations {
+            helpers::log_progress("subquery_in_case", i, iterations, 4);
 
             let scenario = rng.random_range(0..4);
             let query = match scenario {
@@ -197,9 +197,9 @@ mod subquery_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 50;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("subquery_in_between", i, ITERATIONS, 5);
+        let iterations = helpers::fuzz_iterations(50);
+        for i in 0..iterations {
+            helpers::log_progress("subquery_in_between", i, iterations, 5);
 
             let val = rng.random_range(1..20);
             let low = rng.random_range(1..10);
@@ -229,9 +229,9 @@ mod subquery_tests {
         const LIKE_PATTERNS: &[&str] = &["'%ell%'", "'h%'", "'%d'", "'t%t'", "'___'"];
         const GLOB_PATTERNS: &[&str] = &["'*ell*'", "'h*'", "'*d'", "'t*t'", "'???'"];
 
-        const ITERATIONS: usize = 50;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("subquery_in_like_glob", i, ITERATIONS, 5);
+        let iterations = helpers::fuzz_iterations(50);
+        for i in 0..iterations {
+            helpers::log_progress("subquery_in_like_glob", i, iterations, 5);
 
             let str_val = STRINGS[rng.random_range(0..STRINGS.len())];
             let use_glob = rng.random_bool(0.5);
@@ -263,9 +263,9 @@ mod subquery_tests {
 
         const COMPOUND_OPS: &[&str] = &["UNION", "UNION ALL", "INTERSECT", "EXCEPT"];
 
-        const ITERATIONS: usize = 100;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("subquery_in_from_clause", i, ITERATIONS, 4);
+        let iterations = helpers::fuzz_iterations(100);
+        for i in 0..iterations {
+            helpers::log_progress("subquery_in_from_clause", i, iterations, 4);
 
             let scenario = rng.random_range(0..6);
             let query = match scenario {
@@ -333,9 +333,9 @@ mod subquery_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 50;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("subquery_joins", i, ITERATIONS, 5);
+        let iterations = helpers::fuzz_iterations(50);
+        for i in 0..iterations {
+            helpers::log_progress("subquery_joins", i, iterations, 5);
 
             let scenario = rng.random_range(0..4);
             let query = match scenario {
@@ -392,9 +392,9 @@ mod subquery_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 100;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("cte_with_scalar_subqueries", i, ITERATIONS, 4);
+        let iterations = helpers::fuzz_iterations(100);
+        for i in 0..iterations {
+            helpers::log_progress("cte_with_scalar_subqueries", i, iterations, 4);
 
             let scenario = rng.random_range(0..5);
             let query = match scenario {
@@ -469,9 +469,9 @@ mod subquery_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 50;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("subquery_empty_results", i, ITERATIONS, 5);
+        let iterations = helpers::fuzz_iterations(50);
+        for i in 0..iterations {
+            helpers::log_progress("subquery_empty_results", i, iterations, 5);
 
             let scenario = rng.random_range(0..5);
             let query = match scenario {
@@ -517,9 +517,9 @@ mod subquery_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 50;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("subquery_not_in_null_handling", i, ITERATIONS, 5);
+        let iterations = helpers::fuzz_iterations(50);
+        for i in 0..iterations {
+            helpers::log_progress("subquery_not_in_null_handling", i, iterations, 5);
 
             let scenario = rng.random_range(0..4);
             let query = match scenario {

@@ -3,6 +3,7 @@
 use rand::seq::SliceRandom;
 use rand::Rng;
 
+use super::helpers;
 use core_tester::common::{limbo_exec_rows, rng_from_time_or_env, TempDatabase};
 use rusqlite::types::Value;
 
@@ -122,7 +123,7 @@ fn test_star_schema_fuzz() {
             &format!("INSERT INTO t1 VALUES ({})", fact_values.join(", ")),
         );
 
-        for _ in 0..24 {
+        for _ in 0..helpers::fuzz_iterations(24) {
             let query = generate_star_query_randomized(&mut rng, &fact_table, &dimension_tables);
             let eqp_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
 

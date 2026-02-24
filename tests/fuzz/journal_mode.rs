@@ -213,7 +213,7 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
     let iterations = std::env::var("FUZZ_ITERATIONS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(500);
+        .unwrap_or_else(|| helpers::fuzz_iterations(500));
 
     // Create a temp directory for the Limbo database
     let tmp_dir = TempDir::new().unwrap();

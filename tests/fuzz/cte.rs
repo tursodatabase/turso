@@ -111,9 +111,9 @@ mod cte_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("cte_dml_scenario");
         let builder = helpers::builder_from_db(&db);
 
-        const ITERATIONS: usize = 100;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("cte_dml_scenario", i, ITERATIONS, 4);
+        let iterations = helpers::fuzz_iterations(100);
+        for i in 0..iterations {
+            helpers::log_progress("cte_dml_scenario", i, iterations, 4);
 
             // Create fresh databases for each iteration
             let limbo_db = builder.clone().build();
@@ -209,9 +209,9 @@ mod cte_tests {
             "\"column!\"",
         ];
 
-        const ITERATIONS: usize = 200;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("cte_quoted_names_scenario", i, ITERATIONS, 4);
+        let iterations = helpers::fuzz_iterations(200);
+        for i in 0..iterations {
+            helpers::log_progress("cte_quoted_names_scenario", i, iterations, 4);
 
             let cte_name = QUOTED_NAMES[rng.random_range(0..QUOTED_NAMES.len())];
             let col_name = QUOTED_COLS[rng.random_range(0..QUOTED_COLS.len())];
@@ -242,9 +242,9 @@ mod cte_tests {
 
         const COMPOUND_OPS: &[&str] = &["UNION", "UNION ALL", "INTERSECT", "EXCEPT"];
 
-        const ITERATIONS: usize = 200;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("cte_feature_interaction_scenario", i, ITERATIONS, 2);
+        let iterations = helpers::fuzz_iterations(200);
+        for i in 0..iterations {
+            helpers::log_progress("cte_feature_interaction_scenario", i, iterations, 2);
 
             let scenario = rng.random_range(0..17);
             let query = match scenario {
@@ -524,9 +524,9 @@ mod cte_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("cte_with_real_tables_scenario");
         let builder = helpers::builder_from_db(&db);
 
-        const ITERATIONS: usize = 100;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("cte_with_real_tables_scenario", i, ITERATIONS, 4);
+        let iterations = helpers::fuzz_iterations(100);
+        for i in 0..iterations {
+            helpers::log_progress("cte_with_real_tables_scenario", i, iterations, 4);
 
             let limbo_db = builder.clone().build();
             let sqlite_db = builder.clone().build();
@@ -682,9 +682,9 @@ mod cte_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 200;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("cte_comprehensive_scenario", i, ITERATIONS, 2);
+        let iterations = helpers::fuzz_iterations(200);
+        for i in 0..iterations {
+            helpers::log_progress("cte_comprehensive_scenario", i, iterations, 2);
 
             // Generate 2-4 CTEs with various body types
             let num_ctes = rng.random_range(2..=4);
@@ -1609,9 +1609,9 @@ mod cte_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 100;
-        for i in 0..ITERATIONS {
-            helpers::log_progress("cte_fuzz", i, ITERATIONS, 1);
+        let iterations = helpers::fuzz_iterations(100);
+        for i in 0..iterations {
+            helpers::log_progress("cte_fuzz", i, iterations, 1);
 
             // Decide number of CTEs (1-5)
             let num_ctes = rng.random_range(1..=5);
