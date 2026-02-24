@@ -875,8 +875,14 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
 
             Ok(Value::build_text(escaped_value))
         }
-        // Numbers are unquoted in json
-        ValueRef::Numeric(n @ (Numeric::Integer(_) | Numeric::Float(_))) => Ok(Value::Numeric(n)),
+        // Numbers are unquoted in json, but must be returned as TEXT
+        ValueRef::Numeric(n) => match n {
+            crate::numeric::Numeric::Integer(i) => Ok(Value::build_text(i.to_string())),
+            crate::numeric::Numeric::Float(_) => {
+                let json = convert_ref_dbtype_to_jsonb(ValueRef::Numeric(n), Conv::Strict)?;
+                Ok(Value::build_text(json.to_string()?))
+            }
+        },
         ValueRef::Blob(_) => crate::bail_constraint_error!("JSON cannot hold BLOB values"),
         ValueRef::Null => Ok(Value::build_text("null")),
     }
