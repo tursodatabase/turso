@@ -448,12 +448,10 @@ pub struct WindowRegisters {
     /// Stores the ROWID of the last row inserted into the buffer table.
     /// If NULL, we are before inserting the first row of a new partition.
     pub rowid: usize,
-    /// Stores the current row number within the partition for ROW_NUMBER().
-    pub row_number: Option<usize>,
     /// Start of the register array storing partition key values for the current partition.
     pub partition_start: Option<usize>,
-    /// Start of the register array storing accumulator states for each window function
-    /// (populated by `AggStep` during aggregation).
+    /// Start of the register array storing per-function state for window functions.
+    /// Aggregates use `AggStep` to populate their state.
     pub acc_start: usize,
     /// Start of the register array storing current accumulator results for each window function
     /// (populated by `AggValue` when computing results without clearing accumulators).
@@ -508,7 +506,6 @@ impl EmitWindow {
                     src_table.table
                 );
             };
-
         let src_columns = src_table.columns().to_vec();
         let src_column_count = src_columns.len();
         let window_name = window.name.clone().expect("window name is missing");
@@ -517,12 +514,6 @@ impl EmitWindow {
             .unwrap_or(window.partition_by.len());
         let order_by_len = window.order_by.len();
         let window_function_count = window.functions.len();
-        let needs_row_number = window.functions.iter().any(|func| {
-            matches!(
-                &func.func,
-                WindowFunctionKind::Window(WindowFunc::RowNumber)
-            )
-        });
 
         // An ephemeral table used to buffer rows for the current frame
         let buffer_table = Arc::new(BTreeTable {
@@ -593,11 +584,6 @@ impl EmitWindow {
             },
             registers: WindowRegisters {
                 rowid: program.alloc_registers_and_init_w_null(1),
-                row_number: if needs_row_number {
-                    Some(program.alloc_registers_and_init_w_null(1))
-                } else {
-                    None
-                },
                 partition_start: if partition_by_len > 0 {
                     Some(program.alloc_registers_and_init_w_null(partition_by_len))
                 } else {
@@ -836,8 +822,10 @@ fn emit_reset_state_if_new_partition(
         dest: registers.acc_start,
         dest_end: Some(registers.acc_start + window.functions.len() - 1),
     });
-    if let Some(reg_row_number) = registers.row_number {
-        program.emit_int(0, reg_row_number);
+    for (i, func) in window.functions.iter().enumerate() {
+        if matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)) {
+            program.emit_int(0, registers.acc_start + i);
+        }
     }
 
     program.preassign_label_to_next_insn(label_skip_reset_state);
@@ -1090,19 +1078,18 @@ fn emit_return_buffered_rows(
         let reg_result = registers.result_columns_start + i;
         program.emit_column_or_rowid(cursors.buffer_read, *col_idx, reg_result);
     }
-    if let Some(reg_row_number) = registers.row_number {
-        program.emit_insn(Insn::AddImm {
-            register: reg_row_number,
-            value: 1,
-        });
-        for (i, func) in window.functions.iter().enumerate() {
-            if let WindowFunctionKind::Window(WindowFunc::RowNumber) = &func.func {
-                program.emit_insn(Insn::Copy {
-                    src_reg: reg_row_number,
-                    dst_reg: registers.acc_result_start + i,
-                    extra_amount: 0,
-                });
-            }
+    for (i, func) in window.functions.iter().enumerate() {
+        if let WindowFunctionKind::Window(WindowFunc::RowNumber) = &func.func {
+            let reg_row_number = registers.acc_start + i;
+            program.emit_insn(Insn::AddImm {
+                register: reg_row_number,
+                value: 1,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: reg_row_number,
+                dst_reg: registers.acc_result_start + i,
+                extra_amount: 0,
+            });
         }
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
