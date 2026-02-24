@@ -1517,7 +1517,7 @@ fn fire_fk_cascade_delete(
         &subprog_ctx,
         db_name.as_deref(),
     );
-    let compile_key = fk_action_compile_key(fk_ref, FkActionCompileKey::OnDeleteCascade);
+    let compile_key = fk_action_compile_key(fk_ref, FkActionCompileKey::DeleteCascade);
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -1625,7 +1625,7 @@ fn fire_fk_cascade_update(
         &subprog_ctx,
         db_name.as_deref(),
     );
-    let compile_key = fk_action_compile_key(fk_ref, FkActionCompileKey::OnUpdateCascade);
+    let compile_key = fk_action_compile_key(fk_ref, FkActionCompileKey::UpdateCascade);
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -1734,7 +1734,7 @@ pub fn fire_prepared_fk_delete_actions(
                     connection,
                     &action.ctx,
                     database_id,
-                    FkActionCompileKey::OnDeleteSetNull,
+                    FkActionCompileKey::DeleteSetNull,
                 )?;
             }
             RefAct::SetDefault => {
@@ -1745,7 +1745,7 @@ pub fn fire_prepared_fk_delete_actions(
                     connection,
                     &action.ctx,
                     database_id,
-                    FkActionCompileKey::OnDeleteSetDefault,
+                    FkActionCompileKey::DeleteSetDefault,
                 )?;
             }
             _ => unreachable!(),
@@ -1836,7 +1836,7 @@ pub fn fire_fk_update_actions(
                     connection,
                     &ctx,
                     database_id,
-                    FkActionCompileKey::OnUpdateSetNull,
+                    FkActionCompileKey::UpdateSetNull,
                 )?;
             }
             RefAct::SetDefault => {
@@ -1847,7 +1847,7 @@ pub fn fire_fk_update_actions(
                     connection,
                     &ctx,
                     database_id,
-                    FkActionCompileKey::OnUpdateSetDefault,
+                    FkActionCompileKey::UpdateSetDefault,
                 )?;
             }
         }
@@ -2003,7 +2003,7 @@ pub fn emit_fk_drop_table_check(
                     connection,
                     &ctx,
                     database_id,
-                    FkActionCompileKey::OnDeleteSetNull,
+                    FkActionCompileKey::DeleteSetNull,
                 )?;
             }
             RefAct::SetDefault => {
@@ -2014,7 +2014,7 @@ pub fn emit_fk_drop_table_check(
                     connection,
                     &ctx,
                     database_id,
-                    FkActionCompileKey::OnDeleteSetDefault,
+                    FkActionCompileKey::DeleteSetDefault,
                 )?;
             }
             RefAct::NoAction | RefAct::Restrict => {

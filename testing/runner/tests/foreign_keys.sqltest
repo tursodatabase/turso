@@ -1675,7 +1675,8 @@ expect {
     0
 }
 
-# Self-referential CASCADE must fail with a bounded recursion error instead of stack overflowing.
+# Self-referential CASCADE recursion depth guard in Turso backends.
+@skip-if sqlite "sqlite CLI succeeds for this shallow self-reference"
 test fk-cascade-delete-self-reference-depth-limit {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t (

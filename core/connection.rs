@@ -46,12 +46,12 @@ pub(crate) enum TransactionState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FkActionCompileKey {
-    OnDeleteCascade(usize),
-    OnDeleteSetNull(usize),
-    OnDeleteSetDefault(usize),
-    OnUpdateCascade(usize),
-    OnUpdateSetNull(usize),
-    OnUpdateSetDefault(usize),
+    DeleteCascade(usize),
+    DeleteSetNull(usize),
+    DeleteSetDefault(usize),
+    UpdateCascade(usize),
+    UpdateSetNull(usize),
+    UpdateSetDefault(usize),
 }
 
 /// Database connection handle.
