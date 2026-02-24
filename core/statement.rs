@@ -285,6 +285,32 @@ impl Statement {
         Ok(())
     }
 
+    /// Like `run_with_row_callback`, but steps the program directly without
+    /// reprepare checks. Used by internal schema-loading code
+    /// (reparse_schema, gather_sqlite_stat1) that is already part of a
+    /// reparse operation — repreparing there would cycle back into
+    /// reparse_schema.
+    pub(crate) fn run_with_row_callback_no_reprepare(
+        &mut self,
+        mut func: impl FnMut(&Row) -> Result<()>,
+    ) -> Result<()> {
+        loop {
+            match self
+                .program
+                .step(&mut self.state, self.pager.clone(), self.query_mode, None)?
+            {
+                vdbe::StepResult::Done => break,
+                vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::Row => {
+                    func(self.row().expect("row should be present"))?;
+                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+            }
+        }
+        Ok(())
+    }
+
     /// Blocks execution, advances IO, and stops at any StepResult except IO
     /// You can optionally pass a handler to run after IO is advanced
     pub fn run_one_step_blocking(
@@ -337,7 +363,29 @@ impl Statement {
             }
         }
 
-        *conn.schema.write() = conn.db.clone_schema();
+        // Check if the DB-level schema is stale (e.g., another process created
+        // a table, incrementing the schema cookie on disk). If so, reparse
+        // from sqlite_schema on disk so we get the new table definitions.
+        if conn.mvcc_enabled() {
+            // MVCC tracks schema through MvStore, not the on-disk page 1 cookie.
+            // Comparing on-disk vs in-memory would falsely trigger reparse because
+            // MvStore changes aren't checkpointed to page 1 yet. Just clone the
+            // latest schema from Database.
+            *conn.schema.write() = conn.db.clone_schema();
+        } else {
+            let on_disk_cookie = conn.effective_schema_cookie().unwrap_or_else(|e| {
+                tracing::warn!("effective_schema_cookie failed during reprepare: {e}");
+                0
+            });
+            let db_cookie = conn.db.schema.lock().schema_version;
+            if on_disk_cookie != db_cookie {
+                conn.reparse_schema()?;
+                let schema = conn.schema.read().clone();
+                conn.db.update_schema_if_newer(schema);
+            } else {
+                *conn.schema.write() = conn.db.clone_schema();
+            }
+        }
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;

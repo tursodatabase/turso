@@ -212,6 +212,9 @@ bitflags! {
         const None = 0b00000000;
         const Create = 0b0000001;
         const ReadOnly = 0b0000010;
+        /// Take a shared file lock instead of exclusive.
+        /// Used when locking_mode is SharedReads or SharedWrites.
+        const SharedLock = 0b0000100;
     }
 }
 
