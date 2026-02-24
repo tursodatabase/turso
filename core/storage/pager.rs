@@ -3594,6 +3594,19 @@ impl Pager {
                             }
                             PageSource::Evicted(page) => page.clone(),
                         };
+
+                        // Update change counter on page 1 before preparing WAL frames.
+                        // Matches SQLite's pager_write_changecounter() call in pagerWalFrames().
+                        if page.get().id == DatabaseHeader::PAGE_ID {
+                            let buf = page.get_contents().as_ptr();
+                            let header = bytemuck::from_bytes_mut::<DatabaseHeader>(
+                                &mut buf[0..DatabaseHeader::SIZE],
+                            );
+                            let new_counter = header.change_counter.get() + 1;
+                            header.change_counter = pack1::U32BE::new(new_counter);
+                            header.version_valid_for = pack1::U32BE::new(new_counter);
+                        }
+
                         commit_info.page_source_cursor += 1;
                         commit_info.collected_pages.push(page);
 
