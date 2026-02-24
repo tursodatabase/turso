@@ -121,9 +121,6 @@ pub fn translate_create_index(
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
     let columns = resolve_sorted_columns(&tbl, &columns)?;
-    if connection.mvcc_enabled() && columns.iter().any(|c| c.expr.is_some()) {
-        bail_parse_error!("Expression indexes are not supported in MVCC mode");
-    }
 
     // Block CREATE INDEX on non-orderable custom type columns
     for col in &columns {

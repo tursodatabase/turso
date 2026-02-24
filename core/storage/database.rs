@@ -301,8 +301,8 @@ fn checksum_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &ChecksumContext) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{MemoryIO, IO};
-    use crate::{File, LimboError};
+
+    use crate::File;
 
     struct MockFile {
         read_result: std::result::Result<i32, CompletionError>,
