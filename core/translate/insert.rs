@@ -280,6 +280,7 @@ pub fn translate_insert(
             body,
             on_conflict,
             resolver,
+            connection,
         )?;
         return Ok(());
     }
@@ -2596,8 +2597,22 @@ fn translate_virtual_table_insert(
     mut body: InsertBody,
     on_conflict: Option<ResolveType>,
     resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    if virtual_table.readonly() {
+    #[cfg(not(feature = "cli_only"))]
+    let _ = connection;
+    let allow_dbpage_write = {
+        #[cfg(feature = "cli_only")]
+        {
+            virtual_table.name == crate::dbpage::DBPAGE_TABLE_NAME
+                && connection.db.opts.unsafe_testing
+        }
+        #[cfg(not(feature = "cli_only"))]
+        {
+            false
+        }
+    };
+    if virtual_table.readonly() && !allow_dbpage_write {
         crate::bail_constraint_error!("Table is read-only: {}", virtual_table.name);
     }
     let (num_values, value) = match &mut body {
@@ -2611,7 +2626,9 @@ fn translate_virtual_table_insert(
     let table = Table::Virtual(virtual_table.clone());
     let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
     program.emit_insn(Insn::VOpen { cursor_id });
-    program.emit_insn(Insn::VBegin { cursor_id });
+    if !allow_dbpage_write {
+        program.emit_insn(Insn::VBegin { cursor_id });
+    }
     /* *
      * Inserts for virtual tables are done in a single step.
      * argv[0] = (NULL for insert)

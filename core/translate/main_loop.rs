@@ -293,12 +293,22 @@ pub fn init_loop(
                             | OperationMode::UPDATE { .. }
                             | OperationMode::DELETE
                     );
-                    if is_write && tbl.readonly() {
+                    let allow_dbpage_write = {
+                        #[cfg(feature = "cli_only")]
+                        {
+                            t_ctx.unsafe_testing && tbl.name == crate::dbpage::DBPAGE_TABLE_NAME
+                        }
+                        #[cfg(not(feature = "cli_only"))]
+                        {
+                            false
+                        }
+                    };
+                    if is_write && tbl.readonly() && !allow_dbpage_write {
                         return Err(crate::LimboError::ReadOnly);
                     }
                     if let Some(cursor_id) = table_cursor_id {
                         program.emit_insn(Insn::VOpen { cursor_id });
-                        if is_write {
+                        if is_write && !allow_dbpage_write {
                             program.emit_insn(Insn::VBegin { cursor_id });
                         }
                     }

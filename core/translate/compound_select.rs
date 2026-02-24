@@ -38,6 +38,7 @@ pub fn emit_program_for_compound_select(
         program,
         resolver.fork(),
         right_most.table_references.joined_tables().len(),
+        false,
     );
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
@@ -200,6 +201,7 @@ fn emit_compound_select(
         program,
         resolver.fork(),
         right_most.table_references.joined_tables().len(),
+        false,
     );
     right_most_ctx.reg_result_cols_start = reg_result_cols_start;
     match left.pop() {

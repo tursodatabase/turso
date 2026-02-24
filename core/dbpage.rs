@@ -3,10 +3,12 @@ use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::util::IOExt;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
-use crate::{Connection, Result, Value};
+use crate::{Connection, LimboError, Result, Value};
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };
+
+pub const DBPAGE_TABLE_NAME: &str = "sqlite_dbpage";
 
 #[derive(Debug)]
 pub struct DbPageTable;
@@ -25,7 +27,7 @@ impl DbPageTable {
 
 impl InternalVirtualTable for DbPageTable {
     fn name(&self) -> String {
-        "sqlite_dbpage".to_string()
+        DBPAGE_TABLE_NAME.to_string()
     }
 
     fn sql(&self) -> String {
@@ -201,4 +203,135 @@ impl InternalVirtualTableCursor for DbPageCursor {
     fn rowid(&self) -> i64 {
         self.pgno
     }
+}
+
+fn parse_rowid(value: &Value) -> Result<Option<i64>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Numeric(crate::numeric::Numeric::Integer(i)) => Ok(Some(*i)),
+        _ => Err(LimboError::InvalidArgument(
+            "sqlite_dbpage rowid must be an integer".to_string(),
+        )),
+    }
+}
+
+fn ensure_main_schema(value: &Value) -> Result<()> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Text(schema) if schema.as_str() == "main" => Ok(()),
+        Value::Text(schema) => Err(LimboError::InvalidArgument(format!(
+            "sqlite_dbpage only supports main schema (got {})",
+            schema.as_str()
+        ))),
+        _ => Err(LimboError::InvalidArgument(
+            "sqlite_dbpage schema must be text or null".to_string(),
+        )),
+    }
+}
+
+pub(crate) fn update_dbpage(pager: &Arc<Pager>, args: &[Value]) -> Result<Option<i64>> {
+    if args.len() < 2 {
+        return Err(LimboError::InternalError(
+            "sqlite_dbpage update expects at least 2 arguments".to_string(),
+        ));
+    }
+
+    let old_rowid = parse_rowid(&args[0])?;
+    let new_rowid = parse_rowid(&args[1])?;
+
+    if old_rowid.is_some() && new_rowid.is_none() {
+        return Err(LimboError::InvalidArgument(
+            "sqlite_dbpage does not support DELETE".to_string(),
+        ));
+    }
+
+    let columns = if args.len() > 2 { &args[2..] } else { &[] };
+    let column_pgno = columns.first().and_then(|value| value.as_int());
+    let column_data = columns.get(1);
+    let column_schema = columns.get(2);
+
+    let target_pgno = match (new_rowid, old_rowid, column_pgno) {
+        (Some(rowid), _, Some(pgno)) if rowid != pgno => {
+            return Err(LimboError::InvalidArgument(
+                "sqlite_dbpage pgno does not match rowid".to_string(),
+            ));
+        }
+        (Some(rowid), _, _) => rowid,
+        (None, Some(rowid), Some(pgno)) if rowid != pgno => {
+            return Err(LimboError::InvalidArgument(
+                "sqlite_dbpage pgno does not match rowid".to_string(),
+            ));
+        }
+        (None, Some(rowid), _) => rowid,
+        (None, None, Some(pgno)) => pgno,
+        _ => {
+            return Err(LimboError::InvalidArgument(
+                "sqlite_dbpage requires a target page number".to_string(),
+            ))
+        }
+    };
+
+    if target_pgno <= 0 {
+        return Err(LimboError::InvalidArgument(
+            "sqlite_dbpage pgno must be positive".to_string(),
+        ));
+    }
+
+    if let Some(schema) = column_schema {
+        ensure_main_schema(schema)?;
+    }
+
+    let data = match column_data {
+        Some(Value::Blob(blob)) => blob.as_slice(),
+        Some(Value::Null) | None => {
+            return Err(LimboError::InvalidArgument(
+                "sqlite_dbpage requires data for updates".to_string(),
+            ))
+        }
+        _ => {
+            return Err(LimboError::InvalidArgument(
+                "sqlite_dbpage data must be a blob".to_string(),
+            ))
+        }
+    };
+
+    let db_size = pager
+        .io
+        .block(|| pager.with_header(|header| header.database_size.get()))?;
+    if target_pgno as u64 > db_size as u64 {
+        return Err(LimboError::InvalidArgument(format!(
+            "sqlite_dbpage pgno {target_pgno} is out of range"
+        )));
+    }
+
+    if let Some(pending_page) = pager.pending_byte_page_id() {
+        if target_pgno == pending_page as i64 {
+            return Err(LimboError::InvalidArgument(
+                "sqlite_dbpage cannot write the pending byte page".to_string(),
+            ));
+        }
+    }
+
+    let expected_len = pager.usable_space() + pager.get_reserved_space().unwrap_or(0) as usize;
+    if data.len() != expected_len {
+        return Err(LimboError::InvalidArgument(format!(
+            "sqlite_dbpage data length must be {expected_len} bytes"
+        )));
+    }
+
+    let (page_ref, completion) = pager.read_page(target_pgno)?;
+    if let Some(c) = completion {
+        pager.io.wait_for_completion(c)?;
+    }
+
+    pager.add_dirty(&page_ref)?;
+    let contents = page_ref.get_contents();
+    let buffer = contents
+        .buffer
+        .as_ref()
+        .expect("sqlite_dbpage page buffer should be loaded");
+    buffer.as_mut_slice().copy_from_slice(data);
+
+    let is_insert = old_rowid.is_none();
+    Ok(if is_insert { Some(target_pgno) } else { None })
 }
