@@ -4,7 +4,7 @@ use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::LocalClock;
 use crate::numeric::Numeric;
-use crate::schema::{Table, SQLITE_SEQUENCE_TABLE_NAME};
+use crate::schema::{Schema, Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -2778,6 +2778,36 @@ pub fn op_savepoint(
             };
             conn.fk_deferred_violations
                 .store(deferred_fk_snapshot, Ordering::SeqCst);
+
+            // After rolling back pages, the in-memory schema cache may be stale
+            // if DDL was executed within the savepoint. Invalidate the pager's
+            // cached schema cookie and check if a schema reparse is needed.
+            pager.set_schema_cookie(None);
+            let in_memory_version = conn.schema.read().schema_version;
+            let pager_ref = conn.pager.load().clone();
+            match pager_ref
+                .io
+                .block(|| pager.with_header(|h| h.schema_cookie.get()))
+            {
+                Ok(on_disk_cookie) if in_memory_version != on_disk_cookie => {
+                    // Schema was modified during the savepoint. Try to reparse
+                    // from the restored database pages. If that fails (e.g. the
+                    // database was empty at the savepoint), use an empty schema.
+                    if conn.reparse_schema().is_err() {
+                        conn.with_schema_mut(|schema| {
+                            *schema = Schema::new();
+                        });
+                    }
+                }
+                Err(_) => {
+                    // Header page is not readable (database empty after rollback).
+                    // Reset to an empty schema.
+                    conn.with_schema_mut(|schema| {
+                        *schema = Schema::new();
+                    });
+                }
+                _ => {} // Schema unchanged, nothing to do.
+            }
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
