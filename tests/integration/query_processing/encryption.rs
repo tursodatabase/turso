@@ -1,7 +1,10 @@
 use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
 use rand::{rng, RngCore};
 use std::sync::Arc;
-use turso_core::{Database, DatabaseOpts, EncryptionOpts, OpenFlags, PlatformIO, Row, IO};
+use turso_core::{
+    CipherMode, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, PlatformIO, Row,
+    IO,
+};
 
 const ENABLE_ENCRYPTION: bool = true;
 
@@ -646,5 +649,344 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             "Should still read data with correct key after wrong key attempt"
         );
     }
+    Ok(())
+}
+
+// Two different keys/ciphers for the two attached databases
+const KEY_A: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+const CIPHER_A: &str = "aegis256";
+const KEY_B: &str = "a2ccfeb5f690ed0ebf01a843f22222f11ed11d9348213f6d8113b677ae84ad38";
+const CIPHER_B: &str = "aes256gcm";
+
+/// Helper: create an encrypted database file with the given cipher, hexkey, table name, and value.
+/// Returns the file path.
+fn create_encrypted_db(
+    cipher: &str,
+    hexkey: &str,
+    table_name: &str,
+    value: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir
+        .path()
+        .join(format!("enc-{}-{}.db", table_name, rng().next_u32()));
+    let db_path_str = db_path.to_str().unwrap();
+
+    let io: Arc<dyn IO + Send> = Arc::new(PlatformIO::new()?);
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let encryption_opts = Some(EncryptionOpts {
+        cipher: cipher.to_string(),
+        hexkey: hexkey.to_string(),
+    });
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_str,
+        OpenFlags::Create,
+        opts,
+        encryption_opts,
+    )?;
+
+    let conn = db.connect()?;
+    let cipher_mode = CipherMode::try_from(cipher)?;
+    let key = EncryptionKey::from_hex_string(hexkey)?;
+    conn.set_encryption_cipher(cipher_mode)?;
+    conn.set_encryption_key(key)?;
+
+    conn.execute(format!(
+        "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, value TEXT)"
+    ))?;
+    conn.execute(format!(
+        "INSERT INTO {table_name} (value) VALUES ('{value}')"
+    ))?;
+    conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    for c in conn.cacheflush()? {
+        io.wait_for_completion(c)?;
+    }
+
+    // Keep the temp dir alive by leaking it (the test process will clean up)
+    std::mem::forget(temp_dir);
+    Ok(db_path)
+}
+
+/// Helper: open a plain (unencrypted) main database with attach + encryption enabled.
+fn open_main_db() -> anyhow::Result<(TempDatabase, Arc<turso_core::Connection>)> {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_encryption(true).with_attach(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+    Ok((tmp_db, conn))
+}
+
+#[turso_macros::test(mvcc)]
+fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    // Create two encrypted databases with different keys and ciphers
+    let path_a = create_encrypted_db(CIPHER_A, KEY_A, "secret_a", "data from A")?;
+    let path_b = create_encrypted_db(CIPHER_B, KEY_B, "secret_b", "data from B")?;
+
+    // --- Test 1: Happy path — attach both with correct keys ---
+    {
+        let (main_db, conn) = open_main_db()?;
+        let attach_a = format!(
+            "ATTACH 'file:{}?cipher={}&hexkey={}' AS aux_a",
+            path_a.to_str().unwrap(),
+            CIPHER_A,
+            KEY_A
+        );
+        let attach_b = format!(
+            "ATTACH 'file:{}?cipher={}&hexkey={}' AS aux_b",
+            path_b.to_str().unwrap(),
+            CIPHER_B,
+            KEY_B
+        );
+        run_query(&main_db, &conn, &attach_a)?;
+        run_query(&main_db, &conn, &attach_b)?;
+
+        let mut row_count = 0;
+        run_query_on_row(
+            &main_db,
+            &conn,
+            "SELECT value FROM aux_a.secret_a",
+            |row: &Row| {
+                assert_eq!(row.get::<String>(0).unwrap(), "data from A");
+                row_count += 1;
+            },
+        )?;
+        assert_eq!(row_count, 1, "Should read one row from aux_a");
+
+        let mut row_count = 0;
+        run_query_on_row(
+            &main_db,
+            &conn,
+            "SELECT value FROM aux_b.secret_b",
+            |row: &Row| {
+                assert_eq!(row.get::<String>(0).unwrap(), "data from B");
+                row_count += 1;
+            },
+        )?;
+        assert_eq!(row_count, 1, "Should read one row from aux_b");
+    }
+
+    // --- Test 2: Wrong key for db_a — use key_b instead ---
+    {
+        let (main_db, conn) = open_main_db()?;
+        let attach_wrong = format!(
+            "ATTACH 'file:{}?cipher={}&hexkey={}' AS aux_a",
+            path_a.to_str().unwrap(),
+            CIPHER_A,
+            KEY_B // wrong key!
+        );
+        // Attaching may succeed (key is not validated at open time), but reading must fail
+        let attach_result = run_query(&main_db, &conn, &attach_wrong);
+        if attach_result.is_ok() {
+            let read_result = run_query_on_row(
+                &main_db,
+                &conn,
+                "SELECT value FROM aux_a.secret_a",
+                |_: &Row| {},
+            );
+            assert!(
+                read_result.is_err(),
+                "Reading with wrong key should fail with decryption error"
+            );
+        }
+        // If attach itself failed, that's also acceptable
+    }
+
+    // --- Test 3: Swapped keys — db_a gets key_b, db_b gets key_a ---
+    {
+        let (main_db, conn) = open_main_db()?;
+        let attach_a_wrong = format!(
+            "ATTACH 'file:{}?cipher={}&hexkey={}' AS aux_a",
+            path_a.to_str().unwrap(),
+            CIPHER_A,
+            KEY_B
+        );
+        let attach_b_wrong = format!(
+            "ATTACH 'file:{}?cipher={}&hexkey={}' AS aux_b",
+            path_b.to_str().unwrap(),
+            CIPHER_B,
+            KEY_A
+        );
+
+        // Attach may succeed at open time; reading should fail for both
+        let _ = run_query(&main_db, &conn, &attach_a_wrong);
+        let _ = run_query(&main_db, &conn, &attach_b_wrong);
+
+        let read_a = run_query_on_row(
+            &main_db,
+            &conn,
+            "SELECT value FROM aux_a.secret_a",
+            |_: &Row| {},
+        );
+        let read_b = run_query_on_row(
+            &main_db,
+            &conn,
+            "SELECT value FROM aux_b.secret_b",
+            |_: &Row| {},
+        );
+        assert!(
+            read_a.is_err() || read_b.is_err(),
+            "At least one read with swapped keys must fail"
+        );
+    }
+
+    // --- Test 4: Missing hexkey in URI ---
+    {
+        let (main_db, conn) = open_main_db()?;
+        let attach_no_hexkey = format!(
+            "ATTACH 'file:{}?cipher={}' AS aux_a",
+            path_a.to_str().unwrap(),
+            CIPHER_A
+        );
+        let result = run_query(&main_db, &conn, &attach_no_hexkey);
+        assert!(
+            result.is_err(),
+            "ATTACH with cipher but no hexkey should fail"
+        );
+    }
+
+    // --- Test 5: Missing cipher in URI ---
+    {
+        let (main_db, conn) = open_main_db()?;
+        let attach_no_cipher = format!(
+            "ATTACH 'file:{}?hexkey={}' AS aux_a",
+            path_a.to_str().unwrap(),
+            KEY_A
+        );
+        let result = run_query(&main_db, &conn, &attach_no_cipher);
+        assert!(
+            result.is_err(),
+            "ATTACH with hexkey but no cipher should fail"
+        );
+    }
+
+    // --- Test 6: No encryption params at all ---
+    {
+        let (main_db, conn) = open_main_db()?;
+        let attach_no_enc = format!("ATTACH '{}' AS aux_a", path_a.to_str().unwrap());
+        let result = run_query(&main_db, &conn, &attach_no_enc);
+        // Opening an encrypted DB without key should fail
+        assert!(
+            result.is_err(),
+            "ATTACH encrypted DB without key should fail"
+        );
+    }
+
+    // --- Test 7: Correct key after wrong key attempt ---
+    {
+        let (main_db, conn) = open_main_db()?;
+
+        // First, try wrong key
+        let attach_wrong = format!(
+            "ATTACH 'file:{}?cipher={}&hexkey={}' AS aux_a",
+            path_a.to_str().unwrap(),
+            CIPHER_A,
+            KEY_B
+        );
+        let _ = run_query(&main_db, &conn, &attach_wrong);
+        // Detach (ignore error if attach failed)
+        let _ = run_query(&main_db, &conn, "DETACH aux_a");
+
+        // Now attach with correct key
+        let attach_correct = format!(
+            "ATTACH 'file:{}?cipher={}&hexkey={}' AS aux_a",
+            path_a.to_str().unwrap(),
+            CIPHER_A,
+            KEY_A
+        );
+        run_query(&main_db, &conn, &attach_correct)?;
+
+        let mut row_count = 0;
+        run_query_on_row(
+            &main_db,
+            &conn,
+            "SELECT value FROM aux_a.secret_a",
+            |row: &Row| {
+                assert_eq!(row.get::<String>(0).unwrap(), "data from A");
+                row_count += 1;
+            },
+        )?;
+        assert_eq!(
+            row_count, 1,
+            "Should read data after re-attaching with correct key"
+        );
+    }
+
+    // --- Test 8: Write to encrypted attached DB ---
+    {
+        let (main_db, conn) = open_main_db()?;
+        let attach_a = format!(
+            "ATTACH 'file:{}?cipher={}&hexkey={}' AS aux_a",
+            path_a.to_str().unwrap(),
+            CIPHER_A,
+            KEY_A
+        );
+        run_query(&main_db, &conn, &attach_a)?;
+
+        run_query(
+            &main_db,
+            &conn,
+            "INSERT INTO aux_a.secret_a (value) VALUES ('new data')",
+        )?;
+        do_flush(&conn, &main_db)?;
+
+        let mut values = Vec::new();
+        run_query_on_row(
+            &main_db,
+            &conn,
+            "SELECT value FROM aux_a.secret_a ORDER BY id",
+            |row: &Row| {
+                values.push(row.get::<String>(0).unwrap());
+            },
+        )?;
+        assert_eq!(values.len(), 2, "Should have original + new row");
+        assert_eq!(values[0], "data from A");
+        assert_eq!(values[1], "new data");
+    }
+
+    // --- Test 9: Different ciphers on same connection ---
+    {
+        let (main_db, conn) = open_main_db()?;
+        let attach_a = format!(
+            "ATTACH 'file:{}?cipher={}&hexkey={}' AS aux_a",
+            path_a.to_str().unwrap(),
+            CIPHER_A,
+            KEY_A
+        );
+        let attach_b = format!(
+            "ATTACH 'file:{}?cipher={}&hexkey={}' AS aux_b",
+            path_b.to_str().unwrap(),
+            CIPHER_B,
+            KEY_B
+        );
+        run_query(&main_db, &conn, &attach_a)?;
+        run_query(&main_db, &conn, &attach_b)?;
+
+        // Verify both are readable with their respective keys/ciphers
+        let mut val_a = String::new();
+        let mut val_b = String::new();
+        run_query_on_row(
+            &main_db,
+            &conn,
+            "SELECT value FROM aux_a.secret_a WHERE id = 1",
+            |row: &Row| {
+                val_a = row.get::<String>(0).unwrap();
+            },
+        )?;
+        run_query_on_row(
+            &main_db,
+            &conn,
+            "SELECT value FROM aux_b.secret_b WHERE id = 1",
+            |row: &Row| {
+                val_b = row.get::<String>(0).unwrap();
+            },
+        )?;
+        assert_eq!(val_a, "data from A");
+        assert_eq!(val_b, "data from B");
+    }
+
     Ok(())
 }
