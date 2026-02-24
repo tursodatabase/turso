@@ -1141,35 +1141,92 @@ fn where_term_is_null_rejecting_for_table(
     !expr_has_null_masking_for_table(expr, table_id)
 }
 
-/// Returns true if an expression uses a NULL-masking function over columns from `table_id`.
+/// Returns true if an expression references a column from `table_id`.
+fn expr_references_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> bool {
+    use crate::translate::expr::{walk_expr, WalkControl};
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |inner: &ast::Expr| -> Result<WalkControl> {
+        match inner {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. }
+                if *table == table_id =>
+            {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+/// Returns true if an expression is a NULL check on a column from `table_id`.
+/// Matches patterns like `col IS NULL`, `col IS NOT NULL`, `IsNull(col)`, `NotNull(col)`.
+fn is_null_check_on_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> bool {
+    match expr {
+        ast::Expr::IsNull(inner) | ast::Expr::NotNull(inner) => {
+            expr_references_table(inner, table_id)
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Is | ast::Operator::IsNot, rhs) => {
+            (matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null))
+                && expr_references_table(lhs, table_id))
+                || (matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null))
+                    && expr_references_table(rhs, table_id))
+        }
+        _ => false,
+    }
+}
+
+/// Returns true if an expression uses a NULL-masking construct over columns from `table_id`.
+/// This includes NULL-masking functions (COALESCE, IFNULL) and CASE/IIF expressions
+/// that explicitly handle the NULL case for columns from the target table.
 fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> bool {
     use crate::translate::expr::{walk_expr, WalkControl};
     let mut found = false;
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::FunctionCall { name, args, .. } = e {
-            if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), args.len()) {
-                if !func.can_mask_nulls() {
-                    return Ok(WalkControl::Continue);
-                }
-                for arg in args {
-                    let mut refs_table = false;
-                    let _ = walk_expr(arg, &mut |inner: &ast::Expr| -> Result<WalkControl> {
-                        match inner {
-                            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. }
-                                if *table == table_id =>
-                            {
-                                refs_table = true;
+        match e {
+            ast::Expr::FunctionCall { name, args, .. } => {
+                if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), args.len())
+                {
+                    // IIF(cond, then, else) is like CASE WHEN cond THEN then ELSE else END.
+                    // If the condition is a null check on the target table, IIF masks nulls.
+                    if matches!(
+                        func,
+                        crate::function::Func::Scalar(crate::function::ScalarFunc::Iif)
+                    ) {
+                        if let Some(cond) = args.first() {
+                            if is_null_check_on_table(cond, table_id) {
+                                found = true;
+                                return Ok(WalkControl::SkipChildren);
                             }
-                            _ => {}
                         }
-                        Ok(WalkControl::Continue)
-                    });
-                    if refs_table {
+                        return Ok(WalkControl::Continue);
+                    }
+                    if !func.can_mask_nulls() {
+                        return Ok(WalkControl::Continue);
+                    }
+                    for arg in args {
+                        if expr_references_table(arg, table_id) {
+                            found = true;
+                            return Ok(WalkControl::SkipChildren);
+                        }
+                    }
+                }
+            }
+            // CASE WHEN <null-check-on-table> THEN ... ELSE ... END
+            // If any WHEN condition checks for NULL on a column from the target table,
+            // the CASE explicitly handles NULLs and can produce non-NULL results.
+            ast::Expr::Case {
+                when_then_pairs, ..
+            } => {
+                for (when_expr, _) in when_then_pairs {
+                    if is_null_check_on_table(when_expr, table_id) {
                         found = true;
                         return Ok(WalkControl::SkipChildren);
                     }
                 }
             }
+            _ => {}
         }
         Ok(WalkControl::Continue)
     });
@@ -3131,6 +3188,113 @@ mod tests {
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::IsNot.into(),
+            table
+        ));
+    }
+
+    #[test]
+    fn null_rejection_detection_case_with_is_null_check_not_rejecting() {
+        let table = TableInternalId::from(15);
+        // CASE WHEN t.col IS NULL THEN 1 ELSE t.col END > 0
+        let expr = Expr::Binary(
+            Box::new(Expr::Case {
+                base: None,
+                when_then_pairs: vec![(
+                    Box::new(Expr::IsNull(Box::new(Expr::Column {
+                        database: None,
+                        table,
+                        column: 0,
+                        is_rowid_alias: false,
+                    }))),
+                    Box::new(Expr::Literal(ast::Literal::Numeric("1".into()))),
+                )],
+                else_expr: Some(Box::new(Expr::Column {
+                    database: None,
+                    table,
+                    column: 0,
+                    is_rowid_alias: false,
+                })),
+            }),
+            ast::Operator::Greater,
+            Box::new(Expr::Literal(ast::Literal::Numeric("0".into()))),
+        );
+
+        assert!(!where_term_is_null_rejecting_for_table(
+            &expr,
+            ast::Operator::Greater.into(),
+            table
+        ));
+    }
+
+    #[test]
+    fn null_rejection_detection_case_without_null_check_is_rejecting() {
+        let table = TableInternalId::from(16);
+        // CASE WHEN t.col > 5 THEN t.col ELSE 0 END > 0
+        let expr = Expr::Binary(
+            Box::new(Expr::Case {
+                base: None,
+                when_then_pairs: vec![(
+                    Box::new(Expr::Binary(
+                        Box::new(Expr::Column {
+                            database: None,
+                            table,
+                            column: 0,
+                            is_rowid_alias: false,
+                        }),
+                        ast::Operator::Greater,
+                        Box::new(Expr::Literal(ast::Literal::Numeric("5".into()))),
+                    )),
+                    Box::new(Expr::Column {
+                        database: None,
+                        table,
+                        column: 0,
+                        is_rowid_alias: false,
+                    }),
+                )],
+                else_expr: Some(Box::new(Expr::Literal(ast::Literal::Numeric("0".into())))),
+            }),
+            ast::Operator::Greater,
+            Box::new(Expr::Literal(ast::Literal::Numeric("0".into()))),
+        );
+
+        // CASE without IS NULL check doesn't mask nulls, so it IS null-rejecting
+        assert!(where_term_is_null_rejecting_for_table(
+            &expr,
+            ast::Operator::Greater.into(),
+            table
+        ));
+    }
+
+    #[test]
+    fn null_rejection_detection_iif_with_is_null_check_not_rejecting() {
+        let table = TableInternalId::from(17);
+        // IIF(t.col IS NULL, 1, t.col) > 0
+        let expr = Expr::Binary(
+            Box::new(fn_call(
+                "iif",
+                vec![
+                    Expr::IsNull(Box::new(Expr::Column {
+                        database: None,
+                        table,
+                        column: 0,
+                        is_rowid_alias: false,
+                    })),
+                    Expr::Literal(ast::Literal::Numeric("1".into())),
+                    Expr::Column {
+                        database: None,
+                        table,
+                        column: 0,
+                        is_rowid_alias: false,
+                    },
+                ],
+            )),
+            ast::Operator::Greater,
+            Box::new(Expr::Literal(ast::Literal::Numeric("0".into()))),
+        );
+
+        assert!(!where_term_is_null_rejecting_for_table(
+            &expr,
+            ast::Operator::Greater.into(),
             table
         ));
     }
