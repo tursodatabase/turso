@@ -864,6 +864,10 @@ impl Drop for WindowsFile {
     fn drop(&mut self) {
         trace!("dropping handle {:08X}", self.file_handle.addr());
 
+        if ENABLE_LOCK_ON_OPEN {
+            let _ = self.unlock_file();
+        }
+
         unsafe {
             CancelIoEx(self.file_handle, ptr::null());
             CloseHandle(self.file_handle);

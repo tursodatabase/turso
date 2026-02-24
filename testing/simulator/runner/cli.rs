@@ -24,6 +24,7 @@ pub enum IoBackend {
     IoUring,
     /// Use win_iocp backend (windows only)
     #[cfg(target_os = "windows")]
+    #[value(name = "experimental_win_iocp")]
     WindowsIOCP,
 }
 
