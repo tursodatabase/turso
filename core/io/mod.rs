@@ -108,6 +108,19 @@ pub trait File: Send + Sync {
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
 
+    /// Returns the device sector size in bytes.
+    /// Matches SQLite's SQLITE_DEFAULT_SECTOR_SIZE (4096).
+    fn sector_size(&self) -> usize {
+        4096
+    }
+
+    /// Returns true if the device supports powersafe overwrite,
+    /// meaning partial sector writes cannot corrupt adjacent data.
+    /// When true, WAL commit frame padding to sector boundaries is skipped.
+    fn device_characteristics_powersafe_overwrite(&self) -> bool {
+        true
+    }
+
     /// Optional method implemented by the IO which supports "partial" files (e.g. file with "holes")
     /// This method is used in sync engine only for now (in partial sync mode) and never used in the core database code
     ///

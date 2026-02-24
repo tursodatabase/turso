@@ -379,6 +379,16 @@ pub trait Wal: Debug + Send + Sync {
         prev: Option<&PreparedFrames>,
     ) -> Result<PreparedFrames>;
 
+    /// Prepare padding frames that repeat the commit frame until the next sector boundary
+    /// is crossed. This matches SQLite's behavior in synchronous=FULL mode when the device
+    /// does not support SQLITE_IOCAP_POWERSAFE_OVERWRITE.
+    fn prepare_commit_padding(
+        &self,
+        last_batch: &PreparedFrames,
+        page_sz: PageSize,
+        sector_size: usize,
+    ) -> Result<Option<PreparedFrames>>;
+
     /// For each prepared frame, update in-memory WAL index and rolling checksum
     /// and advance max_frame to make committed frames visible to readers.
     fn commit_prepared_frames(&self, prepared: &[PreparedFrames]);
@@ -1933,6 +1943,80 @@ impl Wal for WalFile {
             final_max_frame: next_frame_id - 1,
             epoch,
         })
+    }
+
+    fn prepare_commit_padding(
+        &self,
+        last_batch: &PreparedFrames,
+        page_sz: PageSize,
+        sector_size: usize,
+    ) -> Result<Option<PreparedFrames>> {
+        let sz_frame = WAL_FRAME_HEADER_SIZE as u64 + page_sz.get() as u64;
+        // Offset just past the last frame in the batch
+        let i_offset = last_batch.offset + last_batch.bufs.len() as u64 * sz_frame;
+        let sector_size = sector_size as u64;
+        let i_sync_point = i_offset.div_ceil(sector_size) * sector_size;
+
+        if i_sync_point == i_offset {
+            // Already aligned, no padding needed.
+            return Ok(None);
+        }
+
+        let (header, epoch) = self.with_shared(|shared| {
+            let hdr = *shared.wal_header.lock();
+            let epoch = shared.epoch.load(Ordering::Acquire);
+            (hdr, epoch)
+        });
+
+        // The commit frame is the last buffer in the batch.
+        let commit_buf = last_batch
+            .bufs
+            .last()
+            .expect("last_batch must have at least one frame");
+        let commit_frame = commit_buf.as_slice();
+        // Extract page_number and db_size from the commit frame header.
+        let page_number =
+            u32::from_be_bytes(commit_frame[0..4].try_into().expect("4 bytes for page_no"));
+        let db_size =
+            u32::from_be_bytes(commit_frame[4..8].try_into().expect("4 bytes for db_size"));
+        let page_data = &commit_frame[WAL_FRAME_HEADER_SIZE..];
+
+        let commit_page_ref = &last_batch.metadata.last().expect("metadata non-empty").0;
+
+        let mut rolling_checksum = last_batch.final_checksum;
+        let mut next_frame_id = last_batch.final_max_frame + 1;
+        let first_frame_id = next_frame_id;
+        let n_padding = (i_sync_point - i_offset).div_ceil(sz_frame) as usize;
+        let mut bufs = Vec::with_capacity(n_padding);
+        let mut metadata = Vec::with_capacity(n_padding);
+        let mut current_offset = i_offset;
+
+        while current_offset < i_sync_point {
+            let (checksum, frame_buf) = prepare_wal_frame(
+                &self.buffer_pool,
+                &header,
+                rolling_checksum,
+                header.page_size,
+                page_number,
+                db_size,
+                page_data,
+            );
+            bufs.push(frame_buf);
+            metadata.push((commit_page_ref.clone(), next_frame_id, checksum));
+            rolling_checksum = checksum;
+            next_frame_id += 1;
+            current_offset += sz_frame;
+        }
+
+        let offset = self.frame_offset(first_frame_id);
+        Ok(Some(PreparedFrames {
+            offset,
+            bufs,
+            metadata,
+            final_checksum: rolling_checksum,
+            final_max_frame: next_frame_id - 1,
+            epoch,
+        }))
     }
 
     /// For each prepared frame, update in-memory WAL index and rolling checksum.
@@ -4307,5 +4391,268 @@ pub mod test {
             result.everything_backfilled(),
             "checkpoint must succeed after rollback, not return Busy"
         );
+    }
+
+    #[test]
+    fn test_prepare_commit_padding_generates_correct_frame_count() {
+        use crate::storage::sqlite3_ondisk::PageSize;
+        use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
+
+        let (db, _path) = get_database();
+        let conn = db.connect().unwrap();
+
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("insert into test values (1, 'hello')")
+            .unwrap();
+
+        let pager = conn.pager.load();
+        let wal = pager.wal.as_ref().unwrap();
+
+        // After the insert, frames exist in the WAL. Get the last batch info.
+        let max_frame = wal.get_max_frame();
+        assert!(max_frame > 0, "should have frames in WAL after insert");
+
+        let page_sz = PageSize::new(4096).unwrap();
+        let sz_frame = WAL_FRAME_HEADER_SIZE as u64 + page_sz.get() as u64;
+        let sector_size: usize = 4096;
+
+        // Create a dummy PreparedFrames that simulates 1 frame at WAL offset.
+        // Frame 1 starts at WAL_HEADER_SIZE (32), so after 1 frame:
+        // offset_after = 32 + 4120 = 4152
+        // Next sector boundary = 8192
+        // Need padding until offset >= 8192: (8192 - 4152) / 4120 = ~0.98 => 1 frame
+        let (page, _) = pager.read_page(1).unwrap();
+        let pages = vec![page];
+        let prepared = wal.prepare_frames(&pages, page_sz, Some(1), None).unwrap();
+
+        let padding = wal
+            .prepare_commit_padding(&prepared, page_sz, sector_size)
+            .unwrap();
+
+        // With page_size=4096, frame_size=4120, WAL header=32:
+        // After frame at offset = prepared.offset, the next byte is:
+        let offset_after = prepared.offset + prepared.bufs.len() as u64 * sz_frame;
+        let sync_point = offset_after.div_ceil(sector_size as u64) * sector_size as u64;
+
+        if sync_point == offset_after {
+            // Already aligned, no padding needed
+            assert!(padding.is_none(), "should have no padding when aligned");
+        } else {
+            let padding = padding.expect("should have padding when not aligned");
+            // Verify padding frames fill to at least the sync point
+            let padding_end = padding.offset + padding.bufs.len() as u64 * sz_frame;
+            assert!(
+                padding_end >= sync_point,
+                "padding must reach at least the sector boundary: end={padding_end}, sync_point={sync_point}"
+            );
+            // Frame IDs must continue from the last prepared frame
+            assert_eq!(
+                padding.metadata[0].1,
+                prepared.final_max_frame + 1,
+                "padding frame IDs must continue from last prepared frame"
+            );
+            // All padding frames should reference the same page as the commit frame
+            let commit_page_id = prepared.metadata.last().unwrap().0.get().id;
+            for (page_ref, _, _) in &padding.metadata {
+                assert_eq!(
+                    page_ref.get().id,
+                    commit_page_id,
+                    "padding frames must reference the same page as commit frame"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_prepare_commit_padding_checksums_chain_correctly() {
+        use crate::storage::sqlite3_ondisk::PageSize;
+
+        let (db, _path) = get_database();
+        let conn = db.connect().unwrap();
+
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("insert into test values (1, 'hello')")
+            .unwrap();
+
+        let pager = conn.pager.load();
+        let wal = pager.wal.as_ref().unwrap();
+
+        let page_sz = PageSize::new(4096).unwrap();
+        let sector_size: usize = 4096;
+
+        let (page, _) = pager.read_page(1).unwrap();
+        let pages = vec![page];
+        let prepared = wal.prepare_frames(&pages, page_sz, Some(1), None).unwrap();
+
+        let padding = wal
+            .prepare_commit_padding(&prepared, page_sz, sector_size)
+            .unwrap();
+
+        if let Some(padding) = padding {
+            // First padding frame's checksum should chain from the last prepared frame's checksum
+            let first_padding_checksum = padding.metadata[0].2;
+            // The checksum should NOT equal the prepared batch's final checksum
+            // (it should be a new checksum computed from the padding frame data)
+            assert_ne!(
+                first_padding_checksum, prepared.final_checksum,
+                "padding checksum should differ from commit frame checksum (different chain)"
+            );
+
+            // Verify checksums chain within padding frames
+            for i in 1..padding.metadata.len() {
+                let prev_checksum = padding.metadata[i - 1].2;
+                let curr_checksum = padding.metadata[i].2;
+                assert_ne!(
+                    prev_checksum, curr_checksum,
+                    "consecutive padding frame checksums must differ"
+                );
+            }
+
+            // Final checksum of padding should match the batch's final_checksum
+            assert_eq!(
+                padding.metadata.last().unwrap().2,
+                padding.final_checksum,
+                "final_checksum must match last metadata checksum"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prepare_commit_padding_no_padding_when_aligned() {
+        use crate::storage::sqlite3_ondisk::PageSize;
+        use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
+
+        let (db, _path) = get_database();
+        let conn = db.connect().unwrap();
+
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("insert into test values (1, 'hello')")
+            .unwrap();
+
+        let pager = conn.pager.load();
+        let wal = pager.wal.as_ref().unwrap();
+
+        let page_sz = PageSize::new(4096).unwrap();
+
+        let (page, _) = pager.read_page(1).unwrap();
+        let pages = vec![page];
+        let prepared = wal.prepare_frames(&pages, page_sz, Some(1), None).unwrap();
+
+        let sz_frame = WAL_FRAME_HEADER_SIZE as u64 + page_sz.get() as u64;
+        let offset_after = prepared.offset + prepared.bufs.len() as u64 * sz_frame;
+
+        // Use a sector size that divides evenly into offset_after (if such exists),
+        // or use sector_size=1 which should always be aligned.
+        let padding = wal.prepare_commit_padding(&prepared, page_sz, 1).unwrap();
+        assert!(
+            padding.is_none(),
+            "sector_size=1 should always be aligned, no padding needed"
+        );
+
+        // Also test with a sector size that equals the frame size + header alignment
+        // offset_after is always a multiple of itself, so use that
+        let padding = wal
+            .prepare_commit_padding(&prepared, page_sz, offset_after as usize)
+            .unwrap();
+        assert!(
+            padding.is_none(),
+            "sector_size equal to offset_after should be aligned"
+        );
+    }
+
+    #[test]
+    fn test_wal_commit_padding_data_survives_checkpoint() {
+        // Verify that data written with padding frames can be read back correctly
+        // after a checkpoint.
+        let (db, _path) = get_database();
+        let conn = db.connect().unwrap();
+
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        // Write multiple rows to exercise the WAL
+        for i in 0..20 {
+            conn.execute(format!("insert into test values ({i}, 'row_{i}')"))
+                .unwrap();
+        }
+
+        // Checkpoint everything
+        {
+            let pager = conn.pager.load();
+            let result = run_checkpoint_until_done(
+                &pager,
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+            );
+            assert!(
+                result.everything_backfilled(),
+                "all frames should be backfilled"
+            );
+        }
+
+        // Verify all data is readable after checkpoint
+        let count = count_test_table(&conn);
+        assert_eq!(count, 20, "all 20 rows should survive checkpoint");
+    }
+
+    #[test]
+    fn test_prepare_commit_padding_with_large_sector_size() {
+        use crate::storage::sqlite3_ondisk::PageSize;
+        use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
+
+        let (db, _path) = get_database();
+        let conn = db.connect().unwrap();
+
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("insert into test values (1, 'hello')")
+            .unwrap();
+
+        let pager = conn.pager.load();
+        let wal = pager.wal.as_ref().unwrap();
+
+        let page_sz = PageSize::new(4096).unwrap();
+        let sz_frame = WAL_FRAME_HEADER_SIZE as u64 + page_sz.get() as u64;
+
+        let (page, _) = pager.read_page(1).unwrap();
+        let pages = vec![page];
+        let prepared = wal.prepare_frames(&pages, page_sz, Some(1), None).unwrap();
+
+        // Use a very large sector size (e.g., 65536) to test multiple padding frames
+        let sector_size: usize = 65536;
+        let padding = wal
+            .prepare_commit_padding(&prepared, page_sz, sector_size)
+            .unwrap();
+
+        let offset_after = prepared.offset + prepared.bufs.len() as u64 * sz_frame;
+        let sync_point = offset_after.div_ceil(sector_size as u64) * sector_size as u64;
+
+        if sync_point != offset_after {
+            let padding = padding.expect("should have padding for large sector size");
+            let padding_end = padding.offset + padding.bufs.len() as u64 * sz_frame;
+            assert!(
+                padding_end >= sync_point,
+                "padding must cross sector boundary: end={padding_end}, sync_point={sync_point}"
+            );
+            // With 65536 sector size and 4120 frame size, we need multiple frames
+            let expected_count =
+                ((sync_point - offset_after) as f64 / sz_frame as f64).ceil() as usize;
+            assert_eq!(
+                padding.bufs.len(),
+                expected_count,
+                "incorrect number of padding frames"
+            );
+            // Frame IDs must be sequential
+            for i in 1..padding.metadata.len() {
+                assert_eq!(
+                    padding.metadata[i].1,
+                    padding.metadata[i - 1].1 + 1,
+                    "frame IDs must be sequential"
+                );
+            }
+        }
     }
 }

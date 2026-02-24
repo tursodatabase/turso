@@ -3615,8 +3615,23 @@ impl Pager {
                         );
                         return Ok(IOResult::Done(()));
                     }
-                    // Submit all WAL writes
                     let wal_file = wal.wal_file()?;
+                    // In synchronous=FULL mode, pad the commit frame to sector boundary.
+                    // This matches SQLite's behavior when SQLITE_IOCAP_POWERSAFE_OVERWRITE
+                    // is not set: the final commit frame is repeated until the next disk
+                    // sector boundary is crossed, ensuring durability of the commit mark.
+                    if sync_mode == SyncMode::Full
+                        && !wal_file.device_characteristics_powersafe_overwrite()
+                    {
+                        let last_batch = commit_info.prepared_frames.last().unwrap();
+                        let sector_size = wal_file.sector_size();
+                        if let Some(padding) =
+                            wal.prepare_commit_padding(last_batch, page_sz, sector_size)?
+                        {
+                            commit_info.prepared_frames.push(padding);
+                        }
+                    }
+                    // Submit all WAL writes
                     let mut batch = WriteBatch::new(wal_file);
                     for prepared in &commit_info.prepared_frames {
                         batch.writev(prepared.offset, &prepared.bufs);
