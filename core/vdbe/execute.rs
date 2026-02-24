@@ -8141,12 +8141,30 @@ fn new_rowid_inner(
                     return_if_io!(cursor.rowid())
                 };
 
-                // Initialize table's max rowid in MVCC if enabled
+                // Initialize table's max rowid in MVCC if enabled.
+                // For concurrent transactions, initialize to the *allocated* rowid
+                // (current_max + 1) so that another concurrent thread calling
+                // get_next_rowid() won't get the same value. For other modes,
+                // initialize to current_max to match SQLite's rowid behavior.
                 if mv_store.is_some() {
+                    let is_concurrent = matches!(
+                        program.connection.get_mv_tx(),
+                        Some((_, TransactionMode::Concurrent))
+                    );
+                    let init_value = if is_concurrent || program.connection.get_auto_commit()
+                    {
+                        match current_max {
+                            Some(rowid) if rowid < MAX_ROWID => Some(rowid + 1),
+                            None => Some(1),
+                            _ => current_max,
+                        }
+                    } else {
+                        current_max
+                    };
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-                        mvcc_cursor.initialize_max_rowid(current_max)?;
+                        mvcc_cursor.initialize_max_rowid(init_value)?;
                     };
                 }
 
