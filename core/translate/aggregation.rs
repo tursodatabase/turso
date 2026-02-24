@@ -193,10 +193,18 @@ fn emit_collseq_if_needed(
                         reg: None,
                         collation: c,
                     });
+                    return;
                 }
             }
         }
     }
+
+    // Always emit a CollSeq to reset to BINARY default, preventing collation
+    // from a previous aggregate leaking into this one.
+    program.emit_insn(Insn::CollSeq {
+        reg: None,
+        collation: CollationSeq::Binary,
+    });
 }
 
 /// Emits the bytecode for handling duplicates in a distinct aggregate.

@@ -726,3 +726,51 @@ test collate_concat_binary_comparison {
 expect {
     0
 }
+
+# Tests for aggregate COLLATE not leaking to subsequent aggregates (#5539)
+
+setup agg_collate_schema {
+    CREATE TABLE t_agg(a TEXT, b TEXT);
+    INSERT INTO t_agg VALUES ('z', 'a');
+    INSERT INTO t_agg VALUES ('a', 'Z');
+}
+
+@setup agg_collate_schema
+test agg_collate_no_leak_min_max {
+    SELECT MIN(a COLLATE NOCASE), MAX(b) FROM t_agg;
+}
+expect {
+    a|a
+}
+
+@setup agg_collate_schema
+test agg_collate_no_leak_max_min {
+    SELECT MAX(a COLLATE NOCASE), MIN(b) FROM t_agg;
+}
+expect {
+    z|Z
+}
+
+@setup agg_collate_schema
+test agg_collate_no_leak_three_aggs {
+    SELECT MIN(a COLLATE NOCASE), MAX(b), MIN(b) FROM t_agg;
+}
+expect {
+    a|a|Z
+}
+
+@setup agg_collate_schema
+test agg_collate_explicit_nocase_both {
+    SELECT MIN(a COLLATE NOCASE), MAX(b COLLATE NOCASE) FROM t_agg;
+}
+expect {
+    a|Z
+}
+
+@setup agg_collate_schema
+test agg_collate_no_leak_with_count {
+    SELECT MIN(a COLLATE NOCASE), MAX(b), COUNT(*) FROM t_agg;
+}
+expect {
+    a|a|2
+}

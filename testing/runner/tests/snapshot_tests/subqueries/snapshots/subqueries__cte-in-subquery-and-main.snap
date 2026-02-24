@@ -31,8 +31,8 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                    p1  p2  p3  p4              p5  comment
-   0            Init             0  90   0                   0  Start at 90
-   1            Once            57   0   0                   0  goto 57
+   0            Init             0  91   0                   0  Start at 91
+   1            Once            58   0   0                   0  goto 58
    2            BeginSubrtn      2   0   0                   0  r[2]=NULL
    3            Null             0   1   0                   0  r[1]=NULL
    4            OpenEphemeral    0   1   0                   0  cursor=0 is_table=true
@@ -77,50 +77,51 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   43    OpenDup                  3   0   0                   0  new_cursor=3, original_cursor=0
   44    Null                     0  22   0                   0  r[22]=NULL
   45    Integer                  1  23   0                   0  r[23]=1; LIMIT counter
-  46    IfNot                   23  53   0                   0  if !r[23] goto 53
-  47    Rewind                   3  53   0                   0  Rewind  ephemeral()
+  46    IfNot                   23  54   0                   0  if !r[23] goto 54
+  47    Rewind                   3  54   0                   0  Rewind  ephemeral()
   48      Column                 3   0  19                   0  r[19]=ephemeral().column 0
   49      Column                 3   1  20                   0  r[20]=ephemeral().column 1
   50      Copy                  20  24   0                   0  r[24]=r[20]
-  51      AggStep                0  24  22  max              0  accum=r[22] step(r[24])
-  52    Next                     3  48   0                   0
-  53    AggFinal                 0  22   0  max              0  accum=r[22]
-  54    Copy                    22  21   0                   0  r[21]=r[22]
-  55    Copy                    21   1   0                   0  r[1]=r[21]
-  56  Return                     2   0   1                   0
-  57  OpenDup                    4   0   0                   0  new_cursor=4, original_cursor=0
-  58  OpenEphemeral              5   0   0                   0  cursor=5 is_table=false
-  59  Rewind                     4  68   0                   0  Rewind  ephemeral()
-  60    Column                   4   0  26                   0  r[26]=ephemeral().column 0
-  61    Column                   4   1  27                   0  r[27]=ephemeral().column 1
-  62    Copy                    26  28   0                   0  r[28]=r[26]
-  63    Copy                    27  29   0                   0  r[29]=r[27]
-  64    RowId                    4  30   0                   0  r[30]=ephemeral().rowid
-  65    MakeRecord              28   3  25                   0  r[25]=mkrec(r[28..30]); for ephemeral_subquery_t5
-  66    IdxInsert                5  25  28                   0  key=r[25]
-  67  Next                       4  60   0                   0
-  68  OpenRead                   6   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  69  Rewind                     6  89   0                   0  Rewind table products
-  70    Column                   6   3  37                   0  r[37]=products.price
-  71    RealAffinity            37   0   0                   0
-  72    Copy                     1  39   0                   0  r[39]=r[1]
-  73    Multiply                39  40  38                   0  r[38]=r[39]*r[40]
-  74    Le                      37  38  88  Binary           0  if r[37]<=r[38] goto 88
-  75    Column                   6   2  41                   0  r[41]=products.category_id
-  76    IsNull                  41  88   0                   0  if (r[41]==NULL) goto 88
-  77    Affinity                41   1   0                   0  r[41..42] = D
-  78    SeekGE                   5  88  41                   0  key=[41..41]
-  79      IdxGT                  5  88  41                   0  key=[41..41]
-  80      Column                 5   0  31                   0  r[31]=ephemeral(ephemeral_subquery_t5).category_id
-  81      Column                 5   1  32                   0  r[32]=ephemeral(ephemeral_subquery_t5).avg_price
-  82      Column                 6   1  33                   0  r[33]=products.name
-  83      Column                 6   3  34                   0  r[34]=products.price
-  84      RealAffinity          34   0   0                   0
-  85      Column                 5   1  35                   0  r[35]=ephemeral(ephemeral_subquery_t5).avg_price
-  86      ResultRow             33   3   0                   0  output=r[33..35]
-  87    Next                     5  79   0                   0
-  88  Next                       6  70   0                   0
-  89  Halt                       0   0   0                   0
-  90  Transaction                0   1  11                   0  iDb=0 tx_mode=Read
-  91  Real                       0  40   0  0.8              0  r[40]=0.8
-  92  Goto                       0   1   0                   0
+  51      CollSeq                0   0   0  Binary           0  collation=Binary
+  52      AggStep                0  24  22  max              0  accum=r[22] step(r[24])
+  53    Next                     3  48   0                   0
+  54    AggFinal                 0  22   0  max              0  accum=r[22]
+  55    Copy                    22  21   0                   0  r[21]=r[22]
+  56    Copy                    21   1   0                   0  r[1]=r[21]
+  57  Return                     2   0   1                   0
+  58  OpenDup                    4   0   0                   0  new_cursor=4, original_cursor=0
+  59  OpenEphemeral              5   0   0                   0  cursor=5 is_table=false
+  60  Rewind                     4  69   0                   0  Rewind  ephemeral()
+  61    Column                   4   0  26                   0  r[26]=ephemeral().column 0
+  62    Column                   4   1  27                   0  r[27]=ephemeral().column 1
+  63    Copy                    26  28   0                   0  r[28]=r[26]
+  64    Copy                    27  29   0                   0  r[29]=r[27]
+  65    RowId                    4  30   0                   0  r[30]=ephemeral().rowid
+  66    MakeRecord              28   3  25                   0  r[25]=mkrec(r[28..30]); for ephemeral_subquery_t5
+  67    IdxInsert                5  25  28                   0  key=r[25]
+  68  Next                       4  61   0                   0
+  69  OpenRead                   6   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  70  Rewind                     6  90   0                   0  Rewind table products
+  71    Column                   6   3  37                   0  r[37]=products.price
+  72    RealAffinity            37   0   0                   0
+  73    Copy                     1  39   0                   0  r[39]=r[1]
+  74    Multiply                39  40  38                   0  r[38]=r[39]*r[40]
+  75    Le                      37  38  89  Binary           0  if r[37]<=r[38] goto 89
+  76    Column                   6   2  41                   0  r[41]=products.category_id
+  77    IsNull                  41  89   0                   0  if (r[41]==NULL) goto 89
+  78    Affinity                41   1   0                   0  r[41..42] = D
+  79    SeekGE                   5  89  41                   0  key=[41..41]
+  80      IdxGT                  5  89  41                   0  key=[41..41]
+  81      Column                 5   0  31                   0  r[31]=ephemeral(ephemeral_subquery_t5).category_id
+  82      Column                 5   1  32                   0  r[32]=ephemeral(ephemeral_subquery_t5).avg_price
+  83      Column                 6   1  33                   0  r[33]=products.name
+  84      Column                 6   3  34                   0  r[34]=products.price
+  85      RealAffinity          34   0   0                   0
+  86      Column                 5   1  35                   0  r[35]=ephemeral(ephemeral_subquery_t5).avg_price
+  87      ResultRow             33   3   0                   0  output=r[33..35]
+  88    Next                     5  80   0                   0
+  89  Next                       6  71   0                   0
+  90  Halt                       0   0   0                   0
+  91  Transaction                0   1  11                   0  iDb=0 tx_mode=Read
+  92  Real                       0  40   0  0.8              0  r[40]=0.8
+  93  Goto                       0   1   0                   0
