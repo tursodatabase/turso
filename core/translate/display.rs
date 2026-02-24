@@ -53,12 +53,12 @@ impl Display for Plan {
                 }
                 if let Some(order_by) = order_by {
                     writeln!(f, "ORDER BY:")?;
-                    for (expr, dir) in order_by {
+                    for ob in order_by {
                         writeln!(
                             f,
-                            "  - {} {}",
-                            expr,
-                            if *dir == SortOrder::Asc {
+                            "  - column {} {}",
+                            ob.column_idx,
+                            if ob.order == SortOrder::Asc {
                                 "ASC"
                             } else {
                                 "DESC"
@@ -466,9 +466,11 @@ impl ToTokens for Plan {
                     s.append(TokenType::TK_BY, None)?;
 
                     s.comma(
-                        order_by.iter().map(|(expr, order)| ast::SortedColumn {
-                            expr: expr.clone().into(),
-                            order: Some(*order),
+                        order_by.iter().map(|ob| ast::SortedColumn {
+                            expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                                (ob.column_idx + 1).to_string(),
+                            ))),
+                            order: Some(ob.order),
                             nulls: None,
                         }),
                         context,

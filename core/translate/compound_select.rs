@@ -1,16 +1,19 @@
-use crate::schema::{Index, IndexColumn};
+use crate::schema::{BTreeTable, Index, IndexColumn};
 use crate::sync::Arc;
 use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
-use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
-use crate::translate::result_row::emit_columns_to_destination;
+use crate::translate::plan::{
+    CompoundSelectOrderBy, EphemeralRowidMode, Plan, QueryDestination, SelectPlan,
+};
+use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{to_u16, Insn};
 use crate::{emit_explain, LimboError, QueryMode};
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
 
+use crate::schema::PseudoCursorType;
 use tracing::Level;
 
 /// Emits bytecode for a compound SELECT statement (UNION, INTERSECT, EXCEPT, UNION ALL).
@@ -22,18 +25,22 @@ pub fn emit_program_for_compound_select(
     resolver: &Resolver,
     plan: Plan,
 ) -> crate::Result<Option<usize>> {
-    let Plan::CompoundSelect {
-        left,
-        right_most,
-        limit,
-        offset,
-        ..
-    } = &plan
-    else {
-        crate::bail_parse_error!("expected compound select plan");
+    // Destructure by value so we can modify fields for ORDER BY
+    let (left, mut right_most, limit, offset, order_by) = match plan {
+        Plan::CompoundSelect {
+            left,
+            right_most,
+            limit,
+            offset,
+            order_by,
+        } => (left, right_most, limit, offset, order_by),
+        _ => crate::bail_parse_error!("expected compound select plan"),
     };
 
-    let right_plan = right_most.clone();
+    let has_order_by = order_by.is_some();
+    let num_result_cols = right_most.result_columns.len();
+    let original_destination = right_most.query_destination.clone();
+
     let right_most_ctx = TranslateCtx::new(
         program,
         resolver.fork(),
@@ -103,6 +110,50 @@ pub fn emit_program_for_compound_select(
         })
         .transpose()?;
 
+    // When ORDER BY is present, redirect compound output to an ephemeral table,
+    // then sort and emit to the original destination.
+    let (eph_cursor_id, sort_cursor_id) = if let Some(ref order_by_cols) = order_by {
+        let eph_table = Arc::new(BTreeTable {
+            root_page: 0,
+            name: String::new(),
+            columns: vec![],
+            primary_key_columns: vec![],
+            has_rowid: true,
+            is_strict: false,
+            has_autoincrement: false,
+            unique_sets: vec![],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+        });
+        let eph_cursor = program.alloc_cursor_id(CursorType::BTreeTable(eph_table.clone()));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: eph_cursor,
+            is_table: true,
+        });
+
+        right_most.query_destination = QueryDestination::EphemeralTable {
+            cursor_id: eph_cursor,
+            table: eph_table,
+            rowid_mode: EphemeralRowidMode::Auto,
+        };
+
+        // Set up Sorter for ORDER BY
+        let order_and_collations: Vec<(SortOrder, Option<_>)> = order_by_cols
+            .iter()
+            .map(|ob| (ob.order, ob.collation))
+            .collect();
+        let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
+        program.emit_insn(Insn::SorterOpen {
+            cursor_id: sort_cursor,
+            columns: order_by_cols.len(),
+            order_and_collations,
+        });
+
+        (Some(eph_cursor), Some(sort_cursor))
+    } else {
+        (None, None)
+    };
+
     // When a compound SELECT is part of a query that yields results to a coroutine (e.g. within an INSERT clause),
     // we must allocate registers for the result columns to be yielded. Each subselect will then yield to
     // the coroutine using the same set of registers.
@@ -138,31 +189,96 @@ pub fn emit_program_for_compound_select(
     // any tables are actually touched by the query. Previously this only used the rightmost subselect's
     // table references, but that breaks down with e.g. "SELECT * FROM t UNION VALUES(1)" where VALUES(1)
     // does not have any table references and we would erroneously not start a transaction.
-    for (plan, _) in left {
-        program
-            .table_references
-            .extend(plan.table_references.clone());
+    let right_plan_table_refs = right_most.table_references.clone();
+    for (p, _) in &left {
+        program.table_references.extend(p.table_references.clone());
     }
-    program.table_references.extend(right_plan.table_references);
+    program.table_references.extend(right_plan_table_refs);
+
+    // When ORDER BY is present, don't pass LIMIT/OFFSET to the compound select —
+    // they will be applied after sorting. But we still need to check LIMIT 0 to
+    // skip the entire compound select.
+    let label_order_by_end = if has_order_by {
+        let label = program.allocate_label();
+        if let Some(limit_ctx) = &limit_ctx {
+            program.emit_insn(Insn::IfNot {
+                reg: limit_ctx.reg_limit,
+                target_pc: label,
+                jump_if_null: false,
+            });
+        }
+        Some(label)
+    } else {
+        None
+    };
+
+    let (compound_limit_ctx, compound_offset_reg) = if has_order_by {
+        (None, None)
+    } else {
+        (limit_ctx, offset_reg)
+    };
+
+    // Reconstruct plan without ORDER BY (it's handled at this level)
+    let compound_plan = Plan::CompoundSelect {
+        left,
+        right_most,
+        limit: if has_order_by { None } else { limit },
+        offset: if has_order_by { None } else { offset },
+        order_by: None,
+    };
 
     emit_compound_select(
         program,
-        plan,
+        compound_plan,
         &right_most_ctx.resolver,
-        limit_ctx,
-        offset_reg,
+        compound_limit_ctx,
+        compound_offset_reg,
         reg_result_cols_start,
         &query_destination,
     )?;
     program.pop_current_parent_explain();
 
+    // If ORDER BY is present, sort the collected rows and emit to the original destination
+    let final_reg_result_cols_start = if let Some(order_by_cols) = order_by {
+        let eph_cursor = eph_cursor_id.unwrap();
+        let sort_cursor = sort_cursor_id.unwrap();
+        let num_sort_keys = order_by_cols.len();
+
+        emit_sort_from_ephemeral(
+            program,
+            eph_cursor,
+            sort_cursor,
+            &order_by_cols,
+            num_result_cols,
+            num_sort_keys,
+            &original_destination,
+            limit_ctx,
+            offset_reg,
+        )?;
+
+        // For ResultRows, we return None (same as without ORDER BY)
+        // For CoroutineYield/EphemeralTable, the sorted output uses different registers
+        if matches!(original_destination, QueryDestination::ResultRows) {
+            None
+        } else {
+            reg_result_cols_start
+        }
+    } else {
+        reg_result_cols_start
+    };
+
+    // Resolve the LIMIT 0 early-exit label if ORDER BY was present
+    if let Some(label) = label_order_by_end {
+        program.preassign_label_to_next_insn(label);
+    }
+
     // Restore reg_result_cols_start after emit_compound_select, because nested
     // subqueries (e.g. CTE coroutines) can overwrite program.reg_result_cols_start
     // with their own result column registers. This mirrors the same fix in
     // emit_program_for_select_with_inputs.
-    program.reg_result_cols_start = reg_result_cols_start;
+    program.reg_result_cols_start = final_reg_result_cols_start;
 
-    Ok(reg_result_cols_start)
+    Ok(final_reg_result_cols_start)
 }
 
 // Emits bytecode for a compound SELECT statement. This function processes the rightmost part of
@@ -633,5 +749,140 @@ fn read_intersect_rows(
     program.emit_insn(Insn::Close {
         cursor_id: left_cursor_id,
     });
+    Ok(())
+}
+
+/// Reads all rows from an ephemeral table, inserts them into a Sorter (with ORDER BY keys),
+/// then reads sorted rows and emits them to the given destination with LIMIT/OFFSET.
+#[allow(clippy::too_many_arguments)]
+fn emit_sort_from_ephemeral(
+    program: &mut ProgramBuilder,
+    eph_cursor: usize,
+    sort_cursor: usize,
+    order_by_cols: &[CompoundSelectOrderBy],
+    num_result_cols: usize,
+    num_sort_keys: usize,
+    destination: &QueryDestination,
+    limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
+) -> crate::Result<()> {
+    emit_explain!(program, false, "USE SORTER FOR ORDER BY".to_owned());
+
+    // Phase 1: Iterate ephemeral table and insert each row into the Sorter.
+    // Sorter layout: [sort_key_1, ..., sort_key_n, result_col_1, ..., result_col_m]
+    let total_sorter_cols = num_sort_keys + num_result_cols;
+    let sorter_regs = program.alloc_registers(total_sorter_cols);
+
+    let label_eph_end = program.allocate_label();
+    let label_eph_loop = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: eph_cursor,
+        pc_if_empty: label_eph_end,
+    });
+    program.preassign_label_to_next_insn(label_eph_loop);
+
+    // Copy sort key columns from the ephemeral table
+    for (i, ob) in order_by_cols.iter().enumerate() {
+        program.emit_insn(Insn::Column {
+            cursor_id: eph_cursor,
+            column: ob.column_idx,
+            dest: sorter_regs + i,
+            default: None,
+        });
+    }
+    // Copy all result columns from the ephemeral table
+    for i in 0..num_result_cols {
+        program.emit_insn(Insn::Column {
+            cursor_id: eph_cursor,
+            column: i,
+            dest: sorter_regs + num_sort_keys + i,
+            default: None,
+        });
+    }
+
+    // Insert into Sorter
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(sorter_regs),
+        count: to_u16(total_sorter_cols),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::SorterInsert {
+        cursor_id: sort_cursor,
+        record_reg,
+    });
+
+    program.emit_insn(Insn::Next {
+        cursor_id: eph_cursor,
+        pc_if_next: label_eph_loop,
+    });
+    program.preassign_label_to_next_insn(label_eph_end);
+    program.emit_insn(Insn::Close {
+        cursor_id: eph_cursor,
+    });
+
+    // Phase 2: Read sorted rows from the Sorter and emit to destination.
+    let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+        column_count: total_sorter_cols,
+    }));
+    let sorter_data_reg = program.alloc_register();
+
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: pseudo_cursor,
+        content_reg: sorter_data_reg,
+        num_fields: total_sorter_cols,
+    });
+
+    let label_sort_end = program.allocate_label();
+    let label_sort_next = program.allocate_label();
+    let label_sort_loop = program.allocate_label();
+
+    program.emit_insn(Insn::SorterSort {
+        cursor_id: sort_cursor,
+        pc_if_empty: label_sort_end,
+    });
+    program.preassign_label_to_next_insn(label_sort_loop);
+
+    // Apply OFFSET
+    emit_offset(program, label_sort_next, offset_reg);
+
+    program.emit_insn(Insn::SorterData {
+        cursor_id: sort_cursor,
+        dest_reg: sorter_data_reg,
+        pseudo_cursor,
+    });
+
+    // Read result columns from the Sorter (they start after the sort keys)
+    let result_regs = program.alloc_registers(num_result_cols);
+    for i in 0..num_result_cols {
+        program.emit_insn(Insn::Column {
+            cursor_id: pseudo_cursor,
+            column: num_sort_keys + i,
+            dest: result_regs + i,
+            default: None,
+        });
+    }
+
+    // Emit to destination
+    emit_columns_to_destination(program, destination, result_regs, num_result_cols)?;
+
+    // Apply LIMIT
+    if let Some(limit_ctx) = limit_ctx {
+        program.emit_insn(Insn::DecrJumpZero {
+            reg: limit_ctx.reg_limit,
+            target_pc: label_sort_end,
+        });
+    }
+
+    program.preassign_label_to_next_insn(label_sort_next);
+    program.emit_insn(Insn::SorterNext {
+        cursor_id: sort_cursor,
+        pc_if_next: label_sort_loop,
+    });
+    program.preassign_label_to_next_insn(label_sort_end);
+
     Ok(())
 }

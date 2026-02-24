@@ -1,0 +1,196 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    INSERT INTO t1 VALUES(3, 'cherry'), (1, 'apple'), (2, 'banana');
+    CREATE TABLE t2(x INTEGER, y TEXT);
+    INSERT INTO t2 VALUES(5, 'elderberry'), (4, 'date');
+}
+
+# Basic UNION ALL with ORDER BY
+@setup schema
+test union-all-order-by-asc {
+    SELECT a, b FROM t1 UNION ALL SELECT x, y FROM t2 ORDER BY 1;
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+    4|date
+    5|elderberry
+}
+
+# UNION ALL with ORDER BY DESC
+@setup schema
+test union-all-order-by-desc {
+    SELECT a, b FROM t1 UNION ALL SELECT x, y FROM t2 ORDER BY 1 DESC;
+}
+expect {
+    5|elderberry
+    4|date
+    3|cherry
+    2|banana
+    1|apple
+}
+
+# UNION (dedup) with ORDER BY
+@setup schema
+test union-order-by {
+    SELECT a FROM t1 UNION SELECT x FROM t2 UNION SELECT 3 ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+# UNION with ORDER BY on text column
+@setup schema
+test union-order-by-text {
+    SELECT b FROM t1 UNION SELECT y FROM t2 ORDER BY 1;
+}
+expect {
+    apple
+    banana
+    cherry
+    date
+    elderberry
+}
+
+# EXCEPT with ORDER BY
+@setup schema
+test except-order-by {
+    SELECT a FROM t1 EXCEPT SELECT 2 ORDER BY 1;
+}
+expect {
+    1
+    3
+}
+
+# INTERSECT with ORDER BY
+@setup schema
+test intersect-order-by {
+    SELECT a FROM t1 INTERSECT SELECT a FROM t1 WHERE a > 1 ORDER BY 1 DESC;
+}
+expect {
+    3
+    2
+}
+
+# ORDER BY with LIMIT
+@setup schema
+test order-by-with-limit {
+    SELECT a FROM t1 UNION ALL SELECT x FROM t2 ORDER BY 1 LIMIT 3;
+}
+expect {
+    1
+    2
+    3
+}
+
+# ORDER BY with LIMIT and OFFSET
+@setup schema
+test order-by-with-limit-offset {
+    SELECT a FROM t1 UNION ALL SELECT x FROM t2 ORDER BY 1 LIMIT 2 OFFSET 2;
+}
+expect {
+    3
+    4
+}
+
+# ORDER BY by column alias
+@setup schema
+test order-by-alias {
+    SELECT a AS val FROM t1 UNION ALL SELECT x FROM t2 ORDER BY val;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+# ORDER BY second column
+@setup schema
+test order-by-second-column {
+    SELECT a, b FROM t1 UNION ALL SELECT x, y FROM t2 ORDER BY 2;
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+    4|date
+    5|elderberry
+}
+
+# Compound of VALUES with ORDER BY
+test values-union-order-by {
+    SELECT 3 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+# UNION ALL with duplicates, ORDER BY preserves all rows
+@setup schema
+test union-all-duplicates-order-by {
+    SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY 1;
+}
+expect {
+    1
+    1
+    2
+}
+
+# UNION with duplicates removed, then ORDER BY
+@setup schema
+test union-dedup-order-by {
+    SELECT 1 AS x UNION SELECT 1 UNION SELECT 2 ORDER BY 1 DESC;
+}
+expect {
+    2
+    1
+}
+
+# ORDER BY with LIMIT 0 returns nothing
+test order-by-limit-zero {
+    SELECT 1 AS x UNION ALL SELECT 2 ORDER BY 1 LIMIT 0;
+}
+expect {
+}
+
+# ORDER BY with multiple sort columns
+@setup schema
+test order-by-multiple-columns {
+    SELECT 1 AS a, 'z' AS b UNION ALL SELECT 2, 'a' UNION ALL SELECT 1, 'a' ORDER BY 1, 2;
+}
+expect {
+    1|a
+    1|z
+    2|a
+}
+
+# NULL values in ORDER BY
+test null-order-by {
+    SELECT NULL AS x UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY 1;
+}
+expect {
+
+    1
+    2
+}
+
+# Mixed types in ORDER BY
+test mixed-types-order-by {
+    SELECT 'abc' AS x UNION ALL SELECT 123 UNION ALL SELECT NULL ORDER BY 1;
+}
+expect {
+
+    123
+    abc
+}

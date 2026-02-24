@@ -198,16 +198,107 @@ pub fn prepare_select_plan(
                 .limit
                 .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
 
-            // FIXME: handle ORDER BY for compound selects
-            if !select.order_by.is_empty() {
-                crate::bail_parse_error!("ORDER BY is not supported for compound SELECTs yet");
-            }
+            // Parse ORDER BY for compound selects.
+            // Each ORDER BY term must reference a result column (by number, alias, or expression).
+            let order_by = if select.order_by.is_empty() {
+                None
+            } else {
+                let mut compound_order_by = Vec::new();
+                for o in select.order_by {
+                    if o.nulls == Some(ast::NullsOrder::Last) {
+                        crate::bail_parse_error!("NULLS LAST is not supported yet in ORDER BY");
+                    }
+                    let sort_order = o.order.unwrap_or(ast::SortOrder::Asc);
+
+                    // Extract explicit COLLATE wrapper
+                    let (explicit_collation, mut inner_expr) = match *o.expr {
+                        ast::Expr::Collate(inner, coll_name) => (
+                            Some(crate::translate::collate::CollationSeq::new(
+                                coll_name.as_str(),
+                            )?),
+                            *inner,
+                        ),
+                        other => (None, other),
+                    };
+
+                    // Resolve ORDER BY term to a result column index
+                    let first_plan = &mut left[0].0;
+                    let column_idx = if let ast::Expr::Literal(ast::Literal::Numeric(ref num)) =
+                        inner_expr
+                    {
+                        // Numeric literal: 1-based column position
+                        if let Ok(col_num) = num.parse::<usize>() {
+                            if col_num == 0 || col_num > first_plan.result_columns.len() {
+                                crate::bail_parse_error!("invalid column index: {}", col_num);
+                            }
+                            col_num - 1
+                        } else {
+                            crate::bail_parse_error!(
+                                "{} - ORDER BY term out of range - should be between 1 and {}",
+                                num,
+                                first_plan.result_columns.len()
+                            );
+                        }
+                    } else {
+                        // Try to bind against the first SELECT's context
+                        bind_and_rewrite_expr(
+                            &mut inner_expr,
+                            Some(&mut first_plan.table_references),
+                            Some(&first_plan.result_columns),
+                            resolver,
+                            BindingBehavior::TryResultColumnsFirst,
+                        )?;
+                        first_plan
+                            .result_columns
+                            .iter()
+                            .position(|rc| exprs_are_equivalent(&inner_expr, &rc.expr))
+                            .ok_or_else(|| {
+                                crate::LimboError::ParseError(
+                                    "ORDER BY term does not match any output column".to_string(),
+                                )
+                            })?
+                    };
+
+                    // Derive collation
+                    let first_plan = &left[0].0;
+                    let collation = if let Some(coll) = explicit_collation {
+                        Some(coll)
+                    } else {
+                        crate::translate::collate::get_collseq_from_expr(
+                            &first_plan.result_columns[column_idx].expr,
+                            &first_plan.table_references,
+                        )?
+                    };
+
+                    compound_order_by.push(crate::translate::plan::CompoundSelectOrderBy {
+                        column_idx,
+                        order: sort_order,
+                        collation,
+                    });
+                }
+
+                // Remove duplicate ORDER BY terms (keep first occurrence)
+                let mut i = 0;
+                while i < compound_order_by.len() {
+                    if compound_order_by[..i]
+                        .iter()
+                        .any(|prev| prev.column_idx == compound_order_by[i].column_idx)
+                    {
+                        compound_order_by.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                Some(compound_order_by)
+            };
+
             Ok(Plan::CompoundSelect {
                 left,
                 right_most: last,
                 limit,
                 offset,
-                order_by: None,
+                order_by,
             })
         }
     }

@@ -239,6 +239,18 @@ impl Ord for EvalAt {
     }
 }
 
+/// Describes one ORDER BY term for a compound SELECT (UNION/INTERSECT/EXCEPT/UNION ALL).
+/// Each term maps to a result column index with a sort direction and optional collation.
+#[derive(Debug, Clone)]
+pub struct CompoundSelectOrderBy {
+    /// 0-based index into the result columns of the first SELECT.
+    pub column_idx: usize,
+    /// Sort direction (ASC or DESC).
+    pub order: SortOrder,
+    /// Collation sequence for sorting; derived from explicit COLLATE or column definition.
+    pub collation: Option<CollationSeq>,
+}
+
 /// A query plan is either a SELECT or a DELETE (for now)
 #[derive(Debug, Clone)]
 pub enum Plan {
@@ -248,7 +260,7 @@ pub enum Plan {
         right_most: SelectPlan,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+        order_by: Option<Vec<CompoundSelectOrderBy>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),
