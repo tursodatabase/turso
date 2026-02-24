@@ -8,27 +8,15 @@ use crate::Result;
 use turso_parser::ast;
 use turso_parser::ast::TableInternalId;
 
-/// Normalize a query expression so it can be compared with an
+/// Normalize a bound query expression so it can be compared with an
 /// expression stored on an index definition.
 ///
-/// We need to remove the bindings and turn them back into identifiers so we can say:
-///
-/// - `CREATE INDEX idx ON t(Expr::Id(a) + Expr::Id(b));`
-/// - `SELECT * FROM t WHERE Expr::Column(name: 'a') + Expr::Column(name: 'b') = 10;`
-///
-/// After normalization, both sides look like `Expr::Id('a') + Expr::Id('b')`, allowing an
-/// equality check to spot the match.
-pub fn normalize_expr_for_index_matching(
-    expr: &ast::Expr,
-    table_reference: &JoinedTable,
-    table_references: &TableReferences,
-) -> ast::Expr {
+/// Replaces `Expr::Column` nodes with `Expr::Id` and `Expr::RowId` with
+/// `Expr::Id("rowid")`, so that a bound query expression like
+/// `Expr::Column(name: 'a') + Expr::Column(name: 'b')` matches the index
+/// definition form `Expr::Id('a') + Expr::Id('b')`.
+pub fn normalize_expr_for_index(expr: &ast::Expr, table_reference: &JoinedTable) -> ast::Expr {
     let mut expr = expr.clone();
-    let _table_idx = table_references
-        .joined_tables()
-        .iter()
-        .position(|t| t.internal_id == table_reference.internal_id)
-        .expect("table must exist in table_references");
     let columns = table_reference.table.columns();
     let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
         match e {
@@ -46,6 +34,24 @@ pub fn normalize_expr_for_index_matching(
     };
     let _ = walk_expr_mut(&mut expr, &mut normalize);
     expr
+}
+
+/// Wrapper around [`normalize_expr_for_index`] that asserts the table exists
+/// in `table_references`. Callers in the constraint extraction path (which
+/// always have a full `TableReferences`) should prefer this variant.
+pub fn normalize_expr_for_index_matching(
+    expr: &ast::Expr,
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+) -> ast::Expr {
+    debug_assert!(
+        table_references
+            .joined_tables()
+            .iter()
+            .any(|t| t.internal_id == table_reference.internal_id),
+        "table must exist in table_references"
+    );
+    normalize_expr_for_index(expr, table_reference)
 }
 
 /// Determine whether an expression references columns from exactly one table

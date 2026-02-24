@@ -7,6 +7,7 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::schema::Schema;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
+use crate::translate::expression_index::normalize_expr_for_index;
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, BinaryExprSide, Constraint, RangeConstraintRef,
 };
@@ -311,10 +312,13 @@ fn find_best_access_method_for_btree(
                         index.columns[i].expr.is_none() && index.columns[i].pos_in_table == *col_no
                     }
                     // Expression column target on expression index, check expr equivalence
-                    (ColumnTarget::Expr(expr), Some(index)) => index.columns[i]
-                        .expr
-                        .as_ref()
-                        .is_some_and(|e| exprs_are_equivalent(e, unsafe { &**expr })),
+                    (ColumnTarget::Expr(expr), Some(index)) => {
+                        index.columns[i].expr.as_ref().is_some_and(|e| {
+                            let normalized =
+                                normalize_expr_for_index(unsafe { &**expr }, rhs_table);
+                            exprs_are_equivalent(e, &normalized)
+                        })
+                    }
                     // Normal column target on rowid index, check if column is rowid
                     (ColumnTarget::Column(col_no), None) => {
                         rowid_column_idx.is_some_and(|idx| idx == *col_no)

@@ -1,0 +1,237 @@
+@database :memory:
+@skip-file-if mvcc "expression indexes are not supported with mvcc"
+
+# Expression index ORDER BY and GROUP BY optimization tests.
+# Verifies that expression indexes are used for sorting and grouping,
+# matching SQLite behavior.
+
+# ORDER BY with arithmetic expression index
+@cross-check-integrity
+test order-by-arithmetic-expr-index {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES(3, 'world');
+    INSERT INTO t VALUES(1, 'hello');
+    INSERT INTO t VALUES(2, 'foo');
+    CREATE INDEX ti ON t(a+1);
+    SELECT a, b FROM t ORDER BY a+1;
+}
+expect {
+    1|hello
+    2|foo
+    3|world
+}
+
+# ORDER BY DESC with expression index
+@cross-check-integrity
+test order-by-desc-expr-index {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES(3, 'world');
+    INSERT INTO t VALUES(1, 'hello');
+    INSERT INTO t VALUES(2, 'foo');
+    CREATE INDEX ti ON t(a+1);
+    SELECT a, b FROM t ORDER BY a+1 DESC;
+}
+expect {
+    3|world
+    2|foo
+    1|hello
+}
+
+# ORDER BY with function-based expression index
+@cross-check-integrity
+test order-by-function-expr-index {
+    CREATE TABLE t(name TEXT);
+    INSERT INTO t VALUES('Charlie');
+    INSERT INTO t VALUES('Alice');
+    INSERT INTO t VALUES('Bob');
+    CREATE INDEX ti ON t(lower(name));
+    SELECT name FROM t ORDER BY lower(name);
+}
+expect {
+    Alice
+    Bob
+    Charlie
+}
+
+# ORDER BY with concat expression index
+@cross-check-integrity
+test order-by-concat-expr-index {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(3);
+    INSERT INTO t VALUES(1);
+    INSERT INTO t VALUES(2);
+    CREATE INDEX tid ON t(concat(a, 'suffix'));
+    SELECT a FROM t ORDER BY concat(a, 'suffix');
+}
+expect {
+    1
+    2
+    3
+}
+
+# GROUP BY with expression index
+@cross-check-integrity
+test group-by-expr-index {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES(1, 'x');
+    INSERT INTO t VALUES(2, 'y');
+    INSERT INTO t VALUES(3, 'z');
+    INSERT INTO t VALUES(1, 'w');
+    CREATE INDEX ti ON t(a+1);
+    SELECT a+1, count(*) FROM t GROUP BY a+1;
+}
+expect {
+    2|2
+    3|1
+    4|1
+}
+
+# GROUP BY with function expression index
+@cross-check-integrity
+test group-by-function-expr-index {
+    CREATE TABLE t(name TEXT, val INT);
+    INSERT INTO t VALUES('Alice', 10);
+    INSERT INTO t VALUES('alice', 20);
+    INSERT INTO t VALUES('BOB', 30);
+    INSERT INTO t VALUES('bob', 40);
+    CREATE INDEX ti ON t(lower(name));
+    SELECT lower(name), sum(val) FROM t GROUP BY lower(name);
+}
+expect {
+    alice|30
+    bob|70
+}
+
+# WHERE + ORDER BY with expression index
+@cross-check-integrity
+test where-and-order-by-expr-index {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES(1, 'hello');
+    INSERT INTO t VALUES(2, 'foo');
+    INSERT INTO t VALUES(3, 'world');
+    INSERT INTO t VALUES(4, 'bar');
+    INSERT INTO t VALUES(5, 'baz');
+    CREATE INDEX ti ON t(a+1);
+    SELECT a, b FROM t WHERE a+1 > 3 ORDER BY a+1;
+}
+expect {
+    3|world
+    4|bar
+    5|baz
+}
+
+# Expression index with multi-column expression
+@cross-check-integrity
+test order-by-multi-column-expr-index {
+    CREATE TABLE t(x, y);
+    INSERT INTO t VALUES(3, 1);
+    INSERT INTO t VALUES(1, 2);
+    INSERT INTO t VALUES(2, 3);
+    CREATE INDEX ti ON t(x+y);
+    SELECT x, y FROM t ORDER BY x+y;
+}
+expect {
+    1|2
+    3|1
+    2|3
+}
+
+# ORDER BY expression index with NULLs
+@cross-check-integrity
+test order-by-expr-index-with-nulls {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(3);
+    INSERT INTO t VALUES(NULL);
+    INSERT INTO t VALUES(1);
+    INSERT INTO t VALUES(2);
+    CREATE INDEX ti ON t(a+1);
+    SELECT a FROM t ORDER BY a+1;
+}
+expect {
+
+    1
+    2
+    3
+}
+
+# Expression index SELECT with covering index
+@cross-check-integrity
+test select-covering-expr-index {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES(1, 'x');
+    INSERT INTO t VALUES(2, 'y');
+    INSERT INTO t VALUES(3, 'z');
+    CREATE INDEX ti ON t(a+1);
+    SELECT a+1 FROM t;
+}
+expect {
+    2
+    3
+    4
+}
+
+# INSERT into table with pre-existing expression index
+@cross-check-integrity
+test insert-with-expression-index {
+    CREATE TABLE t(a);
+    CREATE INDEX ti ON t(a*2);
+    INSERT INTO t VALUES(10);
+    INSERT INTO t VALUES(20);
+    INSERT INTO t VALUES(30);
+    SELECT * FROM t WHERE a*2 = 40;
+}
+expect {
+    20
+}
+
+# WHERE with range on expression index
+@cross-check-integrity
+test where-range-expr-index {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(1);
+    INSERT INTO t VALUES(2);
+    INSERT INTO t VALUES(3);
+    INSERT INTO t VALUES(4);
+    INSERT INTO t VALUES(5);
+    CREATE INDEX ti ON t(a+1);
+    SELECT a FROM t WHERE a+1 BETWEEN 3 AND 5;
+}
+expect {
+    2
+    3
+    4
+}
+
+# DELETE with expression index
+@cross-check-integrity
+test delete-with-expression-index {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES(1, 'x');
+    INSERT INTO t VALUES(2, 'y');
+    INSERT INTO t VALUES(3, 'z');
+    CREATE INDEX ti ON t(a+1);
+    DELETE FROM t WHERE a+1 = 3;
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    3|z
+}
+
+# GROUP BY with expression index and HAVING
+@cross-check-integrity
+test group-by-expr-index-with-having {
+    CREATE TABLE t(a, val INT);
+    INSERT INTO t VALUES(1, 10);
+    INSERT INTO t VALUES(2, 20);
+    INSERT INTO t VALUES(1, 30);
+    INSERT INTO t VALUES(2, 40);
+    INSERT INTO t VALUES(3, 50);
+    CREATE INDEX ti ON t(a+1);
+    SELECT a+1, sum(val) FROM t GROUP BY a+1 HAVING sum(val) > 25;
+}
+expect {
+    2|40
+    3|60
+    4|50
+}

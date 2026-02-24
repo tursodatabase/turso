@@ -309,9 +309,19 @@ fn collect_non_aggregate_expressions<'a>(
     }
 
     for group_expr in &group_by.exprs {
+        // Check both the collected base columns AND the original result/order-by
+        // expressions. collect_result_columns only extracts leaf column nodes,
+        // so complex expressions like `a+1` from expression indexes would not
+        // match via base columns alone.
         let in_result = result_columns
             .iter()
-            .any(|expr| exprs_are_equivalent(expr, group_expr));
+            .any(|expr| exprs_are_equivalent(expr, group_expr))
+            || root_result_columns
+                .iter()
+                .any(|rc| exprs_are_equivalent(&rc.expr, group_expr))
+            || order_by
+                .iter()
+                .any(|(e, _)| exprs_are_equivalent(e, group_expr));
         non_aggregate_expressions.push((group_expr, in_result));
     }
     for expr in result_columns {

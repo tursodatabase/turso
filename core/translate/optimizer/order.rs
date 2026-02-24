@@ -2,6 +2,7 @@ use crate::turso_assert_greater_than_or_equal;
 use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
+        expression_index::normalize_expr_for_index,
         optimizer::access_method::AccessMethodParams,
         plan::{GroupBy, HashJoinType, IterationDirection, JoinedTable, TableReferences},
         planner::table_mask_from_expr,
@@ -248,7 +249,9 @@ pub fn plan_satisfies_order_target(
                         let column_matches = match (&target_col.target, &idx_col.expr) {
                             (ColumnTarget::Column(col_no), None) => idx_col.pos_in_table == *col_no,
                             (ColumnTarget::Expr(expr), Some(idx_expr)) => {
-                                exprs_are_equivalent(unsafe { &**expr }, idx_expr)
+                                let normalized =
+                                    normalize_expr_for_index(unsafe { &**expr }, table_ref);
+                                exprs_are_equivalent(&normalized, idx_expr)
                             }
                             (ColumnTarget::RowId, _) => false,
                             _ => false,
