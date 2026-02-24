@@ -393,8 +393,8 @@ fn find_best_access_method_for_vtab(
     constraints: &[Constraint],
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
+    _base_row_count: RowCountEstimate,
+    _params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order);
 
@@ -405,16 +405,9 @@ fn find_best_access_method_for_vtab(
     match best_index_result {
         Ok(index_info) => {
             Ok(Some(AccessMethod {
-                // TODO: Base cost on `IndexInfo::estimated_cost` and output cardinality on `IndexInfo::estimated_rows`
-                cost: estimate_cost_for_scan_or_seek(
-                    None,
-                    &[],
-                    &[],
-                    input_cardinality,
-                    base_row_count,
-                    false,
-                    params,
-                ),
+                // Use the estimated cost from the virtual table's best_index(),
+                // scaled by input_cardinality for nested loop joins.
+                cost: Cost(index_info.estimated_cost * input_cardinality),
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
                     idx_str: index_info.idx_str,
