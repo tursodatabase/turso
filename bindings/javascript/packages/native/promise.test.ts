@@ -228,6 +228,42 @@ test('attach', async () => {
     }
 })
 
+test('fts', async () => {
+    const db = await connect(":memory:", { experimental: ["index_method"] });
+    await db.exec(`
+        CREATE TABLE documents (id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+        INSERT INTO documents VALUES (1, 'Introduction to Rust', 'Rust is a systems programming language focused on safety and performance');
+        INSERT INTO documents VALUES (2, 'JavaScript Guide', 'JavaScript is a dynamic programming language used for web development');
+        INSERT INTO documents VALUES (3, 'Database Internals', 'Understanding how databases store and retrieve data efficiently');
+        CREATE INDEX documents_fts ON documents USING fts (title, body);
+    `);
+
+    // fts_match search
+    const matchResults = await db.prepare(
+        "SELECT id, title, fts_score(title, body, 'programming language') as score FROM documents WHERE fts_match(title, body, 'programming language')"
+    ).all();
+    expect(matchResults.length).toBe(2);
+    expect(matchResults.map(r => r.id).sort()).toEqual([1, 2]);
+    for (const row of matchResults) {
+        expect(row.score).toBeGreaterThan(0);
+    }
+
+    // fts_highlight
+    const highlightResults = await db.prepare(
+        "SELECT id, fts_highlight(title, '<b>', '</b>', 'Rust') as highlighted FROM documents WHERE fts_match(title, body, 'Rust')"
+    ).all();
+    expect(highlightResults.length).toBe(1);
+    expect(highlightResults[0].id).toBe(1);
+    expect(highlightResults[0].highlighted).toContain('<b>');
+    expect(highlightResults[0].highlighted).toContain('Rust');
+
+    // no match
+    const noResults = await db.prepare(
+        "SELECT * FROM documents WHERE fts_match(title, body, 'nonexistentterm')"
+    ).all();
+    expect(noResults.length).toBe(0);
+})
+
 test('blobs', async () => {
     const db = await connect(":memory:");
     const rows = await db.prepare("SELECT x'1020' as x").all();
