@@ -1,123 +1,154 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# React Native Example App
 
-# Getting Started
+Example app for `@tursodatabase/sync-react-native`. Runs functional tests,
+a performance benchmark, concurrency smoke tests, and (optionally) sync/encryption tests. Results including
+DB open time and query throughput are displayed in the app UI.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+## Prerequisites
 
-## Step 1: Start Metro
+- [React Native environment](https://reactnative.dev/docs/set-up-your-environment) set up
+- Rust toolchain (`rustup`)
+- For Android: Android SDK/NDK, `cargo-ndk` (`cargo install cargo-ndk`)
+- For iOS: Xcode, CocoaPods, Ruby >= 3.2 (see [Run on iOS](#run-on-ios))
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+## Build the native Rust library
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+Before building the example app, you must cross-compile the Rust core for
+your target platform. From the repo root:
 
 ```sh
-# Using npm
-npm start
+# Android (all ABIs)
+cd bindings/react-native && make android
 
-# OR using Yarn
-yarn start
+# iOS (device + simulator)
+cd bindings/react-native && make ios
 ```
 
-### Testing Sync API (Optional)
+## Install JS dependencies
 
-To test the sync API (pull/push), set the following environment variables before starting Metro:
+The example app links to the binding via `file:../../bindings/react-native`.
+When npm installs it, it runs the binding's `prepare` script which needs
+`react-native-builder-bob` (a devDep of the binding). To avoid a
+`bob: command not found` error, install the binding's dependencies first:
 
 ```sh
+# Step 1: install binding deps (--ignore-scripts avoids chicken-and-egg problem)
+cd bindings/react-native && npm install --ignore-scripts
+
+# Step 2: install example app (this will now find bob when prepare runs)
+cd ../../examples/react-native && npm install
+```
+
+## Run on Android
+
+```sh
+# Terminal 1: start Metro
+npm start
+
+# Terminal 2: build and deploy
+npm run android
+```
+
+## Run on iOS
+
+macOS ships with Ruby 2.6 which is too old for the bundler version in
+`Gemfile.lock`. Install a modern Ruby via Homebrew:
+
+```sh
+brew install ruby
+# Add to your shell profile (~/.zshrc or ~/.bashrc):
+export PATH="/opt/homebrew/opt/ruby/bin:$PATH"
+```
+
+Then install the required bundler:
+
+```sh
+gem install bundler:4.0.4 # might require sudo
+```
+
+Install CocoaPods deps (first time only, or after updating native deps):
+
+```sh
+cd ios && bundle install && bundle exec pod install && cd ..
+```
+
+Then run:
+
+```sh
+# Terminal 1: start Metro
+npm start
+
+# Terminal 2: build and deploy
+npm run ios
+```
+
+If the default simulator target doesn't work (e.g. "application is not
+supported on this Mac"), specify one explicitly:
+
+```sh
+npm run ios -- --simulator="iPhone 16 Pro"
+```
+
+## Testing with a custom database
+
+To benchmark against an existing `.sqlite` file, push it to the device.
+The app opens it via `connect({ path: 'yourfile.sqlite' })` which resolves
+to the app's data directory.
+
+If the database has an active WAL, checkpoint it first so all data is in
+the main file:
+
+```sh
+sqlite3 yourfile.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+```
+
+**Android:**
+
+```sh
+adb push yourfile.sqlite /sdcard/yourfile.sqlite
+adb shell "run-as com.tursoexample mkdir -p databases"
+adb shell "cat /sdcard/yourfile.sqlite | run-as com.tursoexample sh -c 'cat > databases/yourfile.sqlite'"
+
+# Verify the file copied correctly (check size matches the original)
+adb shell "run-as com.tursoexample ls -la databases/yourfile.sqlite"
+```
+
+**iOS Simulator:**
+
+```sh
+# Launch the app once first so the container exists, then:
+APP_DATA="$(xcrun simctl get_app_container booted org.reactjs.native.example.TursoExample data)"
+cp yourfile.sqlite "$APP_DATA/Documents/yourfile.sqlite"
+```
+
+Then open it in your app code with a relative path matching the filename:
+
+```ts
+const db = await connect({ path: 'yourfile.sqlite' });
+```
+
+Relative paths resolve to the app's data directory automatically
+(Android: `databases/`, iOS: `Documents/`).
+
+Reload the app after copying (Cmd+R on iOS, R R on Android).
+
+## Sync and encryption tests
+
+Set environment variables before starting Metro. You **must** use
+`--reset-cache` when changing env vars (they're inlined at build time by Babel).
+
+```sh
+# Sync only
 TURSO_DATABASE_URL=libsql://your-db.turso.io \
 TURSO_AUTH_TOKEN=your-auth-token \
 npm start -- --reset-cache
-```
 
-### Testing Encryption (Optional)
-
-To also test encryption, add the encryption key:
-
-```sh
+# Sync + encryption
 TURSO_DATABASE_URL=libsql://your-db.turso.io \
 TURSO_AUTH_TOKEN=your-auth-token \
-TURSO_ENCRYPTION_KEY=your-base64-encryption-key \
+TURSO_ENCRYPTION_KEY=your-base64-key \
 TURSO_ENCRYPTION_CIPHER=aes256gcm \
 npm start -- --reset-cache
 ```
 
 Supported ciphers: `aes256gcm`, `aes128gcm`, `chacha20poly1305` (default: `aes256gcm`)
-
-> **Important**: Environment variables are inlined at build time by Babel. If you change env vars, you **must** reset Metro's cache with `--reset-cache`, otherwise the old values will be used.
-
-## Step 2: Build and run your app
-
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
-
-```sh
-# Using npm
-npm run android
-
-# OR using Yarn
-yarn android
-```
-
-### iOS
-
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
-
-```sh
-bundle install
-```
-
-Then, and every time you update your native dependencies, run:
-
-```sh
-bundle exec pod install
-```
-
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
-
-```sh
-# Using npm
-npm run ios
-
-# OR using Yarn
-yarn ios
-```
-
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
-
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
-
-## Step 3: Modify your app
-
-Now that you have successfully run the app, let's make changes!
-
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
-
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
