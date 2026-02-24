@@ -107,6 +107,13 @@ pub use error::{io_error, CompletionError, LimboError};
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
 pub use io::UringIO;
+#[cfg(all(
+    feature = "fs",
+    target_os = "windows",
+    feature = "experimental_win_iocp",
+    not(miri)
+))]
+pub use io::WindowsIOCP;
 pub use io::{
     clock::{Clock, MonotonicInstant, WallClockInstant},
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
@@ -1475,6 +1482,9 @@ impl Database {
                 "syscall" => Arc::new(SyscallIO::new()?),
                 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
                 "io_uring" => Arc::new(UringIO::new()?),
+                #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
+                "experimental_win_iocp" => Arc::new(WindowsIOCP::new()?),
+
                 other => {
                     return Err(LimboError::InvalidArgument(format!("no such VFS: {other}")));
                 }

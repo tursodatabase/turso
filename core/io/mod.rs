@@ -27,6 +27,12 @@ cfg_block! {
         pub use PlatformIO as SyscallIO;
     }
 
+    #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))] {
+        mod win_iocp;
+        #[cfg(feature = "fs")]
+        pub use win_iocp::WindowsIOCP;
+    }
+
     #[cfg(any(not(any(target_family = "unix", target_os = "android", target_os = "ios")), miri))] {
         mod generic;
         pub use generic::GenericIO as PlatformIO;
@@ -602,6 +608,45 @@ mod shuttle_tests {
         }
     }
 
+    #[cfg(all(
+        target_os = "windows",
+        feature = "experimental_win_iocp",
+        feature = "fs",
+        not(miri)
+    ))]
+    struct WinIOCPFactory {
+        temp_dir: tempfile::TempDir,
+    }
+
+    #[cfg(all(
+        target_os = "windows",
+        feature = "experimental_win_iocp",
+        feature = "fs",
+        not(miri)
+    ))]
+    impl WinIOCPFactory {
+        fn new() -> Self {
+            Self {
+                temp_dir: tempfile::tempdir().unwrap(),
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_os = "windows",
+        feature = "experimental_win_iocp",
+        feature = "fs",
+        not(miri)
+    ))]
+    impl IOFactory for WinIOCPFactory {
+        fn create(&self) -> Arc<dyn IO> {
+            Arc::new(WindowsIOCP::new().unwrap())
+        }
+        fn temp_dir(&self) -> PathBuf {
+            self.temp_dir.path().to_path_buf()
+        }
+    }
+
     /// Macro to generate shuttle tests for all IO implementations.
     /// Creates a test for MemoryIO, and conditionally for PlatformIO and UringIO.
     macro_rules! shuttle_io_test {
@@ -623,6 +668,13 @@ mod shuttle_tests {
                 fn [<shuttle_ $test_name _uring>]() {
                     shuttle::check_random(|| $test_impl(UringIOFactory::new()), 1000);
                 }
+
+                #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", feature = "fs", not(miri)))]
+                #[test]
+                fn [<shuttle_ $test_name _win_iocp>]() {
+                    shuttle::check_random(|| $test_impl(WinIOCPFactory::new()), 1000);
+                }
+
             }
         };
     }

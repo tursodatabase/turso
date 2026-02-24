@@ -23,7 +23,11 @@ name = "plan_to_test"
 path = "plan_to_test.rs"
 
 [dependencies]
-turso_core = { workspace = true, features = ["simulator", "io_uring"] }
+turso_core = { workspace = true, features = [
+    "simulator",
+    "io_uring",
+    "experimental_win_iocp",
+] }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 regex = { workspace = true }

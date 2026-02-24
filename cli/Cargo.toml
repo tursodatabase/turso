@@ -67,6 +67,7 @@ itertools.workspace = true
 [features]
 default = ["io_uring", "mimalloc"]
 io_uring = ["turso_core/io_uring"]
+experimental_win_iocp = ["turso_core/experimental_win_iocp"]
 tracing_release = ["turso_core/tracing_release"]
 mimalloc = ["dep:mimalloc"]
 fts = ["turso_core/fts"]

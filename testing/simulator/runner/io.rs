@@ -36,6 +36,8 @@ impl SimulatorIO {
             IoBackend::Default => Box::new(PlatformIO::new()?),
             #[cfg(target_os = "linux")]
             IoBackend::IoUring => Box::new(turso_core::UringIO::new()?),
+            #[cfg(target_os = "windows")]
+            IoBackend::WindowsIOCP => Box::new(turso_core::WindowsIOCP::new()?),
             IoBackend::Memory => {
                 panic!("Memory IO has its own impl, is not supported in SimulatorIO");
             }

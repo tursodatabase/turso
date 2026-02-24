@@ -61,7 +61,7 @@ pub struct Opts {
     #[clap(
         short = 'v',
         long,
-        help = "Select VFS. options are io_uring (if feature enabled), memory, and syscall"
+        help = "Select VFS. options are io_uring (if feature enabled), experimental_win_iocp (if feature enabled on windows), memory, and syscall"
     )]
     pub vfs: Option<String>,
     #[clap(long, help = "Open the database in read-only mode")]

@@ -966,6 +966,9 @@ mod tests {
                     found_tables.push(table_name);
                 }
                 StepResult::Done => break,
+                StepResult::IO => {
+                    stmt.get_pager().io.step()?;
+                }
                 _ => {}
             }
         }

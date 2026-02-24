@@ -827,7 +827,18 @@ impl Connection {
         else {
             return Ok(false);
         };
-        self.get_pager().io.wait_for_completion(c)?;
+        match self.get_pager().io.wait_for_completion(c) {
+            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+            Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
+                std::io::ErrorKind::UnexpectedEof,
+                _,
+            ))) => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+            _ => {}
+        }
+
         self.try_wal_watermark_read_page_end(page, page_ref)
     }
 
@@ -1180,6 +1191,10 @@ impl Connection {
             #[cfg(all(target_os = "linux", feature = "io_uring"))]
             {
                 all_vfs.push("io_uring".to_string());
+            }
+            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+            {
+                all_vfs.push("experimental_win_iocp".to_string());
             }
             all_vfs.extend(crate::ext::list_vfs_modules());
         }

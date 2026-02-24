@@ -50,7 +50,7 @@ pub struct Opts {
     /// Select VFS
     #[clap(
         long,
-        help = "Select VFS. options are io_uring (if feature enabled), memory, and syscall"
+        help = "Select VFS. options are io_uring (if feature enabled), win_iocp (if feature enabled), memory, and syscall"
     )]
     pub vfs: Option<String>,
 

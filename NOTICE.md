@@ -40,3 +40,9 @@ This project depends on libm, distributed by the rust-lang project:
 * License: licenses/extensions/libm-apache-license.md (Apache License v2.0)
 * License: licenses/extensions/libm-mit-license.md (MIT License)
 * Homepage: https://github.com/rust-lang/libm
+
+This project depends on windows-sys, distributed by the Microsoft:
+
+* License: licenses/core/windows-apache.license.md (Apache License v2.0)
+* License: licenses/core/windows-mit-license.md (MIT License)
+* Homepage: https://github.com/microsoft/windows-rs

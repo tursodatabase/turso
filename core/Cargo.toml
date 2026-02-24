@@ -24,6 +24,7 @@ fs = ["turso_ext/vfs"]
 json = []
 uuid = ["dep:uuid"]
 io_uring = ["dep:io-uring", "rustix/io_uring"]
+experimental_win_iocp = []
 time = []
 fuzz = []
 omit_autovacuum = []
@@ -39,6 +40,14 @@ nanosecond-bench = ["bench"]
 fts = ["dep:tantivy"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
@@ -83,8 +92,8 @@ uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
 tempfile = { workspace = true }
 pack1 = { version = "1.0.0", features = ["bytemuck"] }
 bytemuck = "1.23.1"
-aes-gcm = { version = "0.10.3"}
-aes = { version = "0.8.4"}
+aes-gcm = { version = "0.10.3" }
+aes = { version = "0.8.4" }
 turso_parser = { workspace = true }
 twox-hash = "2.1.1"
 intrusive-collections = "0.9.7"
@@ -150,7 +159,6 @@ test-log = { version = "0.2.17", features = ["trace"] }
 sorted-vec = "0.8.6"
 mimalloc = { workspace = true, default-features = false }
 divan.workspace = true
-
 
 
 [[bench]]
