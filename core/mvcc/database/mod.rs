@@ -45,7 +45,6 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use tracing::instrument;
 use tracing::Level;
-use turso_macros::turso_assert_unreachable;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};
