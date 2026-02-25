@@ -186,7 +186,10 @@ mod savepoint_tests {
         helpers::history_tail(history, max_lines)
     }
 
-    #[turso_macros::test(mvcc)]
+    // MVCC variant disabled: the monotonic rowid allocator intentionally never reuses
+    // rowids after DELETE/ROLLBACK, diverging from SQLite's reuse behavior. This makes
+    // differential rowid comparison invalid for auto-generated rowids.
+    #[turso_macros::test]
     pub fn named_savepoint_differential_fuzz(db: TempDatabase) {
         let (mut rng, seed) = helpers::init_fuzz_test("named_savepoint_differential_fuzz");
 
