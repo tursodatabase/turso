@@ -46,6 +46,7 @@ pub mod value;
 pub mod sync;
 
 pub use connection::Connection;
+use turso_sdk_kit::rsapi::TursoError;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -239,15 +240,21 @@ impl Builder {
             turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
                 path: self.path,
                 experimental_features: features,
-                async_io: false,
+                async_io: true,
                 encryption: self.encryption_opts,
                 vfs: self.vfs,
                 io: None,
                 db_file: None,
             });
-        let result = db.open()?;
-        // async_io is false - so db.open() will return result immediately
-        assert!(!result.is_io());
+        while let Some(io_c) = db.open()?.io() {
+            // At this point IO must already be created
+            let io = db
+                .io()
+                .expect("IO must have been set on the first call to db open");
+            io_c.wait_async(io.as_ref())
+                .await
+                .map_err(TursoError::from)?;
+        }
         Ok(Database { inner: db })
     }
 }

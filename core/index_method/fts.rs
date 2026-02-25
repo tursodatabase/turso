@@ -65,7 +65,7 @@ const ROWID_FIELD: &str = "rowid";
 
 // Thread-local tokenizer cache to avoid creating a new tokenizer for each call.
 // TextAnalyzer is not Send/Sync, so we use thread_local storage.
-thread_local! {
+crate::thread::thread_local! {
     static FTS_TOKENIZER: RefCell<TextAnalyzer> = RefCell::new(
         TextAnalyzer::builder(SimpleTokenizer::default())
             .filter(tantivy::tokenizer::LowerCaser)
@@ -2400,7 +2400,7 @@ impl FtsCursor {
 impl Drop for FtsCursor {
     fn drop(&mut self) {
         // Skip cleanup if we're already panicking
-        if std::thread::panicking() {
+        if crate::thread::panicking() {
             return;
         }
 
