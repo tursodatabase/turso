@@ -988,6 +988,52 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(TransitionResult::Done(()))
     }
 
+    /// Convert TxID references to Timestamps in a version chain for this transaction's commit.
+    ///
+    /// For each version whose `begin` or `end` matches `self.tx_id`, replaces the TxID
+    /// with the commit timestamp and appends the version to `log_record`. Returns `true`
+    /// if any converted version belongs to `sqlite_schema` (i.e. a schema change was committed).
+    fn convert_version_timestamps(
+        &self,
+        row_versions: &mut [RowVersion],
+        end_ts: u64,
+        log_record: &mut LogRecord,
+        mvcc_store: &Arc<MvStore<Clock>>,
+    ) -> bool {
+        let mut did_touch_schema = false;
+        for row_version in row_versions.iter_mut() {
+            if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                if id == self.tx_id {
+                    // New version is valid STARTING FROM committing transaction's end timestamp
+                    // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                    row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                    mvcc_store.insert_version_raw(
+                        &mut log_record.row_versions,
+                        row_version.clone(),
+                    ); // FIXME: optimize cloning out
+                    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        did_touch_schema = true;
+                    }
+                }
+            }
+            if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                if id == self.tx_id {
+                    // Old version is valid UNTIL committing transaction's end timestamp
+                    // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                    row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                    mvcc_store.insert_version_raw(
+                        &mut log_record.row_versions,
+                        row_version.clone(),
+                    ); // FIXME: optimize cloning out
+                    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        did_touch_schema = true;
+                    }
+                }
+            }
+        }
+        did_touch_schema
+    }
+
     /// Validates commit-time write-write conflicts for one table row key.
     ///
     /// Returns [LimboError::WriteWriteConflict] when another transaction committed or is
@@ -1439,37 +1485,13 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 for id in &self.write_set {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
                         let mut row_versions = row_versions.value().write();
-                        for row_version in row_versions.iter_mut() {
-                            if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
-                                if id == self.tx_id {
-                                    // New version is valid STARTING FROM committing transaction's end timestamp
-                                    // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                    row_version.begin = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                    mvcc_store.insert_version_raw(
-                                        &mut log_record.row_versions,
-                                        row_version.clone(),
-                                    ); // FIXME: optimize cloning out
-
-                                    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                        self.did_commit_schema_change = true;
-                                    }
-                                }
-                            }
-                            if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
-                                if id == self.tx_id {
-                                    // Old version is valid UNTIL committing transaction's end timestamp
-                                    // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                    row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                    mvcc_store.insert_version_raw(
-                                        &mut log_record.row_versions,
-                                        row_version.clone(),
-                                    ); // FIXME: optimize cloning out
-
-                                    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                        self.did_commit_schema_change = true;
-                                    }
-                                }
-                            }
+                        if self.convert_version_timestamps(
+                            &mut row_versions,
+                            *end_ts,
+                            &mut log_record,
+                            mvcc_store,
+                        ) {
+                            self.did_commit_schema_change = true;
                         }
                     }
                     if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
@@ -1479,30 +1501,13 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         };
                         if let Some(row_versions) = index.get(index_key) {
                             let mut row_versions = row_versions.value().write();
-                            for row_version in row_versions.iter_mut() {
-                                if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
-                                    if id == self.tx_id {
-                                        // New version is valid STARTING FROM committing transaction's end timestamp
-                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                        row_version.begin =
-                                            Some(TxTimestampOrID::Timestamp(*end_ts));
-                                        mvcc_store.insert_version_raw(
-                                            &mut log_record.row_versions,
-                                            row_version.clone(),
-                                        ); // FIXME: optimize cloning out
-                                    }
-                                }
-                                if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
-                                    if id == self.tx_id {
-                                        // Old version is valid UNTIL committing transaction's end timestamp
-                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                        row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                        mvcc_store.insert_version_raw(
-                                            &mut log_record.row_versions,
-                                            row_version.clone(),
-                                        );
-                                    }
-                                }
+                            if self.convert_version_timestamps(
+                                &mut row_versions,
+                                *end_ts,
+                                &mut log_record,
+                                mvcc_store,
+                            ) {
+                                self.did_commit_schema_change = true;
                             }
                         }
                     }
