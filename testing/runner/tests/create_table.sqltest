@@ -115,7 +115,6 @@ test create_table_duplicate_column_names_quoted {
 expect error {
 }
 
-@skip-if mvcc "not supported in MVCC mode"
 @cross-check-integrity
 test create_table_view_collision-1 {
     CREATE VIEW v_same AS SELECT 1;
@@ -124,7 +123,6 @@ test create_table_view_collision-1 {
 expect error {
 }
 
-@skip-if mvcc "not supported in MVCC mode"
 @cross-check-integrity
 test create_view_table_collision-1 {
     CREATE TABLE t_same(x INT);
@@ -133,7 +131,6 @@ test create_view_table_collision-1 {
 expect error {
 }
 
-@skip-if mvcc "not supported in MVCC mode"
 @cross-check-integrity
 test create_index_view_collision-1 {
     CREATE VIEW i_same AS SELECT 1;
@@ -143,7 +140,6 @@ test create_index_view_collision-1 {
 expect error {
 }
 
-@skip-if mvcc "not supported in MVCC mode"
 @cross-check-integrity
 test create_view_index_collision-1 {
     CREATE TABLE t4(w);
