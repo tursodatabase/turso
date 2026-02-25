@@ -1,0 +1,584 @@
+---
+title: SELECT
+description: Query rows from one or more tables using filtering, joining, grouping, sorting, and set operations
+sidebarTitle: SELECT
+---
+
+# SELECT
+
+Retrieves rows from one or more tables. SELECT is the primary way to read data in Turso and supports filtering, joining, aggregation, sorting, subqueries, and set operations.
+
+## Syntax
+
+```sql
+[WITH cte_name AS (select_statement) [, ...]]
+SELECT [DISTINCT] result_column [, ...]
+  [FROM table_or_subquery [join_clause ...]]
+  [WHERE expression]
+  [GROUP BY expression [, ...]]
+  [HAVING expression]
+  [WINDOW window_name AS (window_definition) [, ...]]
+  [compound_operator select_statement]
+  [ORDER BY ordering_term [, ...]]
+  [LIMIT expression [OFFSET expression]]
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `result_column` | expression, `*`, or `table.*` | Columns or expressions to return. Use `*` for all columns |
+| `table_or_subquery` | identifier or subquery | Table name, aliased table, or parenthesized SELECT |
+| `expression` | expression | Any valid SQL expression |
+| `ordering_term` | expression + direction | Expression followed by optional ASC/DESC and NULLS FIRST/LAST |
+| `compound_operator` | keyword | UNION, UNION ALL, INTERSECT, or EXCEPT |
+| `cte_name` | identifier | Name for a Common Table Expression |
+| `window_name` | identifier | Name for a reusable window definition |
+
+## Basic Queries
+
+### Selecting Columns
+
+```sql
+-- All columns
+SELECT * FROM employees;
+
+-- Specific columns
+SELECT name, department FROM employees;
+
+-- Expressions and aliases
+SELECT name, salary * 12 AS annual_salary FROM employees;
+```
+
+### Column and Table Aliases
+
+Use `AS` to assign aliases to columns or tables. The `AS` keyword is optional for column aliases.
+
+```sql
+SELECT e.name, e.salary * 12 annual_pay
+FROM employees AS e;
+```
+
+## FROM Clause
+
+The FROM clause specifies the source tables for the query. It accepts table names, aliased tables, subqueries, and join expressions.
+
+```sql
+-- Single table
+SELECT * FROM employees;
+
+-- Subquery as table source
+SELECT * FROM (SELECT name, salary FROM employees WHERE salary > 50000) AS high_earners;
+```
+
+## WHERE Clause
+
+Filters rows based on a condition. Only rows where the expression evaluates to true are included in the result.
+
+```sql
+SELECT * FROM employees WHERE department = 'Engineering';
+
+SELECT * FROM orders WHERE total > 100 AND status != 'cancelled';
+```
+
+### Comparison Operators
+
+| Operator | Description |
+|----------|-------------|
+| `=` | Equal |
+| `!=` or `<>` | Not equal |
+| `<` | Less than |
+| `>` | Greater than |
+| `<=` | Less than or equal |
+| `>=` | Greater than or equal |
+| `IS` | Equal (NULL-safe) |
+| `IS NOT` | Not equal (NULL-safe) |
+| `IS DISTINCT FROM` | Not identical (NULL-safe, SQL standard) |
+| `IS NOT DISTINCT FROM` | Identical (NULL-safe, SQL standard) |
+
+### Logical Operators
+
+Combine conditions with `AND`, `OR`, and `NOT`.
+
+```sql
+SELECT * FROM products
+WHERE (category = 'Electronics' OR category = 'Books')
+  AND price < 50
+  AND NOT discontinued;
+```
+
+### Pattern Matching
+
+```sql
+-- LIKE: case-insensitive pattern matching (% = any chars, _ = one char)
+SELECT * FROM employees WHERE name LIKE 'J%';
+
+-- GLOB: case-sensitive pattern matching (* = any chars, ? = one char)
+SELECT * FROM files WHERE path GLOB '*.txt';
+
+-- REGEXP: regular expression matching
+SELECT * FROM logs WHERE message REGEXP '^ERROR:';
+```
+
+### Range and Membership Tests
+
+```sql
+-- BETWEEN (inclusive on both ends)
+SELECT * FROM orders WHERE total BETWEEN 100 AND 500;
+
+-- IN with a list
+SELECT * FROM employees WHERE department IN ('Engineering', 'Design', 'Product');
+
+-- IN with a subquery
+SELECT * FROM employees WHERE department_id IN (SELECT id FROM departments WHERE active = 1);
+```
+
+### NULL Tests
+
+```sql
+SELECT * FROM employees WHERE manager_id IS NULL;
+
+SELECT * FROM employees WHERE phone IS NOT NULL;
+```
+
+### CASE Expressions
+
+```sql
+SELECT name,
+  CASE
+    WHEN salary >= 100000 THEN 'Senior'
+    WHEN salary >= 60000 THEN 'Mid'
+    ELSE 'Junior'
+  END AS level
+FROM employees;
+
+-- Simple CASE form
+SELECT name,
+  CASE department
+    WHEN 'Engineering' THEN 'Eng'
+    WHEN 'Marketing' THEN 'Mkt'
+    ELSE 'Other'
+  END AS dept_code
+FROM employees;
+```
+
+## JOIN Clause
+
+Combines rows from two or more tables based on a related column.
+
+### Supported Join Types
+
+| Join Type | Description |
+|-----------|-------------|
+| `INNER JOIN` or `JOIN` | Returns rows that have matching values in both tables |
+| `LEFT JOIN` or `LEFT OUTER JOIN` | Returns all rows from the left table, with NULLs for unmatched right-side columns |
+| `FULL OUTER JOIN` | Returns all rows from both tables, with NULLs where there is no match on either side |
+| `NATURAL JOIN` | Joins on all columns with the same name in both tables |
+| `JOIN ... USING (column)` | Joins on the specified column that exists in both tables |
+
+### INNER JOIN
+
+Returns only rows where the join condition is satisfied in both tables.
+
+```sql
+SELECT e.name, d.department_name
+FROM employees e
+INNER JOIN departments d ON e.department_id = d.id;
+```
+
+### LEFT OUTER JOIN
+
+Returns all rows from the left table. When no matching row exists in the right table, the right-side columns contain NULL.
+
+```sql
+SELECT e.name, m.name AS manager_name
+FROM employees e
+LEFT JOIN employees m ON e.manager_id = m.id;
+```
+
+### FULL OUTER JOIN
+
+Returns all rows from both tables. When a row in either table has no match in the other table, the missing side's columns contain NULL.
+
+```sql
+SELECT e.name, d.department_name
+FROM employees e
+FULL OUTER JOIN departments d ON e.department_id = d.id;
+-- Returns all employees (even without a department)
+-- and all departments (even without employees)
+```
+
+### NATURAL JOIN
+
+Automatically joins on all columns with identical names in both tables. Equivalent to JOIN ... USING with every shared column name.
+
+```sql
+SELECT * FROM orders NATURAL JOIN customers;
+-- Joins on every column name shared between orders and customers
+```
+
+### JOIN ... USING
+
+Joins on the specified column that must exist in both tables. The shared column appears only once in the result.
+
+```sql
+SELECT * FROM orders JOIN customers USING (customer_id);
+```
+
+### Multi-Table Joins
+
+```sql
+SELECT o.id, c.name, p.product_name, oi.quantity
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN order_items oi ON o.id = oi.order_id
+JOIN products p ON oi.product_id = p.id
+WHERE o.order_date > '2024-01-01';
+```
+
+## GROUP BY and HAVING
+
+### GROUP BY
+
+Groups rows that share the same values in the specified columns. Typically used with aggregate functions.
+
+```sql
+SELECT department, COUNT(*) AS employee_count, AVG(salary) AS avg_salary
+FROM employees
+GROUP BY department;
+```
+
+Aggregate functions that can be used with GROUP BY:
+
+| Function | Description |
+|----------|-------------|
+| `COUNT(*)` | Number of rows in the group |
+| `COUNT(expression)` | Number of non-NULL values |
+| `SUM(expression)` | Sum of non-NULL values |
+| `AVG(expression)` | Average of non-NULL values |
+| `MIN(expression)` | Minimum value |
+| `MAX(expression)` | Maximum value |
+| `TOTAL(expression)` | Sum as a REAL (returns 0.0 instead of NULL for empty sets) |
+| `GROUP_CONCAT(expression, separator)` | Concatenation of values |
+| `STRING_AGG(expression, separator)` | Alias for GROUP_CONCAT |
+
+### HAVING
+
+Filters groups after aggregation. WHERE filters individual rows before grouping; HAVING filters groups after.
+
+```sql
+SELECT department, COUNT(*) AS headcount
+FROM employees
+GROUP BY department
+HAVING COUNT(*) >= 5;
+```
+
+### GROUP BY with Expressions
+
+```sql
+SELECT
+  CASE WHEN salary >= 80000 THEN 'High' ELSE 'Standard' END AS band,
+  COUNT(*) AS count
+FROM employees
+GROUP BY CASE WHEN salary >= 80000 THEN 'High' ELSE 'Standard' END;
+```
+
+## DISTINCT
+
+Removes duplicate rows from the result set.
+
+```sql
+SELECT DISTINCT department FROM employees;
+
+SELECT DISTINCT department, title FROM employees;
+```
+
+<Info>
+DISTINCT applies to the entire result row, not to a single column. Two rows are considered duplicates only if every column value is identical.
+</Info>
+
+## ORDER BY
+
+Sorts the result set. Without ORDER BY, the row order is unspecified.
+
+```sql
+SELECT * FROM employees ORDER BY salary DESC;
+
+-- Multiple sort keys
+SELECT * FROM employees ORDER BY department ASC, salary DESC;
+
+-- Ordering by column position
+SELECT name, salary FROM employees ORDER BY 2 DESC;
+
+-- Ordering by alias
+SELECT name, salary * 12 AS annual FROM employees ORDER BY annual DESC;
+```
+
+### NULLS FIRST / NULLS LAST
+
+Controls where NULL values appear in the sorted result.
+
+```sql
+-- NULLs at the end (default for ASC is NULLS LAST, for DESC is NULLS FIRST)
+SELECT * FROM employees ORDER BY manager_id ASC NULLS LAST;
+
+-- NULLs at the beginning
+SELECT * FROM employees ORDER BY manager_id DESC NULLS FIRST;
+```
+
+| Direction | Default NULL Placement |
+|-----------|----------------------|
+| ASC | NULLS LAST |
+| DESC | NULLS FIRST |
+
+## LIMIT and OFFSET
+
+Restricts the number of rows returned and optionally skips a number of rows.
+
+```sql
+-- Return at most 10 rows
+SELECT * FROM employees ORDER BY salary DESC LIMIT 10;
+
+-- Skip 20 rows, then return 10
+SELECT * FROM employees ORDER BY salary DESC LIMIT 10 OFFSET 20;
+```
+
+<Info>
+Always use ORDER BY with LIMIT and OFFSET. Without ORDER BY, the set of rows skipped or returned is arbitrary.
+</Info>
+
+## Subqueries
+
+A subquery is a SELECT statement nested inside another query.
+
+### Scalar Subqueries
+
+Returns a single value. Can be used anywhere an expression is expected.
+
+```sql
+SELECT name, salary,
+  salary - (SELECT AVG(salary) FROM employees) AS diff_from_avg
+FROM employees;
+```
+
+### Subqueries with IN
+
+Tests whether a value matches any row returned by the subquery.
+
+```sql
+SELECT * FROM products
+WHERE category_id IN (SELECT id FROM categories WHERE active = 1);
+
+SELECT * FROM products
+WHERE category_id NOT IN (SELECT id FROM categories WHERE discontinued = 1);
+```
+
+### Subqueries with EXISTS
+
+Tests whether the subquery returns at least one row. The actual values are ignored.
+
+```sql
+SELECT * FROM customers c
+WHERE EXISTS (
+  SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.total > 1000
+);
+```
+
+### Subqueries in FROM
+
+A subquery in the FROM clause acts as a derived table and must have an alias.
+
+```sql
+SELECT dept, avg_salary
+FROM (
+  SELECT department AS dept, AVG(salary) AS avg_salary
+  FROM employees
+  GROUP BY department
+) AS dept_stats
+WHERE avg_salary > 70000;
+```
+
+## Common Table Expressions (CTE)
+
+A WITH clause defines one or more temporary named result sets that exist for the duration of the query.
+
+```sql
+WITH regional_sales AS (
+  SELECT region, SUM(amount) AS total_sales
+  FROM orders
+  GROUP BY region
+)
+SELECT region, total_sales
+FROM regional_sales
+WHERE total_sales > 100000
+ORDER BY total_sales DESC;
+```
+
+### Multiple CTEs
+
+```sql
+WITH
+  active_customers AS (
+    SELECT * FROM customers WHERE active = 1
+  ),
+  recent_orders AS (
+    SELECT * FROM orders WHERE order_date > '2024-01-01'
+  )
+SELECT ac.name, COUNT(ro.id) AS order_count
+FROM active_customers ac
+JOIN recent_orders ro ON ac.id = ro.customer_id
+GROUP BY ac.name;
+```
+
+<Info>
+CTEs in Turso are SELECT-only. RECURSIVE CTEs and the MATERIALIZED/NOT MATERIALIZED hints are not supported.
+</Info>
+
+## Window Functions
+
+A window function performs a calculation across a set of rows related to the current row, without collapsing them into a single output row.
+
+```sql
+SELECT name, department, salary,
+  SUM(salary) OVER (PARTITION BY department ORDER BY salary) AS running_total
+FROM employees;
+```
+
+### Named Windows
+
+Use the WINDOW clause to define a reusable window definition.
+
+```sql
+SELECT name, department, salary,
+  SUM(salary) OVER w AS dept_running_total,
+  COUNT(*) OVER w AS dept_running_count
+FROM employees
+WINDOW w AS (PARTITION BY department ORDER BY salary)
+ORDER BY department, salary;
+```
+
+### Window Clause Syntax
+
+```sql
+function_name() OVER (
+  [PARTITION BY expression [, ...]]
+  [ORDER BY expression [ASC | DESC] [, ...]]
+)
+```
+
+| Component | Description |
+|-----------|-------------|
+| `PARTITION BY` | Divides rows into groups (partitions). The function resets for each partition |
+| `ORDER BY` | Defines the order of rows within each partition |
+
+Standard aggregate functions (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`) can all be used as window functions.
+
+<Info>
+Window functions in Turso use the default frame definition (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW). Custom frame specifications (ROWS, RANGE, GROUPS with explicit bounds) are not supported. Built-in ranking functions (row_number, rank, dense_rank) are not yet available.
+</Info>
+
+## Set Operations
+
+Combine the results of two or more SELECT statements.
+
+| Operator | Description |
+|----------|-------------|
+| `UNION` | Combines results and removes duplicates |
+| `UNION ALL` | Combines results and keeps duplicates |
+| `INTERSECT` | Returns only rows present in both result sets |
+| `EXCEPT` | Returns rows from the first result set that are not in the second |
+
+All set operations require the same number of columns in each SELECT, with compatible types.
+
+```sql
+-- Customers who are also employees
+SELECT name FROM customers
+INTERSECT
+SELECT name FROM employees;
+
+-- All people from both tables, no duplicates
+SELECT name, email FROM customers
+UNION
+SELECT name, email FROM employees;
+
+-- Customers who are not employees
+SELECT name FROM customers
+EXCEPT
+SELECT name FROM employees;
+```
+
+### UNION ALL
+
+When duplicates are acceptable, UNION ALL is faster because it skips the deduplication step.
+
+```sql
+SELECT id, 'order' AS source FROM orders
+UNION ALL
+SELECT id, 'return' AS source FROM returns;
+```
+
+### Set Operations with ORDER BY
+
+ORDER BY applies to the entire combined result set and must appear after the last SELECT.
+
+```sql
+SELECT name FROM customers
+UNION
+SELECT name FROM employees
+ORDER BY name;
+```
+
+## Examples
+
+### Paginated Report with Aggregation
+
+```sql
+SELECT
+  d.department_name,
+  COUNT(e.id) AS headcount,
+  ROUND(AVG(e.salary), 2) AS avg_salary,
+  MIN(e.hire_date) AS earliest_hire
+FROM departments d
+LEFT JOIN employees e ON d.id = e.department_id
+GROUP BY d.department_name
+HAVING COUNT(e.id) > 0
+ORDER BY avg_salary DESC
+LIMIT 10 OFFSET 0;
+```
+
+### CTE with Filtered Join
+
+```sql
+WITH high_value_orders AS (
+  SELECT customer_id, COUNT(*) AS order_count, SUM(total) AS total_spent
+  FROM orders
+  WHERE order_date >= '2024-01-01'
+  GROUP BY customer_id
+  HAVING SUM(total) > 5000
+)
+SELECT c.name, h.order_count, h.total_spent
+FROM customers c
+JOIN high_value_orders h ON c.id = h.customer_id
+ORDER BY h.total_spent DESC;
+```
+
+### Subquery with EXISTS and LEFT JOIN
+
+```sql
+SELECT p.product_name, p.price, c.category_name
+FROM products p
+LEFT JOIN categories c ON p.category_id = c.id
+WHERE EXISTS (
+  SELECT 1 FROM order_items oi WHERE oi.product_id = p.id
+)
+ORDER BY p.price DESC
+LIMIT 20;
+```
+
+## See Also
+
+- [INSERT](/docs/sql-reference/statements/insert) for adding rows to a table
+- [UPDATE](/docs/sql-reference/statements/update) for modifying existing rows
+- [DELETE](/docs/sql-reference/statements/delete) for removing rows
+- [CREATE VIEW](/docs/sql-reference/statements/create-view) for saving a query as a view
+- [Data Types](/docs/sql-reference/data-types) for storage classes and type affinity

@@ -1,0 +1,389 @@
+---
+title: CREATE TYPE
+description: Define a custom type with encoding, decoding, validation, operators, and defaults for use in STRICT tables
+sidebarTitle: CREATE TYPE
+---
+
+# CREATE TYPE
+
+<Info>
+**Turso Extension**: CREATE TYPE is a Turso-specific statement not available in standard SQLite. Custom types require STRICT tables. This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
+</Info>
+
+The CREATE TYPE statement defines a user-defined type that controls how values are encoded before storage, decoded when read, validated on input, compared for ordering, and what default value to use. Custom types extend the STRICT table type system beyond the five built-in SQLite storage classes.
+
+## Syntax
+
+```sql
+CREATE TYPE [IF NOT EXISTS] type-name [(parameters)]
+    BASE base-type
+    ENCODE encode-expr
+    DECODE decode-expr
+    [OPERATOR 'op' [function-name] ...]
+    [DEFAULT default-expr];
+```
+
+## Description
+
+A custom type wraps one of the four base storage types with user-defined logic. When a value is written to a column of a custom type, the ENCODE expression transforms it before storage. When a value is read, the DECODE expression transforms it back. This lets you store data in an efficient on-disk representation while presenting a different form to queries.
+
+Custom types work only with STRICT tables. Using a custom type name in a non-STRICT table has no effect.
+
+## Clauses
+
+### IF NOT EXISTS
+
+Suppresses the error that would occur if a type with the same name already exists. The existing type is left unchanged.
+
+```sql
+CREATE TYPE IF NOT EXISTS cents BASE integer ENCODE value * 100 DECODE value / 100;
+```
+
+### BASE
+
+Specifies the underlying SQLite storage class used to store values on disk. Every custom type must have a BASE clause.
+
+| Base Type | Description |
+|-----------|-------------|
+| `integer` | Signed integer, stored in 1-8 bytes depending on magnitude |
+| `real` | 8-byte IEEE 754 floating-point number |
+| `text` | UTF-8 encoded string |
+| `blob` | Raw binary data |
+
+```sql
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100;
+```
+
+### ENCODE / DECODE
+
+The ENCODE expression is evaluated whenever a value is written to a column of this type. The DECODE expression is evaluated whenever a value is read. Both expressions use the identifier `value` to refer to the input.
+
+- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST.
+- **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT.
+- **NULL handling**: NULL values bypass both ENCODE and DECODE. A NULL input produces a NULL output without evaluating the expression.
+
+```sql
+-- Store text in reversed form
+CREATE TYPE reversed_text BASE text
+    ENCODE turso_reverse(value)
+    DECODE turso_reverse(value);
+```
+
+The ENCODE expression is the place to put validation logic. If the ENCODE expression raises an error, the INSERT or UPDATE is aborted.
+
+### Parameters
+
+Custom types can accept parameters that are available in the ENCODE and DECODE expressions. Parameters are declared as a parenthesized list after the type name. Each parameter has a name and an optional type annotation.
+
+```sql
+CREATE TYPE varchar(value text, maxlen integer) BASE text
+    ENCODE CASE
+        WHEN length(value) <= maxlen THEN value
+        ELSE RAISE(ABORT, 'value too long for varchar')
+    END
+    DECODE value;
+```
+
+When a column uses a parametric type, the arguments are supplied in parentheses after the type name:
+
+```sql
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name varchar(100),
+    bio varchar(500)
+) STRICT;
+```
+
+The first parameter is always the input `value`. Additional parameters are the arguments provided in the column type declaration, in order.
+
+### OPERATOR
+
+The OPERATOR clause maps SQL operators to functions. This allows columns of a custom type to participate in comparisons, arithmetic, and ordering.
+
+```sql
+OPERATOR 'op' function-name
+```
+
+| Component | Description |
+|-----------|-------------|
+| `'op'` | The operator symbol as a string literal: `'+'`, `'-'`, `'*'`, `'/'`, `'<'`, `'='`, etc. |
+| `function-name` | The name of a SQL function to call when this operator is used. Omit to use the base type's native comparison. |
+
+When an operator is defined, expressions like `column + 1` are rewritten into `function_name(column, 1)`.
+
+#### Ordering with OPERATOR '<'
+
+The `<` operator is special: it controls how values of this type are sorted in ORDER BY, MIN, MAX, and CREATE INDEX.
+
+- **`OPERATOR '<'`** (no function name): Uses the base type's native comparison for ordering. This is sufficient for types where the encoded form sorts correctly (e.g., text dates in ISO 8601 format).
+- **`OPERATOR '<' my_compare`**: Uses `my_compare(a, b)` as a custom comparator. The function must return a negative integer if `a < b`, zero if `a = b`, and a positive integer if `a > b`.
+- **No `<` operator**: The type cannot be used in ORDER BY or CREATE INDEX.
+
+```sql
+-- Use base type comparison for ordering
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100
+    OPERATOR '<';
+
+-- Full operator set for a numeric type
+CREATE TYPE uint BASE integer
+    ENCODE CASE WHEN value >= 0 THEN value ELSE RAISE(ABORT, 'uint must be non-negative') END
+    DECODE value
+    OPERATOR '+' uint_add
+    OPERATOR '-' uint_sub
+    OPERATOR '*' uint_mul
+    OPERATOR '<'
+    OPERATOR '=';
+```
+
+The `=` operator, when defined, is also used to derive `!=`. The `<` operator is used to derive `>`, `>=`, and `<=` automatically by swapping arguments or negating the result.
+
+### DEFAULT
+
+The DEFAULT clause sets a type-level default value. When a column of this type does not specify its own DEFAULT, this value is used.
+
+```sql
+CREATE TYPE boolean BASE integer
+    ENCODE boolean_to_int(value)
+    DECODE CASE WHEN value THEN 1 ELSE 0 END
+    OPERATOR '<'
+    DEFAULT 0;
+```
+
+A column-level DEFAULT overrides the type-level DEFAULT:
+
+```sql
+CREATE TABLE flags (
+    id INTEGER PRIMARY KEY,
+    is_active boolean,              -- uses type default (0)
+    is_admin boolean DEFAULT 1      -- overrides type default
+) STRICT;
+```
+
+## Validation with RAISE
+
+Use CASE/WHEN with RAISE in the ENCODE expression to validate input at write time. If the condition fails, the statement is aborted with the specified error message.
+
+```sql
+CREATE TYPE positive_int BASE integer
+    ENCODE CASE
+        WHEN value > 0 THEN value
+        ELSE RAISE(ABORT, 'value must be positive')
+    END
+    DECODE value;
+```
+
+```sql
+CREATE TYPE email BASE text
+    ENCODE CASE
+        WHEN value LIKE '%_@_%.__%' THEN lower(value)
+        ELSE RAISE(ABORT, 'invalid email address')
+    END
+    DECODE value;
+```
+
+## CAST Support
+
+The CAST expression applies a custom type's ENCODE logic:
+
+```sql
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100;
+
+SELECT CAST(42.5 AS cents);
+-- 4250
+```
+
+This is useful for converting values to the encoded form outside of INSERT/UPDATE, such as in WHERE clauses and CHECK constraints.
+
+## CHECK Constraints with Custom Types
+
+In STRICT tables with custom types, CHECK constraints operate on the **decoded** (presentation) values. When comparing a column of a custom type against a literal, use CAST to encode the literal:
+
+```sql
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100;
+
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY,
+    price cents CHECK(price >= CAST(0 AS cents))
+) STRICT;
+```
+
+## Inspecting Types
+
+### PRAGMA list_types
+
+Lists all available types, including built-in and user-defined:
+
+```sql
+PRAGMA list_types;
+-- name
+-- boolean
+-- varchar
+-- date
+-- time
+-- timestamp
+-- smallint
+-- numeric
+-- ...
+```
+
+### sqlite_turso_types Virtual Table
+
+The `sqlite_turso_types` virtual table provides the name and SQL definition of each type:
+
+```sql
+SELECT name, sql FROM sqlite_turso_types;
+-- name    | sql
+-- boolean | CREATE TYPE boolean(value any) BASE integer ENCODE ...
+-- ...
+```
+
+## Using with ALTER TABLE
+
+Custom types can be used when adding columns with ALTER TABLE ADD COLUMN:
+
+```sql
+ALTER TABLE users ADD COLUMN email varchar(255);
+```
+
+The added column follows the same STRICT type-checking rules as columns defined in the original CREATE TABLE.
+
+## Built-in Types
+
+Turso provides the following built-in custom types in STRICT tables:
+
+| Type | Base | Parameters | Description |
+|------|------|------------|-------------|
+| `boolean` | integer | -- | Constrained to 0 or 1. Aliases: `bool`. |
+| `smallint` | integer | -- | Integer constrained to -32768 through 32767. Aliases: `int2`. |
+| `bigint` | integer | -- | Integer (no range constraint). Aliases: `int8`. |
+| `varchar(N)` | text | `maxlen` | Text with a maximum length of N characters. |
+| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. |
+| `time` | text | -- | ISO 8601 time (HH:MM:SS), validated on insert. |
+| `timestamp` | text | -- | ISO 8601 datetime, validated on insert. |
+| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. Supports arithmetic operators. |
+| `uuid` | blob | -- | UUID stored as 16-byte blob, displayed as string. Default: `uuid4_str()`. |
+| `inet` | text | -- | Validated IP address (IPv4 or IPv6). |
+| `bytea` | blob | -- | Binary data (PostgreSQL-compatible alias). |
+| `json` | text | -- | Validated JSON text. |
+| `jsonb` | blob | -- | JSON stored in binary format, returned as JSON text on read. |
+
+<Info>
+The `uuid`, `json`, and `jsonb` types require their respective extensions to be compiled in. They are available by default in standard Turso builds.
+</Info>
+
+## Restrictions
+
+- **STRICT tables only**: Custom type names are ignored in non-STRICT tables. The column uses standard type affinity rules instead.
+- **Cannot drop while in use**: A type cannot be dropped with DROP TYPE while any table has a column of that type.
+- **No subqueries in expressions**: The ENCODE, DECODE, and DEFAULT expressions cannot contain subqueries, aggregate functions, or window functions.
+
+## Examples
+
+### Identity Type (Passthrough)
+
+A minimal type that stores and retrieves values without transformation:
+
+```sql
+CREATE TYPE my_text BASE text ENCODE value DECODE value;
+
+CREATE TABLE notes (
+    id INTEGER PRIMARY KEY,
+    body my_text
+) STRICT;
+```
+
+### Monetary Values as Cents
+
+Store dollar amounts as integer cents for exact arithmetic, present them as the original value:
+
+```sql
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100
+    OPERATOR '<';
+
+CREATE TABLE invoices (
+    id INTEGER PRIMARY KEY,
+    amount cents
+) STRICT;
+
+INSERT INTO invoices VALUES (1, 42);
+-- Stored as 4200 on disk, queried as 42
+
+SELECT amount FROM invoices;
+-- 42
+```
+
+### JSON Validation
+
+Validate that inserted values are valid JSON:
+
+```sql
+CREATE TYPE json BASE text
+    ENCODE json(value)
+    DECODE value;
+
+CREATE TABLE configs (
+    id INTEGER PRIMARY KEY,
+    data json
+) STRICT;
+
+INSERT INTO configs VALUES (1, '{"key": "value"}');
+-- succeeds
+
+INSERT INTO configs VALUES (2, 'not json');
+-- Error: malformed JSON
+```
+
+### Unsigned Integer with Operators
+
+A non-negative integer type with arithmetic and comparison operators:
+
+```sql
+CREATE TYPE uint BASE integer
+    ENCODE CASE
+        WHEN value >= 0 THEN value
+        ELSE RAISE(ABORT, 'uint must be non-negative')
+    END
+    DECODE value
+    OPERATOR '<'
+    OPERATOR '=';
+
+CREATE TABLE counters (
+    id INTEGER PRIMARY KEY,
+    count uint DEFAULT 0
+) STRICT;
+
+INSERT INTO counters VALUES (1, 5);
+SELECT * FROM counters WHERE count > 0 ORDER BY count;
+```
+
+### Fixed-Point Decimal
+
+Use the built-in `numeric` type for precise decimal arithmetic:
+
+```sql
+CREATE TABLE transactions (
+    id INTEGER PRIMARY KEY,
+    amount numeric(10, 2),
+    tax numeric(10, 2)
+) STRICT;
+
+INSERT INTO transactions VALUES (1, 99.99, 8.25);
+SELECT amount + tax FROM transactions;
+-- 108.24
+```
+
+## See Also
+
+- [DROP TYPE](/docs/sql-reference/statements/drop-type) for removing custom types
+- [Data Types](/docs/sql-reference/data-types) for an overview of the type system and type affinity
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for STRICT table definitions

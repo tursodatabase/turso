@@ -1,0 +1,56 @@
+---
+title: DETACH DATABASE
+description: Remove an attached database from the current connection
+sidebarTitle: DETACH DATABASE
+---
+
+# DETACH DATABASE
+
+The DETACH DATABASE statement removes a previously attached database from the current connection. After detaching, tables in that database are no longer accessible through the schema name.
+
+## Syntax
+
+```sql
+DETACH [DATABASE] schema-name;
+```
+
+## Description
+
+DETACH closes the connection to the attached database identified by `schema-name` and frees its resources. Any subsequent references to `schema-name.table-name` will fail.
+
+### Clauses
+
+| Clause | Description |
+|--------|-------------|
+| `DATABASE` | Optional keyword. Has no effect on behavior. |
+| `schema-name` | The schema name assigned when the database was attached. |
+
+The `main` and `temp` schemas cannot be detached.
+
+<Info>
+DETACH cannot be used while a transaction is active. Commit or roll back any open transaction before detaching a database.
+</Info>
+
+## Examples
+
+### Detach a Database
+
+```sql
+ATTACH 'archive.db' AS archive;
+
+-- Use the attached database
+SELECT count(*) FROM archive.events;
+
+-- Detach when done
+DETACH DATABASE archive;
+```
+
+### Detach Without the DATABASE Keyword
+
+```sql
+DETACH archive;
+```
+
+## See Also
+
+- [ATTACH DATABASE](/docs/sql-reference/statements/attach-database) for attaching a database

@@ -1,0 +1,264 @@
+---
+title: Window Functions
+description: Perform calculations across sets of rows related to the current row without collapsing them
+sidebarTitle: Window
+---
+
+# Window Functions
+
+Window functions perform calculations across a set of rows that are related to the current row. Unlike aggregate functions with GROUP BY, window functions do not collapse rows into a single output row. Every input row produces a corresponding output row, with the window function result appended.
+
+<Info>
+Turso supports aggregate functions used as window functions with the default frame definition. Custom frame specifications (ROWS, RANGE, or GROUPS with explicit bounds) and dedicated window functions (row_number, rank, dense_rank, ntile, lag, lead, first_value, last_value, nth_value) are not yet supported.
+</Info>
+
+## Syntax
+
+```sql
+aggregate_function(expression) OVER (
+    [PARTITION BY expression [, ...]]
+    [ORDER BY expression [ASC | DESC] [, ...]]
+)
+```
+
+| Clause | Description |
+|--------|-------------|
+| `aggregate_function` | Any supported aggregate function: `count`, `sum`, `avg`, `min`, `max`, `total`, `group_concat` |
+| `OVER (...)` | Defines the window over which the function operates |
+| `PARTITION BY` | Divides the result set into partitions. The function is applied independently within each partition. If omitted, the entire result set is one partition |
+| `ORDER BY` | Defines the order of rows within each partition. This determines which rows are included in the frame for each calculation |
+
+### Default Frame
+
+When ORDER BY is specified, the default frame is:
+
+```
+RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+```
+
+This means the function considers all rows from the start of the partition up to and including the current row (and any rows with equal ORDER BY values, since the frame mode is RANGE).
+
+When ORDER BY is omitted, the default frame covers the entire partition.
+
+## Supported Aggregate Functions as Window Functions
+
+Any aggregate function can be used as a window function by adding an OVER clause.
+
+| Function | Description |
+|----------|-------------|
+| `count(*)` | Number of rows in the frame |
+| `count(expression)` | Number of non-NULL values in the frame |
+| `sum(expression)` | Sum of non-NULL values in the frame |
+| `avg(expression)` | Average of non-NULL values in the frame |
+| `min(expression)` | Minimum value in the frame |
+| `max(expression)` | Maximum value in the frame |
+| `total(expression)` | Sum as REAL (returns 0.0 for empty frames instead of NULL) |
+| `group_concat(expression, separator)` | Concatenation of values in the frame |
+
+## PARTITION BY
+
+PARTITION BY divides the rows into groups. The window function resets and recalculates independently for each partition.
+
+```sql
+SELECT
+    department,
+    name,
+    salary,
+    SUM(salary) OVER (PARTITION BY department) AS dept_total
+FROM employees;
+```
+
+| department | name | salary | dept_total |
+|------------|------|--------|------------|
+| Engineering | Alice | 90000 | 250000 |
+| Engineering | Bob | 85000 | 250000 |
+| Engineering | Carol | 75000 | 250000 |
+| Marketing | Dave | 70000 | 130000 |
+| Marketing | Eve | 60000 | 130000 |
+
+Without PARTITION BY, the function treats the entire result set as one partition:
+
+```sql
+SELECT
+    name,
+    salary,
+    SUM(salary) OVER () AS company_total
+FROM employees;
+```
+
+## ORDER BY
+
+ORDER BY within the OVER clause determines row ordering within each partition. Combined with the default frame (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), this produces running calculations.
+
+```sql
+SELECT
+    name,
+    salary,
+    SUM(salary) OVER (ORDER BY salary) AS running_total
+FROM employees;
+```
+
+| name | salary | running_total |
+|------|--------|---------------|
+| Eve | 60000 | 60000 |
+| Dave | 70000 | 130000 |
+| Carol | 75000 | 205000 |
+| Bob | 85000 | 290000 |
+| Alice | 90000 | 380000 |
+
+### PARTITION BY with ORDER BY
+
+Use both clauses together for running calculations within groups:
+
+```sql
+SELECT
+    department,
+    name,
+    salary,
+    SUM(salary) OVER (
+        PARTITION BY department
+        ORDER BY salary
+    ) AS dept_running_total
+FROM employees;
+```
+
+| department | name | salary | dept_running_total |
+|------------|------|--------|--------------------|
+| Engineering | Carol | 75000 | 75000 |
+| Engineering | Bob | 85000 | 160000 |
+| Engineering | Alice | 90000 | 250000 |
+| Marketing | Eve | 60000 | 60000 |
+| Marketing | Dave | 70000 | 130000 |
+
+## Named Windows
+
+The WINDOW clause defines a reusable window specification that can be referenced by multiple window functions in the same query. This avoids repeating the same OVER definition.
+
+```sql
+SELECT
+    department,
+    name,
+    salary,
+    SUM(salary) OVER w AS running_total,
+    AVG(salary) OVER w AS running_avg,
+    COUNT(*) OVER w AS running_count
+FROM employees
+WINDOW w AS (PARTITION BY department ORDER BY salary)
+ORDER BY department, salary;
+```
+
+Multiple named windows can be defined:
+
+```sql
+SELECT
+    department,
+    name,
+    salary,
+    SUM(salary) OVER dept AS dept_total,
+    SUM(salary) OVER company AS company_total
+FROM employees
+WINDOW
+    dept AS (PARTITION BY department),
+    company AS ()
+ORDER BY department, name;
+```
+
+## Examples
+
+### Running Total
+
+```sql
+SELECT
+    order_date,
+    amount,
+    SUM(amount) OVER (ORDER BY order_date) AS running_total
+FROM orders;
+```
+
+### Count per Group
+
+```sql
+-- Show each employee alongside their department headcount
+SELECT
+    name,
+    department,
+    COUNT(*) OVER (PARTITION BY department) AS dept_size
+FROM employees
+ORDER BY department, name;
+```
+
+### Running Average
+
+```sql
+SELECT
+    date,
+    temperature,
+    AVG(temperature) OVER (ORDER BY date) AS running_avg_temp
+FROM weather_readings
+ORDER BY date;
+```
+
+### Percentage of Total
+
+```sql
+SELECT
+    product_name,
+    revenue,
+    ROUND(100.0 * revenue / SUM(revenue) OVER (), 2) AS pct_of_total
+FROM products
+ORDER BY revenue DESC;
+```
+
+### Multiple Window Functions in One Query
+
+```sql
+SELECT
+    department,
+    name,
+    salary,
+    MIN(salary) OVER (PARTITION BY department) AS dept_min,
+    MAX(salary) OVER (PARTITION BY department) AS dept_max,
+    AVG(salary) OVER (PARTITION BY department) AS dept_avg,
+    salary - AVG(salary) OVER (PARTITION BY department) AS diff_from_avg
+FROM employees
+ORDER BY department, salary DESC;
+```
+
+### Group Concatenation over a Window
+
+```sql
+SELECT
+    department,
+    name,
+    GROUP_CONCAT(name, ', ') OVER (PARTITION BY department ORDER BY name) AS names_so_far
+FROM employees;
+```
+
+## Limitations
+
+The following window function features are not yet supported in Turso:
+
+| Feature | Status |
+|---------|--------|
+| `row_number()` | Not supported |
+| `rank()` | Not supported |
+| `dense_rank()` | Not supported |
+| `ntile(N)` | Not supported |
+| `lag(expr, offset, default)` | Not supported |
+| `lead(expr, offset, default)` | Not supported |
+| `first_value(expr)` | Not supported |
+| `last_value(expr)` | Not supported |
+| `nth_value(expr, N)` | Not supported |
+| `cume_dist()` | Not supported |
+| `percent_rank()` | Not supported |
+| Custom frame: `ROWS BETWEEN ...` | Not supported |
+| Custom frame: `RANGE BETWEEN ... AND ...` | Not supported |
+| Custom frame: `GROUPS BETWEEN ...` | Not supported |
+| `EXCLUDE` clause | Not supported |
+| `FILTER (WHERE ...)` on window functions | Not supported |
+
+## See Also
+
+- [SELECT](/docs/sql-reference/statements/select) for the full SELECT syntax including the WINDOW clause
+- [Aggregate Functions](/docs/sql-reference/functions/aggregate) for aggregate function reference
+- [Expressions](/docs/sql-reference/expressions) for using window function results in expressions

@@ -1,0 +1,686 @@
+---
+title: JSON Functions
+description: Create, extract, modify, and aggregate JSON data
+sidebarTitle: JSON
+---
+
+# JSON Functions
+
+Turso provides a full set of JSON functions compatible with SQLite's JSON1 extension. These functions operate on JSON stored as TEXT or in Turso's internal binary JSON (JSONB) format.
+
+Most functions come in pairs: a `json_*` variant that returns TEXT and a `jsonb_*` variant that returns BLOB in the internal binary format. The JSONB variants are more efficient when the result will be stored or passed to another JSON function rather than returned to the application.
+
+## JSON Path Syntax
+
+Many JSON functions accept a **path** argument that identifies a specific element within a JSON document.
+
+| Syntax | Meaning |
+|--------|---------|
+| `$` | The root element |
+| `$.key` | Object member named `key` |
+| `$[N]` | Array element at index `N` (zero-based) |
+| `$.key1.key2` | Nested object member |
+| `$.key[0]` | First element of an array inside an object member |
+| `$[0].key` | Object member inside the first array element |
+
+Path arguments must begin with `$`. If a path does not match any element, functions generally return `NULL`.
+
+```sql
+SELECT json_extract('{"a": {"b": [10, 20, 30]}}', '$.a.b[1]');
+-- 20
+```
+
+---
+
+## JSON Creation and Validation
+
+### json
+
+Validates a JSON string and returns it in minified form. If the input is not valid JSON, an error is raised.
+
+```sql
+json(json_text)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT | A JSON string to validate and minify |
+
+**Returns:** TEXT -- the minified JSON string.
+
+```sql
+SELECT json('  { "name": "Alice" ,  "age": 30 } ');
+-- {"name":"Alice","age":30}
+```
+
+### jsonb
+
+Converts a JSON string to the internal binary JSON format.
+
+```sql
+jsonb(json_text)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT | A JSON string to convert |
+
+**Returns:** BLOB -- the value in binary JSON format.
+
+```sql
+SELECT typeof(jsonb('{"a":1}'));
+-- blob
+```
+
+### json_array / jsonb_array
+
+Creates a JSON array from the arguments.
+
+```sql
+json_array(value1, value2, ...)
+jsonb_array(value1, value2, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `value1, value2, ...` | any | Values to include in the array. SQL NULL becomes JSON `null`. |
+
+**Returns:** TEXT (json_array) or BLOB (jsonb_array) -- a JSON array.
+
+```sql
+SELECT json_array(1, 'hello', NULL, 3.14);
+-- [1,"hello",null,3.14]
+
+SELECT json_array();
+-- []
+```
+
+### json_object / jsonb_object
+
+Creates a JSON object from alternating label/value pairs. When called with `*`, expands all columns of the row into label/value pairs using column names as keys.
+
+```sql
+json_object(label1, value1, label2, value2, ...)
+jsonb_object(label1, value1, label2, value2, ...)
+json_object(*)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `label1, label2, ...` | TEXT | Keys for the JSON object. Must be strings. |
+| `value1, value2, ...` | any | Corresponding values. SQL NULL becomes JSON `null`. |
+
+**Returns:** TEXT (json_object) or BLOB (jsonb_object) -- a JSON object.
+
+```sql
+SELECT json_object('name', 'Alice', 'age', 30);
+-- {"name":"Alice","age":30}
+
+SELECT json_object('items', json_array(1, 2, 3));
+-- {"items":[1,2,3]}
+```
+
+### json_quote
+
+Converts a SQL value to its JSON representation.
+
+```sql
+json_quote(value)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `value` | any | A SQL value to quote as JSON |
+
+**Returns:** TEXT -- the JSON representation of the value.
+
+```sql
+SELECT json_quote('hello');
+-- "hello"
+
+SELECT json_quote(42);
+-- 42
+
+SELECT json_quote(NULL);
+-- null
+```
+
+### json_valid
+
+Returns 1 if the argument is well-formed JSON, or 0 otherwise.
+
+```sql
+json_valid(json_text)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT | A string to check for valid JSON |
+
+**Returns:** INTEGER -- 1 if valid JSON, 0 otherwise.
+
+```sql
+SELECT json_valid('{"name":"Alice"}');
+-- 1
+
+SELECT json_valid('not json');
+-- 0
+
+SELECT json_valid(NULL);
+-- 0
+```
+
+### json_error_position
+
+Returns the character position of the first syntax error in a JSON string, or 0 if the string is valid JSON.
+
+```sql
+json_error_position(json_text)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT | A string to check for JSON errors |
+
+**Returns:** INTEGER -- character position of the first error (1-based), or 0 if valid.
+
+```sql
+SELECT json_error_position('{"a":1}');
+-- 0
+
+SELECT json_error_position('{"a":}');
+-- 6
+```
+
+---
+
+## JSON Extraction
+
+### json_extract / jsonb_extract
+
+Extracts one or more values from a JSON document using path arguments.
+
+```sql
+json_extract(json_text, path)
+json_extract(json_text, path1, path2, ...)
+jsonb_extract(json_text, path)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | One or more JSON path expressions |
+
+**Returns:** With a single path, returns the extracted value using its natural SQL type (INTEGER, REAL, TEXT, or NULL). JSON objects and arrays are returned as TEXT. With multiple paths, returns a JSON array of the extracted values. `jsonb_extract` returns BLOB.
+
+```sql
+SELECT json_extract('{"name":"Alice","age":30}', '$.name');
+-- Alice
+
+SELECT json_extract('{"name":"Alice","age":30}', '$.age');
+-- 30
+
+-- Multiple paths return a JSON array
+SELECT json_extract('{"a":1,"b":2,"c":3}', '$.a', '$.c');
+-- [1,3]
+```
+
+### -> operator
+
+Extracts a value from JSON and returns it as JSON. This is a shorthand for `json_extract` that always returns JSON text (objects and arrays remain as JSON, strings are JSON-quoted).
+
+```sql
+json_text -> path
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | A JSON path expression |
+
+**Returns:** TEXT -- the extracted value as JSON.
+
+```sql
+SELECT '{"name":"Alice"}' -> '$.name';
+-- "Alice"
+
+SELECT '{"items":[1,2,3]}' -> '$.items';
+-- [1,2,3]
+```
+
+### ->> operator
+
+Extracts a value from JSON and returns it as a SQL value. Strings are unquoted, numbers are returned as INTEGER or REAL, and booleans are returned as integers (0 or 1).
+
+```sql
+json_text ->> path
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | A JSON path expression |
+
+**Returns:** The extracted value as its natural SQL type (TEXT, INTEGER, REAL, or NULL).
+
+```sql
+SELECT '{"name":"Alice"}' ->> '$.name';
+-- Alice
+
+SELECT '{"count":42}' ->> '$.count';
+-- 42
+```
+
+### json_type
+
+Returns the type of a JSON value as a string: `"null"`, `"true"`, `"false"`, `"integer"`, `"real"`, `"text"`, `"array"`, or `"object"`.
+
+```sql
+json_type(json_text)
+json_type(json_text, path)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | Optional. A JSON path to inspect. If omitted, inspects the root. |
+
+**Returns:** TEXT -- the JSON type name.
+
+```sql
+SELECT json_type('{"a":1}');
+-- object
+
+SELECT json_type('[1, 2, 3]');
+-- array
+
+SELECT json_type('{"a": 1}', '$.a');
+-- integer
+
+SELECT json_type('{"a": "hello"}', '$.a');
+-- text
+```
+
+---
+
+## JSON Modification
+
+### json_insert / jsonb_insert
+
+Inserts new values into a JSON document. Existing values are **not** overwritten. If the path already exists, the value is left unchanged.
+
+```sql
+json_insert(json_text, path1, value1, path2, value2, ...)
+jsonb_insert(json_text, path1, value1, path2, value2, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | A JSON path where the value should be inserted |
+| `value` | any | The value to insert |
+
+**Returns:** TEXT (json_insert) or BLOB (jsonb_insert) -- the modified JSON.
+
+```sql
+SELECT json_insert('{"a":1}', '$.b', 2);
+-- {"a":1,"b":2}
+
+-- Existing values are NOT overwritten
+SELECT json_insert('{"a":1}', '$.a', 99);
+-- {"a":1}
+```
+
+### json_replace / jsonb_replace
+
+Replaces existing values in a JSON document. If the path does not exist, no insertion is made.
+
+```sql
+json_replace(json_text, path1, value1, path2, value2, ...)
+jsonb_replace(json_text, path1, value1, path2, value2, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | A JSON path identifying the value to replace |
+| `value` | any | The replacement value |
+
+**Returns:** TEXT (json_replace) or BLOB (jsonb_replace) -- the modified JSON.
+
+```sql
+SELECT json_replace('{"a":1,"b":2}', '$.a', 99);
+-- {"a":99,"b":2}
+
+-- Non-existent paths are ignored
+SELECT json_replace('{"a":1}', '$.b', 2);
+-- {"a":1}
+```
+
+### json_set / jsonb_set
+
+Inserts or replaces values in a JSON document. Combines the behavior of `json_insert` and `json_replace`: if the path exists, the value is replaced; if it does not exist, the value is inserted.
+
+```sql
+json_set(json_text, path1, value1, path2, value2, ...)
+jsonb_set(json_text, path1, value1, path2, value2, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | A JSON path for the value |
+| `value` | any | The value to set |
+
+**Returns:** TEXT (json_set) or BLOB (jsonb_set) -- the modified JSON.
+
+```sql
+-- Replace existing
+SELECT json_set('{"a":1}', '$.a', 99);
+-- {"a":99}
+
+-- Insert new
+SELECT json_set('{"a":1}', '$.b', 2);
+-- {"a":1,"b":2}
+```
+
+### json_remove / jsonb_remove
+
+Removes one or more elements from a JSON document.
+
+```sql
+json_remove(json_text, path1, path2, ...)
+jsonb_remove(json_text, path1, path2, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | One or more JSON paths to remove |
+
+**Returns:** TEXT (json_remove) or BLOB (jsonb_remove) -- the modified JSON.
+
+```sql
+SELECT json_remove('{"a":1,"b":2,"c":3}', '$.b');
+-- {"a":1,"c":3}
+
+SELECT json_remove('[1,2,3,4]', '$[1]');
+-- [1,3,4]
+```
+
+### json_patch / jsonb_patch
+
+Applies an RFC 7396 merge patch to a JSON document. Object members in the patch overwrite members in the target. A `null` value in the patch removes the corresponding member.
+
+```sql
+json_patch(json_text, patch)
+jsonb_patch(json_text, patch)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | The target JSON document |
+| `patch` | TEXT or BLOB | The merge patch to apply |
+
+**Returns:** TEXT (json_patch) or BLOB (jsonb_patch) -- the patched JSON.
+
+```sql
+SELECT json_patch('{"a":1,"b":2}', '{"b":3,"c":4}');
+-- {"a":1,"b":3,"c":4}
+
+-- null in the patch removes a key
+SELECT json_patch('{"a":1,"b":2}', '{"b":null}');
+-- {"a":1}
+```
+
+### json_pretty
+
+Returns a pretty-printed (indented) representation of a JSON document.
+
+```sql
+json_pretty(json_text)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+
+**Returns:** TEXT -- the formatted JSON string with indentation.
+
+```sql
+SELECT json_pretty('{"name":"Alice","scores":[90,85,92]}');
+/*
+{
+    "name": "Alice",
+    "scores": [
+        90,
+        85,
+        92
+    ]
+}
+*/
+```
+
+---
+
+## JSON Array Functions
+
+### json_array_length
+
+Returns the number of elements in a JSON array. Returns 0 for an empty array and NULL for non-array JSON values.
+
+```sql
+json_array_length(json_text)
+json_array_length(json_text, path)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | Optional. A JSON path to an array within the document. |
+
+**Returns:** INTEGER -- the number of elements, or NULL if the value at the path is not an array.
+
+```sql
+SELECT json_array_length('[1, 2, 3, 4]');
+-- 4
+
+SELECT json_array_length('{"items": [10, 20]}', '$.items');
+-- 2
+
+SELECT json_array_length('{"a": 1}');
+-- NULL
+```
+
+---
+
+## JSON Aggregate Functions
+
+### json_group_array / jsonb_group_array
+
+Aggregate function that collects values from a group into a JSON array.
+
+```sql
+json_group_array(value)
+jsonb_group_array(value)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `value` | any | The value to aggregate from each row |
+
+**Returns:** TEXT (json_group_array) or BLOB (jsonb_group_array) -- a JSON array of all values in the group.
+
+```sql
+CREATE TABLE items (category TEXT, name TEXT);
+INSERT INTO items VALUES ('fruit', 'apple'), ('fruit', 'banana'), ('veggie', 'carrot');
+
+SELECT category, json_group_array(name) FROM items GROUP BY category;
+-- fruit  | ["apple","banana"]
+-- veggie | ["carrot"]
+```
+
+### json_group_object / jsonb_group_object
+
+Aggregate function that collects label/value pairs from a group into a JSON object.
+
+```sql
+json_group_object(label, value)
+jsonb_group_object(label, value)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `label` | TEXT | The key for each entry |
+| `value` | any | The value for each entry |
+
+**Returns:** TEXT (json_group_object) or BLOB (jsonb_group_object) -- a JSON object.
+
+```sql
+CREATE TABLE settings (key TEXT, value TEXT);
+INSERT INTO settings VALUES ('theme', 'dark'), ('lang', 'en');
+
+SELECT json_group_object(key, value) FROM settings;
+-- {"theme":"dark","lang":"en"}
+```
+
+---
+
+## JSON Table-Valued Functions
+
+### json_each
+
+A table-valued function that walks the top-level elements of a JSON array or object, returning one row per element.
+
+```sql
+SELECT * FROM json_each(json_text);
+SELECT * FROM json_each(json_text, path);
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | Optional. A JSON path to the array or object to iterate. Defaults to `$`. |
+
+**Output columns:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `key` | TEXT or INTEGER | Object key (TEXT) or array index (INTEGER) |
+| `value` | any | The value of the element, as JSON text for objects/arrays or as a SQL value for primitives |
+| `type` | TEXT | JSON type: `null`, `true`, `false`, `integer`, `real`, `text`, `array`, or `object` |
+| `atom` | any | The SQL value for primitives (NULL for arrays and objects) |
+| `id` | INTEGER | A sequential identifier for the element |
+| `parent` | INTEGER | The id of the parent element (NULL for top-level) |
+| `fullkey` | TEXT | The full JSON path to this element |
+| `path` | TEXT | The JSON path to the parent of this element |
+
+```sql
+SELECT key, value, type FROM json_each('[10, "hello", null]');
+-- 0 | 10    | integer
+-- 1 | hello | text
+-- 2 | null  | null
+
+SELECT key, value FROM json_each('{"a":1, "b":2}');
+-- a | 1
+-- b | 2
+
+-- With a path
+SELECT key, value FROM json_each('{"data": [1, 2, 3]}', '$.data');
+-- 0 | 1
+-- 1 | 2
+-- 2 | 3
+```
+
+### json_tree
+
+<Warning>
+`json_tree` has partial support. Some advanced traversal features may not work as expected.
+</Warning>
+
+A table-valued function that recursively walks a JSON document, returning one row for every element at every level of nesting.
+
+```sql
+SELECT * FROM json_tree(json_text);
+SELECT * FROM json_tree(json_text, path);
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_text` | TEXT or BLOB | A JSON document |
+| `path` | TEXT | Optional. A JSON path to the subtree to walk. Defaults to `$`. |
+
+**Output columns:** Same as `json_each`.
+
+```sql
+SELECT key, value, type, path FROM json_tree('{"a": [1, 2]}');
+-- NULL | {"a":[1,2]} | object  | $
+-- a    | [1,2]       | array   | $
+-- 0    | 1           | integer | $.a
+-- 1    | 2           | integer | $.a
+```
+
+---
+
+## Practical Examples
+
+### Storing and querying JSON data
+
+```sql
+CREATE TABLE events (id INTEGER PRIMARY KEY, data TEXT);
+INSERT INTO events VALUES (1, '{"type":"click","x":100,"y":200}');
+INSERT INTO events VALUES (2, '{"type":"scroll","offset":500}');
+
+-- Extract specific fields
+SELECT id, data ->> '$.type' AS event_type FROM events;
+-- 1 | click
+-- 2 | scroll
+
+-- Filter by JSON value
+SELECT * FROM events WHERE data ->> '$.type' = 'click';
+```
+
+### Modifying JSON in place
+
+```sql
+UPDATE events
+SET data = json_set(data, '$.timestamp', '2025-01-15T10:30:00Z')
+WHERE id = 1;
+
+SELECT data FROM events WHERE id = 1;
+-- {"type":"click","x":100,"y":200,"timestamp":"2025-01-15T10:30:00Z"}
+```
+
+### Building JSON from relational data
+
+```sql
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);
+INSERT INTO users VALUES (1, 'Alice', 'alice@example.com');
+INSERT INTO users VALUES (2, 'Bob', 'bob@example.com');
+
+SELECT json_object('users', json_group_array(
+    json_object('id', id, 'name', name, 'email', email)
+)) FROM users;
+-- {"users":[{"id":1,"name":"Alice","email":"alice@example.com"},{"id":2,"name":"Bob","email":"bob@example.com"}]}
+```
+
+### Flattening JSON arrays with json_each
+
+```sql
+CREATE TABLE orders (id INTEGER PRIMARY KEY, items TEXT);
+INSERT INTO orders VALUES (1, '["widget","gadget","gizmo"]');
+INSERT INTO orders VALUES (2, '["sprocket"]');
+
+-- Expand each order's items into individual rows
+SELECT orders.id, each.value AS item
+FROM orders, json_each(orders.items) AS each;
+-- 1 | widget
+-- 1 | gadget
+-- 1 | gizmo
+-- 2 | sprocket
+```
+
+## See Also
+
+- [Data Types](/docs/sql-reference/data-types) for how JSON values map to SQL types
+- [Expressions](/docs/sql-reference/expressions) for using JSON operators in expressions

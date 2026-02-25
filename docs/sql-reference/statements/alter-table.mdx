@@ -1,0 +1,273 @@
+---
+title: ALTER TABLE
+description: Modify the structure of an existing table by renaming, adding, or dropping columns
+sidebarTitle: ALTER TABLE
+---
+
+# ALTER TABLE
+
+Modify the structure of an existing table.
+
+## Syntax
+
+```sql
+ALTER TABLE [schema-name.]table-name RENAME TO new-table-name;
+ALTER TABLE [schema-name.]table-name RENAME COLUMN old-column-name TO new-column-name;
+ALTER TABLE [schema-name.]table-name ADD COLUMN column-def;
+ALTER TABLE [schema-name.]table-name DROP COLUMN column-name;
+```
+
+## Description
+
+`ALTER TABLE` modifies the structure of an existing table without requiring you to recreate the table and copy its data. Turso supports four forms of ALTER TABLE: renaming the table, renaming a column, adding a new column, and dropping an existing column.
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `schema-name` | The name of an attached database containing the table. Defaults to the main database if omitted. |
+| `table-name` | The name of the table to alter. |
+
+## RENAME TO
+
+Rename an existing table.
+
+```sql
+ALTER TABLE old_name RENAME TO new_name;
+```
+
+Renaming a table updates all references to the table in:
+
+- Triggers that reference the table
+- Indexes on the table
+- Foreign key constraints (both as parent and child table)
+- CHECK constraints
+- Views that reference the table
+
+<Info>
+The new table name must not collide with an existing table, view, or index name in the same database.
+</Info>
+
+### Example
+
+```sql
+CREATE TABLE customers (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+ALTER TABLE customers RENAME TO clients;
+
+-- The table is now accessible as 'clients'
+SELECT * FROM clients;
+```
+
+## RENAME COLUMN
+
+Rename an existing column in a table.
+
+```sql
+ALTER TABLE table-name RENAME COLUMN old-column-name TO new-column-name;
+```
+
+Renaming a column updates all references to the column in:
+
+- Indexes that reference the column (including expression indexes)
+- Triggers that reference the column
+- CHECK constraints that reference the column
+- Foreign key constraint definitions
+
+### Restrictions
+
+A column rename fails if:
+
+- The column does not exist in the table.
+- The new column name conflicts with an existing column in the same table.
+- A trigger on the table uses a qualified reference (e.g., `table_name.column_name`) to the column in its body.
+- A trigger's WHEN clause references the column.
+
+### Example
+
+```sql
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY,
+    product_name TEXT NOT NULL,
+    price REAL
+);
+
+CREATE INDEX idx_name ON products(product_name);
+
+ALTER TABLE products RENAME COLUMN product_name TO name;
+
+-- The index is automatically updated
+-- Queries now use the new column name
+SELECT name, price FROM products;
+```
+
+## ADD COLUMN
+
+Add a new column to an existing table. The new column is always appended as the last column.
+
+```sql
+ALTER TABLE table-name ADD COLUMN column-name type [constraints];
+```
+
+### Restrictions
+
+A new column added with ADD COLUMN must satisfy these requirements:
+
+| Requirement | Reason |
+|-------------|--------|
+| No `PRIMARY KEY` constraint | The primary key of a table cannot be changed after creation |
+| No `UNIQUE` constraint | Adding a UNIQUE column would require scanning all existing rows |
+| `NOT NULL` requires a non-NULL default | Existing rows must have a valid value for the new column |
+| Default must be a constant expression | Only literal values, signed literals, and parenthesized constant expressions are allowed. Functions like `random()` are not permitted |
+| `CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` defaults require an empty table | These non-deterministic values cannot be retroactively applied to existing rows |
+| CHECK constraints require an empty table | The constraint cannot be validated against existing rows |
+| No duplicate column name | The column name must not already exist in the table |
+| No `GENERATED ALWAYS AS` | Generated columns cannot be added via ALTER TABLE |
+| STRICT tables require an explicit type | The column type must be a valid STRICT type |
+
+### Supported Column Constraints
+
+The following constraints are supported on added columns:
+
+- `NOT NULL` (with a non-NULL default)
+- `DEFAULT expression`
+- `CHECK (expression)`
+- `REFERENCES` (foreign key)
+- `COLLATE`
+
+### Examples
+
+#### Add a simple column
+
+```sql
+ALTER TABLE users ADD COLUMN phone TEXT;
+```
+
+#### Add a column with a default value
+
+```sql
+ALTER TABLE orders ADD COLUMN priority INTEGER DEFAULT 0;
+```
+
+#### Add a NOT NULL column with a default
+
+```sql
+ALTER TABLE products ADD COLUMN in_stock INTEGER NOT NULL DEFAULT 1;
+```
+
+#### Add a column with a foreign key
+
+```sql
+ALTER TABLE orders ADD COLUMN warehouse_id INTEGER REFERENCES warehouses(id);
+```
+
+#### Add a column on a STRICT table
+
+```sql
+CREATE TABLE metrics (
+    id INTEGER PRIMARY KEY,
+    value REAL
+) STRICT;
+
+-- Must specify a valid STRICT type
+ALTER TABLE metrics ADD COLUMN label TEXT DEFAULT 'unknown';
+```
+
+## DROP COLUMN
+
+Remove an existing column from a table.
+
+```sql
+ALTER TABLE table-name DROP COLUMN column-name;
+```
+
+### Restrictions
+
+A column cannot be dropped if any of the following conditions are true:
+
+| Condition | Error |
+|-----------|-------|
+| The column is a PRIMARY KEY or part of one | Cannot drop PRIMARY KEY column |
+| The column has a UNIQUE constraint | Cannot drop UNIQUE column |
+| The column is referenced by an index | Cannot drop indexed column |
+| The column is referenced in an expression index | Cannot drop column used in expression index |
+| The column is named in a partial index WHERE clause | Cannot drop column used in partial index |
+| The column is referenced in a CHECK constraint belonging to another column or the table | Cannot drop column used in CHECK constraint |
+| The column is referenced by a foreign key in another table | Cannot drop column used in foreign key |
+| The table has only one column | Cannot drop the last remaining column |
+| The column appears in a trigger or view | Cannot drop column referenced by trigger or view |
+
+### Examples
+
+#### Drop a column
+
+```sql
+ALTER TABLE users DROP COLUMN phone;
+```
+
+#### Verify columns after dropping
+
+```sql
+CREATE TABLE example (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    old_field TEXT,
+    active INTEGER DEFAULT 1
+);
+
+ALTER TABLE example DROP COLUMN old_field;
+
+PRAGMA table_info(example);
+-- cid | name   | type    | notnull | dflt_value | pk
+-- 0   | id     | INTEGER | 0       | NULL       | 1
+-- 1   | name   | TEXT    | 1       | NULL       | 0
+-- 2   | active | INTEGER | 0       | 1          | 0
+```
+
+## Examples
+
+### Complete Schema Evolution
+
+```sql
+-- Create initial table
+CREATE TABLE articles (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT
+);
+
+-- Add an author column with a foreign key
+ALTER TABLE articles ADD COLUMN author_id INTEGER REFERENCES users(id);
+
+-- Add a publication status
+ALTER TABLE articles ADD COLUMN status TEXT NOT NULL DEFAULT 'draft';
+
+-- Rename a column for clarity
+ALTER TABLE articles RENAME COLUMN body TO content;
+
+-- Add a nullable timestamp column
+ALTER TABLE articles ADD COLUMN updated_at TEXT;
+
+-- Rename the table
+ALTER TABLE articles RENAME TO posts;
+
+-- Final schema
+PRAGMA table_info(posts);
+-- cid | name       | type    | notnull | dflt_value        | pk
+-- 0   | id         | INTEGER | 0       | NULL              | 1
+-- 1   | title      | TEXT    | 1       | NULL              | 0
+-- 2   | content    | TEXT    | 0       | NULL              | 0
+-- 3   | author_id  | INTEGER | 0       | NULL              | 0
+-- 4   | status     | TEXT    | 1       | 'draft'           | 0
+-- 5   | updated_at | TEXT    | 0       | NULL              | 0
+```
+
+## See Also
+
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for creating tables
+- [DROP TABLE](/docs/sql-reference/statements/drop-table) for removing tables
+- [CREATE INDEX](/docs/sql-reference/statements/create-index) for indexing columns
+- [Data Types](/docs/sql-reference/data-types) for column types and STRICT table types

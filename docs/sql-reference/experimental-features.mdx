@@ -1,0 +1,129 @@
+---
+title: Experimental Features
+description: How to enable experimental features in the CLI and each SDK
+sidebarTitle: Experimental Features
+---
+
+# Experimental Features
+
+Some Turso features are still experimental and must be explicitly enabled before use. Experimental features are stable enough for testing but their API may change in future releases.
+
+## Experimental Features List
+
+| Feature | Flag | Description |
+|---------|------|-------------|
+| Views | `views` | [CREATE VIEW](/docs/sql-reference/statements/create-view) and [CREATE MATERIALIZED VIEW](/docs/sql-reference/statements/create-materialized-view) |
+| Custom Types | `custom_types` | [CREATE TYPE](/docs/sql-reference/statements/create-type) and [DROP TYPE](/docs/sql-reference/statements/drop-type) for STRICT tables |
+| Triggers | `triggers` | [CREATE TRIGGER](/docs/sql-reference/statements/create-trigger) and [DROP TRIGGER](/docs/sql-reference/statements/drop-trigger) |
+| Encryption | `encryption` | At-rest encryption via [PRAGMA cipher / hexkey](/docs/sql-reference/pragmas#encryption) |
+| Index Methods | `index_method` | [CREATE INDEX ... USING](/docs/sql-reference/statements/create-index#using-clause) for FTS and custom index types |
+| Autovacuum | `autovacuum` | Automatic database file compaction |
+| Attach | `attach` | [ATTACH DATABASE](/docs/sql-reference/statements/attach-database) and [DETACH DATABASE](/docs/sql-reference/statements/detach-database) |
+
+## CLI
+
+Pass `--experimental-<feature>` flags when starting `tursodb`:
+
+```bash
+tursodb --experimental-views --experimental-triggers database.db
+```
+
+Multiple flags can be combined:
+
+```bash
+tursodb \
+  --experimental-views \
+  --experimental-custom-types \
+  --experimental-triggers \
+  --experimental-encryption \
+  --experimental-index-method \
+  database.db
+```
+
+## Rust SDK
+
+The Rust binding uses a fluent `Builder` API:
+
+```rust
+use turso::Builder;
+
+let db = Builder::new_local("database.db")
+    .experimental_encryption(true)
+    .experimental_triggers(true)
+    .experimental_materialized_views(true)
+    .experimental_custom_types(true)
+    .experimental_index_method(true)
+    .experimental_attach(true)
+    .build()?;
+```
+
+## Python SDK
+
+Pass a comma-separated string to the `experimental_features` parameter:
+
+```python
+import turso
+
+conn = turso.connect(
+    "database.db",
+    experimental_features="views,triggers,custom_types",
+)
+```
+
+## JavaScript / Node.js SDK
+
+Pass an array of feature strings to the `experimental` option:
+
+```typescript
+import { Database } from "@tursodatabase/libsql";
+
+const db = new Database("file:database.db", {
+    experimental: ["views", "triggers", "custom_types", "encryption"],
+});
+```
+
+## Go SDK
+
+Set the `ExperimentalFeatures` field as a comma-separated string:
+
+```go
+db, err := turso.NewDatabase(turso.TursoDatabaseConfig{
+    Path: "database.db",
+    ExperimentalFeatures: "views,triggers,custom_types",
+})
+```
+
+The Go driver also supports DSN query parameters:
+
+```go
+db, err := sql.Open("turso", "database.db?experimental=views,triggers")
+```
+
+## Java SDK
+
+The Java binding currently supports encryption through a dedicated method:
+
+```java
+TursoDB db = TursoDB.openWithEncryption(
+    "database.db",
+    OpenFlags.CREATE,
+    "aegis256",
+    "your-hex-key-here"
+);
+```
+
+## .NET SDK
+
+The .NET binding currently supports encryption through the C FFI:
+
+```csharp
+var db = Database.OpenWithEncryption(
+    "database.db",
+    "aegis256",
+    "your-hex-key-here"
+);
+```
+
+## See Also
+
+- [Compatibility](/docs/sql-reference/compatibility) for the full feature support matrix

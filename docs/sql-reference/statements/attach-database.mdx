@@ -1,0 +1,67 @@
+---
+title: ATTACH DATABASE
+description: Attach an additional database file to the current connection
+sidebarTitle: ATTACH DATABASE
+---
+
+# ATTACH DATABASE
+
+The ATTACH DATABASE statement adds another database file to the current connection under a schema name. Once attached, tables in the external database can be queried alongside tables in the main database.
+
+## Syntax
+
+```sql
+ATTACH [DATABASE] filename AS schema-name;
+```
+
+## Description
+
+ATTACH opens the database file at `filename` and makes its tables accessible through the given `schema-name`. Tables in the attached database are referenced as `schema-name.table-name`.
+
+### Clauses
+
+| Clause | Description |
+|--------|-------------|
+| `DATABASE` | Optional keyword. Has no effect on behavior. |
+| `filename` | A string expression that evaluates to the path of the database file to attach. Use `':memory:'` to attach an in-memory database. |
+| `schema-name` | The name used to qualify table references from the attached database. This name must be unique among all attached databases on the connection. |
+
+Every connection has a built-in schema named `main` for its primary database. The names `main` and `temp` are reserved and cannot be used as schema names for attached databases.
+
+<Info>
+This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features). Attached databases are currently **read-only**. All write operations (INSERT, UPDATE, DELETE, CREATE TABLE, etc.) on tables in attached databases will fail. Use ATTACH for cross-database queries and data migration reads.
+</Info>
+
+## Examples
+
+### Attach and Query an External Database
+
+```sql
+-- Attach another database file
+ATTACH DATABASE 'archive.db' AS archive;
+
+-- Query a table in the attached database
+SELECT * FROM archive.events WHERE event_date > '2025-01-01';
+```
+
+### Cross-Database Queries
+
+```sql
+ATTACH 'customers.db' AS customers_db;
+
+-- Join tables across the main and attached databases
+SELECT o.id, o.total, c.name
+FROM main.orders o
+JOIN customers_db.customers c ON o.customer_id = c.id;
+```
+
+### Attach an In-Memory Database
+
+```sql
+ATTACH ':memory:' AS scratch;
+```
+
+## See Also
+
+- [DETACH DATABASE](/docs/sql-reference/statements/detach-database) for removing an attached database
+- [SELECT](/docs/sql-reference/statements/select) for querying tables across databases

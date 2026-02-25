@@ -1,0 +1,61 @@
+---
+title: DROP TRIGGER
+description: Remove a trigger from the database
+sidebarTitle: DROP TRIGGER
+---
+
+# DROP TRIGGER
+
+The DROP TRIGGER statement removes a trigger from the database schema. Once dropped, the trigger no longer fires in response to its associated table events.
+
+## Syntax
+
+```sql
+DROP TRIGGER [IF EXISTS] [schema-name.]trigger-name;
+```
+
+## Description
+
+DROP TRIGGER removes the named trigger from the database. The trigger must exist unless the `IF EXISTS` clause is specified.
+
+### Clauses
+
+| Clause | Description |
+|--------|-------------|
+| `IF EXISTS` | Suppresses the error that would occur if the trigger does not exist. The statement is a no-op when the trigger is not found. |
+| `schema-name` | The name of the attached database containing the trigger. When omitted, Turso searches for the trigger in the main database. |
+| `trigger-name` | The name of the trigger to remove. |
+
+Dropping a trigger does not affect any data in the table the trigger was associated with. It only removes the trigger definition from the schema.
+
+## Examples
+
+### Drop a Trigger
+
+```sql
+CREATE TRIGGER log_insert AFTER INSERT ON users
+BEGIN
+    INSERT INTO audit_log (action, user_id) VALUES ('insert', NEW.id);
+END;
+
+-- Remove the trigger
+DROP TRIGGER log_insert;
+```
+
+### Drop a Trigger with IF EXISTS
+
+```sql
+-- Safe to run even if the trigger does not exist
+DROP TRIGGER IF EXISTS log_insert;
+```
+
+### Drop a Trigger in an Attached Database
+
+```sql
+DROP TRIGGER IF EXISTS aux.log_insert;
+```
+
+## See Also
+
+- [CREATE TRIGGER](/docs/sql-reference/statements/create-trigger) for creating triggers
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for table definitions

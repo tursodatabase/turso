@@ -1,0 +1,464 @@
+---
+title: Aggregate Functions
+description: Built-in aggregate functions for computing summary values over groups of rows
+sidebarTitle: Aggregate Functions
+---
+
+# Aggregate Functions
+
+Aggregate functions compute a single result from a set of input rows. They are typically used with the `GROUP BY` clause in SELECT statements, but can also be used without `GROUP BY` to aggregate over all rows. When used in a SELECT with non-aggregate columns and no `GROUP BY`, the result is a single row.
+
+All standard aggregate functions ignore NULL values (except `count(*)`). If every input value is NULL, the aggregate returns NULL, with the exception of `count()` (which returns 0) and `total()` (which returns 0.0).
+
+## Function Reference
+
+| Function | Return Type | Description |
+|----------|-------------|-------------|
+| `avg(X)` | REAL | Average of all non-NULL values of X |
+| `count(X)` | INTEGER | Count of rows where X is not NULL |
+| `count(*)` | INTEGER | Count of all rows in the group |
+| `group_concat(X)` | TEXT | Concatenation of all non-NULL values of X, separated by commas |
+| `group_concat(X, Y)` | TEXT | Concatenation of all non-NULL values of X, separated by Y |
+| `string_agg(X, Y)` | TEXT | Alias for `group_concat(X, Y)` |
+| `max(X)` | same as X | Maximum non-NULL value of X |
+| `min(X)` | same as X | Minimum non-NULL value of X |
+| `sum(X)` | INTEGER or REAL | Sum of all non-NULL values of X. Returns NULL if all values are NULL |
+| `total(X)` | REAL | Sum of all non-NULL values of X. Always returns REAL, 0.0 if all values are NULL |
+
+## Detailed Descriptions and Examples
+
+The examples below use the following table:
+
+```sql
+CREATE TABLE sales (
+    id INTEGER PRIMARY KEY,
+    region TEXT,
+    product TEXT,
+    amount REAL,
+    quantity INTEGER
+);
+
+INSERT INTO sales VALUES
+    (1, 'North', 'Widget', 100.00, 5),
+    (2, 'North', 'Gadget', 250.00, 2),
+    (3, 'South', 'Widget', 150.00, 8),
+    (4, 'South', 'Gadget', NULL, 3),
+    (5, 'North', 'Widget', 200.00, NULL),
+    (6, 'South', 'Widget', 175.00, 6);
+```
+
+### avg(X)
+
+```sql
+avg(X)
+```
+
+Returns the average of all non-NULL values of X as a REAL (floating-point) number. Returns NULL if all values are NULL.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| X | any numeric | The expression to average |
+
+**Return type:** REAL
+
+```sql
+SELECT avg(amount) FROM sales;
+-- 175.0 (sum of non-NULL amounts / count of non-NULL amounts = 875.0 / 5)
+
+SELECT region, avg(amount) AS avg_amount
+FROM sales
+GROUP BY region;
+```
+
+| region | avg_amount |
+|--------|------------|
+| North | 183.333333333333 |
+| South | 162.5 |
+
+<Info>
+`avg(X)` ignores NULL values in both the sum and the count. In the example above, the South region has three non-NULL amounts (150 + 175 = 325, but also the NULL row is excluded), so the average is computed over the non-NULL values only.
+</Info>
+
+### count(X) and count(*)
+
+```sql
+count(X)
+count(*)
+```
+
+`count(X)` returns the number of rows where X is not NULL. `count(*)` returns the total number of rows in the group, including rows with NULL values.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| X | any | The expression to count non-NULL values for |
+| `*` | special | Counts all rows regardless of NULL |
+
+**Return type:** INTEGER
+
+```sql
+SELECT count(*) FROM sales;
+-- 6 (all rows)
+
+SELECT count(amount) FROM sales;
+-- 5 (excludes the row where amount is NULL)
+
+SELECT region, count(*) AS total_rows, count(amount) AS rows_with_amount
+FROM sales
+GROUP BY region;
+```
+
+| region | total_rows | rows_with_amount |
+|--------|------------|------------------|
+| North | 3 | 3 |
+| South | 3 | 2 |
+
+### group_concat(X) and group_concat(X, Y)
+
+```sql
+group_concat(X)
+group_concat(X, Y)
+```
+
+Concatenates all non-NULL values of X into a single string. The default separator is a comma (`,`). When Y is provided, it is used as the separator instead.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| X | any | The expression whose values to concatenate |
+| Y | TEXT | Separator string (default: `","`) |
+
+**Return type:** TEXT
+
+```sql
+SELECT group_concat(product) FROM sales;
+-- 'Widget,Gadget,Widget,Gadget,Widget,Widget'
+
+SELECT group_concat(DISTINCT product) FROM sales;
+-- 'Widget,Gadget'
+
+SELECT region, group_concat(product, ' | ') AS products
+FROM sales
+GROUP BY region;
+```
+
+| region | products |
+|--------|----------|
+| North | Widget \| Gadget \| Widget |
+| South | Widget \| Gadget \| Widget |
+
+### string_agg(X, Y)
+
+```sql
+string_agg(X, Y)
+```
+
+Alias for `group_concat(X, Y)`. Provided for compatibility with PostgreSQL.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| X | any | The expression whose values to concatenate |
+| Y | TEXT | Separator string |
+
+**Return type:** TEXT
+
+```sql
+SELECT region, string_agg(product, ', ') AS products
+FROM sales
+GROUP BY region;
+```
+
+| region | products |
+|--------|----------|
+| North | Widget, Gadget, Widget |
+| South | Widget, Gadget, Widget |
+
+### max(X) and min(X)
+
+```sql
+max(X)
+min(X)
+```
+
+`max(X)` returns the maximum non-NULL value of X. `min(X)` returns the minimum non-NULL value of X. Values are compared using the standard SQLite comparison rules. Returns NULL if all values are NULL.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| X | any | The expression to find the maximum or minimum value of |
+
+**Return type:** Same as the input type
+
+```sql
+SELECT max(amount), min(amount) FROM sales;
+-- max: 250.0, min: 100.0
+
+SELECT region, max(amount) AS highest, min(amount) AS lowest
+FROM sales
+GROUP BY region;
+```
+
+| region | highest | lowest |
+|--------|---------|--------|
+| North | 250.0 | 100.0 |
+| South | 175.0 | 150.0 |
+
+<Info>
+When `max(X)` or `min(X)` is called with a single argument in an aggregate context, it acts as an aggregate function. When called with two or more arguments (e.g., `max(a, b, c)`), it acts as a [scalar function](/docs/sql-reference/functions/scalar) and returns the largest argument.
+</Info>
+
+### sum(X) and total(X)
+
+```sql
+sum(X)
+total(X)
+```
+
+Both functions return the sum of all non-NULL values of X. They differ in return type and behavior when all values are NULL.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| X | any numeric | The expression to sum |
+
+**Return type:**
+- `sum(X)`: INTEGER if all non-NULL inputs are integers and no overflow occurs, otherwise REAL. Returns NULL if all values are NULL.
+- `total(X)`: Always REAL. Returns 0.0 if all values are NULL.
+
+```sql
+SELECT sum(amount), total(amount) FROM sales;
+-- sum: 875.0, total: 875.0
+
+SELECT sum(quantity), total(quantity) FROM sales;
+-- sum: 24, total: 24.0
+```
+
+#### Difference between sum() and total()
+
+The key difference appears when all values in the group are NULL:
+
+```sql
+CREATE TABLE empty_amounts (val REAL);
+INSERT INTO empty_amounts VALUES (NULL), (NULL);
+
+SELECT sum(val) FROM empty_amounts;
+-- NULL
+
+SELECT total(val) FROM empty_amounts;
+-- 0.0
+```
+
+This makes `total()` convenient when you need a numeric result even for empty or all-NULL groups:
+
+```sql
+SELECT
+    region,
+    sum(amount) AS sum_amount,
+    total(amount) AS total_amount
+FROM sales
+GROUP BY region;
+```
+
+| region | sum_amount | total_amount |
+|--------|------------|--------------|
+| North | 550.0 | 550.0 |
+| South | 325.0 | 325.0 |
+
+```sql
+-- total() is useful in arithmetic to avoid NULL propagation
+SELECT total(amount) * 1.1 AS with_tax FROM sales;
+-- 962.5
+
+-- sum() with all NULLs would produce NULL, making the multiplication NULL too
+```
+
+<Info>
+`sum(X)` returns an integer result when all inputs are integers and the result fits within a 64-bit signed integer. If the sum overflows, it automatically switches to REAL. Use `total(X)` when you always want a floating-point result.
+</Info>
+
+## Using Aggregates with GROUP BY
+
+The `GROUP BY` clause partitions rows into groups. Each aggregate function is computed independently for each group.
+
+```sql
+SELECT
+    region,
+    product,
+    count(*) AS order_count,
+    sum(amount) AS total_sales,
+    avg(amount) AS avg_sale,
+    min(amount) AS min_sale,
+    max(amount) AS max_sale
+FROM sales
+GROUP BY region, product;
+```
+
+| region | product | order_count | total_sales | avg_sale | min_sale | max_sale |
+|--------|---------|-------------|-------------|----------|----------|----------|
+| North | Gadget | 1 | 250.0 | 250.0 | 250.0 | 250.0 |
+| North | Widget | 2 | 300.0 | 150.0 | 100.0 | 200.0 |
+| South | Gadget | 1 | NULL | NULL | NULL | NULL |
+| South | Widget | 2 | 325.0 | 162.5 | 150.0 | 175.0 |
+
+## Filtering Groups with HAVING
+
+The `HAVING` clause filters groups after aggregation. Use `WHERE` to filter rows before aggregation and `HAVING` to filter groups after.
+
+```sql
+SELECT region, sum(amount) AS total_sales
+FROM sales
+WHERE amount IS NOT NULL
+GROUP BY region
+HAVING sum(amount) > 400;
+```
+
+| region | total_sales |
+|--------|-------------|
+| North | 550.0 |
+
+## Aggregates with DISTINCT
+
+The `DISTINCT` keyword causes the aggregate to consider only unique non-NULL values.
+
+```sql
+SELECT count(product) FROM sales;
+-- 6 (all non-NULL product values)
+
+SELECT count(DISTINCT product) FROM sales;
+-- 2 (only 'Widget' and 'Gadget')
+
+SELECT group_concat(DISTINCT product) FROM sales;
+-- 'Widget,Gadget'
+```
+
+## Aggregates as Window Functions
+
+All standard aggregate functions can be used as window functions. When used with an `OVER` clause, the function computes a running or partitioned result without collapsing rows.
+
+```sql
+SELECT
+    id,
+    region,
+    amount,
+    sum(amount) OVER (PARTITION BY region ORDER BY id) AS running_total,
+    count(*) OVER (PARTITION BY region) AS region_count
+FROM sales
+ORDER BY region, id;
+```
+
+| id | region | amount | running_total | region_count |
+|----|--------|--------|---------------|--------------|
+| 1 | North | 100.0 | 100.0 | 3 |
+| 2 | North | 250.0 | 350.0 | 3 |
+| 5 | North | 200.0 | 550.0 | 3 |
+| 3 | South | 150.0 | 150.0 | 3 |
+| 4 | South | NULL | 150.0 | 3 |
+| 6 | South | 175.0 | 325.0 | 3 |
+
+## Turso Extension: stddev(X)
+
+<Info>
+`stddev(X)` is a Turso extension and is not part of standard SQLite. It is available by default in Turso without loading any additional extensions.
+</Info>
+
+```sql
+stddev(X)
+```
+
+Returns the population standard deviation of all non-NULL values of X. Returns NULL if there are no non-NULL values.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| X | any numeric | The expression to compute the standard deviation of |
+
+**Return type:** REAL
+
+```sql
+SELECT stddev(amount) FROM sales;
+
+SELECT region, avg(amount) AS mean, stddev(amount) AS std_dev
+FROM sales
+GROUP BY region;
+```
+
+## Extension Aggregate Functions
+
+The following aggregate functions are available through the **percentile** extension. Load it before use.
+
+<Info>
+These functions require the `percentile` extension. Load it with `SELECT load_extension('./percentile');` or by configuring your connection to auto-load it.
+</Info>
+
+### median(X)
+
+```sql
+median(X)
+```
+
+Returns the median (middle value) of all non-NULL values of X.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| X | any numeric | The expression to find the median of |
+
+**Return type:** REAL
+
+```sql
+SELECT median(amount) FROM sales;
+-- 175.0
+
+SELECT region, median(amount) AS median_amount
+FROM sales
+GROUP BY region;
+```
+
+### percentile(Y, P)
+
+```sql
+percentile(Y, P)
+```
+
+Returns the P-th percentile of all non-NULL values of Y. Uses linear interpolation between adjacent values.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| Y | any numeric | The values to compute the percentile over |
+| P | REAL | The percentile to compute (0.0 to 100.0) |
+
+**Return type:** REAL
+
+```sql
+SELECT percentile(amount, 50) FROM sales;   -- 50th percentile (median)
+SELECT percentile(amount, 90) FROM sales;   -- 90th percentile
+SELECT percentile(amount, 25) FROM sales;   -- 25th percentile (Q1)
+```
+
+### percentile_cont(Y, P) and percentile_disc(Y, P)
+
+```sql
+percentile_cont(Y, P)
+percentile_disc(Y, P)
+```
+
+SQL-standard percentile functions. `percentile_cont` uses continuous (interpolated) distribution, while `percentile_disc` returns the nearest discrete input value.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| Y | any numeric | The values to compute the percentile over |
+| P | REAL | The percentile fraction (0.0 to 1.0) |
+
+**Return type:** REAL
+
+```sql
+-- Continuous percentile (interpolates between values)
+SELECT percentile_cont(amount, 0.5) FROM sales;
+
+-- Discrete percentile (returns an actual input value)
+SELECT percentile_disc(amount, 0.5) FROM sales;
+```
+
+<Info>
+Note the difference in P range: `percentile(Y, P)` takes P from 0 to 100, while `percentile_cont` and `percentile_disc` take P from 0.0 to 1.0.
+</Info>
+
+## See Also
+
+- [Scalar Functions](/docs/sql-reference/functions/scalar) for per-row functions
+- [Expressions](/docs/sql-reference/expressions) for operator syntax, CAST, CASE, and subqueries
+- [SELECT](/docs/sql-reference/statements/select) for GROUP BY, HAVING, and window function syntax

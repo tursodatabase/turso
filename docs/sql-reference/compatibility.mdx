@@ -1,0 +1,32 @@
+---
+title: SQLite Compatibility
+description: Turso compatibility with SQLite - supported features, known differences, and limitations
+sidebarTitle: Compatibility
+---
+
+# SQLite Compatibility
+
+The authoritative compatibility reference is maintained at [`COMPAT.md`](https://github.com/tursodatabase/turso/blob/main/COMPAT.md) in the repository root. It tracks the support status for every SQL statement, expression, function, PRAGMA, C API function, VDBE opcode, and extension.
+
+Refer to that document for the current state of compatibility. It is updated alongside code changes to stay accurate.
+
+## Turso-Specific Extensions
+
+These features extend Turso beyond SQLite compatibility:
+
+| Feature | Description |
+|---------|-------------|
+| [CREATE TYPE](/docs/sql-reference/statements/create-type) | User-defined types for STRICT tables |
+| [CREATE MATERIALIZED VIEW](/docs/sql-reference/statements/create-materialized-view) | Live materialized views with incremental maintenance |
+| [BEGIN CONCURRENT](/docs/sql-reference/statements/transactions#begin-concurrent) | Optimistic concurrent write transactions (MVCC) |
+| [Vector functions](/docs/sql-reference/functions/vector) | Vector storage, distance calculations, similarity search |
+| [Full-text search](/docs/sql-reference/functions/fts) | Tantivy-powered FTS with BM25 scoring |
+| [CDC](/docs/sql-reference/pragmas#change-data-capture) | Change Data Capture via PRAGMA |
+| [Encryption](/docs/sql-reference/pragmas#encryption) | At-rest database encryption |
+| [Custom index methods](/docs/sql-reference/statements/create-index#using-method) | CREATE INDEX ... USING for FTS and custom access methods |
+| stddev() | Standard deviation aggregate function |
+
+## See Also
+
+- [Experimental Features](/docs/sql-reference/experimental-features) for how to enable experimental features
+- [COMPAT.md](https://github.com/tursodatabase/turso/blob/main/COMPAT.md) for the full compatibility matrix

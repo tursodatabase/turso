@@ -1,0 +1,422 @@
+---
+title: Expressions
+description: SQL expression syntax including literals, operators, CAST, CASE, and subqueries
+sidebarTitle: Expressions
+---
+
+# Expressions
+
+Expressions are combinations of values, operators, and functions that Turso evaluates to produce a result. Expressions appear in many SQL clauses including SELECT columns, WHERE conditions, ORDER BY, GROUP BY, HAVING, CHECK constraints, and DEFAULT values.
+
+## Literals
+
+### Numeric Literals
+
+```sql
+SELECT 42;           -- integer literal
+SELECT -17;          -- negative integer
+SELECT 3.14;         -- real (floating-point) literal
+SELECT 2.5e10;       -- scientific notation
+SELECT 0xFF;         -- hexadecimal integer (255)
+```
+
+### String Literals
+
+String literals are enclosed in single quotes. To include a single quote within a string, use two consecutive single quotes:
+
+```sql
+SELECT 'hello world';        -- text literal
+SELECT 'it''s a test';       -- embedded single quote
+SELECT '';                   -- empty string
+```
+
+### Blob Literals
+
+Blob literals are hexadecimal strings preceded by `x` or `X`:
+
+```sql
+SELECT x'CAFEBABE';          -- blob literal
+SELECT X'48454C4C4F';        -- blob literal (case insensitive prefix)
+```
+
+### NULL Literal
+
+```sql
+SELECT NULL;                 -- null value
+```
+
+### Boolean Literals
+
+Turso does not have a separate boolean type. Use integers `0` (false) and `1` (true):
+
+```sql
+SELECT 1;    -- true
+SELECT 0;    -- false
+```
+
+## Operators
+
+### Arithmetic Operators
+
+| Operator | Description | Example | Result |
+|----------|-------------|---------|--------|
+| `+` | Addition | `3 + 4` | `7` |
+| `-` | Subtraction | `10 - 3` | `7` |
+| `*` | Multiplication | `3 * 4` | `12` |
+| `/` | Division | `10 / 3` | `3` (integer division) |
+| `-` (unary) | Negation | `-5` | `-5` |
+| `+` (unary) | No-op | `+5` | `5` |
+
+Integer division truncates toward zero. Use `CAST` or multiply by `1.0` for floating-point division:
+
+```sql
+SELECT 10 / 3;           -- 3 (integer division)
+SELECT 10 / 3.0;         -- 3.333... (real division)
+SELECT CAST(10 AS REAL) / 3;  -- 3.333...
+```
+
+### Comparison Operators
+
+| Operator | Description | Example |
+|----------|-------------|---------|
+| `=` or `==` | Equal | `x = 5` |
+| `!=` or `<>` | Not equal | `x != 5` |
+| `<` | Less than | `x < 5` |
+| `>` | Greater than | `x > 5` |
+| `<=` | Less than or equal | `x <= 5` |
+| `>=` | Greater than or equal | `x >= 5` |
+
+All comparison operators return `1` (true), `0` (false), or `NULL` (if either operand is NULL).
+
+### Logical Operators
+
+| Operator | Description | Example |
+|----------|-------------|---------|
+| `AND` | Logical AND | `x > 0 AND x < 10` |
+| `OR` | Logical OR | `x = 1 OR x = 2` |
+| `NOT` | Logical NOT | `NOT x = 5` |
+
+### Bitwise Operators
+
+| Operator | Description | Example | Result |
+|----------|-------------|---------|--------|
+| `&` | Bitwise AND | `5 & 3` | `1` |
+| `\|` | Bitwise OR | `5 \| 3` | `7` |
+| `~` | Bitwise NOT | `~5` | `-6` |
+| `<<` | Left shift | `1 << 4` | `16` |
+| `>>` | Right shift | `16 >> 2` | `4` |
+
+### String Concatenation
+
+| Operator | Description | Example | Result |
+|----------|-------------|---------|--------|
+| `\|\|` | Concatenation | `'hello' \|\| ' ' \|\| 'world'` | `'hello world'` |
+
+## CAST Expression
+
+The CAST expression converts a value to a specified type.
+
+```sql
+CAST(expression AS type-name)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| expression | any | The value to convert |
+| type-name | type | The target type name |
+
+```sql
+SELECT CAST(3.7 AS INTEGER);    -- 3 (truncates toward zero)
+SELECT CAST(42 AS TEXT);         -- '42'
+SELECT CAST('123' AS INTEGER);   -- 123
+SELECT CAST('abc' AS INTEGER);   -- 0
+SELECT CAST(NULL AS INTEGER);    -- NULL
+```
+
+<Info>
+**Turso Extension**: In STRICT tables with custom types, `CAST(value AS custom_type)` applies the custom type's ENCODE function. See [CREATE TYPE](/docs/sql-reference/statements/create-type) for details.
+</Info>
+
+## COLLATE Expression
+
+The COLLATE expression specifies a collation sequence for string comparison.
+
+```sql
+expression COLLATE collation-name
+```
+
+Built-in collation sequences:
+
+| Collation | Description |
+|-----------|-------------|
+| `BINARY` | Byte-by-byte comparison (default) |
+| `NOCASE` | Case-insensitive comparison for ASCII characters |
+| `RTRIM` | Like BINARY but ignores trailing spaces |
+
+```sql
+SELECT 'ABC' = 'abc';                        -- 0 (BINARY comparison)
+SELECT 'ABC' = 'abc' COLLATE NOCASE;          -- 1 (case-insensitive)
+SELECT 'abc ' = 'abc' COLLATE RTRIM;           -- 1 (trailing space ignored)
+
+SELECT name FROM users ORDER BY name COLLATE NOCASE;
+```
+
+## Pattern Matching
+
+### LIKE Operator
+
+The LIKE operator performs case-insensitive pattern matching (for ASCII characters). The `%` wildcard matches any sequence of characters, and `_` matches any single character.
+
+```sql
+expression [NOT] LIKE pattern [ESCAPE escape-char]
+```
+
+```sql
+SELECT 'Hello World' LIKE 'hello%';         -- 1 (case-insensitive)
+SELECT 'Hello World' LIKE 'H_llo%';         -- 1 (_ matches 'e')
+SELECT 'Hello World' LIKE '%World';          -- 1
+SELECT '10%' LIKE '10\%' ESCAPE '\';        -- 1 (escaped % literal)
+```
+
+### GLOB Operator
+
+The GLOB operator performs case-sensitive pattern matching using Unix-style wildcards. `*` matches any sequence of characters, and `?` matches any single character.
+
+```sql
+expression [NOT] GLOB pattern
+```
+
+```sql
+SELECT 'Hello' GLOB 'H*';      -- 1
+SELECT 'Hello' GLOB 'h*';      -- 0 (case-sensitive)
+SELECT 'Hello' GLOB 'H?llo';   -- 1
+SELECT 'Hello' GLOB 'H[a-z]*'; -- 1 (character class)
+```
+
+### REGEXP Operator
+
+The REGEXP operator performs regular expression matching. Requires the regexp extension (loaded by default).
+
+```sql
+expression [NOT] REGEXP pattern
+```
+
+```sql
+SELECT 'Hello123' REGEXP '[A-Za-z]+[0-9]+';  -- 1
+SELECT 'test@email.com' REGEXP '^[^@]+@[^@]+\.[^@]+$';  -- 1
+```
+
+## BETWEEN Expression
+
+The BETWEEN expression tests whether a value falls within an inclusive range.
+
+```sql
+expression [NOT] BETWEEN low AND high
+```
+
+The BETWEEN expression is equivalent to `expression >= low AND expression <= high`:
+
+```sql
+SELECT 5 BETWEEN 1 AND 10;     -- 1
+SELECT 5 NOT BETWEEN 1 AND 3;  -- 1
+SELECT 'b' BETWEEN 'a' AND 'c'; -- 1
+```
+
+## IN Expression
+
+The IN expression tests whether a value matches any value in a list or subquery result.
+
+```sql
+expression [NOT] IN (value1, value2, ...)
+expression [NOT] IN (select-statement)
+```
+
+```sql
+SELECT 3 IN (1, 2, 3, 4, 5);           -- 1
+SELECT 'red' NOT IN ('blue', 'green');   -- 1
+
+SELECT name FROM users
+WHERE id IN (SELECT user_id FROM orders WHERE total > 100);
+```
+
+## EXISTS Expression
+
+The EXISTS expression returns `1` if the subquery returns at least one row, and `0` otherwise.
+
+```sql
+[NOT] EXISTS (select-statement)
+```
+
+```sql
+SELECT EXISTS (SELECT 1 FROM users WHERE name = 'Alice');  -- 1 if Alice exists
+
+SELECT name FROM departments d
+WHERE EXISTS (
+    SELECT 1 FROM employees e
+    WHERE e.department_id = d.id
+);
+```
+
+## IS NULL / IS NOT NULL
+
+The IS NULL expression tests whether a value is NULL. Unlike `= NULL`, which always returns NULL, `IS NULL` returns `1` or `0`.
+
+```sql
+expression IS NULL
+expression IS NOT NULL
+```
+
+```sql
+SELECT NULL IS NULL;       -- 1
+SELECT NULL = NULL;        -- NULL (not 1!)
+SELECT 42 IS NOT NULL;     -- 1
+SELECT NULL IS NOT NULL;   -- 0
+```
+
+## IS DISTINCT FROM
+
+The IS DISTINCT FROM expression compares two values, treating NULL as a comparable value.
+
+```sql
+expression IS [NOT] DISTINCT FROM expression
+```
+
+```sql
+SELECT 1 IS DISTINCT FROM 2;       -- 1 (different values)
+SELECT 1 IS DISTINCT FROM 1;       -- 0 (same value)
+SELECT NULL IS DISTINCT FROM NULL;  -- 0 (both NULL)
+SELECT NULL IS DISTINCT FROM 1;     -- 1 (NULL vs non-NULL)
+SELECT 1 IS NOT DISTINCT FROM 1;    -- 1
+```
+
+## CASE Expression
+
+The CASE expression provides conditional logic within SQL expressions.
+
+### Simple CASE
+
+```sql
+CASE expression
+    WHEN value1 THEN result1
+    WHEN value2 THEN result2
+    ...
+    [ELSE default_result]
+END
+```
+
+### Searched CASE
+
+```sql
+CASE
+    WHEN condition1 THEN result1
+    WHEN condition2 THEN result2
+    ...
+    [ELSE default_result]
+END
+```
+
+If no WHEN clause matches and there is no ELSE clause, the CASE expression returns NULL.
+
+```sql
+-- Simple CASE
+SELECT name,
+    CASE status
+        WHEN 'A' THEN 'Active'
+        WHEN 'I' THEN 'Inactive'
+        ELSE 'Unknown'
+    END AS status_text
+FROM users;
+
+-- Searched CASE
+SELECT name, score,
+    CASE
+        WHEN score >= 90 THEN 'A'
+        WHEN score >= 80 THEN 'B'
+        WHEN score >= 70 THEN 'C'
+        ELSE 'F'
+    END AS grade
+FROM students;
+```
+
+## Scalar Subqueries
+
+A subquery enclosed in parentheses that returns a single value can be used as an expression.
+
+```sql
+(select-statement)
+```
+
+The subquery must return exactly one column and at most one row. If the subquery returns no rows, the expression evaluates to NULL.
+
+```sql
+SELECT name,
+    (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) AS order_count
+FROM users;
+
+SELECT * FROM products
+WHERE price > (SELECT AVG(price) FROM products);
+```
+
+## RAISE Function
+
+The RAISE function raises an error condition. In standard SQLite, RAISE can only be used inside triggers. In Turso, `RAISE(ABORT, msg)` can also be used outside triggers — in CHECK constraints, custom type ENCODE expressions, and standalone queries. The other forms (`RAISE(IGNORE)`, `RAISE(ROLLBACK, msg)`, `RAISE(FAIL, msg)`) are only valid inside triggers.
+
+```sql
+RAISE(IGNORE)
+RAISE(ROLLBACK, error-message)
+RAISE(ABORT, error-message)
+RAISE(FAIL, error-message)
+```
+
+| Form | Description |
+|------|-------------|
+| `RAISE(IGNORE)` | Abandon the current trigger action but continue the statement |
+| `RAISE(ROLLBACK, msg)` | Abort the statement and roll back the current transaction |
+| `RAISE(ABORT, msg)` | Abort the current statement; prior changes in the transaction are preserved |
+| `RAISE(FAIL, msg)` | Abort the current statement at the current point; prior row changes are preserved |
+
+```sql
+-- In a trigger
+CREATE TRIGGER validate_age BEFORE INSERT ON users
+BEGIN
+    SELECT CASE
+        WHEN NEW.age < 0 THEN RAISE(ABORT, 'age must be non-negative')
+    END;
+END;
+
+-- In a custom type ENCODE expression
+CREATE TYPE positive_int BASE integer
+    ENCODE CASE WHEN value > 0 THEN value
+                ELSE RAISE(ABORT, 'value must be positive') END
+    DECODE value;
+```
+
+## Operator Precedence
+
+Operators are evaluated in the following order (highest precedence first):
+
+| Precedence | Operators |
+|------------|-----------|
+| 1 (highest) | `~` (unary NOT), `+` (unary), `-` (unary) |
+| 2 | `\|\|` (concatenation) |
+| 3 | `*`, `/` |
+| 4 | `+`, `-` |
+| 5 | `<<`, `>>`, `&`, `\|` |
+| 6 | `<`, `<=`, `>`, `>=` |
+| 7 | `=`, `==`, `!=`, `<>`, `IS`, `IS NOT`, `IS DISTINCT FROM`, `IN`, `LIKE`, `GLOB`, `REGEXP`, `BETWEEN` |
+| 8 | `NOT` |
+| 9 | `AND` |
+| 10 (lowest) | `OR` |
+
+Use parentheses to override precedence when needed:
+
+```sql
+SELECT 2 + 3 * 4;       -- 14 (multiplication first)
+SELECT (2 + 3) * 4;     -- 20 (parentheses override)
+```
+
+## See Also
+
+- [Data Types](/docs/sql-reference/data-types) for storage classes and type affinity
+- [Scalar Functions](/docs/sql-reference/functions/scalar) for built-in functions usable in expressions
+- [SELECT](/docs/sql-reference/statements/select) for using expressions in queries

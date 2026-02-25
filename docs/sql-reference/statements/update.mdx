@@ -1,0 +1,170 @@
+---
+title: UPDATE
+description: Modify existing rows in a table
+sidebarTitle: UPDATE
+---
+
+# UPDATE
+
+The `UPDATE` statement modifies the values of columns in existing rows of a table.
+
+## Syntax
+
+```sql
+UPDATE [OR conflict-algorithm] table-name
+SET column-name = expression [, column-name = expression ...]
+[FROM from-clause]
+[WHERE expression]
+[RETURNING result-column [, result-column ...]]
+[ORDER BY sort-expression [, sort-expression ...]]
+[LIMIT expression [OFFSET expression]]
+```
+
+## Description
+
+`UPDATE` changes column values in rows that match the `WHERE` condition. If no `WHERE` clause is provided, all rows in the table are updated.
+
+### Conflict Handling
+
+The optional `OR` clause specifies how to handle constraint violations during the update. When omitted, the default behavior is `ABORT`.
+
+| Algorithm | Behavior |
+|-----------|----------|
+| `ABORT` | Roll back the current statement and return an error. The transaction remains active. This is the default. |
+| `ROLLBACK` | Roll back the entire transaction and return an error. |
+| `FAIL` | Stop at the first constraint violation and return an error, but keep changes made by earlier rows in this statement. |
+| `IGNORE` | Skip the row that caused the constraint violation and continue processing remaining rows. |
+| `REPLACE` | Delete the conflicting row before updating the current row. If a NOT NULL constraint fails and there is no DEFAULT value, the statement behaves as `ABORT`. |
+
+```sql
+UPDATE OR IGNORE employees
+SET department = 'Engineering'
+WHERE department = 'IT';
+```
+
+### SET Clause
+
+The `SET` clause assigns new values to one or more columns. Each assignment consists of a column name, an equals sign, and an expression. The expression can reference other columns of the same row, and it sees the original (pre-update) values of all columns.
+
+```sql
+UPDATE products
+SET price = price * 1.10,
+    updated_at = datetime('now');
+```
+
+Multiple columns can also be set using a parenthesized column list:
+
+```sql
+UPDATE products
+SET (price, updated_at) = (price * 1.10, datetime('now'));
+```
+
+### FROM Clause
+
+The `FROM` clause allows the `UPDATE` to reference other tables. Columns from the joined tables can be used in `SET` expressions and the `WHERE` clause. This is useful for updating a table based on matching rows from another table.
+
+```sql
+UPDATE inventory
+SET quantity = inventory.quantity - order_items.qty
+FROM order_items
+WHERE inventory.product_id = order_items.product_id
+  AND order_items.order_id = 1001;
+```
+
+When the target table also appears in the `FROM` clause, it refers to a second instance of that table that can be used for self-joins.
+
+### WHERE Clause
+
+The `WHERE` clause restricts which rows are updated. Only rows where the expression evaluates to true are modified. If the `WHERE` clause is omitted, every row in the table is updated.
+
+### RETURNING Clause
+
+The `RETURNING` clause causes the `UPDATE` statement to return the new values of each modified row. The result columns can be expressions referencing the updated column values.
+
+```sql
+UPDATE accounts
+SET balance = balance - 100
+WHERE account_id = 42
+RETURNING account_id, balance;
+-- Returns: 42|900
+```
+
+### ORDER BY and LIMIT
+
+The `ORDER BY` and `LIMIT` clauses restrict which rows are updated. `ORDER BY` determines the order in which rows are considered, and `LIMIT` caps the number of rows that are actually modified. `ORDER BY` requires `LIMIT` to be present.
+
+```sql
+UPDATE logs
+SET archived = 1
+ORDER BY created_at ASC
+LIMIT 1000;
+```
+
+`LIMIT` accepts an optional `OFFSET` to skip a number of rows before applying the limit:
+
+```sql
+UPDATE logs
+SET archived = 1
+ORDER BY created_at ASC
+LIMIT 1000 OFFSET 500;
+```
+
+## Examples
+
+### Update rows matching a condition
+
+```sql
+CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, salary REAL, department TEXT);
+INSERT INTO employees VALUES (1, 'Alice', 90000, 'Engineering');
+INSERT INTO employees VALUES (2, 'Bob', 75000, 'Marketing');
+INSERT INTO employees VALUES (3, 'Carol', 85000, 'Engineering');
+
+UPDATE employees
+SET salary = salary * 1.05
+WHERE department = 'Engineering';
+
+SELECT name, salary FROM employees WHERE department = 'Engineering';
+-- Alice|94500.0
+-- Carol|89250.0
+```
+
+### Update using a join with FROM
+
+```sql
+CREATE TABLE departments (name TEXT PRIMARY KEY, budget REAL);
+INSERT INTO departments VALUES ('Engineering', 500000);
+INSERT INTO departments VALUES ('Marketing', 200000);
+
+CREATE TABLE employees2 (id INTEGER PRIMARY KEY, name TEXT, bonus REAL, dept TEXT);
+INSERT INTO employees2 VALUES (1, 'Alice', 0, 'Engineering');
+INSERT INTO employees2 VALUES (2, 'Bob', 0, 'Marketing');
+
+UPDATE employees2
+SET bonus = departments.budget * 0.01
+FROM departments
+WHERE employees2.dept = departments.name;
+
+SELECT name, bonus FROM employees2;
+-- Alice|5000.0
+-- Bob|2000.0
+```
+
+### Update with RETURNING
+
+```sql
+CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER);
+INSERT INTO counters VALUES ('page_views', 41);
+
+UPDATE counters
+SET value = value + 1
+WHERE name = 'page_views'
+RETURNING name, value;
+-- page_views|42
+```
+
+## See Also
+
+- [INSERT](/docs/sql-reference/statements/insert) for adding new rows
+- [DELETE](/docs/sql-reference/statements/delete) for removing rows
+- [INSERT ... ON CONFLICT](/docs/sql-reference/statements/upsert) for conditional insert-or-update operations
+- [SELECT](/docs/sql-reference/statements/select) for querying data

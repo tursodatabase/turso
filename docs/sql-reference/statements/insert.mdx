@@ -1,0 +1,234 @@
+---
+title: INSERT
+description: Add new rows to a table using literal values, query results, or default values
+sidebarTitle: INSERT
+---
+
+# INSERT
+
+Adds one or more rows to a table. Rows can be specified as literal values, copied from another query, or generated from column defaults.
+
+## Syntax
+
+```sql
+INSERT [OR conflict_action] INTO table_name [(column_name [, ...])]
+  VALUES (expression [, ...]) [, (expression [, ...]) ...]
+  [RETURNING result_column [, ...]];
+
+INSERT [OR conflict_action] INTO table_name [(column_name [, ...])]
+  select_statement
+  [RETURNING result_column [, ...]];
+
+INSERT [OR conflict_action] INTO table_name [(column_name [, ...])]
+  DEFAULT VALUES
+  [RETURNING result_column [, ...]];
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `conflict_action` | keyword | One of REPLACE, IGNORE, ABORT, ROLLBACK, or FAIL. Controls behavior on constraint violations |
+| `table_name` | identifier | The table to insert rows into |
+| `column_name` | identifier | Column to assign a value to. Unlisted columns receive their default value or NULL |
+| `expression` | expression | A value to insert. Must match the position or name of the target column |
+| `select_statement` | SELECT query | A query whose result rows are inserted into the table |
+| `result_column` | expression | Column or expression to return for each inserted row |
+
+## Description
+
+INSERT adds new rows to the specified table. There are three forms:
+
+- **VALUES**: Insert one or more rows with explicit values.
+- **SELECT**: Insert the result set of a query.
+- **DEFAULT VALUES**: Insert a single row where every column uses its default value (or NULL if no default is defined).
+
+When a column list is provided, only those columns receive explicit values. All other columns use their default value or NULL. When no column list is provided, values must be supplied for every column in the table, in the order the columns were defined.
+
+## Inserting Rows
+
+### Single Row
+
+```sql
+INSERT INTO employees (name, department, salary)
+VALUES ('Alice', 'Engineering', 95000);
+```
+
+### Multiple Rows
+
+Supply multiple parenthesized groups separated by commas.
+
+```sql
+INSERT INTO employees (name, department, salary) VALUES
+  ('Bob', 'Design', 82000),
+  ('Carol', 'Engineering', 97000),
+  ('Dave', 'Marketing', 74000);
+```
+
+### All Columns
+
+When the column list is omitted, provide a value for every column in table-definition order.
+
+```sql
+-- Assuming employees has columns: id, name, department, salary
+INSERT INTO employees VALUES (1, 'Alice', 'Engineering', 95000);
+```
+
+## INSERT INTO ... SELECT
+
+Inserts the result of a SELECT statement. The number of columns returned by the SELECT must match the number of target columns.
+
+```sql
+INSERT INTO archive_employees (name, department, salary)
+SELECT name, department, salary
+FROM employees
+WHERE termination_date IS NOT NULL;
+```
+
+The SELECT can include any valid clause: WHERE, JOIN, GROUP BY, ORDER BY, LIMIT, UNION, or subqueries.
+
+```sql
+INSERT INTO monthly_summary (department, headcount, total_salary)
+SELECT department, COUNT(*), SUM(salary)
+FROM employees
+GROUP BY department;
+```
+
+## DEFAULT VALUES
+
+Inserts a single row where every column receives its default value. Columns without an explicit DEFAULT definition receive NULL. INTEGER PRIMARY KEY columns receive an auto-generated rowid.
+
+```sql
+CREATE TABLE audit_log (
+  id INTEGER PRIMARY KEY,
+  created_at TEXT DEFAULT (datetime('now')),
+  action TEXT DEFAULT 'unknown'
+);
+
+INSERT INTO audit_log DEFAULT VALUES;
+-- Inserts: (auto_id, current_timestamp, 'unknown')
+```
+
+## Column Default Values
+
+When a column list is provided, omitted columns use their default values.
+
+```sql
+CREATE TABLE tasks (
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  status TEXT DEFAULT 'pending',
+  priority INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- status, priority, and created_at use their defaults
+INSERT INTO tasks (title) VALUES ('Review pull request');
+```
+
+## Conflict Handling
+
+The `OR` clause specifies what happens when an INSERT violates a uniqueness or NOT NULL constraint.
+
+| Action | Behavior |
+|--------|----------|
+| `ABORT` | Roll back the current statement and return an error. Previously inserted rows within the same INSERT are undone. This is the default |
+| `ROLLBACK` | Roll back the entire transaction and return an error |
+| `FAIL` | Stop execution and return an error. Rows already inserted by this statement before the failure are kept |
+| `IGNORE` | Skip the row that caused the violation and continue with the next row |
+| `REPLACE` | Delete the conflicting row and insert the new row in its place |
+
+```sql
+-- Skip rows that violate a UNIQUE constraint
+INSERT OR IGNORE INTO employees (id, name, department, salary)
+VALUES (1, 'Alice', 'Engineering', 95000);
+
+-- Replace the existing row on conflict
+INSERT OR REPLACE INTO employees (id, name, department, salary)
+VALUES (1, 'Alice', 'Engineering', 105000);
+
+-- Roll back only this statement on conflict
+INSERT OR ABORT INTO employees (id, name, department, salary)
+VALUES (1, 'Alice', 'Engineering', 95000);
+```
+
+<Info>
+For more granular conflict handling based on specific constraints, use the [ON CONFLICT](/docs/sql-reference/statements/upsert) clause (UPSERT), which allows different actions depending on which constraint was violated.
+</Info>
+
+## RETURNING Clause
+
+Returns data from the rows that were actually inserted. This is useful for retrieving generated values such as auto-incremented IDs or evaluated defaults.
+
+```sql
+INSERT INTO employees (name, department, salary)
+VALUES ('Eve', 'Engineering', 91000)
+RETURNING id, name;
+-- Returns: 5|Eve
+```
+
+RETURNING accepts any expression that can reference the inserted row's columns.
+
+```sql
+INSERT INTO employees (name, department, salary)
+VALUES ('Frank', 'Design', 78000)
+RETURNING id, name, salary * 12 AS annual_salary;
+-- Returns: 6|Frank|936000
+```
+
+### RETURNING with Multiple Rows
+
+```sql
+INSERT INTO employees (name, department, salary) VALUES
+  ('Grace', 'Engineering', 102000),
+  ('Hank', 'Marketing', 68000)
+RETURNING id, name, department;
+-- Returns one row per inserted row
+```
+
+### RETURNING *
+
+Return all columns of the inserted rows.
+
+```sql
+INSERT INTO employees (name, department, salary)
+VALUES ('Ivy', 'Product', 88000)
+RETURNING *;
+```
+
+## Examples
+
+### Insert with Subquery Values
+
+```sql
+INSERT INTO department_stats (department, avg_salary)
+SELECT department, AVG(salary)
+FROM employees
+GROUP BY department
+HAVING COUNT(*) >= 3;
+```
+
+### Insert with Conflict Handling and RETURNING
+
+```sql
+INSERT OR REPLACE INTO settings (key, value)
+VALUES ('theme', 'dark'), ('locale', 'en-US')
+RETURNING key, value;
+```
+
+### Archival Pattern
+
+```sql
+-- Copy rows to archive, then delete originals
+INSERT INTO orders_archive
+SELECT * FROM orders WHERE order_date < '2023-01-01';
+
+DELETE FROM orders WHERE order_date < '2023-01-01';
+```
+
+## See Also
+
+- [INSERT ... ON CONFLICT (UPSERT)](/docs/sql-reference/statements/upsert) for conditional insert-or-update behavior
+- [REPLACE](/docs/sql-reference/statements/replace) for shorthand INSERT OR REPLACE
+- [SELECT](/docs/sql-reference/statements/select) for the query syntax used with INSERT INTO ... SELECT
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for column definitions and default values
