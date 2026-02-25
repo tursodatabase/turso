@@ -1242,115 +1242,108 @@ impl Jsonb {
         }
 
         match kind {
-            // Can be serialized as is. Do not need escaping
-            ElementType::TEXT => {
+            ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
                 let word = from_utf8(word_slice).map_err(|_| {
                     LimboError::ParseError("Failed to serialize string!".to_string())
                 })?;
-                string.push_str(word);
+
+                let mut last_end = 0;
+                let bytes = word.as_bytes();
+                for i in 0..bytes.len() {
+                    let b = bytes[i];
+                    let needs_escape = if *kind == ElementType::TEXTJ {
+                        b <= 0x1F
+                    } else {
+                        b == b'"' || b == b'\\' || b <= 0x1F
+                    };
+
+                    if needs_escape {
+                        string.push_str(&word[last_end..i]);
+                        match b {
+                            b'"' => string.push_str("\\\""),
+                            b'\\' => string.push_str("\\\\"),
+                            0x08 => string.push_str("\\b"),
+                            0x0C => string.push_str("\\f"),
+                            b'\n' => string.push_str("\\n"),
+                            b'\r' => string.push_str("\\r"),
+                            b'\t' => string.push_str("\\t"),
+                            c => {
+                                let _ = write!(string, "\\u{:04x}", c);
+                            }
+                        }
+                        last_end = i + 1;
+                    }
+                }
+                string.push_str(&word[last_end..]);
             }
 
-            // Contain standard json escapes
-            ElementType::TEXTJ => {
-                let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
-                })?;
-                string.push_str(word);
-            }
-
-            // We have to escape some JSON5 escape sequences
             ElementType::TEXT5 => {
                 let mut i = 0;
                 while i < word_slice.len() {
                     let ch = word_slice[i];
 
-                    // Handle normal characters that don't need escaping
                     if is_json_ok(ch) || ch == b'\'' {
                         string.push(ch as char);
                         i += 1;
                         continue;
                     }
 
-                    // Handle special cases
                     match ch {
-                        // Double quotes need escaping
                         b'"' => {
                             string.push_str("\\\"");
                             i += 1;
                         }
-
-                        // Control characters (0x00-0x1F)
                         ch if ch <= 0x1F => {
                             match ch {
-                                // \b
                                 0x08 => string.push_str("\\b"),
                                 b'\t' => string.push_str("\\t"),
                                 b'\n' => string.push_str("\\n"),
-                                // \f
                                 0x0C => string.push_str("\\f"),
                                 b'\r' => string.push_str("\\r"),
                                 _ => {
-                                    // Format as \u00XX
                                     let hex = format!("\\u{ch:04x}");
                                     string.push_str(&hex);
                                 }
                             }
                             i += 1;
                         }
-
-                        // Handle escape sequences
                         b'\\' if i + 1 < word_slice.len() => {
                             let next_ch = word_slice[i + 1];
                             match next_ch {
-                                // Single quote
                                 b'\'' => {
                                     string.push('\'');
                                     i += 2;
                                 }
-
-                                // Vertical tab
                                 b'v' => {
                                     string.push_str("\\u0009");
                                     i += 2;
                                 }
-
-                                // Hex escapes like \x27
                                 b'x' if i + 3 < word_slice.len() => {
                                     string.push_str("\\u00");
                                     string.push(word_slice[i + 2] as char);
                                     string.push(word_slice[i + 3] as char);
                                     i += 4;
                                 }
-
-                                // Null character
                                 b'0' => {
                                     string.push_str("\\u0000");
                                     i += 2;
                                 }
-
-                                // CR line continuation
                                 b'\r' => {
                                     if i + 2 < word_slice.len() && word_slice[i + 2] == b'\n' {
-                                        i += 3; // Skip CRLF
+                                        i += 3;
                                     } else {
-                                        i += 2; // Skip CR
+                                        i += 2;
                                     }
                                 }
-
-                                // LF line continuation
                                 b'\n' => {
                                     i += 2;
                                 }
-
-                                // Unicode line separators (U+2028 and U+2029)
                                 0xe2 if i + 3 < word_slice.len()
                                     && word_slice[i + 2] == 0x80
                                     && (word_slice[i + 3] == 0xa8 || word_slice[i + 3] == 0xa9) =>
                                 {
                                     i += 4;
                                 }
-
-                                // All other escapes pass through
                                 _ => {
                                     string.push('\\');
                                     string.push(next_ch as char);
@@ -1358,34 +1351,10 @@ impl Jsonb {
                                 }
                             }
                         }
-
-                        // Default case - just push the character
                         _ => {
                             string.push(ch as char);
                             i += 1;
                         }
-                    }
-                }
-            }
-
-            ElementType::TEXTRAW => {
-                let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
-                })?;
-
-                for ch in word.chars() {
-                    match ch {
-                        '"' => string.push_str("\\\""),
-                        '\\' => string.push_str("\\\\"),
-                        '\x08' => string.push_str("\\b"),
-                        '\x0C' => string.push_str("\\f"),
-                        '\n' => string.push_str("\\n"),
-                        '\r' => string.push_str("\\r"),
-                        '\t' => string.push_str("\\t"),
-                        c if c <= '\u{001F}' => {
-                            string.push_str(&format!("\\u{:04x}", c as u32));
-                        }
-                        _ => string.push(ch),
                     }
                 }
             }
