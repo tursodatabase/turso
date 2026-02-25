@@ -52,5 +52,5 @@ QUERY PLAN
 |  |--SCALAR SUBQUERY 1
 |  |  `--SCAN customer
 |  |--SCAN customer
-|  `--SCAN orders
+|  `--SEARCH orders USING INDEX ephemeral_orders_t5
 `--USE SORTER FOR GROUP BY
