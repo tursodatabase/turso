@@ -11,17 +11,22 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
-/// Elle operation types for the list-append model.
-/// In this model, objects are lists of integers and transactions either append values or read lists.
+/// Elle operation types for the list-append and rw-register models.
+/// List-append: objects are lists of integers, transactions append values or read lists.
+/// Rw-register: objects are single integers, transactions write or read single values.
 #[derive(Debug, Clone)]
 pub enum ElleOp {
-    /// Append a value to a list identified by key
+    /// Append a value to a list identified by key (list-append model)
     Append { key: String, value: i64 },
-    /// Read a list by key, result is None before execution and Some after
+    /// Read a list by key, result is None before execution and Some after (list-append model)
     Read {
         key: String,
         result: Option<Vec<i64>>,
     },
+    /// Write a single value to a key (rw-register model)
+    Write { key: String, value: i64 },
+    /// Read a single value by key (rw-register model)
+    RwRead { key: String, result: Option<i64> },
 }
 
 impl ElleOp {
@@ -45,6 +50,16 @@ impl ElleOp {
                             format!("[{}]", vals_str.join(" "))
                         }
                     }
+                };
+                format!("[:r \"{}\" {}]", escape_edn_string(key), result_str)
+            }
+            ElleOp::Write { key, value } => {
+                format!("[:w \"{}\" {}]", escape_edn_string(key), value)
+            }
+            ElleOp::RwRead { key, result } => {
+                let result_str = match result {
+                    None => "nil".to_string(),
+                    Some(val) => val.to_string(),
                 };
                 format!("[:r \"{}\" {}]", escape_edn_string(key), result_str)
             }
@@ -193,8 +208,11 @@ fn escape_edn_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Number of Elle keys to use (small key space ensures conflicts).
-pub const ELLE_KEY_COUNT: usize = 10;
+/// Number of Elle keys for list-append model (larger space is fine — appends always create version deps).
+pub const ELLE_LIST_APPEND_KEY_COUNT: usize = 10;
+
+/// Number of Elle keys for rw-register model (small space increases contention for wfr/wfw edges).
+pub const ELLE_RW_REGISTER_KEY_COUNT: usize = 4;
 
 /// Generate an Elle key name from an index.
 pub fn elle_key_name(index: usize) -> String {
@@ -230,6 +248,24 @@ mod tests {
             result: Some(vec![1, 2, 3]),
         };
         assert_eq!(read_values.to_edn(), "[:r \"w\" [1 2 3]]");
+
+        let write = ElleOp::Write {
+            key: "x".to_string(),
+            value: 99,
+        };
+        assert_eq!(write.to_edn(), "[:w \"x\" 99]");
+
+        let rw_read_nil = ElleOp::RwRead {
+            key: "y".to_string(),
+            result: None,
+        };
+        assert_eq!(rw_read_nil.to_edn(), "[:r \"y\" nil]");
+
+        let rw_read_val = ElleOp::RwRead {
+            key: "z".to_string(),
+            result: Some(42),
+        };
+        assert_eq!(rw_read_val.to_edn(), "[:r \"z\" 42]");
     }
 
     #[test]

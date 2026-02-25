@@ -65,6 +65,14 @@ pub enum Operation {
     },
     /// Read an Elle list by key
     ElleRead { table_name: String, key: String },
+    /// Write a single value to an Elle rw-register key
+    ElleRwWrite {
+        table_name: String,
+        key: String,
+        value: i64,
+    },
+    /// Read a single value from an Elle rw-register key
+    ElleRwRead { table_name: String, key: String },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
@@ -131,6 +139,19 @@ impl Operation {
             }
             Operation::ElleRead { table_name, key } => {
                 format!("SELECT vals FROM {table_name} WHERE key = '{key}'")
+            }
+            Operation::ElleRwWrite {
+                table_name,
+                key,
+                value,
+            } => {
+                format!(
+                    "INSERT INTO {table_name} (key, val) VALUES ('{key}', {value}) \
+                     ON CONFLICT(key) DO UPDATE SET val = {value}"
+                )
+            }
+            Operation::ElleRwRead { table_name, key } => {
+                format!("SELECT val FROM {table_name} WHERE key = '{key}'")
             }
         }
     }

@@ -30,13 +30,14 @@ env:
 
 jobs:
   elle-check:
-    name: Elle check (${{ matrix.mvcc && 'MVCC' || 'default' }})
+    name: Elle ${{ matrix.elle_model }} (${{ matrix.mvcc && 'MVCC' || 'default' }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         mvcc: [false, true]
+        elle_model: [list-append, rw-register]
     steps:
       - uses: actions/checkout@v4
 
@@ -84,13 +85,13 @@ jobs:
             MVCC_FLAG="--enable-mvcc"
           fi
           if ./target/debug/turso_whopper \
-            --elle list-append \
+            --elle ${{ matrix.elle_model }} \
             --elle-output elle-history.edn \
             --max-steps "$MAX_STEPS" \
             $MVCC_FLAG; then
             echo "SIMULATION_OK=true" >> "$GITHUB_ENV"
           else
-            echo "::warning::Simulation failed (mvcc=${{ matrix.mvcc }})"
+            echo "::warning::Simulation failed (model=${{ matrix.elle_model }}, mvcc=${{ matrix.mvcc }})"
             echo "SIMULATION_OK=false" >> "$GITHUB_ENV"
             if [ "${{ matrix.mvcc }}" != "true" ]; then
               exit 1
@@ -134,10 +135,10 @@ jobs:
           if [ "${{ matrix.mvcc }}" = "true" ]; then
             CONSISTENCY_FLAG="--consistency-models snapshot-isolation"
           fi
-          if java -jar "$ELLE_JAR" --model list-append $CONSISTENCY_FLAG --verbose --directory elle-results elle-history.edn; then
+          if java -jar "$ELLE_JAR" --model ${{ matrix.elle_model }} $CONSISTENCY_FLAG --verbose --directory elle-results elle-history.edn; then
             echo "Elle analysis passed"
           else
-            echo "::warning::Elle analysis found consistency violations (mvcc=${{ matrix.mvcc }})"
+            echo "::warning::Elle analysis found consistency violations (model=${{ matrix.elle_model }}, mvcc=${{ matrix.mvcc }})"
             if [ "${{ matrix.mvcc }}" != "true" ]; then
               exit 1
             fi
@@ -149,7 +150,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: elle-results-${{ matrix.mvcc && 'mvcc' || 'default' }}
+          name: elle-results-${{ matrix.elle_model }}-${{ matrix.mvcc && 'mvcc' || 'default' }}
           path: |
             elle-history.edn
             elle-results/
