@@ -67,6 +67,10 @@ Use if-statements only when both branches are expected paths.
 - Don't create abstractions for one-time operations
 - Three similar lines > premature abstraction
 
+## Index Mutations
+
+When code involves index inserts, deletes, or conflict resolution, double-check the ordering against SQLite. Wrong ordering causes index inconsistencies. and easy to miss.
+
 ## Ensure understanding of IO model
 
 - [Async IO model](../async-io-model/SKILL.md)
