@@ -223,7 +223,16 @@ impl Limbo {
             .with_attach(opts.experimental_attach)
             .with_unsafe_testing(opts.unsafe_testing);
 
-        let (io, conn) = if db_file.contains([':', '?', '&', '#']) {
+        // Normalize path?key=val to file:path?key=val so query parameters
+        // are parsed as URI options (e.g. ?locking=shared_reads) instead of
+        // being treated as part of the filename.
+        let db_file = if !db_file.starts_with("file:") && db_file.contains('?') {
+            format!("file:{db_file}")
+        } else {
+            db_file
+        };
+
+        let (io, conn) = if db_file.starts_with("file:") {
             Connection::from_uri(&db_file, db_opts)?
         } else {
             let flags = if opts.readonly {
