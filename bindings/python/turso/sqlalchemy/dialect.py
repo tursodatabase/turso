@@ -7,6 +7,7 @@ This module provides two SQLAlchemy dialects:
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from sqlalchemy import pool
@@ -17,6 +18,8 @@ from sqlalchemy.engine.reflection import ObjectKind
 if TYPE_CHECKING:
     from sqlalchemy.engine.interfaces import ConnectArgsType, ReflectedForeignKeyConstraint, ReflectedIndex
     from sqlalchemy.pool import Pool
+
+logger = logging.getLogger(__name__)
 
 
 class _TursoDialectMixin:
@@ -42,6 +45,11 @@ class _TursoDialectMixin:
         Turso doesn't support PRAGMA foreign_key_list, so we return an empty list.
         Foreign key constraints are still enforced at write time if defined.
         """
+        logger.debug(
+            "PRAGMA foreign_key_list not supported; "
+            "foreign key reflection unavailable for table '%s'",
+            table_name,
+        )
         return []
 
     def get_indexes(
@@ -57,6 +65,11 @@ class _TursoDialectMixin:
         Turso doesn't support PRAGMA index_list, so we return an empty list.
         Indexes still exist and are used for query optimization.
         """
+        logger.debug(
+            "PRAGMA index_list not supported; "
+            "index reflection unavailable for table '%s'",
+            table_name,
+        )
         return []
 
     def get_unique_constraints(
@@ -71,6 +84,11 @@ class _TursoDialectMixin:
 
         This also relies on PRAGMA index_list which Turso doesn't support.
         """
+        logger.debug(
+            "PRAGMA index_list not supported; "
+            "unique constraint reflection unavailable for table '%s'",
+            table_name,
+        )
         return []
 
     def get_check_constraints(
@@ -84,8 +102,11 @@ class _TursoDialectMixin:
         Return check constraints for a table.
 
         SQLite stores these in sqlite_master which Turso may not fully support.
-        Return empty list for safety.
         """
+        logger.debug(
+            "check constraint reflection not supported for table '%s'",
+            table_name,
+        )
         return []
 
     def get_multi_indexes(
@@ -98,6 +119,7 @@ class _TursoDialectMixin:
         **kw,
     ) -> Dict[Any, List[ReflectedIndex]]:
         """Return indexes for multiple tables."""
+        logger.debug("PRAGMA index_list not supported; multi-index reflection unavailable")
         return {}
 
     def get_multi_unique_constraints(
@@ -110,6 +132,7 @@ class _TursoDialectMixin:
         **kw,
     ) -> Dict[Any, List[Dict[str, Any]]]:
         """Return unique constraints for multiple tables."""
+        logger.debug("PRAGMA index_list not supported; multi-unique-constraint reflection unavailable")
         return {}
 
     def get_multi_foreign_keys(
@@ -122,6 +145,7 @@ class _TursoDialectMixin:
         **kw,
     ) -> Dict[Any, List[ReflectedForeignKeyConstraint]]:
         """Return foreign keys for multiple tables."""
+        logger.debug("PRAGMA foreign_key_list not supported; multi-foreign-key reflection unavailable")
         return {}
 
     def get_multi_check_constraints(
@@ -134,7 +158,24 @@ class _TursoDialectMixin:
         **kw,
     ) -> Dict[Any, List[Dict[str, Any]]]:
         """Return check constraints for multiple tables."""
+        logger.debug("multi-check-constraint reflection not supported")
         return {}
+
+    def get_temp_table_names(self, connection, **kw) -> List[str]:
+        """Return temporary table names.
+
+        Turso doesn't support sqlite_temp_master, so we return an empty list.
+        """
+        logger.debug("sqlite_temp_master not supported; temp table reflection unavailable")
+        return []
+
+    def get_temp_view_names(self, connection, **kw) -> List[str]:
+        """Return temporary view names.
+
+        Turso doesn't support sqlite_temp_master, so we return an empty list.
+        """
+        logger.debug("sqlite_temp_master not supported; temp view reflection unavailable")
+        return []
 
 
 class TursoDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
@@ -171,7 +212,6 @@ class TursoDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
     def import_dbapi(cls):
         """Import the turso module as DBAPI."""
         import turso
-
         return turso
 
     def on_connect(self):
