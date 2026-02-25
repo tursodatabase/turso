@@ -263,7 +263,10 @@ mod join_fuzz_tests {
                     continue;
                 }
                 let col = cols[rng.random_range(0..cols.len())];
-                let kind = rng.random_range(0..4);
+                // EXISTS/NOT EXISTS only when indexes exist — without indexes,
+                // non-unnested correlated subqueries cause pathological O(n²) scans.
+                let max_kind = if add_indexes { 6 } else { 4 };
+                let kind = rng.random_range(0..max_kind);
                 let cond = match kind {
                     0 => {
                         let val = rng.random_range(-10..=20);
@@ -275,6 +278,21 @@ mod join_fuzz_tests {
                     }
                     2 => format!("{alias}.{col} IS NULL"),
                     3 => format!("{alias}.{col} IS NOT NULL"),
+                    4 | 5 => {
+                        // EXISTS / NOT EXISTS correlated subquery
+                        let not = if kind == 5 { "NOT " } else { "" };
+                        let target_table = tables[rng.random_range(0..tables.len())];
+                        let sub_col = ["a", "b", "c", "d"][rng.random_range(0..4)];
+                        let extra = if rng.random_bool(0.3) {
+                            let val = rng.random_range(-10..=20);
+                            format!(" AND {target_table}.{sub_col} > {val}")
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "{not}EXISTS (SELECT 1 FROM {target_table} WHERE {target_table}.{sub_col} = {alias}.{col}{extra})"
+                        )
+                    }
                     _ => unreachable!(),
                 };
                 where_parts.push(cond);

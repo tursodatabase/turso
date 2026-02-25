@@ -5392,6 +5392,7 @@ mod fuzz_tests {
     #[turso_macros::test(mvcc)]
     /// Tests for correlated and uncorrelated subqueries in SELECT statements (WHERE, SELECT-list, GROUP BY/HAVING).
     pub fn table_subquery_fuzz(db: TempDatabase) {
+        let verbose = std::env::var("VERBOSE").is_ok();
         let (mut rng, _seed) = helpers::init_fuzz_test("table_subquery_fuzz");
 
         // Constants for fuzzing parameters
@@ -6390,6 +6391,13 @@ mod fuzz_tests {
             let limit_clause = gen_limit_offset_clause(&mut rng);
             if !limit_clause.is_empty() {
                 query.push_str(&limit_clause);
+            }
+
+            if verbose {
+                println!(
+                    "Iteration {}/{num_fuzz_iterations}: Query: {query}",
+                    iter_num + 1
+                );
             }
 
             helpers::assert_differential_no_ordering(
