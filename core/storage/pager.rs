@@ -2718,6 +2718,11 @@ impl Pager {
             self.set_schema_cookie(None);
             wal.rollback(None);
             wal.end_write_tx();
+        } else {
+            // For read-only transactions, pager state machines (e.g. header_ref_state)
+            // can be left in intermediate states if an IO completion was aborted.
+            // Reset them so the next query on this attached DB starts clean.
+            self.reset_internal_states();
         }
         if wal.holds_read_lock() {
             wal.end_read_tx();
