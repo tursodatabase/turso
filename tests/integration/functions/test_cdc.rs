@@ -1019,10 +1019,8 @@ fn setup_backward_compat_v1(db: &TempDatabase, mode: &str) -> Arc<turso_core::Co
         .unwrap();
 
     // Enable CDC — table already exists, InitCdcVersion reads version from table
-    conn.execute(format!(
-        "PRAGMA capture_data_changes_conn('{mode}')"
-    ))
-    .unwrap();
+    conn.execute(format!("PRAGMA capture_data_changes_conn('{mode}')"))
+        .unwrap();
 
     // Verify version table is unchanged
     let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");

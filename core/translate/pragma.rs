@@ -378,8 +378,7 @@ fn update_pragma(
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
-        PragmaName::CaptureDataChangesConn
-        | PragmaName::UnstableCaptureDataChangesConn => {
+        PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
             if opts.is_some() && connection.mvcc_enabled() {
@@ -1074,8 +1073,7 @@ fn query_pragma(
             translate_quick_check(schema, program, resolver, database_id, max_errors)?;
             Ok(TransactionMode::Read)
         }
-        PragmaName::CaptureDataChangesConn
-        | PragmaName::UnstableCaptureDataChangesConn => {
+        PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
             let pragma = pragma_for(&pragma);
             let second_column = program.alloc_register();
             let third_column = program.alloc_register();
