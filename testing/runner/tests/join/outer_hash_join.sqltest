@@ -1410,3 +1410,79 @@ test right-join-select-star-with-aggregate {
 expect {
     3|1|3
 }
+
+# Regression: FULL OUTER with correlated NOT EXISTS subquery.
+# Used to fail with misleading "FULL OUTER JOIN requires an equality condition
+# in the ON clause". Now gives a specific error about correlated subqueries.
+@skip-if sqlite "supported in sqlite"
+@cross-check-integrity
+test full-outer-with-not-exists-subquery {
+    CREATE TABLE t(x);
+    CREATE TABLE u(x);
+    CREATE TABLE v(x);
+    SELECT t.x, u.x FROM t FULL OUTER JOIN u ON t.x=u.x
+    WHERE NOT EXISTS (SELECT * FROM v WHERE v.x=t.x);
+}
+expect error {
+    FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables
+}
+
+# Regression: FULL OUTER with IN subquery on probe table column.
+# Used to panic with "FULL OUTER probe table must have left join metadata"
+# because the null-rejection optimizer removed the outer flag needed for
+# LeftJoinMetadata allocation.
+@cross-check-integrity
+test full-outer-with-in-subquery {
+    CREATE TABLE t(x);
+    CREATE TABLE u(x);
+    CREATE TABLE v(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    INSERT INTO u VALUES (2), (3), (4);
+    INSERT INTO v VALUES (2), (3);
+    SELECT t.x, u.x FROM t FULL OUTER JOIN u ON t.x=u.x
+    WHERE u.x IN (SELECT * FROM v)
+    ORDER BY coalesce(t.x, u.x);
+}
+expect {
+    2|2
+    3|3
+}
+
+# FULL OUTER with WHERE equijoin duplicating the ON condition.
+# Both conditions are consumed as hash join keys, so the WHERE t.x=u.x
+# does not act as a post-join filter. This is a known limitation; the
+# result includes unmatched rows that SQLite would filter out.
+@skip-if sqlite "known limitation: duplicate equijoin consumed as hash key"
+@cross-check-integrity
+test full-outer-with-where-equijoin {
+    CREATE TABLE t(x);
+    CREATE TABLE u(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    INSERT INTO u VALUES (2), (3), (4);
+    SELECT t.x, u.x FROM t FULL OUTER JOIN u ON t.x=u.x
+    WHERE t.x=u.x
+    ORDER BY coalesce(t.x, u.x);
+}
+expect {
+    1|
+    2|2
+    3|3
+    |4
+}
+
+# Regression: FULL OUTER with a simple self-filter on the probe (RHS) table.
+# Same root cause as the IN subquery case: u.x=3 is null-rejecting for u,
+# so the optimizer removed the outer flag, dropping LeftJoinMetadata.
+@cross-check-integrity
+test full-outer-with-rhs-self-filter {
+    CREATE TABLE t(x);
+    CREATE TABLE u(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    INSERT INTO u VALUES (2), (3), (4);
+    SELECT t.x, u.x FROM t FULL OUTER JOIN u ON t.x=u.x
+    WHERE u.x=3
+    ORDER BY coalesce(t.x, u.x);
+}
+expect {
+    3|3
+}

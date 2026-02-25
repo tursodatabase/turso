@@ -324,8 +324,7 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
 }
 
 /// Returns true if every Column/RowId table reference in `expr` is contained
-/// in `allowed`. Constants (no table refs) pass. Subquery results are
-/// conservatively treated as referencing unknown tables (returns false).
+/// in `allowed`. Constants (no table refs) pass.
 pub(crate) fn expr_tables_subset_of(
     expr: &Expr,
     table_references: &TableReferences,
@@ -346,10 +345,6 @@ pub(crate) fn expr_tables_subset_of(
                     }
                 }
                 // Outer query references are already in scope — allow them.
-            }
-            Expr::SubqueryResult { .. } => {
-                ok = false;
-                return Ok(WalkControl::SkipChildren);
             }
             _ => {}
         }
