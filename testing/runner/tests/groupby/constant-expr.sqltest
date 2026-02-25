@@ -72,7 +72,6 @@ expect {
     1
 }
 
-@skip-if mvcc "views not supported in mvcc"
 @cross-check-integrity
 test group-by-view-constant-order-by {
     CREATE TABLE v3 (c1 INT);

@@ -1008,7 +1008,6 @@ setup cte_shadow_table {
 }
 
 # CTE can shadow a view (sqlite compat)
-@skip-if mvcc "views not supported in MVCC"
 @setup cte_shadow_view
 test cte-shadows-view {
     WITH v AS (SELECT 'from_cte' as val) SELECT * FROM v;
@@ -1027,7 +1026,6 @@ expect {
 }
 
 # Self-referencing non-recursive CTE with same name as view = circular reference
-@skip-if mvcc "views not supported in MVCC"
 @setup cte_shadow_view
 test cte-circular-ref-view {
     WITH v AS (SELECT * FROM v) SELECT * FROM v;
@@ -1058,7 +1056,6 @@ expect {
 }
 
 # CTE does not leak into view expansion — view sees the real table
-@skip-if mvcc "views not supported in MVCC"
 @setup cte_shadow_table
 test cte-does-not-leak-into-view {
     CREATE VIEW v AS SELECT * FROM t;

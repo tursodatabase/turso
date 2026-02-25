@@ -1,6 +1,5 @@
 @database :memory:
 
-@skip-if mvcc "views not supported in MVCC"
 test view-rowid-order-by-index {
     CREATE TABLE t(a);
     CREATE VIEW v AS SELECT * FROM t;
@@ -9,7 +8,6 @@ test view-rowid-order-by-index {
 expect error {
 }
 
-@skip-if mvcc "views not supported in MVCC"
 test view-rowid-select {
     CREATE TABLE t(a);
     CREATE VIEW v AS SELECT * FROM t;
