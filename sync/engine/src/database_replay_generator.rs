@@ -382,8 +382,7 @@ impl DatabaseReplayGenerator {
         table_name: &str,
         columns: usize,
     ) -> Result<ReplayInfo> {
-        let (column_names, pk_column_indices) =
-            self.table_columns_info(coro, table_name).await?;
+        let (column_names, pk_column_indices) = self.table_columns_info(coro, table_name).await?;
         // The CDC record may have fewer columns than the current schema
         // (e.g. records captured before ALTER TABLE ADD COLUMN).
         // Only reference columns present in the record.
@@ -418,8 +417,9 @@ impl DatabaseReplayGenerator {
         if !self.opts.use_implicit_rowid {
             let col_list = record_columns.join(", ");
             let placeholders = ["?"].repeat(columns).join(",");
-            let query =
-                format!("INSERT INTO {table_name}({col_list}) VALUES ({placeholders}){conflict_clause}");
+            let query = format!(
+                "INSERT INTO {table_name}({col_list}) VALUES ({placeholders}){conflict_clause}"
+            );
             return Ok(ReplayInfo {
                 change_type: DatabaseChangeType::Insert,
                 query,

@@ -1587,9 +1587,7 @@ mod tests {
                 conn1
                     .execute("INSERT INTO t VALUES ('a', 'alpha')")
                     .unwrap();
-                conn1
-                    .execute("INSERT INTO t VALUES ('b', 'beta')")
-                    .unwrap();
+                conn1.execute("INSERT INTO t VALUES ('b', 'beta')").unwrap();
                 conn1
                     .execute("ALTER TABLE t ADD COLUMN z TEXT DEFAULT NULL")
                     .unwrap();
@@ -1697,9 +1695,7 @@ mod tests {
                 conn1
                     .execute("INSERT INTO t VALUES ('a', 'alpha')")
                     .unwrap();
-                conn1
-                    .execute("INSERT INTO t VALUES ('b', 'beta')")
-                    .unwrap();
+                conn1.execute("INSERT INTO t VALUES ('b', 'beta')").unwrap();
 
                 // Target: post-ALTER schema with 3 columns (set up without CDC)
                 let conn2 = db2.connect_untracked().unwrap();
@@ -1979,12 +1975,8 @@ mod tests {
                 conn1
                     .execute("INSERT INTO t VALUES ('a', 'alpha')")
                     .unwrap();
-                conn1
-                    .execute("INSERT INTO t VALUES ('b', 'beta')")
-                    .unwrap();
-                conn1
-                    .execute("DELETE FROM t WHERE x = 'a'")
-                    .unwrap();
+                conn1.execute("INSERT INTO t VALUES ('b', 'beta')").unwrap();
+                conn1.execute("DELETE FROM t WHERE x = 'a'").unwrap();
 
                 // Target: post-ALTER schema with both rows present
                 let conn2 = db2.connect_untracked().unwrap();
