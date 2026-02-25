@@ -1,0 +1,50 @@
+@database :memory:
+
+# Regression: UPDATE OR REPLACE must not corrupt secondary indexes when a rowid/PK
+# conflict is resolved via REPLACE.
+
+@cross-check-integrity
+test update-or-replace-rowid-conflict-preserves-secondary-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT, payload TEXT);
+    CREATE INDEX idx_c ON t(c);
+
+    INSERT INTO t VALUES (1, 'x', 'old'), (2, 'y', 'new');
+
+    -- Move row 2 onto rowid 1 (PK conflict) and match the indexed column value so
+    -- the secondary index entry key would collide if conflict resolution is ordered
+    -- incorrectly.
+    UPDATE OR REPLACE t
+      SET id = 1,
+          c = 'x',
+          payload = 'new'
+      WHERE id = 2;
+
+    SELECT id, c, payload FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|x|new
+    ok
+}
+
+test update-or-replace-rowid-no-conflict-preserves-secondary-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT, payload TEXT);
+    CREATE INDEX idx_c ON t(c);
+
+    INSERT INTO t VALUES (1, 'x', 'old'), (2, 'y', 'new');
+
+    -- No PK conflict. This should behave like a normal UPDATE.
+    UPDATE OR REPLACE t
+      SET id = 3,
+          c = 'z',
+          payload = 'new'
+      WHERE id = 2;
+
+    SELECT id, c, payload FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|x|old
+    3|z|new
+    ok
+}

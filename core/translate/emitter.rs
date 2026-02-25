@@ -3739,6 +3739,124 @@ fn emit_update_insns<'a>(
         }
     }
 
+    if target_table.table.btree().is_some()
+        && has_user_provided_rowid
+        && matches!(or_conflict, ResolveType::Replace)
+    {
+        let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
+        let no_rowid_conflict_label = program.allocate_label();
+        let row_not_found_label = check_rowid_not_exists_label
+            .expect("check_rowid_not_exists_label must be set when rowid is updated");
+
+        // If the new rowid equals the old rowid, no conflict.
+        program.emit_insn(Insn::Eq {
+            lhs: target_reg,
+            rhs: beg,
+            target_pc: no_rowid_conflict_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+
+        // If a row with the new rowid doesn't exist, no conflict.
+        program.emit_insn(Insn::NotExists {
+            cursor: target_table_cursor_id,
+            rowid_reg: target_reg,
+            target_pc: no_rowid_conflict_label,
+        });
+
+        // Phase 1: Before Delete - prepare FK cascade actions for implicitly-deleted row.
+        // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
+        let prepared_fk_actions = if connection.foreign_keys_enabled() {
+            let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
+                s.any_resolved_fks_referencing(table_name)
+            }) {
+                ForeignKeyActions::prepare_fk_delete_actions(
+                    program,
+                    &mut t_ctx.resolver,
+                    table_name,
+                    target_table_cursor_id,
+                    target_reg,
+                    update_database_id,
+                )?
+            } else {
+                ForeignKeyActions::default()
+            };
+            if t_ctx
+                .resolver
+                .with_schema(update_database_id, |s| s.has_child_fks(table_name))
+            {
+                emit_fk_child_decrement_on_delete(
+                    program,
+                    &target_table
+                        .table
+                        .btree()
+                        .expect("UPDATE target must be a BTree table"),
+                    table_name,
+                    target_table_cursor_id,
+                    target_reg,
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
+            }
+            prepared
+        } else {
+            ForeignKeyActions::default()
+        };
+
+        for (other_index, other_idx_cursor_id) in all_index_cursors {
+            let other_num_regs = other_index.columns.len() + 1;
+            let other_start_reg = program.alloc_registers(other_num_regs);
+
+            for (reg_offset, column_index) in other_index.columns.iter().enumerate() {
+                emit_index_column_value_old_image(
+                    program,
+                    &t_ctx.resolver,
+                    table_references,
+                    target_table_cursor_id,
+                    column_index,
+                    other_start_reg + reg_offset,
+                )?;
+            }
+
+            // Add the conflicting rowid.
+            program.emit_insn(Insn::Copy {
+                src_reg: target_reg,
+                dst_reg: other_start_reg + other_num_regs - 1,
+                extra_amount: 0,
+            });
+
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: other_start_reg,
+                num_regs: other_num_regs,
+                cursor_id: *other_idx_cursor_id,
+                raise_error_if_no_matching_entry: other_index.where_clause.is_none(),
+            });
+        }
+
+        program.emit_insn(Insn::Delete {
+            cursor_id: target_table_cursor_id,
+            table_name: table_name.to_string(),
+            is_part_of_update: false,
+        });
+
+        // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
+        prepared_fk_actions.fire_prepared_fk_delete_actions(
+            program,
+            &mut t_ctx.resolver,
+            connection,
+            update_database_id,
+        )?;
+
+        // NotExists repositions the cursor. Reseek to the row under update (beg)
+        // so that old-image reads/deletes operate on the correct row.
+        program.preassign_label_to_next_insn(no_rowid_conflict_label);
+        program.emit_insn(Insn::NotExists {
+            cursor: target_table_cursor_id,
+            rowid_reg: beg,
+            target_pc: row_not_found_label,
+        });
+    }
+
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
         // We need to know whether or not the OLD values satisfied the predicate on the
         // partial index, so we can know whether or not to delete the old index entry,
@@ -4094,7 +4212,7 @@ fn emit_update_insns<'a>(
     }
 
     if target_table.table.btree().is_some() {
-        if has_user_provided_rowid {
+        if has_user_provided_rowid && !matches!(or_conflict, ResolveType::Replace) {
             let record_label = program.allocate_label();
             let target_reg = rowid_set_clause_reg.unwrap();
 
@@ -4121,108 +4239,6 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Goto {
                         target_pc: skip_row_label,
                     });
-                }
-                ResolveType::Replace => {
-                    // For REPLACE with rowid conflict, delete the conflicting row
-                    // The conflicting row is at the new target rowid position
-                    // Seek to the conflicting row (target_reg has the new rowid)
-                    let after_delete_label = program.allocate_label();
-                    program.emit_insn(Insn::SeekRowid {
-                        cursor_id: target_table_cursor_id,
-                        src_reg: target_reg,
-                        target_pc: after_delete_label, // Skip if row doesn't exist
-                    });
-
-                    // Phase 1: Before Delete - prepare FK cascade actions for implicitly-deleted row
-                    // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
-                    let prepared_fk_actions = if connection.foreign_keys_enabled() {
-                        let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-                            s.any_resolved_fks_referencing(table_name)
-                        }) {
-                            ForeignKeyActions::prepare_fk_delete_actions(
-                                program,
-                                &mut t_ctx.resolver,
-                                table_name,
-                                target_table_cursor_id,
-                                target_reg,
-                                update_database_id,
-                            )?
-                        } else {
-                            ForeignKeyActions::default()
-                        };
-                        if t_ctx
-                            .resolver
-                            .with_schema(update_database_id, |s| s.has_child_fks(table_name))
-                        {
-                            emit_fk_child_decrement_on_delete(
-                                program,
-                                &target_table
-                                    .table
-                                    .btree()
-                                    .expect("UPDATE target must be a BTree table"),
-                                table_name,
-                                target_table_cursor_id,
-                                target_reg,
-                                update_database_id,
-                                &t_ctx.resolver,
-                            )?;
-                        }
-                        prepared
-                    } else {
-                        ForeignKeyActions::default()
-                    };
-
-                    // Delete from ALL indexes for the conflicting row
-                    // We must delete from all indexes, not just indexes_to_update,
-                    // because the conflicting row may have entries in indexes
-                    // whose columns are not being modified by this UPDATE.
-                    for (other_index, other_idx_cursor_id) in all_index_cursors {
-                        // Build index key for the conflicting row
-                        let other_num_regs = other_index.columns.len() + 1;
-                        let other_start_reg = program.alloc_registers(other_num_regs);
-
-                        for (reg_offset, column_index) in other_index.columns.iter().enumerate() {
-                            emit_index_column_value_old_image(
-                                program,
-                                &t_ctx.resolver,
-                                table_references,
-                                target_table_cursor_id,
-                                column_index,
-                                other_start_reg + reg_offset,
-                            )?;
-                        }
-
-                        // Add the conflicting rowid (target_reg has the new/conflicting rowid)
-                        program.emit_insn(Insn::Copy {
-                            src_reg: target_reg,
-                            dst_reg: other_start_reg + other_num_regs - 1,
-                            extra_amount: 0,
-                        });
-
-                        program.emit_insn(Insn::IdxDelete {
-                            start_reg: other_start_reg,
-                            num_regs: other_num_regs,
-                            cursor_id: *other_idx_cursor_id,
-                            raise_error_if_no_matching_entry: other_index.where_clause.is_none(),
-                        });
-                    }
-
-                    // Delete the conflicting row from the main table
-                    program.emit_insn(Insn::Delete {
-                        cursor_id: target_table_cursor_id,
-                        table_name: table_name.to_string(),
-                        is_part_of_update: false,
-                    });
-
-                    // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
-                    prepared_fk_actions.fire_prepared_fk_delete_actions(
-                        program,
-                        &mut t_ctx.resolver,
-                        connection,
-                        update_database_id,
-                    )?;
-
-                    program.preassign_label_to_next_insn(after_delete_label);
                 }
                 _ => {
                     // Default ABORT behavior
