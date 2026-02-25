@@ -15,7 +15,7 @@ use crate::{
         plan::{
             ColumnUsedMask, DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
-            SeekKeyComponent,
+            SeekKeyComponent, SubqueryState,
         },
         trigger_exec::has_relevant_triggers_type_only,
     },
@@ -47,9 +47,9 @@ use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 use super::{
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, MultiIndexBranch,
-        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, TableReferences,
-        UpdatePlan, WhereTerm,
+        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinType, JoinedTable,
+        MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan,
+        TableReferences, UpdatePlan, WhereTerm,
     },
     planner::TableMask,
 };
@@ -61,6 +61,7 @@ mod cost_params;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod order;
+pub(crate) mod unnest;
 
 /// A candidate index method that could be used for table access in a join query.
 /// This struct captures all information needed to construct an IndexMethodQuery
@@ -496,6 +497,21 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
 
+    unnest::unnest_exists_subqueries(plan)?;
+    // EXISTS only needs 1 row. Add LIMIT 1 to surviving (non-unnested) EXISTS
+    // subqueries. This is done here rather than in the subquery planner so that
+    // unnesting sees the plan without an artificial LIMIT.
+    for sub in &mut plan.non_from_clause_subqueries {
+        if matches!(sub.query_type, ast::SubqueryType::Exists { .. }) {
+            if let SubqueryState::Unevaluated { plan: Some(inner) } = &mut sub.state {
+                if inner.limit.is_none() {
+                    inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
+                        "1".to_string(),
+                    ))));
+                }
+            }
+        }
+    }
     optimize_subqueries(plan, schema)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -815,7 +831,9 @@ fn add_ephemeral_table_to_update_plan(
             is_outer: t
                 .join_info
                 .as_ref()
-                .is_some_and(|join_info| join_info.outer),
+                .is_some_and(|join_info| join_info.is_outer()),
+            is_semi: false,
+            is_anti: false,
         })
         .collect();
     let rowid_internal_id = table_references_ephemeral_select
@@ -1373,7 +1391,7 @@ fn optimize_table_access(
                     // Skip FULL OUTER JOIN tables: removing `outer` would suppress
                     // unmatched-probe-row emission and prevent LeftJoinMetadata
                     // allocation needed by the hash join.
-                    .is_some_and(|join_info| join_info.outer && !join_info.full_outer)
+                    .is_some_and(|join_info| join_info.is_outer() && !join_info.is_full_outer())
             })
         {
             // Check if there's a constraint that would filter out NULL rows,
@@ -1392,7 +1410,7 @@ fn optimize_table_access(
                 );
                 is_from_where && is_null_rejecting
             }) {
-                t.join_info.as_mut().unwrap().outer = false;
+                t.join_info.as_mut().unwrap().join_type = JoinType::Inner;
                 for term in where_clause.iter_mut() {
                     if let Some(from_outer_join) = term.from_outer_join {
                         if from_outer_join == t.internal_id {
@@ -1577,7 +1595,15 @@ fn optimize_table_access(
             is_outer: table_references.joined_tables_mut()[table_number]
                 .join_info
                 .as_ref()
-                .is_some_and(|join_info| join_info.outer),
+                .is_some_and(|join_info| join_info.is_outer()),
+            is_semi: table_references.joined_tables_mut()[table_number]
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_semi()),
+            is_anti: table_references.joined_tables_mut()[table_number]
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_anti()),
         })
         .collect();
 
@@ -1725,7 +1751,7 @@ fn optimize_table_access(
                     let is_outer_join = table_references.joined_tables_mut()[table_idx]
                         .join_info
                         .as_ref()
-                        .is_some_and(|join_info| join_info.outer);
+                        .is_some_and(|join_info| join_info.is_outer());
                     // Build-only hash-join tables do not have a main-loop cursor,
                     // so leave cross-table constraints for probe-side evaluation.
                     let defer_cross_table_constraints =
