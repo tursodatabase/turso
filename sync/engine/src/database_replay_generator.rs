@@ -324,12 +324,27 @@ impl DatabaseReplayGenerator {
         columns: &[bool],
     ) -> Result<ReplayInfo> {
         let (column_names, pk_column_indices) = self.table_columns_info(coro, table_name).await?;
+        // The CDC record may have fewer columns than the current schema
+        // (e.g. records captured before ALTER TABLE ADD COLUMN).
+        // Only reference columns present in the record.
+        let record_len = columns.len();
+        let record_columns = if record_len < column_names.len() {
+            &column_names[..record_len]
+        } else {
+            &column_names[..]
+        };
         let mut pk_predicates = Vec::with_capacity(1);
         let mut column_updates = Vec::with_capacity(1);
         for &idx in &pk_column_indices {
-            pk_predicates.push(format!("{} = ?", column_names[idx]));
+            if idx >= record_columns.len() {
+                return Err(Error::DatabaseTapeError(format!(
+                    "primary key column index {} is outside CDC record with {} columns for table '{}'",
+                    idx, record_columns.len(), table_name
+                )));
+            }
+            pk_predicates.push(format!("{} = ?", record_columns[idx]));
         }
-        for (idx, name) in column_names.iter().enumerate() {
+        for (idx, name) in record_columns.iter().enumerate() {
             if columns[idx] {
                 column_updates.push(format!("{name} = ?"));
             }
@@ -356,7 +371,7 @@ impl DatabaseReplayGenerator {
         Ok(ReplayInfo {
             change_type: DatabaseChangeType::Update,
             query,
-            column_names,
+            column_names: record_columns.to_vec(),
             pk_column_indices,
             is_ddl_replay: false,
         })
@@ -367,19 +382,33 @@ impl DatabaseReplayGenerator {
         table_name: &str,
         columns: usize,
     ) -> Result<ReplayInfo> {
-        let (mut column_names, pk_column_indices) =
+        let (column_names, pk_column_indices) =
             self.table_columns_info(coro, table_name).await?;
+        // The CDC record may have fewer columns than the current schema
+        // (e.g. records captured before ALTER TABLE ADD COLUMN).
+        // Only reference columns present in the record.
+        let record_columns = if columns < column_names.len() {
+            &column_names[..columns]
+        } else {
+            &column_names[..]
+        };
         let conflict_clause = if !pk_column_indices.is_empty() {
             let mut pk_column_names = Vec::new();
             for &idx in &pk_column_indices {
-                pk_column_names.push(column_names[idx].clone());
+                if idx >= record_columns.len() {
+                    return Err(Error::DatabaseTapeError(format!(
+                        "primary key column index {} is outside CDC record with {} columns for table '{}'",
+                        idx, record_columns.len(), table_name
+                    )));
+                }
+                pk_column_names.push(record_columns[idx].clone());
             }
             let mut update_clauses = Vec::new();
-            for name in &column_names {
+            for name in record_columns {
                 update_clauses.push(format!("{name} = excluded.{name}"));
             }
             format!(
-                "ON CONFLICT({}) DO UPDATE SET {}",
+                " ON CONFLICT({}) DO UPDATE SET {}",
                 pk_column_names.join(","),
                 update_clauses.join(",")
             )
@@ -387,23 +416,25 @@ impl DatabaseReplayGenerator {
             String::new()
         };
         if !self.opts.use_implicit_rowid {
+            let col_list = record_columns.join(", ");
             let placeholders = ["?"].repeat(columns).join(",");
             let query =
-                format!("INSERT INTO {table_name} VALUES ({placeholders}){conflict_clause}");
+                format!("INSERT INTO {table_name}({col_list}) VALUES ({placeholders}){conflict_clause}");
             return Ok(ReplayInfo {
                 change_type: DatabaseChangeType::Insert,
                 query,
                 pk_column_indices: None,
-                column_names,
+                column_names: record_columns.to_vec(),
                 is_ddl_replay: false,
             });
         };
-        let original_column_names = column_names.clone();
-        column_names.push("rowid".to_string());
+        let mut insert_columns = record_columns.to_vec();
+        let original_column_names = insert_columns.clone();
+        insert_columns.push("rowid".to_string());
 
         let placeholders = ["?"].repeat(columns + 1).join(",");
-        let column_names = column_names.join(", ");
-        let query = format!("INSERT INTO {table_name}({column_names}) VALUES ({placeholders})");
+        let col_list = insert_columns.join(", ");
+        let query = format!("INSERT INTO {table_name}({col_list}) VALUES ({placeholders})");
         Ok(ReplayInfo {
             change_type: DatabaseChangeType::Insert,
             query,
