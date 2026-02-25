@@ -965,6 +965,29 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
     }
 
+    /// Commit a read-only transaction (empty write_set) after dependencies are resolved.
+    ///
+    /// Used by both the `Initial` fast-path and the `WaitForDependencies` read-only path.
+    fn commit_read_only_tx(
+        &mut self,
+        end_ts: u64,
+        tx: &Transaction,
+        mvcc_store: &Arc<MvStore<Clock>>,
+    ) -> Result<TransitionResult<()>> {
+        turso_assert!(
+            tx.commit_dep_set.lock().is_empty(),
+            "MVCC read only transaction should not have commit dependencies on other txns"
+        );
+        tx.state.store(TransactionState::Committed(end_ts));
+        if mvcc_store.is_exclusive_tx(&self.tx_id) {
+            mvcc_store.release_exclusive_tx(&self.tx_id);
+        }
+        mvcc_store.unlock_commit_lock_if_held(tx);
+        mvcc_store.remove_tx(self.tx_id);
+        self.finalize(mvcc_store)?;
+        Ok(TransitionResult::Done(()))
+    }
+
     /// Validates commit-time write-write conflicts for one table row key.
     ///
     /// Returns [LimboError::WriteWriteConflict] when another transaction committed or is
@@ -1316,10 +1339,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
                 });
                 if self.write_set.is_empty() {
-                    turso_assert!(
-                        tx.commit_dep_set.lock().is_empty(),
-                        "MVCC read only transaction should not have commit dependencies on other txns"
-                    );
                     // Abort eagerly if requested
                     if tx.abort_now.load(Ordering::Acquire) {
                         return Err(LimboError::CommitDependencyAborted);
@@ -1340,14 +1359,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     if tx.abort_now.load(Ordering::Acquire) {
                         return Err(LimboError::CommitDependencyAborted);
                     }
-                    tx.state.store(TransactionState::Committed(end_ts));
-                    if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                        mvcc_store.release_exclusive_tx(&self.tx_id);
-                    }
-                    mvcc_store.unlock_commit_lock_if_held(tx);
-                    mvcc_store.remove_tx(self.tx_id);
-                    self.finalize(mvcc_store)?;
-                    return Ok(TransitionResult::Done(()));
+                    return self.commit_read_only_tx(end_ts, tx, mvcc_store);
                 }
                 self.state = CommitState::Commit { end_ts };
                 Ok(TransitionResult::Continue)
@@ -1418,18 +1430,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // which would make a read-only transaction look like a write,
                 // causing spurious Busy errors from acquire_exclusive_tx.
                 if self.write_set.is_empty() {
-                    turso_assert!(
-                        tx.commit_dep_set.lock().is_empty(),
-                        "MVCC read only transaction should not have commit dependencies on other txns"
-                    );
-                    tx.state.store(TransactionState::Committed(*end_ts));
-                    if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                        mvcc_store.release_exclusive_tx(&self.tx_id);
-                        self.commit_coordinator.pager_commit_lock.unlock();
-                    }
-                    mvcc_store.remove_tx(self.tx_id);
-                    self.finalize(mvcc_store)?;
-                    return Ok(TransitionResult::Done(()));
+                    return self.commit_read_only_tx(*end_ts, tx, mvcc_store);
                 }
 
                 // All dependencies resolved — proceed with timestamp updates
