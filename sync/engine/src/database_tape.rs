@@ -29,7 +29,7 @@ pub struct DatabaseTape {
 const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
 const DEFAULT_CDC_MODE: &str = "full";
 const DEFAULT_CHANGES_BATCH_SIZE: usize = 100;
-pub const CDC_PRAGMA_NAME: &str = "unstable_capture_data_changes_conn";
+pub const CDC_PRAGMA_NAME: &str = "capture_data_changes_conn";
 
 #[derive(Debug, Clone)]
 pub struct DatabaseTapeOpts {

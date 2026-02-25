@@ -1427,7 +1427,7 @@ expect error {
 
 test attach-write-cdc-insert {
     CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
-    PRAGMA unstable_capture_data_changes_conn('full');
+    PRAGMA capture_data_changes_conn('full');
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(x INTEGER, y TEXT);
     INSERT INTO aux.t1 VALUES (1, 'hello');
@@ -1439,7 +1439,7 @@ expect {
 
 test attach-write-cdc-delete {
     CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
-    PRAGMA unstable_capture_data_changes_conn('full');
+    PRAGMA capture_data_changes_conn('full');
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(x INTEGER);
     INSERT INTO aux.t1 VALUES (1);
@@ -1455,7 +1455,7 @@ expect {
 
 test attach-write-cdc-update {
     CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
-    PRAGMA unstable_capture_data_changes_conn('full');
+    PRAGMA capture_data_changes_conn('full');
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(x INTEGER, y TEXT);
     INSERT INTO aux.t1 VALUES (1, 'old');

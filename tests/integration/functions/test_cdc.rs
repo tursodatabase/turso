@@ -72,7 +72,7 @@ fn test_cdc_simple_id(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (10, 10), (5, 1)")
         .unwrap();
@@ -116,7 +116,7 @@ fn test_cdc_simple_before(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('before')")
+    conn.execute("PRAGMA capture_data_changes_conn('before')")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
     conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
@@ -166,7 +166,7 @@ fn test_cdc_simple_after(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('after')")
+    conn.execute("PRAGMA capture_data_changes_conn('after')")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
     conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
@@ -216,7 +216,7 @@ fn test_cdc_simple_full(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
     conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
@@ -285,7 +285,7 @@ fn test_cdc_crud(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (20, 20), (10, 10), (5, 1)")
         .unwrap();
@@ -335,7 +335,7 @@ fn test_cdc_failed_op(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
         .unwrap();
@@ -381,23 +381,23 @@ fn test_cdc_uncaptured_connection(db: TempDatabase) {
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn1
-        .execute("PRAGMA unstable_capture_data_changes_conn('id')")
+        .execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (2, 20)").unwrap(); // captured
     let conn2 = db.connect_limbo();
     conn2.execute("INSERT INTO t VALUES (3, 30)").unwrap();
     conn2
-        .execute("PRAGMA unstable_capture_data_changes_conn('id')")
+        .execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap(); // captured
     conn2
-        .execute("PRAGMA unstable_capture_data_changes_conn('off')")
+        .execute("PRAGMA capture_data_changes_conn('off')")
         .unwrap();
     conn2.execute("INSERT INTO t VALUES (5, 50)").unwrap();
 
     conn1.execute("INSERT INTO t VALUES (6, 60)").unwrap(); // captured
     conn1
-        .execute("PRAGMA unstable_capture_data_changes_conn('off')")
+        .execute("PRAGMA capture_data_changes_conn('off')")
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (7, 70)").unwrap();
 
@@ -436,7 +436,7 @@ fn test_cdc_custom_table(db: TempDatabase) {
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
         .unwrap();
     conn1
-        .execute("PRAGMA unstable_capture_data_changes_conn('id,custom_cdc')")
+        .execute("PRAGMA capture_data_changes_conn('id,custom_cdc')")
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn1.execute("INSERT INTO t VALUES (2, 20)").unwrap();
@@ -468,7 +468,7 @@ fn test_cdc_ignore_changes_in_cdc_table(db: TempDatabase) {
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
         .unwrap();
     conn1
-        .execute("PRAGMA unstable_capture_data_changes_conn('id,custom_cdc')")
+        .execute("PRAGMA capture_data_changes_conn('id,custom_cdc')")
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn1.execute("INSERT INTO t VALUES (2, 20)").unwrap();
@@ -507,7 +507,7 @@ fn test_cdc_transaction(db: TempDatabase) {
         .execute("CREATE TABLE q (x INTEGER PRIMARY KEY, y UNIQUE)")
         .unwrap();
     conn1
-        .execute("PRAGMA unstable_capture_data_changes_conn('id,custom_cdc')")
+        .execute("PRAGMA capture_data_changes_conn('id,custom_cdc')")
         .unwrap();
     conn1.execute("BEGIN").unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
@@ -539,7 +539,7 @@ fn test_cdc_transaction(db: TempDatabase) {
 #[turso_macros::test()]
 fn test_cdc_ddl_in_explicit_transaction(db: TempDatabase) {
     let conn = db.connect_limbo();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     conn.execute("BEGIN").unwrap();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -573,10 +573,10 @@ fn test_cdc_independent_connections(db: TempDatabase) {
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
         .unwrap();
     conn1
-        .execute("PRAGMA unstable_capture_data_changes_conn('id,custom_cdc1')")
+        .execute("PRAGMA capture_data_changes_conn('id,custom_cdc1')")
         .unwrap();
     conn2
-        .execute("PRAGMA unstable_capture_data_changes_conn('id,custom_cdc2')")
+        .execute("PRAGMA capture_data_changes_conn('id,custom_cdc2')")
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn2.execute("INSERT INTO t VALUES (2, 20)").unwrap();
@@ -609,10 +609,10 @@ fn test_cdc_independent_connections_different_cdc_not_ignore(db: TempDatabase) {
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
         .unwrap();
     conn1
-        .execute("PRAGMA unstable_capture_data_changes_conn('id,custom_cdc1')")
+        .execute("PRAGMA capture_data_changes_conn('id,custom_cdc1')")
         .unwrap();
     conn2
-        .execute("PRAGMA unstable_capture_data_changes_conn('id,custom_cdc2')")
+        .execute("PRAGMA capture_data_changes_conn('id,custom_cdc2')")
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn1.execute("INSERT INTO t VALUES (2, 20)").unwrap();
@@ -711,7 +711,7 @@ fn test_cdc_bin_record(db: TempDatabase) {
 #[turso_macros::test()]
 fn test_cdc_schema_changes(db: TempDatabase) {
     let conn = db.connect_limbo();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
     conn.execute("CREATE TABLE t(x, y, z UNIQUE, q, PRIMARY KEY (x, y))")
         .unwrap();
@@ -835,7 +835,7 @@ fn test_cdc_schema_changes(db: TempDatabase) {
 #[turso_macros::test()]
 fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
     let conn = db.connect_limbo();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
     conn.execute("CREATE TABLE t(x, y, z UNIQUE, q, PRIMARY KEY (x, y))")
         .unwrap();
@@ -945,7 +945,7 @@ fn test_cdc_version_table_created(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
     let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
     assert_eq!(
@@ -963,7 +963,7 @@ fn test_cdc_version_custom_table(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id,my_cdc')")
+    conn.execute("PRAGMA capture_data_changes_conn('id,my_cdc')")
         .unwrap();
     let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
     assert_eq!(
@@ -981,13 +981,13 @@ fn test_cdc_version_not_created_when_exists(db: TempDatabase) {
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
     // First enable creates turso_cdc table and version entry
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
     // Disable CDC
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('off')")
+    conn.execute("PRAGMA capture_data_changes_conn('off')")
         .unwrap();
     // Re-enable CDC — turso_cdc table already exists, so no duplicate version row
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
     let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
     assert_eq!(
@@ -1019,10 +1019,8 @@ fn setup_backward_compat_v1(db: &TempDatabase, mode: &str) -> Arc<turso_core::Co
         .unwrap();
 
     // Enable CDC — table already exists, InitCdcVersion reads version from table
-    conn.execute(format!(
-        "PRAGMA unstable_capture_data_changes_conn('{mode}')"
-    ))
-    .unwrap();
+    conn.execute(format!("PRAGMA capture_data_changes_conn('{mode}')"))
+        .unwrap();
 
     // Verify version table is unchanged
     let rows = limbo_exec_rows(&conn, "SELECT table_name, version FROM turso_cdc_version");
@@ -1310,7 +1308,7 @@ fn test_cdc_version_preserves_old_version(db: TempDatabase) {
         .unwrap();
 
     // Enable CDC — should fail because "v0" is an unknown version
-    let result = conn.execute("PRAGMA unstable_capture_data_changes_conn('full')");
+    let result = conn.execute("PRAGMA capture_data_changes_conn('full')");
     assert!(
         result.is_err(),
         "enabling CDC with unknown version 'v0' should fail"
@@ -1324,7 +1322,7 @@ fn test_cdc_pragma_get_returns_version(db: TempDatabase) {
         .unwrap();
 
     // Before enabling CDC, PRAGMA GET should return "off" with null table and version
-    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    let rows = limbo_exec_rows(&conn, "PRAGMA capture_data_changes_conn");
     assert_eq!(
         rows,
         vec![vec![
@@ -1335,11 +1333,11 @@ fn test_cdc_pragma_get_returns_version(db: TempDatabase) {
     );
 
     // Enable CDC
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
 
     // PRAGMA GET should return mode, table, and version
-    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    let rows = limbo_exec_rows(&conn, "PRAGMA capture_data_changes_conn");
     assert_eq!(
         rows,
         vec![vec![
@@ -1350,9 +1348,9 @@ fn test_cdc_pragma_get_returns_version(db: TempDatabase) {
     );
 
     // Disable CDC and verify it goes back to "off"
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('off')")
+    conn.execute("PRAGMA capture_data_changes_conn('off')")
         .unwrap();
-    let rows = limbo_exec_rows(&conn, "PRAGMA unstable_capture_data_changes_conn");
+    let rows = limbo_exec_rows(&conn, "PRAGMA capture_data_changes_conn");
     assert_eq!(
         rows,
         vec![vec![
@@ -1370,7 +1368,7 @@ fn test_cdc_pragma_idempotent(db: TempDatabase) {
         .unwrap();
 
     // Enable CDC
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
 
     // Insert a row — should produce CDC entries (INSERT + COMMIT = 2 rows in v2)
@@ -1379,7 +1377,7 @@ fn test_cdc_pragma_idempotent(db: TempDatabase) {
     assert_eq!(rows, vec![vec![Value::Integer(2)]]);
 
     // Enable CDC again (idempotent — should not create extra CDC entries)
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
 
     // CDC count should not have changed (no self-capture)
@@ -1387,7 +1385,7 @@ fn test_cdc_pragma_idempotent(db: TempDatabase) {
     assert_eq!(rows, vec![vec![Value::Integer(2)]]);
 
     // Switch mode — should also be idempotent (no DDL, just mode change)
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc");
     assert_eq!(rows, vec![vec![Value::Integer(2)]]);
@@ -1415,7 +1413,7 @@ fn test_cdc_version_helper_defaults_to_v1(db: TempDatabase) {
     ).unwrap();
 
     // Enable CDC — InitCdcVersion will detect existing v1 table and set version to "v1"
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
 
     // version() helper should return v1 since the pre-existing table has v1 schema
@@ -1444,7 +1442,7 @@ fn test_cdc_preexisting_v1_table_writes_v1_format(db: TempDatabase) {
     ).unwrap();
 
     // Enable CDC — should detect v1 schema and use v1 format
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
 
     // Version should be detected as v1
@@ -1504,7 +1502,7 @@ fn test_cdc_drop_table_cleans_up_version(db: TempDatabase) {
         .unwrap();
 
     // Enable CDC — creates turso_cdc and turso_cdc_version tables
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
 
     // Verify version entry exists
@@ -1534,7 +1532,7 @@ fn test_cdc_v2_txn_id_autocommit(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
@@ -1559,7 +1557,7 @@ fn test_cdc_v2_txn_id_explicit_transaction(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
@@ -1586,7 +1584,7 @@ fn test_cdc_v2_commit_record_fields(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
@@ -1618,7 +1616,7 @@ fn test_cdc_v2_txn_id_reset_after_commit(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
 
     // First autocommit statement
@@ -1640,7 +1638,7 @@ fn test_cdc_v2_schema_has_9_columns(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
@@ -1663,7 +1661,7 @@ fn test_cdc_v2_schema_has_9_columns(db: TempDatabase) {
 #[turso_macros::test()]
 fn test_cdc_no_internal_table_changes(db: TempDatabase) {
     let conn = db.connect_limbo();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
     conn.execute("CREATE TABLE t(x)").unwrap();
     conn.execute("CREATE INDEX t_idx ON t(x)").unwrap();
@@ -1715,7 +1713,7 @@ fn test_cdc_drop_turso_cdc(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('id')")
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
@@ -1737,7 +1735,7 @@ fn test_cdc_drop_turso_cdc(db: TempDatabase) {
 #[turso_macros::test]
 fn test_cdc_drop_turso_cdc_version(db: TempDatabase) {
     let conn = db.connect_limbo();
-    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
         .unwrap();
     conn.execute("CREATE TABLE t(x)").unwrap();
 
