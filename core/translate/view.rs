@@ -23,13 +23,6 @@ pub fn translate_create_materialized_view(
                 .to_string(),
         ));
     }
-    /*
-    if connection.mvcc_enabled() {
-        return Err(crate::LimboError::ParseError(
-            "Materialized views are not supported in MVCC mode".to_string(),
-        ));
-    }
-    */
 
     let database_id = resolver.resolve_database_id(view_name)?;
     // The DBSP incremental maintenance runtime (populate_from_table, etc.) assumes
