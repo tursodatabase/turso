@@ -251,7 +251,7 @@ macro_rules! static_iterator_hack {
 
 pub(crate) use static_iterator_hack;
 
-pub struct MvccLazyCursor<Clock: LogicalClock> {
+pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: CursorPosition,
     /// Stateful MVCC table iterator if this is a table cursor.
@@ -375,11 +375,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(())
     }
 
-    pub fn start_new_rowid(
-        &mut self,
-        allow_cached_allocator: bool,
-    ) -> Result<IOResult<NextRowidResult>> {
+    pub fn start_new_rowid(&mut self) -> Result<IOResult<NextRowidResult>> {
         tracing::trace!("start_new_rowid");
+
         let allocator = self.db.get_rowid_allocator(&self.table_id);
         let locked = allocator.lock();
         if !locked {
@@ -388,27 +386,20 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         }
 
         self.creating_new_rowid = true;
-        let res = if allow_cached_allocator {
-            if allocator.is_uninitialized() {
-                NextRowidResult::Uninitialized
-            } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
-                NextRowidResult::Next {
-                    new_rowid: next_rowid,
-                    prev_rowid: prev_max_rowid,
-                }
-            } else {
-                NextRowidResult::FindRandom
+        let res = if allocator.is_uninitialized() {
+            NextRowidResult::Uninitialized
+        } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
+            NextRowidResult::Next {
+                new_rowid: next_rowid,
+                prev_rowid: prev_max_rowid,
             }
         } else {
-            // For non-concurrent transactions, derive from the current visible max rowid.
-            // This avoids rowid drift after savepoint rollbacks and failed statements.
-            NextRowidResult::Uninitialized
+            NextRowidResult::FindRandom
         };
         Ok(IOResult::Done(res))
     }
 
     pub fn initialize_max_rowid(&mut self, max_rowid: Option<i64>) -> Result<()> {
-        tracing::trace!("start_new_rowid");
         let allocator = self.db.get_rowid_allocator(&self.table_id);
         turso_assert!(
             self.creating_new_rowid,
@@ -416,6 +407,13 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         );
         allocator.initialize(max_rowid);
         Ok(())
+    }
+
+    /// Allocate the next rowid from the (already initialized) allocator.
+    /// Must be called while holding the allocator lock.
+    pub fn allocate_next_rowid(&self) -> Option<(i64, Option<i64>)> {
+        let allocator = self.db.get_rowid_allocator(&self.table_id);
+        allocator.get_next_rowid()
     }
 
     pub fn end_new_rowid(&mut self) {
