@@ -1420,7 +1420,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if self.write_set.is_empty() {
                     turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
-                        "MVCC read only transaction should not have commit dependencies on other txns"
+                        "MVCC read-only transaction should not have other transactions depending on it"
                     );
                     tx.state.store(TransactionState::Committed(*end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
