@@ -2860,7 +2860,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         pager_commit_lock_held: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
-        commit_dep_set: Mutex::new(Vec::new()),
+        commit_dep_set: Mutex::new(HashSet::default()),
     }
 }
 
@@ -3086,7 +3086,10 @@ fn test_commit_dependency_speculative_read() {
 
     // Verify tx 1's CommitDepSet contains reader's tx_id
     let dep_set = txs.get(&1).unwrap();
-    assert_eq!(*dep_set.value().commit_dep_set.lock(), vec![2]);
+    assert_eq!(
+        *dep_set.value().commit_dep_set.lock(),
+        HashSet::from_iter([2])
+    );
 }
 
 /// Test cascade abort: when depended-on tx aborts, it sets AbortNow on dependents
@@ -3120,7 +3123,7 @@ fn test_commit_dependency_cascade_abort() {
     // Add reader to txs so cascade can find it
     txs.insert(2, reader);
 
-    for dep_tx_id in tx1.commit_dep_set.lock().drain(..) {
+    for dep_tx_id in tx1.commit_dep_set.lock().drain() {
         if let Some(dep_tx_entry) = txs.get(&dep_tx_id) {
             let dep_tx = dep_tx_entry.value();
             dep_tx.abort_now.store(true, Ordering::Release);
@@ -3193,10 +3196,10 @@ fn test_commit_dependency_speculative_ignore() {
     );
 }
 
-/// Test that multiple speculative reads from the same preparing tx increment
-/// CommitDepCounter each time.
+/// Test that multiple speculative reads from the same preparing tx only
+/// register one commit dependency (dedup).
 #[test]
-fn test_commit_dependency_multiple_reads() {
+fn test_commit_dependency_multiple_reads_dedup() {
     let txs: SkipMap<TxID, Transaction> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
@@ -3211,16 +3214,16 @@ fn test_commit_dependency_multiple_reads() {
         btree_resident: false,
     };
 
-    // Read 3 rows from the same preparing tx
+    // Read 3 rows from the same preparing tx — dependency is deduplicated
     assert!(make_rv(1).is_visible_to(&reader, &txs, &finalized_tx_states));
     assert!(make_rv(2).is_visible_to(&reader, &txs, &finalized_tx_states));
     assert!(make_rv(3).is_visible_to(&reader, &txs, &finalized_tx_states));
 
-    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 3);
+    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 1);
 
-    // tx 1's CommitDepSet has 3 entries for reader
+    // tx 1's CommitDepSet has 1 entry for reader (deduplicated)
     let dep_set = txs.get(&1).unwrap();
-    assert_eq!(dep_set.value().commit_dep_set.lock().len(), 3);
+    assert_eq!(dep_set.value().commit_dep_set.lock().len(), 1);
 }
 
 /// Hekaton §2.7 cascade abort with real connections and threads.
@@ -3508,7 +3511,7 @@ fn test_commit_dep_threaded_commit_resolves() {
 
         // Committed state + notify dependents
         writer_tx.state.store(TransactionState::Committed(end_ts));
-        for dep_tx_id in writer_tx.commit_dep_set.lock().drain(..) {
+        for dep_tx_id in writer_tx.commit_dep_set.lock().drain() {
             if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
                 dep_tx_entry
                     .value()
@@ -3751,7 +3754,7 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
             }
         }
         writer_tx.state.store(TransactionState::Committed(end_ts));
-        for dep_tx_id in writer_tx.commit_dep_set.lock().drain(..) {
+        for dep_tx_id in writer_tx.commit_dep_set.lock().drain() {
             if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
                 dep_tx_entry
                     .value()
@@ -3851,7 +3854,7 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
             }
         }
         writer_tx.state.store(TransactionState::Committed(end_ts));
-        for dep_tx_id in writer_tx.commit_dep_set.lock().drain(..) {
+        for dep_tx_id in writer_tx.commit_dep_set.lock().drain() {
             if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
                 dep_tx_entry
                     .value()
@@ -4234,7 +4237,7 @@ fn transaction_display() {
         pager_commit_lock_held: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
-        commit_dep_set: Mutex::new(Vec::new()),
+        commit_dep_set: Mutex::new(HashSet::default()),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";

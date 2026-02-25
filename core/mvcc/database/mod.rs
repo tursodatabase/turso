@@ -462,7 +462,7 @@ pub struct Transaction {
     /// Transaction IDs that depend on this transaction (notified on commit/abort).
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
-    commit_dep_set: Mutex<Vec<TxID>>,
+    commit_dep_set: Mutex<HashSet<TxID>>,
 }
 
 impl Transaction {
@@ -478,7 +478,7 @@ impl Transaction {
             pager_commit_lock_held: AtomicBool::new(false),
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
-            commit_dep_set: Mutex::new(Vec::new()),
+            commit_dep_set: Mutex::new(HashSet::default()),
         }
     }
 
@@ -4905,15 +4905,16 @@ fn register_commit_dependency(
     let mut dep_set = depended_on.commit_dep_set.lock();
     match depended_on.state.load() {
         TransactionState::Preparing(_) => {
-            // Increment counter BEFORE pushing to dep_set and BEFORE dropping
-            // the lock. This prevents underflow: if we pushed first and
+            // Increment counter BEFORE inserting into dep_set and BEFORE dropping
+            // the lock. This prevents underflow: if we inserted first and
             // released the lock, the depended-on tx could drain the dep_set
             // and call fetch_sub before we increment, wrapping the counter
-            // from 0 to u64::MAX.
-            dependent_tx
-                .commit_dep_counter
-                .fetch_add(1, Ordering::AcqRel);
-            dep_set.push(dependent_tx.tx_id);
+            // from 0 to u64::MAX. Only increment on first insertion (dedup).
+            if dep_set.insert(dependent_tx.tx_id) {
+                dependent_tx
+                    .commit_dep_counter
+                    .fetch_add(1, Ordering::AcqRel);
+            }
             drop(dep_set);
             tracing::trace!(
                 "register_commit_dependency: tx {} depends on tx {}",
