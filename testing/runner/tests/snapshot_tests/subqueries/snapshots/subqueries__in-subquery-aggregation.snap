@@ -25,7 +25,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                    p1  p2  p3  p4            p5  comment
-   0          Init               0  65   0                 0  Start at 65
+   0          Init               0  66   0                 0  Start at 66
    1          Once              41   0   0                 0  goto 41
    2          OpenEphemeral      0   0   0                 0  cursor=0 is_table=false
    3          Null               0   7   0                 0  r[7]=NULL
@@ -67,29 +67,30 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   39    Integer                  0   3   0                 0  r[3]=0
   40  Return                    11   0   0                 0
   41  OpenRead                   3   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
-  42  Rewind                     3  64   0                 0  Rewind table customers
+  42  Rewind                     3  65   0                 0  Rewind table customers
   43    Integer                  0  18   0                 0  r[18]=0
   44    RowId                    3  19   0                 0  r[19]=customers.rowid
-  45    Affinity                19   1   0                 0  r[19..20] = C
-  46    NotFound                 0  48  19                 0  if not found goto 48
-  47    Goto                     0  54   0                 0
-  48    Rewind                   0  56   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
-  49      Column                 0   0  20                 0  r[20]=ephemeral(ephemeral_index_where_sub_t2).customer_id
-  50      Ne                    19  20  52  Binary         0  if r[19]!=r[20] goto 52
-  51      Goto                   0  58   0                 0
-  52    Next                     0  49   0                 0
-  53    Goto                     0  56   0                 0
-  54    Integer                  1  18   0                 0  r[18]=1
-  55    Goto                     0  59   0                 0
-  56    Integer                  0  18   0                 0  r[18]=0
-  57    Goto                     0  59   0                 0
-  58    Null                     0  18   0                 0  r[18]=NULL
-  59    IfNot                   18  63   1                 0  if !r[18] goto 63
-  60    RowId                    3  16   0                 0  r[16]=customers.rowid
-  61    Column                   3   1  17                 0  r[17]=customers.name
-  62    ResultRow               16   2   0                 0  output=r[16..17]
-  63  Next                       3  43   0                 0
-  64  Halt                       0   0   0                 0
-  65  Transaction                0   1  11                 0  iDb=0 tx_mode=Read
-  66  Integer                 1000  14   0                 0  r[14]=1000
-  67  Goto                       0   1   0                 0
+  45    IsNull                  19  49   0                 0  if (r[19]==NULL) goto 49
+  46    Affinity                19   1   0                 0  r[19..20] = C
+  47    NotFound                 0  49  19                 0  if not found goto 49
+  48    Goto                     0  55   0                 0
+  49    Rewind                   0  57   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
+  50      Column                 0   0  20                 0  r[20]=ephemeral(ephemeral_index_where_sub_t2).customer_id
+  51      Ne                    19  20  53  Binary         0  if r[19]!=r[20] goto 53
+  52      Goto                   0  59   0                 0
+  53    Next                     0  50   0                 0
+  54    Goto                     0  57   0                 0
+  55    Integer                  1  18   0                 0  r[18]=1
+  56    Goto                     0  60   0                 0
+  57    Integer                  0  18   0                 0  r[18]=0
+  58    Goto                     0  60   0                 0
+  59    Null                     0  18   0                 0  r[18]=NULL
+  60    IfNot                   18  64   1                 0  if !r[18] goto 64
+  61    RowId                    3  16   0                 0  r[16]=customers.rowid
+  62    Column                   3   1  17                 0  r[17]=customers.name
+  63    ResultRow               16   2   0                 0  output=r[16..17]
+  64  Next                       3  43   0                 0
+  65  Halt                       0   0   0                 0
+  66  Transaction                0   1  11                 0  iDb=0 tx_mode=Read
+  67  Integer                 1000  14   0                 0  r[14]=1000
+  68  Goto                       0   1   0                 0

@@ -972,16 +972,18 @@ pub fn translate_expr(
                             lhs_column_regs_start + i,
                             resolver,
                         )?;
-                        if !referenced_tables.is_some_and(|tables| lhs_column.is_nonnull(tables)) {
-                            // If LHS is NULL, we need to check if ephemeral is empty first.
-                            // - If empty: IN returns FALSE, NOT IN returns TRUE
-                            // - If not empty: result is NULL (unknown)
-                            // Jump to label_null_rewind which does Rewind and handles empty case.
-                            program.emit_insn(Insn::IsNull {
-                                reg: lhs_column_regs_start + i,
-                                target_pc: label_null_rewind,
-                            });
-                        }
+                        // If LHS is NULL, we need to check if ephemeral is empty first.
+                        // - If empty: IN returns FALSE, NOT IN returns TRUE
+                        // - If not empty: result is NULL (unknown)
+                        // Jump to label_null_rewind which does Rewind and handles empty case.
+                        //
+                        // Always emit this check even for NOT NULL columns because NullRow
+                        // (used in ungrouped aggregates when no rows match) overrides all
+                        // column values to NULL regardless of the NOT NULL constraint.
+                        program.emit_insn(Insn::IsNull {
+                            reg: lhs_column_regs_start + i,
+                            target_pc: label_null_rewind,
+                        });
                     }
 
                     // Only emit Affinity instruction if there's meaningful affinity to apply
