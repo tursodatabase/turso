@@ -1277,73 +1277,99 @@ impl Jsonb {
                 string.push_str(&word[last_end..]);
             }
 
+            // We have to escape some JSON5 escape sequences
             ElementType::TEXT5 => {
                 let mut i = 0;
                 while i < word_slice.len() {
                     let ch = word_slice[i];
 
+                    // Handle normal characters that don't need escaping
                     if is_json_ok(ch) || ch == b'\'' {
                         string.push(ch as char);
                         i += 1;
                         continue;
                     }
 
+                    // Handle special cases
                     match ch {
+                        // Double quotes need escaping
                         b'"' => {
                             string.push_str("\\\"");
                             i += 1;
                         }
+
+                        // Control characters (0x00-0x1F)
                         ch if ch <= 0x1F => {
                             match ch {
+                                // \b
                                 0x08 => string.push_str("\\b"),
                                 b'\t' => string.push_str("\\t"),
                                 b'\n' => string.push_str("\\n"),
+                                // \f
                                 0x0C => string.push_str("\\f"),
                                 b'\r' => string.push_str("\\r"),
                                 _ => {
+                                    // Format as \u00XX
                                     let hex = format!("\\u{ch:04x}");
                                     string.push_str(&hex);
                                 }
                             }
                             i += 1;
                         }
+
+                        // Handle escape sequences
                         b'\\' if i + 1 < word_slice.len() => {
                             let next_ch = word_slice[i + 1];
                             match next_ch {
+                                // Single quote
                                 b'\'' => {
                                     string.push('\'');
                                     i += 2;
                                 }
+
+                                // Vertical tab
                                 b'v' => {
                                     string.push_str("\\u0009");
                                     i += 2;
                                 }
+
+                                // Hex escapes like \x27
                                 b'x' if i + 3 < word_slice.len() => {
                                     string.push_str("\\u00");
                                     string.push(word_slice[i + 2] as char);
                                     string.push(word_slice[i + 3] as char);
                                     i += 4;
                                 }
+
+                                // Null character
                                 b'0' => {
                                     string.push_str("\\u0000");
                                     i += 2;
                                 }
+
+                                // CR line continuation
                                 b'\r' => {
                                     if i + 2 < word_slice.len() && word_slice[i + 2] == b'\n' {
-                                        i += 3;
+                                        i += 3; // Skip CRLF
                                     } else {
-                                        i += 2;
+                                        i += 2; // Skip CR
                                     }
                                 }
+
+                                // LF line continuation
                                 b'\n' => {
                                     i += 2;
                                 }
+
+                                // Unicode line separators (U+2028 and U+2029)
                                 0xe2 if i + 3 < word_slice.len()
                                     && word_slice[i + 2] == 0x80
                                     && (word_slice[i + 3] == 0xa8 || word_slice[i + 3] == 0xa9) =>
                                 {
                                     i += 4;
                                 }
+
+                                // All other escapes pass through
                                 _ => {
                                     string.push('\\');
                                     string.push(next_ch as char);
@@ -1351,6 +1377,8 @@ impl Jsonb {
                                 }
                             }
                         }
+
+                        // Default case - just push the character
                         _ => {
                             string.push(ch as char);
                             i += 1;
