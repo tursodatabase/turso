@@ -193,6 +193,8 @@ fn prepare_window_subquery(
         table_id: subquery_id,
         original_idx: 0,
         is_outer: false,
+        is_semi: false,
+        is_anti: false,
     }];
     let new_table_references = TableReferences::new(
         vec![],
