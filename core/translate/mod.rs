@@ -233,9 +233,7 @@ pub fn translate_inner(
             select,
             columns,
             ..
-        } => view::translate_create_view(
-            &view_name, resolver, &select, &columns, program, connection,
-        )?,
+        } => view::translate_create_view(&view_name, resolver, &select, &columns, program)?,
         ast::Stmt::CreateMaterializedView {
             view_name, select, ..
         } => view::translate_create_materialized_view(

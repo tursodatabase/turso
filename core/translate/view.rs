@@ -258,16 +258,7 @@ pub fn translate_create_view(
     select_stmt: &ast::Select,
     _columns: &[ast::IndexedColumn],
     program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
 ) -> Result<()> {
-    /*
-    if connection.mvcc_enabled() {
-        return Err(crate::LimboError::ParseError(
-            "Views are not supported in MVCC mode".to_string(),
-        ));
-    }
-    */
-
     let database_id = resolver.resolve_database_id(view_name)?;
     if crate::is_attached_db(database_id) {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);

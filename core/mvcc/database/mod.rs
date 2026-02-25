@@ -4289,7 +4289,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         &mut dbsp_state_roots,
                         &mut dbsp_state_index_roots,
                         &mut materialized_view_info,
-                        mv_store.as_ref(),
                         connection.experimental_triggers_enabled(),
                     )?;
                 }
