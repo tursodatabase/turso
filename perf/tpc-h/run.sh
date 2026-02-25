@@ -35,6 +35,100 @@ clear_caches() {
     fi
 }
 
+extract_skip_reason() {
+    local skip_line=$1
+    local directive=$2
+    echo "$skip_line" | sed -E "s/^-- ${directive}:?[[:space:]]*//"
+}
+
+has_limbo_skip() {
+    head -n1 "$1" | grep -q "^-- LIMBO_SKIP: "
+}
+
+get_limbo_skip_reason() {
+    head -n1 "$1" | sed 's/^-- LIMBO_SKIP: //'
+}
+
+get_sqlite_skip_line() {
+    grep -m1 "^-- SQLITE_SKIP\(.*\)\?$" "$1"
+}
+
+load_query_sql() {
+    local query_file=$1
+    # Strip runner directives before execution; they are metadata, not query text.
+    sed -E '/^-- (LIMBO_SKIP|SQLITE_SKIP)(:.*)?$/d' "$query_file"
+}
+
+run_query_with_limbo() {
+    local query_file=$1
+    local query_sql
+    query_sql=$(load_query_sql "$query_file")
+    { time -p RUST_LOG=off "$LIMBO_BIN" "$DB_FILE" --quiet --output-mode list -- "$query_sql" 2>&1; } 2>&1
+}
+
+run_query_with_sqlite() {
+    local query_file=$1
+    local query_sql
+    query_sql=$(load_query_sql "$query_file")
+    { time -p "$SQLITE_BIN" "$DB_FILE" "$query_sql" 2>&1; } 2>&1
+}
+
+log_query_outputs() {
+    local limbo_output_lines=$1
+    local sqlite_output_lines=$2
+    local sqlite_skipped=$3
+
+    echo "Limbo output:"
+    echo "$limbo_output_lines"
+    if [ "$sqlite_skipped" -eq 1 ]; then
+        echo "SQLite3 output: SKIPPED"
+        echo "Output comparison: SKIPPED"
+    else
+        echo "SQLite3 output:"
+        echo "$sqlite_output_lines"
+    fi
+}
+
+compare_query_outputs() {
+    local limbo_output_lines=$1
+    local sqlite_output_lines=$2
+    local sqlite_skipped=$3
+
+    if [ "$sqlite_skipped" -eq 1 ]; then
+        return 0
+    fi
+
+    output_diff=$(diff <(echo "$limbo_output_lines") <(echo "$sqlite_output_lines"))
+    if [ -n "$output_diff" ]; then
+        echo "Output difference:"
+        echo "$output_diff"
+        return 1
+    fi
+
+    echo "No output difference"
+    return 0
+}
+
+record_query_times() {
+    local mode=$1
+    local query_name=$2
+    local limbo_time=$3
+    local sqlite_time=$4
+    local sqlite_skipped=$5
+
+    if [ "$mode" = "WITHOUT ANALYZE" ]; then
+        LIMBO_TIMES_WITHOUT_ANALYZE["$query_name"]="$limbo_time"
+        if [ "$sqlite_skipped" -eq 0 ]; then
+            SQLITE_TIMES_WITHOUT_ANALYZE["$query_name"]="$sqlite_time"
+        fi
+    else
+        LIMBO_TIMES_WITH_ANALYZE["$query_name"]="$limbo_time"
+        if [ "$sqlite_skipped" -eq 0 ]; then
+            SQLITE_TIMES_WITH_ANALYZE["$query_name"]="$sqlite_time"
+        fi
+    fi
+}
+
 # Function to run all queries
 run_queries() {
     local mode=$1
@@ -43,60 +137,67 @@ run_queries() {
     echo "query,limbo_seconds,sqlite_seconds" >> "$RESULTS_FILE"
 
     local mode_exit_code=0
-    
+
     for query_file in $(ls "$QUERIES_DIR"/*.sql | sort -V); do
-        if [ -f "$query_file" ]; then
-            query_name=$(basename "$query_file")
+        if [ ! -f "$query_file" ]; then
+            echo "Warning: Skipping non-file item $query_file"
+            echo "-----------------------------------------------------------"
+            continue
+        fi
 
-            # If the query file starts with "-- LIMBO_SKIP: ...", skip it and print the reason
-            if head -n1 "$query_file" | grep -q "^-- LIMBO_SKIP: "; then
-                skip_reason=$(head -n1 "$query_file" | sed 's/^-- LIMBO_SKIP: //')
-                echo "Skipping $query_name, reason: $skip_reason"
-                echo "-----------------------------------------------------------"
-                continue
-            fi
+        query_name=$(basename "$query_file")
 
-            echo "Running $query_name with Limbo..." >&2
-            # Clear caches before Limbo run
-            clear_caches
-            # Run Limbo
-            limbo_output=$( { time -p RUST_LOG=off "$LIMBO_BIN" "$DB_FILE" --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
-            limbo_non_time_lines=$(echo "$limbo_output" | grep -v -e "^real" -e "^user" -e "^sys")
-            limbo_real_time=$(echo "$limbo_output" | grep "^real" | awk '{print $2}')
-            echo "Running $query_name with SQLite3..." >&2
-            # Clear caches before SQLite execution
-            clear_caches
-            sqlite_output=$( { time -p "$SQLITE_BIN" "$DB_FILE" "$(cat $query_file)" 2>&1; } 2>&1)
-            sqlite_non_time_lines=$(echo "$sqlite_output" | grep -v -e "^real" -e "^user" -e "^sys")
-            sqlite_real_time=$(echo "$sqlite_output" | grep "^real" | awk '{print $2}')
-            echo "Limbo real time: $limbo_real_time"
-            echo "SQLite3 real time: $sqlite_real_time"
-            echo "$query_name,$limbo_real_time,$sqlite_real_time" >> "$RESULTS_FILE"
-            echo "Limbo output:"
-            echo "$limbo_non_time_lines"
-            echo "SQLite3 output:"
-            echo "$sqlite_non_time_lines"
-            output_diff=$(diff <(echo "$limbo_non_time_lines") <(echo "$sqlite_non_time_lines"))
-            if [ -n "$output_diff" ]; then
-                echo "Output difference:"
-                echo "$output_diff"
-                mode_exit_code=1
+        if has_limbo_skip "$query_file"; then
+            skip_reason=$(get_limbo_skip_reason "$query_file")
+            echo "Skipping $query_name, reason: $skip_reason"
+            echo "-----------------------------------------------------------"
+            continue
+        fi
+
+        echo "Running $query_name with Limbo..." >&2
+        clear_caches
+        limbo_output=$(run_query_with_limbo "$query_file")
+        limbo_non_time_lines=$(echo "$limbo_output" | grep -v -e "^real" -e "^user" -e "^sys")
+        limbo_real_time=$(echo "$limbo_output" | grep "^real" | awk '{print $2}')
+
+        sqlite_skip_line=$(get_sqlite_skip_line "$query_file")
+        sqlite_skipped=0
+        sqlite_real_time="NA"
+        sqlite_non_time_lines=""
+
+        if [ -n "$sqlite_skip_line" ]; then
+            sqlite_skipped=1
+            sqlite_skip_reason=$(extract_skip_reason "$sqlite_skip_line" "SQLITE_SKIP")
+            if [ -n "$sqlite_skip_reason" ] && [ "$sqlite_skip_reason" != "-- SQLITE_SKIP" ]; then
+                echo "Skipping SQLite3 for $query_name, reason: $sqlite_skip_reason" >&2
             else
-                echo "No output difference"
-            fi
-
-            if [ "$mode" = "WITHOUT ANALYZE" ]; then
-                LIMBO_TIMES_WITHOUT_ANALYZE["$query_name"]="$limbo_real_time"
-                SQLITE_TIMES_WITHOUT_ANALYZE["$query_name"]="$sqlite_real_time"
-            else
-                LIMBO_TIMES_WITH_ANALYZE["$query_name"]="$limbo_real_time"
-                SQLITE_TIMES_WITH_ANALYZE["$query_name"]="$sqlite_real_time"
+                echo "Skipping SQLite3 for $query_name" >&2
             fi
         else
-            echo "Warning: Skipping non-file item $query_file"
+            echo "Running $query_name with SQLite3..." >&2
+            clear_caches
+            sqlite_output=$(run_query_with_sqlite "$query_file")
+            sqlite_non_time_lines=$(echo "$sqlite_output" | grep -v -e "^real" -e "^user" -e "^sys")
+            sqlite_real_time=$(echo "$sqlite_output" | grep "^real" | awk '{print $2}')
         fi
+
+        echo "Limbo real time: $limbo_real_time"
+        if [ "$sqlite_skipped" -eq 1 ]; then
+            echo "SQLite3 real time: SKIPPED"
+        else
+            echo "SQLite3 real time: $sqlite_real_time"
+        fi
+        echo "$query_name,$limbo_real_time,$sqlite_real_time" >> "$RESULTS_FILE"
+
+        log_query_outputs "$limbo_non_time_lines" "$sqlite_non_time_lines" "$sqlite_skipped"
+        if ! compare_query_outputs "$limbo_non_time_lines" "$sqlite_non_time_lines" "$sqlite_skipped"; then
+            mode_exit_code=1
+        fi
+
+        record_query_times "$mode" "$query_name" "$limbo_real_time" "$sqlite_real_time" "$sqlite_skipped"
         echo "-----------------------------------------------------------"
     done
+
     echo "" >> "$RESULTS_FILE"
     return $mode_exit_code
 }

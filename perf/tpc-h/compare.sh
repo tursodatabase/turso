@@ -9,7 +9,7 @@ if [ -z "$1" ]; then
 fi
 MAIN_BIN=$1
 CURR_BIN=${2:-./target/release/tursodb}
-DB=TPC-H.db
+DB=perf/tpc-h/TPC-H.db
 if [ ! -f "$DB" ]; then
     echo "Error: Database file '$DB' not found" >&2
     exit 1
