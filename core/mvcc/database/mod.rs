@@ -1916,16 +1916,15 @@ pub(crate) const MVCC_META_KEY_PERSISTENT_TX_TS_MAX: &str = "persistent_tx_ts_ma
 
 #[derive(Debug)]
 pub struct RowidAllocator {
-    /// Lock to ensure that only one thread can initialize the rowid allocator at a time.
-    /// In case of unitialized values, we will look for last rowid first.
+    /// Exclusive lock serializing initialization (btree max read → store).
+    /// Only held during the first NewRowid for a table; after that, the
+    /// fast path is lock-free (atomic CAS on max_rowid).
     lock: TursoRwLock,
-    /// last_rowid is the last rowid that was allocated.
-    max_rowid: RwLock<Option<i64>>,
+    /// Monotonically increasing counter. 0 = empty table (rowids start at 1).
+    /// Updated via atomic CAS — no RwLock needed on the fast path.
+    max_rowid: AtomicI64,
+    /// True after the first btree-max scan. Never reset to false.
     initialized: AtomicBool,
-    /// Count of rowids allocated (via NewRowid) but not yet inserted.
-    /// Used to detect in-flight allocations from other threads during
-    /// ReadingMaxRowid, preventing duplicate rowid assignment.
-    pending_inserts: AtomicI64,
 }
 
 /// A multi-version concurrency control database.
@@ -2384,9 +2383,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
             None => {
                 tx.record_created_table_version(id.clone(), version_id);
-                let table_id = id.table_id;
                 self.insert_version(id, row_version);
-                self.invalidate_rowid_allocator(table_id);
             }
         }
         Ok(())
@@ -2610,7 +2607,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let tx = tx.value();
                         tx.insert_to_write_set(id.clone());
                         tx.record_deleted_table_version(id.clone(), version_id);
-                        self.invalidate_rowid_allocator(id.table_id);
                         return Ok(true);
                     }
                 }
@@ -3275,16 +3271,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.release_exclusive_tx(&tx_id);
         }
 
-        let mut touched_table_ids = BTreeSet::new();
         for rowid in &tx.write_set {
             let rowid = rowid.value();
             self.rollback_rowid(tx_id, rowid);
-            if rowid.row_id.is_int_key() {
-                touched_table_ids.insert(rowid.table_id);
-            }
-        }
-        for table_id in touched_table_ids {
-            self.invalidate_rowid_allocator(table_id);
         }
 
         if connection.schema.read().schema_version > connection.db.schema.lock().schema_version {
@@ -3526,10 +3515,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         touched_rowids.extend(newly_added_to_write_set);
         self.remove_rolled_back_rows_from_write_set(tx_id, touched_rowids.clone());
-        // A statement may reserve a rowid and then abort before a table-version is recorded
-        // (e.g. uniqueness/FK failures). Invalidate all allocators so aborted reservations
-        // never leak into future rowid choices.
-        self.invalidate_all_rowid_allocators();
     }
 
     fn row_has_uncommitted_version_for_tx(&self, rowid: &RowID, tx_id: TxID) -> bool {
@@ -3573,18 +3558,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 continue;
             }
             tx.write_set.remove(&rowid);
-        }
-    }
-
-    fn invalidate_all_rowid_allocators(&self) {
-        for allocator in self.table_id_to_last_rowid.read().values() {
-            allocator.invalidate();
-        }
-    }
-
-    fn invalidate_rowid_allocator(&self, table_id: MVTableId) {
-        if let Some(allocator) = self.table_id_to_last_rowid.read().get(&table_id) {
-            allocator.invalidate();
         }
     }
 
@@ -4674,9 +4647,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         } else {
             let allocator = Arc::new(RowidAllocator {
                 lock: TursoRwLock::new(),
-                max_rowid: RwLock::new(None),
+                max_rowid: AtomicI64::new(0),
                 initialized: AtomicBool::new(false),
-                pending_inserts: AtomicI64::new(0),
             });
             map.insert(*table_id, allocator.clone());
             allocator
@@ -4704,37 +4676,44 @@ fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
 }
 
 impl RowidAllocator {
-    /// Returns None if no rowid could be allocated.
-    /// Returns Some((new_rowid, prev_last_rowid)) where prev_last_rowid is None if table was empty
+    /// Lock-free rowid allocation via atomic CAS.
+    /// Returns None only when at i64::MAX (triggers random fallback).
+    /// Returns Some((new_rowid, prev_rowid)) where prev_rowid is None if table was empty.
     pub fn get_next_rowid(&self) -> Option<(i64, Option<i64>)> {
-        let mut last_rowid_guard = self.max_rowid.write();
-        if last_rowid_guard.is_none() {
-            // Case 1. Table is empty
-            // Database is empty because there is no last rowid
-            *last_rowid_guard = Some(1);
-            tracing::trace!("get_next_rowid(empty, 1)");
-            Some((1, None))
-        } else {
-            // Case 2. Table is not empty
-            let last_rowid = last_rowid_guard.unwrap();
-            if last_rowid == i64::MAX {
+        loop {
+            let cur = self.max_rowid.load(Ordering::SeqCst);
+            if cur == i64::MAX {
                 tracing::trace!("get_next_rowid(max)");
-                None
-            } else {
-                let next_rowid = last_rowid + 1;
-                *last_rowid_guard = Some(next_rowid);
-                tracing::trace!("get_next_rowid({next_rowid})");
-                Some((next_rowid, Some(last_rowid)))
+                return None;
+            }
+            let next = cur + 1;
+            if self
+                .max_rowid
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let prev = if cur == 0 { None } else { Some(cur) };
+                tracing::trace!("get_next_rowid({next})");
+                return Some((next, prev));
             }
         }
     }
 
+    /// Bump the counter to at least `rowid`. Used for user-specified rowids
+    /// (e.g. INSERT INTO t(rowid,...) VALUES(1000,...)).
     pub fn insert_row_id_maybe_update(&self, rowid: i64) {
-        let mut last_rowid = self.max_rowid.write();
-        if let Some(last_rowid) = last_rowid.as_mut() {
-            *last_rowid = (*last_rowid).max(rowid);
-        } else {
-            *last_rowid = Some(rowid);
+        loop {
+            let cur = self.max_rowid.load(Ordering::SeqCst);
+            if rowid <= cur {
+                return;
+            }
+            if self
+                .max_rowid
+                .compare_exchange(cur, rowid, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return;
+            }
         }
     }
 
@@ -4742,33 +4721,11 @@ impl RowidAllocator {
         !self.initialized.load(Ordering::SeqCst)
     }
 
+    /// Initialize from btree max. Called once per table, under lock.
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
-        let mut last_rowid = self.max_rowid.write();
-        *last_rowid = rowid;
+        self.max_rowid.store(rowid.unwrap_or(0), Ordering::SeqCst);
         self.initialized.store(true, Ordering::SeqCst);
-    }
-
-    pub fn invalidate(&self) {
-        self.initialized.store(false, Ordering::SeqCst);
-    }
-
-    /// Read current max_rowid without modifying state.
-    /// Caller must hold the allocator lock.
-    pub fn current_max_rowid(&self) -> Option<i64> {
-        *self.max_rowid.read()
-    }
-
-    pub fn increment_pending(&self) {
-        self.pending_inserts.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub fn decrement_pending(&self) {
-        self.pending_inserts.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    pub fn has_pending(&self) -> bool {
-        self.pending_inserts.load(Ordering::SeqCst) > 0
     }
 
     pub fn lock(&self) -> bool {

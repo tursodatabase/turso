@@ -266,9 +266,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
-    /// True if this cursor has allocated a rowid (via NewRowid) that hasn't
-    /// been inserted yet. Used to track in-flight allocations.
-    has_pending_rowid: bool,
     state: Option<MvccLazyCursorState>,
     // we keep count_state separate to be able to call other public functions like rewind and next
     count_state: Option<CountState>,
@@ -314,7 +311,6 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             btree_cursor,
             null_flag: false,
             creating_new_rowid: false,
-            has_pending_rowid: false,
             state: None,
             count_state: None,
             btree_advance_state: None,
@@ -379,14 +375,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(())
     }
 
-    pub fn start_new_rowid(
-        &mut self,
-        allow_cached_allocator: bool,
-    ) -> Result<IOResult<NextRowidResult>> {
+    pub fn start_new_rowid(&mut self) -> Result<IOResult<NextRowidResult>> {
         tracing::trace!("start_new_rowid");
-        // Clean up stale pending state from a previous NewRowid whose INSERT
-        // never completed (e.g. constraint violation, aborted statement).
-        self.clear_pending_rowid();
 
         let allocator = self.db.get_rowid_allocator(&self.table_id);
         let locked = allocator.lock();
@@ -396,27 +386,20 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         }
 
         self.creating_new_rowid = true;
-        let res = if allow_cached_allocator {
-            if allocator.is_uninitialized() {
-                NextRowidResult::Uninitialized
-            } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
-                NextRowidResult::Next {
-                    new_rowid: next_rowid,
-                    prev_rowid: prev_max_rowid,
-                }
-            } else {
-                NextRowidResult::FindRandom
+        let res = if allocator.is_uninitialized() {
+            NextRowidResult::Uninitialized
+        } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
+            NextRowidResult::Next {
+                new_rowid: next_rowid,
+                prev_rowid: prev_max_rowid,
             }
         } else {
-            // For non-concurrent transactions, derive from the current visible max rowid.
-            // This avoids rowid drift after savepoint rollbacks and failed statements.
-            NextRowidResult::Uninitialized
+            NextRowidResult::FindRandom
         };
         Ok(IOResult::Done(res))
     }
 
     pub fn initialize_max_rowid(&mut self, max_rowid: Option<i64>) -> Result<()> {
-        tracing::trace!("start_new_rowid");
         let allocator = self.db.get_rowid_allocator(&self.table_id);
         turso_assert!(
             self.creating_new_rowid,
@@ -426,38 +409,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(())
     }
 
-    /// Read the allocator's current max_rowid without modifying it.
-    /// Must be called while holding the allocator lock (i.e. between
-    /// start_new_rowid and end_new_rowid).
-    pub fn get_allocator_max_rowid(&self) -> Option<i64> {
-        let allocator = self.db.get_rowid_allocator(&self.table_id);
-        allocator.current_max_rowid()
-    }
-
-    /// Returns true if any cursor for this table has an allocated-but-not-yet-inserted rowid.
-    pub fn has_pending_inserts(&self) -> bool {
-        let allocator = self.db.get_rowid_allocator(&self.table_id);
-        allocator.has_pending()
-    }
-
-    /// Mark that this cursor has an in-flight rowid allocation.
+    /// Allocate the next rowid from the (already initialized) allocator.
     /// Must be called while holding the allocator lock.
-    pub fn mark_pending_rowid(&mut self) {
-        if !self.has_pending_rowid {
-            let allocator = self.db.get_rowid_allocator(&self.table_id);
-            allocator.increment_pending();
-            self.has_pending_rowid = true;
-        }
-    }
-
-    /// Clear this cursor's pending rowid flag.
-    /// Called when the INSERT completes or at the start of the next NewRowid.
-    pub fn clear_pending_rowid(&mut self) {
-        if self.has_pending_rowid {
-            let allocator = self.db.get_rowid_allocator(&self.table_id);
-            allocator.decrement_pending();
-            self.has_pending_rowid = false;
-        }
+    pub fn allocate_next_rowid(&self) -> Option<(i64, Option<i64>)> {
+        let allocator = self.db.get_rowid_allocator(&self.table_id);
+        allocator.get_next_rowid()
     }
 
     pub fn end_new_rowid(&mut self) {
@@ -1356,11 +1312,6 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 })?;
         }
         self.invalidate_record();
-        // For table cursors, the INSERT completed — clear the pending rowid flag
-        // so other threads know there are no more in-flight allocations from us.
-        if matches!(self.mv_cursor_type, MvccCursorType::Table) {
-            self.clear_pending_rowid();
-        }
         Ok(IOResult::Done(()))
     }
 
@@ -1705,14 +1656,6 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn get_skip_advance(&self) -> bool {
         todo!()
-    }
-}
-
-impl<Clock: LogicalClock + 'static> Drop for MvccLazyCursor<Clock> {
-    fn drop(&mut self) {
-        // Clean up any pending rowid allocation that wasn't followed by an INSERT
-        // (e.g. statement aborted, INSERT OR IGNORE skipped, etc.)
-        self.clear_pending_rowid();
     }
 }
 
