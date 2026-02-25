@@ -15,7 +15,7 @@ expect error {
 test mvcc-rejects-cdc {
     PRAGMA journal_mode = 'experimental_mvcc';
     CREATE TABLE t4 (id INTEGER PRIMARY KEY, val TEXT);
-    PRAGMA unstable_capture_data_changes_conn = 'full';
+    PRAGMA capture_data_changes_conn = 'full';
 }
 expect error {
     CDC is not supported in MVCC mode

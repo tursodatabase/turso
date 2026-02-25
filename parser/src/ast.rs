@@ -1644,7 +1644,9 @@ pub enum PragmaName {
     /// - a dynamic or stored generated column (2 or 3)
     /// - or a hidden column in a virtual table (1)
     TableXinfo,
-    /// enable capture-changes logic for the connection
+    /// enable capture-changes logic for the connection (stable name)
+    CaptureDataChangesConn,
+    /// enable capture-changes logic for the connection (deprecated alias)
     UnstableCaptureDataChangesConn,
     /// Returns the user version of the database file.
     UserVersion,

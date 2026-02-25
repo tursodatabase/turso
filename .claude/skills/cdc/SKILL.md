@@ -177,7 +177,7 @@ Used by `emit_cdc_insns()` to determine `change_type` value:
 - When off: returns `("off", NULL, NULL)`
 - When active: returns `(mode_name, table, version)`
 
-**Pragma registration:** `core/pragma.rs` — `UnstableCaptureDataChangesConn` with columns `["mode", "table", "version"]`
+**Pragma registration:** `core/pragma.rs` — `CaptureDataChangesConn` (and deprecated alias `UnstableCaptureDataChangesConn`) with columns `["mode", "table", "version"]`
 
 ### 2. Connection State
 
@@ -283,7 +283,7 @@ The sync engine is the primary consumer of CDC data.
 
 ### DatabaseTape — `sync/engine/src/database_tape.rs`
 - **CDC config:** `DEFAULT_CDC_TABLE_NAME = "turso_cdc"`, `DEFAULT_CDC_MODE = "full"`
-- **PRAGMA name:** `CDC_PRAGMA_NAME = "unstable_capture_data_changes_conn"`
+- **PRAGMA name:** `CDC_PRAGMA_NAME = "capture_data_changes_conn"`
 - **Initialization:** `connect()` sets CDC pragma and caches `cdc_version` from `turso_cdc_version` table. Must be called before `iterate_changes()`.
 - **Version caching:** `cdc_version: RwLock<Option<CdcVersion>>` — set by `connect()`, read by `iterate_changes()`. Panics if not set.
 - **Iterator:** `DatabaseChangesIterator` reads CDC table in batches, emits `DatabaseTapeOperation`. For v2, real COMMIT records from the table are emitted. For v1, a synthetic Commit is appended at end of batch. `ignore_schema_changes: true` (default) filters out `sqlite_schema` row changes but not COMMIT records.

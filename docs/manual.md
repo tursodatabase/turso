@@ -1052,7 +1052,7 @@ Turso supports [Change Data Capture](https://en.wikipedia.org/wiki/Change_data_c
 ### Enabling CDC
 
 ```sql
-PRAGMA unstable_capture_data_changes_conn('<mode>[,custom_cdc_table]');
+PRAGMA capture_data_changes_conn('<mode>[,custom_cdc_table]');
 ```
 
 ### Parameters
@@ -1120,7 +1120,7 @@ When **Change Data Capture (CDC)** is enabled for a connection, Turso automatica
 
 ```zsh
 Example:
-turso> PRAGMA unstable_capture_data_changes_conn('full');
+turso> PRAGMA capture_data_changes_conn('full');
 turso> .tables
 turso_cdc
 turso> CREATE TABLE users (
