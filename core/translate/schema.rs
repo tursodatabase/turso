@@ -2,7 +2,7 @@ use crate::sync::Arc;
 
 use crate::ast;
 use crate::ext::VTabImpl;
-use crate::function::{Deterministic, Func};
+use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
     create_table, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
     RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
@@ -303,17 +303,236 @@ fn resolve_check_expr_type(
             }
         }
         ast::Expr::NotNull(_) | ast::Expr::IsNull(_) => Ok(CheckExprType::Integer),
-        ast::Expr::FunctionCall { name, .. } | ast::Expr::FunctionCallStar { name, .. } => {
-            bail_parse_error!(
-                "cannot determine return type of function {}() in CHECK constraint; \
-                 wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
-                name.as_str(),
-                name.as_str()
-            );
+        ast::Expr::FunctionCall { name, args, .. } => {
+            if let Some(func) = resolver.resolve_function(name.as_str(), args.len()) {
+                resolve_func_return_type(&func, name.as_str(), args, columns, resolver)
+            } else {
+                bail_parse_error!(
+                    "cannot determine return type of function {}() in CHECK constraint; \
+                     wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
+                    name.as_str(),
+                    name.as_str()
+                );
+            }
+        }
+        ast::Expr::FunctionCallStar { name, .. } => {
+            if let Some(func) = resolver.resolve_function(name.as_str(), 0) {
+                resolve_func_return_type(&func, name.as_str(), &[], columns, resolver)
+            } else {
+                bail_parse_error!(
+                    "cannot determine return type of function {}() in CHECK constraint; \
+                     wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
+                    name.as_str(),
+                    name.as_str()
+                );
+            }
         }
         _ => {
             bail_parse_error!("cannot determine type of expression in CHECK constraint; use CAST");
         }
+    }
+}
+
+/// Resolve the return type of a built-in function for CHECK constraint type checking.
+fn resolve_func_return_type(
+    func: &Func,
+    name: &str,
+    args: &[Box<ast::Expr>],
+    columns: &[&ast::ColumnDefinition],
+    resolver: &Resolver,
+) -> Result<CheckExprType> {
+    match func {
+        Func::Scalar(sf) => resolve_scalar_func_return_type(sf, args, columns, resolver),
+        Func::Math(mf) => resolve_math_func_return_type(mf),
+        #[cfg(feature = "json")]
+        Func::Json(jf) => resolve_json_func_return_type(jf),
+        Func::Agg(_) => bail_parse_error!("misuse of aggregate function {}()", name),
+        Func::External(_) => {
+            bail_parse_error!(
+                "cannot determine return type of function {}() in CHECK constraint; \
+                 wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
+                name,
+                name
+            );
+        }
+        _ => Ok(CheckExprType::Any),
+    }
+}
+
+/// Resolve the return type of a scalar function.
+fn resolve_scalar_func_return_type(
+    func: &ScalarFunc,
+    args: &[Box<ast::Expr>],
+    columns: &[&ast::ColumnDefinition],
+    resolver: &Resolver,
+) -> Result<CheckExprType> {
+    match func {
+        // Functions that always return INTEGER
+        ScalarFunc::Length
+        | ScalarFunc::OctetLength
+        | ScalarFunc::Instr
+        | ScalarFunc::Unicode
+        | ScalarFunc::Sign
+        | ScalarFunc::Random
+        | ScalarFunc::Changes
+        | ScalarFunc::TotalChanges
+        | ScalarFunc::LastInsertRowid
+        | ScalarFunc::Glob
+        | ScalarFunc::Like
+        | ScalarFunc::Likely
+        | ScalarFunc::Unlikely
+        | ScalarFunc::Likelihood
+        | ScalarFunc::BooleanToInt
+        | ScalarFunc::IntToBoolean
+        | ScalarFunc::IsAutocommit
+        | ScalarFunc::ConnTxnId
+        | ScalarFunc::TestUintLt
+        | ScalarFunc::TestUintEq
+        | ScalarFunc::NumericLt
+        | ScalarFunc::NumericEq
+        | ScalarFunc::ValidateIpAddr
+        | ScalarFunc::UnixEpoch => Ok(CheckExprType::Integer),
+
+        // Functions that always return TEXT
+        ScalarFunc::Upper
+        | ScalarFunc::Lower
+        | ScalarFunc::Trim
+        | ScalarFunc::LTrim
+        | ScalarFunc::RTrim
+        | ScalarFunc::Hex
+        | ScalarFunc::Soundex
+        | ScalarFunc::Quote
+        | ScalarFunc::Replace
+        | ScalarFunc::Substr
+        | ScalarFunc::Substring
+        | ScalarFunc::Char
+        | ScalarFunc::Concat
+        | ScalarFunc::ConcatWs
+        | ScalarFunc::Typeof
+        | ScalarFunc::SqliteVersion
+        | ScalarFunc::TursoVersion
+        | ScalarFunc::SqliteSourceId
+        | ScalarFunc::Date
+        | ScalarFunc::Time
+        | ScalarFunc::DateTime
+        | ScalarFunc::StrfTime
+        | ScalarFunc::TimeDiff
+        | ScalarFunc::Printf
+        | ScalarFunc::StringReverse => Ok(CheckExprType::Text),
+
+        // Functions that always return REAL
+        ScalarFunc::Round | ScalarFunc::JulianDay => Ok(CheckExprType::Real),
+
+        // Functions that always return BLOB
+        ScalarFunc::RandomBlob | ScalarFunc::ZeroBlob | ScalarFunc::Unhex => {
+            Ok(CheckExprType::Blob)
+        }
+
+        // Functions whose return type depends on arguments
+        ScalarFunc::Abs | ScalarFunc::Nullif => {
+            if let Some(arg) = args.first() {
+                resolve_check_expr_type(arg, columns, resolver)
+            } else {
+                Ok(CheckExprType::Any)
+            }
+        }
+
+        ScalarFunc::Coalesce | ScalarFunc::IfNull => {
+            for arg in args {
+                let ty = resolve_check_expr_type(arg, columns, resolver)?;
+                if ty != CheckExprType::Null {
+                    return Ok(ty);
+                }
+            }
+            Ok(CheckExprType::Null)
+        }
+
+        ScalarFunc::Min | ScalarFunc::Max => {
+            if let Some(first) = args.first() {
+                resolve_check_expr_type(first, columns, resolver)
+            } else {
+                Ok(CheckExprType::Any)
+            }
+        }
+
+        ScalarFunc::Iif => {
+            // iif(cond, then_val, else_val) — return type of then_val
+            if args.len() >= 2 {
+                resolve_check_expr_type(&args[1], columns, resolver)
+            } else {
+                Ok(CheckExprType::Any)
+            }
+        }
+
+        // Internal/custom type functions
+        ScalarFunc::TestUintEncode
+        | ScalarFunc::TestUintDecode
+        | ScalarFunc::TestUintAdd
+        | ScalarFunc::TestUintSub
+        | ScalarFunc::TestUintMul
+        | ScalarFunc::TestUintDiv
+        | ScalarFunc::NumericEncode
+        | ScalarFunc::NumericDecode
+        | ScalarFunc::NumericAdd
+        | ScalarFunc::NumericSub
+        | ScalarFunc::NumericMul
+        | ScalarFunc::NumericDiv => Ok(CheckExprType::Blob),
+
+        // Remaining functions — treat as ANY
+        _ => Ok(CheckExprType::Any),
+    }
+}
+
+/// Resolve the return type of a math function.
+fn resolve_math_func_return_type(func: &MathFunc) -> Result<CheckExprType> {
+    match func {
+        // Floor/ceil/trunc return INTEGER for integer inputs, but always produce numeric results
+        MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc => {
+            Ok(CheckExprType::Integer)
+        }
+        // All other math functions return REAL
+        _ => Ok(CheckExprType::Real),
+    }
+}
+
+/// Resolve the return type of a JSON function.
+#[cfg(feature = "json")]
+fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<CheckExprType> {
+    use crate::function::JsonFunc;
+    match func {
+        // Functions that return TEXT (JSON text)
+        JsonFunc::Json
+        | JsonFunc::JsonArray
+        | JsonFunc::JsonObject
+        | JsonFunc::JsonPatch
+        | JsonFunc::JsonRemove
+        | JsonFunc::JsonReplace
+        | JsonFunc::JsonInsert
+        | JsonFunc::JsonSet
+        | JsonFunc::JsonPretty
+        | JsonFunc::JsonQuote
+        | JsonFunc::JsonType => Ok(CheckExprType::Text),
+
+        // Functions that return BLOB (JSONB binary)
+        JsonFunc::Jsonb
+        | JsonFunc::JsonbArray
+        | JsonFunc::JsonbObject
+        | JsonFunc::JsonbPatch
+        | JsonFunc::JsonbRemove
+        | JsonFunc::JsonbReplace
+        | JsonFunc::JsonbInsert
+        | JsonFunc::JsonbSet => Ok(CheckExprType::Blob),
+
+        // Functions that return INTEGER
+        JsonFunc::JsonArrayLength | JsonFunc::JsonErrorPosition | JsonFunc::JsonValid => {
+            Ok(CheckExprType::Integer)
+        }
+
+        // Extract functions can return any type
+        JsonFunc::JsonExtract
+        | JsonFunc::JsonbExtract
+        | JsonFunc::JsonArrowExtract
+        | JsonFunc::JsonArrowShiftExtract => Ok(CheckExprType::Any),
     }
 }
 
@@ -447,6 +666,11 @@ fn validate_check_types_in_expr(
             }
             if let Some(else_e) = else_expr {
                 validate_check_types_in_expr(else_e, columns, resolver)?;
+            }
+        }
+        ast::Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                validate_check_types_in_expr(arg, columns, resolver)?;
             }
         }
         // Leaf nodes and other expressions: no nested comparisons to validate
