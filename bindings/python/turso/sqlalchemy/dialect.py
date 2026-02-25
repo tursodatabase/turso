@@ -8,7 +8,7 @@ This module provides two SQLAlchemy dialects:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List
 
 from sqlalchemy import pool
 from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
@@ -46,8 +46,7 @@ class _TursoDialectMixin:
         Foreign key constraints are still enforced at write time if defined.
         """
         logger.debug(
-            "PRAGMA foreign_key_list not supported; "
-            "foreign key reflection unavailable for table '%s'",
+            "PRAGMA foreign_key_list not supported; foreign key reflection unavailable for table '%s'",
             table_name,
         )
         return []
@@ -66,8 +65,7 @@ class _TursoDialectMixin:
         Indexes still exist and are used for query optimization.
         """
         logger.debug(
-            "PRAGMA index_list not supported; "
-            "index reflection unavailable for table '%s'",
+            "PRAGMA index_list not supported; index reflection unavailable for table '%s'",
             table_name,
         )
         return []
@@ -85,8 +83,7 @@ class _TursoDialectMixin:
         This also relies on PRAGMA index_list which Turso doesn't support.
         """
         logger.debug(
-            "PRAGMA index_list not supported; "
-            "unique constraint reflection unavailable for table '%s'",
+            "PRAGMA index_list not supported; unique constraint reflection unavailable for table '%s'",
             table_name,
         )
         return []
@@ -212,6 +209,7 @@ class TursoDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
     def import_dbapi(cls):
         """Import the turso module as DBAPI."""
         import turso
+
         return turso
 
     def on_connect(self):
@@ -348,6 +346,12 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
 
         return turso.sync
 
+    def connect(self, *cargs, **cparams):
+        """Remap sync_url to remote_url for libsql-sqlalchemy compatibility."""
+        if "sync_url" in cparams and "remote_url" not in cparams:
+            cparams["remote_url"] = cparams.pop("sync_url")
+        return super().connect(*cargs, **cparams)
+
     def on_connect(self):
         """
         Return a callable to run on each new connection.
@@ -375,6 +379,47 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
         """
         pass
 
+    @staticmethod
+    def _validate_sync_url(opts: Dict[str, Any]) -> None:
+        """Reject URL components that TursoSyncDialect doesn't support."""
+        if opts.get("username") or opts.get("password"):
+            raise ValueError(
+                "TursoSyncDialect does not support username/password in URL. "
+                "Use auth_token query parameter or connect_args instead."
+            )
+        if opts.get("host") or opts.get("port"):
+            raise ValueError(
+                "TursoSyncDialect does not support host/port in URL. "
+                "The local database path goes after ':///', and remote_url "
+                "is specified as a query parameter."
+            )
+
+    @staticmethod
+    def _extract_sync_params(query_params: Dict[str, str]) -> Dict[str, Any]:
+        """Extract and convert sync-specific query parameters into kwargs."""
+        kwargs: Dict[str, Any] = {}
+
+        auth_token = query_params.pop("auth_token", None)
+        if auth_token:
+            kwargs["auth_token"] = auth_token
+
+        client_name = query_params.pop("client_name", None)
+        kwargs["client_name"] = client_name or "turso-sqlalchemy"
+
+        long_poll_timeout_ms = query_params.pop("long_poll_timeout_ms", None)
+        if long_poll_timeout_ms:
+            kwargs["long_poll_timeout_ms"] = int(long_poll_timeout_ms)
+
+        bootstrap_if_empty = query_params.pop("bootstrap_if_empty", None)
+        if bootstrap_if_empty is not None:
+            kwargs["bootstrap_if_empty"] = bootstrap_if_empty.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+
+        return kwargs
+
     def create_connect_args(self, url: URL) -> ConnectArgsType:
         """
         Create connection arguments from SQLAlchemy URL.
@@ -392,53 +437,13 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
             - experimental_features: Comma-separated feature flags
         """
         opts = url.translate_connect_args()
-
-        # 'database' key becomes 'path' for turso.sync.connect
         path = opts.pop("database", ":memory:")
+        self._validate_sync_url(opts)
 
-        # Reject unsupported URL components
-        if opts.get("username") or opts.get("password"):
-            raise ValueError(
-                "TursoSyncDialect does not support username/password in URL. "
-                "Use auth_token query parameter or connect_args instead."
-            )
-        if opts.get("host") or opts.get("port"):
-            raise ValueError(
-                "TursoSyncDialect does not support host/port in URL. "
-                "The local database path goes after ':///', and remote_url "
-                "is specified as a query parameter."
-            )
-
-        # Extract query parameters
         query_params = dict(url.query)
-
-        kwargs: Dict[str, Any] = {}
-
-        # Handle remote_url (required for sync)
-        remote_url = query_params.pop("remote_url", None)
-
-        # Handle auth_token
-        auth_token = query_params.pop("auth_token", None)
-        if auth_token:
-            kwargs["auth_token"] = auth_token
-
-        # Handle client_name
-        client_name = query_params.pop("client_name", None)
-        kwargs["client_name"] = client_name or "turso-sqlalchemy"
-
-        # Handle long_poll_timeout_ms (convert from string)
-        long_poll_timeout_ms = query_params.pop("long_poll_timeout_ms", None)
-        if long_poll_timeout_ms:
-            kwargs["long_poll_timeout_ms"] = int(long_poll_timeout_ms)
-
-        # Handle bootstrap_if_empty (convert from string)
-        bootstrap_if_empty = query_params.pop("bootstrap_if_empty", None)
-        if bootstrap_if_empty is not None:
-            kwargs["bootstrap_if_empty"] = bootstrap_if_empty.lower() in (
-                "true",
-                "1",
-                "yes",
-            )
+        # Accept both remote_url and sync_url (libsql-sqlalchemy compat)
+        remote_url = query_params.pop("remote_url", None) or query_params.pop("sync_url", None)
+        kwargs = self._extract_sync_params(query_params)
 
         # Handle isolation_level
         isolation_level = query_params.pop("isolation_level", None)
