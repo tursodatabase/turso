@@ -1377,8 +1377,11 @@ pub fn compute_best_join_order<'a>(
                                 .is_some_and(|ji| ji.outer || ji.full_outer)
                     })
                 });
+                let has_correlated_subquery = subqueries.iter().any(|sq| sq.correlated);
                 let msg = if build_is_outer {
                     "FULL OUTER JOIN chaining is not yet supported"
+                } else if has_correlated_subquery {
+                    "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables"
                 } else {
                     "FULL OUTER JOIN requires an equality condition in the ON clause"
                 };

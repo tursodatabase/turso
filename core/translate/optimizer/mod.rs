@@ -1370,7 +1370,10 @@ fn optimize_table_access(
             .filter(|(_, t)| {
                 t.join_info
                     .as_ref()
-                    .is_some_and(|join_info| join_info.outer)
+                    // Skip FULL OUTER JOIN tables: removing `outer` would suppress
+                    // unmatched-probe-row emission and prevent LeftJoinMetadata
+                    // allocation needed by the hash join.
+                    .is_some_and(|join_info| join_info.outer && !join_info.full_outer)
             })
         {
             // Check if there's a constraint that would filter out NULL rows,
