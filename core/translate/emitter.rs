@@ -43,8 +43,8 @@ use crate::translate::expr::{
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters, emit_fk_update_parent_actions,
-    emit_guarded_fk_decrement, fire_fk_update_actions, fire_prepared_fk_delete_actions,
-    open_read_index, open_read_table, prepare_fk_delete_actions, stabilize_new_row_for_fk,
+    emit_guarded_fk_decrement, fire_fk_update_actions, open_read_index, open_read_table,
+    stabilize_new_row_for_fk, ForeignKeyActions,
 };
 use crate::translate::plan::{
     DeletePlan, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinedTable, NonFromClauseSubquery,
@@ -2049,7 +2049,7 @@ fn emit_delete_row_common(
                 .resolver
                 .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
             {
-                prepare_fk_delete_actions(
+                ForeignKeyActions::prepare_fk_delete_actions(
                     program,
                     &mut t_ctx.resolver,
                     table_name,
@@ -2058,7 +2058,7 @@ fn emit_delete_row_common(
                     delete_db_id,
                 )?
             } else {
-                Vec::new()
+                ForeignKeyActions::default()
             };
             if t_ctx
                 .resolver
@@ -2076,10 +2076,10 @@ fn emit_delete_row_common(
             }
             prepared
         } else {
-            Vec::new()
+            ForeignKeyActions::default()
         }
     } else {
-        Vec::new()
+        ForeignKeyActions::default()
     };
 
     if unsafe { &*table_reference }.virtual_table().is_some() {
@@ -2223,12 +2223,11 @@ fn emit_delete_row_common(
     // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
     // Per SQLite docs, the parent row must be deleted before FK cascade actions fire,
     // so triggers during cascade see the parent row as already deleted.
-    if !prepared_fk_actions.is_empty() {
+    {
         let delete_db_id = unsafe { (*table_reference).database_id };
-        fire_prepared_fk_delete_actions(
+        prepared_fk_actions.fire_prepared_fk_delete_actions(
             program,
             &mut t_ctx.resolver,
-            prepared_fk_actions,
             connection,
             delete_db_id,
         )?;
@@ -3937,6 +3936,45 @@ fn emit_update_insns<'a>(
                         target_pc: after_delete_label, // Skip if row doesn't exist
                     });
 
+                    // Phase 1: Before Delete - prepare FK cascade actions for implicitly-deleted row
+                    // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
+                    let prepared_fk_actions = if connection.foreign_keys_enabled() {
+                        let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
+                            s.any_resolved_fks_referencing(table_name)
+                        }) {
+                            ForeignKeyActions::prepare_fk_delete_actions(
+                                program,
+                                &mut t_ctx.resolver,
+                                table_name,
+                                target_table_cursor_id,
+                                idx_rowid_reg,
+                                update_database_id,
+                            )?
+                        } else {
+                            ForeignKeyActions::default()
+                        };
+                        if t_ctx
+                            .resolver
+                            .with_schema(update_database_id, |s| s.has_child_fks(table_name))
+                        {
+                            emit_fk_child_decrement_on_delete(
+                                program,
+                                &target_table
+                                    .table
+                                    .btree()
+                                    .expect("UPDATE target must be a BTree table"),
+                                table_name,
+                                target_table_cursor_id,
+                                idx_rowid_reg,
+                                update_database_id,
+                                &t_ctx.resolver,
+                            )?;
+                        }
+                        prepared
+                    } else {
+                        ForeignKeyActions::default()
+                    };
+
                     // Delete from ALL indexes for the conflicting row
                     // We must delete from all indexes, not just indexes_to_update,
                     // because the conflicting row may have entries in indexes
@@ -3978,6 +4016,14 @@ fn emit_update_insns<'a>(
                         table_name: table_name.to_string(),
                         is_part_of_update: false,
                     });
+
+                    // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
+                    prepared_fk_actions.fire_prepared_fk_delete_actions(
+                        program,
+                        &mut t_ctx.resolver,
+                        connection,
+                        update_database_id,
+                    )?;
 
                     program.preassign_label_to_next_insn(after_delete_label);
 
@@ -4071,6 +4117,45 @@ fn emit_update_insns<'a>(
                         target_pc: after_delete_label, // Skip if row doesn't exist
                     });
 
+                    // Phase 1: Before Delete - prepare FK cascade actions for implicitly-deleted row
+                    // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
+                    let prepared_fk_actions = if connection.foreign_keys_enabled() {
+                        let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
+                            s.any_resolved_fks_referencing(table_name)
+                        }) {
+                            ForeignKeyActions::prepare_fk_delete_actions(
+                                program,
+                                &mut t_ctx.resolver,
+                                table_name,
+                                target_table_cursor_id,
+                                target_reg,
+                                update_database_id,
+                            )?
+                        } else {
+                            ForeignKeyActions::default()
+                        };
+                        if t_ctx
+                            .resolver
+                            .with_schema(update_database_id, |s| s.has_child_fks(table_name))
+                        {
+                            emit_fk_child_decrement_on_delete(
+                                program,
+                                &target_table
+                                    .table
+                                    .btree()
+                                    .expect("UPDATE target must be a BTree table"),
+                                table_name,
+                                target_table_cursor_id,
+                                target_reg,
+                                update_database_id,
+                                &t_ctx.resolver,
+                            )?;
+                        }
+                        prepared
+                    } else {
+                        ForeignKeyActions::default()
+                    };
+
                     // Delete from ALL indexes for the conflicting row
                     // We must delete from all indexes, not just indexes_to_update,
                     // because the conflicting row may have entries in indexes
@@ -4112,6 +4197,14 @@ fn emit_update_insns<'a>(
                         table_name: table_name.to_string(),
                         is_part_of_update: false,
                     });
+
+                    // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
+                    prepared_fk_actions.fire_prepared_fk_delete_actions(
+                        program,
+                        &mut t_ctx.resolver,
+                        connection,
+                        update_database_id,
+                    )?;
 
                     program.preassign_label_to_next_insn(after_delete_label);
                 }
