@@ -3034,3 +3034,74 @@ test json_valid_blob_header_overlap_scalar_bytes {
 expect {
     0
 }
+
+# From sqlite tlc tests
+test json101-9-2 {
+    SELECT json_quote(3.14159);
+} 
+expect {
+    3.14159
+}
+
+test json101-9-3 {
+    SELECT json_quote(12345);
+} 
+expect {
+    12345
+}
+
+test json101-24-4-insert {
+    SELECT json_insert('[0,1,2]', '$[3].a[0].b', 9);
+} 
+expect {
+    [0,1,2,{"a":[{"b":9}]}]
+}
+
+test json104-200 {
+  	SELECT json_patch('[1,2,3]','{"x":null}');
+}
+expect {
+		{}
+}
+
+test json104-210 {
+  	SELECT json_patch('[1,2,3]','{"x":null,"y":1,"z":null}');
+} 
+expect {
+		{"y":1}
+}
+
+test json104-311 {
+    SELECT json_patch('{"a":"foo"}','"bar"');
+} 
+expect {
+    "bar"
+}
+
+test json104-310 {
+    SELECT json_patch('{"a":"foo"}', 'null');
+} 
+expect {
+    null
+}
+
+test json104-310a {
+    SELECT coalesce(json_patch('{"a":"foo"}', null), 'real-null');
+} 
+expect {
+    real-null
+}
+
+test json104-313 {
+  	SELECT json_patch('[1,2]','{"a":"b","c":null}');
+} 
+expect {
+		{"a":"b"}
+}
+
+test json107-1-8 {
+  	SELECT json(CAST('{"a":123,"b":456}' AS blob));
+}
+expect {
+		{"a":123,"b":456}
+}

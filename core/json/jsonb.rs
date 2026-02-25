@@ -1268,7 +1268,7 @@ impl Jsonb {
                             b'\r' => string.push_str("\\r"),
                             b'\t' => string.push_str("\\t"),
                             c => {
-                                let _ = write!(string, "\\u{:04x}", c);
+                                let _ = write!(string, "\\u{c:04x}");
                             }
                         }
                         last_end = i + 1;
