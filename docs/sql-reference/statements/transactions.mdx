@@ -1,0 +1,182 @@
+---
+title: Transactions
+description: Start, commit, and roll back transactions to group operations atomically
+sidebarTitle: Transactions
+---
+
+# Transactions
+
+Transactions group multiple SQL statements into a single atomic unit of work. Either all statements in a transaction succeed and are committed, or the entire transaction is rolled back and no changes are applied. Turso supports explicit transactions with BEGIN, COMMIT, and ROLLBACK, and also runs each standalone statement in an implicit transaction (autocommit mode).
+
+## Syntax
+
+```sql
+BEGIN [DEFERRED | IMMEDIATE | EXCLUSIVE] [TRANSACTION];
+
+COMMIT [TRANSACTION];
+END [TRANSACTION];
+
+ROLLBACK [TRANSACTION];
+```
+
+## BEGIN
+
+The BEGIN statement starts a new explicit transaction. While a transaction is open, all subsequent statements are part of that transaction until a COMMIT or ROLLBACK is issued.
+
+### Transaction Types
+
+| Type | Description |
+|------|-------------|
+| `DEFERRED` | Default. No locks are acquired until the first read or write operation. A read operation acquires a shared lock; a write operation acquires a write lock. |
+| `IMMEDIATE` | Acquires a write lock immediately when BEGIN is executed. Other connections can still read but cannot write until the transaction completes. |
+| `EXCLUSIVE` | Same behavior as IMMEDIATE in Turso. Turso always uses WAL mode, where EXCLUSIVE and IMMEDIATE are equivalent. |
+
+If no type is specified, the transaction defaults to `DEFERRED`.
+
+```sql
+-- Start a deferred transaction (default)
+BEGIN;
+
+-- Start an immediate transaction
+BEGIN IMMEDIATE;
+
+-- The TRANSACTION keyword is optional
+BEGIN IMMEDIATE TRANSACTION;
+```
+
+## COMMIT / END
+
+The COMMIT statement (or its alias END) finalizes the transaction and writes all changes to the database. Once committed, changes are durable and visible to other connections.
+
+```sql
+BEGIN;
+INSERT INTO accounts (name, balance) VALUES ('Alice', 1000);
+INSERT INTO accounts (name, balance) VALUES ('Bob', 500);
+COMMIT;
+```
+
+COMMIT and END are interchangeable.
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE name = 'Alice';
+END;
+```
+
+## ROLLBACK
+
+The ROLLBACK statement aborts the current transaction and reverts all changes made since BEGIN. The database is left in the state it was in before the transaction started.
+
+```sql
+BEGIN;
+DELETE FROM accounts WHERE balance < 0;
+-- Changed our mind, undo everything
+ROLLBACK;
+```
+
+## Implicit Transactions
+
+When no explicit transaction is active, Turso wraps each individual statement in an implicit transaction. This is called autocommit mode. Each statement is automatically committed after it executes successfully, or automatically rolled back if it fails.
+
+```sql
+-- Each of these runs in its own implicit transaction
+INSERT INTO logs (msg) VALUES ('first');
+INSERT INTO logs (msg) VALUES ('second');
+-- If the second INSERT fails, the first INSERT is still committed
+```
+
+## Transaction Lifecycle
+
+A typical transaction lifecycle:
+
+```sql
+-- 1. Begin the transaction
+BEGIN;
+
+-- 2. Perform operations
+UPDATE inventory SET quantity = quantity - 1 WHERE product_id = 42;
+INSERT INTO orders (product_id, customer_id) VALUES (42, 7);
+
+-- 3a. Commit if everything succeeded
+COMMIT;
+
+-- OR 3b. Rollback if something went wrong
+ROLLBACK;
+```
+
+<Info>
+Turso does not support SAVEPOINT or nested transactions. Each connection can have at most one active transaction at a time.
+</Info>
+
+## BEGIN CONCURRENT
+
+<Info>
+**Turso Extension**: BEGIN CONCURRENT is a Turso-specific extension not available in standard SQLite. It requires MVCC mode.
+</Info>
+
+The BEGIN CONCURRENT statement starts an optimistic concurrent write transaction that allows multiple connections to write simultaneously.
+
+### Syntax
+
+```sql
+BEGIN CONCURRENT [TRANSACTION];
+```
+
+### Requirements
+
+BEGIN CONCURRENT requires MVCC mode. Enable it by setting the journal mode before opening any transactions:
+
+```sql
+PRAGMA journal_mode = experimental_mvcc;
+```
+
+### How It Works
+
+A concurrent transaction operates on a snapshot of the database taken at the time of BEGIN CONCURRENT. Each connection reads from its own snapshot and writes independently.
+
+When COMMIT is issued, Turso checks whether any other transaction has modified the same rows since the snapshot was taken:
+
+- If there is no conflict, the transaction commits successfully.
+- If a write-write conflict is detected, the COMMIT fails and the transaction must be rolled back and retried.
+
+This provides **snapshot isolation**: each transaction sees a consistent view of the database as of its start time, without blocking other writers.
+
+### Example
+
+```sql
+-- Connection 1
+PRAGMA journal_mode = experimental_mvcc;
+BEGIN CONCURRENT;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+COMMIT;
+
+-- Connection 2 (running simultaneously)
+PRAGMA journal_mode = experimental_mvcc;
+BEGIN CONCURRENT;
+UPDATE accounts SET balance = balance + 50 WHERE id = 2;
+COMMIT;
+-- Both succeed because they modified different rows
+```
+
+If both connections modify the same row, the second COMMIT fails:
+
+```sql
+-- Connection 1
+BEGIN CONCURRENT;
+UPDATE accounts SET balance = 900 WHERE id = 1;
+COMMIT;  -- succeeds
+
+-- Connection 2 (started before Connection 1 committed)
+BEGIN CONCURRENT;
+UPDATE accounts SET balance = 800 WHERE id = 1;
+COMMIT;  -- fails: write-write conflict detected
+ROLLBACK;
+-- Retry the transaction from BEGIN CONCURRENT
+```
+
+## See Also
+
+- [INSERT](/docs/sql-reference/statements/insert) for inserting rows
+- [UPDATE](/docs/sql-reference/statements/update) for updating rows
+- [DELETE](/docs/sql-reference/statements/delete) for deleting rows
+- [Compatibility](/docs/sql-reference/compatibility) for differences from SQLite

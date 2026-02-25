@@ -1,0 +1,8 @@
+[book]
+title = "Turso SQL Reference"
+authors = ["Turso"]
+src = "src"
+
+[output.html]
+no-section-label = true
+git-repository-url = "https://github.com/tursodatabase/turso"

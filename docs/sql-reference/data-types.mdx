@@ -1,0 +1,208 @@
+---
+title: Data Types
+description: Storage classes, type affinity, STRICT tables, and custom types in Turso
+sidebarTitle: Data Types
+---
+
+# Data Types
+
+Turso uses the same dynamic type system as SQLite, where values have types but columns do not enforce a single type (unless using STRICT tables). Every value stored in Turso belongs to one of five storage classes.
+
+## Storage Classes
+
+| Storage Class | Description |
+|---------------|-------------|
+| NULL | The NULL value |
+| INTEGER | A signed integer, stored in 1, 2, 3, 4, 6, or 8 bytes depending on magnitude |
+| REAL | An 8-byte IEEE 754 floating-point number |
+| TEXT | A UTF-8 encoded string |
+| BLOB | Raw binary data, stored exactly as input |
+
+```sql
+SELECT typeof(NULL);       -- 'null'
+SELECT typeof(42);         -- 'integer'
+SELECT typeof(3.14);       -- 'real'
+SELECT typeof('hello');    -- 'text'
+SELECT typeof(x'CAFE');    -- 'blob'
+```
+
+## Type Affinity
+
+When a column is declared with a type name, Turso assigns a **type affinity** to that column. Type affinity is a recommendation for how to store values, not a strict constraint (unless using STRICT tables). Turso uses the same affinity rules as SQLite.
+
+### Affinity Determination Rules
+
+The type affinity of a column is determined by the declared type name, using these rules applied in order:
+
+| Rule | Condition | Affinity | Examples |
+|------|-----------|----------|----------|
+| 1 | Type name contains "INT" | INTEGER | `INT`, `INTEGER`, `BIGINT`, `SMALLINT`, `TINYINT` |
+| 2 | Type name contains "CHAR", "CLOB", or "TEXT" | TEXT | `TEXT`, `VARCHAR(255)`, `CLOB`, `CHARACTER(20)` |
+| 3 | Type name contains "BLOB" or no type specified | BLOB | `BLOB`, (no type) |
+| 4 | Type name contains "REAL", "FLOA", or "DOUB" | REAL | `REAL`, `FLOAT`, `DOUBLE`, `DOUBLE PRECISION` |
+| 5 | Otherwise | NUMERIC | `NUMERIC`, `DECIMAL`, `BOOLEAN`, `DATE` |
+
+```sql
+-- Type affinity is a suggestion, not a constraint
+CREATE TABLE flexible (
+    id INTEGER,
+    name TEXT,
+    data BLOB
+);
+
+-- This works - TEXT value in an INTEGER column
+INSERT INTO flexible VALUES ('not a number', 42, 'text in blob');
+SELECT typeof(id), typeof(name), typeof(data) FROM flexible;
+-- 'text', 'integer', 'text'
+```
+
+### Type Conversions
+
+When a value is inserted into a column, Turso attempts to convert the value to the column's affinity:
+
+- **INTEGER affinity**: If the value is TEXT or REAL that looks like an integer, Turso converts the value to INTEGER
+- **REAL affinity**: If the value is TEXT that looks like a number, Turso converts to REAL. If the value is an integer, Turso converts to REAL
+- **NUMERIC affinity**: Turso tries INTEGER first, then REAL, then keeps as TEXT
+- **TEXT affinity**: Integer and REAL values are converted to their text representation
+- **BLOB affinity**: No conversion is attempted
+
+## STRICT Tables
+
+STRICT tables enforce type checking at the storage layer. Every value inserted into a STRICT table must match the declared column type or be convertible to the column type.
+
+```sql
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    age INTEGER,
+    score REAL
+) STRICT;
+
+-- This works - values match declared types
+INSERT INTO users VALUES (1, 'Alice', 30, 95.5);
+
+-- This fails - 'thirty' cannot be converted to INTEGER
+INSERT INTO users VALUES (2, 'Bob', 'thirty', 80.0);
+-- Error: cannot store TEXT value in INTEGER column
+```
+
+### Allowed Types in STRICT Tables
+
+STRICT tables only allow these base type names:
+
+| Type | Description |
+|------|-------------|
+| INTEGER | Signed integer |
+| REAL | Floating-point number |
+| TEXT | UTF-8 string |
+| BLOB | Raw binary data |
+| ANY | Any storage class (disables type checking for this column) |
+
+<Info>
+**Turso Extension**: STRICT tables also accept [custom type](/docs/sql-reference/statements/create-type) names. Custom types extend the type system with user-defined encoding, decoding, validation, and operator overloading.
+</Info>
+
+## Custom Types
+
+<Info>
+**Turso Extension**: Custom types are a Turso-specific feature not available in SQLite. Custom types work only with STRICT tables. This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
+</Info>
+
+Custom types let you define how values are encoded before storage and decoded when read, enforce domain constraints at the storage layer, attach operators, and provide defaults. Custom types are declared with the `CREATE TYPE` statement.
+
+```sql
+-- A type that stores monetary values as cents
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100;
+
+CREATE TABLE prices (
+    id INTEGER PRIMARY KEY,
+    amount cents
+) STRICT;
+
+INSERT INTO prices VALUES (1, 42);
+SELECT amount FROM prices;
+-- 42  (stored on disk as 4200)
+```
+
+### Built-in Custom Types
+
+Turso provides several built-in custom types available in STRICT tables:
+
+| Type | Base | Description |
+|------|------|-------------|
+| `date` | TEXT | ISO 8601 date (YYYY-MM-DD) |
+| `time` | TEXT | ISO 8601 time (HH:MM:SS) |
+| `timestamp` | TEXT | ISO 8601 datetime |
+| `varchar(N)` | TEXT | Text with maximum length constraint |
+| `numeric(P,S)` | BLOB | Fixed-point decimal with precision and scale |
+| `smallint` | INTEGER | Integer constrained to -32768..32767 |
+| `boolean` | INTEGER | Integer constrained to 0 or 1 |
+| `uuid` | BLOB | UUID stored as 16-byte blob, displayed as string |
+| `bytea` | BLOB | Binary data (PostgreSQL-compatible alias) |
+| `inet` | TEXT | IP address |
+| `json` | TEXT | Validated JSON text |
+| `jsonb` | BLOB | JSON in binary format |
+
+```sql
+CREATE TABLE events (
+    id uuid PRIMARY KEY,
+    name varchar(100),
+    event_date date,
+    is_active boolean DEFAULT 1,
+    metadata json
+) STRICT;
+
+INSERT INTO events VALUES (
+    uuid4(),
+    'Product Launch',
+    '2025-03-15',
+    1,
+    '{"venue": "online"}'
+);
+```
+
+For the full custom types reference including ENCODE/DECODE, operators, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
+
+### Inspecting Types
+
+List all available types (built-in and custom):
+
+```sql
+PRAGMA list_types;
+```
+
+All types are also available through the `sqlite_turso_types` virtual table:
+
+```sql
+SELECT name, sql FROM sqlite_turso_types;
+```
+
+## Comparison and Sorting
+
+Turso uses the same comparison rules as SQLite. Values of different storage classes are ordered as:
+
+```
+NULL < INTEGER/REAL < TEXT < BLOB
+```
+
+- NULL values are considered less than any other value
+- INTEGER and REAL values are compared numerically
+- TEXT values are compared using the column's collation sequence (default: BINARY)
+- BLOB values are compared using `memcmp()`
+
+```sql
+SELECT 1 < 2;          -- 1 (true)
+SELECT 'abc' < 'abd';  -- 1 (true)
+SELECT 1 < '2';        -- 1 (true, numeric < text)
+SELECT NULL < 1;        -- NULL (any comparison with NULL yields NULL)
+SELECT NULL IS NULL;    -- 1 (use IS to test for NULL)
+```
+
+## See Also
+
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for column definitions and constraints
+- [CREATE TYPE](/docs/sql-reference/statements/create-type) for custom type definitions
+- [Expressions](/docs/sql-reference/expressions) for CAST expressions and type conversions
+- [Compatibility](/docs/sql-reference/compatibility) for differences from SQLite

@@ -1,0 +1,75 @@
+---
+title: DROP TYPE
+description: Remove a user-defined custom type from the database
+sidebarTitle: DROP TYPE
+---
+
+# DROP TYPE
+
+<Info>
+**Turso Extension**: DROP TYPE is a Turso-specific statement not available in standard SQLite. This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
+</Info>
+
+The DROP TYPE statement removes a user-defined custom type from the database. Once dropped, the type name can no longer be used in new column definitions.
+
+## Syntax
+
+```sql
+DROP TYPE [IF EXISTS] type-name;
+```
+
+## Description
+
+DROP TYPE removes the named custom type from the database. The type must exist unless the `IF EXISTS` clause is specified.
+
+### Clauses
+
+| Clause | Description |
+|--------|-------------|
+| `IF EXISTS` | Suppresses the error that would occur if the type does not exist. The statement is a no-op when the type is not found. |
+| `type-name` | The name of the custom type to remove. |
+
+### Restrictions
+
+A type cannot be dropped while any table column uses it. All columns of that type must be removed or the table must be dropped before the type can be dropped.
+
+```sql
+CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+
+CREATE TABLE prices (
+    id INTEGER PRIMARY KEY,
+    amount cents
+) STRICT;
+
+-- This fails because the 'prices' table has a column of type 'cents'
+DROP TYPE cents;
+-- Error: type 'cents' is in use
+
+-- Drop the table first, then the type
+DROP TABLE prices;
+DROP TYPE cents;
+```
+
+## Examples
+
+### Drop a Custom Type
+
+```sql
+CREATE TYPE reversed_text BASE text
+    ENCODE turso_reverse(value)
+    DECODE turso_reverse(value);
+
+DROP TYPE reversed_text;
+```
+
+### Drop a Type with IF EXISTS
+
+```sql
+-- Safe to run even if the type does not exist
+DROP TYPE IF EXISTS reversed_text;
+```
+
+## See Also
+
+- [CREATE TYPE](/docs/sql-reference/statements/create-type) for defining custom types
+- [Data Types](/docs/sql-reference/data-types) for an overview of the type system
