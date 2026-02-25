@@ -572,6 +572,12 @@ impl ProgramState {
         self.current_collation = None;
         self.op_column_state = OpColumnState::Start;
         self.op_row_id_state = OpRowIdState::Start;
+        self.commit_state = CommitState::Ready;
+        self.op_destroy_state = OpDestroyState::CreateCursor;
+        self.op_program_state = OpProgramState::Start;
+        self.op_transaction_state = OpTransactionState::Start;
+        self.op_journal_mode_state = OpJournalModeState::default();
+        self.op_vacuum_into_state = OpVacuumIntoState::default();
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
@@ -585,8 +591,11 @@ impl ProgramState {
         self.op_hash_probe_state = None;
         self.uses_subjournal = false;
         self.distinct_key_values.clear();
+        self.attached_savepoint_pagers.clear();
         self.n_change.store(0, Ordering::SeqCst);
         *self.explain_state.write() = ExplainState::default();
+        self.pending_fail_error = None;
+        self.pending_cdc_info = None;
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
