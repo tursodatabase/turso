@@ -745,7 +745,7 @@ pub fn join_lhs_and_rhs<'a>(
         let is_full_outer = rhs_table_reference
             .join_info
             .as_ref()
-            .is_some_and(|ji| ji.full_outer);
+            .is_some_and(|ji| ji.is_full_outer());
         if is_full_outer
             && !matches!(
                 best_access_method.params,
@@ -1090,6 +1090,8 @@ pub fn compute_best_join_order<'a>(
         table_id: TableInternalId::default(),
         original_idx: 0,
         is_outer: false,
+        is_semi: false,
+        is_anti: false,
     });
 
     // Keep track of the current best cost so we can short-circuit planning for subplans
@@ -1119,6 +1121,8 @@ pub fn compute_best_join_order<'a>(
             table_id: table_ref.internal_id,
             original_idx: i,
             is_outer: false,
+            is_semi: false,
+            is_anti: false,
         };
         turso_assert_eq!(join_order.len(), 1);
         let rel = join_lhs_and_rhs(
@@ -1153,19 +1157,29 @@ pub fn compute_best_join_order<'a>(
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
     let left_join_illegal_map = {
-        let left_join_count = joined_tables
+        let ordering_constrained_count = joined_tables
             .iter()
-            .filter(|t| t.join_info.as_ref().is_some_and(|j| j.outer))
+            .filter(|t| {
+                t.join_info
+                    .as_ref()
+                    .is_some_and(|j| j.is_outer() || j.is_semi() || j.is_anti())
+            })
             .count();
-        if left_join_count == 0 {
+        if ordering_constrained_count == 0 {
             None
         } else {
             // map from rhs table index to lhs table index
             let mut left_join_illegal_map: HashMap<usize, TableMask> =
-                HashMap::with_capacity_and_hasher(left_join_count, Default::default());
+                HashMap::with_capacity_and_hasher(ordering_constrained_count, Default::default());
             for (i, _) in joined_tables.iter().enumerate() {
                 for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
-                    if joined_table.join_info.as_ref().is_some_and(|j| j.outer) {
+                    // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
+                    // to appear after the LHS table in the join order.
+                    if joined_table
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|j| j.is_outer() || j.is_semi() || j.is_anti())
+                    {
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
                             illegal_lhs.add_table(j);
@@ -1235,7 +1249,15 @@ pub fn compute_best_join_order<'a>(
                             is_outer: joined_tables[table_no]
                                 .join_info
                                 .as_ref()
-                                .is_some_and(|j| j.outer),
+                                .is_some_and(|j| j.is_outer()),
+                            is_semi: joined_tables[table_no]
+                                .join_info
+                                .as_ref()
+                                .is_some_and(|j| j.is_semi()),
+                            is_anti: joined_tables[table_no]
+                                .join_info
+                                .as_ref()
+                                .is_some_and(|j| j.is_anti()),
                         });
                     }
                     join_order.push(JoinOrderMember {
@@ -1244,7 +1266,15 @@ pub fn compute_best_join_order<'a>(
                         is_outer: joined_tables[rhs_idx]
                             .join_info
                             .as_ref()
-                            .is_some_and(|j| j.outer),
+                            .is_some_and(|j| j.is_outer()),
+                        is_semi: joined_tables[rhs_idx]
+                            .join_info
+                            .as_ref()
+                            .is_some_and(|j| j.is_semi()),
+                        is_anti: joined_tables[rhs_idx]
+                            .join_info
+                            .as_ref()
+                            .is_some_and(|j| j.is_anti()),
                     });
                     turso_assert_eq!(join_order.len(), subset_size);
 
@@ -1360,21 +1390,18 @@ pub fn compute_best_join_order<'a>(
             // Give a targeted error for FULL OUTER when no plan was found.
             let has_full_outer = joined_tables
                 .iter()
-                .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.full_outer));
+                .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.is_full_outer()));
             if has_full_outer {
                 // Distinguish chaining from a missing equi-join condition.
                 let build_is_outer = joined_tables.iter().any(|t| {
-                    let is_full = t.join_info.as_ref().is_some_and(|ji| ji.full_outer);
+                    let is_full = t.join_info.as_ref().is_some_and(|ji| ji.is_full_outer());
                     if !is_full {
                         return false;
                     }
                     // Check if any earlier table (potential build) is also outer.
                     joined_tables.iter().any(|other| {
                         !std::ptr::eq(t, other)
-                            && other
-                                .join_info
-                                .as_ref()
-                                .is_some_and(|ji| ji.outer || ji.full_outer)
+                            && other.join_info.as_ref().is_some_and(|ji| ji.is_outer())
                     })
                 });
                 let has_correlated_subquery = subqueries.iter().any(|sq| sq.correlated);
@@ -1431,7 +1458,11 @@ pub fn compute_greedy_join_order<'a>(
     let left_join_deps: HashMap<usize, TableMask> = joined_tables
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer))
+        .filter(|(_, t)| {
+            t.join_info
+                .as_ref()
+                .is_some_and(|ji| ji.is_outer() || ji.is_semi() || ji.is_anti())
+        })
         .map(|(j, _)| {
             let mut required = TableMask::new();
             for k in 0..j {
@@ -1452,6 +1483,8 @@ pub fn compute_greedy_join_order<'a>(
         table_id: first_table.internal_id,
         original_idx: first_idx,
         is_outer: false, // First table cannot be outer join RHS
+        is_semi: false,
+        is_anti: false,
     });
     remaining.retain(|&x| x != first_idx);
 
@@ -1540,7 +1573,9 @@ pub fn compute_greedy_join_order<'a>(
             let last = join_order.last_mut().unwrap();
             last.table_id = table.internal_id;
             last.original_idx = idx;
-            last.is_outer = table.join_info.as_ref().is_some_and(|ji| ji.outer);
+            last.is_outer = table.join_info.as_ref().is_some_and(|ji| ji.is_outer());
+            last.is_semi = table.join_info.as_ref().is_some_and(|ji| ji.is_semi());
+            last.is_anti = table.join_info.as_ref().is_some_and(|ji| ji.is_anti());
 
             if let Some(plan) = join_lhs_and_rhs(
                 current_plan.as_ref(),
@@ -1579,7 +1614,12 @@ pub fn compute_greedy_join_order<'a>(
         join_order.push(JoinOrderMember {
             table_id: next_table.internal_id,
             original_idx: next_idx,
-            is_outer: next_table.join_info.as_ref().is_some_and(|ji| ji.outer),
+            is_outer: next_table
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.is_outer()),
+            is_semi: next_table.join_info.as_ref().is_some_and(|ji| ji.is_semi()),
+            is_anti: next_table.join_info.as_ref().is_some_and(|ji| ji.is_anti()),
         });
         remaining.retain(|&x| x != next_idx);
         current_plan = Some(next_plan);
@@ -1682,7 +1722,9 @@ pub fn compute_naive_left_deep_plan<'a>(
         .map(|(i, t)| JoinOrderMember {
             table_id: t.internal_id,
             original_idx: i,
-            is_outer: t.join_info.as_ref().is_some_and(|j| j.outer),
+            is_outer: t.join_info.as_ref().is_some_and(|j| j.is_outer()),
+            is_semi: t.join_info.as_ref().is_some_and(|j| j.is_semi()),
+            is_anti: t.join_info.as_ref().is_some_and(|j| j.is_anti()),
         })
         .collect::<Vec<_>>();
 
@@ -1840,7 +1882,8 @@ mod tests {
                 cost_params::DEFAULT_PARAMS,
             },
             plan::{
-                ColumnUsedMask, IterationDirection, JoinInfo, Operation, TableReferences, WhereTerm,
+                ColumnUsedMask, IterationDirection, JoinInfo, JoinType, Operation, TableReferences,
+                WhereTerm,
             },
             planner::TableMask,
         },
@@ -2109,8 +2152,7 @@ mod tests {
             _create_table_reference(
                 t2,
                 Some(JoinInfo {
-                    outer: false,
-                    full_outer: false,
+                    join_type: JoinType::Inner,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2233,8 +2275,7 @@ mod tests {
             _create_table_reference(
                 table_customers,
                 Some(JoinInfo {
-                    outer: false,
-                    full_outer: false,
+                    join_type: JoinType::Inner,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2242,8 +2283,7 @@ mod tests {
             _create_table_reference(
                 table_order_items,
                 Some(JoinInfo {
-                    outer: false,
-                    full_outer: false,
+                    join_type: JoinType::Inner,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2445,8 +2485,7 @@ mod tests {
             _create_table_reference(
                 t2,
                 Some(JoinInfo {
-                    outer: false,
-                    full_outer: false,
+                    join_type: JoinType::Inner,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2454,8 +2493,7 @@ mod tests {
             _create_table_reference(
                 t3,
                 Some(JoinInfo {
-                    outer: false,
-                    full_outer: false,
+                    join_type: JoinType::Inner,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2570,8 +2608,7 @@ mod tests {
                 _create_table_reference(
                     t.clone(),
                     Some(JoinInfo {
-                        outer: false,
-                        full_outer: false,
+                        join_type: JoinType::Inner,
                         using: vec![],
                     }),
                     table_id_counter.next(),
@@ -2580,8 +2617,7 @@ mod tests {
             refs.push(_create_table_reference(
                 fact_table,
                 Some(JoinInfo {
-                    outer: false,
-                    full_outer: false,
+                    join_type: JoinType::Inner,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -3309,8 +3345,7 @@ mod tests {
             _create_table_reference(
                 t2,
                 Some(JoinInfo {
-                    outer: false,
-                    full_outer: false,
+                    join_type: JoinType::Inner,
                     using: vec![],
                 }),
                 table_id_counter.next(),
