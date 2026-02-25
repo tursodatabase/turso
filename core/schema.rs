@@ -1387,9 +1387,11 @@ impl Schema {
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
+                /*
                 if mv_store.is_some() {
                     crate::bail_parse_error!("Views are not supported in MVCC mode");
                 }
+                */
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
