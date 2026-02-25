@@ -87,8 +87,8 @@ impl Property {
                         }
                         Query::Update(Update {
                             table: t,
-                            set_values: _,
                             predicate,
+                            ..
                         }) if t == &table.name && predicate.test(row, table) => {
                             // The inserted row will not be updated.
                             None

@@ -248,12 +248,20 @@ pub fn execute_interaction_turso(
 
             stack.push(results);
             // TODO: skip integrity check with mvcc
-            if !env.profile.experimental_mvcc && env.rng.random_ratio(1, 10) {
-                let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
-                else {
-                    unreachable!()
-                };
-                limbo_integrity_check(conn)?;
+            if !env.profile.experimental_mvcc && !env.opts.disable_integrity_check {
+                if matches!(
+                    query,
+                    Query::Update(u)
+                        if matches!(u.or_conflict, Some(turso_parser::ast::ResolveType::Replace))
+                ) || env.rng.random_ratio(1, 10)
+                {
+                    let SimConnection::LimboConnection(conn) =
+                        &mut env.connections[connection_index]
+                    else {
+                        unreachable!()
+                    };
+                    limbo_integrity_check(conn)?;
+                }
             }
             env.update_conn_last_interaction(connection_index, Some(query));
         }
@@ -310,7 +318,10 @@ pub fn execute_interaction_turso(
             // Reset fault injection
             env.io.inject_fault(false);
             // TODO: skip integrity check with mvcc
-            if !env.profile.experimental_mvcc && env.rng.random_ratio(1, 10) {
+            if !env.profile.experimental_mvcc
+                && !env.opts.disable_integrity_check
+                && env.rng.random_ratio(1, 10)
+            {
                 limbo_integrity_check(&conn)?;
             }
         }
