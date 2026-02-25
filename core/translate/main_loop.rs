@@ -1,9 +1,9 @@
-use turso_parser::ast::{Expr, SortOrder};
+use turso_parser::ast::{Expr, SortOrder, TableInternalId};
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     emitter::{
-        MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, TranslateCtx,
+        MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver, TranslateCtx,
         UpdateRowSource,
     },
     expr::{
@@ -58,6 +58,16 @@ pub struct LeftJoinMetadata {
     pub label_match_flag_set_true: BranchOffset,
     // label for the instruction that checks if the match flag is true
     pub label_match_flag_check_value: BranchOffset,
+}
+
+/// Metadata for handling SEMI/ANTI JOIN operations (EXISTS/NOT EXISTS unnesting)
+#[derive(Debug)]
+pub struct SemiAntiJoinMetadata {
+    /// Label pointing to the body (for anti-join: jump back to body when inner exhausts).
+    /// Also used by anti-join to resolve the body start address.
+    pub label_body: BranchOffset,
+    /// Label of the outer loop's Next instruction (to skip outer row or skip inner loop).
+    pub label_next_outer: BranchOffset,
 }
 
 /// Jump labels for each loop in the query's main execution loop
@@ -179,13 +189,51 @@ pub fn init_loop(
         }
         // Initialize bookkeeping for OUTER JOIN
         if let Some(join_info) = table.join_info.as_ref() {
-            if join_info.outer {
+            if join_info.is_outer() {
                 let lj_metadata = LeftJoinMetadata {
                     reg_match_flag: program.alloc_register(),
                     label_match_flag_set_true: program.allocate_label(),
                     label_match_flag_check_value: program.allocate_label(),
                 };
                 t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
+            }
+            if join_info.is_semi() || join_info.is_anti() {
+                // Find the true outer table's next label by walking backwards past
+                // other semi/anti-join tables. When multiple semi/anti-joins form a
+                // chain (e.g. NOT EXISTS t2 AND NOT EXISTS t3), "skip outer row"
+                // must jump all the way back to the non-semi/anti-join table's Next.
+                let join_idx = join_order
+                    .iter()
+                    .position(|m| m.original_idx == table_index)
+                    .expect("table must be in join_order");
+                assert!(join_idx > 0, "semi/anti-join cannot be the first table");
+                let mut outer_idx = join_idx - 1;
+                while outer_idx > 0 {
+                    let prev_table = &tables.joined_tables()[join_order[outer_idx].original_idx];
+                    let prev_is_semi_anti = prev_table
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|ji| ji.is_semi() || ji.is_anti());
+                    if !prev_is_semi_anti {
+                        break;
+                    }
+                    outer_idx -= 1;
+                }
+                let outer_table_idx = join_order[outer_idx].original_idx;
+                // For hash join probe tables, loop_labels.next points to the probe
+                // cursor's Next (which advances to the next outer row), but we need
+                // to jump to the HashNext (which advances to the next hash match
+                // for the current outer row). We allocate a fresh label here and
+                // resolve it in close_loop at the right point.
+                let label_next_outer = program.allocate_label();
+                t_ctx
+                    .semi_anti_outer_next_labels
+                    .push((outer_table_idx, label_next_outer));
+                let sa_metadata = SemiAntiJoinMetadata {
+                    label_body: program.allocate_label(),
+                    label_next_outer,
+                };
+                t_ctx.meta_semi_anti_joins[table_index] = Some(sa_metadata);
             }
         }
         let (table_cursor_id, index_cursor_id) =
@@ -1158,11 +1206,28 @@ pub fn open_loop(
             .get(joined_table_index)
             .expect("table has no loop labels");
 
+        // For chained anti-joins (e.g. NOT EXISTS t2 AND NOT EXISTS t3),
+        // when anti-join N exhausts without a match, execution should continue
+        // to anti-join N+1's open_loop (not jump to the body). Resolve the
+        // previous anti-join's label_body to the current program offset.
+        if join_index > 0 {
+            let prev_table_idx = join_order[join_index - 1].original_idx;
+            let prev_is_anti = table_references.joined_tables()[prev_table_idx]
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.is_anti());
+            if prev_is_anti {
+                if let Some(prev_sa_meta) = t_ctx.meta_semi_anti_joins[prev_table_idx].as_ref() {
+                    program.resolve_label(prev_sa_meta.label_body, program.offset());
+                }
+            }
+        }
+
         // Each OUTER JOIN has a "match flag" that is initially set to false,
         // and is set to true when a match is found for the OUTER JOIN.
         // This is used to determine whether to emit actual columns or NULLs for the columns of the right table.
         if let Some(join_info) = table.join_info.as_ref() {
-            if join_info.outer {
+            if join_info.is_outer() {
                 let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                 program.emit_insn(Insn::Integer {
                     value: 0,
@@ -1725,8 +1790,12 @@ pub fn open_loop(
         } else {
             next
         };
+        let is_outer_hj_probe = matches!(table.op, Operation::HashJoin(ref hj) if matches!(
+            hj.join_type,
+            HashJoinType::LeftOuter | HashJoinType::FullOuter
+        ));
 
-        // First emit outer join conditions, if any.
+        // First emit OUTER JOIN conditions that do not reference subquery results.
         emit_conditions(
             program,
             &t_ctx,
@@ -1737,17 +1806,39 @@ pub fn open_loop(
             condition_fail_target,
             true,
             subqueries,
-            SubqueryRefFilter::All,
+            SubqueryRefFilter::WithoutSubqueryRefs,
+        )?;
+
+        emit_correlated_subqueries(
+            program,
+            &t_ctx.resolver,
+            table_references,
+            join_order,
+            join_index,
+            predicates,
+            subqueries,
+            true,
+        )?;
+
+        // Emit OUTER JOIN conditions that reference subquery results.
+        // These must run before setting OUTER JOIN match flags.
+        emit_conditions(
+            program,
+            &t_ctx,
+            table_references,
+            join_order,
+            predicates,
+            join_index,
+            condition_fail_target,
+            true,
+            subqueries,
+            SubqueryRefFilter::WithSubqueryRefs,
         )?;
 
         // Set the LEFT JOIN match flag. Skip outer hash join probes - they use
         // HashMarkMatched / check_outer instead.
-        let is_outer_hj_probe = matches!(table.op, Operation::HashJoin(ref hj) if matches!(
-            hj.join_type,
-            HashJoinType::LeftOuter | HashJoinType::FullOuter
-        ));
         if let Some(join_info) = table.join_info.as_ref() {
-            if join_info.outer && !is_outer_hj_probe {
+            if join_info.is_outer() && !is_outer_hj_probe {
                 let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                 program.resolve_label(lj_meta.label_match_flag_set_true, program.offset());
                 program.emit_insn(Insn::Integer {
@@ -1781,7 +1872,7 @@ pub fn open_loop(
             }
         }
 
-        // emit conditions that do not reference subquery results
+        // Emit non-OUTER JOIN conditions that do not reference subquery results.
         emit_conditions(
             program,
             &t_ctx,
@@ -1795,27 +1886,18 @@ pub fn open_loop(
             SubqueryRefFilter::WithoutSubqueryRefs,
         )?;
 
-        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
-            turso_assert!(subquery.correlated, "subquery must be correlated");
-            let eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
+        emit_correlated_subqueries(
+            program,
+            &t_ctx.resolver,
+            table_references,
+            join_order,
+            join_index,
+            predicates,
+            subqueries,
+            false,
+        )?;
 
-            if eval_at != EvalAt::Loop(join_index) {
-                continue;
-            }
-
-            let plan = subquery.consume_plan(eval_at);
-
-            emit_non_from_clause_subquery(
-                program,
-                &t_ctx.resolver,
-                *plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
-        }
-
-        // FINALLY emit conditions that DO reference subquery results.
-        // These depend on the subquery evaluation that just happened above.
+        // FINALLY emit non-OUTER JOIN conditions that reference subquery results.
         emit_conditions(
             program,
             &t_ctx,
@@ -1828,6 +1910,21 @@ pub fn open_loop(
             subqueries,
             SubqueryRefFilter::WithSubqueryRefs,
         )?;
+
+        // ANTI-JOIN: all conditions passed means a match was found.
+        // Skip the outer row by jumping to the outer loop's Next.
+        // label_body is resolved later in emit_loop, right before the body is emitted.
+        if let Some(join_info) = table.join_info.as_ref() {
+            if join_info.is_anti() {
+                let sa_meta = t_ctx.meta_semi_anti_joins[joined_table_index]
+                    .as_ref()
+                    .expect("anti-join must have SemiAntiJoinMetadata");
+                program.add_comment(program.offset(), "anti-join: match found, skip outer row");
+                program.emit_insn(Insn::Goto {
+                    target_pc: sa_meta.label_next_outer,
+                });
+            }
+        }
 
         // Outer hash joins wrap inner loops in a Gosub subroutine so that
         // unmatched-row emission paths can re-enter them (cursors get Rewind'd).
@@ -1887,10 +1984,70 @@ fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquer
     found
 }
 
+fn subquery_referenced_in_predicates(
+    predicates: &[WhereTerm],
+    from_outer_join: bool,
+    subquery_id: TableInternalId,
+) -> bool {
+    predicates
+        .iter()
+        .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
+        .any(|cond| {
+            let mut matches_subquery = false;
+            let _ = walk_expr(&cond.expr, &mut |e: &Expr| -> Result<WalkControl> {
+                if let Expr::SubqueryResult {
+                    subquery_id: found_id,
+                    ..
+                } = e
+                {
+                    if *found_id == subquery_id {
+                        matches_subquery = true;
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                }
+                Ok(WalkControl::Continue)
+            });
+            matches_subquery
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_correlated_subqueries(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver<'_>,
+    table_references: &TableReferences,
+    join_order: &[JoinOrderMember],
+    join_index: usize,
+    predicates: &[WhereTerm],
+    subqueries: &mut [NonFromClauseSubquery],
+    on_only: bool,
+) -> Result<()> {
+    for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+        if !subquery.correlated {
+            continue;
+        }
+        if on_only && !subquery_referenced_in_predicates(predicates, true, subquery.internal_id) {
+            continue;
+        }
+        let eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
+        if eval_at != EvalAt::Loop(join_index) {
+            continue;
+        }
+
+        let plan = subquery.consume_plan(eval_at);
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SubqueryRefFilter {
-    /// Emit all conditions regardless of subquery references
-    All,
     /// Only emit conditions that do NOT reference subqueries (for early evaluation)
     WithoutSubqueryRefs,
     /// Only emit conditions that DO reference subqueries (for late evaluation)
@@ -1918,7 +2075,6 @@ fn emit_conditions(
             cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
         })
         .filter(|cond| match subquery_ref_filter {
-            SubqueryRefFilter::All => true,
             SubqueryRefFilter::WithoutSubqueryRefs => {
                 !condition_references_subquery(&cond.expr, subqueries)
             }
@@ -1970,6 +2126,28 @@ pub fn emit_loop<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
 ) -> Result<()> {
+    // Resolve the innermost anti-join's label_body to the body start.
+    // Non-innermost anti-joins have their label_body resolved in open_loop
+    // (pointing to the next anti-join's open_loop code, not the body).
+    // We use preassign_label_to_next_insn rather than resolve_label because
+    // the first body instruction may be a constant (e.g. Integer for count(1))
+    // that gets relocated to the init section by emit_constant_insns().
+    // preassign_label_to_next_insn anchors to the last emitted non-constant
+    // instruction, so after reordering the label correctly resolves to the
+    // first non-constant body instruction.
+    if let Some(last_join) = plan.join_order.last() {
+        let last_idx = last_join.original_idx;
+        let is_anti = plan.table_references.joined_tables()[last_idx]
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.is_anti());
+        if is_anti {
+            if let Some(sa_meta) = t_ctx.meta_semi_anti_joins[last_idx].as_ref() {
+                program.preassign_label_to_next_insn(sa_meta.label_body);
+            }
+        }
+    }
+
     // if we have a group by, we emit a record into the group by sorter,
     // or if the rows are already sorted, we do the group by aggregation phase directly.
     let has_group_by_exprs = plan
@@ -2329,9 +2507,35 @@ pub fn close_loop<'a>(
             .get(table_index)
             .expect("source has no loop labels");
 
+        // SEMI/ANTI-JOIN: emit Goto -> outer_next right after the body.
+        // For semi-join: after body runs (one match found), skip inner's Next.
+        // For anti-join: after body runs (inner exhausted), move to next outer row.
+        let is_semi_or_anti = table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.is_semi() || ji.is_anti());
+        if is_semi_or_anti {
+            let sa_meta = t_ctx.meta_semi_anti_joins[table_index]
+                .as_ref()
+                .expect("semi/anti-join must have SemiAntiJoinMetadata");
+            let comment = if table.join_info.as_ref().unwrap().is_semi() {
+                "semi-join: early out after first match"
+            } else {
+                "anti-join: exit body, next outer row"
+            };
+            program.add_comment(program.offset(), comment);
+            program.emit_insn(Insn::Goto {
+                target_pc: sa_meta.label_next_outer,
+            });
+        }
+
         let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program, mode.clone())?;
+        // Track the "next iteration" offset for semi/anti-join label resolution.
+        // For hash join probes this is HashNext, for others it's loop_labels.next.
+        let mut semi_anti_next_pc = None;
         match &table.op {
             Operation::Scan(scan) => {
+                semi_anti_next_pc = Some(program.offset());
                 program.resolve_label(loop_labels.next, program.offset());
                 match scan {
                     Scan::BTreeTable { iter_dir, .. } => {
@@ -2409,6 +2613,7 @@ pub fn close_loop<'a>(
                     },
                     "Subqueries do not support index seeks unless materialized"
                 );
+                semi_anti_next_pc = Some(program.offset());
                 program.resolve_label(loop_labels.next, program.offset());
                 let iteration_cursor_id =
                     if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
@@ -2448,6 +2653,7 @@ pub fn close_loop<'a>(
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
             Operation::IndexMethodQuery(_) => {
+                semi_anti_next_pc = Some(program.offset());
                 program.resolve_label(loop_labels.next, program.offset());
                 program.emit_insn(Insn::Next {
                     cursor_id: index_cursor_id.unwrap(),
@@ -2475,6 +2681,13 @@ pub fn close_loop<'a>(
 
                     // End the inner-loop subroutine.
                     if let Some(gosub_reg) = inner_loop_gosub_reg {
+                        // For semi/anti-joins inside a Gosub subroutine (LEFT/FULL
+                        // OUTER hash join), the "next outer" jump must land on Return
+                        // so the Gosub register routes us back to the correct caller
+                        // (HashNext in the matched phase, HashNextUnmatched in the
+                        // unmatched phase). If we jumped to HashNext directly, we'd
+                        // escape the subroutine and loop forever.
+                        semi_anti_next_pc = Some(program.offset());
                         program.emit_insn(Insn::Return {
                             return_reg: gosub_reg,
                             can_fallthrough: false,
@@ -2491,6 +2704,9 @@ pub fn close_loop<'a>(
                         label_next_probe_row
                     };
 
+                    if semi_anti_next_pc.is_none() {
+                        semi_anti_next_pc = Some(program.offset());
+                    }
                     program.resolve_label(hash_next_label, program.offset());
 
                     // Try next hash match; exhaustion jumps to hash_next_target.
@@ -2510,7 +2726,7 @@ pub fn close_loop<'a>(
                     // FULL OUTER check_outer: emit unmatched probe rows with NULLs
                     // for the build side (reached on probe miss or hash exhaustion).
                     if matches!(join_type, HashJoinType::FullOuter) {
-                        // Probe table (RHS) has LeftJoinMetadata via join_info.outer=true.
+                        // Probe table (RHS) has LeftJoinMetadata via join_info.is_outer()=true.
                         let probe_table_idx = hash_join_op.probe_table_idx;
                         let lj_meta = t_ctx.meta_left_joins[probe_table_idx]
                             .as_ref()
@@ -2644,11 +2860,43 @@ pub fn close_loop<'a>(
             Operation::MultiIndexScan(_) => {
                 // MultiIndexScan uses RowSetRead for iteration - the next is handled
                 // at the end of the RowSet read loop in emit_multi_index_scan_loop
+                semi_anti_next_pc = Some(program.offset());
                 program.resolve_label(loop_labels.next, program.offset());
                 program.emit_insn(Insn::Goto {
                     target_pc: loop_labels.loop_start,
                 });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
+            }
+        }
+
+        // Resolve any semi/anti-join "outer next" labels targeting this table.
+        if let Some(pc) = semi_anti_next_pc {
+            for (target_idx, label) in &t_ctx.semi_anti_outer_next_labels {
+                if *target_idx == table_index {
+                    program.resolve_label(*label, pc);
+                }
+            }
+        }
+
+        // SEMI/ANTI-JOIN: after loop_end (inner loop exhausted).
+        // Semi-join: no match found -> skip outer row (Goto -> next_outer).
+        // Anti-join: no match found -> run body (Goto -> label_body, jumps backward).
+        if is_semi_or_anti {
+            let sa_meta = t_ctx.meta_semi_anti_joins[table_index]
+                .as_ref()
+                .expect("semi/anti-join must have SemiAntiJoinMetadata");
+            let join_info = table.join_info.as_ref().unwrap();
+            if join_info.is_semi() {
+                program.add_comment(program.offset(), "semi-join: no match, skip outer row");
+                program.emit_insn(Insn::Goto {
+                    target_pc: sa_meta.label_next_outer,
+                });
+            } else {
+                // Anti-join: inner exhausted without match -> run body
+                program.add_comment(program.offset(), "anti-join: no match, emit outer row");
+                program.emit_insn(Insn::Goto {
+                    target_pc: sa_meta.label_body,
+                });
             }
         }
 
@@ -2662,7 +2910,7 @@ pub fn close_loop<'a>(
             )
         );
         if let Some(join_info) = table.join_info.as_ref() {
-            if join_info.outer && !is_outer_hash_join_probe {
+            if join_info.is_outer() && !is_outer_hash_join_probe {
                 let lj_meta = t_ctx.meta_left_joins[table_index].as_ref().unwrap();
                 // The left join match flag is set to 1 when there is any match on the right table
                 // (e.g. SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a).
@@ -2703,12 +2951,8 @@ pub fn close_loop<'a>(
                         }
                     }
                 }
-                // Then we jump to setting the left join match flag to 1 again,
-                // but this time the right table cursor will set everything to null.
-                // This leads to emitting a row with cols from the left + nulls from the right,
-                // and we will end up back in the IfPos instruction above, which will then
-                // check the match flag again, and since it is now 1, we will jump to the
-                // next row in the left table.
+                // Re-enter the loop body at match-flag set so
+                // post-join predicates are re-evaluated with right-table NULLs.
                 program.emit_insn(Insn::Goto {
                     target_pc: lj_meta.label_match_flag_set_true,
                 });

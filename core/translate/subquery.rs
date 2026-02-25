@@ -378,10 +378,6 @@ fn get_subquery_parser<'a>(
                     );
                 };
                 optimize_select_plan(&mut plan, resolver.schema())?;
-                // EXISTS subqueries are satisfied after at most 1 row has been returned.
-                plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
-                    "1".to_string(),
-                ))));
                 let correlated = plan.is_correlated();
                 handle_unsupported_correlation(correlated, position)?;
                 out_subqueries.push(NonFromClauseSubquery {
@@ -1214,6 +1210,9 @@ pub fn emit_from_clause_subquery(
                 meta_left_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
+                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
@@ -1228,6 +1227,7 @@ pub fn emit_from_clause_subquery(
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
+                semi_anti_outer_next_labels: Vec::new(),
             };
             emit_query(program, select_plan, &mut metadata)?
         }
@@ -1312,6 +1312,9 @@ fn emit_materialized_cte(
                 meta_left_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
+                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
@@ -1326,6 +1329,7 @@ fn emit_materialized_cte(
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
+                semi_anti_outer_next_labels: Vec::new(),
             };
             emit_query(program, select_plan, &mut metadata)?;
         }
@@ -1400,6 +1404,9 @@ fn emit_indexed_materialized_subquery(
                 meta_left_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
+                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
@@ -1414,6 +1421,7 @@ fn emit_indexed_materialized_subquery(
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
+                semi_anti_outer_next_labels: Vec::new(),
             };
             emit_query(program, select_plan, &mut metadata)?;
         }

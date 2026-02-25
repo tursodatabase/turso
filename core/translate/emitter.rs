@@ -20,6 +20,7 @@ use super::group_by::{
 };
 use super::main_loop::{
     close_loop, emit_loop, init_distinct, init_loop, open_loop, LeftJoinMetadata, LoopLabels,
+    SemiAntiJoinMetadata,
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{
@@ -409,6 +410,12 @@ pub struct TranslateCtx<'a> {
     /// mapping between table loop index and associated metadata (for left joins only)
     /// this metadata exists for the right table in a given left join
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
+    /// mapping between table loop index and associated metadata (for semi/anti joins)
+    pub meta_semi_anti_joins: Vec<Option<SemiAntiJoinMetadata>>,
+    /// Labels that need to be resolved to the "next iteration" address of their
+    /// target table. For hash join probes this is HashNext, for scans it's Next.
+    /// Each entry is (outer_table_idx, label_to_resolve).
+    pub semi_anti_outer_next_labels: Vec<(usize, BranchOffset)>,
     pub resolver: Resolver<'a>,
     /// Hash table contexts for hash joins, keyed by build table index.
     pub hash_table_contexts: HashMap<usize, HashCtx>,
@@ -451,6 +458,8 @@ impl<'a> TranslateCtx<'a> {
             reg_result_cols_start: None,
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
+            meta_semi_anti_joins: (0..table_count).map(|_| None).collect(),
+            semi_anti_outer_next_labels: Vec::new(),
             meta_sort: None,
             hash_table_contexts: HashMap::default(),
             materialized_build_inputs: HashMap::default(),
@@ -903,7 +912,15 @@ fn materialization_prefix(
             is_outer: probe_table
                 .join_info
                 .as_ref()
-                .is_some_and(|join_info| join_info.outer),
+                .is_some_and(|join_info| join_info.is_outer()),
+            is_semi: probe_table
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.is_semi()),
+            is_anti: probe_table
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.is_anti()),
         });
     }
     let probe_pos = join_order
@@ -925,7 +942,15 @@ fn materialization_prefix(
             is_outer: build_table
                 .join_info
                 .as_ref()
-                .is_some_and(|join_info| join_info.outer),
+                .is_some_and(|join_info| join_info.is_outer()),
+            is_semi: build_table
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.is_semi()),
+            is_anti: build_table
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.is_anti()),
         });
     }
 
@@ -1527,6 +1552,8 @@ fn emit_program_for_delete(
             table_id: t.internal_id,
             original_idx: i,
             is_outer: false,
+            is_semi: false,
+            is_anti: false,
         })
         .collect::<Vec<_>>();
 
@@ -2521,6 +2548,8 @@ fn emit_program_for_update(
             table_id: t.internal_id,
             original_idx: i,
             is_outer: false,
+            is_semi: false,
+            is_anti: false,
         })
         .collect::<Vec<_>>();
 
