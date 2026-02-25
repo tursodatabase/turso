@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if sqlite "sqlite does not support index method syntax or fts_match()"
 
 @backend cli
 test fts-delete-where-match {
