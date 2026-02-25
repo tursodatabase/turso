@@ -18,6 +18,7 @@ use turso_core::{
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
+pub mod chaotic_elle;
 pub mod elle;
 mod io;
 mod operations;
@@ -25,12 +26,13 @@ pub mod properties;
 pub mod workloads;
 
 use crate::{
+    chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile},
     io::FILE_SIZE_SOFT_LIMIT,
     properties::Property,
     workloads::{Workload, WorkloadContext},
 };
 pub use io::{IOFaultConfig, SimulatorIO};
-pub use operations::{FiberState, OpContext, Operation};
+pub use operations::{FiberState, OpContext, OpResult, Operation};
 
 /// A bounded container for sampling values with reservoir sampling.
 #[derive(Debug, Clone)]
@@ -203,12 +205,16 @@ pub struct WhopperOpts {
     pub enable_mvcc: bool,
     /// Enable database encryption with random cipher.
     pub enable_encryption: bool,
-    /// Enable Elle consistency checking (creates Elle tables at init).
-    pub elle_enabled: bool,
+    /// Elle tables to create: vec of (table_name, create_sql).
+    pub elle_tables: Vec<(String, String)>,
     /// Workloads with weights: (weight, workload). Higher weight = more likely.
     pub workloads: Vec<(u32, Box<dyn Workload>)>,
     /// Properties to check
     pub properties: Vec<Box<dyn Property>>,
+    /// Chaotic workload profiles: (probability, name, profile).
+    /// On each idle step, each profile fires with the given probability (0.0–1.0).
+    /// If none fires, regular workloads run instead.
+    pub chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
 }
 
 impl Default for WhopperOpts {
@@ -221,9 +227,10 @@ impl Default for WhopperOpts {
             keep_files: false,
             enable_mvcc: false,
             enable_encryption: false,
-            elle_enabled: false,
+            elle_tables: vec![],
             workloads: vec![],
             properties: vec![],
+            chaotic_profiles: vec![],
         }
     }
 }
@@ -289,8 +296,8 @@ impl WhopperOpts {
         self
     }
 
-    pub fn with_elle_enabled(mut self, enable: bool) -> Self {
-        self.elle_enabled = enable;
+    pub fn with_elle_tables(mut self, tables: Vec<(String, String)>) -> Self {
+        self.elle_tables = tables;
         self
     }
 
@@ -301,6 +308,14 @@ impl WhopperOpts {
 
     pub fn with_properties(mut self, properties: Vec<Box<dyn Property>>) -> Self {
         self.properties = properties;
+        self
+    }
+
+    pub fn with_chaotic_profiles(
+        mut self,
+        profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
+    ) -> Self {
+        self.chaotic_profiles = profiles;
         self
     }
 }
@@ -334,6 +349,11 @@ pub struct SimulatorFiber {
     txn_id: Option<u64>,
     /// Current operation being executed
     current_op: Option<Operation>,
+    /// Active chaotic workload (if any)
+    chaotic_workload: Option<Box<dyn ChaoticWorkload>>,
+    /// Saved result from last completed operation, for the chaotic workload.
+    /// Not overwritten if already set (preserves error across auto-rollback).
+    last_chaotic_result: Option<OpResult>,
 }
 
 /// Shared state for simulator that can be accessed by workloads.
@@ -412,6 +432,8 @@ pub struct Whopper {
     pub max_steps: usize,
     pub seed: u64,
     pub stats: Stats,
+    /// Chaotic workload profiles: (probability, name, profile).
+    chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
 }
 
 impl Whopper {
@@ -487,16 +509,12 @@ impl Whopper {
             bootstrap_conn.execute(&sql)?;
         }
 
-        // Create Elle table if Elle mode is enabled
-        let mut elle_tables = Vec::new();
-        if opts.elle_enabled {
-            let table_name = "elle_lists".to_string();
-            let sql = format!(
-                "CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')"
-            );
-            debug!("{}", sql);
-            bootstrap_conn.execute(&sql)?;
-            elle_tables.push(table_name);
+        // Create Elle tables if configured
+        let mut elle_table_names = Vec::new();
+        for (table_name, create_sql) in &opts.elle_tables {
+            debug!("{}", create_sql);
+            bootstrap_conn.execute(create_sql)?;
+            elle_table_names.push(table_name.clone());
         }
 
         bootstrap_conn.close()?;
@@ -507,7 +525,7 @@ impl Whopper {
             .collect();
 
         let mut state = SimulatorState::new(tables, indexes_vec);
-        for table_name in elle_tables {
+        for table_name in elle_table_names {
             state.elle_tables.insert(table_name, ());
         }
 
@@ -540,6 +558,7 @@ impl Whopper {
             max_steps: opts.max_steps,
             seed,
             stats: Stats::default(),
+            chaotic_profiles: opts.chaotic_profiles,
         };
 
         whopper.open_connections()?;
@@ -679,6 +698,15 @@ impl Whopper {
                     .inspect_err(|e| error!("property failed: {e}"))?;
             }
 
+            // Save result for chaotic workload.
+            // Don't overwrite if already set — preserves the original error
+            // across auto-rollback sequences. If chaotic_workload is None
+            // (already completed), the result is silently dropped — benign,
+            // since try_resume_chaotic won't consume it anyway.
+            if ctx.fiber.chaotic_workload.is_some() && ctx.fiber.last_chaotic_result.is_none() {
+                ctx.fiber.last_chaotic_result = Some(op_result.clone());
+            }
+
             if ctx.fiber.connection.get_auto_commit() {
                 ctx.fiber.state = FiberState::Idle;
                 ctx.fiber.txn_id = None;
@@ -708,38 +736,46 @@ impl Whopper {
         }
 
         if self.context.fibers[fiber_idx].current_op.is_none() {
-            // Generate new operation from workloads list using weighted random selection
-            if self.total_weight == 0 {
-                return Ok(());
+            // Try chaotic workload first
+            if !self.chaotic_profiles.is_empty() {
+                self.try_resume_chaotic(fiber_idx);
             }
 
-            let mut roll = self.rng.random_range(0..self.total_weight);
-            for (weight, workload) in &self.workloads {
-                if roll >= *weight {
-                    roll = roll.saturating_sub(*weight);
-                    continue;
+            // Fall through to regular workloads if chaotic didn't produce an op
+            if self.context.fibers[fiber_idx].current_op.is_some() {
+                // chaotic workload produced an op, skip regular workloads
+            } else if self.total_weight == 0 {
+                return Ok(());
+            } else {
+                let mut roll = self.rng.random_range(0..self.total_weight);
+                for (weight, workload) in &self.workloads {
+                    if roll >= *weight {
+                        roll = roll.saturating_sub(*weight);
+                        continue;
+                    }
+                    let fiber = &self.context.fibers[fiber_idx];
+                    let state_str = format!("{:?}", &fiber.state);
+                    let span =
+                        tracing::debug_span!("generate", fiber = fiber_idx, state = state_str);
+                    let _enter = span.enter();
+
+                    let ctx = WorkloadContext {
+                        fiber_state: &fiber.state,
+                        sim_state: &self.context.state,
+                        opts: &self.opts,
+                        enable_mvcc: self.context.enable_mvcc,
+                        tables_vec: self.context.state.tables_vec(),
+                    };
+
+                    // Generate operation from workload; skip current workload if it returned None
+                    let Some(op) = workload.generate(&ctx, &mut self.rng) else {
+                        continue;
+                    };
+
+                    debug!("set fiber operation: {:?}", op);
+                    self.context.fibers[fiber_idx].current_op = Some(op);
+                    break;
                 }
-                let fiber = &self.context.fibers[fiber_idx];
-                let state_str = format!("{:?}", &fiber.state);
-                let span = tracing::debug_span!("generate", fiber = fiber_idx, state = state_str);
-                let _enter = span.enter();
-
-                let ctx = WorkloadContext {
-                    fiber_state: &fiber.state,
-                    sim_state: &self.context.state,
-                    opts: &self.opts,
-                    enable_mvcc: self.context.enable_mvcc,
-                    tables_vec: self.context.state.tables_vec(),
-                };
-
-                // Generate operation from workload; skip current workload if it returned None
-                let Some(op) = workload.generate(&ctx, &mut self.rng) else {
-                    continue;
-                };
-
-                debug!("set fiber operation: {:?}", op);
-                self.context.fibers[fiber_idx].current_op = Some(op);
-                break;
             }
         }
 
@@ -797,6 +833,60 @@ impl Whopper {
         }
 
         Ok(())
+    }
+
+    /// Try to resume or start a chaotic workload for the given fiber.
+    /// Sets `current_op` on the fiber if a workload produces an operation.
+    fn try_resume_chaotic(&mut self, fiber_idx: usize) {
+        // Resume active workload with saved result
+        if let Some(result) = self.context.fibers[fiber_idx].last_chaotic_result.take() {
+            let mut workload = self.context.fibers[fiber_idx].chaotic_workload.take();
+            if let Some(ref mut wl) = workload {
+                if let Some(op) = wl.next(Some(result)) {
+                    debug!("chaotic: resumed workload, next op: {:?}", op);
+                    self.context.fibers[fiber_idx].current_op = Some(op);
+                    self.context.fibers[fiber_idx].chaotic_workload = workload;
+                    return;
+                }
+                debug!("chaotic: workload completed");
+            }
+        }
+
+        // No active workload — pick a new one (only when idle, since chaotic
+        // workloads start with BEGIN and can't nest inside an existing transaction)
+        if self.context.fibers[fiber_idx].chaotic_workload.is_none()
+            && self.context.fibers[fiber_idx].state == FiberState::Idle
+        {
+            if let Some(op) = self.pick_chaotic_workload(fiber_idx) {
+                self.context.fibers[fiber_idx].current_op = Some(op);
+            }
+        }
+    }
+
+    /// Pick a chaotic workload for the given fiber using weighted random selection.
+    /// Each profile's weight is its probability (0.0–1.0) of being selected on any
+    /// given idle step. If no profile fires, regular workloads run instead.
+    fn pick_chaotic_workload(&mut self, fiber_idx: usize) -> Option<Operation> {
+        if self.chaotic_profiles.is_empty() {
+            return None;
+        }
+
+        for (probability, name, profile) in &self.chaotic_profiles {
+            if !self.rng.random_bool(*probability) {
+                continue;
+            }
+            let fiber_rng = ChaCha8Rng::seed_from_u64(self.rng.next_u64());
+            let mut workload = profile.generate(fiber_rng, fiber_idx);
+            if let Some(op) = workload.next(None) {
+                debug!(
+                    "chaotic: picked workload '{}' for fiber {}",
+                    name, fiber_idx
+                );
+                self.context.fibers[fiber_idx].chaotic_workload = Some(workload);
+                return Some(op);
+            }
+        }
+        None
     }
 
     /// Run the simulation to completion (up to max_steps or WAL limit).
@@ -943,6 +1033,8 @@ impl Whopper {
                 execution_id: None,
                 txn_id: None,
                 current_op: None,
+                chaotic_workload: None,
+                last_chaotic_result: None,
             });
         }
 
