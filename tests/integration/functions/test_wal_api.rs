@@ -341,7 +341,7 @@ fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
                         synced_frame = *committed;
                     }
                 }
-                if rng.next_u32() % 10 == 0 {
+                if rng.next_u32() % 10 == 0 && synced_frame > 0 {
                     synced_frame = rng.next_u32() as u64 % synced_frame;
                 }
                 let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM t");
