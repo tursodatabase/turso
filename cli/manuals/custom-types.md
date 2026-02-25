@@ -8,10 +8,10 @@ display_name: "custom types"
 
 Turso extends SQLite's STRICT table type system with user-defined custom types. Custom types let you define how values are encoded before storage and decoded when read, enforce domain constraints at the storage layer, attach operators, and provide defaults — all declared in pure SQL.
 
-Custom types work only with **STRICT** tables and require the `--experimental-strict` flag:
+Custom types work only with **STRICT** tables (which are always enabled):
 
 ```
-tursodb --experimental-strict mydb.db
+tursodb mydb.db
 ```
 
 Without this flag, `CREATE TYPE`, `DROP TYPE`, the `sqlite_turso_types` virtual table, and all built-in custom types (date, varchar, numeric, etc.) are unavailable. `PRAGMA list_types` will only show the five base SQLite types (INTEGER, REAL, TEXT, BLOB, ANY).
@@ -425,7 +425,7 @@ SELECT id, val FROM t1;
 
 ## Restrictions
 
-- Custom types require **STRICT** tables and the `--experimental-strict` flag.
+- Custom types require **STRICT** tables.
 - A type cannot be dropped while any table column uses it.
 - `CREATE TYPE IF NOT EXISTS` silently succeeds if the type already exists.
 - Encode/decode expressions use the identifier `value` to reference the input.

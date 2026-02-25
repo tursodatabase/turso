@@ -196,9 +196,7 @@ impl Fuzzer {
 
         // Create Turso in-memory database using MemorySimIO
         let io = Arc::new(MemorySimIO::new(config.seed));
-        let opts = turso_core::DatabaseOpts::new()
-            .with_attach(true)
-            .with_strict(true);
+        let opts = turso_core::DatabaseOpts::new().with_attach(true);
 
         let turso_db = Database::open_file_with_flags(
             io.clone(),

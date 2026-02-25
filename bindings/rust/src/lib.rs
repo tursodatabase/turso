@@ -138,7 +138,6 @@ pub struct Builder {
     enable_encryption: bool,
     enable_triggers: bool,
     enable_attach: bool,
-    enable_strict: bool,
     enable_custom_types: bool,
     enable_index_method: bool,
     enable_materialized_views: bool,
@@ -154,7 +153,6 @@ impl Builder {
             enable_encryption: false,
             enable_triggers: false,
             enable_attach: false,
-            enable_strict: false,
             enable_custom_types: false,
             enable_index_method: false,
             enable_materialized_views: false,
@@ -183,8 +181,8 @@ impl Builder {
         self
     }
 
-    pub fn experimental_strict(mut self, strict_enabled: bool) -> Self {
-        self.enable_strict = strict_enabled;
+    /// Kept for backwards compatibility. Strict tables are now always enabled.
+    pub fn experimental_strict(self, _strict_enabled: bool) -> Self {
         self
     }
 
@@ -217,9 +215,6 @@ impl Builder {
         }
         if self.enable_attach {
             features.push("attach");
-        }
-        if self.enable_strict {
-            features.push("strict");
         }
         if self.enable_custom_types {
             features.push("custom_types");

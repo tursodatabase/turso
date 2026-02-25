@@ -166,7 +166,6 @@ pub const fn is_attached_db(database_id: usize) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
     pub enable_views: bool,
-    pub enable_strict: bool,
     pub enable_custom_types: bool,
     pub enable_encryption: bool,
     pub enable_index_method: bool,
@@ -193,16 +192,8 @@ impl DatabaseOpts {
         self
     }
 
-    pub fn with_strict(mut self, enable: bool) -> Self {
-        self.enable_strict = enable;
-        self
-    }
-
     pub fn with_custom_types(mut self, enable: bool) -> Self {
         self.enable_custom_types = enable;
-        if enable {
-            self.enable_strict = true;
-        }
         self
     }
 
@@ -1563,10 +1554,6 @@ impl Database {
 
     pub fn experimental_index_method_enabled(&self) -> bool {
         self.opts.enable_index_method
-    }
-
-    pub fn experimental_strict_enabled(&self) -> bool {
-        self.opts.enable_strict
     }
 
     pub fn experimental_custom_types_enabled(&self) -> bool {

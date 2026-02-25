@@ -1236,7 +1236,8 @@ fn query_pragma(
             }
 
             // Custom types from the type registry are only shown when strict mode is enabled
-            if connection.experimental_strict_enabled() {
+            // Custom types are always shown since strict mode is always enabled
+            {
                 // Skip aliases where key != canonical name
                 let mut type_names: Vec<_> = schema
                     .type_registry

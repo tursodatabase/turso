@@ -27,7 +27,6 @@ expect {
     4
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-basic-creation {
     CREATE TABLE test1 (id INTEGER, name TEXT, price REAL) STRICT;
@@ -52,7 +51,6 @@ expect {
 }
 
 # Reproducer for https://github.com/tursodatabase/turso/issues/2822
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-type-case-insensitivity {
     CREATE TABLE test1 (id integer, name text, price real) STRICT;
@@ -63,7 +61,6 @@ expect {
     1|item1|10.5
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-require-datatype {
     CREATE TABLE test2 (id INTEGER, name) STRICT;
@@ -71,7 +68,6 @@ test strict-require-datatype {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-valid-datatypes {
     CREATE TABLE test2 (id INTEGER, value DATETIME) STRICT;
@@ -79,7 +75,6 @@ test strict-valid-datatypes {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-type-enforcement {
     CREATE TABLE test3 (id INTEGER, name TEXT, price REAL) STRICT;
@@ -88,7 +83,6 @@ test strict-type-enforcement {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-type-coercion {
     CREATE TABLE test4 (id INTEGER, name TEXT, price REAL) STRICT;
@@ -99,7 +93,6 @@ expect {
     real|10.5
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-any-flexibility {
     CREATE TABLE test5 (id INTEGER, data ANY) STRICT;
@@ -114,7 +107,6 @@ expect {
     3|real
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-any-preservation {
     CREATE TABLE test6 (id INTEGER, code ANY) STRICT;
@@ -125,7 +117,6 @@ expect {
     text|000123
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-int-vs-integer-pk {
     CREATE TABLE test8 (id INT PRIMARY KEY, name TEXT) STRICT
@@ -134,7 +125,6 @@ test strict-int-vs-integer-pk {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-integer-pk-behavior {
     CREATE TABLE test9 (id INTEGER PRIMARY KEY, name TEXT) STRICT;
@@ -145,7 +135,6 @@ expect {
     1|test
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-mixed-inserts {
     CREATE TABLE test11 (
@@ -164,7 +153,6 @@ expect {
     2|item2|20.75|10|integer
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-update-basic {
     CREATE TABLE test1 (id INTEGER, name TEXT, price REAL) STRICT;
@@ -176,7 +164,6 @@ expect {
     1|item1|15.75
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-update-type-enforcement {
     CREATE TABLE test2 (id INTEGER, name TEXT, price REAL) STRICT;
@@ -186,7 +173,6 @@ test strict-update-type-enforcement {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-update-type-coercion {
     CREATE TABLE test3 (id INTEGER, name TEXT, price REAL) STRICT;
@@ -198,7 +184,6 @@ expect {
     1|real|15.75
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-update-any-flexibility {
     CREATE TABLE test4 (id INTEGER, data ANY) STRICT;
@@ -213,7 +198,6 @@ expect {
     2|real|3.14
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-update-any-preservation {
     CREATE TABLE test5 (id INTEGER, code ANY) STRICT;
@@ -225,7 +209,6 @@ expect {
     text|000123
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-update-not-null-constraint {
     CREATE TABLE test7 (id INTEGER, name TEXT NOT NULL) STRICT;
@@ -236,7 +219,6 @@ expect error {
 }
 
 # Uncomment following test case when unique constraint is added
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-update-pk-constraint {
     CREATE TABLE test8 (id INTEGER PRIMARY KEY, name TEXT) STRICT;
@@ -247,7 +229,6 @@ test strict-update-pk-constraint {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-update-multiple-columns {
     CREATE TABLE test9 (id INTEGER, name TEXT, price REAL, quantity INT) STRICT;
@@ -259,7 +240,6 @@ expect {
     1|updated|20.75|10
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-update-where-clause {
     CREATE TABLE test10 (id INTEGER, category TEXT, price REAL) STRICT;
@@ -274,8 +254,12 @@ expect {
     2|40.0
     3|30.0
 }
+expect @js {
+    1|20
+    2|40
+    3|30
+}
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-update-expression {
     CREATE TABLE test11 (id INTEGER, name TEXT, price REAL, discount REAL) STRICT;
@@ -286,8 +270,10 @@ test strict-update-expression {
 expect {
     1|90.0
 }
+expect @js {
+    1|90
+}
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-text-float-to-integer-basic {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -298,7 +284,6 @@ expect {
     42|integer
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-text-float-to-integer-zero {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -309,7 +294,6 @@ expect {
     0|integer
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-text-float-to-integer-negative {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -320,7 +304,6 @@ expect {
     -5|integer
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-text-float-to-integer-scientific {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -331,7 +314,6 @@ expect {
     100|integer
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-text-float-to-integer-fractional-error {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -340,7 +322,6 @@ test strict-text-float-to-integer-fractional-error {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-text-integer-to-real-basic {
     CREATE TABLE t(a REAL) STRICT;
@@ -350,8 +331,10 @@ test strict-text-integer-to-real-basic {
 expect {
     42.0|real
 }
+expect @js {
+    42|real
+}
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-text-integer-to-real-negative {
     CREATE TABLE t(a REAL) STRICT;
@@ -361,8 +344,10 @@ test strict-text-integer-to-real-negative {
 expect {
     -7.0|real
 }
+expect @js {
+    -7|real
+}
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-text-integer-to-real-zero {
     CREATE TABLE t(a REAL) STRICT;
@@ -372,8 +357,10 @@ test strict-text-integer-to-real-zero {
 expect {
     0.0|real
 }
+expect @js {
+    0|real
+}
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-text-float-to-real {
     CREATE TABLE t(a REAL) STRICT;
@@ -384,7 +371,6 @@ expect {
     3.14|real
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-text-string-to-real-error {
     CREATE TABLE t(a REAL) STRICT;

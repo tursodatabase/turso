@@ -55,7 +55,7 @@ mkdir -p "$RESULTS_DIR"
 
 AFL_CMD="$AFL -t 1000"  # 1 second timeout (normal queries finish in ~20ms)
 # Enable all experimental features to maximize attack surface
-AFL_TARGET="-- $TURSODB -q -m list --experimental-views --experimental-strict --experimental-triggers --experimental-index-method --experimental-autovacuum --experimental-attach --experimental-encryption"
+AFL_TARGET="-- $TURSODB -q -m list --experimental-views --experimental-triggers --experimental-index-method --experimental-autovacuum --experimental-attach --experimental-encryption"
 
 # Find the most recent run directory for this oracle (for --resume)
 if [ "$RESUME" = true ]; then

@@ -68,8 +68,6 @@ pub struct Opts {
     pub readonly: bool,
     #[clap(long, help = "Enable experimental views feature")]
     pub experimental_views: bool,
-    #[clap(long, help = "Enable experimental strict schema mode")]
-    pub experimental_strict: bool,
     #[clap(
         long,
         help = "Enable experimental custom types (CREATE TYPE / DROP TYPE)"
@@ -217,7 +215,6 @@ impl Limbo {
 
         let db_opts = turso_core::DatabaseOpts::new()
             .with_views(opts.experimental_views)
-            .with_strict(opts.experimental_strict)
             .with_custom_types(opts.experimental_custom_types)
             .with_encryption(opts.experimental_encryption)
             .with_index_method(opts.experimental_index_method)

@@ -29,7 +29,6 @@ expect {
     main|v1|view|2|0|0
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test pragma-table-list-strict {
     CREATE TABLE strict_t(a INTEGER, b TEXT) STRICT;

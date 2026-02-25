@@ -373,7 +373,6 @@ expect error {
     error in table t_check2 after drop column: no such column: b
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-invalid-varchar {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -382,7 +381,6 @@ test strict-alter-add-column-invalid-varchar {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-invalid-datetime {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -391,7 +389,6 @@ test strict-alter-add-column-invalid-datetime {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-no-type {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -400,7 +397,6 @@ test strict-alter-add-column-no-type {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-integer {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -412,7 +408,6 @@ expect {
     1|42
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-text {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -424,7 +419,6 @@ expect {
     1|hello
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-any {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -436,7 +430,6 @@ expect {
     1|3.14
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-default-type-mismatch {
     CREATE TABLE t1(name TEXT) STRICT;
@@ -447,7 +440,6 @@ expect error {
     type mismatch on DEFAULT
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-default-integer-from-text {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -459,7 +451,6 @@ expect {
     integer|10
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-default-real-from-text {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -471,7 +462,6 @@ expect {
     real|1.25
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-default-text-from-integer {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -483,7 +473,6 @@ expect {
     text|123
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-default-integer-fractional {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -494,7 +483,6 @@ expect error {
     type mismatch on DEFAULT
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-default-real-nonnumeric {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -505,7 +493,6 @@ expect error {
     type mismatch on DEFAULT
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-default-text-blob {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -516,7 +503,6 @@ expect error {
     type mismatch on DEFAULT
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-default-blob-text {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -527,7 +513,6 @@ expect error {
     type mismatch on DEFAULT
 }
 
-@requires strict "uses STRICT tables"
 @cross-check-integrity
 test strict-alter-add-column-default-mismatch-empty-table {
     CREATE TABLE t(a INTEGER) STRICT;
