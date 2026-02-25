@@ -1,17 +1,24 @@
 /// Whopper CLI - The Turso deterministic simulator
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 use rand::{Rng, RngCore};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-use turso_whopper::{StepResult, Whopper, WhopperOpts, properties::*, workloads::*};
+use turso_whopper::{
+    StepResult, Whopper, WhopperOpts,
+    chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
+    properties::*,
+    workloads::*,
+};
 
 /// Elle consistency model to use
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ElleModel {
     /// List-append model: transactions append to and read from lists
     ListAppend,
-    // TODO: rw-register model
+    /// Rw-register model: transactions write and read single values
+    RwRegister,
 }
 
 #[derive(Parser)]
@@ -146,14 +153,53 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
     }
 
     // Build workloads and properties based on Elle mode
-    let (workloads, properties) = if let Some(elle_model) = args.elle {
+    let (workloads, properties, elle_tables, chaotic_profiles) = if let Some(elle_model) = args.elle
+    {
+        // Shared counter ensures globally unique values across all Elle workloads
+        let elle_counter = Arc::new(std::sync::atomic::AtomicI64::new(1));
+
         // Elle mode: only Elle workloads + transactions
+        let (table_name, create_sql) = match elle_model {
+            ElleModel::ListAppend => (
+                "elle_lists",
+                "CREATE TABLE IF NOT EXISTS elle_lists (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')",
+            ),
+            ElleModel::RwRegister => (
+                "elle_rw",
+                "CREATE TABLE IF NOT EXISTS elle_rw (key TEXT PRIMARY KEY, val INTEGER)",
+            ),
+        };
+
+        let model_kind = match elle_model {
+            ElleModel::ListAppend => ElleModelKind::ListAppend,
+            ElleModel::RwRegister => ElleModelKind::RwRegister,
+        };
+
+        let chaotic: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)> = vec![(
+            0.3,
+            "chaotic-elle",
+            Box::new(ChaoticElleProfile::new(
+                table_name.to_string(),
+                model_kind,
+                elle_counter.clone(),
+                args.enable_mvcc,
+            )),
+        )];
+
         let w: Vec<(u32, Box<dyn Workload>)> = match elle_model {
             ElleModel::ListAppend => vec![
-                // Elle list-append workloads (single pre-created table)
-                (40, Box::new(ElleAppendWorkload::new())),
+                (40, Box::new(ElleAppendWorkload::with_counter(elle_counter))),
                 (30, Box::new(ElleReadWorkload)),
-                // Transaction control
+                (30, Box::new(BeginWorkload)),
+                (15, Box::new(CommitWorkload)),
+                (5, Box::new(RollbackWorkload)),
+            ],
+            ElleModel::RwRegister => vec![
+                (
+                    40,
+                    Box::new(ElleRwWriteWorkload::with_counter(elle_counter)),
+                ),
+                (30, Box::new(ElleRwReadWorkload)),
                 (30, Box::new(BeginWorkload)),
                 (15, Box::new(CommitWorkload)),
                 (5, Box::new(RollbackWorkload)),
@@ -163,7 +209,9 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         let output_path = PathBuf::from(&args.elle_output);
         let p: Vec<Box<dyn Property>> = vec![Box::new(ElleHistoryRecorder::new(output_path))];
 
-        (w, p)
+        let et = vec![(table_name.to_string(), create_sql.to_string())];
+
+        (w, p, et, chaotic)
     } else {
         // Normal mode: all workloads
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
@@ -189,7 +237,7 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
             Box::new(SimpleKeysDoNotDisappear::new()),
         ];
 
-        (w, p)
+        (w, p, vec![], vec![])
     };
 
     let opts = base_opts
@@ -198,9 +246,10 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_keep_files(args.keep)
         .with_enable_mvcc(args.enable_mvcc)
         .with_enable_encryption(args.enable_encryption)
-        .with_elle_enabled(args.elle.is_some())
+        .with_elle_tables(elle_tables)
         .with_workloads(workloads)
-        .with_properties(properties);
+        .with_properties(properties)
+        .with_chaotic_profiles(chaotic_profiles);
 
     Ok(opts)
 }
