@@ -1220,6 +1220,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Err(LimboError::SchemaConflict);
                 }
 
+                turso_assert!(
+                    end_ts > tx.begin_ts,
+                    "end_ts must be strictly greater than begin_ts"
+                );
                 tx.state.store(TransactionState::Preparing(end_ts));
                 tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
                 /* In order to implement serializability, we need the following steps:
@@ -1414,6 +1418,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // which would make a read-only transaction look like a write,
                 // causing spurious Busy errors from acquire_exclusive_tx.
                 if self.write_set.is_empty() {
+                    turso_assert!(
+                        tx.commit_dep_set.lock().is_empty(),
+                        "MVCC read only transaction should not have commit dependencies on other txns"
+                    );
                     tx.state.store(TransactionState::Committed(*end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
@@ -3259,6 +3267,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Hekaton Section 3.3: "If it aborted, it forces the dependent transactions
         // to also abort by setting their AbortNow flags."
         let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
+        // a txn cannot depend on itself
+        turso_assert!(
+            !dependents.contains(&tx_id),
+            "rollback_tx: transaction has itself in its own commit_dep_set"
+        );
         for dep_tx_id in dependents {
             if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
                 let dep_tx = dep_tx_entry.value();
@@ -4875,6 +4888,10 @@ fn register_commit_dependency(
     dependent_tx: &Transaction,
     depended_on_tx_id: TxID,
 ) {
+    turso_assert!(
+        dependent_tx.tx_id != depended_on_tx_id,
+        "transaction cannot depend on itself"
+    );
     let Some(depended_on) = txs.get(&depended_on_tx_id) else {
         // Transaction was already committed and removed from the map
         // (CommitEnd calls remove_tx after setting Committed and draining
@@ -4969,7 +4986,11 @@ fn is_begin_visible(
                             // If begin_ts >= end_ts, the version would be visible once TB
                             // commits. Speculatively return true and register a dependency.
                             // Fixes partial commit visibility (Bug #8).
-                            if tx.begin_ts >= end_ts && tx.tx_id != tb.tx_id {
+                            turso_assert!(
+                                tx.tx_id != tb.tx_id,
+                                "a txn cannot read its own row versions during prepare"
+                            );
+                            if tx.begin_ts >= end_ts {
                                 register_commit_dependency(txs, tx, rv_begin);
                                 true
                             } else {
