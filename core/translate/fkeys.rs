@@ -1627,119 +1627,133 @@ pub struct PreparedFkDeleteAction {
     ctx: FkActionContext,
 }
 
-/// Phase 1 of FK delete actions: build parent keys into registers and handle
-/// NoAction/Restrict checks. Returns prepared actions for CASCADE/SetNull/
-/// SetDefault that must be fired AFTER the parent row is deleted (step 4 per
-/// SQLite docs: delete parent row first, then perform FK cascade actions).
-pub fn prepare_fk_delete_actions(
-    program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
-    parent_table_name: &str,
-    parent_cursor_id: usize,
-    parent_rowid_reg: usize,
-    database_id: usize,
-) -> Result<Vec<PreparedFkDeleteAction>> {
-    let parent_bt = resolver
-        .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
-        .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
+pub struct ForeignKeyActions<T>(Vec<T>);
 
-    let mut prepared = Vec::new();
-
-    for fk_ref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(parent_table_name)
-    })? {
-        let parent_cols = get_fk_parent_cols(&fk_ref, &parent_bt);
-        let ncols = parent_cols.len();
-        let key_regs_start = program.alloc_registers(ncols);
-
-        build_parent_key(
-            program,
-            &parent_bt,
-            &parent_cols,
-            parent_cursor_id,
-            parent_rowid_reg,
-            key_regs_start,
-        )?;
-
-        match fk_ref.fk.on_delete {
-            RefAct::NoAction | RefAct::Restrict => {
-                emit_fk_delete_parent_existence_check_single(
-                    program,
-                    &fk_ref,
-                    &parent_bt,
-                    parent_table_name,
-                    parent_cursor_id,
-                    parent_rowid_reg,
-                    database_id,
-                    resolver,
-                )?;
-            }
-            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
-                // Decode encoded values so they match the subprogram's decoded column reads
-                decode_fk_key_registers(
-                    program,
-                    resolver,
-                    &parent_bt,
-                    &parent_cols,
-                    key_regs_start,
-                )?;
-                let old_key_registers: Vec<usize> =
-                    (key_regs_start..key_regs_start + ncols).collect();
-                let ctx = FkActionContext::new_for_delete(old_key_registers);
-                prepared.push(PreparedFkDeleteAction { fk_ref, ctx });
-            }
-        }
+impl<T> Default for ForeignKeyActions<T> {
+    fn default() -> Self {
+        Self(Vec::new())
     }
-
-    Ok(prepared)
 }
 
-/// Phase 2 of FK delete actions: fire CASCADE/SetNull/SetDefault sub-programs.
-/// Must be called AFTER the parent row is deleted from the B-tree.
-pub fn fire_prepared_fk_delete_actions(
-    program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
-    prepared: Vec<PreparedFkDeleteAction>,
-    connection: &Arc<Connection>,
-    database_id: usize,
-) -> Result<()> {
-    for action in prepared {
-        match action.fk_ref.fk.on_delete {
-            RefAct::Cascade => {
-                fire_fk_cascade_delete(
-                    program,
-                    resolver,
-                    &action.fk_ref,
-                    connection,
-                    &action.ctx,
-                    database_id,
-                )?;
+impl ForeignKeyActions<PreparedFkDeleteAction> {
+    /// Phase 1 of FK delete actions: build parent keys into registers and handle
+    /// NoAction/Restrict checks. Returns prepared actions for CASCADE/SetNull/
+    /// SetDefault that must be fired AFTER the parent row is deleted (step 4 per
+    /// SQLite docs: delete parent row first, then perform FK cascade actions).
+    pub fn prepare_fk_delete_actions(
+        program: &mut ProgramBuilder,
+        resolver: &mut Resolver,
+        parent_table_name: &str,
+        parent_cursor_id: usize,
+        parent_rowid_reg: usize,
+        database_id: usize,
+    ) -> Result<ForeignKeyActions<PreparedFkDeleteAction>> {
+        let parent_bt = resolver
+            .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
+            .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
+
+        let mut prepared = Vec::new();
+
+        for fk_ref in resolver.with_schema(database_id, |s| {
+            s.resolved_fks_referencing(parent_table_name)
+        })? {
+            let parent_cols = get_fk_parent_cols(&fk_ref, &parent_bt);
+            let ncols = parent_cols.len();
+            let key_regs_start = program.alloc_registers(ncols);
+
+            build_parent_key(
+                program,
+                &parent_bt,
+                &parent_cols,
+                parent_cursor_id,
+                parent_rowid_reg,
+                key_regs_start,
+            )?;
+
+            match fk_ref.fk.on_delete {
+                RefAct::NoAction | RefAct::Restrict => {
+                    emit_fk_delete_parent_existence_check_single(
+                        program,
+                        &fk_ref,
+                        &parent_bt,
+                        parent_table_name,
+                        parent_cursor_id,
+                        parent_rowid_reg,
+                        database_id,
+                        resolver,
+                    )?;
+                }
+                RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
+                    // Decode encoded values so they match the subprogram's decoded column reads
+                    decode_fk_key_registers(
+                        program,
+                        resolver,
+                        &parent_bt,
+                        &parent_cols,
+                        key_regs_start,
+                    )?;
+                    let old_key_registers: Vec<usize> =
+                        (key_regs_start..key_regs_start + ncols).collect();
+                    let ctx = FkActionContext::new_for_delete(old_key_registers);
+                    prepared.push(PreparedFkDeleteAction { fk_ref, ctx });
+                }
             }
-            RefAct::SetNull => {
-                fire_fk_set_null(
-                    program,
-                    resolver,
-                    &action.fk_ref,
-                    connection,
-                    &action.ctx,
-                    database_id,
-                )?;
-            }
-            RefAct::SetDefault => {
-                fire_fk_set_default(
-                    program,
-                    resolver,
-                    &action.fk_ref,
-                    connection,
-                    &action.ctx,
-                    database_id,
-                )?;
-            }
-            _ => unreachable!(),
         }
+
+        Ok(ForeignKeyActions(prepared))
     }
 
-    Ok(())
+    /// Phase 2 of FK delete actions: fire CASCADE/SetNull/SetDefault sub-programs.
+    /// Must be called AFTER the parent row is deleted from the B-tree.
+    pub fn fire_prepared_fk_delete_actions(
+        self,
+        program: &mut ProgramBuilder,
+        resolver: &mut Resolver,
+        connection: &Arc<Connection>,
+        database_id: usize,
+    ) -> Result<()> {
+        let prepared = self.0;
+        if prepared.is_empty() {
+            return Ok(());
+        }
+        for action in prepared {
+            match action.fk_ref.fk.on_delete {
+                RefAct::Cascade => {
+                    fire_fk_cascade_delete(
+                        program,
+                        resolver,
+                        &action.fk_ref,
+                        connection,
+                        &action.ctx,
+                        database_id,
+                    )?;
+                }
+                RefAct::SetNull => {
+                    fire_fk_set_null(
+                        program,
+                        resolver,
+                        &action.fk_ref,
+                        connection,
+                        &action.ctx,
+                        database_id,
+                    )?;
+                }
+                RefAct::SetDefault => {
+                    fire_fk_set_default(
+                        program,
+                        resolver,
+                        &action.fk_ref,
+                        connection,
+                        &action.ctx,
+                        database_id,
+                    )?;
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Fire FK actions for UPDATE on parent table using Program opcode.
