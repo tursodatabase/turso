@@ -17,6 +17,9 @@ impl ArbitraryFromMaybe<&SimValue> for LikeValue {
             value @ Value::Text(..) => {
                 let t = value.to_string();
                 let mut t = t.chars().collect::<Vec<_>>();
+                if t.is_empty() {
+                    return Some(Self(SimValue(Value::build_text("%".to_string()))));
+                }
                 // Remove a number of characters, either insert `_` for each character removed, or
                 // insert one `%` for the whole substring
                 let mut i = 0;

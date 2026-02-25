@@ -47,7 +47,7 @@ impl Default for TableOpts {
     fn default() -> Self {
         Self {
             large_table: Default::default(),
-            rowid_alias_prob: 0.05,
+            rowid_alias_prob: 0.15,
             // Up to 10 columns
             column_range: 1..11,
         }
@@ -200,13 +200,25 @@ impl Default for InsertOpts {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpdateOpts {
     #[garde(skip)]
     pub padding_size: Option<usize>,
     #[garde(skip)]
     pub force_late_failure: bool,
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub or_replace_prob: f64,
+}
+
+impl Default for UpdateOpts {
+    fn default() -> Self {
+        Self {
+            padding_size: None,
+            force_late_failure: false,
+            or_replace_prob: 0.1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
