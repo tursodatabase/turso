@@ -16,7 +16,7 @@ use std::{
     os::{fd::AsFd, unix::io::AsRawFd},
     sync::Arc,
 };
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 /// Size of the io_uring submission and completion queues
 const ENTRIES: u32 = 512;
@@ -48,8 +48,15 @@ const ARENA_COUNT: usize = 2;
 /// user_data tag for cancellation operations
 const CANCEL_TAG: u64 = 1;
 
+/// Probed io_uring opcode support. Opcodes that are not supported by the
+/// running kernel fall back to synchronous POSIX syscalls.
+struct UringCapabilities {
+    ftruncate: bool,
+}
+
 pub struct UringIO {
     inner: Arc<Mutex<InnerUringIO>>,
+    caps: Arc<UringCapabilities>,
 }
 
 unsafe impl Send for UringIO {}
@@ -119,6 +126,18 @@ impl UringIO {
         // to similar logic as the existing buffer pool for cases where it is over capacity.
         ring.submitter()
             .register_buffers_sparse(ARENA_COUNT as u32).map_err(|e| io_error(e, "register_buffers"))?;
+        // Probe supported opcodes so we can fall back to POSIX for unsupported ones.
+        let mut probe = io_uring::register::Probe::new();
+        let caps = if ring.submitter().register_probe(&mut probe).is_ok() {
+            UringCapabilities {
+                ftruncate: probe.is_supported(io_uring::opcode::Ftruncate::CODE),
+            }
+        } else {
+            UringCapabilities { ftruncate: false }
+        };
+        if !caps.ftruncate {
+            warn!("io_uring: IORING_OP_FTRUNCATE not supported by kernel, using POSIX fallback");
+        }
         let inner = InnerUringIO {
             ring: WrappedIOUring {
                 ring,
@@ -133,6 +152,7 @@ impl UringIO {
         debug!("Using IO backend 'io-uring'");
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
+            caps: Arc::new(caps),
         })
     }
 }
@@ -487,6 +507,7 @@ impl IO for UringIO {
         let id = self.inner.lock().register_file(file.as_raw_fd()).ok();
         let uring_file = Arc::new(UringFile {
             io: self.inner.clone(),
+            caps: self.caps.clone(),
             file,
             id,
         });
@@ -654,6 +675,7 @@ fn completion_from_key(key: u64) -> Completion {
 
 pub struct UringFile {
     io: Arc<Mutex<InnerUringIO>>,
+    caps: Arc<UringCapabilities>,
     file: std::fs::File,
     id: Option<u32>,
 }
@@ -813,14 +835,25 @@ impl File for UringFile {
     }
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
-        let truncate = with_fd!(self, |fd| {
-            io_uring::opcode::Ftruncate::new(fd, len)
-                .build()
-                .user_data(get_key(c.clone()))
-        });
-        let mut io = self.io.lock();
-        io.ring.submit_entry(&truncate);
-        Ok(c)
+        if self.caps.ftruncate {
+            let truncate = with_fd!(self, |fd| {
+                io_uring::opcode::Ftruncate::new(fd, len)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            });
+            self.io.lock().ring.submit_entry(&truncate);
+            Ok(c)
+        } else {
+            let result = self.file.set_len(len);
+            match result {
+                Ok(()) => {
+                    trace!("file truncated to len=({})", len);
+                    c.complete(0);
+                    Ok(c)
+                }
+                Err(e) => Err(io_error(e, "truncate")),
+            }
+        }
     }
 }
 
