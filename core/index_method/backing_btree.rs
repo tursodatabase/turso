@@ -36,6 +36,7 @@ impl IndexMethodAttachment for BackingBTreeIndexMethodAttachment {
             index_name: &self.0,
             patterns: &[],
             backing_btree: true,
+            results_materialized: false,
         }
     }
 

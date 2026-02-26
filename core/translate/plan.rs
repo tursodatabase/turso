@@ -588,6 +588,9 @@ pub enum DmlSafetyReason {
     ReplaceMode,
     /// The statement updates key columns used by the scan itself.
     KeyMutation,
+    /// The index method cursor does not materialize results up front,
+    /// so writes could invalidate the live iterator.
+    IndexMethodNotMaterialized,
 }
 
 /// Safety decisions made while planning UPDATE/DELETE.

@@ -1490,6 +1490,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
             index_name: &self.cfg.index_name,
             patterns: &self.patterns,
             backing_btree: false,
+            results_materialized: true,
         }
     }
 

@@ -653,6 +653,18 @@ fn first_update_safety_reason(
             break 'requires Some(DmlSafetyReason::MultiIndexScan);
         }
 
+        // Index method cursors that stream lazily need rowids collected first.
+        if let Operation::IndexMethodQuery(query) = &table_ref.op {
+            let attachment = query
+                .index
+                .index_method
+                .as_ref()
+                .expect("IndexMethodQuery always has an index_method attachment");
+            if !attachment.definition().results_materialized {
+                break 'requires Some(DmlSafetyReason::IndexMethodNotMaterialized);
+            }
+        }
+
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
         let database_id = table_ref.database_id;

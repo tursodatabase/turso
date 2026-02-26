@@ -302,6 +302,19 @@ fn record_delete_optimizer_safety(plan: &mut DeletePlan) {
     {
         plan.safety.require(DmlSafetyReason::MultiIndexScan);
     }
+    if let Some(Operation::IndexMethodQuery(query)) =
+        plan.table_references.joined_tables().first().map(|t| &t.op)
+    {
+        let attachment = query
+            .index
+            .index_method
+            .as_ref()
+            .expect("IndexMethodQuery always has an index_method attachment");
+        if !attachment.definition().results_materialized {
+            plan.safety
+                .require(DmlSafetyReason::IndexMethodNotMaterialized);
+        }
+    }
 }
 
 /// Convert a DELETE plan into a RowSet-driven delete:

@@ -343,6 +343,7 @@ impl IndexMethodAttachment for VectorSparseInvertedIndexMethodAttachment {
             index_name: &self.configuration.index_name,
             patterns: self.patterns.as_slice(),
             backing_btree: false,
+            results_materialized: true,
         }
     }
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
