@@ -1,5 +1,6 @@
 @database :memory:
 @skip-file-if sqlite "sqlite does not support index method syntax or fts_match()"
+@skip-file-if mvcc "index methods not supported in mvcc mode"
 
 @backend cli
 test fts-delete-where-match {
