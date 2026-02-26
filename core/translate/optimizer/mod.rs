@@ -1725,6 +1725,17 @@ fn optimize_table_access(
                         &usable_constraint_refs,
                     );
 
+                    mark_seek_constraints_consumed(
+                        &table_constraints.constraints,
+                        &usable_constraint_refs,
+                        where_clause,
+                        table_references.joined_tables()[table_idx]
+                            .join_info
+                            .as_ref()
+                            .is_some_and(|ji| ji.is_outer()),
+                        hash_join_build_only_tables.contains(&table_idx),
+                    );
+
                     let ephemeral_index = Arc::new(ephemeral_index);
                     table_references.joined_tables_mut()[table_idx].op =
                         Operation::Search(Search::Seek {
@@ -1742,39 +1753,15 @@ fn optimize_table_access(
                         .join_info
                         .as_ref()
                         .is_some_and(|join_info| join_info.is_outer());
-                    // Build-only hash-join tables do not have a main-loop cursor,
-                    // so leave cross-table constraints for probe-side evaluation.
                     let defer_cross_table_constraints =
                         hash_join_build_only_tables.contains(&table_idx);
-                    for cref in constraint_refs.iter() {
-                        for constraint_vec_pos in &[cref.eq, cref.lower_bound, cref.upper_bound] {
-                            let Some(constraint_vec_pos) = constraint_vec_pos else {
-                                continue;
-                            };
-                            let constraint =
-                                &constraints_per_table[table_idx].constraints[*constraint_vec_pos];
-                            let where_term = &mut where_clause[constraint.where_clause_pos.0];
-                            turso_assert!(
-                                !where_term.consumed,
-                                "trying to consume a where clause term twice",
-                                {"where_term": format!("{where_term:?}")}
-                            );
-                            if is_outer_join && where_term.from_outer_join.is_none() {
-                                // Don't consume WHERE terms from outer joins if the where term is not part of the outer join condition. Consider:
-                                // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
-                                // - there is no row in t2 where t2.id = 5
-                                // This should never produce any rows with null columns for t2 (because NULL != 5), but if we consume 't2.id = 5' to use it as a seek key,
-                                // this will cause a null row to be emitted for EVERY row of t1.
-                                // Note: in most cases like this, the LEFT JOIN could just be converted into an INNER JOIN (because e.g. t2.id=5 statically excludes any null rows),
-                                // but that optimization should not be done here - it should be done before the join order optimization happens.
-                                continue;
-                            }
-                            if defer_cross_table_constraints && !constraint.lhs_mask.is_empty() {
-                                continue;
-                            }
-                            where_term.consumed = true;
-                        }
-                    }
+                    mark_seek_constraints_consumed(
+                        &constraints_per_table[table_idx].constraints,
+                        constraint_refs,
+                        where_clause,
+                        is_outer_join,
+                        defer_cross_table_constraints,
+                    );
                     if let Some(index) = &index {
                         table_references.joined_tables_mut()[table_idx].op =
                             Operation::Search(Search::Seek {
@@ -2082,6 +2069,41 @@ fn build_vtab_scan_op(
         idx_str: idx_str.clone(),
         constraints,
     }))
+}
+
+/// Mark WHERE clause terms as consumed when they are covered by a seek
+/// (index seek, ephemeral auto-index seek, or rowid seek).
+///
+/// `is_outer_join`: skip consuming non-ON WHERE terms for outer joins, because
+/// the cursor may land on a NULL-extended row that the WHERE filter must still
+/// reject (e.g. `SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5`).
+///
+/// `defer_cross_table`: skip cross-table constraints for hash-join build-only
+/// tables that lack a main-loop cursor — the probe side will evaluate them.
+fn mark_seek_constraints_consumed(
+    constraints: &[Constraint],
+    constraint_refs: &[RangeConstraintRef],
+    where_clause: &mut [WhereTerm],
+    is_outer_join: bool,
+    defer_cross_table: bool,
+) {
+    for cref in constraint_refs.iter() {
+        for pos in &[cref.eq, cref.lower_bound, cref.upper_bound] {
+            let Some(pos) = pos else { continue };
+            let constraint = &constraints[*pos];
+            let where_term = &mut where_clause[constraint.where_clause_pos.0];
+            if where_term.consumed {
+                continue;
+            }
+            if is_outer_join && where_term.from_outer_join.is_none() {
+                continue;
+            }
+            if defer_cross_table && !constraint.lhs_mask.is_empty() {
+                continue;
+            }
+            where_term.consumed = true;
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
