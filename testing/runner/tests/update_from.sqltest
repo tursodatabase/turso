@@ -1,0 +1,172 @@
+@database :memory:
+
+# UPDATE ... FROM tests (SQLite-compatible UPDATE FROM syntax)
+
+@cross-check-integrity
+test update-from-basic {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'old1'), (2, 'old2'), (3, 'old3');
+    INSERT INTO t2 VALUES (1, 'new1'), (2, 'new2');
+    UPDATE t1 SET val = t2.val FROM t2 WHERE t1.id = t2.id;
+    SELECT * FROM t1;
+}
+expect {
+    1|new1
+    2|new2
+    3|old3
+}
+
+@cross-check-integrity
+test update-from-multiple-set-columns {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    INSERT INTO t1 VALUES (1, 'old_a', 10), (2, 'old_b', 20), (3, 'old_c', 30);
+    INSERT INTO t2 VALUES (1, 'new_a', 100), (3, 'new_c', 300);
+    UPDATE t1 SET a = t2.a, b = t2.b FROM t2 WHERE t1.id = t2.id;
+    SELECT * FROM t1;
+}
+expect {
+    1|new_a|100
+    2|old_b|20
+    3|new_c|300
+}
+
+@cross-check-integrity
+test update-from-expression-in-set {
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, total REAL, discount REAL);
+    CREATE TABLE coupons(order_id INTEGER, pct REAL);
+    INSERT INTO orders VALUES (1, 100.0, 0.0), (2, 200.0, 0.0), (3, 300.0, 0.0);
+    INSERT INTO coupons VALUES (1, 0.1), (3, 0.2);
+    UPDATE orders SET discount = orders.total * coupons.pct FROM coupons WHERE orders.id = coupons.order_id;
+    SELECT * FROM orders;
+}
+expect {
+    1|100.0|10.0
+    2|200.0|0.0
+    3|300.0|60.0
+}
+
+@cross-check-integrity
+test update-from-with-join {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(id INTEGER, val TEXT);
+    CREATE TABLE t3(id INTEGER, active INTEGER);
+    INSERT INTO t1 VALUES (1, 'old1'), (2, 'old2'), (3, 'old3');
+    INSERT INTO t2 VALUES (1, 'new1'), (2, 'new2'), (3, 'new3');
+    INSERT INTO t3 VALUES (1, 1), (2, 0), (3, 1);
+    UPDATE t1 SET val = t2.val FROM t2 JOIN t3 ON t2.id = t3.id WHERE t1.id = t2.id AND t3.active = 1;
+    SELECT * FROM t1;
+}
+expect {
+    1|new1
+    2|old2
+    3|new3
+}
+
+@cross-check-integrity
+test update-from-null-values {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(id INTEGER, val TEXT);
+    INSERT INTO t1 VALUES (1, 'hello'), (2, 'world');
+    INSERT INTO t2 VALUES (1, NULL);
+    UPDATE t1 SET val = t2.val FROM t2 WHERE t1.id = t2.id;
+    SELECT id, val IS NULL FROM t1;
+}
+expect {
+    1|1
+    2|0
+}
+
+@cross-check-integrity
+test update-from-self-join {
+    CREATE TABLE emp(id INTEGER PRIMARY KEY, name TEXT, mgr_id INTEGER);
+    INSERT INTO emp VALUES (1, 'Alice', NULL), (2, 'Bob', 1), (3, 'Charlie', 1);
+    UPDATE emp SET name = emp.name || ' (reports to ' || m.name || ')' FROM emp AS m WHERE emp.mgr_id = m.id;
+    SELECT * FROM emp;
+}
+expect {
+    1|Alice|
+    2|Bob (reports to Alice)|1
+    3|Charlie (reports to Alice)|1
+}
+
+@cross-check-integrity
+test update-from-subquery {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE t1 SET val = sub.total FROM (SELECT id, val * 2 AS total FROM t1) AS sub WHERE t1.id = sub.id;
+    SELECT * FROM t1;
+}
+expect {
+    1|20
+    2|40
+    3|60
+}
+
+@cross-check-integrity
+test update-from-comma-separated-tables {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c);
+    CREATE TABLE t3(d);
+    INSERT INTO t1 VALUES ('a', 'a');
+    INSERT INTO t2 VALUES ('ddd');
+    INSERT INTO t3 VALUES(1234);
+    UPDATE t1 SET b = t2.rowid FROM t2, t3;
+    SELECT * FROM t1;
+}
+expect {
+    a|1
+}
+
+@cross-check-integrity
+test update-from-no-match {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'original');
+    INSERT INTO t2 VALUES (99, 'no_match');
+    UPDATE t1 SET val = t2.val FROM t2 WHERE t1.id = t2.id;
+    SELECT * FROM t1;
+}
+expect {
+    1|original
+}
+
+@cross-check-integrity
+test update-from-empty-from-table {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'original');
+    UPDATE t1 SET val = t2.val FROM t2 WHERE t1.id = t2.id;
+    SELECT * FROM t1;
+}
+expect {
+    1|original
+}
+
+@cross-check-integrity
+test update-from-returning {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'old1'), (2, 'old2'), (3, 'old3');
+    INSERT INTO t2 VALUES (1, 'new1'), (3, 'new3');
+    UPDATE t1 SET val = t2.val FROM t2 WHERE t1.id = t2.id RETURNING t1.id, t1.val;
+}
+expect {
+    1|new1
+    3|new3
+}
+
+@cross-check-integrity
+test update-from-with-cte {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+    WITH doubles AS (SELECT id, val * 2 AS dval FROM t1)
+    UPDATE t1 SET val = doubles.dval FROM doubles WHERE t1.id = doubles.id;
+    SELECT * FROM t1;
+}
+expect {
+    1|20
+    2|40
+    3|60
+}

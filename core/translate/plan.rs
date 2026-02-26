@@ -588,6 +588,8 @@ pub enum DmlSafetyReason {
     ReplaceMode,
     /// The statement updates key columns used by the scan itself.
     KeyMutation,
+    /// UPDATE ... FROM requires collecting joined results before writing.
+    FromClause,
 }
 
 /// Safety decisions made while planning UPDATE/DELETE.
@@ -665,6 +667,11 @@ pub struct UpdatePlan {
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+    /// Whether this UPDATE has a FROM clause (UPDATE ... FROM syntax).
+    /// When true, SET expression values are materialized into the ephemeral table
+    /// during phase 1 (the join), because the FROM table cursors are not available
+    /// during phase 2 (the update loop).
+    pub has_from_clause: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

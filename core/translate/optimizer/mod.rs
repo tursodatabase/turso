@@ -3,7 +3,7 @@ use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
     numeric::Numeric,
-    schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
+    schema::{BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type, ROWID_SENTINEL},
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
@@ -613,7 +613,7 @@ fn optimize_update_plan(
         plan.contains_constant_false_condition = true;
         return Ok(());
     }
-    let _ = optimize_table_access(
+    let best_join_order = optimize_table_access(
         schema,
         &mut [],
         &mut plan.table_references,
@@ -627,6 +627,10 @@ fn optimize_update_plan(
         false,
     )?;
 
+    if plan.has_from_clause {
+        plan.safety.require(DmlSafetyReason::FromClause);
+    }
+
     if let Some(reason) = first_update_safety_reason(plan, resolver)? {
         plan.safety.require(reason);
     }
@@ -635,7 +639,8 @@ fn optimize_update_plan(
         return Ok(());
     }
 
-    add_ephemeral_table_to_update_plan(program, plan)
+    let optimized_join_order = best_join_order.map(|(jo, _)| jo);
+    add_ephemeral_table_to_update_plan(program, plan, optimized_join_order)
 }
 
 fn first_update_safety_reason(
@@ -758,15 +763,45 @@ fn collect_update_phase_subquery_ids(
 fn add_ephemeral_table_to_update_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
+    optimized_join_order: Option<Vec<JoinOrderMember>>,
 ) -> Result<()> {
     let internal_id = program.table_reference_counter.next();
+    let has_from_clause = plan.has_from_clause;
+
+    // For UPDATE ... FROM, the ephemeral table stores pre-computed SET values
+    // because FROM table cursors are not available during the update phase.
+    // Layout: [set_val_0, set_val_1, ..., target_rowid]
+    // With EphemeralRowidMode::FromResultColumns, the last column is the key.
+    let ephemeral_columns = if has_from_clause {
+        let mut cols: Vec<Column> = plan
+            .set_clauses
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                Column::new(
+                    Some(format!("set_val_{i}")),
+                    String::new(),
+                    None,
+                    None,
+                    Type::Blob, // Generic type for ephemeral storage
+                    None,
+                    ColDef::default(),
+                )
+            })
+            .collect();
+        cols.push((*ROWID_COLUMN).clone());
+        cols
+    } else {
+        vec![(*ROWID_COLUMN).clone()]
+    };
+
     let ephemeral_table = Arc::new(BTreeTable {
         root_page: 0, // Not relevant for ephemeral table definition
         name: "ephemeral_scratch".to_string(),
         has_rowid: true,
         has_autoincrement: false,
         primary_key_columns: vec![],
-        columns: vec![(*ROWID_COLUMN).clone()],
+        columns: ephemeral_columns,
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
@@ -824,35 +859,79 @@ fn add_ephemeral_table_to_update_plan(
             .add_outer_query_reference(outer_ref.clone());
     }
 
-    let join_order = table_references_ephemeral_select
-        .joined_tables()
-        .iter()
-        .enumerate()
-        .map(|(i, t)| JoinOrderMember {
-            table_id: t.internal_id,
-            original_idx: i,
-            is_outer: t
-                .join_info
-                .as_ref()
-                .is_some_and(|join_info| join_info.is_outer()),
-        })
-        .collect();
+    // Use the optimized join order if available (for UPDATE ... FROM with multiple tables),
+    // otherwise fall back to the default order.
+    let join_order = optimized_join_order.unwrap_or_else(|| {
+        table_references_ephemeral_select
+            .joined_tables()
+            .iter()
+            .enumerate()
+            .map(|(i, t)| JoinOrderMember {
+                table_id: t.internal_id,
+                original_idx: i,
+                is_outer: t
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|join_info| join_info.is_outer()),
+            })
+            .collect()
+    });
     let rowid_internal_id = table_references_ephemeral_select
         .joined_tables()
         .first()
         .unwrap()
         .internal_id;
 
-    let ephemeral_plan = SelectPlan {
-        table_references: table_references_ephemeral_select,
-        result_columns: vec![ResultSetColumn {
+    // Build ephemeral SELECT result columns.
+    // For UPDATE ... FROM: [set_expr_0, set_expr_1, ..., target_rowid]
+    // For regular ephemeral: [target_rowid]
+    let result_columns = if has_from_clause {
+        let mut cols: Vec<ResultSetColumn> = plan
+            .set_clauses
+            .iter()
+            .map(|(_, expr)| ResultSetColumn {
+                expr: expr.as_ref().clone(),
+                alias: None,
+                contains_aggregates: false,
+            })
+            .collect();
+        cols.push(ResultSetColumn {
             expr: Expr::RowId {
                 database: None,
                 table: rowid_internal_id,
             },
             alias: None,
             contains_aggregates: false,
-        }],
+        });
+        cols
+    } else {
+        vec![ResultSetColumn {
+            expr: Expr::RowId {
+                database: None,
+                table: rowid_internal_id,
+            },
+            alias: None,
+            contains_aggregates: false,
+        }]
+    };
+
+    // For UPDATE ... FROM, rewrite SET clauses to read pre-computed values
+    // from the ephemeral table instead of evaluating the original expressions
+    // (which may reference FROM table columns no longer available in the update phase).
+    if has_from_clause {
+        for (i, (_, ref mut expr)) in plan.set_clauses.iter_mut().enumerate() {
+            *expr = Box::new(Expr::Column {
+                database: None,
+                table: internal_id,
+                column: i,
+                is_rowid_alias: false,
+            });
+        }
+    }
+
+    let ephemeral_plan = SelectPlan {
+        table_references: table_references_ephemeral_select,
+        result_columns,
         where_clause: plan.where_clause.drain(..).collect(),
         group_by: None,     // N/A
         order_by: vec![],   // N/A
@@ -870,12 +949,23 @@ fn add_ephemeral_table_to_update_plan(
         values: vec![],
         window: None,
         estimated_output_rows: None,
-        // Only move WHERE clause subqueries to the ephemeral plan.
-        // SET clause and RETURNING clause subqueries must remain in the main update plan
-        // because they compute new column values during the update phase (second pass),
-        // not during row collection (first pass). Moving them here would cause correlated
-        // subqueries in SET to evaluate with wrong cursor positions.
-        non_from_clause_subqueries: {
+        // For UPDATE ... FROM, SET clause subqueries move to the ephemeral plan
+        // because SET expressions are evaluated during phase 1 (the join).
+        // RETURNING subqueries must stay in the main plan (evaluated after INSERT).
+        // For regular ephemeral, only move WHERE clause subqueries.
+        non_from_clause_subqueries: if has_from_clause {
+            let mut ephemeral_subs = Vec::new();
+            let mut remaining = Vec::new();
+            for sq in plan.non_from_clause_subqueries.drain(..) {
+                if sq.is_returning {
+                    remaining.push(sq);
+                } else {
+                    ephemeral_subs.push(sq);
+                }
+            }
+            plan.non_from_clause_subqueries = remaining;
+            ephemeral_subs
+        } else {
             let update_phase_ids = collect_update_phase_subquery_ids(plan);
             let mut ephemeral_subs = Vec::new();
             let mut remaining = Vec::new();

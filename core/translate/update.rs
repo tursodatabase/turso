@@ -22,7 +22,7 @@ use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
 };
-use super::planner::{parse_where, plan_ctes_as_outer_refs};
+use super::planner::{parse_from, parse_where, plan_ctes_as_outer_refs};
 use super::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_set_clauses, plan_subqueries_from_where_clause,
@@ -167,9 +167,6 @@ fn validate_update(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
-    if body.from.is_some() {
-        bail_parse_error!("FROM clause is not supported in UPDATE");
-    }
     if body
         .indexed
         .as_ref()
@@ -272,6 +269,26 @@ pub fn prepare_update_plan(
 
     // Plan CTEs and add them as outer query references for subquery resolution
     plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
+
+    // Parse FROM clause tables (UPDATE ... FROM syntax) and add them to table_references.
+    // This must happen before SET/WHERE processing so that column references to FROM tables
+    // can be resolved during expression binding.
+    let has_from_clause = body.from.is_some();
+    let mut from_join_where_clause = vec![];
+    if has_from_clause {
+        let from_clause = body.from.take();
+        parse_from(
+            from_clause,
+            resolver,
+            program,
+            None, // CTEs already handled above
+            false,
+            &mut from_join_where_clause,
+            &mut vec![],
+            &mut table_references,
+            connection,
+        )?;
+    }
 
     let column_lookup: HashMap<String, usize> = table
         .columns()
@@ -382,7 +399,7 @@ pub fn prepare_update_plan(
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L395
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L670
     let columns = table.columns();
-    let mut where_clause = vec![];
+    let mut where_clause = from_join_where_clause;
     // Parse the WHERE clause
     parse_where(
         body.where_clause.as_deref(),
@@ -472,6 +489,7 @@ pub fn prepare_update_plan(
         cdc_update_alter_statement: None,
         non_from_clause_subqueries,
         safety: DmlSafety::default(),
+        has_from_clause,
     }))
 }
 
