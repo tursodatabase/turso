@@ -10668,6 +10668,15 @@ pub fn op_alter_column(
             }
         }
 
+        // Update unique_sets to reflect the renamed column
+        for unique_set in &mut btree.unique_sets {
+            for (col_name, _) in &mut unique_set.columns {
+                if col_name.eq_ignore_ascii_case(&old_column_name) {
+                    col_name.clone_from(&new_name);
+                }
+            }
+        }
+
         // Update CHECK constraint expressions to reference the new column name
         let old_col_normalized = normalize_ident(&old_column_name);
         for check in &mut btree.check_constraints {
