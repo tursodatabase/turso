@@ -401,10 +401,6 @@ pub struct JoinOrderMember {
     pub original_idx: usize,
     /// Whether this member is the right side of an OUTER JOIN
     pub is_outer: bool,
-    /// Whether this member is a semi-join (EXISTS)
-    pub is_semi: bool,
-    /// Whether this member is an anti-join (NOT EXISTS)
-    pub is_anti: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -689,6 +685,15 @@ pub fn select_star(
         tables.iter().collect()
     };
     for table in table_iter {
+        // Semi/anti-join tables are internal (from EXISTS/NOT EXISTS unnesting)
+        // and should not contribute columns to SELECT *.
+        if table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.is_semi_or_anti())
+        {
+            continue;
+        }
         out_columns.extend(
             table
                 .columns()
@@ -762,6 +767,11 @@ impl JoinInfo {
     /// Whether this is an anti-join (NOT EXISTS).
     pub fn is_anti(&self) -> bool {
         self.join_type == JoinType::Anti
+    }
+
+    /// Whether this is a semi-join or anti-join (EXISTS/NOT EXISTS).
+    pub fn is_semi_or_anti(&self) -> bool {
+        matches!(self.join_type, JoinType::Semi | JoinType::Anti)
     }
 }
 

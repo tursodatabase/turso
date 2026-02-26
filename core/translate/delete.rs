@@ -349,8 +349,6 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
                 table_id: t.internal_id,
                 original_idx: i,
                 is_outer: false,
-                is_semi: false,
-                is_anti: false,
             })
             .collect(),
         offset: plan.offset.take(),

@@ -832,8 +832,6 @@ fn add_ephemeral_table_to_update_plan(
                 .join_info
                 .as_ref()
                 .is_some_and(|join_info| join_info.is_outer()),
-            is_semi: false,
-            is_anti: false,
         })
         .collect();
     let rowid_internal_id = table_references_ephemeral_select
@@ -1596,14 +1594,6 @@ fn optimize_table_access(
                 .join_info
                 .as_ref()
                 .is_some_and(|join_info| join_info.is_outer()),
-            is_semi: table_references.joined_tables_mut()[table_number]
-                .join_info
-                .as_ref()
-                .is_some_and(|join_info| join_info.is_semi()),
-            is_anti: table_references.joined_tables_mut()[table_number]
-                .join_info
-                .as_ref()
-                .is_some_and(|join_info| join_info.is_anti()),
         })
         .collect();
 

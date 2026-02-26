@@ -1090,8 +1090,6 @@ pub fn compute_best_join_order<'a>(
         table_id: TableInternalId::default(),
         original_idx: 0,
         is_outer: false,
-        is_semi: false,
-        is_anti: false,
     });
 
     // Keep track of the current best cost so we can short-circuit planning for subplans
@@ -1121,8 +1119,6 @@ pub fn compute_best_join_order<'a>(
             table_id: table_ref.internal_id,
             original_idx: i,
             is_outer: false,
-            is_semi: false,
-            is_anti: false,
         };
         turso_assert_eq!(join_order.len(), 1);
         let rel = join_lhs_and_rhs(
@@ -1162,7 +1158,7 @@ pub fn compute_best_join_order<'a>(
             .filter(|t| {
                 t.join_info
                     .as_ref()
-                    .is_some_and(|j| j.is_outer() || j.is_semi() || j.is_anti())
+                    .is_some_and(|j| j.is_outer() || j.is_semi_or_anti())
             })
             .count();
         if ordering_constrained_count == 0 {
@@ -1178,7 +1174,7 @@ pub fn compute_best_join_order<'a>(
                     if joined_table
                         .join_info
                         .as_ref()
-                        .is_some_and(|j| j.is_outer() || j.is_semi() || j.is_anti())
+                        .is_some_and(|j| j.is_outer() || j.is_semi_or_anti())
                     {
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
@@ -1250,14 +1246,6 @@ pub fn compute_best_join_order<'a>(
                                 .join_info
                                 .as_ref()
                                 .is_some_and(|j| j.is_outer()),
-                            is_semi: joined_tables[table_no]
-                                .join_info
-                                .as_ref()
-                                .is_some_and(|j| j.is_semi()),
-                            is_anti: joined_tables[table_no]
-                                .join_info
-                                .as_ref()
-                                .is_some_and(|j| j.is_anti()),
                         });
                     }
                     join_order.push(JoinOrderMember {
@@ -1267,14 +1255,6 @@ pub fn compute_best_join_order<'a>(
                             .join_info
                             .as_ref()
                             .is_some_and(|j| j.is_outer()),
-                        is_semi: joined_tables[rhs_idx]
-                            .join_info
-                            .as_ref()
-                            .is_some_and(|j| j.is_semi()),
-                        is_anti: joined_tables[rhs_idx]
-                            .join_info
-                            .as_ref()
-                            .is_some_and(|j| j.is_anti()),
                     });
                     turso_assert_eq!(join_order.len(), subset_size);
 
@@ -1461,7 +1441,7 @@ pub fn compute_greedy_join_order<'a>(
         .filter(|(_, t)| {
             t.join_info
                 .as_ref()
-                .is_some_and(|ji| ji.is_outer() || ji.is_semi() || ji.is_anti())
+                .is_some_and(|ji| ji.is_outer() || ji.is_semi_or_anti())
         })
         .map(|(j, _)| {
             let mut required = TableMask::new();
@@ -1483,8 +1463,6 @@ pub fn compute_greedy_join_order<'a>(
         table_id: first_table.internal_id,
         original_idx: first_idx,
         is_outer: false, // First table cannot be outer join RHS
-        is_semi: false,
-        is_anti: false,
     });
     remaining.retain(|&x| x != first_idx);
 
@@ -1574,8 +1552,6 @@ pub fn compute_greedy_join_order<'a>(
             last.table_id = table.internal_id;
             last.original_idx = idx;
             last.is_outer = table.join_info.as_ref().is_some_and(|ji| ji.is_outer());
-            last.is_semi = table.join_info.as_ref().is_some_and(|ji| ji.is_semi());
-            last.is_anti = table.join_info.as_ref().is_some_and(|ji| ji.is_anti());
 
             if let Some(plan) = join_lhs_and_rhs(
                 current_plan.as_ref(),
@@ -1618,8 +1594,6 @@ pub fn compute_greedy_join_order<'a>(
                 .join_info
                 .as_ref()
                 .is_some_and(|ji| ji.is_outer()),
-            is_semi: next_table.join_info.as_ref().is_some_and(|ji| ji.is_semi()),
-            is_anti: next_table.join_info.as_ref().is_some_and(|ji| ji.is_anti()),
         });
         remaining.retain(|&x| x != next_idx);
         current_plan = Some(next_plan);
@@ -1723,8 +1697,6 @@ pub fn compute_naive_left_deep_plan<'a>(
             table_id: t.internal_id,
             original_idx: i,
             is_outer: t.join_info.as_ref().is_some_and(|j| j.is_outer()),
-            is_semi: t.join_info.as_ref().is_some_and(|j| j.is_semi()),
-            is_anti: t.join_info.as_ref().is_some_and(|j| j.is_anti()),
         })
         .collect::<Vec<_>>();
 

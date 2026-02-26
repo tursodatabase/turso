@@ -913,14 +913,6 @@ fn materialization_prefix(
                 .join_info
                 .as_ref()
                 .is_some_and(|join_info| join_info.is_outer()),
-            is_semi: probe_table
-                .join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_semi()),
-            is_anti: probe_table
-                .join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_anti()),
         });
     }
     let probe_pos = join_order
@@ -943,14 +935,6 @@ fn materialization_prefix(
                 .join_info
                 .as_ref()
                 .is_some_and(|join_info| join_info.is_outer()),
-            is_semi: build_table
-                .join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_semi()),
-            is_anti: build_table
-                .join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_anti()),
         });
     }
 
@@ -1552,8 +1536,6 @@ fn emit_program_for_delete(
             table_id: t.internal_id,
             original_idx: i,
             is_outer: false,
-            is_semi: false,
-            is_anti: false,
         })
         .collect::<Vec<_>>();
 
@@ -2548,8 +2530,6 @@ fn emit_program_for_update(
             table_id: t.internal_id,
             original_idx: i,
             is_outer: false,
-            is_semi: false,
-            is_anti: false,
         })
         .collect::<Vec<_>>();
 

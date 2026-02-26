@@ -313,8 +313,6 @@ fn prepare_one_select_plan(
                         table_id: t.internal_id,
                         original_idx: i,
                         is_outer: t.join_info.as_ref().is_some_and(|j| j.is_outer()),
-                        is_semi: t.join_info.as_ref().is_some_and(|j| j.is_semi()),
-                        is_anti: t.join_info.as_ref().is_some_and(|j| j.is_anti()),
                     })
                     .collect(),
                 table_references,

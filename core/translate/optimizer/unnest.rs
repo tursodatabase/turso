@@ -32,6 +32,7 @@
 //! - [PG-JOIN-ORDER] https://www.postgresql.org/docs/current/queries-table-expressions.html
 //! - [MYSQL-SEMIJOIN] https://dev.mysql.com/doc/refman/8.4/en/semijoins-antijoins.html
 
+use smallvec::SmallVec;
 use turso_parser::ast::{self, Expr, TableInternalId, UnaryOperator};
 
 use crate::function::{Deterministic, Func};
@@ -397,8 +398,8 @@ fn is_correlation_equality(
 }
 
 /// Collect all table IDs referenced by column expressions in an expression tree.
-fn collect_table_refs(expr: &Expr) -> Vec<TableInternalId> {
-    let mut refs = Vec::new();
+fn collect_table_refs(expr: &Expr) -> SmallVec<[TableInternalId; 2]> {
+    let mut refs = SmallVec::new();
     let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
         if let Expr::Column { table, .. } = e {
             if !refs.contains(table) {

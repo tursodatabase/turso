@@ -838,11 +838,11 @@ pub fn try_hash_join_access_method(
     if probe_table
         .join_info
         .as_ref()
-        .is_some_and(|ji| ji.is_semi() || ji.is_anti())
+        .is_some_and(|ji| ji.is_semi_or_anti())
         || build_table
             .join_info
             .as_ref()
-            .is_some_and(|ji| ji.is_semi() || ji.is_anti())
+            .is_some_and(|ji| ji.is_semi_or_anti())
     {
         return None;
     }
