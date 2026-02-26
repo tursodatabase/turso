@@ -1675,6 +1675,20 @@ expect {
     0
 }
 
+# Self-referential CASCADE recursion depth guard in Turso backends.
+@skip-if sqlite "sqlite CLI succeeds for this shallow self-reference"
+test fk-cascade-delete-self-reference-depth-limit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES t(id) ON DELETE CASCADE
+    );
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2), (4, 3);
+    DELETE FROM t WHERE id = 1;
+}
+expect error {
+}
+
 # Basic ON UPDATE CASCADE - single child row
 @cross-check-integrity
 test fk-cascade-update-basic {
@@ -2615,7 +2629,6 @@ test fk-drop-column-composite-fk-fails {
 }
 expect error {
 }
-
 # No-op UPDATE on NULL FK column with deferred FK should not error (#5410)
 @cross-check-integrity
 test fk-deferred-noop-update-null {

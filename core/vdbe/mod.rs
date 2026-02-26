@@ -891,6 +891,7 @@ pub struct PrepareContext {
     page_size: u32,
     sync_mode: SyncMode,
     data_sync_retry: bool,
+    trigger_recursion_limit: i32,
     encryption_key_set: bool,
     encryption_cipher: CipherMode,
     mvcc_checkpoint_threshold: Option<i64>,
@@ -912,6 +913,7 @@ impl PrepareContext {
             page_size: connection.get_page_size().get(),
             sync_mode: connection.get_sync_mode(),
             data_sync_retry: connection.get_data_sync_retry(),
+            trigger_recursion_limit: connection.get_trigger_recursion_limit(),
             encryption_key_set: connection.encryption_key.read().is_some(),
             encryption_cipher: connection.encryption_cipher_mode.get(),
             mvcc_checkpoint_threshold: connection
