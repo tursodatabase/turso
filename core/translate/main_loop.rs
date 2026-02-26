@@ -478,7 +478,62 @@ pub fn init_loop(
                         db: table.database_id,
                     });
                 }
-                _ => panic!("only SELECT is supported for index method"),
+                OperationMode::DELETE => {
+                    if let Some(table_cursor_id) = table_cursor_id {
+                        program.emit_insn(Insn::OpenWrite {
+                            cursor_id: table_cursor_id,
+                            root_page: table.table.get_root_page()?.into(),
+                            db: table.database_id,
+                        });
+                    }
+                    let index_cursor_id = index_cursor_id.unwrap();
+                    program.emit_insn(Insn::OpenWrite {
+                        cursor_id: index_cursor_id,
+                        root_page: table.op.index().unwrap().root_page.into(),
+                        db: table.database_id,
+                    });
+                    // For DELETE, open all other indexes for writing so they
+                    // get updated when rows are removed.
+                    let indices: Vec<_> =
+                        t_ctx.resolver.with_schema(table.database_id, |s| {
+                            s.get_indices(table.table.get_name()).cloned().collect()
+                        });
+                    for index in &indices {
+                        if table
+                            .op
+                            .index()
+                            .is_some_and(|table_index| table_index.name == index.name)
+                        {
+                            continue;
+                        }
+                        let cursor_id = program.alloc_cursor_index(
+                            Some(CursorKey::index(table.internal_id, index.clone())),
+                            index,
+                        )?;
+                        program.emit_insn(Insn::OpenWrite {
+                            cursor_id,
+                            root_page: index.root_page.into(),
+                            db: table.database_id,
+                        });
+                    }
+                }
+                OperationMode::UPDATE { .. } => {
+                    let table_cursor_id = table_cursor_id.expect(
+                        "table cursor is always opened in OperationMode::UPDATE for IndexMethodQuery",
+                    );
+                    program.emit_insn(Insn::OpenWrite {
+                        cursor_id: table_cursor_id,
+                        root_page: table.table.get_root_page()?.into(),
+                        db: table.database_id,
+                    });
+                    let index_cursor_id = index_cursor_id.unwrap();
+                    program.emit_insn(Insn::OpenWrite {
+                        cursor_id: index_cursor_id,
+                        root_page: table.op.index().unwrap().root_page.into(),
+                        db: table.database_id,
+                    });
+                }
+                _ => panic!("Unsupported operation mode for index method"),
             },
             Operation::HashJoin(_) => {
                 match mode {
