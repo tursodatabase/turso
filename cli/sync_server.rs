@@ -86,6 +86,7 @@ impl TursoSyncServer {
 
     fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
         let mut buffer = [0u8; 8192];
         let mut request_data = Vec::new();
