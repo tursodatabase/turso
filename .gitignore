@@ -6,6 +6,7 @@
 **/target
 
 *.so
+*.dylib
 *.ipynb
 *.o
 *.sqlite
