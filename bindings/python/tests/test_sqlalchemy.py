@@ -5,11 +5,10 @@ import pytest
 # Skip all tests if SQLAlchemy is not installed
 sqlalchemy = pytest.importorskip("sqlalchemy")
 
-from sqlalchemy import Column, Integer, String, create_engine, text
-from sqlalchemy.engine import URL
-from sqlalchemy.orm import Session, declarative_base
-
-from turso.sqlalchemy import TursoDialect, TursoSyncDialect, get_sync_connection
+from sqlalchemy import Column, Integer, String, create_engine, text  # noqa: E402
+from sqlalchemy.engine import URL  # noqa: E402
+from sqlalchemy.orm import Session, declarative_base  # noqa: E402
+from turso.sqlalchemy import TursoDialect, TursoSyncDialect, get_sync_connection  # noqa: E402
 
 
 class TestTursoDialectImport:
@@ -394,7 +393,7 @@ class TestSyncDialectIntegration:
     @pytest.fixture
     def server(self):
         """Create a TursoServer for testing."""
-        requests = pytest.importorskip("requests")
+        pytest.importorskip("requests")
         from tests.utils import TursoServer
 
         try:

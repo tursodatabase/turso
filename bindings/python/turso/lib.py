@@ -42,8 +42,8 @@ def _get_sqlite_version() -> tuple[str, tuple[int, int, int]]:
     """Get SQLite version from a temporary connection."""
     try:
         cfg = PyTursoDatabaseConfig(path=":memory:")
-        db = py_turso_open_database(cfg)
-        conn = py_turso_connect_database(db)
+        db = py_turso_database_open(cfg)
+        conn = db.connect()
         stmt = conn.prepare("SELECT sqlite_version()")
         result = stmt.step()
         version_str = result[0]

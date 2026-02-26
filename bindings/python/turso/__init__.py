@@ -2,7 +2,7 @@ import logging
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
-from .lib import (
+from .lib import (  # noqa: E402
     Connection,
     Cursor,
     DatabaseError,
