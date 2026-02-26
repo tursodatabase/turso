@@ -412,10 +412,6 @@ pub struct TranslateCtx<'a> {
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
     /// mapping between table loop index and associated metadata (for semi/anti joins)
     pub meta_semi_anti_joins: Vec<Option<SemiAntiJoinMetadata>>,
-    /// Labels that need to be resolved to the "next iteration" address of their
-    /// target table. For hash join probes this is HashNext, for scans it's Next.
-    /// Each entry is (outer_table_idx, label_to_resolve).
-    pub semi_anti_outer_next_labels: Vec<(usize, BranchOffset)>,
     pub resolver: Resolver<'a>,
     /// Hash table contexts for hash joins, keyed by build table index.
     pub hash_table_contexts: HashMap<usize, HashCtx>,
@@ -459,7 +455,6 @@ impl<'a> TranslateCtx<'a> {
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_semi_anti_joins: (0..table_count).map(|_| None).collect(),
-            semi_anti_outer_next_labels: Vec::new(),
             meta_sort: None,
             hash_table_contexts: HashMap::default(),
             materialized_build_inputs: HashMap::default(),

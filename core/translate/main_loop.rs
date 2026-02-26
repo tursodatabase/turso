@@ -68,6 +68,9 @@ pub struct SemiAntiJoinMetadata {
     pub label_body: BranchOffset,
     /// Label of the outer loop's Next instruction (to skip outer row or skip inner loop).
     pub label_next_outer: BranchOffset,
+    /// The original table index of the outer (non-semi/anti) table whose Next
+    /// instruction `label_next_outer` should resolve to.
+    pub outer_table_idx: usize,
 }
 
 /// Jump labels for each loop in the query's main execution loop
@@ -235,13 +238,10 @@ pub fn init_loop(
                 // to jump to the HashNext (which advances to the next hash match
                 // for the current outer row). We allocate a fresh label here and
                 // resolve it in close_loop at the right point.
-                let label_next_outer = program.allocate_label();
-                t_ctx
-                    .semi_anti_outer_next_labels
-                    .push((outer_table_idx, label_next_outer));
                 let sa_metadata = SemiAntiJoinMetadata {
                     label_body: program.allocate_label(),
-                    label_next_outer,
+                    label_next_outer: program.allocate_label(),
+                    outer_table_idx,
                 };
                 t_ctx.meta_semi_anti_joins[table_index] = Some(sa_metadata);
             }
@@ -2878,9 +2878,9 @@ pub fn close_loop<'a>(
 
         // Resolve any semi/anti-join "outer next" labels targeting this table.
         if let Some(pc) = semi_anti_next_pc {
-            for (target_idx, label) in &t_ctx.semi_anti_outer_next_labels {
-                if *target_idx == table_index {
-                    program.resolve_label(*label, pc);
+            for meta in t_ctx.meta_semi_anti_joins.iter().flatten() {
+                if meta.outer_table_idx == table_index {
+                    program.resolve_label(meta.label_next_outer, pc);
                 }
             }
         }
