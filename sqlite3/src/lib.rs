@@ -502,13 +502,73 @@ pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut sqlite3, ms: ffi::c_int) 
     SQLITE_OK
 }
 
+/// Type for C authorizer callback function.
+type AuthorizerFn = unsafe extern "C" fn(
+    *mut ffi::c_void,
+    ffi::c_int,
+    *const ffi::c_char,
+    *const ffi::c_char,
+    *const ffi::c_char,
+    *const ffi::c_char,
+) -> ffi::c_int;
+
+/// Register an authorizer callback for the database connection.
+///
+/// The authorizer callback is invoked during SQL statement compilation to check
+/// whether specific operations are allowed.
+///
+/// If the callback returns SQLITE_OK, the operation is allowed.
+/// If the callback returns SQLITE_DENY, the entire SQL statement is rejected.
+/// If the callback returns SQLITE_IGNORE, the operation is silently disallowed.
+///
+/// Only one authorizer can be active at a time; setting a new one replaces the previous.
+/// Pass NULL callback to disable the authorizer.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_set_authorizer(
-    _db: *mut sqlite3,
-    _callback: Option<unsafe extern "C" fn() -> ffi::c_int>,
-    _context: *mut ffi::c_void,
+    db: *mut sqlite3,
+    callback: Option<AuthorizerFn>,
+    context: *mut ffi::c_void,
 ) -> ffi::c_int {
-    stub!();
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+
+    let db_ref = &*db;
+    let inner = match db_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    match callback {
+        None => {
+            inner.conn.set_authorizer(None);
+        }
+        Some(c_callback) => {
+            let ctx = context as usize; // Convert to usize for Send+Sync
+            let cb = c_callback;
+            inner
+                .conn
+                .set_authorizer(Some(Box::new(move |action, arg3, arg4, arg5, arg6| {
+                    // Convert Option<&str> to CString then to *const c_char (NULL for None)
+                    let c_arg3 = arg3.map(|s| CString::new(s).unwrap_or_default());
+                    let c_arg4 = arg4.map(|s| CString::new(s).unwrap_or_default());
+                    let c_arg5 = arg5.map(|s| CString::new(s).unwrap_or_default());
+                    let c_arg6 = arg6.map(|s| CString::new(s).unwrap_or_default());
+                    unsafe {
+                        cb(
+                            ctx as *mut ffi::c_void,
+                            action as ffi::c_int,
+                            c_arg3.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                            c_arg4.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                            c_arg5.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                            c_arg6.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                        )
+                    }
+                })));
+        }
+    }
+
+    SQLITE_OK
 }
 
 #[no_mangle]
@@ -2536,6 +2596,7 @@ fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
         LimboError::Busy => SQLITE_BUSY,
+        LimboError::AuthDenied(_) => SQLITE_AUTH,
         _ => SQLITE_ERROR,
     }
 }

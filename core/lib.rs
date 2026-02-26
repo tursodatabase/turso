@@ -1,3 +1,4 @@
+pub mod authorizer;
 pub mod busy;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
@@ -60,6 +61,7 @@ mod vtab;
 pub use function::MathFunc;
 
 use crate::{
+    authorizer::AuthorizerCallback,
     busy::{BusyHandler, BusyHandlerCallback},
     incremental::view::AllViewsTxState,
     index_method::IndexMethod,
@@ -1295,6 +1297,8 @@ impl Database {
             fk_deferred_violations: AtomicIsize::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
+            authorizer: RwLock::new(None),
+            authorizer_generation: AtomicU64::new(0),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);

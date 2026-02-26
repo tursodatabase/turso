@@ -97,6 +97,8 @@ pub enum LimboError {
     PlanningError(String),
     #[error("Checkpoint failed: {0}")]
     CheckpointFailed(String),
+    #[error("{0}")]
+    AuthDenied(String),
 }
 
 #[cfg(target_family = "unix")]

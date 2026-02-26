@@ -45,6 +45,7 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+use crate::authorizer::{self, action};
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
@@ -52,7 +53,7 @@ use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
-use crate::{bail_parse_error, Connection, Result, SymbolTable};
+use crate::{bail_parse_error, Connection, LimboError, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize};
@@ -107,6 +108,18 @@ pub fn translate(
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
+            let pragma_name = name.name.as_str();
+            let pragma_arg = body.as_ref().map(|b| match b {
+                ast::PragmaBody::Equals(v) | ast::PragmaBody::Call(v) => format!("{v}"),
+            });
+            check_auth(
+                &connection,
+                action::SQLITE_PRAGMA,
+                Some(pragma_name),
+                pragma_arg.as_deref(),
+                Some("main"),
+                None,
+            )?;
             pragma::translate_pragma(
                 &resolver,
                 &name,
@@ -122,6 +135,25 @@ pub fn translate(
     program.epilogue(schema);
 
     program.build(connection, change_cnt_on, input)
+}
+
+/// Check the authorizer and return an error if the action is denied.
+/// Returns Ok(true) if the action is allowed, Ok(false) if ignored (SQLITE_IGNORE).
+fn check_auth(
+    connection: &Connection,
+    action_code: i32,
+    arg3: Option<&str>,
+    arg4: Option<&str>,
+    db_name: Option<&str>,
+    trigger_name: Option<&str>,
+) -> Result<bool> {
+    let rc = connection.auth_check(action_code, arg3, arg4, db_name, trigger_name);
+    match rc {
+        authorizer::SQLITE_OK => Ok(true),
+        authorizer::SQLITE_DENY => Err(LimboError::AuthDenied("not authorized".to_string())),
+        authorizer::SQLITE_IGNORE => Ok(false),
+        _ => Err(LimboError::AuthDenied("authorizer malfunction".to_string())),
+    }
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -163,59 +195,161 @@ pub fn translate_inner(
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
 
     match stmt {
-        ast::Stmt::AlterTable(alter) => {
+        ast::Stmt::AlterTable(ref alter) => {
+            let tbl_name = alter.name.name.as_str();
+            let db_name = alter.name.db_name.as_ref().map(|n| n.as_str());
+            check_auth(
+                connection,
+                action::SQLITE_ALTER_TABLE,
+                db_name.or(Some("main")),
+                Some(tbl_name),
+                db_name.or(Some("main")),
+                None,
+            )?;
+            let ast::Stmt::AlterTable(alter) = stmt else {
+                unreachable!()
+            };
             translate_alter_table(alter, resolver, program, connection, input)?;
         }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
-        ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
+        ast::Stmt::Analyze { ref name } => {
+            let tbl = name.as_ref().map(|n| n.name.as_str());
+            check_auth(
+                connection,
+                action::SQLITE_ANALYZE,
+                tbl,
+                None,
+                Some("main"),
+                None,
+            )?;
+            let ast::Stmt::Analyze { name } = stmt else {
+                unreachable!()
+            };
+            translate_analyze(name, resolver, program)?
+        }
+        ast::Stmt::Attach {
+            ref expr,
+            ref db_name,
+            ref key,
+        } => {
+            check_auth(connection, action::SQLITE_ATTACH, None, None, None, None)?;
+            attach::translate_attach(expr, resolver, db_name, key, program, connection.clone())?;
         }
         ast::Stmt::Begin { typ, name } => {
+            check_auth(
+                connection,
+                action::SQLITE_TRANSACTION,
+                Some("BEGIN"),
+                None,
+                None,
+                None,
+            )?;
             translate_tx_begin(typ, name, resolver.schema(), program)?
         }
         ast::Stmt::Commit { name } => {
+            check_auth(
+                connection,
+                action::SQLITE_TRANSACTION,
+                Some("COMMIT"),
+                None,
+                None,
+                None,
+            )?;
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
+            // Auth check happens inside translate_create_index which has access to the index details
+            check_auth(
+                connection,
+                action::SQLITE_CREATE_INDEX,
+                None,
+                None,
+                Some("main"),
+                None,
+            )?;
             translate_create_index(program, connection, resolver, stmt)?;
         }
         ast::Stmt::CreateTable {
             temporary,
-            if_not_exists,
-            tbl_name,
-            body,
-        } => translate_create_table(
-            tbl_name,
-            resolver,
-            temporary,
-            if_not_exists,
-            body,
-            program,
-            connection,
-        )?,
+            ref tbl_name,
+            ..
+        } => {
+            let action_code = if temporary {
+                action::SQLITE_CREATE_TEMP_TABLE
+            } else {
+                action::SQLITE_CREATE_TABLE
+            };
+            let db_name = tbl_name.db_name.as_ref().map(|n| n.as_str());
+            check_auth(
+                connection,
+                action_code,
+                Some(tbl_name.name.as_str()),
+                None,
+                db_name.or(Some("main")),
+                None,
+            )?;
+            let ast::Stmt::CreateTable {
+                temporary,
+                if_not_exists,
+                tbl_name,
+                body,
+            } = stmt
+            else {
+                unreachable!()
+            };
+            translate_create_table(
+                tbl_name,
+                resolver,
+                temporary,
+                if_not_exists,
+                body,
+                program,
+                connection,
+            )?
+        }
         ast::Stmt::CreateTrigger {
             temporary,
             if_not_exists,
-            trigger_name,
+            ref trigger_name,
             time,
-            event,
-            tbl_name,
+            ref event,
+            ref tbl_name,
             for_each_row,
-            when_clause,
-            commands,
+            ref when_clause,
+            ref commands,
         } => {
+            let action_code = if temporary {
+                action::SQLITE_CREATE_TEMP_TRIGGER
+            } else {
+                action::SQLITE_CREATE_TRIGGER
+            };
+            check_auth(
+                connection,
+                action_code,
+                Some(trigger_name.name.as_str()),
+                Some(tbl_name.name.as_str()),
+                Some("main"),
+                None,
+            )?;
             // Reconstruct SQL for storage
             let sql = trigger::create_trigger_to_sql(
                 temporary,
                 if_not_exists,
-                &trigger_name,
+                trigger_name,
                 time,
-                &event,
-                &tbl_name,
+                event,
+                tbl_name,
                 for_each_row,
                 when_clause.as_deref(),
-                &commands,
+                commands,
             );
+            let ast::Stmt::CreateTrigger {
+                trigger_name,
+                tbl_name,
+                ..
+            } = stmt
+            else {
+                unreachable!()
+            };
             trigger::translate_create_trigger(
                 trigger_name,
                 resolver,
@@ -229,27 +363,58 @@ pub fn translate_inner(
             )?
         }
         ast::Stmt::CreateView {
-            view_name,
-            select,
-            columns,
+            ref view_name,
+            ref select,
+            ref columns,
             ..
-        } => view::translate_create_view(
-            &view_name, resolver, &select, &columns, program, connection,
-        )?,
+        } => {
+            check_auth(
+                connection,
+                action::SQLITE_CREATE_VIEW,
+                Some(view_name.name.as_str()),
+                None,
+                Some("main"),
+                None,
+            )?;
+            view::translate_create_view(view_name, resolver, select, columns, program, connection)?
+        }
         ast::Stmt::CreateMaterializedView {
-            view_name, select, ..
-        } => view::translate_create_materialized_view(
-            &view_name,
-            resolver,
-            &select,
-            connection.clone(),
-            program,
-        )?,
-        ast::Stmt::CreateVirtualTable(vtab) => {
+            ref view_name,
+            ref select,
+            ..
+        } => {
+            check_auth(
+                connection,
+                action::SQLITE_CREATE_VIEW,
+                Some(view_name.name.as_str()),
+                None,
+                Some("main"),
+                None,
+            )?;
+            view::translate_create_materialized_view(
+                view_name,
+                resolver,
+                select,
+                connection.clone(),
+                program,
+            )?
+        }
+        ast::Stmt::CreateVirtualTable(ref vtab) => {
+            check_auth(
+                connection,
+                action::SQLITE_CREATE_VTABLE,
+                Some(vtab.tbl_name.name.as_str()),
+                Some(vtab.module_name.as_str()),
+                Some("main"),
+                None,
+            )?;
+            let ast::Stmt::CreateVirtualTable(vtab) = stmt else {
+                unreachable!()
+            };
             translate_create_virtual_table(vtab, resolver, program, connection)?
         }
         ast::Stmt::Delete {
-            tbl_name,
+            ref tbl_name,
             where_clause,
             limit,
             returning,
@@ -257,6 +422,18 @@ pub fn translate_inner(
             order_by,
             with,
         } => {
+            check_auth(
+                connection,
+                action::SQLITE_DELETE,
+                Some(tbl_name.name.as_str()),
+                None,
+                tbl_name
+                    .db_name
+                    .as_ref()
+                    .map(|n| n.as_str())
+                    .or(Some("main")),
+                None,
+            )?;
             if indexed.is_some_and(|i| matches!(i, Indexed::IndexedBy(_))) {
                 bail_parse_error!("INDEXED BY clause is not supported in DELETE");
             }
@@ -264,7 +441,7 @@ pub fn translate_inner(
                 bail_parse_error!("ORDER BY clause is not supported in DELETE");
             }
             translate_delete(
-                &tbl_name,
+                tbl_name,
                 resolver,
                 where_clause,
                 limit,
@@ -274,64 +451,156 @@ pub fn translate_inner(
                 connection,
             )?
         }
-        ast::Stmt::Detach { name } => {
+        ast::Stmt::Detach { ref name } => {
+            let detach_name = format!("{name}");
+            check_auth(
+                connection,
+                action::SQLITE_DETACH,
+                Some(&detach_name),
+                None,
+                None,
+                None,
+            )?;
+            let ast::Stmt::Detach { name } = stmt else {
+                unreachable!()
+            };
             attach::translate_detach(&name, resolver, program, connection.clone())?
         }
         ast::Stmt::DropIndex {
             if_exists,
-            idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
-        ast::Stmt::DropTable {
-            if_exists,
-            tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
+            ref idx_name,
+        } => {
+            check_auth(
+                connection,
+                action::SQLITE_DROP_INDEX,
+                Some(idx_name.name.as_str()),
+                None,
+                Some("main"),
+                None,
+            )?;
+            translate_drop_index(idx_name, resolver, if_exists, program)?
+        }
+        ast::Stmt::DropTable { ref tbl_name, .. } => {
+            let db_name = tbl_name.db_name.as_ref().map(|n| n.as_str());
+            check_auth(
+                connection,
+                action::SQLITE_DROP_TABLE,
+                Some(tbl_name.name.as_str()),
+                None,
+                db_name.or(Some("main")),
+                None,
+            )?;
+            let ast::Stmt::DropTable {
+                if_exists,
+                tbl_name,
+            } = stmt
+            else {
+                unreachable!()
+            };
+            translate_drop_table(tbl_name, resolver, if_exists, program, connection)?
+        }
         ast::Stmt::DropTrigger {
             if_exists,
-            trigger_name,
-        } => trigger::translate_drop_trigger(
-            connection,
-            resolver,
-            &trigger_name,
-            if_exists,
-            program,
-        )?,
+            ref trigger_name,
+        } => {
+            check_auth(
+                connection,
+                action::SQLITE_DROP_TRIGGER,
+                Some(trigger_name.name.as_str()),
+                None,
+                Some("main"),
+                None,
+            )?;
+            trigger::translate_drop_trigger(connection, resolver, trigger_name, if_exists, program)?
+        }
         ast::Stmt::DropView {
             if_exists,
-            view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+            ref view_name,
+        } => {
+            check_auth(
+                connection,
+                action::SQLITE_DROP_VIEW,
+                Some(view_name.name.as_str()),
+                None,
+                Some("main"),
+                None,
+            )?;
+            view::translate_drop_view(resolver, view_name, if_exists, program)?
+        }
         ast::Stmt::CreateType {
             if_not_exists,
-            type_name,
-            body,
+            ref type_name,
+            ref body,
         } => {
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+            schema::translate_create_type(type_name, body, if_not_exists, resolver, program)?
         }
         ast::Stmt::DropType {
             if_exists,
-            type_name,
+            ref type_name,
         } => {
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&type_name, if_exists, resolver, program)?
+            schema::translate_drop_type(type_name, if_exists, resolver, program)?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
         ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
-        ast::Stmt::Optimize { idx_name } => {
+        ast::Stmt::Optimize { .. } => {
+            let ast::Stmt::Optimize { idx_name } = stmt else {
+                unreachable!()
+            };
             translate_optimize(idx_name, resolver, program, connection)?
         }
-        ast::Stmt::Release { name } => translate_release(program, name)?,
-        ast::Stmt::Rollback {
-            tx_name,
-            savepoint_name,
-        } => translate_rollback(program, tx_name, savepoint_name)?,
-        ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
+        ast::Stmt::Release { name } => {
+            check_auth(
+                connection,
+                action::SQLITE_SAVEPOINT,
+                Some("RELEASE"),
+                Some(name.as_str()),
+                None,
+                None,
+            )?;
+            translate_release(program, name)?
+        }
+        ast::Stmt::Rollback { .. } => {
+            check_auth(
+                connection,
+                action::SQLITE_TRANSACTION,
+                Some("ROLLBACK"),
+                None,
+                None,
+                None,
+            )?;
+            let ast::Stmt::Rollback {
+                tx_name,
+                savepoint_name,
+            } = stmt
+            else {
+                unreachable!()
+            };
+            translate_rollback(program, tx_name, savepoint_name)?
+        }
+        ast::Stmt::Savepoint { ref name } => {
+            check_auth(
+                connection,
+                action::SQLITE_SAVEPOINT,
+                Some("BEGIN"),
+                Some(name.as_str()),
+                None,
+                None,
+            )?;
+            let ast::Stmt::Savepoint { name } = stmt else {
+                unreachable!()
+            };
+            translate_savepoint(program, name)?
+        }
         ast::Stmt::Select(select) => {
+            check_auth(connection, action::SQLITE_SELECT, None, None, None, None)?;
             translate_select(
                 select,
                 resolver,
@@ -340,28 +609,64 @@ pub fn translate_inner(
                 connection,
             )?;
         }
-        ast::Stmt::Update(update) => translate_update(update, resolver, program, connection)?,
+        ast::Stmt::Update(ref update) => {
+            check_auth(
+                connection,
+                action::SQLITE_UPDATE,
+                Some(update.tbl_name.name.as_str()),
+                None,
+                update
+                    .tbl_name
+                    .db_name
+                    .as_ref()
+                    .map(|n| n.as_str())
+                    .or(Some("main")),
+                None,
+            )?;
+            let ast::Stmt::Update(update) = stmt else {
+                unreachable!()
+            };
+            translate_update(update, resolver, program, connection)?
+        }
         ast::Stmt::Vacuum { name, into } => {
             vacuum::translate_vacuum(program, name.as_ref(), into.as_deref())?
         }
-        ast::Stmt::Insert {
-            with,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-        } => translate_insert(
-            resolver,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            with,
-            program,
-            connection,
-        )?,
+        ast::Stmt::Insert { ref tbl_name, .. } => {
+            check_auth(
+                connection,
+                action::SQLITE_INSERT,
+                Some(tbl_name.name.as_str()),
+                None,
+                tbl_name
+                    .db_name
+                    .as_ref()
+                    .map(|n| n.as_str())
+                    .or(Some("main")),
+                None,
+            )?;
+            let ast::Stmt::Insert {
+                with,
+                or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
+            } = stmt
+            else {
+                unreachable!()
+            };
+            translate_insert(
+                resolver,
+                or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
+                with,
+                program,
+                connection,
+            )?
+        }
     };
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction

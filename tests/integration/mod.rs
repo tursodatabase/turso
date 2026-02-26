@@ -1,4 +1,5 @@
 mod assert_details;
+mod authorizer;
 mod common;
 mod conflict_resolution;
 mod custom_types;

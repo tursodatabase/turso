@@ -894,6 +894,7 @@ pub struct PrepareContext {
     encryption_key_set: bool,
     encryption_cipher: CipherMode,
     mvcc_checkpoint_threshold: Option<i64>,
+    authorizer_generation: u64,
 }
 
 impl PrepareContext {
@@ -919,6 +920,7 @@ impl PrepareContext {
                 .mvcc_enabled()
                 .then(|| connection.mvcc_checkpoint_threshold())
                 .and_then(|res| res.ok()),
+            authorizer_generation: connection.authorizer_generation(),
         }
     }
 

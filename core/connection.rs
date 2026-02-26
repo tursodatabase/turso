@@ -15,12 +15,12 @@ use crate::{
     io::{MemoryIO, IO},
     parse_schema_rows, refresh_analyze_stats, translate,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
-    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
-    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
-    Value, VirtualTable,
+    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, AuthorizerCallback,
+    BusyHandler, BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult,
+    CipherMode, Cmd, Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts,
+    Duration, EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
+    Pager, Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
+    Trigger, Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -70,6 +70,7 @@ pub(crate) enum TransactionState {
 /// - `encryption_cipher_mode`
 /// - Pager's `spill_enabled` setting
 /// - MVCC checkpoint threshold (when MVCC enabled)
+/// - `authorizer` (via authorizer_generation)
 pub struct Connection {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -137,6 +138,11 @@ pub struct Connection {
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// Authorizer callback for compile-time authorization checks.
+    /// None means no authorization (all operations allowed).
+    pub(super) authorizer: RwLock<Option<AuthorizerCallback>>,
+    /// Generation counter for authorizer changes (for PrepareContext cache invalidation).
+    pub(super) authorizer_generation: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1874,6 +1880,43 @@ impl Connection {
             ));
         }
         pager.set_encryption_context(cipher_mode, key)
+    }
+
+    /// Sets the authorizer callback for this connection.
+    ///
+    /// The authorizer is invoked during SQL statement compilation to check whether
+    /// specific operations are allowed. Pass `None` to disable authorization.
+    ///
+    /// Each call replaces any previously installed authorizer.
+    pub fn set_authorizer(&self, callback: Option<AuthorizerCallback>) {
+        *self.authorizer.write() = callback;
+        self.authorizer_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Get the authorizer generation counter (for cache invalidation).
+    pub(crate) fn authorizer_generation(&self) -> u64 {
+        self.authorizer_generation.load(Ordering::SeqCst)
+    }
+
+    /// Invoke the authorizer callback if one is set.
+    ///
+    /// Returns:
+    /// - `Ok(0)` (SQLITE_OK) if allowed or no authorizer is set
+    /// - `Ok(1)` (SQLITE_DENY) if denied
+    /// - `Ok(2)` (SQLITE_IGNORE) if ignored
+    pub(crate) fn auth_check(
+        &self,
+        action: i32,
+        arg3: Option<&str>,
+        arg4: Option<&str>,
+        db_name: Option<&str>,
+        trigger_name: Option<&str>,
+    ) -> i32 {
+        let guard = self.authorizer.read();
+        match guard.as_ref() {
+            Some(callback) => callback(action, arg3, arg4, db_name, trigger_name),
+            None => crate::authorizer::SQLITE_OK,
+        }
     }
 
     /// Sets a custom busy handler callback.
