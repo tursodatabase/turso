@@ -294,7 +294,7 @@ impl Connection {
             mode,
             input,
         )?;
-        Ok(Statement::new(program, pager, mode))
+        Ok(Statement::new(program, pager, mode, byte_offset_end))
     }
 
     /// Prepare a statement from an AST node directly, skipping SQL parsing.
@@ -317,7 +317,7 @@ impl Connection {
             mode,
             "<ast>", // No SQL input string available
         )?;
-        Ok(Statement::new(program, pager, mode))
+        Ok(Statement::new(program, pager, mode, 0))
     }
 
     /// Whether this is an internal connection used for MVCC bootstrap
@@ -521,7 +521,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
+            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -569,7 +569,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, pager, mode);
+        let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
 
@@ -606,7 +606,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
+            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -638,7 +638,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, pager, mode);
+        let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, parser.offset())))
     }
 

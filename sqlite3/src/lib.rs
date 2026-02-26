@@ -522,27 +522,30 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     sql: *const ffi::c_char,
     _len: ffi::c_int,
     out_stmt: *mut *mut sqlite3_stmt,
-    _tail: *mut *const ffi::c_char,
+    tail: *mut *const ffi::c_char,
 ) -> ffi::c_int {
     if raw_db.is_null() || sql.is_null() || out_stmt.is_null() {
         return SQLITE_MISUSE;
     }
     let db: &mut sqlite3 = &mut *raw_db;
     let mut db = db.inner.lock().unwrap();
-    let sql = CStr::from_ptr(sql);
-    let sql = match sql.to_str() {
+    let sql_cstr = CStr::from_ptr(sql);
+    let sql_str = match sql_cstr.to_str() {
         Ok(s) => s,
         Err(_) => {
             db.err_code = SQLITE_MISUSE;
             return SQLITE_MISUSE;
         }
     };
-    let stmt = match db.conn.prepare(sql) {
+    let stmt = match db.conn.prepare(sql_str) {
         Ok(stmt) => stmt,
         Err(err) => {
             return set_db_err(&mut db, err);
         }
     };
+    if !tail.is_null() {
+        *tail = sql.add(stmt.tail_offset());
+    }
     let new_stmt = Box::leak(Box::new(sqlite3_stmt::new(raw_db, stmt)));
 
     new_stmt.next = db.stmt_list;

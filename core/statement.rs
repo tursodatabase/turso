@@ -46,6 +46,9 @@ pub struct Statement {
     /// DML completed — only the scan-back remains. Used by reset_internal to decide
     /// commit vs rollback when a statement is abandoned.
     has_returned_row: bool,
+    /// Byte offset in the original SQL string where this statement ends.
+    /// Used by sqlite3_prepare_v2 to set the *pzTail output parameter.
+    tail_offset: usize,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -63,7 +66,12 @@ impl Drop for Statement {
 }
 
 impl Statement {
-    pub fn new(program: vdbe::Program, pager: Arc<Pager>, query_mode: QueryMode) -> Self {
+    pub fn new(
+        program: vdbe::Program,
+        pager: Arc<Pager>,
+        query_mode: QueryMode,
+        tail_offset: usize,
+    ) -> Self {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
@@ -78,7 +86,12 @@ impl Statement {
             busy: false,
             busy_handler_state: None,
             has_returned_row: false,
+            tail_offset,
         }
+    }
+
+    pub fn tail_offset(&self) -> usize {
+        self.tail_offset
     }
 
     pub fn get_trigger(&self) -> Option<Arc<Trigger>> {
