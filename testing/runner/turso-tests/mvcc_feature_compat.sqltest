@@ -3,15 +3,6 @@
 # Test that incompatible features are properly rejected when MVCC is enabled.
 # These tests only run against tursodb since MVCC is turso-specific.
 
-test mvcc-rejects-create-view {
-    PRAGMA journal_mode = 'experimental_mvcc';
-    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
-    CREATE VIEW v1 AS SELECT * FROM t1;
-}
-expect error {
-    Views are not supported in MVCC mode
-}
-
 test mvcc-rejects-cdc {
     PRAGMA journal_mode = 'experimental_mvcc';
     CREATE TABLE t4 (id INTEGER PRIMARY KEY, val TEXT);

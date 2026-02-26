@@ -180,7 +180,6 @@ pub fn parse_schema_rows(
             &mut dbsp_state_roots,
             &mut dbsp_state_index_roots,
             &mut materialized_view_info,
-            mv_store.as_ref(),
             enable_triggers,
         )
     })?;

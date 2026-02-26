@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "views not supported in MVCC mode"
 
 @cross-check-integrity
 test view-basic-filtering {
