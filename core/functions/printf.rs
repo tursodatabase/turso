@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::iter::{repeat_n, Peekable};
 use std::str;
 use std::str::Chars;
@@ -131,8 +130,10 @@ fn parse_format_spec(
         None
     };
 
-    // Skip length modifiers (l, ll, h, hh) - ignored in SQL context
-    while matches!(chars.peek(), Some(&'l') | Some(&'h')) {
+    // Skip length modifier 'l'/'ll' - ignored in SQL context.
+    // Note: SQLite does NOT recognize 'h'/'hh' as length modifiers;
+    // '%hd' is treated as unknown specifier 'h' (returns NULL).
+    while matches!(chars.peek(), Some(&'l')) {
         chars.next();
     }
 
@@ -840,15 +841,6 @@ fn format_float_decimal(output: &mut String, value: &Value, spec: &FormatSpec) {
         formatted
     };
 
-    // SQLite 3.51+ (sqlite3.c:32520-32532): Suppress minus sign for %f with #
-    // when displayed value is zero and no +/space flag is set.
-    let negative =
-        if negative && spec.flags.alternate && !spec.flags.force_sign && !spec.flags.space_sign {
-            !content.bytes().all(|b| b == b'0' || b == b'.' || b == b',')
-        } else {
-            negative
-        };
-
     let prefix = sign_prefix(negative, &spec.flags);
     apply_width(output, prefix, &content, spec.width, &spec.flags, false);
 }
@@ -1095,24 +1087,8 @@ fn format_char(output: &mut String, value: &Value, spec: &FormatSpec) {
     apply_width(output, "", &s, spec.width, &flags, false);
 }
 
-/// Escape control characters (0x00-0x1f, 0x7f) as \uXXXX for %#q/%#Q.
-fn escape_control_chars(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_ascii_control() {
-            write!(result, "\\u{:04x}", c as u32).unwrap();
-        } else if c == '\\' {
-            result.push_str("\\\\");
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
 fn format_sql_quote(output: &mut String, value: &Value, spec: &FormatSpec) {
     // %q: double single quotes; NULL → (NULL). Supports width/precision.
-    // %#q: also escape control characters as \uXXXX.
     let mut flags = spec.flags.clone();
     flags.zero_pad = false;
     match value {
@@ -1123,10 +1099,7 @@ fn format_sql_quote(output: &mut String, value: &Value, spec: &FormatSpec) {
         _ => {
             let s = coerce_to_string(value);
             let truncated = truncate_to_precision(&s, spec.precision);
-            let mut escaped = truncated.replace('\'', "''");
-            if spec.flags.alternate {
-                escaped = escape_control_chars(&escaped);
-            }
+            let escaped = truncated.replace('\'', "''");
             apply_width(output, "", &escaped, spec.width, &flags, false);
         }
     }
@@ -1134,7 +1107,6 @@ fn format_sql_quote(output: &mut String, value: &Value, spec: &FormatSpec) {
 
 fn format_sql_quote_wrap(output: &mut String, value: &Value, spec: &FormatSpec) {
     // %Q: like %q but wrapped in quotes; NULL → unquoted NULL. Supports width/precision.
-    // %#Q: also escape control characters as \uXXXX.
     let mut flags = spec.flags.clone();
     flags.zero_pad = false;
     match value {
@@ -1145,31 +1117,8 @@ fn format_sql_quote_wrap(output: &mut String, value: &Value, spec: &FormatSpec) 
         _ => {
             let s = coerce_to_string(value);
             let truncated = truncate_to_precision(&s, spec.precision);
-            let mut escaped = truncated.replace('\'', "''");
-            // %#Q: escape control chars and wrap with unistr('...') if any are present.
-            let use_unistr = if spec.flags.alternate {
-                let has_ctrl = escaped.bytes().any(|b| b <= 0x1f);
-                if has_ctrl {
-                    escaped = escape_control_chars(&escaped);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            let mut quoted = String::with_capacity(escaped.len() + 10);
-            if use_unistr {
-                quoted.push_str("unistr('");
-            } else {
-                quoted.push('\'');
-            }
-            quoted.push_str(&escaped);
-            if use_unistr {
-                quoted.push_str("')");
-            } else {
-                quoted.push('\'');
-            }
+            let escaped = truncated.replace('\'', "''");
+            let quoted = format!("'{escaped}'");
             apply_width(output, "", &quoted, spec.width, &flags, false);
         }
     }
@@ -2026,36 +1975,49 @@ mod tests {
     }
 
     #[test]
-    fn test_control_char_escaping_with_hash_q() {
-        // %#q escapes control characters as \uXXXX and doubles backslashes
+    fn test_h_not_recognized_as_length_modifier() {
+        // SQLite does NOT recognize 'h'/'hh' as length modifiers.
+        // %hd is treated as unknown specifier 'h' → NULL.
         assert_eq!(
-            exec_printf(&[text("%#q"), text("a\nb")]).unwrap(),
-            *text("a\\u000ab").get_value()
+            exec_printf(&[text("%hd"), integer(42)]).unwrap(),
+            Value::Null,
         );
         assert_eq!(
-            exec_printf(&[text("%#q"), text("a\tb")]).unwrap(),
-            *text("a\\u0009b").get_value()
+            exec_printf(&[text("%hhd"), integer(42)]).unwrap(),
+            Value::Null,
         );
-        // Backslash is doubled in escape mode
+        // 'l' IS recognized — %ld and %lld work as %d
         assert_eq!(
-            exec_printf(&[text("%#q"), text("a\\b")]).unwrap(),
-            *text("a\\\\b").get_value()
+            exec_printf(&[text("%ld"), integer(42)]).unwrap(),
+            *text("42").get_value()
+        );
+        assert_eq!(
+            exec_printf(&[text("%lld"), integer(42)]).unwrap(),
+            *text("42").get_value()
         );
     }
 
     #[test]
-    fn test_hash_q_upper_unistr_wrapping() {
-        // %#Q wraps with unistr('...') when control chars are present
+    fn test_hash_flag_no_effect_on_q() {
+        // In SQLite 3.49.1, # flag has no effect on %q, %Q, %w
+        // %#q behaves same as %q
+        assert_eq!(
+            exec_printf(&[text("%#q"), text("a\nb")]).unwrap(),
+            *text("a\nb").get_value()
+        );
+        assert_eq!(
+            exec_printf(&[text("%#q"), text("it's")]).unwrap(),
+            *text("it''s").get_value()
+        );
+        // %#Q behaves same as %Q
         assert_eq!(
             exec_printf(&[text("%#Q"), text("a\nb")]).unwrap(),
-            *text("unistr('a\\u000ab')").get_value()
+            *text("'a\nb'").get_value()
         );
-        // %#Q without control chars — no unistr wrapping
         assert_eq!(
             exec_printf(&[text("%#Q"), text("hello")]).unwrap(),
             *text("'hello'").get_value()
         );
-        // %Q without # — no unistr wrapping even with control chars
         assert_eq!(
             exec_printf(&[text("%Q"), text("a\nb")]).unwrap(),
             *text("'a\nb'").get_value()
@@ -2107,32 +2069,25 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_zero_suppression() {
-        // SQLite 3.51+ (sqlite3.c:32520-32532): With # flag (no + or space),
-        // %f suppresses minus sign when displayed value rounds to zero.
-
-        // -0.0000001 with %#f displays as 0.000000 — suppress minus
-        let result = exec_printf(&[text("%#f"), float(-0.0000001)]).unwrap();
+    fn test_negative_zero_handling() {
+        // %f with -0.0 shows positive zero (standard C behavior)
+        let result = exec_printf(&[text("%f"), float(-0.0)]).unwrap();
         assert_eq!(result.to_string(), "0.000000");
 
-        // Same without # flag — keep minus
+        // %f with -0.0000001 rounds to -0.000000 — minus sign preserved
         let result = exec_printf(&[text("%f"), float(-0.0000001)]).unwrap();
         assert_eq!(result.to_string(), "-0.000000");
 
-        // With + flag, # doesn't suppress (flag_prefix is set)
-        let result = exec_printf(&[text("%#+f"), float(-0.0000001)]).unwrap();
+        // %#f with -0.0000001 — minus sign preserved (no suppression)
+        let result = exec_printf(&[text("%#f"), float(-0.0000001)]).unwrap();
         assert_eq!(result.to_string(), "-0.000000");
 
-        // -0.5 rounds to -1, not zero — keep minus
+        // -0.5 rounds to -1
         let result = exec_printf(&[text("%#.0f"), float(-0.5)]).unwrap();
         assert_eq!(result.to_string(), "-1.");
 
-        // -0.4 rounds to 0 — suppress
+        // -0.4 rounds to -0 — minus sign preserved
         let result = exec_printf(&[text("%#.0f"), float(-0.4)]).unwrap();
-        assert_eq!(result.to_string(), "0.");
-
-        // -0.0000001 with comma separator
-        let result = exec_printf(&[text("%#,f"), float(-0.0000001)]).unwrap();
-        assert_eq!(result.to_string(), "0.000000");
+        assert_eq!(result.to_string(), "-0.");
     }
 }

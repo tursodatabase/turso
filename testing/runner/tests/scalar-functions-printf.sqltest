@@ -1374,3 +1374,85 @@ test printf-blob-s-nul {
 expect {
     1
 }
+
+# ============================================
+# Length modifiers: only l/ll recognized, not h/hh
+# ============================================
+
+test printf-h-modifier-unknown {
+    SELECT printf('%hd', 42) IS NULL;
+}
+expect {
+    1
+}
+
+test printf-hh-modifier-unknown {
+    SELECT printf('%hhd', 42) IS NULL;
+}
+expect {
+    1
+}
+
+test printf-l-modifier-works {
+    SELECT printf('%ld', 42);
+}
+expect {
+    42
+}
+
+test printf-ll-modifier-works {
+    SELECT printf('%lld', 42);
+}
+expect {
+    42
+}
+
+# ============================================
+# Negative-zero: # flag does NOT suppress minus sign
+# ============================================
+
+test printf-hash-f-neg-small {
+    SELECT printf('%#f', -0.0000001);
+}
+expect {
+    -0.000000
+}
+
+test printf-hash-f-neg-round-to-zero {
+    SELECT printf('%#.0f', -0.4);
+}
+expect {
+    -0.
+}
+
+test printf-hash-f-neg-zero-literal {
+    SELECT printf('%#.0f', -0.0);
+}
+expect {
+    0.
+}
+
+# ============================================
+# # flag has no special effect on %q/%Q/%w
+# ============================================
+
+test printf-hash-q-same-as-q {
+    SELECT printf('%#q', 'it''s');
+}
+expect {
+    it''s
+}
+
+test printf-hash-Q-same-as-Q {
+    SELECT printf('%#Q', 'hello');
+}
+expect {
+    'hello'
+}
+
+test printf-hash-Q-null {
+    SELECT printf('%#Q', NULL);
+}
+expect {
+    NULL
+}
