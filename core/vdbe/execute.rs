@@ -4186,17 +4186,23 @@ pub fn op_decr_jump_zero(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
-    match state.registers[*reg].get_value() {
-        Value::Numeric(Numeric::Integer(n)) => {
-            let n = n.saturating_sub(1);
-            state.registers[*reg] = Register::Value(Value::from_i64(n));
-            if n == 0 {
+    match &mut state.registers[*reg] {
+        Register::Value(Value::Numeric(Numeric::Integer(n))) => {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
                 state.pc = target_pc.as_offset_int();
             } else {
                 state.pc += 1;
             }
         }
-        _ => unreachable!("DecrJumpZero on non-integer register"),
+        Register::Value(_) | Register::Record(_) => {
+            bail_constraint_error!("datatype mismatch");
+        }
+        Register::Aggregate(_) => {
+            return Err(LimboError::InternalError(
+                "DecrJumpZero: unexpected aggregate register".into(),
+            ));
+        }
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -12838,6 +12844,37 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Database, DatabaseOpts, MemoryIO, IO};
+
+    #[test]
+    fn test_decr_jump_zero_non_integer_register_returns_error() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        let stmt = conn.prepare("SELECT 1;").unwrap();
+
+        let mut state = ProgramState::new(1, 0);
+        state.set_register(0, Register::Value(Value::Text("not-an-int".into())));
+
+        let insn = Insn::DecrJumpZero {
+            reg: 0,
+            target_pc: crate::vdbe::BranchOffset::Offset(1),
+        };
+
+        let err = match op_decr_jump_zero(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+            Ok(_) => panic!("non-integer register must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, LimboError::Constraint(message) if message == "datatype mismatch"));
+        assert_eq!(state.pc, 0);
+    }
 
     #[test]
     fn test_execute_sqlite_version() {
