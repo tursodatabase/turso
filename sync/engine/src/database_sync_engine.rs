@@ -1012,13 +1012,17 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 cached_insert_stmt: HashMap::new(),
                 cached_update_stmt: HashMap::new(),
                 in_txn: true,
-                generator: DatabaseReplayGenerator {
-                    conn: main_conn.clone(),
-                    opts: DatabaseReplaySessionOpts {
+                generator: DatabaseReplayGenerator::new(
+                    main_conn.clone(),
+                    DatabaseReplaySessionOpts {
                         use_implicit_rowid: false,
                     },
-                },
+                ),
             };
+
+            // Seed the schema cache so CDC records captured before DDL changes
+            // (ALTER TABLE DROP/ADD COLUMN) are mapped using the correct column order.
+            replay.generator.seed_schema_from_changes(&local_changes);
 
             let mut transformed = if self.opts.use_transform {
                 let ctx = &SyncOperationCtx::new(
@@ -1031,6 +1035,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             } else {
                 None
             };
+
+            // Re-seed: apply_transformation consumed the schema cache state via
+            // replay_info calls; reset it so the main loop starts fresh.
+            replay.generator.seed_schema_from_changes(&local_changes);
 
             assert!(!replay.conn().get_auto_commit());
             // Replay local changes collected on Phase 5

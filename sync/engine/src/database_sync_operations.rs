@@ -981,11 +981,19 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         }
     }
 
+    // Seed the schema cache from DDL changes so that DML records captured
+    // before ALTER TABLE DROP/ADD COLUMN use the correct column ordering.
+    generator.seed_schema_from_changes(&local_changes);
+
     let mut transformed = if opts.use_transform {
         Some(apply_transformation(ctx, &local_changes, &generator).await?)
     } else {
         None
     };
+
+    // Re-seed: apply_transformation consumed the schema cache state via
+    // replay_info calls; reset it so the main loop starts fresh.
+    generator.seed_schema_from_changes(&local_changes);
 
     tracing::info!("local_changes: {:?}", local_changes);
 

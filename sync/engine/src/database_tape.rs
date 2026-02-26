@@ -226,7 +226,7 @@ impl DatabaseTape {
             cached_insert_stmt: HashMap::new(),
             cached_update_stmt: HashMap::new(),
             in_txn: true,
-            generator: DatabaseReplayGenerator { conn, opts },
+            generator: DatabaseReplayGenerator::new(conn, opts),
         })
     }
 }
@@ -745,6 +745,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use crate::{
+        database_replay_generator::DatabaseReplayGenerator,
         database_tape::{
             run_stmt_once, DatabaseChangesIteratorOpts, DatabaseReplaySessionOpts, DatabaseTape,
         },
@@ -2115,6 +2116,449 @@ mod tests {
                         ],
                     ]
                 );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// ABA problem: DROP COLUMN + ADD COLUMN with the same name swaps
+    /// ordinal positions. The push path must map old CDC records using
+    /// the schema that was active at capture time, not the current schema.
+    ///
+    /// Source: CREATE TABLE users(id PK, name, temp, email)
+    ///   → INSERT (1, 'Alice', 'junk', 'alice@ex.com')  [temp=pos2, email=pos3]
+    ///   → ALTER TABLE DROP COLUMN temp
+    ///   → ALTER TABLE ADD COLUMN temp TEXT
+    ///   → INSERT (2, 'Bob', 'bob@ex.com', 'stuff')     [email=pos2, temp=pos3]
+    ///
+    /// Without fix: push generator maps old record via current schema
+    ///   (id, name, email, temp) → email='junk', temp='alice@ex.com'
+    /// With fix: seed_schema_from_changes restores the pre-ALTER schema
+    ///   (id, name, temp, email) → temp='junk', email='alice@ex.com'
+    #[test]
+    pub fn test_database_tape_replay_drop_column_add_column_aba() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, temp TEXT, email TEXT)")
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO users VALUES (1, 'Alice', 'junk', 'alice@ex.com')")
+                    .unwrap();
+                conn1.execute("ALTER TABLE users DROP COLUMN temp").unwrap();
+                conn1
+                    .execute("ALTER TABLE users ADD COLUMN temp TEXT")
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO users VALUES (2, 'Bob', 'bob@ex.com', 'stuff')")
+                    .unwrap();
+
+                // Collect all CDC changes
+                let opts = DatabaseChangesIteratorOpts {
+                    ignore_schema_changes: false,
+                    ..Default::default()
+                };
+                let mut iterator = db1.iterate_changes(opts).unwrap();
+                let mut local_changes: Vec<DatabaseTapeRowChange> = Vec::new();
+                while let Some(op) = iterator.next(&coro).await.unwrap() {
+                    if let DatabaseTapeOperation::RowChange(change) = op {
+                        local_changes.push(change);
+                    }
+                }
+
+                // Simulate the push path: create a generator using the
+                // SOURCE connection (whose current schema is post-ALTER).
+                let generator = DatabaseReplayGenerator::new(
+                    conn1.clone(),
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    },
+                );
+
+                // Seed the schema cache (as push_logical_changes does)
+                generator.seed_schema_from_changes(&local_changes);
+
+                // Process changes in order, collecting replay_info for DML
+                let mut insert_infos = Vec::new();
+                for change in &local_changes {
+                    let info = generator.replay_info(&coro, change).await.unwrap();
+                    if !info.is_ddl_replay {
+                        insert_infos.push(info);
+                    }
+                }
+
+                // First INSERT was captured with schema (id, name, temp, email)
+                assert_eq!(
+                    insert_infos[0].column_names,
+                    vec!["id", "name", "temp", "email"],
+                    "old CDC record must use the pre-ALTER column order"
+                );
+
+                // Second INSERT was captured with schema (id, name, email, temp)
+                assert_eq!(
+                    insert_infos[1].column_names,
+                    vec!["id", "name", "email", "temp"],
+                    "new CDC record must use the post-ALTER column order"
+                );
+
+                // Verify the generated SQL uses correct column names.
+                // For the old INSERT (pre-ALTER), the query should reference
+                // (id, name, temp, email) — not the current schema order.
+                assert!(
+                    insert_infos[0].query.contains("id, name, temp, email"),
+                    "old INSERT SQL must use pre-ALTER column order, got: {}",
+                    insert_infos[0].query
+                );
+                // For the new INSERT (post-ALTER), the query should reference
+                // (id, name, email, temp) — the current schema order.
+                assert!(
+                    insert_infos[1].query.contains("id, name, email, temp"),
+                    "new INSERT SQL must use post-ALTER column order, got: {}",
+                    insert_infos[1].query
+                );
+
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Simple variant: single DROP COLUMN shifts subsequent positions.
+    /// Without the schema cache, values[2] (which was temp) maps to email.
+    #[test]
+    pub fn test_database_tape_replay_drop_column_shifts_positions() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT)")
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES (1, 'aa', 'bb', 'cc')")
+                    .unwrap();
+                conn1.execute("ALTER TABLE t DROP COLUMN b").unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES (2, 'dd', 'ee')")
+                    .unwrap();
+
+                let opts = DatabaseChangesIteratorOpts {
+                    ignore_schema_changes: false,
+                    ..Default::default()
+                };
+                let mut iterator = db1.iterate_changes(opts).unwrap();
+                let mut local_changes: Vec<DatabaseTapeRowChange> = Vec::new();
+                while let Some(op) = iterator.next(&coro).await.unwrap() {
+                    if let DatabaseTapeOperation::RowChange(change) = op {
+                        local_changes.push(change);
+                    }
+                }
+
+                let generator = DatabaseReplayGenerator::new(
+                    conn1.clone(),
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    },
+                );
+                generator.seed_schema_from_changes(&local_changes);
+
+                let mut insert_infos = Vec::new();
+                for change in &local_changes {
+                    let info = generator.replay_info(&coro, change).await.unwrap();
+                    if !info.is_ddl_replay {
+                        insert_infos.push(info);
+                    }
+                }
+
+                // Pre-DROP record: 4 columns (id, a, b, c)
+                assert_eq!(
+                    insert_infos[0].column_names,
+                    vec!["id", "a", "b", "c"],
+                    "pre-DROP CDC record must use 4-column schema"
+                );
+                // Post-DROP record: 2 columns (id, a, c)
+                assert_eq!(
+                    insert_infos[1].column_names,
+                    vec!["id", "a", "c"],
+                    "post-DROP CDC record must use 3-column schema"
+                );
+
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Multiple sequential DROP COLUMNs: each one shifts positions further.
+    #[test]
+    pub fn test_database_tape_replay_multiple_drop_columns() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute(
+                        "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT)",
+                    )
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES (1, 'aa', 'bb', 'cc', 'dd')")
+                    .unwrap();
+                conn1.execute("ALTER TABLE t DROP COLUMN b").unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES (2, 'ee', 'ff', 'gg')")
+                    .unwrap();
+                conn1.execute("ALTER TABLE t DROP COLUMN c").unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES (3, 'hh', 'ii')")
+                    .unwrap();
+
+                let opts = DatabaseChangesIteratorOpts {
+                    ignore_schema_changes: false,
+                    ..Default::default()
+                };
+                let mut iterator = db1.iterate_changes(opts).unwrap();
+                let mut local_changes: Vec<DatabaseTapeRowChange> = Vec::new();
+                while let Some(op) = iterator.next(&coro).await.unwrap() {
+                    if let DatabaseTapeOperation::RowChange(change) = op {
+                        local_changes.push(change);
+                    }
+                }
+
+                let generator = DatabaseReplayGenerator::new(
+                    conn1.clone(),
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    },
+                );
+                generator.seed_schema_from_changes(&local_changes);
+
+                let mut insert_infos = Vec::new();
+                for change in &local_changes {
+                    let info = generator.replay_info(&coro, change).await.unwrap();
+                    if !info.is_ddl_replay {
+                        insert_infos.push(info);
+                    }
+                }
+
+                // Before any DROPs: (id, a, b, c, d)
+                assert_eq!(insert_infos[0].column_names, vec!["id", "a", "b", "c", "d"],);
+                // After DROP b: (id, a, c, d)
+                assert_eq!(insert_infos[1].column_names, vec!["id", "a", "c", "d"],);
+                // After DROP c: (id, a, d)
+                assert_eq!(insert_infos[2].column_names, vec!["id", "a", "d"],);
+
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// DROP + ADD COLUMN with UPDATE records: verify update column mapping
+    /// is correct when schema has been modified.
+    #[test]
+    pub fn test_database_tape_replay_drop_add_column_with_updates() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT)")
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES (1, 'aa', 'bb', 'cc')")
+                    .unwrap();
+                // Update before DROP: schema is (id, a, b, c)
+                conn1
+                    .execute("UPDATE t SET c = 'cc2' WHERE id = 1")
+                    .unwrap();
+                conn1.execute("ALTER TABLE t DROP COLUMN b").unwrap();
+                conn1.execute("ALTER TABLE t ADD COLUMN b TEXT").unwrap();
+                // Update after DROP+ADD: schema is (id, a, c, b)
+                conn1
+                    .execute("UPDATE t SET c = 'cc3' WHERE id = 1")
+                    .unwrap();
+
+                let opts = DatabaseChangesIteratorOpts {
+                    ignore_schema_changes: false,
+                    ..Default::default()
+                };
+                let mut iterator = db1.iterate_changes(opts).unwrap();
+                let mut local_changes: Vec<DatabaseTapeRowChange> = Vec::new();
+                while let Some(op) = iterator.next(&coro).await.unwrap() {
+                    if let DatabaseTapeOperation::RowChange(change) = op {
+                        local_changes.push(change);
+                    }
+                }
+
+                let generator = DatabaseReplayGenerator::new(
+                    conn1.clone(),
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    },
+                );
+                generator.seed_schema_from_changes(&local_changes);
+
+                let mut dml_infos = Vec::new();
+                for change in &local_changes {
+                    let info = generator.replay_info(&coro, change).await.unwrap();
+                    if !info.is_ddl_replay {
+                        dml_infos.push(info);
+                    }
+                }
+
+                // INSERT: pre-ALTER schema (id, a, b, c)
+                assert_eq!(dml_infos[0].column_names, vec!["id", "a", "b", "c"]);
+                // UPDATE: pre-ALTER schema (id, a, b, c)
+                assert_eq!(dml_infos[1].column_names, vec!["id", "a", "b", "c"]);
+                // UPDATE: post-ALTER schema (id, a, c, b)
+                assert_eq!(dml_infos[2].column_names, vec!["id", "a", "c", "b"]);
+
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// No DDL changes in the batch: schema cache stays empty and
+    /// table_columns_info falls through to PRAGMA table_info.
+    #[test]
+    pub fn test_database_tape_replay_no_ddl_changes_uses_pragma() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT, y TEXT)")
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES (1, 'hello', 'world')")
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES (2, 'foo', 'bar')")
+                    .unwrap();
+
+                // Only data changes, no schema changes in the CDC batch
+                let opts = DatabaseChangesIteratorOpts {
+                    ignore_schema_changes: true,
+                    ..Default::default()
+                };
+                let mut iterator = db1.iterate_changes(opts).unwrap();
+                let mut local_changes: Vec<DatabaseTapeRowChange> = Vec::new();
+                while let Some(op) = iterator.next(&coro).await.unwrap() {
+                    if let DatabaseTapeOperation::RowChange(change) = op {
+                        local_changes.push(change);
+                    }
+                }
+
+                let generator = DatabaseReplayGenerator::new(
+                    conn1.clone(),
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    },
+                );
+                generator.seed_schema_from_changes(&local_changes);
+
+                let mut insert_infos = Vec::new();
+                for change in &local_changes {
+                    let info = generator.replay_info(&coro, change).await.unwrap();
+                    if !info.is_ddl_replay {
+                        insert_infos.push(info);
+                    }
+                }
+
+                // Without DDL changes, column names come from PRAGMA
+                assert_eq!(insert_infos[0].column_names, vec!["id", "x", "y"]);
+                assert_eq!(insert_infos[1].column_names, vec!["id", "x", "y"]);
+
                 crate::Result::Ok(())
             }
         });

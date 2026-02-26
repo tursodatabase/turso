@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use turso_parser::parser::Parser;
 
@@ -12,9 +15,16 @@ use crate::{
     Result,
 };
 
+type TableColumnInfo = (Vec<String>, Vec<usize>);
+
 pub struct DatabaseReplayGenerator {
     pub conn: Arc<turso_core::Connection>,
     pub opts: DatabaseReplaySessionOpts,
+    /// Cache of table column info derived from CDC DDL changes.
+    /// Tracks schema evolution so that CDC records captured before
+    /// ALTER TABLE DROP/ADD COLUMN are mapped to the schema that was
+    /// active at capture time, not the current schema.
+    schema_cache: Mutex<HashMap<String, TableColumnInfo>>,
 }
 
 pub struct ReplayInfo {
@@ -28,7 +38,143 @@ pub struct ReplayInfo {
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
 impl DatabaseReplayGenerator {
     pub fn new(conn: Arc<turso_core::Connection>, opts: DatabaseReplaySessionOpts) -> Self {
-        Self { conn, opts }
+        Self {
+            conn,
+            opts,
+            schema_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Parse a CREATE TABLE SQL statement to extract column names and
+    /// primary key column indices.
+    fn parse_columns_from_create_table_sql(sql: &str) -> Option<TableColumnInfo> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let ast = parser.next()?.ok()?;
+        let turso_parser::ast::Cmd::Stmt(stmt) = ast else {
+            return None;
+        };
+        let turso_parser::ast::Stmt::CreateTable { body, .. } = stmt else {
+            return None;
+        };
+        let turso_parser::ast::CreateTableBody::ColumnsAndConstraints {
+            columns,
+            constraints,
+            ..
+        } = body
+        else {
+            return None;
+        };
+        let mut column_names = Vec::with_capacity(columns.len());
+        let mut pk_column_indices = Vec::new();
+        for (i, col) in columns.iter().enumerate() {
+            column_names.push(col.col_name.as_str().to_string());
+            for named_constraint in &col.constraints {
+                if matches!(
+                    named_constraint.constraint,
+                    turso_parser::ast::ColumnConstraint::PrimaryKey { .. }
+                ) {
+                    pk_column_indices.push(i);
+                }
+            }
+        }
+        // Check table-level constraints for composite PKs
+        for named_constraint in &constraints {
+            if let turso_parser::ast::TableConstraint::PrimaryKey {
+                columns: pk_cols, ..
+            } = &named_constraint.constraint
+            {
+                for pk_col in pk_cols {
+                    if let turso_parser::ast::Expr::Id(name) = pk_col.expr.as_ref() {
+                        let pk_name = name.as_str();
+                        if let Some(idx) = column_names.iter().position(|n| n == pk_name) {
+                            pk_column_indices.push(idx);
+                        }
+                    }
+                }
+            }
+        }
+        Some((column_names, pk_column_indices))
+    }
+
+    /// Extract the table name from a sqlite_schema CDC record.
+    /// Column layout: [type, name, tbl_name, rootpage, sql]
+    fn extract_schema_table_name(record: &[turso_core::Value]) -> Option<String> {
+        match record.get(2) {
+            Some(turso_core::Value::Text(tbl_name)) => Some(tbl_name.as_str().to_string()),
+            _ => None,
+        }
+    }
+
+    /// Extract and parse the CREATE TABLE SQL from a sqlite_schema CDC record.
+    fn extract_schema_info(record: &[turso_core::Value]) -> Option<(String, TableColumnInfo)> {
+        let tbl_name = Self::extract_schema_table_name(record)?;
+        let turso_core::Value::Text(sql) = record.last()? else {
+            return None;
+        };
+        let info = Self::parse_columns_from_create_table_sql(sql.as_str())?;
+        Some((tbl_name, info))
+    }
+
+    /// Pre-scan CDC changes to seed the schema cache with the initial schema
+    /// for tables that have DDL changes. This ensures DML records captured
+    /// before ALTER TABLE operations are mapped using the correct column order.
+    pub fn seed_schema_from_changes(&self, changes: &[DatabaseTapeRowChange]) {
+        let mut cache = self.schema_cache.lock().unwrap();
+        cache.clear();
+        for change in changes {
+            if change.table_name != SQLITE_SCHEMA_TABLE {
+                continue;
+            }
+            match &change.change {
+                DatabaseTapeRowChangeType::Insert { after } => {
+                    // CREATE TABLE: seed with the new table's schema
+                    if let Some((tbl_name, info)) = Self::extract_schema_info(after) {
+                        cache.entry(tbl_name).or_insert(info);
+                    }
+                }
+                DatabaseTapeRowChangeType::Update { before, .. } => {
+                    // ALTER TABLE: seed with the schema BEFORE the alteration
+                    if let Some((tbl_name, info)) = Self::extract_schema_info(before) {
+                        cache.entry(tbl_name).or_insert(info);
+                    }
+                }
+                DatabaseTapeRowChangeType::Delete { before } => {
+                    // DROP TABLE: seed with the schema before it was dropped
+                    if let Some((tbl_name, info)) = Self::extract_schema_info(before) {
+                        cache.entry(tbl_name).or_insert(info);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update the schema cache after a DDL change is processed, so subsequent
+    /// DML changes see the new schema.
+    fn update_schema_for_ddl(&self, change: &DatabaseTapeRowChange) {
+        if change.table_name != SQLITE_SCHEMA_TABLE {
+            return;
+        }
+        let mut cache = self.schema_cache.lock().unwrap();
+        match &change.change {
+            DatabaseTapeRowChangeType::Insert { after } => {
+                // CREATE TABLE: add the new schema
+                if let Some((tbl_name, info)) = Self::extract_schema_info(after) {
+                    cache.insert(tbl_name, info);
+                }
+            }
+            DatabaseTapeRowChangeType::Update { after, .. } => {
+                // ALTER TABLE: update to the new schema
+                if let Some((tbl_name, info)) = Self::extract_schema_info(after) {
+                    cache.insert(tbl_name, info);
+                }
+            }
+            DatabaseTapeRowChangeType::Delete { before } => {
+                // DROP TABLE: remove from cache
+                if let Some(tbl_name) = Self::extract_schema_table_name(before) {
+                    cache.remove(&tbl_name);
+                }
+            }
+        }
     }
     pub fn create_mutation(
         &self,
@@ -186,7 +332,7 @@ impl DatabaseReplayGenerator {
 
         if table_name == SQLITE_SCHEMA_TABLE {
             // sqlite_schema table: type, name, tbl_name, rootpage, sql
-            match &change.change {
+            let result: Result<ReplayInfo> = match &change.change {
                 DatabaseTapeRowChangeType::Delete { before } => {
                     assert!(before.len() == 5);
                     let Some(turso_core::Value::Text(entity_type)) = before.first() else {
@@ -202,14 +348,13 @@ impl DatabaseReplayGenerator {
                         );
                     };
                     let query = format!("DROP {} {}", entity_type.as_str(), entity_name.as_str());
-                    let delete = ReplayInfo {
+                    Ok(ReplayInfo {
                         change_type: DatabaseChangeType::Delete,
                         query,
                         pk_column_indices: None,
                         column_names: Vec::new(),
                         is_ddl_replay: true,
-                    };
-                    Ok(delete)
+                    })
                 }
                 DatabaseTapeRowChangeType::Insert { after } => {
                     assert!(after.len() == 5);
@@ -253,14 +398,13 @@ impl DatabaseReplayGenerator {
                         }
                         _ => {}
                     }
-                    let insert = ReplayInfo {
+                    Ok(ReplayInfo {
                         change_type: DatabaseChangeType::Insert,
                         query: ast.to_string(),
                         pk_column_indices: None,
                         column_names: Vec::new(),
                         is_ddl_replay: true,
-                    };
-                    Ok(insert)
+                    })
                 }
                 DatabaseTapeRowChangeType::Update { updates, .. } => {
                     let Some(updates) = updates else {
@@ -276,16 +420,20 @@ impl DatabaseReplayGenerator {
                             updates.last()
                         );
                     };
-                    let update = ReplayInfo {
+                    Ok(ReplayInfo {
                         change_type: DatabaseChangeType::Update,
                         query: ddl_stmt.as_str().to_string(),
                         pk_column_indices: None,
                         column_names: Vec::new(),
                         is_ddl_replay: true,
-                    };
-                    Ok(update)
+                    })
                 }
-            }
+            };
+            let result = result?;
+            // Advance the schema cache so subsequent DML changes see the
+            // post-DDL column layout.
+            self.update_schema_for_ddl(change);
+            Ok(result)
         } else {
             match &change.change {
                 DatabaseTapeRowChangeType::Delete { .. } => {
@@ -483,6 +631,12 @@ impl DatabaseReplayGenerator {
         coro: &Coro<Ctx>,
         table_name: &str,
     ) -> Result<(Vec<String>, Vec<usize>)> {
+        // Check schema cache first — it tracks column ordering through DDL
+        // changes in the current CDC batch, preventing positional mismatch
+        // when DROP COLUMN / ADD COLUMN shifts ordinals.
+        if let Some(info) = self.schema_cache.lock().unwrap().get(table_name).cloned() {
+            return Ok(info);
+        }
         let mut table_info_stmt = self.conn.prepare(format!(
             "SELECT cid, name, pk FROM pragma_table_info('{table_name}')"
         ))?;
