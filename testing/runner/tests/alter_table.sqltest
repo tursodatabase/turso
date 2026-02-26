@@ -581,3 +581,4 @@ test fail-alter-table-drop-column-expr-index-multi-col {
 }
 expect error {
 }
+

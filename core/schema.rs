@@ -2256,6 +2256,37 @@ impl BTreeTable {
             sql.push_str(&check_constraint.sql());
         }
 
+        // Add table-level UNIQUE constraints
+        for unique_set in &self.unique_sets {
+            // Skip primary key (handled above)
+            if unique_set.is_primary_key {
+                continue;
+            }
+            // Skip single-column unique constraints that were already emitted inline
+            if unique_set.columns.len() == 1 {
+                let col_name = &unique_set.columns[0].0;
+                if let Some((_, col)) = self.get_column(col_name) {
+                    if col.unique() {
+                        continue;
+                    }
+                }
+            }
+            sql.push_str(", UNIQUE (");
+            for (i, (col_name, _)) in unique_set.columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                if identifier_contains_special_chars(col_name) {
+                    sql.push('[');
+                    sql.push_str(col_name);
+                    sql.push(']');
+                } else {
+                    sql.push_str(col_name);
+                }
+            }
+            sql.push(')');
+        }
+
         sql.push(')');
 
         // Add STRICT keyword if this is a STRICT table
