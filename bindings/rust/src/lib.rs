@@ -395,6 +395,56 @@ impl Statement {
         execute.await
     }
 
+    /// Returns the number of columns in the result set.
+    pub fn column_count(&self) -> usize {
+        self.inner.lock().unwrap().column_count()
+    }
+
+    /// Returns the name of the column at the given index.
+    pub fn column_name(&self, idx: usize) -> Result<String> {
+        let stmt = self.inner.lock().unwrap();
+        if idx >= stmt.column_count() {
+            return Err(Error::Misuse(format!(
+                "column index {idx} out of bounds (statement has {} columns)",
+                stmt.column_count()
+            )));
+        }
+        Ok(stmt
+            .column_name(idx)
+            .expect("column index must be within valid range")
+            .into_owned())
+    }
+
+    /// Returns the names of all columns in the result set.
+    pub fn column_names(&self) -> Vec<String> {
+        let stmt = self.inner.lock().unwrap();
+        let n = stmt.column_count();
+        (0..n)
+            .map(|i| {
+                stmt.column_name(i)
+                    .expect("column index must be within valid range")
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    /// Returns the index of the column with the given name.
+    pub fn column_index(&self, name: &str) -> Result<usize> {
+        let stmt = self.inner.lock().unwrap();
+        let n = stmt.column_count();
+        for i in 0..n {
+            let col_name = stmt
+                .column_name(i)
+                .expect("column index must be within valid range");
+            if col_name.eq_ignore_ascii_case(name) {
+                return Ok(i);
+            }
+        }
+        Err(Error::Misuse(format!(
+            "column '{name}' not found in result set"
+        )))
+    }
+
     /// Returns columns of the result of this prepared statement.
     pub fn columns(&self) -> Vec<Column> {
         let stmt = self.inner.lock().unwrap();
@@ -603,6 +653,50 @@ mod tests {
                 "Expected SqlExecutionFailure for 'no such table', but got a different error: {e:?}"
             ),
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rows_column_names() -> Result<()> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+        conn.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.org');",
+            (),
+        )
+        .await?;
+
+        let rows = conn.query("SELECT id, name, email FROM users;", ()).await?;
+
+        // columns()
+        let columns = rows.columns();
+        let names: Vec<&str> = columns.iter().map(|c| c.name()).collect();
+        assert_eq!(names, vec!["id", "name", "email"]);
+
+        // column_count()
+        assert_eq!(rows.column_count(), 3);
+
+        // column_name()
+        assert_eq!(rows.column_name(0)?, "id");
+        assert_eq!(rows.column_name(1)?, "name");
+        assert_eq!(rows.column_name(2)?, "email");
+        assert!(rows.column_name(3).is_err());
+
+        // column_names()
+        assert_eq!(rows.column_names(), vec!["id", "name", "email"]);
+
+        // column_index()
+        assert_eq!(rows.column_index("id")?, 0);
+        assert_eq!(rows.column_index("name")?, 1);
+        assert_eq!(rows.column_index("email")?, 2);
+        assert_eq!(rows.column_index("EMAIL")?, 2); // case-insensitive
+        assert!(rows.column_index("nonexistent").is_err());
 
         Ok(())
     }

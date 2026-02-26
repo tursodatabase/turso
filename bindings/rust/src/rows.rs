@@ -1,4 +1,4 @@
-use crate::{assert_send_sync, Error, Result, Statement, Value};
+use crate::{assert_send_sync, Column, Error, Result, Statement, Value};
 use std::fmt::Debug;
 use std::future::Future;
 
@@ -11,6 +11,32 @@ impl Rows {
     pub(crate) fn new(inner: Statement) -> Self {
         Self { inner }
     }
+
+    /// Returns the number of columns in the result set.
+    pub fn column_count(&self) -> usize {
+        self.inner.column_count()
+    }
+
+    /// Returns the name of the column at the given index.
+    pub fn column_name(&self, idx: usize) -> Result<String> {
+        self.inner.column_name(idx)
+    }
+
+    /// Returns the names of all columns in the result set.
+    pub fn column_names(&self) -> Vec<String> {
+        self.inner.column_names()
+    }
+
+    /// Returns the index of the column with the given name.
+    pub fn column_index(&self, name: &str) -> Result<usize> {
+        self.inner.column_index(name)
+    }
+
+    /// Returns columns of the result set.
+    pub fn columns(&self) -> Vec<Column> {
+        self.inner.columns()
+    }
+
     /// Fetch the next row of this result set.
     pub async fn next(&mut self) -> Result<Option<Row>> {
         struct Next {
