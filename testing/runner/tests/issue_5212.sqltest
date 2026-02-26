@@ -1,0 +1,31 @@
+@database :memory:
+
+test basic_alias {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES(42);
+    CREATE VIEW v1(b) AS SELECT a FROM t1;
+    SELECT b FROM v1;
+}
+expect {
+    42
+}
+
+test multiple_aliases {
+    CREATE TABLE t2(a);
+    INSERT INTO t2 VALUES(42);
+    CREATE VIEW v2(x, y) AS SELECT a, a*2 FROM t2;
+    SELECT x, y FROM v2;
+}
+expect {
+    42|84
+}
+
+test regression_no_explicit_columns {
+    CREATE TABLE t3(a);
+    INSERT INTO t3 VALUES(42);
+    CREATE VIEW v3 AS SELECT a FROM t3;
+    SELECT a FROM v3;
+}
+expect {
+    42
+}

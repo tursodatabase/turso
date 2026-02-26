@@ -254,7 +254,7 @@ pub fn translate_create_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
     select_stmt: &ast::Select,
-    _columns: &[ast::IndexedColumn],
+    columns: &[ast::IndexedColumn],
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -285,9 +285,12 @@ pub fn translate_create_view(
     }
 
     // Also check materialized views (not in get_object_type since they're stored differently)
-    if resolver.with_schema(database_id, |s| {
-        s.get_materialized_view(&normalized_view_name).is_some()
-    }) {
+    if resolver
+        .with_schema(database_id, |s| {
+            s.get_materialized_view(&normalized_view_name)
+        })
+        .is_some()
+    {
         return Err(crate::LimboError::ParseError(format!(
             "view {normalized_view_name} already exists"
         )));
@@ -296,7 +299,7 @@ pub fn translate_create_view(
     crate::util::validate_select_for_unsupported_features(select_stmt)?;
 
     // Reconstruct the SQL string
-    let sql = create_view_to_str(&view_name.name.as_ident(), select_stmt);
+    let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
@@ -337,7 +340,19 @@ pub fn translate_create_view(
     Ok(())
 }
 
-fn create_view_to_str(view_name: &str, select_stmt: &ast::Select) -> String {
+fn create_view_to_str(
+    view_name: &str,
+    columns: &[ast::IndexedColumn],
+    select_stmt: &ast::Select,
+) -> String {
+    let columns_str = columns
+        .iter()
+        .map(|col| col.col_name.as_str())
+        .collect::<Vec<&str>>()
+        .join(", ");
+    if !columns_str.is_empty() {
+        return format!("CREATE VIEW {view_name} ({columns_str}) AS {select_stmt}");
+    }
     format!("CREATE VIEW {view_name} AS {select_stmt}")
 }
 
