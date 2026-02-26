@@ -39,8 +39,8 @@
 //!   - `payload_len: sqlite varint`
 //!   - `payload: [u8; payload_len]`
 //!
-//! Trailer (`TX_TRAILER_SIZE = 12`):
-//! - `payload_size: u32` (total bytes of all op entries)
+//! Trailer (`TX_TRAILER_SIZE = 16`):
+//! - `payload_size: u64` (total bytes of all op entries)
 //! - `crc32c: u32` (chained CRC32C: `crc32c_append(prev_frame_crc, tx_header || payload)`;
 //!   the first frame uses `crc32c(salt.to_le_bytes())` as its seed)
 //! - `end_magic: u32` (`END_MAGIC`)
@@ -138,7 +138,7 @@ const OP_UPDATE_HEADER: u8 = 4;
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 
 const TX_HEADER_SIZE: usize = 16;
-const TX_TRAILER_SIZE: usize = 12;
+const TX_TRAILER_SIZE: usize = 16;
 const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE;
 
 /// Log's Header, the first 56 bytes of any logical log file.
@@ -350,9 +350,7 @@ impl LogicalLog {
         }
 
         let payload_end = self.write_buf.len();
-        let payload_size = u32::try_from(payload_end - payload_start).map_err(|_| {
-            LimboError::InternalError("Logical log payload_size exceeds u32".to_string())
-        })?;
+        let payload_size = (payload_end - payload_start) as u64;
         // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
         let crc = crc32c::crc32c_append(
             self.running_crc,
@@ -811,7 +809,7 @@ impl StreamingLogicalLogReader {
 
         // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
         let mut running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
-        let mut payload_bytes_read: u32 = 0;
+        let mut payload_bytes_read: u64 = 0;
         let mut parsed_ops = Vec::with_capacity(op_count as usize);
 
         for _ in 0..op_count {
@@ -869,7 +867,7 @@ impl StreamingLogicalLogReader {
             running_crc = crc32c::crc32c_append(running_crc, &payload);
 
             let op_total_bytes = 6 + payload_len_bytes_len + payload_len;
-            payload_bytes_read = match u32::try_from(op_total_bytes)
+            payload_bytes_read = match u64::try_from(op_total_bytes)
                 .ok()
                 .and_then(|op_size| payload_bytes_read.checked_add(op_size))
             {
@@ -974,23 +972,27 @@ impl StreamingLogicalLogReader {
             None => return Ok(ParseResult::Eof),
         };
 
-        let payload_size = u32::from_le_bytes([
+        let payload_size = u64::from_le_bytes([
             trailer_bytes[0],
             trailer_bytes[1],
             trailer_bytes[2],
             trailer_bytes[3],
-        ]);
-        let crc32c_expected = u32::from_le_bytes([
             trailer_bytes[4],
             trailer_bytes[5],
             trailer_bytes[6],
             trailer_bytes[7],
         ]);
-        let end_magic = u32::from_le_bytes([
+        let crc32c_expected = u32::from_le_bytes([
             trailer_bytes[8],
             trailer_bytes[9],
             trailer_bytes[10],
             trailer_bytes[11],
+        ]);
+        let end_magic = u32::from_le_bytes([
+            trailer_bytes[12],
+            trailer_bytes[13],
+            trailer_bytes[14],
+            trailer_bytes[15],
         ]);
 
         if payload_size != payload_bytes_read {
@@ -2178,7 +2180,7 @@ mod tests {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let (file, op_size) = write_single_table_tx(&io, "payload-size.db-log", 101);
         let trailer_offset = LOG_HDR_SIZE + TX_HEADER_SIZE + op_size;
-        let bad_payload_size = (op_size as u32 + 1).to_le_bytes().to_vec();
+        let bad_payload_size = (op_size as u64 + 1).to_le_bytes().to_vec();
         let bad = Arc::new(Buffer::new(bad_payload_size));
         let c = file
             .pwrite(trailer_offset as u64, bad, Completion::new_write(|_| {}))
@@ -2226,7 +2228,7 @@ mod tests {
         let bad = Arc::new(Buffer::new(0u32.to_le_bytes().to_vec()));
         let c = file
             .pwrite(
-                (trailer_offset + 4) as u64,
+                (trailer_offset + 8) as u64,
                 bad,
                 Completion::new_write(|_| {}),
             )
@@ -2262,7 +2264,7 @@ mod tests {
         let after_second = log.offset as usize;
         let second_frame_len = after_second - after_first;
 
-        let second_trailer_crc_offset = after_first + second_frame_len - TX_TRAILER_SIZE + 4;
+        let second_trailer_crc_offset = after_first + second_frame_len - TX_TRAILER_SIZE + 8;
         let c = file
             .pwrite(
                 second_trailer_crc_offset as u64,
