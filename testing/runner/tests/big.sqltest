@@ -1,4 +1,5 @@
 @database iso.db
+@skip-file-if sqlite "run heavy test only on tursodb"
 
 @backend cli
 test big-db {
