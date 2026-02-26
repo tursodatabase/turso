@@ -33,77 +33,71 @@ info:
 ---
 QUERY PLAN
 |--SCAN orders
-|--USE SORTER FOR GROUP BY
-`--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1
+|--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1
+`--USE SORTER FOR GROUP BY
 
 BYTECODE
-addr  opcode                      p1  p2  p3  p4                                     p5  comment
-   0            Init               0  64   0                                          0  Start at 64
-   1            Null               0   9   0                                          0  r[9]=NULL
-   2            SorterOpen         0   1   0  k(1,B)                                  0  cursor=0
-   3            Integer            0   6   0                                          0  r[6]=0; clear group by abort flag
-   4            Null               0   7   0                                          0  r[7]=NULL; initialize group by comparison registers to NULL
-   5            Gosub             12  60   0                                          0  ; go to clear accumulator subroutine
-   6            OpenRead           2   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
-   7            Rewind             2  34   0                                          0  Rewind table orders
-   8              Column           2   4  14                                          0  r[14]=orders.o_orderdate
-   9              Lt              14  15  33  Binary                                  0  if r[14]<r[15] goto 33
-  10              Column           2   4  17                                          0  r[17]=orders.o_orderdate
-  11              Ge              17  18  33  Binary                                  0  if r[17]>=r[18] goto 33
-  12              BeginSubrtn     19   0   0                                          0  r[19]=NULL
-  13              Integer          0   1   0                                          0  r[1]=0
-  14              Integer          1  36   0                                          0  r[36]=1; LIMIT counter
-  15              IfNot           36  28   0                                          0  if !r[36] goto 28
-  16              OpenRead         3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-  17              OpenRead         4  11   0  k(3,B,B)                                0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
-  18              RowId            2  37   0                                          0  r[37]=orders.rowid
-  19              SeekGE           4  28  37                                          0  key=[37..37]
-  20                IdxGT          4  28  37                                          0  key=[37..37]
-  21                DeferredSeek   4   3   0                                          0
-  22                Column         3  11  39                                          0  r[39]=lineitem.l_commitdate
-  23                Column         3  12  40                                          0  r[40]=lineitem.l_receiptdate
-  24                Ge            39  40  27  Binary                                  0  if r[39]>=r[40] goto 27
-  25                Integer        1   1   0                                          0  r[1]=1
-  26                DecrJumpZero  36  28   0                                          0  if (--r[36]==0) goto 28
-  27              Next             4  20   0                                          0
-  28            Return            19   0   1                                          0
-  29            IfNot              1  33   1                                          0  if !r[1] goto 33
-  30            Column             2   5  11                                          0  r[11]=orders.o_orderpriority
-  31            MakeRecord        11   1  10                                          0  r[10]=mkrec(r[11..11])
-  32            SorterInsert       0  10   0  0                                       0  key=r[10]
-  33          Next                 2   8   0                                          0
-  34          OpenPseudo           1  10   1                                          0  1 columns in r[10]
-  35          SorterSort           0  49   0                                          0
-  36            SorterData         0  10   1                                          0  r[10]=data
-  37            Column             1   0  41                                          0  r[41]=pseudo.column 0
-  38            Compare            7  41   1  k(1, Binary)                            0  r[7..7]==r[41..41]
-  39            Jump              40  44  40                                          0  ; start new group if comparison is not equal
-  40            Gosub              4  53   0                                          0  ; check if ended group had data, and output if so
-  41            Move              41   7   1                                          0  r[7..7]=r[41..41]
-  42            IfPos              6  63   0                                          0  r[6]>0 -> r[6]-=0, goto 63; check abort flag
-  43            Gosub             12  60   0                                          0  ; goto clear accumulator subroutine
-  44            AggStep            0  42   9  count                                   0  accum=r[9] step(r[42])
-  45            If                 5  47   0                                          0  if r[5] goto 47; don't emit group columns if continuing existing group
-  46            Column             1   0   8                                          0  r[8]=pseudo.column 0
-  47            Integer            1   5   0                                          0  r[5]=1; indicate data in accumulator
-  48          SorterNext           0  36   0                                          0
-  49          Gosub                4  53   0                                          0  ; emit row for final group
-  50          Goto                 0  63   0                                          0  ; group by finished
-  51          Integer              1   6   0                                          0  r[6]=1
-  52        Return                 4   0   0                                          0
-  53        IfPos                  5  55   0                                          0  r[5]>0 -> r[5]-=0, goto 55; output group by row subroutine start
-  54      Return                   4   0   0                                          0
-  55      AggFinal                 0   9   0  count                                   0  accum=r[9]
-  56      Copy                     8   2   0                                          0  r[2]=r[8]
-  57      Copy                     9   3   0                                          0  r[3]=r[9]
-  58      ResultRow                2   2   0                                          0  output=r[2..3]
-  59    Return                     4   0   0                                          0
-  60    Null                       0   8   9                                          0  r[8..9]=NULL; clear accumulator subroutine start
-  61    Integer                    0   5   0                                          0  r[5]=0
-  62  Return                      12   0   0                                          0
-  63  Halt                         0   0   0                                          0
-  64  Transaction                  0   1   8                                          0  iDb=0 tx_mode=Read
-  65  String8                      0  15   0  1997-06-01                              0  r[15]='1997-06-01'
-  66  String8                      0  18   0  1997-09-01                              0  r[18]='1997-09-01'
-  67  Integer                      1  42   0                                          0  r[42]=1
-  68  Goto                         0   1   0                                          0
+addr  opcode                    p1  p2  p3  p4                                     p5  comment
+   0          Init               0  58   0                                          0  Start at 58
+   1          Null               0   9   0                                          0  r[9]=NULL
+   2          SorterOpen         0   1   0  k(1,B)                                  0  cursor=0
+   3          Integer            0   6   0                                          0  r[6]=0; clear group by abort flag
+   4          Null               0   7   0                                          0  r[7]=NULL; initialize group by comparison registers to NULL
+   5          Gosub             12  54   0                                          0  ; go to clear accumulator subroutine
+   6          OpenRead           2   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
+   7          OpenRead           3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+   8          OpenRead           4  11   0  k(3,B,B)                                0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
+   9          Rewind             2  28   0                                          0  Rewind table orders
+  10            Column           2   4  14                                          0  r[14]=orders.o_orderdate
+  11            Lt              14  15  27  Binary                                  0  if r[14]<r[15] goto 27
+  12            Column           2   4  17                                          0  r[17]=orders.o_orderdate
+  13            Ge              17  18  27  Binary                                  0  if r[17]>=r[18] goto 27
+  14            RowId            2  19   0                                          0  r[19]=orders.rowid
+  15            SeekGE           4  26  19                                          0  key=[19..19]
+  16              IdxGT          4  26  19                                          0  key=[19..19]
+  17              DeferredSeek   4   3   0                                          0
+  18              Column         3  11  21                                          0  r[21]=lineitem.l_commitdate
+  19              Column         3  12  22                                          0  r[22]=lineitem.l_receiptdate
+  20              Ge            21  22  25  Binary                                  0  if r[21]>=r[22] goto 25
+  21              Column         2   5  11                                          0  r[11]=orders.o_orderpriority
+  22              MakeRecord    11   1  10                                          0  r[10]=mkrec(r[11..11])
+  23              SorterInsert   0  10   0  0                                       0  key=r[10]
+  24              Goto           0  27   0                                          0  ; semi-join: early out after first match
+  25            Next             4  16   0                                          0
+  26            Goto             0  27   0                                          0  ; semi-join: no match, skip outer row
+  27          Next               2  10   0                                          0
+  28          OpenPseudo         1  10   1                                          0  1 columns in r[10]
+  29          SorterSort         0  43   0                                          0
+  30            SorterData       0  10   1                                          0  r[10]=data
+  31            Column           1   0  23                                          0  r[23]=pseudo.column 0
+  32            Compare          7  23   1  k(1, Binary)                            0  r[7..7]==r[23..23]
+  33            Jump            34  38  34                                          0  ; start new group if comparison is not equal
+  34            Gosub            4  47   0                                          0  ; check if ended group had data, and output if so
+  35            Move            23   7   1                                          0  r[7..7]=r[23..23]
+  36            IfPos            6  57   0                                          0  r[6]>0 -> r[6]-=0, goto 57; check abort flag
+  37            Gosub           12  54   0                                          0  ; goto clear accumulator subroutine
+  38            AggStep          0  24   9  count                                   0  accum=r[9] step(r[24])
+  39            If               5  41   0                                          0  if r[5] goto 41; don't emit group columns if continuing existing group
+  40            Column           1   0   8                                          0  r[8]=pseudo.column 0
+  41            Integer          1   5   0                                          0  r[5]=1; indicate data in accumulator
+  42          SorterNext         0  30   0                                          0
+  43          Gosub              4  47   0                                          0  ; emit row for final group
+  44          Goto               0  57   0                                          0  ; group by finished
+  45          Integer            1   6   0                                          0  r[6]=1
+  46        Return               4   0   0                                          0
+  47        IfPos                5  49   0                                          0  r[5]>0 -> r[5]-=0, goto 49; output group by row subroutine start
+  48      Return                 4   0   0                                          0
+  49      AggFinal               0   9   0  count                                   0  accum=r[9]
+  50      Copy                   8   2   0                                          0  r[2]=r[8]
+  51      Copy                   9   3   0                                          0  r[3]=r[9]
+  52      ResultRow              2   2   0                                          0  output=r[2..3]
+  53    Return                   4   0   0                                          0
+  54    Null                     0   8   9                                          0  r[8..9]=NULL; clear accumulator subroutine start
+  55    Integer                  0   5   0                                          0  r[5]=0
+  56  Return                    12   0   0                                          0
+  57  Halt                       0   0   0                                          0
+  58  Transaction                0   1   8                                          0  iDb=0 tx_mode=Read
+  59  String8                    0  15   0  1997-06-01                              0  r[15]='1997-06-01'
+  60  String8                    0  18   0  1997-09-01                              0  r[18]='1997-09-01'
+  61  Integer                    1  24   0                                          0  r[24]=1
+  62  Goto                       0   1   0                                          0

@@ -834,14 +834,30 @@ pub fn try_hash_join_access_method(
     if build_root_page == probe_root_page {
         return None;
     }
+    // No hash join for semi/anti-joins (nested loop with index seek is preferred).
+    if probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.is_semi_or_anti())
+        || build_table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.is_semi_or_anti())
+    {
+        return None;
+    }
     // Determine join type from the probe table's join_info.
     let hash_join_type = if probe_table
         .join_info
         .as_ref()
-        .is_some_and(|ji| ji.full_outer)
+        .is_some_and(|ji| ji.is_full_outer())
     {
         HashJoinType::FullOuter
-    } else if probe_table.join_info.as_ref().is_some_and(|ji| ji.outer) {
+    } else if probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.is_outer())
+    {
         HashJoinType::LeftOuter
     } else {
         HashJoinType::Inner
@@ -852,7 +868,7 @@ pub fn try_hash_join_access_method(
     if build_table
         .join_info
         .as_ref()
-        .is_some_and(|ji| ji.outer || ji.full_outer)
+        .is_some_and(|ji| ji.is_outer())
     {
         return None;
     }

@@ -312,7 +312,7 @@ fn prepare_one_select_plan(
                     .map(|(i, t)| JoinOrderMember {
                         table_id: t.internal_id,
                         original_idx: i,
-                        is_outer: t.join_info.as_ref().is_some_and(|j| j.outer),
+                        is_outer: t.join_info.as_ref().is_some_and(|j| j.is_outer()),
                     })
                     .collect(),
                 table_references,
@@ -795,7 +795,7 @@ fn add_vtab_predicates_to_where_clause(
                 .and_then(|t| {
                     t.join_info
                         .as_ref()
-                        .and_then(|ji| ji.outer.then_some(table_id))
+                        .and_then(|ji| ji.is_outer().then_some(table_id))
                 })
         });
         plan.where_clause.push(WhereTerm {

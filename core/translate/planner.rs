@@ -6,8 +6,8 @@ use super::{
     expr::walk_expr,
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
-        JoinOrderMember, JoinedTable, Operation, OuterQueryReference, Plan, QueryDestination,
-        ResultSetColumn, Scan, TableReferences, WhereTerm,
+        JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
+        Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
     },
     select::prepare_select_plan,
 };
@@ -1855,9 +1855,15 @@ fn parse_join(
         .joined_tables_mut()
         .get_mut(last_idx)
         .unwrap();
+    let plan_join_type = if full_outer {
+        PlanJoinType::FullOuter
+    } else if outer {
+        PlanJoinType::LeftOuter
+    } else {
+        PlanJoinType::Inner
+    };
     rightmost_table.join_info = Some(JoinInfo {
-        outer,
-        full_outer,
+        join_type: plan_join_type,
         using,
     });
 

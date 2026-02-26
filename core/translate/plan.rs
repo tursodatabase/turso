@@ -685,6 +685,15 @@ pub fn select_star(
         tables.iter().collect()
     };
     for table in table_iter {
+        // Semi/anti-join tables are internal (from EXISTS/NOT EXISTS unnesting)
+        // and should not contribute columns to SELECT *.
+        if table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.is_semi_or_anti())
+        {
+            continue;
+        }
         out_columns.extend(
             table
                 .columns()
@@ -718,15 +727,52 @@ pub fn select_star(
     }
 }
 
+/// The type of join between two tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    LeftOuter,
+    FullOuter,
+    /// Semi-join: keep outer row if inner match found (EXISTS).
+    Semi,
+    /// Anti-join: keep outer row if NO inner match found (NOT EXISTS).
+    Anti,
+}
+
 /// Join information for a table reference.
 #[derive(Debug, Clone)]
 pub struct JoinInfo {
-    /// Whether this is an OUTER JOIN.
-    pub outer: bool,
-    /// FULL OUTER JOIN (implies `outer = true`).
-    pub full_outer: bool,
+    /// The type of join.
+    pub join_type: JoinType,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
     pub using: Vec<ast::Name>,
+}
+
+impl JoinInfo {
+    /// Whether this is an OUTER JOIN (LEFT OUTER or FULL OUTER).
+    pub fn is_outer(&self) -> bool {
+        matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
+    }
+
+    /// Whether this is a FULL OUTER JOIN.
+    pub fn is_full_outer(&self) -> bool {
+        self.join_type == JoinType::FullOuter
+    }
+
+    /// Whether this is a semi-join (EXISTS).
+    pub fn is_semi(&self) -> bool {
+        self.join_type == JoinType::Semi
+    }
+
+    /// Whether this is an anti-join (NOT EXISTS).
+    pub fn is_anti(&self) -> bool {
+        self.join_type == JoinType::Anti
+    }
+
+    /// Whether this is a semi-join or anti-join (EXISTS/NOT EXISTS).
+    pub fn is_semi_or_anti(&self) -> bool {
+        matches!(self.join_type, JoinType::Semi | JoinType::Anti)
+    }
 }
 
 /// A joined table in the query plan.
@@ -738,7 +784,7 @@ pub struct JoinInfo {
 /// - all have [Operation::Scan]
 /// - identifiers are `t`, `p`, `sub`
 /// - `t` and `p` are [Table::BTree] while `sub` is [Table::FromClauseSubquery]
-/// - join_info is None for the first table reference, and Some(JoinInfo { outer: false, using: None }) for the second and third table references
+/// - join_info is None for the first table reference, and Some(JoinInfo { join_type: JoinType::Inner, using: vec![] }) for the second and third table references
 #[derive(Debug, Clone)]
 pub struct JoinedTable {
     /// The operation that this table reference performs.
