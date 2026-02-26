@@ -4056,7 +4056,11 @@ pub fn op_decr_jump_zero(
                 state.pc += 1;
             }
         }
-        _ => unreachable!("DecrJumpZero on non-integer register"),
+        _ => {
+            return Err(LimboError::InternalError(
+                "DecrJumpZero: the value in the register is not an integer".into(),
+            ));
+        }
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -12242,6 +12246,39 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Database, DatabaseOpts, MemoryIO, IO};
+
+    #[test]
+    fn test_decr_jump_zero_non_integer_register_returns_error() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        let stmt = conn.prepare("SELECT 1;").unwrap();
+
+        let mut state = ProgramState::new(1, 0);
+        state.set_register(0, Register::Value(Value::Text("not-an-int".into())));
+
+        let insn = Insn::DecrJumpZero {
+            reg: 0,
+            target_pc: crate::vdbe::BranchOffset::Offset(1),
+        };
+
+        let err = match op_decr_jump_zero(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+            Ok(_) => panic!("non-integer register must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, LimboError::InternalError(message) if message == "DecrJumpZero: the value in the register is not an integer")
+        );
+        assert_eq!(state.pc, 0);
+    }
 
     #[test]
     fn test_execute_sqlite_version() {
