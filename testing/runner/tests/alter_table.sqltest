@@ -574,6 +574,22 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-rename-column-updates-unique-sets {
+    CREATE TABLE t(a INTEGER, b TEXT, UNIQUE(b));
+    INSERT INTO t VALUES (1, 'hello');
+    ALTER TABLE t RENAME b TO c;
+
+    -- Adding a column triggers to_sql() which reads unique_sets.
+    -- If unique_sets still has the old name "b", the regenerated
+    -- CREATE TABLE will reference a non-existent column.
+    ALTER TABLE t ADD d INTEGER;
+    SELECT sql FROM sqlite_schema WHERE type = 'table';
+}
+expect pattern {
+    CREATE TABLE t\s*\(a INTEGER, c TEXT, d INTEGER, UNIQUE\s*\(c\)\)
+}
+
+@cross-check-integrity
 test fail-alter-table-drop-column-expr-index-multi-col {
     CREATE TABLE t(a, b, c);
     CREATE INDEX i_expr ON t(a + c, substr(b, 1, 1));
