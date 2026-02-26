@@ -199,3 +199,38 @@ test create-table-only-generated-column-error {
 }
 expect error {
 }
+
+# https://github.com/tursodatabase/turso/issues/4987
+@cross-check-integrity
+test create_table_trailing_named_column_constraint {
+    CREATE TABLE str_KQGEZYFQJABU (
+        str_MJIKIZANNECS NUMERIC NUMERIC,
+        str_BSBKHLMWFJWP INTEGER(513886854) CONSTRAINT str_BCABUIOGMFKB PRIMARY KEY,
+        str_WMEAIZUBQNJL,
+        str_KRXQUVJSHKZB CONSTRAINT str_NUUHXJKMDPMJ
+    );
+    INSERT INTO str_KQGEZYFQJABU
+        (str_MJIKIZANNECS, str_BSBKHLMWFJWP, str_WMEAIZUBQNJL, str_KRXQUVJSHKZB)
+    VALUES
+        (1, 10, 'left', 'right');
+    SELECT str_BSBKHLMWFJWP, str_WMEAIZUBQNJL, str_KRXQUVJSHKZB
+    FROM str_KQGEZYFQJABU;
+}
+expect {
+    10|left|right
+}
+
+# https://github.com/tursodatabase/turso/issues/4987
+@cross-check-integrity
+test create_table_trailing_named_column_constraint_primary_key_enforced {
+    CREATE TABLE t(
+        a INTEGER CONSTRAINT c PRIMARY KEY,
+        b CONSTRAINT d
+    );
+    INSERT INTO t VALUES(1, 'x');
+    INSERT OR IGNORE INTO t VALUES(1, 'y');
+    SELECT count(*), min(b), max(b) FROM t;
+}
+expect {
+    1|x|x
+}

@@ -167,6 +167,21 @@ expect {
     1|integer|7
 }
 
+# https://github.com/tursodatabase/turso/issues/4987
+@cross-check-integrity
+test alter-table-add-column-trailing-named-constraint {
+    CREATE TABLE t(x);
+    ALTER TABLE t ADD COLUMN a CONSTRAINT c;
+    INSERT INTO t(x, a) VALUES(1, 2);
+    SELECT name FROM pragma_table_info('t') ORDER BY cid;
+    SELECT x, a FROM t;
+}
+expect {
+    x
+    a
+    1|2
+}
+
 @cross-check-integrity
 test alter-table-drop-column {
     CREATE TABLE t (a, b);
