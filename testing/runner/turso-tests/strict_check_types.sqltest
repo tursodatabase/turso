@@ -369,15 +369,56 @@ expect {
 }
 
 # ============================================================================
-# Function calls in CHECK — must require CAST
+# Built-in function calls in CHECK on STRICT tables
 # ============================================================================
 
 @requires strict "uses STRICT tables"
-test function-call-unknown-type-error {
+test function-call-length-valid {
     CREATE TABLE t(a TEXT CHECK(length(a) < 10)) STRICT;
+    INSERT INTO t VALUES('hello');
+    SELECT a FROM t;
+}
+expect {
+    hello
+}
+
+@requires strict "uses STRICT tables"
+test function-call-length-violation {
+    CREATE TABLE t(a TEXT CHECK(length(a) < 5)) STRICT;
+    INSERT INTO t VALUES('toolong');
 }
 expect error {
-    cannot determine return type of function
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test function-call-abs-valid {
+    CREATE TABLE t(x INTEGER CHECK(abs(x) < 100)) STRICT;
+    INSERT INTO t VALUES(-42);
+    SELECT x FROM t;
+}
+expect {
+    -42
+}
+
+@requires strict "uses STRICT tables"
+test function-call-upper-valid {
+    CREATE TABLE t(a TEXT CHECK(upper(a) = a)) STRICT;
+    INSERT INTO t VALUES('HELLO');
+    SELECT a FROM t;
+}
+expect {
+    HELLO
+}
+
+@requires strict "uses STRICT tables"
+test function-call-typeof-valid {
+    CREATE TABLE t(a TEXT CHECK(typeof(a) = 'text')) STRICT;
+    INSERT INTO t VALUES('hello');
+    SELECT a FROM t;
+}
+expect {
+    hello
 }
 
 @requires strict "uses STRICT tables"
