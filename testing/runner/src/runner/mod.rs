@@ -30,6 +30,8 @@ pub struct RunOptions {
     pub setups: HashMap<String, String>,
     /// Whether MVCC mode is enabled
     pub mvcc: bool,
+    /// Whether release mode is enabled
+    pub release: bool,
     /// Global skip directives
     pub global_skip: Vec<Skip>,
     /// Global capability requirements (used by tests)
@@ -69,6 +71,11 @@ pub trait Runnable: Clone + Send + 'static {
 
     /// Whether this test should be cross-checked with another binary's integrity_check.
     fn cross_check_integrity(&self) -> bool {
+        false
+    }
+
+    /// Whether this test requires release mode to run.
+    fn release(&self) -> bool {
         false
     }
 
@@ -124,6 +131,10 @@ impl Runnable for TestCase {
         self.modifiers.cross_check_integrity
     }
 
+    fn release(&self) -> bool {
+        self.modifiers.release
+    }
+
     fn queries_to_execute(&self) -> Vec<String> {
         vec![self.sql.clone()]
     }
@@ -171,6 +182,10 @@ impl Runnable for SnapshotCase {
             }
         }
         None
+    }
+
+    fn release(&self) -> bool {
+        self.modifiers.release
     }
 
     fn queries_to_execute(&self) -> Vec<String> {
@@ -310,6 +325,19 @@ async fn run_single<B: SqlBackend, R: Runnable>(
                     duration: start.elapsed(),
                 };
             }
+        }
+
+        // Check if test requires release mode
+        if test.release() && !options.release {
+            return TestResult {
+                name: test.name().to_string(),
+                file: options.file_path,
+                database: options.db_config,
+                outcome: TestOutcome::Skipped {
+                    reason: "requires release mode".to_string(),
+                },
+                duration: start.elapsed(),
+            };
         }
 
         // Check additional skip conditions (e.g., capabilities)
@@ -713,6 +741,8 @@ pub struct RunnerConfig {
     pub filter: Option<String>,
     /// Whether MVCC mode is enabled
     pub mvcc: bool,
+    /// Whether release mode is enabled
+    pub release: bool,
     /// Snapshot update mode (Auto, New, Always, No)
     pub snapshot_update_mode: SnapshotUpdateMode,
     /// Snapshot name filter (glob pattern)
@@ -728,6 +758,7 @@ impl Default for RunnerConfig {
             max_jobs: num_cpus::get(),
             filter: None,
             mvcc: false,
+            release: false,
             snapshot_update_mode: SnapshotUpdateMode::Auto,
             snapshot_filter: None,
             cross_check_binary: None,
@@ -748,6 +779,11 @@ impl RunnerConfig {
 
     pub fn with_mvcc(mut self, mvcc: bool) -> Self {
         self.mvcc = mvcc;
+        self
+    }
+
+    pub fn with_release(mut self, release: bool) -> Self {
+        self.release = release;
         self
     }
 
@@ -835,6 +871,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     db_config: effective_db_config,
                     setups: test_file.setups.clone(),
                     mvcc: self.config.mvcc,
+                    release: self.config.release,
                     global_skip: test_file.global_skip.clone(),
                     global_requires: test_file.global_requires.clone(),
                     backend_capabilities: backend_capabilities.clone(),
@@ -906,6 +943,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     db_config: db_config.clone(),
                     setups: test_file.setups.clone(),
                     mvcc: self.config.mvcc,
+                    release: self.config.release,
                     global_skip: test_file.global_skip.clone(),
                     global_requires: test_file.global_requires.clone(),
                     backend_capabilities: backend_capabilities.clone(),

@@ -228,6 +228,8 @@ async fn run_tests(
     snapshot_filter: Option<String>,
     cross_check_binary: Option<PathBuf>,
 ) -> ExitCode {
+    let release = !cfg!(debug_assertions);
+
     // Resolve paths, trying to add .sqltest extension if missing
     let mut resolved_paths = Vec::new();
     let mut missing = Vec::new();
@@ -318,6 +320,7 @@ async fn run_tests(
     let mut config = RunnerConfig::default()
         .with_max_jobs(jobs)
         .with_mvcc(mvcc)
+        .with_release(release)
         .with_snapshot_update_mode(snapshot_mode);
     if let Some(f) = filter {
         config = config.with_filter(f);

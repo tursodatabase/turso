@@ -128,7 +128,9 @@
         { "include": "#decorator-skip" },
         { "include": "#decorator-skip-if" },
         { "include": "#decorator-backend" },
-        { "include": "#decorator-requires" }
+        { "include": "#decorator-requires" },
+        { "include": "#decorator-release" },
+        { "include": "#decorator-cross-check-integrity" }
       ]
     },
     "decorator-setup": {
@@ -205,6 +207,20 @@
           "match": "\\\\."
         }
       ]
+    },
+    "decorator-release": {
+      "name": "meta.decorator.release.sqltest",
+      "match": "(@release)",
+      "captures": {
+        "1": { "name": "keyword.control.directive.sqltest" }
+      }
+    },
+    "decorator-cross-check-integrity": {
+      "name": "meta.decorator.cross-check-integrity.sqltest",
+      "match": "(@cross-check-integrity)",
+      "captures": {
+        "1": { "name": "keyword.control.directive.sqltest" }
+      }
     },
     "test-block": {
       "name": "meta.test-block.sqltest",

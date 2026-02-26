@@ -1,6 +1,7 @@
 @database iso.db
 @skip-file-if sqlite "run heavy test only on tursodb"
 
+@release
 @backend cli
 test big-db {
     DROP TABLE IF EXISTS t;
