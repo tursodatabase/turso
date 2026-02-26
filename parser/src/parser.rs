@@ -3458,19 +3458,43 @@ impl<'a> Parser<'a> {
             };
 
             if name.is_some() {
-                peek_expect!(
-                    self,
-                    TK_DEFAULT,
-                    TK_NOT,
-                    TK_NULL,
-                    TK_PRIMARY,
-                    TK_UNIQUE,
-                    TK_CHECK,
-                    TK_REFERENCES,
-                    TK_COLLATE,
-                    TK_GENERATED,
-                    TK_AS,
-                );
+                match self.peek()? {
+                    Some(tok)
+                        if matches!(
+                            tok.token_type,
+                            TK_DEFAULT
+                                | TK_NOT
+                                | TK_NULL
+                                | TK_PRIMARY
+                                | TK_UNIQUE
+                                | TK_CHECK
+                                | TK_REFERENCES
+                                | TK_COLLATE
+                                | TK_GENERATED
+                                | TK_AS
+                        ) => {}
+                    Some(tok) if matches!(tok.token_type, TK_COMMA | TK_RP | TK_SEMI) => {
+                        // SQLite accepts trailing "CONSTRAINT <name>" in a column definition.
+                        // It does not produce a real column constraint, so stop parsing here.
+                        break;
+                    }
+                    None => break,
+                    _ => {
+                        peek_expect!(
+                            self,
+                            TK_DEFAULT,
+                            TK_NOT,
+                            TK_NULL,
+                            TK_PRIMARY,
+                            TK_UNIQUE,
+                            TK_CHECK,
+                            TK_REFERENCES,
+                            TK_COLLATE,
+                            TK_GENERATED,
+                            TK_AS,
+                        );
+                    }
+                }
             }
 
             match self.peek()? {
@@ -10244,6 +10268,48 @@ mod tests {
                         columns: vec![
                             ColumnDefinition {
                                 col_name: Name::exact("column".to_owned()),
+                                col_type: None,
+                                constraints: vec![],
+                            },
+                        ],
+                        constraints: vec![],
+                        options: TableOptions::empty(),
+                    },
+                })],
+            ),
+            (
+                b"CREATE TABLE foo (a CONSTRAINT c PRIMARY KEY, b, d CONSTRAINT e)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateTable {
+                    temporary: false,
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        db_name: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    body: CreateTableBody::ColumnsAndConstraints {
+                        columns: vec![
+                            ColumnDefinition {
+                                col_name: Name::exact("a".to_owned()),
+                                col_type: None,
+                                constraints: vec![
+                                    NamedColumnConstraint {
+                                        name: Some(Name::exact("c".to_owned())),
+                                        constraint: ColumnConstraint::PrimaryKey {
+                                            order: None,
+                                            conflict_clause: None,
+                                            auto_increment: false,
+                                        }
+                                    }
+                                ],
+                            },
+                            ColumnDefinition {
+                                col_name: Name::exact("b".to_owned()),
+                                col_type: None,
+                                constraints: vec![],
+                            },
+                            ColumnDefinition {
+                                col_name: Name::exact("d".to_owned()),
                                 col_type: None,
                                 constraints: vec![],
                             },
