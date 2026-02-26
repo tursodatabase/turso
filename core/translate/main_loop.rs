@@ -486,18 +486,15 @@ pub fn init_loop(
                             db: table.database_id,
                         });
                     }
-                    let index_cursor_id = index_cursor_id.unwrap();
+                    let index_cursor_id = index_cursor_id.expect("index cursor is always opened in OperationMode::DELETE for IndexMethodQuery");
                     program.emit_insn(Insn::OpenWrite {
                         cursor_id: index_cursor_id,
-                        root_page: table.op.index().unwrap().root_page.into(),
+                        root_page: table.op.index().expect("index to exist").root_page.into(),
                         db: table.database_id,
                     });
-                    // For DELETE, open all other indexes for writing so they
-                    // get updated when rows are removed.
-                    let indices: Vec<_> =
-                        t_ctx.resolver.with_schema(table.database_id, |s| {
-                            s.get_indices(table.table.get_name()).cloned().collect()
-                        });
+                    let indices: Vec<_> = t_ctx.resolver.with_schema(table.database_id, |s| {
+                        s.get_indices(table.table.get_name()).cloned().collect()
+                    });
                     for index in &indices {
                         if table
                             .op
@@ -529,7 +526,7 @@ pub fn init_loop(
                     let index_cursor_id = index_cursor_id.unwrap();
                     program.emit_insn(Insn::OpenWrite {
                         cursor_id: index_cursor_id,
-                        root_page: table.op.index().unwrap().root_page.into(),
+                        root_page: table.op.index().expect("index to exist").root_page.into(),
                         db: table.database_id,
                     });
                 }
