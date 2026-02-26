@@ -5562,27 +5562,59 @@ pub fn comparison_affinity(
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Affinity {
-    let mut aff = get_expr_affinity(lhs_expr, referenced_tables, resolver);
+    let lhs_affinity = get_expr_affinity(lhs_expr, referenced_tables, resolver);
+    let lhs_has_affinity = expr_has_comparison_affinity(lhs_expr, referenced_tables, resolver);
 
-    aff = compare_affinity(rhs_expr, aff, referenced_tables, resolver);
+    compare_affinity(
+        rhs_expr,
+        lhs_affinity,
+        lhs_has_affinity,
+        referenced_tables,
+        resolver,
+    )
+}
 
-    // If no affinity determined (both operands are literals), default to BLOB
-    if !aff.has_affinity() {
-        Affinity::Blob
-    } else {
-        aff
+/// Return whether an expression has a real affinity for comparison purposes.
+///
+/// This intentionally distinguishes BLOB-affinity expressions (which *do* have
+/// affinity in SQLite comparison rules) from expressions with no affinity
+/// (literals, most computed expressions, unresolved registers).
+pub fn expr_has_comparison_affinity(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
+) -> bool {
+    match expr {
+        ast::Expr::Column { table, column, .. } => referenced_tables
+            .and_then(|tables| tables.find_table_by_internal_id(*table))
+            .and_then(|(_, table_ref)| table_ref.get_column_at(*column))
+            .is_some(),
+        ast::Expr::RowId { .. } => true,
+        ast::Expr::Cast { type_name, .. } => type_name.is_some(),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            expr_has_comparison_affinity(exprs.first().unwrap(), referenced_tables, resolver)
+        }
+        ast::Expr::Collate(expr, _) => {
+            expr_has_comparison_affinity(expr, referenced_tables, resolver)
+        }
+        ast::Expr::Register(reg) => resolver
+            .and_then(|res| res.register_affinities.get(reg))
+            .is_some(),
+        _ => false,
     }
 }
 
 pub fn compare_affinity(
     expr: &ast::Expr,
     other_affinity: Affinity,
+    other_has_affinity: bool,
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Affinity {
     let expr_affinity = get_expr_affinity(expr, referenced_tables, resolver);
+    let expr_has_affinity = expr_has_comparison_affinity(expr, referenced_tables, resolver);
 
-    if expr_affinity.has_affinity() && other_affinity.has_affinity() {
+    if expr_has_affinity && other_has_affinity {
         // Both sides have affinity - use numeric if either is numeric
         if expr_affinity.is_numeric() || other_affinity.is_numeric() {
             Affinity::Numeric
@@ -5591,9 +5623,9 @@ pub fn compare_affinity(
         }
     } else {
         // One or both sides have no affinity - use the one that does, or Blob if neither
-        if expr_affinity.has_affinity() {
+        if expr_has_affinity {
             expr_affinity
-        } else if other_affinity.has_affinity() {
+        } else if other_has_affinity {
             other_affinity
         } else {
             Affinity::Blob
