@@ -130,6 +130,8 @@ pub struct Connection {
     pub(super) busy_handler: RwLock<BusyHandler>,
     /// Whether this is an internal connection used for MVCC bootstrap
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
+    /// Whether pragma automatic_index=ON for this connection (default: true)
+    pub(super) automatic_index_pragma: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
@@ -732,6 +734,14 @@ impl Connection {
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
         Ok((db, encryption_opts))
+    }
+
+    pub fn set_automatic_index_enabled(&self, enable: bool) {
+        self.automatic_index_pragma.store(enable, Ordering::Release);
+    }
+
+    pub fn automatic_index_enabled(&self) -> bool {
+        self.automatic_index_pragma.load(Ordering::Acquire)
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {

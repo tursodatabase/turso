@@ -39,6 +39,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["application_id"],
         ),
+        AutomaticIndex => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["automatic_index"],
+        ),
         CacheSize => Pragma::new(
             PragmaFlags::NeedSchema
                 | PragmaFlags::Result0

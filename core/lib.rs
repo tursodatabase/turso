@@ -1291,6 +1291,7 @@ impl Database {
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
+            automatic_index_pragma: AtomicBool::new(true),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             check_constraints_pragma: AtomicBool::new(false),

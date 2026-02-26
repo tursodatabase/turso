@@ -1,0 +1,76 @@
+@database :memory:
+
+test pragma-automatic-index-default {
+    PRAGMA automatic_index;
+}
+expect {
+    1
+}
+
+test pragma-automatic-index-disable {
+    PRAGMA automatic_index = 0;
+    PRAGMA automatic_index;
+}
+expect {
+    0
+}
+
+test pragma-automatic-index-enable {
+    PRAGMA automatic_index = 0;
+    PRAGMA automatic_index = 1;
+    PRAGMA automatic_index;
+}
+expect {
+    1
+}
+
+test pragma-automatic-index-call-form {
+    PRAGMA automatic_index(0);
+    PRAGMA automatic_index;
+}
+expect {
+    0
+}
+
+test pragma-automatic-index-off-keyword {
+    PRAGMA automatic_index = OFF;
+    PRAGMA automatic_index;
+}
+expect {
+    0
+}
+
+test pragma-automatic-index-on-keyword {
+    PRAGMA automatic_index = OFF;
+    PRAGMA automatic_index = ON;
+    PRAGMA automatic_index;
+}
+expect {
+    1
+}
+
+test pragma-automatic-index-true-keyword {
+    PRAGMA automatic_index = OFF;
+    PRAGMA automatic_index = TRUE;
+    PRAGMA automatic_index;
+}
+expect {
+    1
+}
+
+test pragma-automatic-index-no-keyword {
+    PRAGMA automatic_index = no;
+    PRAGMA automatic_index;
+}
+expect {
+    0
+}
+
+test pragma-automatic-index-yes-keyword {
+    PRAGMA automatic_index = no;
+    PRAGMA automatic_index = yes;
+    PRAGMA automatic_index;
+}
+expect {
+    1
+}
