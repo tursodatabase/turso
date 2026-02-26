@@ -463,6 +463,11 @@ pub struct Transaction {
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
     commit_dep_set: Mutex<HashSet<TxID>>,
+    /// True when `with_header_mut` has been called on this transaction,
+    /// indicating the database header was modified (e.g. by PRAGMA user_version).
+    /// Header-only writes don't add to `write_set`, so without this flag the
+    /// commit fast-path would skip propagating the header to `global_header`.
+    header_dirty: AtomicBool,
 }
 
 impl Transaction {
@@ -479,6 +484,7 @@ impl Transaction {
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
+            header_dirty: AtomicBool::new(false),
         }
     }
 
@@ -1340,6 +1346,13 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     if tx.abort_now.load(Ordering::Acquire) {
                         return Err(LimboError::CommitDependencyAborted);
                     }
+                    // Header-only write (e.g. PRAGMA user_version): propagate
+                    // the modified header to global without advancing
+                    // last_committed_tx_ts — no row data changed, so this
+                    // should not cause spurious Busy errors.
+                    if tx.header_dirty.load(Ordering::Acquire) {
+                        mvcc_store.global_header.write().replace(*tx.header.read());
+                    }
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
@@ -1414,14 +1427,21 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
 
                 // Read-only fast path: if write_set is empty, commit without
-                // going through CommitEnd. CommitEnd updates last_committed_tx_ts
-                // which would make a read-only transaction look like a write,
-                // causing spurious Busy errors from acquire_exclusive_tx.
+                // going through CommitEnd. CommitEnd updates
+                // last_committed_tx_ts which would make a read-only
+                // transaction look like a write, causing spurious Busy errors
+                // from acquire_exclusive_tx.
                 if self.write_set.is_empty() {
                     turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read-only transaction should not have other transactions depending on it"
                     );
+                    // Header-only write (e.g. PRAGMA user_version): propagate
+                    // the modified header to global without advancing
+                    // last_committed_tx_ts — no row data changed.
+                    if tx.header_dirty.load(Ordering::Acquire) {
+                        mvcc_store.global_header.write().replace(*tx.header.read());
+                    }
                     tx.state.store(TransactionState::Committed(*end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
@@ -3201,8 +3221,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .txs
                 .get(tx_id)
                 .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-            let header = tx.value();
-            let mut header = header.header.write();
+            let tx_val = tx.value();
+            tx_val.header_dirty.store(true, Ordering::Release);
+            let mut header = tx_val.header.write();
             tracing::debug!("with_header_mut read: header={:?}", header);
             Ok(f(&mut header))
         } else {
