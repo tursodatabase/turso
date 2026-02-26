@@ -663,6 +663,19 @@ pub fn translate_insert(
     // have a naked ON CONFLICT DO NOTHING, so if we eagerly insert any indexes, we could insert
     // invalid index entries before we hit a conflict down the line.
     let on_replace = matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty();
+
+    // Populate register-to-affinity map for expression index evaluation.
+    // When column references are rewritten to Expr::Register during INSERT,
+    // comparison operators need the original column affinity
+    for cm in &insertion.col_mappings {
+        resolver
+            .register_affinities
+            .insert(cm.register, cm.column.affinity());
+    }
+    resolver
+        .register_affinities
+        .insert(insertion.key_register(), Affinity::Integer);
+
     let mut preflight_ctx = PreflightCtx {
         upsert_actions: &upsert_actions,
         on_replace,
@@ -707,6 +720,8 @@ pub fn translate_insert(
     if has_upsert || !on_replace {
         emit_commit_phase(program, resolver, &insertion, &ctx)?;
     }
+
+    resolver.register_affinities.clear();
 
     if has_fks {
         // Child-side check must run before Insert (may HALT or increment deferred counter)

@@ -6858,16 +6858,11 @@ pub fn op_function(
                                 }
 
                                 for column in &mut columns {
-                                    match column.expr.as_mut() {
-                                        ast::Expr::Id(id)
-                                            if normalize_ident(id.as_str()) == rename_from =>
-                                        {
-                                            *id = Name::exact(
-                                                column_def.col_name.as_str().to_owned(),
-                                            );
-                                        }
-                                        _ => {}
-                                    }
+                                    rename_identifiers(
+                                        column.expr.as_mut(),
+                                        &rename_from,
+                                        column_def.col_name.as_str(),
+                                    );
                                 }
 
                                 if let Some(ref mut wc) = where_clause {
@@ -8441,7 +8436,9 @@ pub fn op_not_exists(
         },
         insn
     );
-    let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
+    let cursor_id = *cursor;
+    state.deferred_seeks[cursor_id].take();
+    let cursor = must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "NotExists");
     let cursor = cursor.as_btree_mut();
     let exists = return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()));
 
@@ -10643,7 +10640,10 @@ pub fn op_alter_column(
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
-                    if ic.name.eq_ignore_ascii_case(
+                    if let Some(ref mut expr) = ic.expr {
+                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
+                        ic.name = expr.to_string();
+                    } else if ic.name.eq_ignore_ascii_case(
                         col.name.as_ref().expect("btree column should be named"),
                     ) {
                         ic.name.clone_from(&new_name);
