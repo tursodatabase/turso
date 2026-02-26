@@ -515,6 +515,23 @@ fn plan_cte(
     // Only count actual references (FROM/JOIN usage), not pre-planning or recursive deps.
     if count_reference {
         program.increment_cte_reference(cte_def.cte_id);
+
+        // Validate explicit column count only on actual references (matching SQLite behavior,
+        // which defers this check until the CTE is used).
+        if let Some(cols) = explicit_cols {
+            let result_col_count = cte_plan
+                .select_result_columns()
+                .expect("should be a select plan")
+                .len();
+            if cols.len() != result_col_count {
+                crate::bail_parse_error!(
+                    "table {} has {} columns but {} column names were provided",
+                    cte_def.name,
+                    result_col_count,
+                    cols.len()
+                );
+            }
+        }
     }
 
     match cte_plan {
@@ -862,6 +879,22 @@ fn parse_table(
             } else {
                 Some(cte_explicit_columns.as_slice())
             };
+            // Validate explicit column count on actual CTE reference (matching SQLite
+            // behavior, which defers this check until the CTE is used).
+            if let Some(cols) = explicit_cols {
+                let result_col_count = cte_plan
+                    .select_result_columns()
+                    .expect("should be a select plan")
+                    .len();
+                if cols.len() != result_col_count {
+                    crate::bail_parse_error!(
+                        "table {} has {} columns but {} column names were provided",
+                        normalized_qualified_name,
+                        result_col_count,
+                        cols.len()
+                    );
+                }
+            }
             // Use the CTE name for the subquery name so query plans show
             // "SCAN cte_name AS alias" instead of just "SCAN alias".
             let mut jt = JoinedTable::new_subquery_from_plan(

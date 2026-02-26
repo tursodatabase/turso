@@ -1553,17 +1553,10 @@ impl JoinedTable {
             }
         };
 
-        // Validate explicit column count if provided
-        if let Some(cols) = explicit_columns {
-            if cols.len() != result_columns.len() {
-                crate::bail_parse_error!(
-                    "table {} has {} columns but {} column names were provided",
-                    identifier,
-                    result_columns.len(),
-                    cols.len()
-                );
-            }
-        }
+        // Note: column count validation (explicit_columns.len() vs result_columns.len())
+        // is intentionally NOT done here. SQLite defers this check until the CTE is
+        // actually referenced. Callers that represent actual CTE references should
+        // validate the count before calling this method.
 
         let mut columns = result_columns
             .iter()
