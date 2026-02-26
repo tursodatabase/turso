@@ -810,7 +810,7 @@ impl StreamingLogicalLogReader {
         // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
         let mut running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
         let mut payload_bytes_read: u64 = 0;
-        let mut parsed_ops = Vec::with_capacity(op_count as usize);
+        let mut parsed_ops = Vec::with_capacity((op_count as usize).min(1024));
 
         for _ in 0..op_count {
             let op_bytes = match self.try_consume_fixed::<6>(io)? {
