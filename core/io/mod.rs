@@ -89,11 +89,8 @@ pub trait File: Send + Sync {
                 let c_main = c.clone();
                 let outstanding = outstanding.clone();
                 let total_written = total_written.clone();
-                let _cloned = buf.clone();
                 Completion::new_write(move |n| {
                     if let Ok(n) = n {
-                        // reference buffer in callback to ensure alive for async io
-                        let _buf = _cloned.clone();
                         // accumulate bytes actually reported by the backend
                         total_written.fetch_add(n as usize, Ordering::SeqCst);
                         if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {

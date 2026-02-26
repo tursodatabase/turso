@@ -1864,13 +1864,10 @@ pub fn begin_write_wal_header<F: File + ?Sized>(io: &F, header: &WalHeader) -> R
         Arc::new(buffer)
     };
 
-    let cloned = buffer.clone();
     let write_complete = move |res: Result<i32, CompletionError>| {
         let Ok(bytes_written) = res else {
             return;
         };
-        // make sure to reference buffer so it's alive for async IO
-        let _buf = cloned.clone();
         turso_assert!(
             bytes_written == WAL_HEADER_SIZE as i32,
             "wal header wrote({bytes_written}) != expected({WAL_HEADER_SIZE})"

@@ -801,6 +801,10 @@ impl File for UringFile {
             })
         };
 
+        // Keep the buffer alive until the completion is processed. For non-fixed
+        // buffers the SQE holds a raw pointer; without this the Arc would drop
+        // here and the kernel could read freed memory.
+        c.keep_write_buffer_alive(buffer);
         io.ring.submit_entry(&write);
         Ok(c)
     }

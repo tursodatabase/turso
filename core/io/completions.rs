@@ -109,6 +109,9 @@ pub(super) struct CompletionInner {
     context: Context,
     /// Optional parent group this completion belongs to
     parent: OnceLock<Arc<GroupCompletionInner>>,
+    /// Keeps the write buffer alive for async I/O backends (io_uring, VFS)
+    /// where pwrite returns before the kernel has consumed the buffer.
+    write_buffer: OnceLock<Arc<Buffer>>,
 }
 
 impl fmt::Debug for CompletionInner {
@@ -274,6 +277,7 @@ impl CompletionInner {
             result: OnceLock::new(),
             context: Context::new(),
             parent: OnceLock::new(),
+            write_buffer: OnceLock::new(),
         }
     }
 }
@@ -289,6 +293,16 @@ impl Completion {
         self.inner
             .as_ref()
             .expect("completion inner should be initialized")
+    }
+
+    /// Stores a write buffer reference in the completion to keep it alive
+    /// until the I/O completes. Required for async backends (io_uring, VFS)
+    /// where pwrite returns before the kernel has consumed the buffer.
+    pub fn keep_write_buffer_alive(&self, buf: Arc<Buffer>) {
+        self.get_inner()
+            .write_buffer
+            .set(buf)
+            .expect("write buffer should only be set once");
     }
 
     pub fn new_write<F>(complete: F) -> Self

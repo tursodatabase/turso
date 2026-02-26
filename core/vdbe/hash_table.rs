@@ -1325,11 +1325,8 @@ impl HashTable {
         io_state.set(SpillIOState::WaitingForWrite);
 
         let buffer_ref = Arc::new(buffer);
-        let _buffer_ref_clone = buffer_ref.clone();
         let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
             Ok(_) => {
-                // keep buffer alive for async IO
-                let _buf = _buffer_ref_clone.clone();
                 tracing::trace!("Successfully wrote spilled partition to disk");
                 io_state.set(SpillIOState::WriteComplete);
             }

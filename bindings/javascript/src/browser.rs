@@ -214,6 +214,9 @@ impl File for OpfsFile {
             pos
         );
         let handle = self.handle;
+        // Keep the buffer alive until the async write completes — write_async
+        // passes a raw pointer to JavaScript which may fire the callback later.
+        c.keep_write_buffer_alive(buffer.clone());
         let buffer = buffer.as_slice();
         if web_worker {
             let result = unsafe { write(handle, buffer.as_ptr(), buffer.len(), pos as i32) };

@@ -162,6 +162,9 @@ impl File for VfsFileImpl {
         if res.is_error() {
             return Err(LimboError::ExtensionError("pwrite failed".to_string()));
         }
+        // Keep the buffer alive until the VFS completion fires — the extension
+        // may process the write asynchronously after this function returns.
+        c.keep_write_buffer_alive(buffer);
         Ok(c)
     }
 
