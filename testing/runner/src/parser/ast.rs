@@ -149,6 +149,8 @@ pub struct CaseModifiers {
     /// If true, cross-check the resulting database file with another binary's
     /// `PRAGMA integrity_check` after the test passes.
     pub cross_check_integrity: bool,
+    /// If true, only run this test in release mode.
+    pub release: bool,
 }
 
 /// A snapshot test case (for EXPLAIN output)
