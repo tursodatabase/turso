@@ -83,8 +83,13 @@ fn main() -> anyhow::Result<()> {
 
     let max_steps = whopper.max_steps;
     let progress_interval = max_steps / 10;
+    let elle_mode = args.elle.is_some();
     let progress_stages = [
-        "       .             I/U/D/C",
+        if elle_mode {
+            "       .             W/R"
+        } else {
+            "       .             I/U/D/C"
+        },
         "       .             ",
         "       .             ",
         "       |             ",
@@ -111,14 +116,15 @@ fn main() -> anyhow::Result<()> {
 
         if progress_interval > 0 && whopper.current_step % progress_interval == 0 {
             let stats = &whopper.stats;
-            println!(
-                "{}{}/{}/{}/{}",
-                progress_stages[progress_index],
-                stats.inserts,
-                stats.updates,
-                stats.deletes,
-                stats.integrity_checks
-            );
+            let counts = if elle_mode {
+                format!("{}/{}", stats.elle_writes, stats.elle_reads)
+            } else {
+                format!(
+                    "{}/{}/{}/{}",
+                    stats.inserts, stats.updates, stats.deletes, stats.integrity_checks
+                )
+            };
+            println!("{}{}", progress_stages[progress_index], counts);
             progress_index += 1;
         }
     }
