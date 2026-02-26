@@ -89,7 +89,9 @@ impl CheckpointResult {
         self.wal_max_frame == self.wal_total_backfilled
     }
     pub fn should_truncate(&self) -> bool {
-        self.everything_backfilled() && self.wal_max_frame > 0
+        // TRUNCATE should also clear any stale WAL bytes when the log was restarted
+        // (wal_max_frame=0) but the file still contains old frames.
+        self.everything_backfilled()
     }
     pub fn release_guard(&mut self) {
         let _ = self.maybe_guard.take();
@@ -3128,6 +3130,38 @@ pub mod test {
         assert_eq!(
             bytes_after, 0,
             "WAL file should be truncated to 0 bytes, but is {bytes_after} bytes",
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn test_shutdown_checkpoint_truncates_after_restart() {
+        let (db, path) = get_database();
+        let mut walpath = path.clone().into_os_string().into_string().unwrap();
+        walpath.push_str("/test.db-wal");
+        let walpath = std::path::PathBuf::from(walpath);
+
+        let conn = db.connect().unwrap();
+        conn.execute("create table test (id integer primary key, value text)")
+            .unwrap();
+        conn.execute("insert into test (value) values ('v1'), ('v2')")
+            .unwrap();
+
+        let pager = conn.pager.load();
+        run_checkpoint_until_done(&pager, CheckpointMode::Restart);
+
+        let bytes_before = std::fs::metadata(&walpath).unwrap().len();
+        assert!(
+            bytes_before > 0,
+            "WAL should still have data after RESTART checkpoint"
+        );
+
+        conn.close().unwrap();
+
+        let bytes_after = std::fs::metadata(&walpath).unwrap().len();
+        assert_eq!(
+            bytes_after, 0,
+            "Shutdown checkpoint should truncate WAL after RESTART, but WAL is {bytes_after} bytes",
         );
         std::fs::remove_dir_all(path).unwrap();
     }
