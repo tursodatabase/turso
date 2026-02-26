@@ -15,9 +15,8 @@ use crate::{
             ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
-            fire_prepared_fk_delete_actions, index_probe, open_read_index, open_read_table,
-            prepare_fk_delete_actions,
+            build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement, index_probe,
+            open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -3103,7 +3102,7 @@ fn emit_replace_delete_conflicting_row(
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let prepared = prepare_fk_delete_actions(
+        let prepared = ForeignKeyActions::prepare_fk_delete_actions(
             program,
             resolver,
             ctx.table.name.as_str(),
@@ -3124,7 +3123,7 @@ fn emit_replace_delete_conflicting_row(
         }
         prepared
     } else {
-        Vec::new()
+        ForeignKeyActions::default()
     };
 
     let table = &ctx.table;
@@ -3239,15 +3238,12 @@ fn emit_replace_delete_conflicting_row(
     });
 
     // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
-    if !prepared_fk_actions.is_empty() {
-        fire_prepared_fk_delete_actions(
-            program,
-            resolver,
-            prepared_fk_actions,
-            connection,
-            ctx.database_id,
-        )?;
-    }
+    prepared_fk_actions.fire_prepared_fk_delete_actions(
+        program,
+        resolver,
+        connection,
+        ctx.database_id,
+    )?;
 
     Ok(())
 }

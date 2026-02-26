@@ -2772,3 +2772,109 @@ test fk-deferred-update-null-to-valid {
 }
 expect error {
 }
+
+# UPDATE OR REPLACE should fire FK CASCADE on implicitly-deleted row
+@cross-check-integrity
+test fk-update-or-replace-cascade-on-unique-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (10, 10), (20, 20);
+    UPDATE OR REPLACE parent SET name = 'y' WHERE id = 10;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    10|10
+}
+
+# UPDATE OR REPLACE with SET NULL FK action on implicitly-deleted row
+@cross-check-integrity
+test fk-update-or-replace-set-null-on-unique-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (10, 10), (20, 20);
+    UPDATE OR REPLACE parent SET name = 'y' WHERE id = 10;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    10|10
+    20|
+}
+
+# UPDATE OR REPLACE cascade with multiple children of replaced row
+@cross-check-integrity
+test fk-update-or-replace-cascade-multiple-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (1, 20), (2, 20), (3, 10);
+    UPDATE OR REPLACE parent SET name = 'y' WHERE id = 10;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    3|10
+}
+
+# UPDATE OR REPLACE with SET DEFAULT FK action on implicitly-deleted row
+@cross-check-integrity
+test fk-update-or-replace-set-default-on-unique-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT DEFAULT NULL REFERENCES parent(id) ON DELETE SET DEFAULT);
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (10, 10), (20, 20);
+    UPDATE OR REPLACE parent SET name = 'y' WHERE id = 10;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    10|10
+    20|
+}
+
+# UPDATE OR REPLACE with no conflict should not affect children
+@cross-check-integrity
+test fk-update-or-replace-no-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (10, 10), (20, 20);
+    UPDATE OR REPLACE parent SET name = 'z' WHERE id = 10;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    10|10
+    20|20
+}
+
+# UPDATE OR REPLACE on rowid conflict should fire FK CASCADE on implicitly-deleted row
+@cross-check-integrity
+test fk-update-or-replace-cascade-on-rowid-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE ON UPDATE CASCADE);
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (1, 10), (2, 20);
+    UPDATE OR REPLACE parent SET id = 20 WHERE id = 10;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    1|20
+}
+
+# UPDATE OR REPLACE with NO ACTION FK should block the implicit delete
+@cross-check-integrity
+test fk-update-or-replace-no-action-blocks {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE NO ACTION);
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (10, 10), (20, 20);
+    UPDATE OR REPLACE parent SET name = 'y' WHERE id = 10;
+}
+expect error {
+}
