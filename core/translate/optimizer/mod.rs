@@ -516,6 +516,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
+        true,
     )?;
 
     if let Some((best_join_order, output_rows)) = best_join_order {
@@ -575,6 +576,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
+        false,
     )?;
 
     Ok(())
@@ -606,6 +608,7 @@ fn optimize_update_plan(
         &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
+        false,
     )?;
 
     if let Some(reason) = first_update_safety_reason(plan, resolver)? {
@@ -1256,6 +1259,7 @@ fn optimize_table_access(
     subqueries: &[NonFromClauseSubquery],
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
+    allow_index_methods: bool,
 ) -> Result<Option<(Vec<JoinOrderMember>, usize)>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -1292,7 +1296,7 @@ fn optimize_table_access(
     // For single-table queries, try to optimize with custom index methods directly.
     // This is the fast path that preserves the original behavior.
     let is_single_table = table_references.joined_tables().len() == 1;
-    if is_single_table {
+    if allow_index_methods && is_single_table {
         let optimized = optimize_table_access_with_custom_modules(
             result_columns,
             table_references,
@@ -1318,7 +1322,7 @@ fn optimize_table_access(
         .map(|t| base_row_estimate(schema, t, params))
         .collect::<Vec<_>>();
 
-    let index_method_candidates = if !is_single_table {
+    let index_method_candidates = if allow_index_methods && !is_single_table {
         collect_index_method_candidates(
             table_references,
             available_indexes,
