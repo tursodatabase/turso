@@ -540,9 +540,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     let stmt = match db.conn.prepare(sql) {
         Ok(stmt) => stmt,
         Err(err) => {
-            let code = handle_limbo_err(err, std::ptr::null_mut());
-            db.err_code = code;
-            return code;
+            return set_db_err(&mut db, err);
         }
     };
     let new_stmt = Box::leak(Box::new(sqlite3_stmt::new(raw_db, stmt)));
@@ -613,7 +611,7 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
 pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
     let db = &mut *stmt.db;
-    let _db = db.inner.lock().unwrap();
+    let mut db_inner = db.inner.lock().unwrap();
     let res = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
     match res {
         Ok(Some(_)) => {
@@ -626,7 +624,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
         }
         Err(LimboError::Busy) => SQLITE_BUSY,
         Err(LimboError::Interrupt) => SQLITE_INTERRUPT,
-        Err(err) => handle_limbo_err(err, std::ptr::null_mut()),
+        Err(err) => set_db_err(&mut db_inner, err),
     }
 }
 
@@ -2523,11 +2521,7 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
     rc
 }
 
-fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
-    if !container.is_null() {
-        let err_msg = format!("{err}");
-        unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
-    }
+fn limbo_err_code(err: &LimboError) -> i32 {
     match err {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
@@ -2538,4 +2532,25 @@ fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
         LimboError::Busy => SQLITE_BUSY,
         _ => SQLITE_ERROR,
     }
+}
+
+fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
+    let code = limbo_err_code(&err);
+    if !container.is_null() {
+        let err_msg = format!("{err}");
+        unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
+    }
+    code
+}
+
+/// Store a LimboError on the database handle, returning the SQLite error code.
+unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
+    if !db.p_err.is_null() {
+        let _ = CString::from_raw(db.p_err as *mut ffi::c_char);
+    }
+    let code = limbo_err_code(&err);
+    let err_msg = format!("{err}");
+    db.p_err = CString::new(err_msg).unwrap().into_raw() as *mut ffi::c_void;
+    db.err_code = code;
+    code
 }
