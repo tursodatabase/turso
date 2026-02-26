@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if mvcc "views not supported in MVCC mode"
 
 test basic_alias {
     CREATE TABLE t1(a);
