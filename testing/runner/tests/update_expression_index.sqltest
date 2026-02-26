@@ -387,3 +387,44 @@ expect {
     3
     ok
 }
+
+# UPDATE that uses a modulo expression index in the WHERE clause.
+@cross-check-integrity
+test update-where-modulo-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
+    CREATE INDEX idx_expr ON t((a%10));
+
+    INSERT INTO t VALUES
+    (1,1),(2,2),(3,3),(4,4),(5,5),
+    (6,6),(7,7),(8,8),(9,9),(10,10),
+    (11,11),(12,12),(13,13),(14,14),(15,15),
+    (16,16),(17,17),(18,18),(19,19),(20,20);
+
+    UPDATE t
+    SET a = a + 1
+    WHERE id <= 16 AND (a%10)=0;
+
+    SELECT id, a FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|4
+    5|5
+    6|6
+    7|7
+    8|8
+    9|9
+    10|11
+    11|11
+    12|12
+    13|13
+    14|14
+    15|15
+    16|16
+    17|17
+    18|18
+    19|19
+    20|20
+}

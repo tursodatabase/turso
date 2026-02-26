@@ -8436,7 +8436,9 @@ pub fn op_not_exists(
         },
         insn
     );
-    let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
+    let cursor_id = *cursor;
+    state.deferred_seeks[cursor_id].take();
+    let cursor = must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "NotExists");
     let cursor = cursor.as_btree_mut();
     let exists = return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()));
 
