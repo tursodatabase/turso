@@ -613,3 +613,196 @@ test fail-alter-table-drop-column-expr-index-multi-col {
 expect error {
 }
 
+
+# Regression: DEFAULT with negative integer on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-negative-integer {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    INSERT INTO t VALUES(2);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT -1;
+    SELECT x, y FROM t;
+}
+expect {
+    1|-1
+    2|-1
+}
+
+# Regression: DEFAULT with negative float on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-negative-float {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y REAL DEFAULT -3.14;
+    SELECT x, y FROM t;
+}
+expect {
+    1|-3.14
+}
+
+# Regression: DEFAULT with positive unary on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-positive-unary {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT +5;
+    SELECT x, y FROM t;
+}
+expect {
+    1|5
+}
+
+# Regression: negative default with TEXT affinity coercion
+@cross-check-integrity
+test alter-add-column-default-negative-text-affinity {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN c TEXT DEFAULT -99;
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|text|-99
+}
+
+# Regression: negative default with REAL affinity coercion
+@cross-check-integrity
+test alter-add-column-default-negative-real-affinity {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN c REAL DEFAULT -7;
+    SELECT a, typeof(c), c FROM t;
+}
+expect {
+    1|real|-7.0
+}
+expect @js {
+    1|real|-7
+}
+
+# Regression: multiple columns with negative defaults on pre-existing rows
+@cross-check-integrity
+test alter-add-column-multiple-negative-defaults {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN a INTEGER DEFAULT -1;
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT -2.5;
+    ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 100;
+    SELECT x, a, b, c FROM t;
+}
+expect {
+    1|-1|-2.5|100
+}
+
+# Regression: negative default value survives new row insertion
+@cross-check-integrity
+test alter-add-column-negative-default-new-rows {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT -1;
+    INSERT INTO t(x) VALUES(2);
+    SELECT x, y FROM t ORDER BY x;
+}
+expect {
+    1|-1
+    2|-1
+}
+
+# Regression: negative default with index lookup on pre-existing rows
+@cross-check-integrity
+test alter-add-column-negative-default-index-scan {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1), (2), (3);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT -1;
+    CREATE INDEX idx_y ON t(y);
+    SELECT x FROM t WHERE y = -1 ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Regression: DEFAULT TRUE / FALSE on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-boolean {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN a DEFAULT TRUE;
+    ALTER TABLE t ADD COLUMN b DEFAULT FALSE;
+    SELECT x, a, b FROM t;
+}
+expect {
+    1|1|0
+}
+
+# Regression: parenthesized negative default on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-parenthesized-negative {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT (-42);
+    SELECT x, y FROM t;
+}
+expect {
+    1|-42
+}
+
+# Regression: large negative integer default
+@cross-check-integrity
+test alter-add-column-default-large-negative {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y INTEGER DEFAULT -9223372036854775807;
+    SELECT x, y, typeof(y) FROM t;
+}
+expect {
+    1|-9223372036854775807|integer
+}
+
+# Regression: negative zero float default
+@cross-check-integrity
+test alter-add-column-default-negative-zero-float {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y REAL DEFAULT -0.0;
+    SELECT x, y, typeof(y) FROM t;
+}
+expect {
+    1|0.0|real
+}
+
+# Regression: blob default on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-blob {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y BLOB DEFAULT X'CAFE';
+    SELECT x, hex(y), typeof(y) FROM t;
+}
+expect {
+    1|CAFE|blob
+}
+
+# Regression: explicit NULL default on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-null {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y DEFAULT NULL;
+    SELECT x, y, typeof(y) FROM t;
+}
+expect {
+    1||null
+}
+
+# Regression: string default with spaces on pre-existing rows
+@cross-check-integrity
+test alter-add-column-default-string-spaces {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN y TEXT DEFAULT 'hello world';
+    SELECT x, y, typeof(y) FROM t;
+}
+expect {
+    1|hello world|text
+}

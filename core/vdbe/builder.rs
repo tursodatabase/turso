@@ -5,7 +5,6 @@ use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
-    numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
@@ -14,7 +13,7 @@ use crate::{
         plan::{ResultSetColumn, TableReferences},
     },
     vdbe::affinity::Affinity,
-    Arc, CaptureDataChangesInfo, Connection, Value, VirtualTable,
+    Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
@@ -1522,8 +1521,6 @@ impl ProgramBuilder {
     fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
 
-        use crate::translate::expr::sanitize_string;
-
         let default = 'value: {
             let default = match cursor_type {
                 CursorType::BTreeTable(btree) => &btree.columns[column].default,
@@ -1532,28 +1529,20 @@ impl ProgramBuilder {
                 _ => break 'value None,
             };
 
-            let Some(ast::Expr::Literal(ref literal)) = default.as_ref().map(|v| v.as_ref()) else {
+            let Some(ref default_expr) = default else {
                 break 'value None;
             };
 
-            let mut value = match literal {
-                ast::Literal::Numeric(s) => Value::Numeric(Numeric::from(s)),
-                ast::Literal::Null => Value::Null,
-                ast::Literal::String(s) => Value::Text(sanitize_string(s).into()),
-                ast::Literal::Blob(s) => Value::Blob(
-                    // Taken from `translate_expr`
-                    s.as_bytes()
-                        .chunks_exact(2)
-                        .map(|pair| {
-                            // We assume that sqlite3-parser has already validated that
-                            // the input is valid hex string, thus expect is safe.
-                            let hex_byte =
-                                std::str::from_utf8(pair).expect("parser validated hex string");
-                            u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
-                        })
-                        .collect(),
-                ),
-                _ => break 'value None,
+            // Try to constant-fold the default expression into a Value for the
+            // Column instruction. Non-constant defaults (e.g. DEFAULT (ABS(-5)))
+            // can't be folded and yield None here — that's correct: they are
+            // evaluated at INSERT time via translate_expr. The Column default
+            // only matters for pre-existing rows after ALTER TABLE ADD COLUMN,
+            // and ALTER TABLE already validates that the default is constant.
+            let mut value = match crate::translate::alter::eval_constant_default_value(default_expr)
+            {
+                Ok(v) => v,
+                Err(_) => break 'value None,
             };
 
             // Apply column affinity to the default value, matching SQLite's
