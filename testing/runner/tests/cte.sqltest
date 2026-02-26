@@ -843,11 +843,63 @@ expect {
 
 # # @skip-if sqlite "sqlite has different error message"
 # test cte-explicit-columns-count-mismatch {
-#     WITH t(a, b, c) AS (SELECT 1, 2) SELECT * FROM t;
+#     With t(a, b, c) AS (SELECT 1, 2) SELECT * FROM t;
 # }
 # expect error {
 #     table t has 2 columns but 3 column names were provided
 # }
+
+# =============================================================================
+# CTE column count mismatch - unreferenced CTEs (deferred validation)
+# =============================================================================
+
+# SQLite defers CTE column count validation until the CTE is actually
+# referenced. Unreferenced CTEs with mismatched column counts should
+# not produce errors.
+
+@cross-check-integrity
+test cte-unreferenced-column-mismatch-delete {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INTEGER);
+    CREATE TABLE t2(x INTEGER PRIMARY KEY);
+    INSERT INTO t1 VALUES(1, 'hello', 10);
+    INSERT INTO t2 VALUES(1);
+    WITH cte(col0) AS (SELECT * FROM t1) DELETE FROM t2 WHERE x = 1;
+    SELECT count(*) FROM t2;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test cte-unreferenced-column-mismatch-update {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INTEGER);
+    CREATE TABLE t2(x INTEGER PRIMARY KEY, y TEXT);
+    INSERT INTO t1 VALUES(1, 'hello', 10);
+    INSERT INTO t2 VALUES(1, 'yes');
+    WITH cte(col0) AS (SELECT * FROM t1) UPDATE t2 SET y = 'no' WHERE x = 1;
+    SELECT y FROM t2;
+}
+expect {
+    no
+}
+
+test cte-unreferenced-column-mismatch-select {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INTEGER);
+    INSERT INTO t1 VALUES(1, 'hello', 10);
+    WITH cte(col0) AS (SELECT * FROM t1) SELECT 42;
+}
+expect {
+    42
+}
+
+test cte-unreferenced-column-mismatch-multi-cte {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INTEGER);
+    INSERT INTO t1 VALUES(1, 'hello', 10);
+    WITH cte_ok(x, y, z) AS (SELECT * FROM t1), cte_bad(col0) AS (SELECT * FROM t1) SELECT x, y, z FROM cte_ok;
+}
+expect {
+    1|hello|10
+}
 
 # =============================================================================
 # CTE visibility in VALUES and RETURNING clause subqueries
