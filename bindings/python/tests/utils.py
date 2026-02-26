@@ -53,7 +53,11 @@ class TursoServer:
                     rc = self._server.poll()
                     if rc is not None:
                         stderr = self._server.stderr.read().decode(errors="replace")
-                        if "os error 10013" in stderr or "address already in use" in stderr.lower():
+                        if (
+                            "os error 10013" in stderr
+                            or "os error 10048" in stderr
+                            or "address already in use" in stderr.lower()
+                        ):
                             break  # retry with a different port
                         raise RuntimeError(
                             f"sync server exited with code {rc} before accepting connections\nstderr: {stderr}"
