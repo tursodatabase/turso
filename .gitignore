@@ -29,7 +29,8 @@ dist/
 **/*.db-shm
 **/*-wal
 # perf
-/Mobibench
+**/*/Mobibench
+perf/mobibench/plot/results.csv
 # OS
 .DS_Store
 
