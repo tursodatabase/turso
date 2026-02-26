@@ -348,17 +348,31 @@ impl LimitCtx {
         }
     }
 }
+/// Labels and registers for hash join probe-phase control flow.
 #[derive(Debug, Clone)]
-pub struct HashCtx {
-    pub match_reg: usize,
-    pub hash_table_reg: usize,
-    /// Label for hash join match processing (points to just after HashProbe instruction)
-    /// Used by HashNext to jump back to process additional matches without re-probing
+pub struct HashJoinLabels {
+    /// Label for hash join match processing (points to just after HashProbe instruction).
+    /// Used by HashNext to jump back to process additional matches without re-probing.
     pub match_found_label: BranchOffset,
     /// Label for advancing to the next hash match (points to HashNext instruction).
     /// When conditions fail within a hash join, they should jump here to try the next
     /// hash match, rather than jumping to the outer loop's next label.
     pub hash_next_label: BranchOffset,
+    /// Jump target for unmatched probe rows (outer joins only).
+    pub check_outer_label: Option<BranchOffset>,
+    /// Gosub register for the inner-loop subroutine wrapping subsequent tables.
+    /// Outer hash joins wrap inner loops so unmatched-row paths can re-enter via Gosub.
+    pub inner_loop_gosub_reg: Option<usize>,
+    /// Entry label for the inner-loop subroutine.
+    pub inner_loop_gosub_label: Option<BranchOffset>,
+    /// Label that skips past the subroutine body (resolved after Return).
+    pub inner_loop_skip_label: Option<BranchOffset>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HashCtx {
+    pub match_reg: usize,
+    pub hash_table_reg: usize,
     /// Starting register where payload columns are stored after HashProbe/HashNext.
     /// None if payload optimization is not used for this hash join.
     pub payload_start_reg: Option<usize>,
@@ -367,18 +381,11 @@ pub struct HashCtx {
     /// These references may point at multiple tables when a build input was
     /// materialized from a join prefix.
     pub payload_columns: Vec<MaterializedColumnRef>,
-    /// Jump target for unmatched probe rows (outer joins only).
-    pub check_outer_label: Option<BranchOffset>,
     /// Build table cursor (for NullRow in outer joins).
     pub build_cursor_id: Option<CursorID>,
     pub join_type: HashJoinType,
-    /// Gosub register for the inner-loop subroutine wrapping subsequent tables.
-    /// Outer hash joins wrap inner loops so unmatched-row paths can re-enter via Gosub.
-    pub inner_loop_gosub_reg: Option<usize>,
-    /// Entry label for the inner-loop subroutine.
-    pub inner_loop_gosub_label: Option<BranchOffset>,
-    /// Label that skips past the subroutine body (resolved after Return).
-    pub inner_loop_skip_label: Option<BranchOffset>,
+    /// Labels for probe-phase control flow.
+    pub labels: HashJoinLabels,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
