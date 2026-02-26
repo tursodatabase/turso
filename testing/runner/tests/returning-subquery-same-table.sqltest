@@ -1,0 +1,113 @@
+@database :memory:
+
+setup tables {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INTEGER);
+    INSERT INTO t1 VALUES(1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+}
+
+setup t2 {
+    CREATE TABLE t2(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t2 VALUES(1, 100), (2, 200), (3, 300);
+}
+
+# DELETE: subquery count sees progressive post-delete state
+@setup tables
+test delete-count-subquery {
+    DELETE FROM t1 WHERE a = 2
+    RETURNING *, (SELECT count(*) FROM t1) as remaining;
+}
+expect {
+    2|b|20|2
+}
+
+# DELETE: multiple rows deleted, count decreases progressively
+@setup tables
+test delete-multiple-rows-count {
+    DELETE FROM t1 WHERE a >= 2
+    RETURNING a, (SELECT count(*) FROM t1) as remaining;
+}
+expect {
+    2|2
+    3|1
+}
+
+# UPDATE: subquery aggregate sees progressive post-update state
+@setup t2
+test update-sum-subquery {
+    UPDATE t2 SET b = b + 10
+    RETURNING a, b, (SELECT sum(b) FROM t2) as total;
+}
+expect {
+    1|110|610
+    2|210|620
+    3|310|630
+}
+
+# UPDATE: max subquery sees progressive state
+@setup t2
+test update-max-subquery {
+    UPDATE t2 SET b = b + 10
+    RETURNING a, b, (SELECT max(b) FROM t2) as current_max;
+}
+expect {
+    1|110|300
+    2|210|300
+    3|310|310
+}
+
+# DELETE: single row remaining, count goes to 0
+@setup tables
+test delete-last-row-count {
+    DELETE FROM t1 WHERE a = 1;
+    DELETE FROM t1 WHERE a = 2;
+    DELETE FROM t1 WHERE a = 3
+    RETURNING a, (SELECT count(*) FROM t1) as cnt;
+}
+expect {
+    3|0
+}
+
+# UPDATE: count subquery (row count unchanged on update)
+@setup tables
+test update-count-unchanged {
+    UPDATE t1 SET c = c * 2
+    RETURNING a, c, (SELECT count(*) FROM t1) as cnt;
+}
+expect {
+    1|20|3
+    2|40|3
+    3|60|3
+}
+
+# DELETE: sum subquery sees progressive remaining sums
+@setup tables
+test delete-sum-subquery {
+    DELETE FROM t1 WHERE a <= 2
+    RETURNING a, c, (SELECT sum(c) FROM t1) as remaining_sum;
+}
+expect {
+    1|10|50
+    2|20|30
+}
+
+# INSERT: multi-row insert with count subquery sees progressive state
+test insert-count-subquery {
+    CREATE TABLE t3(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t3 VALUES(1, 100);
+    INSERT INTO t3 VALUES(2, 200), (3, 300) RETURNING a, b, (SELECT count(*) FROM t3) as cnt;
+}
+expect {
+    2|200|2
+    3|300|3
+}
+
+# INSERT: sum subquery sees progressive state
+test insert-sum-subquery {
+    CREATE TABLE t4(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t4 VALUES(1, 100), (2, 200), (3, 300) RETURNING a, b, (SELECT sum(b) FROM t4) as running_sum;
+}
+expect {
+    1|100|100
+    2|200|300
+    3|300|600
+}

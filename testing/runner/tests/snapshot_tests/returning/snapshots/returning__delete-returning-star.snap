@@ -27,16 +27,16 @@ addr  opcode         p1  p2  p3  p4  p5  comment
    9  Column          1   1   6       0  r[6]=t1.name
   10  RowId           1   7   0       0  r[7]=t1.rowid
   11  IdxDelete       2   6   2       1
-  12  Copy            2   8   0       0  r[8]=r[2]
-  13  Copy            4   9   0       0  r[9]=r[4]
-  14  Copy            5  10   0       0  r[10]=r[5]
-  15  Copy            8  11   0       0  r[11]=r[8]
-  16  Copy            9  12   0       0  r[12]=r[9]
-  17  Copy           10  13   0       0  r[13]=r[10]
-  18  MakeRecord     11   3  14       0  r[14]=mkrec(r[11..13])
-  19  NewRowid        0  15   0       0  r[15]=rowid
-  20  Insert          0  14  15       4  intkey=r[15] data=r[14]
-  21  Delete          1   0   0  t1   0
+  12  Delete          1   0   0  t1   0
+  13  Copy            2   8   0       0  r[8]=r[2]
+  14  Copy            4   9   0       0  r[9]=r[4]
+  15  Copy            5  10   0       0  r[10]=r[5]
+  16  Copy            8  11   0       0  r[11]=r[8]
+  17  Copy            9  12   0       0  r[12]=r[9]
+  18  Copy           10  13   0       0  r[13]=r[10]
+  19  MakeRecord     11   3  14       0  r[14]=mkrec(r[11..13])
+  20  NewRowid        0  15   0       0  r[15]=rowid
+  21  Insert          0  14  15       4  intkey=r[15] data=r[14]
   22  FkCheck         0   0   0       0
   23  Rewind          0  29   0       0  Rewind  ephemeral(t1)
   24    Column        0   0  16       0  r[16]=ephemeral(t1).id

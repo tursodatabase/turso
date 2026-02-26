@@ -416,25 +416,9 @@ pub fn translate_insert(
         inserting_multiple_rows,
     )?;
 
-    // Emit subqueries for RETURNING clause (uncorrelated subqueries are evaluated once)
-    for subquery in returning_subqueries
-        .iter_mut()
-        .filter(|s| !s.has_been_evaluated())
-    {
-        let eval_at = subquery.get_eval_at(&[], Some(&table_references))?;
-        if eval_at != EvalAt::BeforeLoop {
-            continue;
-        }
-        let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-        emit_non_from_clause_subquery(
-            program,
-            resolver,
-            *subquery_plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
+    // RETURNING subqueries are NOT emitted here; they are emitted inside the
+    // insert loop (after the Insert instruction) so that subqueries reading
+    // the same table see progressive post-INSERT state.
 
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 
@@ -868,6 +852,24 @@ pub fn translate_insert(
             after_record_reg,
             None,
             table_name.as_str(),
+        )?;
+    }
+
+    // Emit RETURNING subqueries after Insert so that subqueries reading
+    // the same table see progressive post-INSERT state.
+    for subquery in returning_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            // Always treat as correlated to prevent Once optimization,
+            // since the table state changes between DML iterations.
+            true,
         )?;
     }
 

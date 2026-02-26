@@ -30,15 +30,15 @@ addr  opcode          p1  p2  p3  p4      p5  comment
   12    Column         1   1   8           0  r[8]=t1.name
   13    RowId          1   9   0           0  r[9]=t1.rowid
   14    IdxDelete      2   8   2           1
-  15    Copy           4  10   0           0  r[10]=r[4]
-  16    Copy           6  11   0           0  r[11]=r[6]
-  17    Copy           7  12   0           0  r[12]=r[7]
-  18    Copy          10  13   0           0  r[13]=r[10]
-  19    Copy          11  14   0           0  r[14]=r[11]
-  20    MakeRecord    13   2  15           0  r[15]=mkrec(r[13..14])
-  21    NewRowid       0  16   0           0  r[16]=rowid
-  22    Insert         0  15  16           4  intkey=r[16] data=r[15]
-  23    Delete         1   0   0  t1       0
+  15    Delete         1   0   0  t1       0
+  16    Copy           4  10   0           0  r[10]=r[4]
+  17    Copy           6  11   0           0  r[11]=r[6]
+  18    Copy           7  12   0           0  r[12]=r[7]
+  19    Copy          10  13   0           0  r[13]=r[10]
+  20    Copy          11  14   0           0  r[14]=r[11]
+  21    MakeRecord    13   2  15           0  r[15]=mkrec(r[13..14])
+  22    NewRowid       0  16   0           0  r[16]=rowid
+  23    Insert         0  15  16           4  intkey=r[16] data=r[15]
   24  Next             1   5   0           0
   25  FkCheck          0   0   0           0
   26  Rewind           0  31   0           0  Rewind  ephemeral(t1)

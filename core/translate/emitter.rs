@@ -1534,6 +1534,21 @@ fn emit_program_for_delete(
         })
         .collect::<Vec<_>>();
 
+    // Drain RETURNING subqueries so they aren't evaluated before the DML loop.
+    // RETURNING subqueries must be emitted after the Delete instruction so that
+    // subqueries reading the same table see post-DML state.
+    let mut returning_subqueries = Vec::new();
+    {
+        let mut i = 0;
+        while i < plan.non_from_clause_subqueries.len() {
+            if plan.non_from_clause_subqueries[i].is_returning {
+                returning_subqueries.push(plan.non_from_clause_subqueries.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     // Evaluate uncorrelated subqueries as early as possible (only for normal path without rowset)
     // For the rowset path, subqueries are handled by emit_program_for_select on the rowset_plan.
     if plan.rowset_plan.is_none() {
@@ -1654,6 +1669,7 @@ fn emit_program_for_delete(
             table_cursor_id,
             resolver,
             returning_buffer.as_ref(),
+            &mut returning_subqueries,
         )?;
 
         // Continue loop
@@ -1686,6 +1702,7 @@ fn emit_program_for_delete(
             &plan.result_columns,
             resolver,
             returning_buffer.as_ref(),
+            &mut returning_subqueries,
         )?;
 
         // Clean up and close the main execution loop
@@ -1855,6 +1872,7 @@ pub fn emit_fk_child_decrement_on_delete(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_delete_insns<'a>(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
@@ -1863,6 +1881,7 @@ fn emit_delete_insns<'a>(
     result_columns: &'a [super::plan::ResultSetColumn],
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
+    returning_subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     // we can either use this obviously safe raw pointer or we can clone it
     let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
@@ -1996,6 +2015,7 @@ fn emit_delete_insns<'a>(
         Some(cursor_id), // Use the cursor_id from the operation for virtual tables
         resolver,
         returning_buffer,
+        returning_subqueries,
     )?;
 
     // Delete from the iteration index after deleting from the main table,
@@ -2040,6 +2060,7 @@ fn emit_delete_row_common(
     virtual_table_cursor_id: Option<usize>,
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
+    returning_subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     let internal_id = unsafe { (*table_reference).internal_id };
     let table_name = unsafe { &*table_reference }.table.get_name();
@@ -2201,11 +2222,34 @@ fn emit_delete_row_common(
             )?;
         }
 
-        // Emit RETURNING results if specified (must be before DELETE)
+        program.emit_insn(Insn::Delete {
+            cursor_id: main_table_cursor_id,
+            table_name: table_name.to_string(),
+            is_part_of_update: false,
+        });
+
+        // Emit RETURNING subqueries after Delete so that subqueries reading
+        // the same table see post-DML state (matching SQLite behavior).
+        for subquery in returning_subqueries
+            .iter_mut()
+            .filter(|s| !s.has_been_evaluated())
+        {
+            let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+            emit_non_from_clause_subquery(
+                program,
+                &t_ctx.resolver,
+                *subquery_plan,
+                &subquery.query_type,
+                // Always treat as correlated to prevent Once optimization,
+                // since the table state changes between DML iterations.
+                true,
+            )?;
+        }
+
+        // Emit RETURNING results after Delete and subquery evaluation
         if !result_columns.is_empty() {
             let columns_start_reg = columns_start_reg
                 .expect("columns_start_reg must be provided when there are triggers or RETURNING");
-            // Emit RETURNING results using the values we just read
             emit_returning_results(
                 program,
                 table_references,
@@ -2216,12 +2260,6 @@ fn emit_delete_row_common(
                 returning_buffer,
             )?;
         }
-
-        program.emit_insn(Insn::Delete {
-            cursor_id: main_table_cursor_id,
-            table_name: table_name.to_string(),
-            is_part_of_update: false,
-        });
     }
 
     // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
@@ -2253,6 +2291,7 @@ fn emit_delete_insns_when_triggers_present(
     main_table_cursor_id: usize,
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
+    returning_subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     // Seek to the rowid and delete it
     let skip_not_found_label = program.allocate_label();
@@ -2365,6 +2404,7 @@ fn emit_delete_insns_when_triggers_present(
         None, // Use main_table_cursor_id for virtual tables
         resolver,
         returning_buffer,
+        returning_subqueries,
     )?;
 
     // Fire AFTER DELETE triggers
@@ -2527,10 +2567,36 @@ fn emit_program_for_update(
         })
         .collect::<Vec<_>>();
 
+    // For the ephemeral path, SET clause subqueries remain in plan.non_from_clause_subqueries
+    // (WHERE clause subqueries were moved to the ephemeral plan by the optimizer).
+    // These SET clause subqueries must be emitted inside the update loop, after NotExists
+    // positions the write cursor, so correlated references resolve to the correct cursor.
+    // Drain them into a separate Vec so init_loop/open_loop don't try to evaluate them.
+    let mut update_subqueries = if has_ephemeral_table {
+        plan.non_from_clause_subqueries.drain(..).collect()
+    } else {
+        Vec::new()
+    };
+
+    // Drain RETURNING subqueries so they aren't evaluated before the DML loop.
+    // RETURNING subqueries must be emitted after Insert so that subqueries
+    // reading the same table see post-UPDATE values.
+    {
+        let mut i = 0;
+        while i < plan.non_from_clause_subqueries.len() {
+            if plan.non_from_clause_subqueries[i].is_returning {
+                update_subqueries.push(plan.non_from_clause_subqueries.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     // Evaluate uncorrelated subqueries as early as possible (only for normal path without ephemeral table).
     // For the ephemeral path, WHERE clause subqueries are handled by emit_program_for_select
     // on the ephemeral_plan. SET clause subqueries remain in the main plan and are emitted
     // inside the update loop (after open_loop) where the write cursor is correctly positioned.
+    // RETURNING subqueries have already been drained above.
     if !has_ephemeral_table {
         for subquery in plan
             .non_from_clause_subqueries
@@ -2550,31 +2616,6 @@ fn emit_program_for_update(
                 &subquery.query_type,
                 subquery.correlated,
             )?;
-        }
-    }
-
-    // For the ephemeral path, SET clause subqueries remain in plan.non_from_clause_subqueries
-    // (WHERE clause subqueries were moved to the ephemeral plan by the optimizer).
-    // These SET clause subqueries must be emitted inside the update loop, after NotExists
-    // positions the write cursor, so correlated references resolve to the correct cursor.
-    // Drain them into a separate Vec so init_loop/open_loop don't try to evaluate them.
-    let mut update_subqueries = if has_ephemeral_table {
-        plan.non_from_clause_subqueries.drain(..).collect()
-    } else {
-        Vec::new()
-    };
-
-    // Drain RETURNING subqueries so they aren't evaluated during the main loop scan.
-    // RETURNING subqueries must be emitted after Insert so that correlated column
-    // references read post-UPDATE values from the cursor.
-    {
-        let mut i = 0;
-        while i < plan.non_from_clause_subqueries.len() {
-            if plan.non_from_clause_subqueries[i].is_returning {
-                update_subqueries.push(plan.non_from_clause_subqueries.remove(i));
-            } else {
-                i += 1;
-            }
         }
     }
 
@@ -4436,8 +4477,8 @@ fn emit_update_insns<'a>(
             }
         }
 
-        // Emit RETURNING subqueries after Insert so that correlated column
-        // references read post-UPDATE values from the cursor.
+        // Emit RETURNING subqueries after Insert so that subqueries reading
+        // the same table see post-UPDATE values from the cursor.
         for subquery in non_from_clause_subqueries
             .iter_mut()
             .filter(|s| !s.has_been_evaluated() && s.is_returning)
@@ -4448,7 +4489,9 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 *subquery_plan,
                 &subquery.query_type,
-                subquery.correlated,
+                // Always treat as correlated to prevent Once optimization,
+                // since the table state changes between DML iterations.
+                true,
             )?;
         }
 
