@@ -770,6 +770,9 @@ test alter-add-column-default-negative-zero-float {
 expect {
     1|0.0|real
 }
+expect @js {
+    1|0|real
+}
 
 # Regression: blob default on pre-existing rows
 @cross-check-integrity
