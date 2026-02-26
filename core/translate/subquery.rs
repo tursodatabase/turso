@@ -242,6 +242,8 @@ pub fn plan_subqueries_from_returning(
         ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => None,
     });
 
+    let count_before = non_from_clause_subqueries.len();
+
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -251,6 +253,12 @@ pub fn plan_subqueries_from_returning(
         connection,
         SubqueryPosition::ResultColumn,
     )?;
+
+    // Mark newly added subqueries as RETURNING so the UPDATE emitter can
+    // defer their evaluation until after the Insert instruction.
+    for subquery in &mut non_from_clause_subqueries[count_before..] {
+        subquery.is_returning = true;
+    }
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
     Ok(())
@@ -387,6 +395,7 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
+                    is_returning: false,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -464,6 +473,7 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
+                    is_returning: false,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -588,6 +598,7 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
+                    is_returning: false,
                 });
                 Ok(WalkControl::Continue)
             }

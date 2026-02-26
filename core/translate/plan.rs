@@ -2302,6 +2302,10 @@ pub struct NonFromClauseSubquery {
     pub query_type: SubqueryType,
     pub state: SubqueryState,
     pub correlated: bool,
+    /// Whether this subquery originates from a RETURNING clause.
+    /// RETURNING subqueries must be evaluated after the Insert instruction
+    /// so that correlated column references read post-UPDATE values.
+    pub is_returning: bool,
 }
 
 impl NonFromClauseSubquery {

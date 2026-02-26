@@ -2565,6 +2565,20 @@ fn emit_program_for_update(
         Vec::new()
     };
 
+    // Drain RETURNING subqueries so they aren't evaluated during the main loop scan.
+    // RETURNING subqueries must be emitted after Insert so that correlated column
+    // references read post-UPDATE values from the cursor.
+    {
+        let mut i = 0;
+        while i < plan.non_from_clause_subqueries.len() {
+            if plan.non_from_clause_subqueries[i].is_returning {
+                update_subqueries.push(plan.non_from_clause_subqueries.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     // Initialize the main loop
     init_loop(
         program,
@@ -3123,9 +3137,11 @@ fn emit_update_insns<'a>(
     // is positioned via NotExists. In the ephemeral path, these subqueries were kept
     // in the main plan (not moved to the ephemeral plan) and need the write cursor
     // to be positioned so correlated references resolve correctly.
+    // RETURNING subqueries are skipped here and emitted after Insert so that
+    // correlated column references read post-UPDATE values from the cursor.
     for subquery in non_from_clause_subqueries
         .iter_mut()
-        .filter(|s| !s.has_been_evaluated())
+        .filter(|s| !s.has_been_evaluated() && !s.is_returning)
     {
         let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
         emit_non_from_clause_subquery(
@@ -4325,6 +4341,22 @@ fn emit_update_insns<'a>(
                 }
                 program.preassign_label_to_next_insn(after_trigger_done);
             }
+        }
+
+        // Emit RETURNING subqueries after Insert so that correlated column
+        // references read post-UPDATE values from the cursor.
+        for subquery in non_from_clause_subqueries
+            .iter_mut()
+            .filter(|s| !s.has_been_evaluated() && s.is_returning)
+        {
+            let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+            emit_non_from_clause_subquery(
+                program,
+                &t_ctx.resolver,
+                *subquery_plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
         }
 
         // Emit RETURNING results if specified

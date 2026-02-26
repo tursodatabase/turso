@@ -1,0 +1,76 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER);
+    CREATE TABLE lookup(k INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t1 VALUES(1, 10);
+    INSERT INTO lookup VALUES(10, 'old_value'), (20, 'new_value');
+}
+
+setup multi_row {
+    CREATE TABLE t2(a INTEGER PRIMARY KEY, b INTEGER);
+    CREATE TABLE lookup2(k INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t2 VALUES(1, 10), (2, 20), (3, 30);
+    INSERT INTO lookup2 VALUES(10, 'ten'), (20, 'twenty'), (30, 'thirty');
+    INSERT INTO lookup2 VALUES(100, 'hundred'), (200, 'two_hundred'), (300, 'three_hundred');
+}
+
+@setup schema
+test update-returning-correlated-subquery-basic {
+    UPDATE t1 SET b = 20 WHERE a = 1
+    RETURNING b, (SELECT v FROM lookup WHERE k = b) as looked_up;
+}
+expect {
+    20|new_value
+}
+
+@setup multi_row
+test update-returning-correlated-subquery-multi-row {
+    UPDATE t2 SET b = b * 10
+    RETURNING a, b, (SELECT v FROM lookup2 WHERE k = b) as label;
+}
+expect {
+    1|100|hundred
+    2|200|two_hundred
+    3|300|three_hundred
+}
+
+@setup multi_row
+test update-returning-correlated-subquery-unmodified-column {
+    UPDATE t2 SET b = 999
+    RETURNING a, (SELECT v FROM lookup2 WHERE k = a) as by_pk;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+@setup schema
+test update-returning-direct-and-subquery {
+    UPDATE t1 SET b = 20 WHERE a = 1
+    RETURNING a, b, (SELECT v FROM lookup WHERE k = b) as sub_val;
+}
+expect {
+    1|20|new_value
+}
+
+@setup schema
+test update-returning-correlated-subquery-null-result {
+    UPDATE t1 SET b = 999 WHERE a = 1
+    RETURNING b, (SELECT v FROM lookup WHERE k = b) as looked_up;
+}
+expect {
+    999|
+}
+
+@setup schema
+test update-returning-multiple-correlated-subqueries {
+    UPDATE t1 SET b = 20 WHERE a = 1
+    RETURNING
+        (SELECT v FROM lookup WHERE k = b) as by_new_b,
+        (SELECT k FROM lookup WHERE k = b) as matching_k;
+}
+expect {
+    new_value|20
+}
