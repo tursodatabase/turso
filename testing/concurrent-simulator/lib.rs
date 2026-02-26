@@ -327,6 +327,10 @@ pub struct Stats {
     pub updates: usize,
     pub deletes: usize,
     pub integrity_checks: usize,
+    /// Elle-mode: write operations (append + rw-write)
+    pub elle_writes: usize,
+    /// Elle-mode: read operations (list-read + rw-read)
+    pub elle_reads: usize,
 }
 
 /// Result of a single simulation step.

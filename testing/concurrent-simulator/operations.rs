@@ -214,6 +214,12 @@ impl Operation {
             Operation::CreateElleTable { table_name } => {
                 ctx.sim_state.elle_tables.insert(table_name.clone(), ());
             }
+            Operation::ElleAppend { .. } | Operation::ElleRwWrite { .. } => {
+                ctx.stats.elle_writes += 1;
+            }
+            Operation::ElleRead { .. } | Operation::ElleRwRead { .. } => {
+                ctx.stats.elle_reads += 1;
+            }
             _ => {}
         }
     }
