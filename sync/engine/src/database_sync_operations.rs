@@ -981,6 +981,11 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         }
     }
 
+    // Pre-scan DDL changes to seed the schema cache with the initial column
+    // ordering for each table. This ensures CDC records captured before ALTER
+    // TABLE DROP/ADD COLUMN are correctly mapped to column names.
+    generator.seed_schema_from_changes(&local_changes);
+
     let mut transformed = if opts.use_transform {
         Some(apply_transformation(ctx, &local_changes, &generator).await?)
     } else {

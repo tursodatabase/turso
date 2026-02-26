@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, sync::Mutex};
 
 use turso_parser::parser::Parser;
 
@@ -12,9 +12,17 @@ use crate::{
     Result,
 };
 
+/// Column names and primary key indices for a table.
+type TableColumnInfo = (Vec<String>, Vec<usize>);
+
 pub struct DatabaseReplayGenerator {
     pub conn: Arc<turso_core::Connection>,
     pub opts: DatabaseReplaySessionOpts,
+    /// Cache of table column info derived from CREATE TABLE statements in the
+    /// CDC stream. This tracks schema evolution so that CDC records captured
+    /// before ALTER TABLE DROP/ADD COLUMN are correctly mapped to the schema
+    /// that was active at capture time.
+    schema_cache: Mutex<HashMap<String, TableColumnInfo>>,
 }
 
 pub struct ReplayInfo {
@@ -26,10 +34,185 @@ pub struct ReplayInfo {
 }
 
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
+
+/// Parse column names and primary key indices from a CREATE TABLE SQL statement.
+fn parse_columns_from_create_table_sql(sql: &str) -> Option<(Vec<String>, Vec<usize>)> {
+    let mut parser = Parser::new(sql.as_bytes());
+    let ast = parser.next()?.ok()?;
+    let turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateTable { body, .. }) = ast
+    else {
+        return None;
+    };
+    let turso_parser::ast::CreateTableBody::ColumnsAndConstraints {
+        columns,
+        constraints,
+        ..
+    } = body
+    else {
+        return None;
+    };
+
+    let mut names = Vec::with_capacity(columns.len());
+    let mut pk_indices = Vec::new();
+
+    for (i, col) in columns.iter().enumerate() {
+        names.push(col.col_name.as_str().to_string());
+        for c in &col.constraints {
+            if matches!(
+                c.constraint,
+                turso_parser::ast::ColumnConstraint::PrimaryKey { .. }
+            ) {
+                pk_indices.push(i);
+            }
+        }
+    }
+
+    // Check table-level PRIMARY KEY constraint if no column-level PK found
+    if pk_indices.is_empty() {
+        for tc in &constraints {
+            if let turso_parser::ast::TableConstraint::PrimaryKey {
+                columns: pk_cols, ..
+            } = &tc.constraint
+            {
+                for pk_col in pk_cols {
+                    if let turso_parser::ast::Expr::Id(name) = pk_col.expr.as_ref() {
+                        for (i, col_name) in names.iter().enumerate() {
+                            if col_name.eq_ignore_ascii_case(name.as_str()) {
+                                pk_indices.push(i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some((names, pk_indices))
+}
+
+/// Extract the table name from a sqlite_schema row's values.
+/// sqlite_schema columns: type, name, tbl_name, rootpage, sql
+fn extract_table_name_from_schema_row(row: &[turso_core::Value]) -> Option<String> {
+    if let Some(turso_core::Value::Text(name)) = row.get(2) {
+        Some(name.as_str().to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract and parse the CREATE TABLE SQL from a sqlite_schema row's values.
+fn extract_schema_from_row(row: &[turso_core::Value]) -> Option<(String, Vec<String>, Vec<usize>)> {
+    let turso_core::Value::Text(entity_type) = row.first()? else {
+        return None;
+    };
+    if entity_type.as_str() != "table" {
+        return None;
+    }
+    let table_name = extract_table_name_from_schema_row(row)?;
+    let turso_core::Value::Text(sql) = row.last()? else {
+        return None;
+    };
+    let (col_names, pk_indices) = parse_columns_from_create_table_sql(sql.as_str())?;
+    Some((table_name, col_names, pk_indices))
+}
+
 impl DatabaseReplayGenerator {
     pub fn new(conn: Arc<turso_core::Connection>, opts: DatabaseReplaySessionOpts) -> Self {
-        Self { conn, opts }
+        Self {
+            conn,
+            opts,
+            schema_cache: Mutex::new(HashMap::new()),
+        }
     }
+
+    /// Pre-scan CDC changes to seed the schema cache with the initial column
+    /// ordering for each table that has DDL changes in this batch.
+    ///
+    /// For tables with CREATE TABLE: uses the CREATE TABLE SQL directly.
+    /// For tables with ALTER TABLE: uses the 'before' record of the first
+    /// ALTER TABLE to recover the pre-alter schema.
+    ///
+    /// This must be called before processing DML changes so that CDC records
+    /// captured before schema changes are correctly mapped.
+    pub fn seed_schema_from_changes(&self, changes: &[DatabaseTapeRowChange]) {
+        let mut cache = self.schema_cache.lock().unwrap();
+        for change in changes {
+            if change.table_name != SQLITE_SCHEMA_TABLE {
+                continue;
+            }
+            match &change.change {
+                DatabaseTapeRowChangeType::Insert { after } => {
+                    // CREATE TABLE/INDEX/etc - parse and cache the initial schema
+                    if let Some((table_name, col_names, pk_indices)) =
+                        extract_schema_from_row(after)
+                    {
+                        cache.entry(table_name).or_insert((col_names, pk_indices));
+                    }
+                }
+                DatabaseTapeRowChangeType::Update { before, .. } => {
+                    // ALTER TABLE - seed with the BEFORE schema (pre-alter column order)
+                    // if this is the first DDL change for this table in the batch
+                    if let Some((table_name, col_names, pk_indices)) =
+                        extract_schema_from_row(before)
+                    {
+                        cache.entry(table_name).or_insert((col_names, pk_indices));
+                    }
+                }
+                DatabaseTapeRowChangeType::Delete { .. } => {
+                    // DROP TABLE - no action needed during pre-scan
+                }
+            }
+        }
+    }
+
+    /// Update the schema cache when a DDL change is processed.
+    /// Called from replay_info when handling sqlite_schema changes.
+    fn update_schema_for_ddl(&self, change: &DatabaseTapeRowChange) {
+        match &change.change {
+            DatabaseTapeRowChangeType::Insert { after } => {
+                if let Some((table_name, col_names, pk_indices)) = extract_schema_from_row(after) {
+                    self.schema_cache
+                        .lock()
+                        .unwrap()
+                        .insert(table_name, (col_names, pk_indices));
+                }
+            }
+            DatabaseTapeRowChangeType::Update { after, .. } => {
+                // After ALTER TABLE, update cache with the new schema from the 'after' record
+                if let Some((table_name, col_names, pk_indices)) = extract_schema_from_row(after) {
+                    self.schema_cache
+                        .lock()
+                        .unwrap()
+                        .insert(table_name, (col_names, pk_indices));
+                }
+            }
+            DatabaseTapeRowChangeType::Delete { before } => {
+                if let Some(table_name) = extract_table_name_from_schema_row(before) {
+                    self.schema_cache.lock().unwrap().remove(&table_name);
+                }
+            }
+        }
+    }
+
+    /// Returns the table name affected by a DDL change, if any.
+    /// Used by the replay session to invalidate cached statements.
+    pub fn ddl_affected_table(change: &DatabaseTapeRowChange) -> Option<String> {
+        if change.table_name != SQLITE_SCHEMA_TABLE {
+            return None;
+        }
+        match &change.change {
+            DatabaseTapeRowChangeType::Insert { after } => {
+                extract_table_name_from_schema_row(after)
+            }
+            DatabaseTapeRowChangeType::Update { after, .. } => {
+                extract_table_name_from_schema_row(after)
+            }
+            DatabaseTapeRowChangeType::Delete { before } => {
+                extract_table_name_from_schema_row(before)
+            }
+        }
+    }
+
     pub fn create_mutation(
         &self,
         info: &ReplayInfo,
@@ -185,6 +368,9 @@ impl DatabaseReplayGenerator {
         let table_name = &change.table_name;
 
         if table_name == SQLITE_SCHEMA_TABLE {
+            // Update schema cache from DDL changes
+            self.update_schema_for_ddl(change);
+
             // sqlite_schema table: type, name, tbl_name, rootpage, sql
             match &change.change {
                 DatabaseTapeRowChangeType::Delete { before } => {
@@ -478,11 +664,25 @@ impl DatabaseReplayGenerator {
         })
     }
 
+    /// Get column info for a table, checking the schema cache first.
+    ///
+    /// The schema cache is populated from CREATE TABLE statements in the CDC
+    /// stream and tracks schema evolution through ALTER TABLE changes.
+    /// If the table is not in the cache (no DDL changes in this batch),
+    /// falls back to pragma_table_info which returns the correct current schema.
     async fn table_columns_info<Ctx>(
         &self,
         coro: &Coro<Ctx>,
         table_name: &str,
     ) -> Result<(Vec<String>, Vec<usize>)> {
+        // Check schema cache first - this has the correct column order
+        // for tables that have had DDL changes in the current batch
+        if let Some(info) = self.schema_cache.lock().unwrap().get(table_name).cloned() {
+            return Ok(info);
+        }
+
+        // No cached schema - table has not had DDL changes in this batch.
+        // pragma_table_info gives the correct current schema.
         let mut table_info_stmt = self.conn.prepare(format!(
             "SELECT cid, name, pk FROM pragma_table_info('{table_name}')"
         ))?;

@@ -226,7 +226,7 @@ impl DatabaseTape {
             cached_insert_stmt: HashMap::new(),
             cached_update_stmt: HashMap::new(),
             in_txn: true,
-            generator: DatabaseReplayGenerator { conn, opts },
+            generator: DatabaseReplayGenerator::new(conn, opts),
         })
     }
 }
@@ -572,6 +572,17 @@ impl DatabaseReplaySession {
                 let change_type = (&change.change).into();
 
                 if table == SQLITE_SCHEMA_TABLE {
+                    // Invalidate cached statements for the affected table,
+                    // since ALTER TABLE changes column ordering.
+                    if let Some(affected_table) =
+                        DatabaseReplayGenerator::ddl_affected_table(&change)
+                    {
+                        self.cached_delete_stmt.remove(&affected_table);
+                        self.cached_insert_stmt
+                            .retain(|(tbl, _), _| tbl != &affected_table);
+                        self.cached_update_stmt
+                            .retain(|(tbl, _), _| tbl != &affected_table);
+                    }
                     let replay_info = self.generator.replay_info(coro, &change).await?;
                     self.conn.execute(replay_info.query.as_str())?;
                 } else {
@@ -2112,6 +2123,418 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("p")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
                             turso_core::Value::Null,
+                        ],
+                    ]
+                );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// ABA problem: DROP COLUMN + ADD COLUMN changes column ordering.
+    /// CDC records captured before the ALTER have values in the original column order.
+    /// Without the fix, replaying these records against the new schema maps values
+    /// to the wrong columns (silent data corruption).
+    ///
+    /// Scenario:
+    /// 1. CREATE TABLE t(id PK, name, temp, email)
+    /// 2. INSERT (1, 'Alice', 'junk', 'alice@ex.com') — CDC: temp=pos2, email=pos3
+    /// 3. ALTER TABLE DROP COLUMN temp → (id, name, email)
+    /// 4. ALTER TABLE ADD COLUMN temp → (id, name, email, temp) — temp is now pos3!
+    /// 5. INSERT (2, 'Bob', 'bob@ex.com', 'stuff') — CDC: email=pos2, temp=pos3
+    ///
+    /// Full replay (DDL + DML) must correctly map all records.
+    #[test]
+    pub fn test_database_tape_replay_drop_column_add_column_aba() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 = turso_core::Database::open_file(io.clone(), db_path2).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+
+                // Step 1: Create table with 4 columns
+                conn1
+                    .execute(
+                        "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, temp TEXT, email TEXT)",
+                    )
+                    .unwrap();
+
+                // Step 2: Insert row with original column order
+                conn1
+                    .execute("INSERT INTO t VALUES (1, 'Alice', 'junk', 'alice@ex.com')")
+                    .unwrap();
+
+                // Step 3: DROP COLUMN temp
+                conn1.execute("ALTER TABLE t DROP COLUMN temp").unwrap();
+
+                // Step 4: ADD COLUMN temp back (now at end, after email)
+                conn1.execute("ALTER TABLE t ADD COLUMN temp TEXT").unwrap();
+
+                // Step 5: Insert row with new column order
+                conn1
+                    .execute("INSERT INTO t VALUES (2, 'Bob', 'bob@ex.com', 'stuff')")
+                    .unwrap();
+
+                // Replay all changes (DDL + DML) to db2
+                let conn2 = db2.connect(&coro).await.unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+
+                    let opts = DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    };
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                // Verify: email and temp must NOT be swapped
+                let mut rows = Vec::new();
+                let mut stmt = conn2
+                    .prepare("SELECT id, name, email, temp FROM t ORDER BY id")
+                    .unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec![
+                            turso_core::Value::from_i64(1),
+                            turso_core::Value::Text(turso_core::types::Text::new("Alice")),
+                            turso_core::Value::Text(turso_core::types::Text::new("alice@ex.com")),
+                            turso_core::Value::Null,
+                        ],
+                        vec![
+                            turso_core::Value::from_i64(2),
+                            turso_core::Value::Text(turso_core::types::Text::new("Bob")),
+                            turso_core::Value::Text(turso_core::types::Text::new("bob@ex.com")),
+                            turso_core::Value::Text(turso_core::types::Text::new("stuff")),
+                        ],
+                    ]
+                );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Simpler variant: DROP COLUMN without re-add causes positional shift.
+    /// CDC record with 4 values captured before DROP must not map values[2]
+    /// (which was 'temp') to 'email' (which is now at position 2).
+    #[test]
+    pub fn test_database_tape_replay_drop_column_shifts_positions() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 = turso_core::Database::open_file(io.clone(), db_path2).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+
+                // Table with 4 columns
+                conn1
+                    .execute(
+                        "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, temp TEXT, email TEXT)",
+                    )
+                    .unwrap();
+
+                // Insert row — CDC captures [1, 'Alice', 'junk', 'alice@ex.com']
+                conn1
+                    .execute("INSERT INTO t VALUES (1, 'Alice', 'junk', 'alice@ex.com')")
+                    .unwrap();
+
+                // DROP COLUMN temp — schema becomes (id, name, email)
+                conn1.execute("ALTER TABLE t DROP COLUMN temp").unwrap();
+
+                // Insert with new 3-column schema
+                conn1
+                    .execute("INSERT INTO t VALUES (2, 'Bob', 'bob@ex.com')")
+                    .unwrap();
+
+                // Replay all changes to db2
+                let conn2 = db2.connect(&coro).await.unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+
+                    let opts = DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    };
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                // Verify: email must be 'alice@ex.com', not 'junk'
+                let mut rows = Vec::new();
+                let mut stmt = conn2
+                    .prepare("SELECT id, name, email FROM t ORDER BY id")
+                    .unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec![
+                            turso_core::Value::from_i64(1),
+                            turso_core::Value::Text(turso_core::types::Text::new("Alice")),
+                            turso_core::Value::Text(turso_core::types::Text::new("alice@ex.com")),
+                        ],
+                        vec![
+                            turso_core::Value::from_i64(2),
+                            turso_core::Value::Text(turso_core::types::Text::new("Bob")),
+                            turso_core::Value::Text(turso_core::types::Text::new("bob@ex.com")),
+                        ],
+                    ]
+                );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// DROP COLUMN + ADD COLUMN with UPDATE operations.
+    /// Verifies that UPDATE CDC records are also correctly mapped after
+    /// column ordering changes.
+    #[test]
+    pub fn test_database_tape_replay_drop_add_column_with_updates() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 = turso_core::Database::open_file(io.clone(), db_path2).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+
+                conn1
+                    .execute(
+                        "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, temp TEXT, email TEXT)",
+                    )
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES (1, 'Alice', 'junk', 'alice@ex.com')")
+                    .unwrap();
+
+                // Update email before the schema change
+                conn1
+                    .execute("UPDATE t SET email = 'new@ex.com' WHERE id = 1")
+                    .unwrap();
+
+                // DROP + ADD
+                conn1.execute("ALTER TABLE t DROP COLUMN temp").unwrap();
+                conn1.execute("ALTER TABLE t ADD COLUMN temp TEXT").unwrap();
+
+                // Update after the schema change
+                conn1
+                    .execute("UPDATE t SET temp = 'new_temp' WHERE id = 1")
+                    .unwrap();
+
+                // Replay
+                let conn2 = db2.connect(&coro).await.unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+
+                    let opts = DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    };
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                // Verify final state
+                let mut rows = Vec::new();
+                let mut stmt = conn2
+                    .prepare("SELECT id, name, email, temp FROM t ORDER BY id")
+                    .unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert_eq!(
+                    rows,
+                    vec![vec![
+                        turso_core::Value::from_i64(1),
+                        turso_core::Value::Text(turso_core::types::Text::new("Alice")),
+                        turso_core::Value::Text(turso_core::types::Text::new("new@ex.com")),
+                        turso_core::Value::Text(turso_core::types::Text::new("new_temp")),
+                    ]]
+                );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Multiple DROP COLUMN operations in sequence.
+    /// Tests that the schema tracker correctly handles multiple schema
+    /// changes that progressively reduce the column count.
+    #[test]
+    pub fn test_database_tape_replay_multiple_drop_columns() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 = turso_core::Database::open_file(io.clone(), db_path2).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+
+                conn1
+                    .execute(
+                        "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT)",
+                    )
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES (1, 'a1', 'b1', 'c1', 'd1')")
+                    .unwrap();
+
+                // Drop middle column b
+                conn1.execute("ALTER TABLE t DROP COLUMN b").unwrap();
+
+                // Insert with 4 columns: (id, a, c, d)
+                conn1
+                    .execute("INSERT INTO t VALUES (2, 'a2', 'c2', 'd2')")
+                    .unwrap();
+
+                // Drop another column c
+                conn1.execute("ALTER TABLE t DROP COLUMN c").unwrap();
+
+                // Insert with 3 columns: (id, a, d)
+                conn1
+                    .execute("INSERT INTO t VALUES (3, 'a3', 'd3')")
+                    .unwrap();
+
+                // Replay
+                let conn2 = db2.connect(&coro).await.unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+
+                    let opts = DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    };
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                // Verify: final schema is (id, a, d)
+                let mut rows = Vec::new();
+                let mut stmt = conn2.prepare("SELECT id, a, d FROM t ORDER BY id").unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec![
+                            turso_core::Value::from_i64(1),
+                            turso_core::Value::Text(turso_core::types::Text::new("a1")),
+                            turso_core::Value::Text(turso_core::types::Text::new("d1")),
+                        ],
+                        vec![
+                            turso_core::Value::from_i64(2),
+                            turso_core::Value::Text(turso_core::types::Text::new("a2")),
+                            turso_core::Value::Text(turso_core::types::Text::new("d2")),
+                        ],
+                        vec![
+                            turso_core::Value::from_i64(3),
+                            turso_core::Value::Text(turso_core::types::Text::new("a3")),
+                            turso_core::Value::Text(turso_core::types::Text::new("d3")),
                         ],
                     ]
                 );

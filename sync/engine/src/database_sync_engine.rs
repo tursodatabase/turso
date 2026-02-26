@@ -1012,12 +1012,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 cached_insert_stmt: HashMap::new(),
                 cached_update_stmt: HashMap::new(),
                 in_txn: true,
-                generator: DatabaseReplayGenerator {
-                    conn: main_conn.clone(),
-                    opts: DatabaseReplaySessionOpts {
+                generator: DatabaseReplayGenerator::new(
+                    main_conn.clone(),
+                    DatabaseReplaySessionOpts {
                         use_implicit_rowid: false,
                     },
-                },
+                ),
             };
 
             let mut transformed = if self.opts.use_transform {
