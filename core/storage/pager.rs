@@ -3968,7 +3968,7 @@ impl Pager {
                     let db_size =
                         return_if_io!(self.with_header(|header| header.database_size)).get();
                     let page_size = self.get_page_size().unwrap_or_default();
-                    let expected = (db_size * page_size.get()) as u64;
+                    let expected = db_size as u64 * page_size.get() as u64;
                     let should_skip_db_truncate = match self.db_file.size() {
                         Ok(current_size) => expected >= current_size,
                         Err(err) => {
