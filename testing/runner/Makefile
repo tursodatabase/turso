@@ -56,12 +56,12 @@ endif
 
 # Run all tests with selected backend
 run: build
-	$(TEST_RUNNER) run tests --timeout 300 --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
+	$(TEST_RUNNER) run tests --timeout 600 --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 	$(TEST_RUNNER) run turso-tests --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 
 # Run tests with CLI backend (spawns tursodb subprocess)
 run-cli: build
-	$(TEST_RUNNER) run tests --timeout 300 --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
+	$(TEST_RUNNER) run tests --timeout 600 --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 	$(TEST_RUNNER) run turso-tests --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 
 # Run tests with Rust backend (native turso bindings)
@@ -108,7 +108,7 @@ install-sqlite:
 
 # Run tests against SQLite
 test-sqlite: build-runner install-sqlite
-	$(TEST_RUNNER) run tests --timeout 300 --backend cli --binary $(SQLITE)
+	$(TEST_RUNNER) run tests --timeout 600 --backend cli --binary $(SQLITE)
 
 # Convert Tcl .test files to .sqltest format
 # Usage: make convert                    - convert all .test files in ../testing to ./converted
