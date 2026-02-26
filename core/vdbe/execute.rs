@@ -4046,19 +4046,21 @@ pub fn op_decr_jump_zero(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
-    match state.registers[*reg].get_value() {
-        Value::Numeric(Numeric::Integer(n)) => {
-            let n = n.saturating_sub(1);
-            state.registers[*reg] = Register::Value(Value::from_i64(n));
-            if n == 0 {
+    match &mut state.registers[*reg] {
+        Register::Value(Value::Numeric(Numeric::Integer(n))) => {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
                 state.pc = target_pc.as_offset_int();
             } else {
                 state.pc += 1;
             }
         }
-        _ => {
+        Register::Value(_) | Register::Record(_) => {
+            bail_constraint_error!("datatype mismatch");
+        }
+        Register::Aggregate(_) => {
             return Err(LimboError::InternalError(
-                "DecrJumpZero: the value in the register is not an integer".into(),
+                "DecrJumpZero: unexpected aggregate register".into(),
             ));
         }
     }
@@ -12274,9 +12276,7 @@ mod tests {
             Ok(_) => panic!("non-integer register must fail"),
             Err(err) => err,
         };
-        assert!(
-            matches!(err, LimboError::InternalError(message) if message == "DecrJumpZero: the value in the register is not an integer")
-        );
+        assert!(matches!(err, LimboError::Constraint(message) if message == "datatype mismatch"));
         assert_eq!(state.pc, 0);
     }
 
