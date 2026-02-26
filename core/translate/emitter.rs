@@ -1052,10 +1052,11 @@ fn build_materialized_build_input_plan(
     // set when deciding which WHERE terms can be evaluated inside the materialization.
     let eval_prefix_mask = TableMask::from_table_number_iter(included_tables.iter().copied());
 
-    // Clone WHERE terms but mark as "consumed" any term that needs tables
-    // outside the prefix. This prevents the subplan from trying to evaluate
-    // predicates it doesn't have access to (e.g. autoindex lookups that
-    // would require non-prefix tables to bind parameters).
+    // Clone WHERE terms for the materialization subplan. We cannot reuse the
+    // parent plan's consumed flags because the optimizer may have consumed
+    // terms for access methods (e.g. ephemeral autoindex seeks) that get
+    // overwritten to scans inside the subplan. Reset each term's consumed
+    // flag: only terms referencing tables outside the prefix are consumed.
     let mut where_clause = plan.where_clause.clone();
     for term in where_clause.iter_mut() {
         let mask = table_mask_from_expr(
@@ -1063,10 +1064,7 @@ fn build_materialized_build_input_plan(
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        let outside_prefix = !eval_prefix_mask.contains_all(&mask);
-        // Preserve consumed terms that the optimizer already suppressed, and
-        // additionally consume any term that depends on tables outside the prefix.
-        term.consumed |= outside_prefix;
+        term.consumed = !eval_prefix_mask.contains_all(&mask);
     }
 
     // Clone table references and then "sanitize" each access method so that
