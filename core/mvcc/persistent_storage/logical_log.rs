@@ -26,9 +26,9 @@
 //!
 //! ### Transaction frame
 //!
-//! Header (`TX_HEADER_SIZE = 14`):
+//! Header (`TX_HEADER_SIZE = 16`):
 //! - `frame_magic: u32` (`FRAME_MAGIC`)
-//! - `op_count: u16`
+//! - `op_count: u32`
 //! - `commit_ts: u64`
 //!
 //! Payload:
@@ -137,7 +137,7 @@ const OP_UPDATE_HEADER: u8 = 4;
 
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 
-const TX_HEADER_SIZE: usize = 14;
+const TX_HEADER_SIZE: usize = 16;
 const TX_TRAILER_SIZE: usize = 12;
 const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE;
 
@@ -329,9 +329,9 @@ impl LogicalLog {
 
         // 2. Serialize Transaction header
         // A header-only transaction is encoded as a single OP_UPDATE_HEADER op.
-        let op_count = u16::try_from(tx.row_versions.len() + usize::from(tx.header.is_some()))
+        let op_count = u32::try_from(tx.row_versions.len() + usize::from(tx.header.is_some()))
             .map_err(|_| {
-                LimboError::InternalError("Logical log op_count exceeds u16".to_string())
+                LimboError::InternalError("Logical log op_count exceeds u32".to_string())
             })?;
         let tx_header_start = self.write_buf.len();
         self.write_buf.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
@@ -792,16 +792,21 @@ impl StreamingLogicalLogReader {
             self.last_valid_offset = frame_start;
             return Ok(ParseResult::InvalidFrame);
         }
-        let op_count = u16::from_le_bytes([header_bytes[4], header_bytes[5]]);
-        let commit_ts = u64::from_le_bytes([
+        let op_count = u32::from_le_bytes([
+            header_bytes[4],
+            header_bytes[5],
             header_bytes[6],
             header_bytes[7],
+        ]);
+        let commit_ts = u64::from_le_bytes([
             header_bytes[8],
             header_bytes[9],
             header_bytes[10],
             header_bytes[11],
             header_bytes[12],
             header_bytes[13],
+            header_bytes[14],
+            header_bytes[15],
         ]);
 
         // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
