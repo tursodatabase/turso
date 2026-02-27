@@ -528,14 +528,13 @@ impl SelectPlan {
     pub fn is_simple_count(&self) -> bool {
         if !self.where_clause.is_empty()
             || self.aggregates.len() != 1
-            || matches!(
-                self.query_destination,
-                QueryDestination::CoroutineYield { .. }
-            )
+            || !matches!(self.query_destination, QueryDestination::ResultRows)
             || self.table_references.joined_tables().len() != 1
             || !self.table_references.outer_query_refs().is_empty()
             || self.result_columns.len() != 1
             || self.group_by.is_some()
+            || self.limit.is_some()
+            || self.offset.is_some()
             || self.contains_constant_false_condition
         // TODO: (pedrocarlo) maybe can optimize to use the count optmization with more columns
         {
