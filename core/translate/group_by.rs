@@ -312,7 +312,10 @@ fn collect_non_aggregate_expressions<'a>(
     for group_expr in &group_by.exprs {
         let in_result = result_columns
             .iter()
-            .any(|expr| exprs_are_equivalent(expr, group_expr));
+            .any(|expr| exprs_are_equivalent(expr, group_expr))
+            || root_result_columns
+                .iter()
+                .any(|rc| exprs_are_equivalent(&rc.expr, group_expr));
         non_aggregate_expressions.push((group_expr, in_result));
     }
     for expr in result_columns {
@@ -370,6 +373,16 @@ fn collect_result_columns<'a>(
             }
             _ => {
                 if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
+                    return Ok(WalkControl::SkipChildren);
+                }
+                // Skip children of GROUP BY expressions — their leaf columns
+                // are already covered by the GROUP BY key and don't need
+                // separate materialization in the sorter.
+                if plan
+                    .group_by
+                    .as_ref()
+                    .is_some_and(|gb| gb.exprs.iter().any(|ge| exprs_are_equivalent(ge, expr)))
+                {
                     return Ok(WalkControl::SkipChildren);
                 }
             }
