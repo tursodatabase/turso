@@ -202,7 +202,7 @@ impl LogHeader {
             ));
         }
         let hdr_len = u16::from_le_bytes([buf[6], buf[7]]);
-        if (hdr_len as usize) < LOG_HDR_SIZE {
+        if hdr_len as usize != LOG_HDR_SIZE {
             return Err(LimboError::Corrupt(format!(
                 "Invalid logical log header length {hdr_len}"
             )));
@@ -686,19 +686,11 @@ impl StreamingLogicalLogReader {
             return Ok(HeaderReadResult::NoLog);
         }
 
-        let mut header_bytes = self.read_exact_at(io, 0, LOG_HDR_SIZE)?;
+        let header_bytes = self.read_exact_at(io, 0, LOG_HDR_SIZE)?;
         let hdr_len = u16::from_le_bytes([header_bytes[6], header_bytes[7]]) as usize;
-        if hdr_len < LOG_HDR_SIZE {
+        if hdr_len != LOG_HDR_SIZE {
             self.set_invalid_header_state();
             return Ok(HeaderReadResult::Invalid);
-        }
-        if self.file_size < hdr_len {
-            self.set_invalid_header_state();
-            return Ok(HeaderReadResult::Invalid);
-        }
-        if hdr_len > LOG_HDR_SIZE {
-            let extra = self.read_exact_at(io, LOG_HDR_SIZE as u64, hdr_len - LOG_HDR_SIZE)?;
-            header_bytes.extend_from_slice(&extra);
         }
 
         match LogHeader::decode(&header_bytes) {
@@ -2335,6 +2327,40 @@ mod tests {
         io.wait_for_completion(c).unwrap();
 
         let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let res = reader.read_header(&io);
+        assert!(res.is_err());
+    }
+
+    /// What this test checks: v2 headers must use the fixed 56-byte length.
+    /// Why this matters: Accepting larger lengths can misalign frame parsing and drop valid commits.
+    #[test]
+    fn test_logical_log_header_non_default_len_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let (file, _) = write_single_table_tx(&io, "header-len.db-log", 106);
+
+        let header_buf = Arc::new(Buffer::new_temporary(LOG_HDR_SIZE));
+        let c = file
+            .pread(0, Completion::new_read(header_buf.clone(), |_| None))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        let mut header_bytes = header_buf.as_slice()[..LOG_HDR_SIZE].to_vec();
+
+        header_bytes[6..8].copy_from_slice(&(LOG_HDR_SIZE as u16 + 1).to_le_bytes());
+        header_bytes[LOG_HDR_CRC_START..LOG_HDR_SIZE].fill(0);
+        let new_crc = crc32c::crc32c(&header_bytes);
+        header_bytes[LOG_HDR_CRC_START..LOG_HDR_SIZE].copy_from_slice(&new_crc.to_le_bytes());
+
+        let c = file
+            .pwrite(
+                0,
+                Arc::new(Buffer::new(header_bytes)),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file);
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }
