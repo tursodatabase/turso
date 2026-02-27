@@ -22,6 +22,6 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--MULTI-INDEX AND c (PRIMARY KEY, PRIMARY KEY)
+|--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH o USING INDEX idx_orders_customer_id
 `--USE SORTER FOR GROUP BY
