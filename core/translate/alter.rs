@@ -366,6 +366,13 @@ pub fn translate_alter_table(
     }
     program.begin_write_operation();
     let table_name = qualified_name.name.as_str();
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::AlterTable,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+        Some(&normalize_ident(table_name)),
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
     let qualified_schema_table = match &qualified_name.db_name {

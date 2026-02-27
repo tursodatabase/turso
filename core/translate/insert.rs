@@ -268,6 +268,13 @@ pub fn translate_insert(
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::Insert,
+        Some(table_name.as_str()),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
     validate(table_name.as_str(), resolver, &table, connection)?;
 
     let fk_enabled = connection.foreign_keys_enabled();

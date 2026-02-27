@@ -29,6 +29,13 @@ pub fn translate_attach(
             "ATTACH is not supported in MVCC mode".to_string(),
         ));
     }
+    crate::authorizer::check_auth(
+        &connection,
+        crate::authorizer::AuthAction::Attach,
+        None,
+        None,
+        None,
+    )?;
     // SQLite treats ATTACH as a function call to sqlite_attach(filename, dbname, key)
     // We'll allocate registers for the arguments and call the function
 
@@ -139,6 +146,13 @@ pub fn translate_detach(
             "DETACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
         ));
     }
+    crate::authorizer::check_auth(
+        &connection,
+        crate::authorizer::AuthAction::Detach,
+        None,
+        None,
+        None,
+    )?;
     // SQLite treats DETACH as a function call to sqlite_detach(dbname)
 
     program.extend(&ProgramBuilderOpts {

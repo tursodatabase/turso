@@ -45,6 +45,7 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+use crate::authorizer::{check_auth, AuthAction};
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
@@ -103,6 +104,9 @@ pub fn translate(
         connection.attached_databases(),
         syms,
     );
+    if connection.has_authorizer() {
+        resolver.connection = Some(connection.clone());
+    }
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -166,14 +170,28 @@ pub fn translate_inner(
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
         }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
+        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program, connection)?,
         ast::Stmt::Attach { expr, db_name, key } => {
             attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
         ast::Stmt::Begin { typ, name } => {
+            check_auth(
+                connection,
+                AuthAction::Transaction,
+                Some("BEGIN"),
+                None,
+                None,
+            )?;
             translate_tx_begin(typ, name, resolver.schema(), program)?
         }
         ast::Stmt::Commit { name } => {
+            check_auth(
+                connection,
+                AuthAction::Transaction,
+                Some("COMMIT"),
+                None,
+                None,
+            )?;
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
@@ -278,7 +296,7 @@ pub fn translate_inner(
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, resolver, if_exists, program, connection)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
@@ -296,7 +314,7 @@ pub fn translate_inner(
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(resolver, &view_name, if_exists, program, connection)?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -323,13 +341,41 @@ pub fn translate_inner(
         ast::Stmt::Optimize { idx_name } => {
             translate_optimize(idx_name, resolver, program, connection)?
         }
-        ast::Stmt::Release { name } => translate_release(program, name)?,
+        ast::Stmt::Release { name } => {
+            check_auth(
+                connection,
+                AuthAction::Savepoint,
+                Some("RELEASE"),
+                Some(name.as_str()),
+                None,
+            )?;
+            translate_release(program, name)?
+        }
         ast::Stmt::Rollback {
             tx_name,
             savepoint_name,
-        } => translate_rollback(program, tx_name, savepoint_name)?,
-        ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
+        } => {
+            check_auth(
+                connection,
+                AuthAction::Transaction,
+                Some("ROLLBACK"),
+                None,
+                None,
+            )?;
+            translate_rollback(program, tx_name, savepoint_name)?
+        }
+        ast::Stmt::Savepoint { name } => {
+            check_auth(
+                connection,
+                AuthAction::Savepoint,
+                Some("BEGIN"),
+                Some(name.as_str()),
+                None,
+            )?;
+            translate_savepoint(program, name)?
+        }
         ast::Stmt::Select(select) => {
+            check_auth(connection, AuthAction::Select, None, None, None)?;
             translate_select(
                 select,
                 resolver,

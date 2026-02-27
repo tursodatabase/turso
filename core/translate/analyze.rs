@@ -137,9 +137,20 @@ pub fn translate_analyze(
     target_opt: Option<ast::QualifiedName>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
+    connection: &crate::Connection,
 ) -> Result<()> {
     // Resolve the target database and collect analyze targets.
     let (database_id, analyze_targets) = resolve_analyze_targets(&target_opt, resolver)?;
+    let target_name = target_opt
+        .as_ref()
+        .map(|t| crate::util::normalize_ident(t.name.as_str()));
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::Analyze,
+        target_name.as_deref(),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
 
     if analyze_targets.is_empty() {
         return Ok(());

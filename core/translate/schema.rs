@@ -817,6 +817,13 @@ pub fn translate_create_table(
         program.begin_write_on_database(database_id, schema_cookie);
     }
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::CreateTable,
+        Some(&normalized_tbl_name),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
     if temporary {
         bail_parse_error!("TEMPORARY table not supported yet");
     }
@@ -1283,6 +1290,13 @@ pub fn translate_create_virtual_table(
 
     let table_name = tbl_name.name.as_str().to_string();
     let module_name_str = module_name.as_str().to_string();
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::CreateVtable,
+        Some(&table_name),
+        Some(&module_name_str),
+        None,
+    )?;
     let args_vec = args.clone();
     let Some(vtab_module) = resolver.symbol_table.vtab_modules.get(&module_name_str) else {
         bail_parse_error!("no such module: {}", module_name_str);
@@ -1400,6 +1414,13 @@ pub fn translate_drop_table(
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(&tbl_name)?;
     let name = tbl_name.name.as_str();
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::DropTable,
+        Some(&normalize_ident(name)),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
     let opts = ProgramBuilderOpts {
         num_cursors: 4,
         approx_num_insns: 40,

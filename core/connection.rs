@@ -128,6 +128,9 @@ pub struct Connection {
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
     pub(super) busy_handler: RwLock<BusyHandler>,
+    /// Authorizer callback for SQL statement authorization.
+    /// Called during statement compilation (prepare/translate) to authorize operations.
+    pub(super) authorizer: RwLock<crate::Authorizer>,
     /// Whether this is an internal connection used for MVCC bootstrap
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
@@ -1873,6 +1876,38 @@ impl Connection {
             ));
         }
         pager.set_encryption_context(cipher_mode, key)
+    }
+
+    /// Sets a custom authorizer callback.
+    pub fn set_authorizer(&self, callback: Option<crate::AuthorizerCallback>) {
+        *self.authorizer.write() = match callback {
+            Some(cb) => crate::Authorizer::Custom { callback: cb },
+            None => crate::Authorizer::None,
+        };
+    }
+
+    /// Check authorization for an action. Returns AuthResult.
+    /// If no authorizer is set, returns AuthResult::Ok.
+    pub fn authorize(
+        &self,
+        action: crate::authorizer::AuthAction,
+        arg3: Option<&str>,
+        arg4: Option<&str>,
+        db_name: Option<&str>,
+        trigger_or_view: Option<&str>,
+    ) -> crate::authorizer::AuthResult {
+        let guard = self.authorizer.read();
+        match &*guard {
+            crate::Authorizer::None => crate::authorizer::AuthResult::Ok,
+            crate::Authorizer::Custom { callback } => {
+                callback(action, arg3, arg4, db_name, trigger_or_view)
+            }
+        }
+    }
+
+    /// Returns true if an authorizer callback is currently set on this connection.
+    pub fn has_authorizer(&self) -> bool {
+        !matches!(&*self.authorizer.read(), crate::Authorizer::None)
     }
 
     /// Sets a custom busy handler callback.

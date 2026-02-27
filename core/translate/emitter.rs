@@ -130,6 +130,8 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
+    /// Optional connection reference for authorizer checks during expression translation.
+    pub connection: Option<Arc<crate::Connection>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -150,6 +152,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            connection: None,
         }
     }
 
@@ -166,6 +169,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            connection: self.connection.clone(),
         }
     }
 

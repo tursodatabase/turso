@@ -72,6 +72,13 @@ pub fn translate_create_index(
     let database_id = resolver.resolve_database_id(&original_idx_name)?;
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::CreateIndex,
+        Some(&idx_name),
+        Some(&tbl_name),
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
 
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
@@ -786,9 +793,17 @@ pub fn translate_drop_index(
     resolver: &Resolver,
     if_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &crate::Connection,
 ) -> crate::Result<()> {
     let database_id = resolver.resolve_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::DropIndex,
+        Some(&idx_name),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
     let opts = ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 40,

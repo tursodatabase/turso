@@ -109,6 +109,13 @@ pub fn translate_create_trigger(
     program.begin_write_operation();
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
+    crate::authorizer::check_auth(
+        &connection,
+        crate::authorizer::AuthAction::CreateTrigger,
+        Some(&normalized_trigger_name),
+        Some(&normalized_table_name),
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
 
     if crate::schema::is_system_table(&normalized_table_name) {
         bail_parse_error!("cannot create trigger on system table");
@@ -215,6 +222,13 @@ pub fn translate_drop_trigger(
     }
     program.begin_write_operation();
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::DropTrigger,
+        Some(&normalized_trigger_name),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
 
     // Check if trigger exists
     if resolver.with_schema(database_id, |s| {

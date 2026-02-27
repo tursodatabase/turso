@@ -251,6 +251,7 @@ pub fn translate_create_view(
     select_stmt: &ast::Select,
     _columns: &[ast::IndexedColumn],
     program: &mut ProgramBuilder,
+    connection: &crate::Connection,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
     if crate::is_attached_db(database_id) {
@@ -258,6 +259,13 @@ pub fn translate_create_view(
         program.begin_write_on_database(database_id, schema_cookie);
     }
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::CreateView,
+        Some(&normalized_view_name),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
@@ -335,6 +343,7 @@ pub fn translate_drop_view(
     view_name: &ast::QualifiedName,
     if_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &crate::Connection,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
     if crate::is_attached_db(database_id) {
@@ -342,6 +351,13 @@ pub fn translate_drop_view(
         program.begin_write_on_database(database_id, schema_cookie);
     }
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+    crate::authorizer::check_auth(
+        connection,
+        crate::authorizer::AuthAction::DropView,
+        Some(&normalized_view_name),
+        None,
+        resolver.get_database_name_by_index(database_id).as_deref(),
+    )?;
 
     // Check if view exists (either regular or materialized)
     let (is_regular_view, is_materialized_view) = resolver.with_schema(database_id, |s| {
