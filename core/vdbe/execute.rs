@@ -7588,6 +7588,8 @@ pub fn op_insert(
                 state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
                 continue;
             }
+            // TODO: add some InsertFlags that allows us to skip this check when we know for
+            // certain that the update is not a no-op to avoid the branch.
             OpInsertSubState::NoopCheck => {
                 // UPDATE fast path: skip the physical write if the target row already
                 // has the exact same record payload. This check is isolated in its own
