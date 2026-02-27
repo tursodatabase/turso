@@ -1,4 +1,3 @@
-use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Mutex;
 
 /// No-op callback for use with [`LogicalClock::get_timestamp`] when no
@@ -18,34 +17,6 @@ pub trait LogicalClock: Send + Sync {
     /// Pass [`no_op`] when no atomic side-effect is needed (begin timestamps).
     fn get_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64;
     fn reset(&self, ts: u64);
-}
-
-/// A node-local clock backed by an atomic counter.
-/// Suitable for single-threaded use and tests. Does not provide
-/// atomicity between timestamp generation and the `f` callback.
-#[derive(Debug, Default)]
-pub struct LocalClock {
-    ts_sequence: AtomicU64,
-}
-
-impl LocalClock {
-    pub fn new() -> Self {
-        Self {
-            ts_sequence: AtomicU64::new(0),
-        }
-    }
-}
-
-impl LogicalClock for LocalClock {
-    fn get_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64 {
-        let ts = self.ts_sequence.fetch_add(1, Ordering::SeqCst);
-        f(ts);
-        ts
-    }
-
-    fn reset(&self, ts: u64) {
-        self.ts_sequence.store(ts, Ordering::SeqCst);
-    }
 }
 
 /// A mutex-guarded clock for concurrent MVCC use.

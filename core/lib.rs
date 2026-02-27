@@ -262,9 +262,9 @@ pub enum TempStore {
     Memory = 2,
 }
 
-pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
+pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock>;
 
-pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::LocalClock>;
+pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::MvccClock>;
 
 /// Creates a read completion for database header reads that checks for short reads.
 /// The header is always on page 1, so this function hardcodes that page index.
