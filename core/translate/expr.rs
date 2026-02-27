@@ -5508,52 +5508,84 @@ where
     Ok(WalkControl::Continue)
 }
 
-pub fn get_expr_affinity(
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExprAffinityInfo {
+    affinity: Affinity,
+    has_affinity: bool,
+}
+
+impl ExprAffinityInfo {
+    const fn with_affinity(affinity: Affinity) -> Self {
+        Self {
+            affinity,
+            has_affinity: true,
+        }
+    }
+
+    const fn no_affinity() -> Self {
+        Self {
+            affinity: Affinity::Blob,
+            has_affinity: false,
+        }
+    }
+}
+
+pub(crate) fn get_expr_affinity_info(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
-) -> Affinity {
+) -> ExprAffinityInfo {
     match expr {
         ast::Expr::Column { table, column, .. } => {
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
                         if let Some(btree) = table_ref.btree() {
-                            return col.affinity_with_strict(btree.is_strict);
+                            return ExprAffinityInfo::with_affinity(
+                                col.affinity_with_strict(btree.is_strict),
+                            );
                         }
-                        return col.affinity();
+                        return ExprAffinityInfo::with_affinity(col.affinity());
                     }
                 }
             }
-            Affinity::Blob
+            ExprAffinityInfo::no_affinity()
         }
-        ast::Expr::RowId { .. } => Affinity::Integer,
+        ast::Expr::RowId { .. } => ExprAffinityInfo::with_affinity(Affinity::Integer),
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
-                Affinity::affinity(&type_name.name)
+                ExprAffinityInfo::with_affinity(Affinity::affinity(&type_name.name))
             } else {
-                Affinity::Blob
+                ExprAffinityInfo::no_affinity()
             }
         }
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            get_expr_affinity(exprs.first().unwrap(), referenced_tables, resolver)
+            get_expr_affinity_info(exprs.first().unwrap(), referenced_tables, resolver)
         }
-        ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables, resolver),
-        // Literals have NO affinity in SQLite!
-        ast::Expr::Literal(_) => Affinity::Blob, // No affinity!
+        ast::Expr::Collate(expr, _) => get_expr_affinity_info(expr, referenced_tables, resolver),
+        // Literals have NO affinity in SQLite.
+        ast::Expr::Literal(_) => ExprAffinityInfo::no_affinity(),
         ast::Expr::Register(reg) => {
             // During UPDATE expression index evaluation, column references are
             // rewritten to Expr::Register. Look up the original column affinity
             // from the resolver's register_affinities map.
             if let Some(resolver) = resolver {
                 if let Some(aff) = resolver.register_affinities.get(reg) {
-                    return *aff;
+                    return ExprAffinityInfo::with_affinity(*aff);
                 }
             }
-            Affinity::Blob
+            ExprAffinityInfo::no_affinity()
         }
-        _ => Affinity::Blob, // This may need to change. For now this works.
+        _ => ExprAffinityInfo::no_affinity(),
     }
+}
+
+pub fn get_expr_affinity(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
+) -> Affinity {
+    get_expr_affinity_info(expr, referenced_tables, resolver).affinity
 }
 
 pub fn comparison_affinity(
@@ -5562,75 +5594,41 @@ pub fn comparison_affinity(
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Affinity {
-    let lhs_affinity = get_expr_affinity(lhs_expr, referenced_tables, resolver);
-    let lhs_has_affinity = expr_has_comparison_affinity(lhs_expr, referenced_tables, resolver);
-
     compare_affinity(
         rhs_expr,
-        lhs_affinity,
-        lhs_has_affinity,
+        get_expr_affinity_info(lhs_expr, referenced_tables, resolver),
         referenced_tables,
         resolver,
     )
 }
 
-/// Return whether an expression has a real affinity for comparison purposes.
-///
-/// This intentionally distinguishes BLOB-affinity expressions (which *do* have
-/// affinity in SQLite comparison rules) from expressions with no affinity
-/// (literals, most computed expressions, unresolved registers).
-pub fn expr_has_comparison_affinity(
-    expr: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
-) -> bool {
-    match expr {
-        ast::Expr::Column { table, column, .. } => referenced_tables
-            .and_then(|tables| tables.find_table_by_internal_id(*table))
-            .and_then(|(_, table_ref)| table_ref.get_column_at(*column))
-            .is_some(),
-        ast::Expr::RowId { .. } => true,
-        ast::Expr::Cast { type_name, .. } => type_name.is_some(),
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            expr_has_comparison_affinity(exprs.first().unwrap(), referenced_tables, resolver)
-        }
-        ast::Expr::Collate(expr, _) => {
-            expr_has_comparison_affinity(expr, referenced_tables, resolver)
-        }
-        ast::Expr::Register(reg) => resolver
-            .and_then(|res| res.register_affinities.get(reg))
-            .is_some(),
-        _ => false,
-    }
-}
-
-pub fn compare_affinity(
-    expr: &ast::Expr,
-    other_affinity: Affinity,
-    other_has_affinity: bool,
-    referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
-) -> Affinity {
-    let expr_affinity = get_expr_affinity(expr, referenced_tables, resolver);
-    let expr_has_affinity = expr_has_comparison_affinity(expr, referenced_tables, resolver);
-
-    if expr_has_affinity && other_has_affinity {
+fn comparison_affinity_from_info(lhs: ExprAffinityInfo, rhs: ExprAffinityInfo) -> Affinity {
+    if lhs.has_affinity && rhs.has_affinity {
         // Both sides have affinity - use numeric if either is numeric
-        if expr_affinity.is_numeric() || other_affinity.is_numeric() {
+        if lhs.affinity.is_numeric() || rhs.affinity.is_numeric() {
             Affinity::Numeric
         } else {
             Affinity::Blob
         }
+    } else if lhs.has_affinity {
+        lhs.affinity
+    } else if rhs.has_affinity {
+        rhs.affinity
     } else {
-        // One or both sides have no affinity - use the one that does, or Blob if neither
-        if expr_has_affinity {
-            expr_affinity
-        } else if other_has_affinity {
-            other_affinity
-        } else {
-            Affinity::Blob
-        }
+        Affinity::Blob
     }
+}
+
+pub(crate) fn compare_affinity(
+    expr: &ast::Expr,
+    other: ExprAffinityInfo,
+    referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
+) -> Affinity {
+    comparison_affinity_from_info(
+        other,
+        get_expr_affinity_info(expr, referenced_tables, resolver),
+    )
 }
 
 /// Emit literal values - shared between regular and RETURNING expression evaluation
