@@ -36,7 +36,7 @@ pub mod cursor;
 pub mod database;
 pub mod persistent_storage;
 
-pub use clock::LocalClock;
+pub use clock::{LocalClock, MvccClock};
 pub use database::MvStore;
 
 #[cfg(test)]
