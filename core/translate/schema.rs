@@ -127,7 +127,7 @@ fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()>
             | ast::Expr::SubqueryResult { .. }
             | ast::Expr::Id(_) => {
                 bail_parse_error!(
-                    "default value for column [{}] is not constant",
+                    "default value of column [{}] is not constant",
                     col.col_name.as_str()
                 );
             }
