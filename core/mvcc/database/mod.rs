@@ -1204,7 +1204,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
         tracing::trace!("step(state={:?})", self.state);
         match &self.state {
             CommitState::Initial => {
-                let end_ts = mvcc_store.get_timestamp();
+                let end_ts = mvcc_store.get_commit_timestamp(crate::mvcc::clock::no_op);
                 // NOTICE: the first shadowed tx keeps the entry alive in the map
                 // for the duration of this whole function, which is important for correctness!
                 let tx = mvcc_store
@@ -3037,7 +3037,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .value()
                 .begin_ts
         } else {
-            self.get_timestamp()
+            self.get_begin_timestamp()
         };
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
@@ -3106,7 +3106,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             return Err(LimboError::Busy);
         }
         let tx_id = self.get_tx_id();
-        let begin_ts = self.get_timestamp();
+        let begin_ts = self.get_begin_timestamp();
 
         // Set txn's header to the global header
         let header = self.get_new_transaction_database_header(&pager);
@@ -3650,9 +3650,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.version_id_counter.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Gets current timestamp
-    pub fn get_timestamp(&self) -> u64 {
-        self.clock.get_timestamp()
+    /// Generate a begin timestamp. No side-effect needed alongside generation.
+    pub fn get_begin_timestamp(&self) -> u64 {
+        self.clock.get_timestamp(crate::mvcc::clock::no_op)
+    }
+
+    /// Generate a commit timestamp and call `f` with it while the clock
+    /// lock is held, atomically publishing the timestamp before release.
+    pub fn get_commit_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64 {
+        self.clock.get_timestamp(f)
     }
 
     /// Compute the low-water mark: the minimum begin_ts of all active or

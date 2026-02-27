@@ -3347,14 +3347,15 @@ fn test_commit_dep_threaded_abort_cascades() {
     // Simulate mid-commit: transition writer to Preparing.
     // end_ts comes from the global clock so the reader's begin_ts will be >=
     // end_ts, satisfying the speculative read condition (Hekaton Table 1).
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let _end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     // Reader signals after speculative read so main thread can abort writer.
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
@@ -3451,14 +3452,15 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
         .unwrap();
     let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
 
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let _end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     let num_readers = 4;
     // Barrier: all readers + main thread synchronize after speculative reads
@@ -3537,14 +3539,15 @@ fn test_commit_dep_threaded_commit_resolves() {
         .unwrap();
     let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
 
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -3653,14 +3656,15 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
         .unwrap();
     let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
 
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let _end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -3790,14 +3794,15 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
         .unwrap();
     let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
 
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -3887,14 +3892,15 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
         .unwrap();
     let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
 
-    let end_ts = mvcc_store.clock.get_timestamp();
-    mvcc_store
-        .txs
-        .get(&writer_tx_id)
-        .unwrap()
-        .value()
-        .state
-        .store(TransactionState::Preparing(end_ts));
+    let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
 
     // Start a non-CONCURRENT tx that will try to get exclusive lock later.
     // Its begin_ts is assigned now, before the read-only tx commits.
