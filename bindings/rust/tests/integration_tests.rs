@@ -1695,3 +1695,62 @@ async fn test_snapshot_isolation_violation() {
         "Snapshot isolation violated: COUNT(*) changed within a single BEGIN CONCURRENT txn"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_ghost_commits() {
+    for iteration in 0..500 {
+        if iteration % 100 == 0 {
+            eprintln!("test_ghost_commits: Iteration {iteration}");
+        }
+        let (db, _dir) = setup_mvcc_db("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)").await;
+
+        let num_workers: usize = 8;
+        let ops_per_worker: i64 = 100;
+        let barrier = Arc::new(Barrier::new(num_workers));
+        let mut handles = Vec::new();
+
+        for worker_id in 0..num_workers as i64 {
+            let conn = db.connect().unwrap();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let mut successes = 0i64;
+                let mut errors = 0i64;
+                for i in 0..ops_per_worker {
+                    let id = worker_id * 10_000 + i;
+                    // Autocommit INSERT (no explicit BEGIN/COMMIT)
+                    match conn
+                        .execute(&format!("INSERT INTO t VALUES({id}, {i})"), ())
+                        .await
+                    {
+                        Ok(_) => successes += 1,
+                        Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => errors += 1, // Busy("database is locked")
+                        Err(e) => panic!("unexpected error: {e:?}"),
+                    }
+                }
+                (successes, errors)
+            }));
+        }
+
+        let mut total_successes = 0i64;
+        let mut total_errors = 0i64;
+        for handle in handles {
+            let (s, e) = handle.await.unwrap();
+            total_successes += s;
+            total_errors += e;
+        }
+
+        let conn = db.connect().unwrap();
+        let actual_rows = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
+        if iteration % 100 == 0 {
+            eprintln!("test_ghost_commits: Iteration {iteration}, actual_rows={actual_rows}, total_successes={total_successes}, total_errors={total_errors}");
+        }
+        assert_eq!(
+            actual_rows,
+            total_successes,
+            "Ghost commits! {actual_rows} rows in DB but only {total_successes} reported as Ok ({total_errors} errors). \
+             {} inserts committed despite returning Busy.",
+            total_successes - actual_rows,
+        );
+    }
+}
