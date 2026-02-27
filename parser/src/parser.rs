@@ -1017,6 +1017,7 @@ impl<'a> Parser<'a> {
         } else {
             return Ok(None);
         };
+        let mut type_name_end_offset = self.offset();
 
         while let Some(tok) = self.peek()? {
             match tok.token_type.fallback_id_if_ok() {
@@ -1024,35 +1025,45 @@ impl<'a> Parser<'a> {
                     let tok = eat_assert!(self, TK_ID, TK_STRING);
                     type_name.push(' ');
                     type_name.push_str(from_bytes_as_str(tok.value));
+                    type_name_end_offset = self.offset();
                 }
                 _ => break,
             }
         }
 
-        let size = if let Some(tok) = self.peek()? {
+        let (size, size_text) = if let Some(tok) = self.peek()? {
             if tok.token_type == TK_LP {
+                let size_text_start = type_name_end_offset;
                 eat_assert!(self, TK_LP);
                 let first_size = self.parse_signed()?;
                 let tok = eat_expect!(self, TK_RP, TK_COMMA);
-                match tok.token_type {
-                    TK_RP => Some(TypeSize::MaxSize(first_size)),
+                let parsed_size = match tok.token_type {
+                    TK_RP => TypeSize::MaxSize(first_size),
                     TK_COMMA => {
                         let second_size = self.parse_signed()?;
                         eat_expect!(self, TK_RP);
-                        Some(TypeSize::TypeSize(first_size, second_size))
+                        TypeSize::TypeSize(first_size, second_size)
                     }
                     _ => unreachable!(),
-                }
+                };
+                let size_text_end = self.offset();
+                (
+                    Some(parsed_size),
+                    Some(from_bytes(
+                        &self.lexer.input[size_text_start..size_text_end],
+                    )),
+                )
             } else {
-                None
+                (None, None)
             }
         } else {
-            None
+            (None, None)
         };
 
         Ok(Some(Type {
             name: type_name,
             size,
+            size_text,
         }))
     }
 
@@ -4844,6 +4855,7 @@ mod tests {
                                     type_name: Some(Type {
                                         name: "INTEGER".to_owned(),
                                         size: None,
+                                        size_text: None,
                                     }),
                                 }),
                                 None,
@@ -4874,6 +4886,7 @@ mod tests {
                                         size: Some(TypeSize::MaxSize(Box::new(Expr::Literal(
                                             Literal::Numeric("255".to_owned()),
                                         )))),
+                                        size_text: None,
                                     }),
                                 }),
                                 None,
@@ -4909,6 +4922,7 @@ mod tests {
                                                 "5".to_owned(),
                                             ))),
                                         )),
+                                        size_text: None,
                                     }),
                                 }),
                                 None,
@@ -9600,6 +9614,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![],
                     }),
@@ -9614,6 +9629,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9635,6 +9651,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9658,6 +9675,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9682,6 +9700,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9706,6 +9725,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9727,6 +9747,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9749,6 +9770,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9771,6 +9793,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9793,6 +9816,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9815,6 +9839,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9837,6 +9862,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9858,6 +9884,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9879,6 +9906,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9905,6 +9933,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9945,6 +9974,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9985,6 +10015,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10025,6 +10056,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10065,6 +10097,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10105,6 +10138,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10145,6 +10179,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10185,6 +10220,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10214,6 +10250,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10243,6 +10280,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10272,6 +10310,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10301,6 +10340,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10322,6 +10362,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10344,6 +10385,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10366,6 +10408,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            size_text: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10390,6 +10433,7 @@ mod tests {
                             col_type: Some(Type {
                                 name: "INTEGER".to_owned(),
                                 size: None,
+                                size_text: None,
                             }),
                             constraints: vec![],
                         },
@@ -10555,6 +10599,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    size_text: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -10596,6 +10641,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    size_text: None,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {
@@ -10613,6 +10659,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    size_text: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -10658,6 +10705,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    size_text: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -10696,6 +10744,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    size_text: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -12005,6 +12054,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    size_text: None,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {

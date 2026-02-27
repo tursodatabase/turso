@@ -225,3 +225,15 @@ test create_table_trailing_named_column_constraint_primary_key_enforced {
 expect {
     1|x|x
 }
+
+# https://github.com/tursodatabase/turso/issues/3264
+@cross-check-integrity
+test create_table_preserve_type_size_spacing_in_schema_sql {
+    CREATE TABLE t1 (name varchar ( 255));
+    CREATE TABLE t2 (name varchar( 255));
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name IN ('t1', 't2') ORDER BY name;
+}
+expect {
+    CREATE TABLE t1 (name varchar ( 255))
+    CREATE TABLE t2 (name varchar( 255))
+}
