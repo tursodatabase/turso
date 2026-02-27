@@ -119,7 +119,7 @@ fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     }
 }
 
-fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
+pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
     match expr {
         ast::Expr::Literal(literal) => literal_default_value(literal),
         ast::Expr::Id(name) => Ok(Value::from_text(name.as_str().to_string())),
