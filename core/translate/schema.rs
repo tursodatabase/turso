@@ -4,8 +4,8 @@ use crate::ast;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
-    create_table, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
-    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    create_table, translate_ident_to_string_literal, BTreeTable, ColDef, Column, SchemaObjectType,
+    Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -27,6 +27,7 @@ use crate::Connection;
 use crate::{bail_parse_error, CaptureDataChangesExt, Result};
 
 use turso_ext::VTabKind;
+use turso_parser::ast::ColumnDefinition;
 
 /// Validate a CHECK constraint expression at CREATE TABLE / ALTER TABLE ADD COLUMN time.
 /// Rejects non-existent columns, non-existent functions, aggregates, window functions,
@@ -105,6 +106,33 @@ pub(crate) fn validate_check_expr(
             _ => {}
         }
         Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()> {
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Column { .. }
+            | ast::Expr::RowId { .. }
+            | ast::Expr::Name(_)
+            | ast::Expr::Qualified(_, _)
+            | ast::Expr::DoublyQualified(_, _, _)
+            | ast::Expr::Variable(_)
+            | ast::Expr::Raise(_, _)
+            | ast::Expr::Exists(_)
+            | ast::Expr::InSelect { .. }
+            | ast::Expr::InTable { .. }
+            | ast::Expr::Subquery(_)
+            | ast::Expr::SubqueryResult { .. }
+            | ast::Expr::Id(_) => {
+                bail_parse_error!(
+                    "default value for column [{}] is not constant",
+                    col.col_name.as_str()
+                );
+            }
+            _ => Ok(WalkControl::Continue),
+        }
     })?;
     Ok(())
 }
@@ -709,6 +737,11 @@ fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) 
                         bail_parse_error!(
                             "ON CONFLICT clauses are not supported yet in column definitions"
                         );
+                    }
+                    ast::ColumnConstraint::Default(expr) => {
+                        let expr =
+                            translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone());
+                        validate_default_expr(&expr, col_i)?
                     }
                     _ => {}
                 }
