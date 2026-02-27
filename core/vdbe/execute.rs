@@ -3045,6 +3045,7 @@ pub fn op_program(
                     Program::from_prepared(subprogram.clone(), program.connection.clone()),
                     pager.clone(),
                     QueryMode::Normal,
+                    0,
                 );
                 statement.reset()?;
 
