@@ -13,8 +13,9 @@ use super::{
 };
 use crate::translate::{
     emitter::Resolver,
-    expr::{unwrap_parens, BindingBehavior, WalkControl},
+    expr::{unwrap_parens, WalkControl},
     plan::{NonFromClauseSubquery, SubqueryState},
+    scope::{AliasScope, ChainedScope, EmptyScope, FullTableScope},
 };
 use crate::{
     ast::Limit,
@@ -1310,13 +1311,16 @@ pub fn parse_where(
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
-            bind_and_rewrite_expr(
-                &mut expr.expr,
-                Some(table_references),
-                result_columns,
-                resolver,
-                BindingBehavior::TryCanonicalColumnsFirst,
-            )?;
+            if let Some(result_columns) = result_columns {
+                let mut scope = ChainedScope {
+                    inner: FullTableScope::new(table_references),
+                    outer: AliasScope::new(result_columns),
+                };
+                bind_and_rewrite_expr(&mut expr.expr, &mut scope, resolver, false)?;
+            } else {
+                let mut scope = FullTableScope::new(table_references);
+                bind_and_rewrite_expr(&mut expr.expr, &mut scope, resolver, false)?;
+            }
         }
         // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
         // Re-break any ANDs that were created so they become separate WhereTerms for
@@ -1788,13 +1792,8 @@ fn parse_join(
                     } else {
                         None
                     };
-                    bind_and_rewrite_expr(
-                        &mut predicate.expr,
-                        Some(table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
+                    let mut scope = FullTableScope::new(table_references);
+                    bind_and_rewrite_expr(&mut predicate.expr, &mut scope, resolver, false)?;
                 }
             }
             ast::JoinConstraint::Using(distinct_names) => {
@@ -1952,21 +1951,10 @@ pub fn parse_limit(
     mut limit: Limit,
     resolver: &Resolver,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    bind_and_rewrite_expr(
-        &mut limit.expr,
-        None,
-        None,
-        resolver,
-        BindingBehavior::TryResultColumnsFirst,
-    )?;
+    let mut scope = EmptyScope;
+    bind_and_rewrite_expr(&mut limit.expr, &mut scope, resolver, false)?;
     if let Some(ref mut off_expr) = limit.offset {
-        bind_and_rewrite_expr(
-            off_expr,
-            None,
-            None,
-            resolver,
-            BindingBehavior::TryResultColumnsFirst,
-        )?;
+        bind_and_rewrite_expr(off_expr, &mut scope, resolver, false)?;
     }
     Ok((Some(limit.expr), limit.offset))
 }

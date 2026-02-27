@@ -51,8 +51,6 @@ fn resolve_column_in_joined_tables(refs: &TableReferences, name: &str) -> Result
     let mut match_result = None;
 
     for joined_table in refs.joined_tables() {
-        let database = Some(joined_table.database_id);
-
         let col_idx = joined_table.table.columns().iter().position(|c| {
             c.name
                 .as_ref()
@@ -82,7 +80,7 @@ fn resolve_column_in_joined_tables(refs: &TableReferences, name: &str) -> Result
                 let col = &joined_table.table.columns()[col_idx];
 
                 match_result = Some(ResolvedColumn::Column {
-                    database,
+                    database: None,
                     table: joined_table.internal_id,
                     column: col_idx,
                     is_rowid_alias: col.is_rowid_alias(),
@@ -101,7 +99,7 @@ fn resolve_column_in_joined_tables(refs: &TableReferences, name: &str) -> Result
                     crate::bail_parse_error!("no such column: {}", name);
                 }
                 return Ok(LookupResult::Found(ResolvedColumn::RowId {
-                    database,
+                    database: None,
                     table: refs.joined_tables()[0].internal_id,
                 }));
             }
@@ -177,9 +175,8 @@ fn resolve_qualified_in_joined_tables(
 
     if let Some(col_idx) = col_idx {
         let col = &joined_table.table.columns()[col_idx];
-        let database = Some(joined_table.database_id);
         return Ok(LookupResult::Found(ResolvedColumn::Column {
-            database,
+            database: None,
             table: joined_table.internal_id,
             column: col_idx,
             is_rowid_alias: col.is_rowid_alias(),
@@ -197,9 +194,8 @@ fn resolve_qualified_in_joined_tables(
             if !btree.has_rowid {
                 crate::bail_parse_error!("no such column: {}", normalized_col);
             }
-            let database = Some(joined_table.database_id);
             return Ok(LookupResult::Found(ResolvedColumn::RowId {
-                database,
+                database: None,
                 table: joined_table.internal_id,
             }));
         }
@@ -274,6 +270,10 @@ impl Scope for FullTableScope<'_> {
                 self.refs.mark_column_used(table, column);
                 return Ok(LookupResult::Found(found));
             }
+            LookupResult::Found(found @ ResolvedColumn::RowId { table, .. }) => {
+                self.refs.mark_rowid_referenced(table);
+                return Ok(LookupResult::Found(found));
+            }
             LookupResult::Found(found) => return Ok(LookupResult::Found(found)),
             LookupResult::Ambiguous(msg) => return Ok(LookupResult::Ambiguous(msg)),
             LookupResult::NotFound => {}
@@ -284,23 +284,28 @@ impl Scope for FullTableScope<'_> {
                 self.refs.mark_column_used(table, column);
                 Ok(LookupResult::Found(found))
             }
+            LookupResult::Found(found @ ResolvedColumn::RowId { table, .. }) => {
+                self.refs.mark_rowid_referenced(table);
+                Ok(LookupResult::Found(found))
+            }
             other => Ok(other),
         }
     }
 
     fn resolve_qualified(&mut self, table: &str, col: &str) -> Result<LookupResult> {
         let normalized_table = normalize_ident(table);
-        let table_exists = self
+        let local_table_exists = self
             .refs
             .joined_tables()
             .iter()
-            .any(|t| t.identifier == normalized_table)
-            || self
-                .refs
-                .outer_query_refs()
-                .iter()
-                .any(|t| t.identifier == normalized_table && !t.cte_definition_only);
-        if !table_exists {
+            .any(|t| t.identifier == normalized_table);
+        let outer_table_exists = self
+            .refs
+            .outer_query_refs()
+            .iter()
+            .any(|t| t.identifier == normalized_table && !t.cte_definition_only);
+
+        if !local_table_exists && !outer_table_exists {
             return Ok(LookupResult::Ambiguous(format!(
                 "no such table: {normalized_table}",
             )));
@@ -313,7 +318,13 @@ impl Scope for FullTableScope<'_> {
             }
             LookupResult::Found(found) => return Ok(LookupResult::Found(found)),
             LookupResult::Ambiguous(msg) => return Ok(LookupResult::Ambiguous(msg)),
-            LookupResult::NotFound => {}
+            LookupResult::NotFound => {
+                if local_table_exists {
+                    return Ok(LookupResult::Ambiguous(format!(
+                        "no such column: {table}.{col}"
+                    )));
+                }
+            }
         }
 
         match resolve_qualified_in_outer_refs(self.refs, table, col)? {
@@ -353,6 +364,10 @@ impl Scope for LocalTableScope<'_> {
         match resolve_column_in_joined_tables(self.refs, name)? {
             LookupResult::Found(found @ ResolvedColumn::Column { table, column, .. }) => {
                 self.refs.mark_column_used(table, column);
+                Ok(LookupResult::Found(found))
+            }
+            LookupResult::Found(found @ ResolvedColumn::RowId { table, .. }) => {
+                self.refs.mark_rowid_referenced(table);
                 Ok(LookupResult::Found(found))
             }
             other => Ok(other),

@@ -13,12 +13,13 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
-    BindingBehavior, ConditionMetadata, WalkControl,
+    ConditionMetadata, WalkControl,
 };
 use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
+use crate::translate::scope::FullTableScope;
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError};
@@ -734,13 +735,8 @@ fn emit_index_column_value_from_cursor(
 ) -> crate::Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
+        let mut scope = FullTableScope::new(table_references);
+        bind_and_rewrite_expr(&mut expr, &mut scope, resolver, false)?;
         translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
