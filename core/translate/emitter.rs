@@ -3295,14 +3295,14 @@ fn emit_update_insns<'a>(
             // If the program has a trigger_conflict_override, propagate it to the trigger context.
             let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
                 TriggerContext::new_with_override_conflict(
-                    btree_table.clone(),
+                    btree_table,
                     Some(new_registers),
                     Some(old_registers.clone()), // Clone for AFTER trigger
                     override_conflict,
                 )
             } else {
                 TriggerContext::new(
-                    btree_table.clone(),
+                    btree_table,
                     Some(new_registers),
                     Some(old_registers.clone()), // Clone for AFTER trigger
                 )
