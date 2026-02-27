@@ -7595,15 +7595,33 @@ pub fn op_insert(
                     }
                     Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
                 };
-
+                let mut is_noop_update = false;
                 {
                     let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
 
-                    return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
+                    // UPDATE fast path: skip the physical write if the target row already has the
+                    // exact same record payload. SQLite treats this as a no-op write.
+                    if flag.has(InsertFlags::SKIP_LAST_ROWID)
+                        && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                    {
+                        let existing_key = return_if_io!(cursor.rowid());
+                        if existing_key == Some(key) {
+                            let existing_record = return_if_io!(cursor.record());
+                            if existing_record.is_some_and(|r| r == record.as_ref()) {
+                                is_noop_update = true;
+                            }
+                        }
+                    }
+
+                    if !is_noop_update {
+                        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
+                    }
                 }
-                // Increment metrics for row write
-                state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                if !is_noop_update {
+                    // Increment metrics for row write
+                    state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                }
 
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
                 let root_page = {
