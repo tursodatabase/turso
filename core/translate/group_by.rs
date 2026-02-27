@@ -310,13 +310,13 @@ fn collect_non_aggregate_expressions<'a>(
     }
 
     for group_expr in &group_by.exprs {
-        let in_result = result_columns
+        let expr_appears_in_result_columns = result_columns
             .iter()
             .any(|expr| exprs_are_equivalent(expr, group_expr))
             || root_result_columns
                 .iter()
                 .any(|rc| exprs_are_equivalent(&rc.expr, group_expr));
-        non_aggregate_expressions.push((group_expr, in_result));
+        non_aggregate_expressions.push((group_expr, expr_appears_in_result_columns));
     }
     for expr in result_columns {
         let in_group_by = group_by
@@ -660,10 +660,10 @@ pub fn group_by_process_single_group(
         } => {
             let mut next_reg = *start_reg_dest;
 
-            for (sorter_column_index, (expr, in_result)) in
+            for (sorter_column_index, (expr, expr_appears_in_result_columns)) in
                 t_ctx.non_aggregate_expressions.iter().enumerate()
             {
-                if *in_result {
+                if *expr_appears_in_result_columns {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
                     t_ctx.resolver.expr_to_reg_cache.push((
                         std::borrow::Cow::Borrowed(expr),
