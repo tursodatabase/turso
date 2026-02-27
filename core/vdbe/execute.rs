@@ -2,7 +2,7 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
-use crate::mvcc::LocalClock;
+use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
@@ -11747,7 +11747,7 @@ pub struct OpJournalModeState {
     /// The new journal mode we're changing to
     pub new_mode: Option<journal_mode::JournalMode>,
     /// Checkpoint state machine for MVCC mode
-    pub checkpoint_sm: Option<StateMachine<CheckpointStateMachine<LocalClock>>>,
+    pub checkpoint_sm: Option<StateMachine<CheckpointStateMachine<MvccClock>>>,
     /// Page reference for writing header
     pub page_ref: Option<PageRef>,
 }

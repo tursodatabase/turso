@@ -74,7 +74,7 @@ pub fn open_mv_store(
         .expect("path should be valid string");
     let file = io.open_file(string_path, flags, false)?;
     let storage = mvcc::persistent_storage::Storage::new(file, io);
-    let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
+    let mv_store = MvStore::new(mvcc::MvccClock::new(), storage);
     let mv_store = Arc::new(mv_store);
     Ok(mv_store)
 }

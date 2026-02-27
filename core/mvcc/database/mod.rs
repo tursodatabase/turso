@@ -1204,7 +1204,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
         tracing::trace!("step(state={:?})", self.state);
         match &self.state {
             CommitState::Initial => {
-                let end_ts = mvcc_store.get_timestamp();
                 // NOTICE: the first shadowed tx keeps the entry alive in the map
                 // for the duration of this whole function, which is important for correctness!
                 let tx = mvcc_store
@@ -1230,11 +1229,25 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Err(LimboError::SchemaConflict);
                 }
 
-                turso_assert!(
-                    end_ts > tx.begin_ts,
-                    "end_ts must be strictly greater than begin_ts"
-                );
-                tx.state.store(TransactionState::Preparing(end_ts));
+                // Atomically generate end_ts and publish Preparing(end_ts) while the
+                // clock lock is held. This closes the TOCTOU window
+                // Consider the example:
+                //
+                // tx1 (Active): get_ts for end - 10
+                // tx2 (Active): got begin_ts - 11
+                // tx2 (Active): does queries but does not see changes by tx1
+                // tx1 (Preparing): now stores `end_ts(10)`
+                // tx2 (Active): queries again, but now it can see changes by tx1
+                //
+                // hence we want to guard the timestamp generation by a mutex, only allow next
+                // ts to generate when the previous one is used / discarded
+                let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+                    turso_assert!(
+                        ts > tx.begin_ts,
+                        "end_ts must be strictly greater than begin_ts"
+                    );
+                    tx.state.store(TransactionState::Preparing(ts));
+                });
                 tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
                 /* In order to implement serializability, we need the following steps:
                 **
@@ -3037,7 +3050,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .value()
                 .begin_ts
         } else {
-            self.get_timestamp()
+            self.get_begin_timestamp()
         };
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
@@ -3106,7 +3119,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             return Err(LimboError::Busy);
         }
         let tx_id = self.get_tx_id();
-        let begin_ts = self.get_timestamp();
+        let begin_ts = self.get_begin_timestamp();
 
         // Set txn's header to the global header
         let header = self.get_new_transaction_database_header(&pager);
@@ -3650,9 +3663,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.version_id_counter.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Gets current timestamp
-    pub fn get_timestamp(&self) -> u64 {
-        self.clock.get_timestamp()
+    /// Generate a begin timestamp. No side-effect needed alongside generation.
+    pub fn get_begin_timestamp(&self) -> u64 {
+        self.clock.get_timestamp(crate::mvcc::clock::no_op)
+    }
+
+    /// Generate a commit timestamp and call `f` with it while the clock
+    /// lock is held, atomically publishing the timestamp before release.
+    /// See [`MvccClock`] for the full explanation.
+    pub fn get_commit_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64 {
+        self.clock.get_timestamp(f)
     }
 
     /// Compute the low-water mark: the minimum begin_ts of all active or
@@ -3835,7 +3855,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     // Extracts the begin timestamp from a transaction
     #[inline]
-    fn get_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
+    fn resolve_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
         match ts_or_id {
             Some(TxTimestampOrID::Timestamp(ts)) => *ts,
             Some(TxTimestampOrID::TxID(tx_id)) => {
@@ -3904,8 +3924,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // which performs a binary search for the insertion point.
         let mut position = 0_usize;
         for (i, v) in versions.iter().enumerate().rev() {
-            let existing_begin = self.get_begin_timestamp(&v.begin);
-            let new_begin = self.get_begin_timestamp(&row_version.begin);
+            let existing_begin = self.resolve_begin_timestamp(&v.begin);
+            let new_begin = self.resolve_begin_timestamp(&row_version.begin);
             if existing_begin <= new_begin {
                 // Recovery can replay multiple operations for the same row from one transaction
                 // (e.g. insert then delete), which share the same begin timestamp.
