@@ -195,3 +195,33 @@ test create-table-only-generated-column-error {
 }
 expect error {
 }
+
+# https://github.com/tursodatabase/turso/issues/4987
+@cross-check-integrity
+test create_table_trailing_named_column_constraint {
+    CREATE TABLE t (
+        a INTEGER CONSTRAINT c PRIMARY KEY,
+        b,
+        d CONSTRAINT e
+    );
+    INSERT INTO t (a, b, d) VALUES (10, 'left', 'right');
+    SELECT a, b, d FROM t;
+}
+expect {
+    10|left|right
+}
+
+# https://github.com/tursodatabase/turso/issues/4987
+@cross-check-integrity
+test create_table_trailing_named_column_constraint_primary_key_enforced {
+    CREATE TABLE t(
+        a INTEGER CONSTRAINT c PRIMARY KEY,
+        b CONSTRAINT d
+    );
+    INSERT INTO t VALUES(1, 'x');
+    INSERT OR IGNORE INTO t VALUES(1, 'y');
+    SELECT count(*), min(b), max(b) FROM t;
+}
+expect {
+    1|x|x
+}
