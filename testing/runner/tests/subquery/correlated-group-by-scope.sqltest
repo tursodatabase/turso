@@ -1,0 +1,27 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x, y);
+    CREATE TABLE t3(a, x);
+
+    INSERT INTO t1 VALUES(1, 2);
+    INSERT INTO t2 VALUES(10, 20);
+    INSERT INTO t3 VALUES(7, 70);
+}
+
+@setup schema
+test correlated-subquery-group-by-must-not-capture-outer-column {
+    SELECT a FROM t1 WHERE EXISTS (SELECT x FROM t2 GROUP BY a);
+}
+expect error {
+    no such column: a
+}
+
+@setup schema
+test correlated-subquery-group-by-prefers-inner-column {
+    SELECT a FROM t1 WHERE EXISTS (SELECT x FROM t3 GROUP BY a);
+}
+expect {
+    1
+}
