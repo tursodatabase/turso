@@ -7609,8 +7609,7 @@ pub fn op_insert(
                             Register::Record(r) => std::borrow::Cow::Borrowed(r),
                             Register::Value(value) => {
                                 let values = [value];
-                                let record =
-                                    ImmutableRecord::from_values(values, values.len());
+                                let record = ImmutableRecord::from_values(values, values.len());
                                 std::borrow::Cow::Owned(record)
                             }
                             Register::Aggregate(..) => {
@@ -7646,8 +7645,7 @@ pub fn op_insert(
                     let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
-                    state.metrics.rows_written =
-                        state.metrics.rows_written.saturating_add(1);
+                    state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
                 }
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
                 let root_page = {
