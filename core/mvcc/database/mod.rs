@@ -4241,10 +4241,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let rebuild_schema =
             |connection: &Arc<Connection>, schema_rows: &HashMap<i64, ImmutableRecord>| {
                 let pager = connection.pager.load().clone();
-                let cookie = pager
-                    .io
-                    .block(|| pager.with_header(|header| header.schema_cookie))?
-                    .get();
+                let cookie = self
+                    .global_header
+                    .read()
+                    .as_ref()
+                    .map(|header| header.schema_cookie.get())
+                    .unwrap_or(
+                        pager
+                            .io
+                            .block(|| pager.with_header(|header| header.schema_cookie))?
+                            .get(),
+                    );
                 let mut fresh = Schema::new();
                 fresh.schema_version = cookie;
                 let mut from_sql_indexes = Vec::with_capacity(10);
@@ -4652,6 +4659,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         connection.with_schema_mut(|schema| {
             schema.dropped_root_pages = dropped_root_pages;
         });
+        if let Some(header) = self.global_header.read().as_ref() {
+            // Replay may rebuild schema rows before seeing a later UpdateHeader op in the same
+            // logical-log tail. Normalize to the final recovered header cookie so VDBE schema
+            // cookie checks do not observe a stale in-memory schema version after restart.
+            connection.with_schema_mut(|schema| {
+                schema.schema_version = header.schema_cookie.get();
+            });
+        }
         *connection.db.schema.lock() = connection.schema.read().clone();
         self.clock.reset(max_commit_ts_seen + 1);
         self.last_committed_tx_ts
