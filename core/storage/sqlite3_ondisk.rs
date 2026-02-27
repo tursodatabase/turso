@@ -44,6 +44,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use crate::{turso_assert, turso_assert_eq, turso_assert_greater_than};
+use branches::unlikely;
 use bytemuck::{Pod, Zeroable};
 use pack1::{I32BE, U16BE, U32BE};
 use tracing::{instrument, Level};
@@ -1264,7 +1265,7 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
             // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
             // If those are zero, this should be treated as corrupt.
             // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
-            if (v >> 48) == 0 {
+            if unlikely((v >> 48) == 0) {
                 bail_corrupt_error!("Invalid varint");
             }
             v = (v << 8) + c as u64;
@@ -1274,6 +1275,29 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
             bail_corrupt_error!("Invalid varint");
         }
     }
+}
+
+#[inline(always)]
+/// Reads a varint from the buffer, returning None if more data is needed.
+pub fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>> {
+    let mut v: u64 = 0;
+    for i in 0..8 {
+        let Some(&c) = buf.get(i) else {
+            return Ok(None);
+        };
+        v = (v << 7) + (c & 0x7f) as u64;
+        if (c & 0x80) == 0 {
+            return Ok(Some((v, i + 1)));
+        }
+    }
+    let Some(&c) = buf.get(8) else {
+        return Ok(None);
+    };
+    if unlikely((v >> 48) == 0) {
+        bail_corrupt_error!("Invalid varint");
+    }
+    v = (v << 8) + c as u64;
+    Ok(Some((v, 9)))
 }
 
 /// Compute the length of a varint encoding for a given u64 value.
