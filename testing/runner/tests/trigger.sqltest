@@ -1152,6 +1152,26 @@ expect {
     2
 }
 
+# https://github.com/tursodatabase/turso/issues/5115
+# Scalar count(*) subquery in trigger body
+@cross-check-integrity
+test trigger-after-insert-scalar-count-subquery {
+    CREATE TABLE t5115(id INTEGER PRIMARY KEY, data TEXT);
+    CREATE TABLE log5115(msg TEXT);
+    CREATE TRIGGER tr5115 AFTER INSERT ON t5115
+    BEGIN
+        INSERT INTO log5115 VALUES('count=' || (SELECT count(*) FROM t5115));
+    END;
+
+    INSERT INTO t5115 VALUES(1, 'a');
+    INSERT INTO t5115 VALUES(2, 'b');
+    SELECT * FROM log5115 ORDER BY rowid;
+}
+expect {
+    count=1
+    count=2
+}
+
 # RAISE(ABORT) in BEFORE INSERT trigger prevents insertion
 test trigger-raise-abort-before-insert {
     CREATE TABLE raise_t1 (x INTEGER, y TEXT);
@@ -1654,4 +1674,3 @@ test trigger-raise-fail-delete {
 expect error {
     delete fail
 }
-

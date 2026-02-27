@@ -364,6 +364,17 @@ expect {
     0
 }
 
+test subquery-scalar-count-fast-path {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY);
+    INSERT INTO t1 VALUES(1), (2);
+    SELECT (SELECT count(*) FROM t1);
+    SELECT (SELECT count(*) FROM sqlite_schema);
+}
+expect {
+    2
+    1
+}
+
 test subquery-empty-in-coalesce {
     SELECT COALESCE((SELECT 1 WHERE FALSE), 'default');
 }
