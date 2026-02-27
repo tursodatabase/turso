@@ -35,6 +35,20 @@ expect {
     1
 }
 
+@cross-check-integrity
+test affinity-join-blob-vs-text-column {
+    CREATE TABLE a(x);
+    CREATE TABLE b(x TEXT);
+    INSERT INTO a VALUES (1);
+    INSERT INTO b VALUES ('1');
+    SELECT count(*) FROM a JOIN b ON a.x = b.x;
+    SELECT count(*) FROM a JOIN b ON b.x = a.x;
+}
+expect {
+    0
+    0
+}
+
 # ============================================
 # TEXT affinity: numeric values should be converted to text on INSERT
 # ============================================

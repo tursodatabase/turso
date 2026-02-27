@@ -10,7 +10,9 @@ use crate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
         emitter::emit_program_for_select,
-        expr::{compare_affinity, get_expr_affinity, unwrap_parens, walk_expr_mut, WalkControl},
+        expr::{
+            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
+        },
         optimizer::optimize_select_plan,
         plan::{
             ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
@@ -520,7 +522,7 @@ fn get_subquery_parser<'a>(
                         .enumerate()
                         .map(|(i, lhs_expr)| {
                             let lhs_affinity =
-                                get_expr_affinity(lhs_expr, Some(referenced_tables), None);
+                                get_expr_affinity_info(lhs_expr, Some(referenced_tables), None);
                             compare_affinity(
                                 &plan.result_columns[i].expr,
                                 lhs_affinity,
