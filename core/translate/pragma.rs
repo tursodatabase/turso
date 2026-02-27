@@ -116,9 +116,17 @@ pub fn translate_pragma(
     match mode {
         TransactionMode::None => {}
         TransactionMode::Read => {
+            if crate::is_attached_db(database_id) {
+                let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+                program.begin_read_on_database(database_id, schema_cookie);
+            }
             program.begin_read_operation();
         }
         TransactionMode::Write => {
+            if crate::is_attached_db(database_id) {
+                let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+                program.begin_write_on_database(database_id, schema_cookie);
+            }
             program.begin_write_operation();
         }
         TransactionMode::Concurrent => {

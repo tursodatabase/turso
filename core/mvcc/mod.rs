@@ -96,7 +96,12 @@ mod tests {
                         match commit_tx_no_conn(&db, tx, &conn) {
                             Ok(()) => break,
                             Err(LimboError::Busy) => {
-                                mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn);
+                                mvcc_store.rollback_tx(
+                                    tx,
+                                    conn.pager.load().clone(),
+                                    &conn,
+                                    crate::MAIN_DB_ID,
+                                );
                                 std::thread::yield_now();
                                 continue;
                             }
@@ -117,7 +122,12 @@ mod tests {
                         match commit_tx_no_conn(&db, tx, &conn) {
                             Ok(()) => break,
                             Err(LimboError::Busy) => {
-                                mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn);
+                                mvcc_store.rollback_tx(
+                                    tx,
+                                    conn.pager.load().clone(),
+                                    &conn,
+                                    crate::MAIN_DB_ID,
+                                );
                                 std::thread::yield_now();
                                 continue;
                             }
@@ -157,7 +167,12 @@ mod tests {
                         match commit_tx_no_conn(&db, tx, &conn) {
                             Ok(()) => break,
                             Err(LimboError::Busy) => {
-                                mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn);
+                                mvcc_store.rollback_tx(
+                                    tx,
+                                    conn.pager.load().clone(),
+                                    &conn,
+                                    crate::MAIN_DB_ID,
+                                );
                                 std::thread::yield_now();
                                 continue;
                             }
@@ -178,7 +193,12 @@ mod tests {
                         match commit_tx_no_conn(&db, tx, &conn) {
                             Ok(()) => break,
                             Err(LimboError::Busy) => {
-                                mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn);
+                                mvcc_store.rollback_tx(
+                                    tx,
+                                    conn.pager.load().clone(),
+                                    &conn,
+                                    crate::MAIN_DB_ID,
+                                );
                                 std::thread::yield_now();
                                 continue;
                             }
@@ -243,7 +263,12 @@ mod tests {
                     if let Err(e) = mvcc_store.upsert(tx, row.clone()) {
                         tracing::trace!("upsert failed: {e}");
                         failed_upserts += 1;
-                        mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn);
+                        mvcc_store.rollback_tx(
+                            tx,
+                            conn.pager.load().clone(),
+                            &conn,
+                            crate::MAIN_DB_ID,
+                        );
                         continue;
                     }
                     let committed_row = mvcc_store.read(tx, &id).unwrap();
@@ -251,7 +276,12 @@ mod tests {
                         Ok(()) => {}
                         Err(LimboError::Busy | LimboError::WriteWriteConflict) => {
                             failed_commits += 1;
-                            mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn);
+                            mvcc_store.rollback_tx(
+                                tx,
+                                conn.pager.load().clone(),
+                                &conn,
+                                crate::MAIN_DB_ID,
+                            );
                             continue;
                         }
                         Err(e) => panic!("unexpected commit error: {e:?}"),
