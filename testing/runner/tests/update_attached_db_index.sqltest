@@ -86,3 +86,14 @@ expect @js {
     2|20|200
     ok
 }
+
+@cross-check-integrity
+test select-attached-db-rowid-unqualified {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (val TEXT);
+    INSERT INTO aux.t1 VALUES ('sku1');
+    SELECT rowid FROM aux.t1 JOIN (SELECT 1) s ON 1=1;
+}
+expect {
+    1
+}

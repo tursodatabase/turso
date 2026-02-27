@@ -4800,7 +4800,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         .iter()
                         .any(|s| s.eq_ignore_ascii_case(&normalized_id))
                     {
-                        let mut rowid_table_id = None;
+                        let mut rowid_table = None;
                         for joined_table in referenced_tables.joined_tables().iter() {
                             let Table::BTree(btree) = &joined_table.table else {
                                 continue;
@@ -4808,14 +4808,15 @@ pub fn bind_and_rewrite_expr<'a>(
                             if !btree.has_rowid {
                                 continue;
                             }
-                            if rowid_table_id.is_some() {
+                            if rowid_table.is_some() {
                                 crate::bail_parse_error!("ROWID is ambiguous");
                             }
-                            rowid_table_id = Some(joined_table.internal_id);
+                            rowid_table =
+                                Some((joined_table.internal_id, joined_table.database_id));
                         }
-                        if let Some(table_id) = rowid_table_id {
+                        if let Some((table_id, database_id)) = rowid_table {
                             *expr = Expr::RowId {
-                                database: None, // TODO: support different databases
+                                database: (database_id != 0).then_some(database_id),
                                 table: table_id,
                             };
                             return Ok(WalkControl::Continue);
