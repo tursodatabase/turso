@@ -3670,6 +3670,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Generate a commit timestamp and call `f` with it while the clock
     /// lock is held, atomically publishing the timestamp before release.
+    /// See [`MvccClock`] for the full explanation.
     pub fn get_commit_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64 {
         self.clock.get_timestamp(f)
     }
