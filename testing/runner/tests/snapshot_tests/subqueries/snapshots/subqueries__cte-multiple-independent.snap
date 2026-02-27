@@ -43,7 +43,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4            p5  comment
-   0  Init               0  71   0                 0  Start at 71
+   0  Init               0  72   0                 0  Start at 72
    1  OpenEphemeral      1   1   0                 0  cursor=1 is_table=true
    2  OpenRead           2   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
    3  Rewind             2  15   0                 0  Rewind table orders
@@ -72,48 +72,49 @@ addr  opcode            p1  p2  p3  p4            p5  comment
   26    IdxInsert        0  21   0                 8  key=r[21]
   27  Next               5  21   0                 0
   28  OpenRead           6   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
-  29  Rewind             6  54   0                 0  Rewind table customers
+  29  Rewind             6  55   0                 0  Rewind table customers
   30    Integer          0  24   0                 0  r[24]=0
   31    RowId            6  25   0                 0  r[25]=customers.rowid
-  32    Affinity        25   1   0                 0  r[25..26] = C
-  33    NotFound         0  35  25                 0  if not found goto 35
-  34    Goto             0  41   0                 0
-  35    Rewind           0  43   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t4)
-  36      Column         0   0  26                 0  r[26]=ephemeral(ephemeral_index_where_sub_t4).customer_id
-  37      Ne            25  26  39  Binary         0  if r[25]!=r[26] goto 39
-  38      Goto           0  45   0                 0
-  39    Next             0  36   0                 0
-  40    Goto             0  43   0                 0
-  41    Integer          1  24   0                 0  r[24]=1
-  42    Goto             0  46   0                 0
-  43    Integer          0  24   0                 0  r[24]=0
-  44    Goto             0  46   0                 0
-  45    Null             0  24   0                 0  r[24]=NULL
-  46    IfNot           24  53   1                 0  if !r[24] goto 53
-  47    RowId            6  22   0                 0  r[22]=customers.rowid
-  48    Column           6   1  23                 0  r[23]=customers.name
-  49    Copy            22  28   1                 0  r[28]=r[22]
-  50    Sequence         4  30   0                 0
-  51    MakeRecord      28   3  27                 0  r[27]=mkrec(r[28..30]); for ephemeral_subquery_t6
-  52    IdxInsert        4  27   0                 8  key=r[27]
-  53  Next               6  30   0                 0
-  54  Rewind             3  70   0                 0  Rewind  ephemeral()
-  55    Column           3   0  12                 0  r[12]=ephemeral().column 0
-  56    Column           3   1  13                 0  r[13]=ephemeral().column 1
-  57    Column           3   2  14                 0  r[14]=ephemeral().column 2
-  58    Copy            13  33   0                 0  r[33]=r[13]
-  59    IsNull          33  69   0                 0  if (r[33]==NULL) goto 69
-  60    Affinity        33   1   0                 0  r[33..34] = D
-  61    SeekGE           4  69  33                 0  key=[33..33]
-  62      IdxGT          4  69  33                 0  key=[33..33]
-  63      Column         4   0  15                 0  r[15]=ephemeral(ephemeral_subquery_t6).id
-  64      Column         4   1  16                 0  r[16]=ephemeral(ephemeral_subquery_t6).name
-  65      Column         4   1  31                 0  r[31]=ephemeral(ephemeral_subquery_t6).name
-  66      Copy          14  32   0                 0  r[32]=r[14]
-  67      ResultRow     31   2   0                 0  output=r[31..32]
-  68    Next             4  62   0                 0
-  69  Next               3  55   0                 0
-  70  Halt               0   0   0                 0
-  71  Transaction        0   1  11                 0  iDb=0 tx_mode=Read
-  72  Integer         1000   9   0                 0  r[9]=1000
-  73  Goto               0   1   0                 0
+  32    IsNull          25  36   0                 0  if (r[25]==NULL) goto 36
+  33    Affinity        25   1   0                 0  r[25..26] = C
+  34    NotFound         0  36  25                 0  if not found goto 36
+  35    Goto             0  42   0                 0
+  36    Rewind           0  44   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t4)
+  37      Column         0   0  26                 0  r[26]=ephemeral(ephemeral_index_where_sub_t4).customer_id
+  38      Ne            25  26  40  Binary         0  if r[25]!=r[26] goto 40
+  39      Goto           0  46   0                 0
+  40    Next             0  37   0                 0
+  41    Goto             0  44   0                 0
+  42    Integer          1  24   0                 0  r[24]=1
+  43    Goto             0  47   0                 0
+  44    Integer          0  24   0                 0  r[24]=0
+  45    Goto             0  47   0                 0
+  46    Null             0  24   0                 0  r[24]=NULL
+  47    IfNot           24  54   1                 0  if !r[24] goto 54
+  48    RowId            6  22   0                 0  r[22]=customers.rowid
+  49    Column           6   1  23                 0  r[23]=customers.name
+  50    Copy            22  28   1                 0  r[28]=r[22]
+  51    Sequence         4  30   0                 0
+  52    MakeRecord      28   3  27                 0  r[27]=mkrec(r[28..30]); for ephemeral_subquery_t6
+  53    IdxInsert        4  27   0                 8  key=r[27]
+  54  Next               6  30   0                 0
+  55  Rewind             3  71   0                 0  Rewind  ephemeral()
+  56    Column           3   0  12                 0  r[12]=ephemeral().column 0
+  57    Column           3   1  13                 0  r[13]=ephemeral().column 1
+  58    Column           3   2  14                 0  r[14]=ephemeral().column 2
+  59    Copy            13  33   0                 0  r[33]=r[13]
+  60    IsNull          33  70   0                 0  if (r[33]==NULL) goto 70
+  61    Affinity        33   1   0                 0  r[33..34] = D
+  62    SeekGE           4  70  33                 0  key=[33..33]
+  63      IdxGT          4  70  33                 0  key=[33..33]
+  64      Column         4   0  15                 0  r[15]=ephemeral(ephemeral_subquery_t6).id
+  65      Column         4   1  16                 0  r[16]=ephemeral(ephemeral_subquery_t6).name
+  66      Column         4   1  31                 0  r[31]=ephemeral(ephemeral_subquery_t6).name
+  67      Copy          14  32   0                 0  r[32]=r[14]
+  68      ResultRow     31   2   0                 0  output=r[31..32]
+  69    Next             4  63   0                 0
+  70  Next               3  56   0                 0
+  71  Halt               0   0   0                 0
+  72  Transaction        0   1  11                 0  iDb=0 tx_mode=Read
+  73  Integer         1000   9   0                 0  r[9]=1000
+  74  Goto               0   1   0                 0
