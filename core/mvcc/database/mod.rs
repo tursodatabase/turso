@@ -1204,7 +1204,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
         tracing::trace!("step(state={:?})", self.state);
         match &self.state {
             CommitState::Initial => {
-                let end_ts = mvcc_store.get_commit_timestamp(crate::mvcc::clock::no_op);
                 // NOTICE: the first shadowed tx keeps the entry alive in the map
                 // for the duration of this whole function, which is important for correctness!
                 let tx = mvcc_store
@@ -1230,11 +1229,25 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Err(LimboError::SchemaConflict);
                 }
 
-                turso_assert!(
-                    end_ts > tx.begin_ts,
-                    "end_ts must be strictly greater than begin_ts"
-                );
-                tx.state.store(TransactionState::Preparing(end_ts));
+                // Atomically generate end_ts and publish Preparing(end_ts) while the
+                // clock lock is held. This closes the TOCTOU window
+                // Consider the example:
+                //
+                // tx1 (Active): get_ts for end - 10
+                // tx2 (Active): got begin_ts - 11
+                // tx2 (Active): does queries but does not see changes by tx1
+                // tx1 (Preparing): now stores `end_ts(10)`
+                // tx2 (Active): queries again, but now it can see changes by tx1
+                //
+                // hence we want to guard the timestamp generation by a mutex, only allow next
+                // ts to generate when the previous one is used / discarded
+                let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+                    turso_assert!(
+                        ts > tx.begin_ts,
+                        "end_ts must be strictly greater than begin_ts"
+                    );
+                    tx.state.store(TransactionState::Preparing(ts));
+                });
                 tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
                 /* In order to implement serializability, we need the following steps:
                 **
