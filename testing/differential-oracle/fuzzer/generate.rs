@@ -84,8 +84,12 @@ impl SqlGenerator for SqlGenBackend {
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
         let sql = stmt.to_string();
         let is_ddl = StmtKind::from(&stmt).is_ddl();
-        let has_unordered_limit = stmt.has_unordered_limit();
-        let unordered_limit_reason = stmt.unordered_limit_reason().map(str::to_string);
+        let has_unordered_limit =
+            stmt.has_unordered_limit() || stmt.non_unique_order_by_reason(schema).is_some();
+        let unordered_limit_reason = stmt
+            .unordered_limit_reason()
+            .or_else(|| stmt.non_unique_order_by_reason(schema))
+            .map(str::to_string);
         Ok(GeneratedStatement {
             sql,
             is_ddl,
