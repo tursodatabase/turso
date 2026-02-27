@@ -4342,6 +4342,30 @@ fn test_should_checkpoint() {
     assert!(mv_store.storage.should_checkpoint());
 }
 
+/// What this test checks: After restart recovery, checkpoint-threshold checks use the recovered log offset.
+/// Why this matters: Shadow-offset drift can suppress auto-checkpoint despite a large recovered log tail.
+#[test]
+fn test_should_checkpoint_after_recovery_uses_recovered_offset() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    }
+
+    db.restart();
+    let _conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+    let recovered_offset = mv_store.storage.logical_log.write().offset;
+
+    mv_store.set_checkpoint_threshold(1);
+    assert!(
+        recovered_offset > 1,
+        "expected recovered log offset > 1 byte"
+    );
+    assert!(mv_store.storage.should_checkpoint());
+}
+
 /// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]

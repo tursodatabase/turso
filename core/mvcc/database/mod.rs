@@ -4640,9 +4640,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     self.global_header.write().replace(header);
                 }
                 StreamingResult::Eof => {
-                    let mut log = self.storage.logical_log.write();
-                    log.offset = reader.last_valid_offset() as u64;
-                    log.running_crc = reader.running_crc();
+                    let recovered_offset = reader.last_valid_offset() as u64;
+                    let recovered_running_crc = reader.running_crc();
+                    self.storage.restore_logical_log_state_after_recovery(
+                        recovered_offset,
+                        recovered_running_crc,
+                    );
                     break;
                 }
             }
