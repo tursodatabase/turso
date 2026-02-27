@@ -585,6 +585,53 @@ snapshot-eqp three-table-join-rowid-seek {
         oi.product_id;
 }
 
+setup schema_join_data {
+    -- Customers
+    INSERT INTO customers VALUES (1, 'Alice', 'alice@test.com', 'NYC', '2024-01-01');
+    INSERT INTO customers VALUES (2, 'Bob', 'bob@test.com', 'LA', '2024-01-01');
+    INSERT INTO customers VALUES (3, 'Carol', 'carol@test.com', 'NYC', '2024-01-01');
+
+    -- Orders: customer 1 has 2 orders, customer 2 has 1, customer 3 has 1
+    INSERT INTO orders VALUES (10, 1, '2024-02-01', 'delivered', 100);
+    INSERT INTO orders VALUES (11, 1, '2024-03-01', 'delivered', 200);
+    INSERT INTO orders VALUES (12, 2, '2024-02-15', 'delivered', 150);
+    INSERT INTO orders VALUES (13, 3, '2024-04-01', 'pending', 50);
+
+    -- Order items: order 10 has items for products 501 and 502,
+    -- order 11 has item for 501, order 12 has item for 502, order 13 has item for 503
+    INSERT INTO order_items VALUES (100, 10, 501, 2, 25);
+    INSERT INTO order_items VALUES (101, 10, 502, 1, 50);
+    INSERT INTO order_items VALUES (102, 11, 501, 3, 25);
+    INSERT INTO order_items VALUES (103, 12, 502, 1, 50);
+    INSERT INTO order_items VALUES (104, 13, 503, 1, 50);
+}
+
+# Correctness test for the rowid-seek regression.
+# Expected (ORDER BY product_id):
+#   501: customer 1 via orders 10,11 -> COUNT(DISTINCT customer_id) = 1
+#   502: customer 1 via order 10, customer 2 via order 12 -> 2
+#   503: customer 3 via order 13 -> 1
+@setup schema
+@setup schema_join_data
+test three-table-join-rowid-seek-correctness {
+    SELECT
+        oi.product_id,
+        COUNT(DISTINCT c.customer_id) AS unique_customers
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    GROUP BY
+        oi.product_id
+    ORDER BY
+        oi.product_id;
+}
+expect {
+    501|1
+    502|2
+    503|1
+}
+
 # =============================================================================
 # Regression: verbatim reproduction from testing-bigass.db schema
 # Three-table join where GROUP BY on an indexed column caused the optimizer
@@ -655,4 +702,64 @@ snapshot-eqp bigass-three-table-join-rowid-seek {
     INNER JOIN order_items oi ON o.id = oi.order_id
     GROUP BY
         oi.product_id;
+}
+
+# Fixture data for semantic correctness tests.
+# Designed so that:
+# - Multiple tickets can reference the same order (tickets 1,2 -> order 1)
+# - One order can have multiple items across different products
+# - A ticket referencing an order with items for products 101 and 102
+#   should count toward BOTH products
+# - Tickets referencing orders with NO items should not appear
+# - DISTINCT matters: ticket 1 touches product 101 via TWO items (oi 1 and 2)
+#   but should only count once per product
+setup bigass_data {
+    -- Orders
+    INSERT INTO orders (id, user_id) VALUES (1, 10);
+    INSERT INTO orders (id, user_id) VALUES (2, 10);
+    INSERT INTO orders (id, user_id) VALUES (3, 20);
+    INSERT INTO orders (id, user_id) VALUES (4, 20);  -- order with no items
+
+    -- Order items: order 1 has 3 items (2 for product 101, 1 for product 102)
+    INSERT INTO order_items (id, order_id, product_id, quantity) VALUES (1, 1, 101, 5);
+    INSERT INTO order_items (id, order_id, product_id, quantity) VALUES (2, 1, 101, 3);
+    INSERT INTO order_items (id, order_id, product_id, quantity) VALUES (3, 1, 102, 1);
+    -- Order 2 has 1 item for product 102
+    INSERT INTO order_items (id, order_id, product_id, quantity) VALUES (4, 2, 102, 2);
+    -- Order 3 has 1 item for product 103
+    INSERT INTO order_items (id, order_id, product_id, quantity) VALUES (5, 3, 103, 1);
+
+    -- Tickets: two tickets for order 1, one for order 2, one for order 3, one for order 4 (no items)
+    INSERT INTO customer_support_tickets (id, user_id, order_id) VALUES (1, 10, 1);
+    INSERT INTO customer_support_tickets (id, user_id, order_id) VALUES (2, 10, 1);
+    INSERT INTO customer_support_tickets (id, user_id, order_id) VALUES (3, 10, 2);
+    INSERT INTO customer_support_tickets (id, user_id, order_id) VALUES (4, 20, 3);
+    INSERT INTO customer_support_tickets (id, user_id, order_id) VALUES (5, 20, 4);  -- dangling: order 4 has no items
+}
+
+# Semantic correctness: verify COUNT(DISTINCT t.id) groups correctly.
+# Expected results (ORDER BY product_id):
+#   product 101: tickets 1,2 via order 1 items 1,2 -> each ticket counted once -> 2
+#   product 102: tickets 1,2 via order 1 item 3 + ticket 3 via order 2 item 4 -> 3
+#   product 103: ticket 4 via order 3 item 5 -> 1
+# Ticket 5 (order 4, no items) does not appear due to INNER JOIN.
+@setup bigass_schema
+@setup bigass_data
+test bigass-three-table-join-correctness {
+    SELECT
+        oi.product_id,
+        COUNT(DISTINCT t.id) AS support_issues
+    FROM
+        customer_support_tickets t
+    INNER JOIN orders o ON t.order_id = o.id
+    INNER JOIN order_items oi ON o.id = oi.order_id
+    GROUP BY
+        oi.product_id
+    ORDER BY
+        oi.product_id;
+}
+expect {
+    101|2
+    102|3
+    103|1
 }
