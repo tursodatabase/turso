@@ -40,13 +40,13 @@ pub enum OutputVariant {
 
 pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value> {
     match json_value {
-        Value::Text(ref t) => {
+        Value::Text(ref t) if t.subtype == TextSubtype::Json && indent.is_none() => {
             // optimization: once we know the subtype is a valid JSON, we do not have
             // to go through parsing JSON and serializing it back to string
-            if t.subtype == TextSubtype::Json {
-                return Ok(json_value.to_owned());
-            }
-
+            Ok(json_value.to_owned())
+        }
+        Value::Null => Ok(Value::Null),
+        _ => {
             let json_val = convert_dbtype_to_jsonb(json_value, Conv::Strict)?;
             let mut json = match indent {
                 Some(indent) => json_val.to_string_pretty(Some(indent))?,
@@ -57,23 +57,6 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
             json = json.replace("9.0e+999", "9e999");
 
             Ok(Value::Text(Text::json(json)))
-        }
-        Value::Blob(b) => {
-            let jsonbin = Jsonb::new(b.len(), Some(b));
-            jsonbin.element_type()?;
-            Ok(Value::Text(Text::json(jsonbin.to_string()?)))
-        }
-        Value::Null => Ok(Value::Null),
-        _ => {
-            let json_val = convert_dbtype_to_jsonb(json_value, Conv::Strict)?;
-            let json = match indent {
-                Some(indent) => Value::Text(Text::json(json_val.to_string_pretty(Some(indent))?)),
-                None => {
-                    let element_type = json_val.element_type()?;
-                    json_string_to_db_type(json_val, element_type, OutputVariant::ElementType)?
-                }
-            };
-            Ok(json)
         }
     }
 }
@@ -892,8 +875,14 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
 
             Ok(Value::build_text(escaped_value))
         }
-        // Numbers are unquoted in json
-        ValueRef::Numeric(n @ (Numeric::Integer(_) | Numeric::Float(_))) => Ok(Value::Numeric(n)),
+        // Numbers are unquoted in json, but must be returned as TEXT
+        ValueRef::Numeric(n) => match n {
+            crate::numeric::Numeric::Integer(i) => Ok(Value::build_text(i.to_string())),
+            crate::numeric::Numeric::Float(_) => {
+                let json = convert_ref_dbtype_to_jsonb(ValueRef::Numeric(n), Conv::Strict)?;
+                Ok(Value::build_text(json.to_string()?))
+            }
+        },
         ValueRef::Blob(_) => crate::bail_constraint_error!("JSON cannot hold BLOB values"),
         ValueRef::Null => Ok(Value::build_text("null")),
     }

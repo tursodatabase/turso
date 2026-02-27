@@ -1242,20 +1242,39 @@ impl Jsonb {
         }
 
         match kind {
-            // Can be serialized as is. Do not need escaping
-            ElementType::TEXT => {
+            ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
                 let word = from_utf8(word_slice).map_err(|_| {
                     LimboError::ParseError("Failed to serialize string!".to_string())
                 })?;
-                string.push_str(word);
-            }
 
-            // Contain standard json escapes
-            ElementType::TEXTJ => {
-                let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
-                })?;
-                string.push_str(word);
+                let mut last_end = 0;
+                let bytes = word.as_bytes();
+                for i in 0..bytes.len() {
+                    let b = bytes[i];
+                    let needs_escape = if *kind == ElementType::TEXTJ {
+                        b <= 0x1F
+                    } else {
+                        b == b'"' || b == b'\\' || b <= 0x1F
+                    };
+
+                    if needs_escape {
+                        string.push_str(&word[last_end..i]);
+                        match b {
+                            b'"' => string.push_str("\\\""),
+                            b'\\' => string.push_str("\\\\"),
+                            0x08 => string.push_str("\\b"),
+                            0x0C => string.push_str("\\f"),
+                            b'\n' => string.push_str("\\n"),
+                            b'\r' => string.push_str("\\r"),
+                            b'\t' => string.push_str("\\t"),
+                            c => {
+                                let _ = write!(string, "\\u{c:04x}");
+                            }
+                        }
+                        last_end = i + 1;
+                    }
+                }
+                string.push_str(&word[last_end..]);
             }
 
             // We have to escape some JSON5 escape sequences
@@ -1364,28 +1383,6 @@ impl Jsonb {
                             string.push(ch as char);
                             i += 1;
                         }
-                    }
-                }
-            }
-
-            ElementType::TEXTRAW => {
-                let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
-                })?;
-
-                for ch in word.chars() {
-                    match ch {
-                        '"' => string.push_str("\\\""),
-                        '\\' => string.push_str("\\\\"),
-                        '\x08' => string.push_str("\\b"),
-                        '\x0C' => string.push_str("\\f"),
-                        '\n' => string.push_str("\\n"),
-                        '\r' => string.push_str("\\r"),
-                        '\t' => string.push_str("\\t"),
-                        c if c <= '\u{001F}' => {
-                            string.push_str(&format!("\\u{:04x}", c as u32));
-                        }
-                        _ => string.push(ch),
                     }
                 }
             }
@@ -2476,13 +2473,11 @@ impl Jsonb {
         delta: isize,
     ) -> Result<()> {
         let mut delta = delta;
-        let mut is_prev_arr = false;
         for parent in stack.iter().rev() {
             let (JsonbHeader(el_type, el_size), el_header_len) =
                 self.read_header(parent.field_value_index)?;
 
-            if el_type == ElementType::ARRAY && !is_prev_arr {
-                is_prev_arr = true;
+            if el_type == ElementType::ARRAY {
                 let arr_element_idx = parent.get_array_index().ok_or_else(|| {
                     LimboError::InternalError("array element should have index".to_string())
                 })?;
@@ -2497,8 +2492,6 @@ impl Jsonb {
                 )?;
 
                 delta += (new_arr_el_header_len - arr_el_header_len) as isize;
-            } else {
-                is_prev_arr = false;
             }
             let new_size = el_size as isize + delta;
             let new_header_size = self.write_element_header(
@@ -2559,7 +2552,7 @@ impl Jsonb {
                                     .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
 
                                 return Ok(JsonTraversalResult::with_array_index(
-                                    pos + root_header_size,
+                                    pos,
                                     JsonLocationKind::ArrayEntry,
                                     placeholder_bytes.len() as isize,
                                     arr_pos,
