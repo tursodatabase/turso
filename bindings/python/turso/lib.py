@@ -38,6 +38,28 @@ threadsafety = 1  # 1 means: Threads may share the module, but not connections.
 paramstyle = "qmark"  # Only positional parameters are supported.
 
 
+def _get_sqlite_version() -> tuple[str, tuple[int, int, int]]:
+    """Get SQLite version from a temporary connection."""
+    try:
+        cfg = PyTursoDatabaseConfig(path=":memory:")
+        db = py_turso_database_open(cfg)
+        conn = db.connect()
+        stmt = conn.prepare("SELECT sqlite_version()")
+        result = stmt.step()
+        version_str = result[0]
+        parts = tuple(int(p) for p in version_str.split("."))
+        # Ensure we have exactly 3 parts
+        while len(parts) < 3:
+            parts = (*parts, 0)
+        return version_str, parts[:3]
+    except Exception:
+        # Fallback to a known compatible version
+        return "3.45.0", (3, 45, 0)
+
+
+sqlite_version, sqlite_version_info = _get_sqlite_version()
+
+
 # Exception hierarchy following DB-API 2.0
 class Warning(Exception):
     pass

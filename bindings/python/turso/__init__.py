@@ -1,4 +1,8 @@
-from .lib import (
+import logging
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
+from .lib import (  # noqa: E402
     Connection,
     Cursor,
     DatabaseError,
@@ -17,6 +21,8 @@ from .lib import (
     connect,
     paramstyle,
     setup_logging,
+    sqlite_version,
+    sqlite_version_info,
     threadsafety,
 )
 
@@ -38,6 +44,8 @@ __all__ = [
     "ProgrammingError",
     "apilevel",
     "paramstyle",
+    "sqlite_version",
+    "sqlite_version_info",
     "threadsafety",
     "EncryptionOpts",
 ]

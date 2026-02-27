@@ -46,3 +46,8 @@ This project depends on windows-sys, distributed by the Microsoft:
 * License: licenses/core/windows-apache.license.md (Apache License v2.0)
 * License: licenses/core/windows-mit-license.md (MIT License)
 * Homepage: https://github.com/microsoft/windows-rs
+
+This project depends on SQLAlchemy, distributed by the SQLAlchemy authors:
+
+* License: licenses/bindings/python/sqlalchemy-mit-license.md (MIT License)
+* Homepage: https://github.com/sqlalchemy/sqlalchemy
