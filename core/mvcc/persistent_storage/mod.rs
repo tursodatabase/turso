@@ -87,6 +87,13 @@ impl Storage {
         self.logical_log.write().advance_offset_after_success(bytes);
         self.shadow_offset_advance(bytes);
     }
+
+    pub fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
+        let mut log = self.logical_log.write();
+        log.offset = offset;
+        log.running_crc = running_crc;
+        self.shadow_offset_store(offset);
+    }
 }
 
 impl Debug for Storage {
