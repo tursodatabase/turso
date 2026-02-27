@@ -23,6 +23,7 @@ pub enum JournalMode {
     Persist,
     Memory,
     Wal,
+    #[strum(to_string = "mvcc", serialize = "experimental_mvcc")]
     Mvcc,
     Off,
 }
