@@ -1,0 +1,875 @@
+@database :memory:
+@skip-file-if sqlite "sqlite does not support index method syntax or fts_match()"
+@skip-file-if mvcc "index methods not supported in mvcc mode"
+
+@backend cli
+test fts-delete-where-match {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'no');
+    INSERT INTO t VALUES (2, 'ok');
+    DELETE FROM t WHERE fts_match(x, 'ok');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|no
+}
+
+@backend cli
+test fts-update-where-match {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'no');
+    INSERT INTO t VALUES (2, 'ok');
+    UPDATE t SET x = 'ok2' WHERE fts_match(x, 'ok');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|no
+    2|ok2
+}
+
+@backend cli
+test fts-delete-all-rows-match {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'hello world');
+    INSERT INTO t VALUES (2, 'hello there');
+    INSERT INTO t VALUES (3, 'hello everyone');
+    DELETE FROM t WHERE fts_match(x, 'hello');
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@backend cli
+test fts-delete-no-match {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'apple');
+    INSERT INTO t VALUES (2, 'banana');
+    INSERT INTO t VALUES (3, 'cherry');
+    DELETE FROM t WHERE fts_match(x, 'zebra');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+}
+
+@backend cli
+test fts-delete-multiple-matches {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'foo bar');
+    INSERT INTO t VALUES (2, 'baz qux');
+    INSERT INTO t VALUES (3, 'foo baz');
+    INSERT INTO t VALUES (4, 'qux quux');
+    INSERT INTO t VALUES (5, 'foo quux');
+    DELETE FROM t WHERE fts_match(x, 'foo');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    2|baz qux
+    4|qux quux
+}
+
+@backend cli
+test fts-delete-then-search {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'alpha beta');
+    INSERT INTO t VALUES (2, 'beta gamma');
+    INSERT INTO t VALUES (3, 'gamma delta');
+    DELETE FROM t WHERE fts_match(x, 'alpha');
+    SELECT id, x FROM t WHERE fts_match(x, 'beta') ORDER BY id;
+}
+expect {
+    2|beta gamma
+}
+
+@backend cli
+test fts-delete-then-insert-then-search {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'old data');
+    INSERT INTO t VALUES (2, 'keep this');
+    DELETE FROM t WHERE fts_match(x, 'old');
+    INSERT INTO t VALUES (3, 'new data');
+    SELECT id, x FROM t WHERE fts_match(x, 'data') ORDER BY id;
+}
+expect {
+    3|new data
+}
+
+@backend cli
+test fts-update-then-search-new-term {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'apple pie');
+    INSERT INTO t VALUES (2, 'banana split');
+    UPDATE t SET x = 'cherry pie' WHERE fts_match(x, 'apple');
+    SELECT id, x FROM t WHERE fts_match(x, 'cherry') ORDER BY id;
+}
+expect {
+    1|cherry pie
+}
+@backend cli
+test fts-update-old-term-gone {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'hello world');
+    INSERT INTO t VALUES (2, 'goodbye world');
+    UPDATE t SET x = 'greetings world' WHERE fts_match(x, 'hello');
+    SELECT id, x FROM t WHERE fts_match(x, 'hello') ORDER BY id;
+}
+expect {
+}
+
+@backend cli
+test fts-update-multiple-matches {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'urgent task one');
+    INSERT INTO t VALUES (2, 'normal task two');
+    INSERT INTO t VALUES (3, 'urgent task three');
+    INSERT INTO t VALUES (4, 'normal task four');
+    UPDATE t SET x = 'done' WHERE fts_match(x, 'urgent');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|done
+    2|normal task two
+    3|done
+    4|normal task four
+}
+
+@backend cli
+test fts-update-no-match {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'alpha');
+    INSERT INTO t VALUES (2, 'beta');
+    UPDATE t SET x = 'changed' WHERE fts_match(x, 'omega');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|alpha
+    2|beta
+}
+@backend cli
+test fts-update-still-matches {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'rust programming');
+    INSERT INTO t VALUES (2, 'python programming');
+    UPDATE t SET x = 'rust systems programming' WHERE fts_match(x, 'rust');
+    SELECT id, x FROM t WHERE fts_match(x, 'rust') ORDER BY id;
+}
+expect {
+    1|rust systems programming
+}
+
+@backend cli
+test fts-sequential-deletes {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'cat dog');
+    INSERT INTO t VALUES (2, 'cat fish');
+    INSERT INTO t VALUES (3, 'dog fish');
+    INSERT INTO t VALUES (4, 'bird fish');
+    DELETE FROM t WHERE fts_match(x, 'cat');
+    DELETE FROM t WHERE fts_match(x, 'bird');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    3|dog fish
+}
+@backend cli
+test fts-sequential-updates {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'red apple');
+    INSERT INTO t VALUES (2, 'green apple');
+    INSERT INTO t VALUES (3, 'red banana');
+    UPDATE t SET x = 'blue apple' WHERE fts_match(x, 'red');
+    UPDATE t SET x = 'yellow apple' WHERE fts_match(x, 'green');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|blue apple
+    2|yellow apple
+    3|blue apple
+}
+
+@backend cli
+test fts-mixed-delete-update {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'remove me');
+    INSERT INTO t VALUES (2, 'update me');
+    INSERT INTO t VALUES (3, 'keep me');
+    DELETE FROM t WHERE fts_match(x, 'remove');
+    UPDATE t SET x = 'updated' WHERE fts_match(x, 'update');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    2|updated
+    3|keep me
+}
+@backend cli
+test fts-delete-multi-column-table {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, description TEXT, score INTEGER);
+    CREATE INDEX t_idx ON t USING fts (description);
+    INSERT INTO t VALUES (1, 'alice', 'loves programming', 100);
+    INSERT INTO t VALUES (2, 'bob', 'loves cooking', 80);
+    INSERT INTO t VALUES (3, 'charlie', 'loves programming and cooking', 90);
+    DELETE FROM t WHERE fts_match(description, 'cooking');
+    SELECT id, name, description, score FROM t ORDER BY id;
+}
+expect {
+    1|alice|loves programming|100
+}
+
+@backend cli
+test fts-update-non-fts-column {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, bio TEXT, active INTEGER);
+    CREATE INDEX t_idx ON t USING fts (bio);
+    INSERT INTO t VALUES (1, 'alice', 'software engineer', 1);
+    INSERT INTO t VALUES (2, 'bob', 'data engineer', 1);
+    INSERT INTO t VALUES (3, 'charlie', 'product manager', 1);
+    UPDATE t SET active = 0 WHERE fts_match(bio, 'engineer');
+    SELECT id, name, active FROM t ORDER BY id;
+}
+expect {
+    1|alice|0
+    2|bob|0
+    3|charlie|1
+}
+@backend cli
+test fts-update-fts-column-itself {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, content TEXT);
+    CREATE INDEX t_idx ON t USING fts (content);
+    INSERT INTO t VALUES (1, 'draft version one');
+    INSERT INTO t VALUES (2, 'final version two');
+    UPDATE t SET content = 'final version one' WHERE fts_match(content, 'draft');
+    SELECT id, content FROM t ORDER BY id;
+}
+expect {
+    1|final version one
+    2|final version two
+}
+
+@backend cli
+test fts-delete-single-row {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'only row');
+    DELETE FROM t WHERE fts_match(x, 'only');
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+@backend cli
+test fts-update-single-row {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'before');
+    UPDATE t SET x = 'after' WHERE fts_match(x, 'before');
+    SELECT id, x FROM t;
+}
+expect {
+    1|after
+}
+
+@backend cli
+test fts-delete-verify-count {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'target alpha');
+    INSERT INTO t VALUES (2, 'target beta');
+    INSERT INTO t VALUES (3, 'safe gamma');
+    INSERT INTO t VALUES (4, 'target delta');
+    INSERT INTO t VALUES (5, 'safe epsilon');
+    DELETE FROM t WHERE fts_match(x, 'target');
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+@backend cli
+test fts-update-then-delete {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'fixme bug');
+    INSERT INTO t VALUES (2, 'fixme issue');
+    INSERT INTO t VALUES (3, 'feature request');
+    UPDATE t SET x = 'resolved' WHERE fts_match(x, 'fixme');
+    DELETE FROM t WHERE fts_match(x, 'resolved');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    3|feature request
+}
+
+@backend cli
+test fts-delete-then-update-remaining {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'trash item');
+    INSERT INTO t VALUES (2, 'good item');
+    INSERT INTO t VALUES (3, 'good stuff');
+    DELETE FROM t WHERE fts_match(x, 'trash');
+    UPDATE t SET x = 'great item' WHERE fts_match(x, 'good');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    2|great item
+    3|great item
+}
+
+@backend cli
+test fts-delete-large-batch {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'keep alpha');
+    INSERT INTO t VALUES (2, 'remove beta');
+    INSERT INTO t VALUES (3, 'keep gamma');
+    INSERT INTO t VALUES (4, 'remove delta');
+    INSERT INTO t VALUES (5, 'keep epsilon');
+    INSERT INTO t VALUES (6, 'remove zeta');
+    INSERT INTO t VALUES (7, 'keep eta');
+    INSERT INTO t VALUES (8, 'remove theta');
+    INSERT INTO t VALUES (9, 'keep iota');
+    INSERT INTO t VALUES (10, 'remove kappa');
+    DELETE FROM t WHERE fts_match(x, 'remove');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|keep alpha
+    3|keep gamma
+    5|keep epsilon
+    7|keep eta
+    9|keep iota
+}
+@backend cli
+test fts-update-large-batch {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'pending task one');
+    INSERT INTO t VALUES (2, 'done task two');
+    INSERT INTO t VALUES (3, 'pending task three');
+    INSERT INTO t VALUES (4, 'done task four');
+    INSERT INTO t VALUES (5, 'pending task five');
+    INSERT INTO t VALUES (6, 'done task six');
+    INSERT INTO t VALUES (7, 'pending task seven');
+    INSERT INTO t VALUES (8, 'done task eight');
+    UPDATE t SET x = 'completed' WHERE fts_match(x, 'pending');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|completed
+    2|done task two
+    3|completed
+    4|done task four
+    5|completed
+    6|done task six
+    7|completed
+    8|done task eight
+}
+
+@backend cli
+test fts-delete-reinsert {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'old content');
+    INSERT INTO t VALUES (2, 'keep this');
+    DELETE FROM t WHERE fts_match(x, 'old');
+    INSERT INTO t VALUES (1, 'new content');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|new content
+    2|keep this
+}
+@backend cli
+test fts-delete-reinsert-searchable {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'original text');
+    DELETE FROM t WHERE fts_match(x, 'original');
+    INSERT INTO t VALUES (1, 'replacement text');
+    SELECT id, x FROM t WHERE fts_match(x, 'replacement') ORDER BY id;
+}
+expect {
+    1|replacement text
+}
+
+@backend cli
+test fts-update-multiple-columns {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, title TEXT, body TEXT, status INTEGER);
+    CREATE INDEX t_idx ON t USING fts (body);
+    INSERT INTO t VALUES (1, 'Post A', 'draft needs review', 0);
+    INSERT INTO t VALUES (2, 'Post B', 'published article', 1);
+    INSERT INTO t VALUES (3, 'Post C', 'draft needs editing', 0);
+    UPDATE t SET status = 1, body = 'published' WHERE fts_match(body, 'draft');
+    SELECT id, title, body, status FROM t ORDER BY id;
+}
+expect {
+    1|Post A|published|1
+    2|Post B|published article|1
+    3|Post C|published|1
+}
+@backend cli
+test fts-delete-empty-table {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    DELETE FROM t WHERE fts_match(x, 'anything');
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+@backend cli
+test fts-update-empty-table {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    UPDATE t SET x = 'something' WHERE fts_match(x, 'anything');
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@backend cli
+test fts-delete-with-secondary-btree-index {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, y INTEGER);
+    CREATE INDEX t_fts ON t USING fts (x);
+    CREATE INDEX t_y ON t (y);
+    INSERT INTO t VALUES (1, 'hello world', 10);
+    INSERT INTO t VALUES (2, 'goodbye world', 20);
+    INSERT INTO t VALUES (3, 'hello there', 30);
+    DELETE FROM t WHERE fts_match(x, 'goodbye');
+    SELECT id, x, y FROM t ORDER BY y;
+}
+expect {
+    1|hello world|10
+    3|hello there|30
+}
+@backend cli
+test fts-update-with-secondary-btree-index {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, y INTEGER);
+    CREATE INDEX t_fts ON t USING fts (x);
+    CREATE INDEX t_y ON t (y);
+    INSERT INTO t VALUES (1, 'alpha', 10);
+    INSERT INTO t VALUES (2, 'beta', 20);
+    INSERT INTO t VALUES (3, 'alpha two', 30);
+    UPDATE t SET y = 99 WHERE fts_match(x, 'beta');
+    SELECT id, x, y FROM t ORDER BY y;
+}
+expect {
+    1|alpha|10
+    3|alpha two|30
+    2|beta|99
+}
+
+@backend cli
+test fts-delete-secondary-index-still-works {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, y INTEGER);
+    CREATE INDEX t_fts ON t USING fts (x);
+    CREATE INDEX t_y ON t (y);
+    INSERT INTO t VALUES (1, 'remove this', 100);
+    INSERT INTO t VALUES (2, 'keep this', 200);
+    INSERT INTO t VALUES (3, 'remove also', 300);
+    DELETE FROM t WHERE fts_match(x, 'remove');
+    SELECT id, x, y FROM t WHERE y > 50 ORDER BY id;
+}
+expect {
+    2|keep this|200
+}
+@backend cli
+test fts-repeated-delete-insert-cycles {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'cycle one');
+    DELETE FROM t WHERE fts_match(x, 'cycle');
+    INSERT INTO t VALUES (2, 'cycle two');
+    DELETE FROM t WHERE fts_match(x, 'cycle');
+    INSERT INTO t VALUES (3, 'cycle three');
+    DELETE FROM t WHERE fts_match(x, 'cycle');
+    INSERT INTO t VALUES (4, 'final entry');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    4|final entry
+}
+
+@backend cli
+test fts-repeated-update-cycles {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'version alpha');
+    UPDATE t SET x = 'version beta' WHERE fts_match(x, 'alpha');
+    UPDATE t SET x = 'version gamma' WHERE fts_match(x, 'beta');
+    UPDATE t SET x = 'version delta' WHERE fts_match(x, 'gamma');
+    SELECT id, x FROM t;
+}
+expect {
+    1|version delta
+}
+@backend cli
+test fts-delete-match-syntax {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'match me');
+    INSERT INTO t VALUES (2, 'skip me');
+    DELETE FROM t WHERE x MATCH 'match';
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    2|skip me
+}
+
+@backend cli
+test fts-update-match-syntax {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'match me');
+    INSERT INTO t VALUES (2, 'skip me');
+    UPDATE t SET x = 'matched' WHERE x MATCH 'match';
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|matched
+    2|skip me
+}
+@backend cli
+test fts-delete-all-then-search-empty {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'first entry');
+    INSERT INTO t VALUES (2, 'second entry');
+    INSERT INTO t VALUES (3, 'third entry');
+    DELETE FROM t WHERE fts_match(x, 'entry');
+    SELECT id, x FROM t WHERE fts_match(x, 'entry') ORDER BY id;
+}
+expect {
+}
+
+@backend cli
+test fts-interleaved-dml {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'task alpha');
+    INSERT INTO t VALUES (2, 'task beta');
+    INSERT INTO t VALUES (3, 'task gamma');
+    DELETE FROM t WHERE fts_match(x, 'beta');
+    INSERT INTO t VALUES (4, 'task delta');
+    UPDATE t SET x = 'task omega' WHERE fts_match(x, 'alpha');
+    INSERT INTO t VALUES (5, 'task epsilon');
+    DELETE FROM t WHERE fts_match(x, 'gamma');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|task omega
+    4|task delta
+    5|task epsilon
+}
+@backend cli
+test fts-delete-with-nulls {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, NULL);
+    INSERT INTO t VALUES (2, 'findable');
+    INSERT INTO t VALUES (3, NULL);
+    DELETE FROM t WHERE fts_match(x, 'findable');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|
+    3|
+}
+
+@backend cli
+test fts-update-with-nulls {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, NULL);
+    INSERT INTO t VALUES (2, 'change me');
+    INSERT INTO t VALUES (3, NULL);
+    UPDATE t SET x = 'changed' WHERE fts_match(x, 'change');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|
+    2|changed
+    3|
+}
+@backend cli
+test fts-update-to-null {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'erase me');
+    INSERT INTO t VALUES (2, 'keep me');
+    UPDATE t SET x = NULL WHERE fts_match(x, 'erase');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|
+    2|keep me
+}
+
+@backend cli
+test fts-update-to-null-not-searchable {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'searchable text');
+    INSERT INTO t VALUES (2, 'other text');
+    UPDATE t SET x = NULL WHERE fts_match(x, 'searchable');
+    SELECT id FROM t WHERE fts_match(x, 'searchable') ORDER BY id;
+}
+expect {
+}
+@backend cli
+test fts-delete-long-text {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'the quick brown fox jumps over the lazy dog and then runs away into the forest never to be seen again');
+    INSERT INTO t VALUES (2, 'a simple short sentence');
+    INSERT INTO t VALUES (3, 'another lengthy paragraph that contains many words including the word forest which should make it interesting');
+    DELETE FROM t WHERE fts_match(x, 'forest');
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    2
+}
+
+@backend cli
+test fts-update-special-chars {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'hello world');
+    INSERT INTO t VALUES (2, 'test data');
+    UPDATE t SET x = 'updated value' WHERE fts_match(x, 'hello');
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1|updated value
+    2|test data
+}
+@backend cli
+test fts-delete-integrity-check {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, val REAL);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'remove item', 1.5);
+    INSERT INTO t VALUES (2, 'keep item', 2.5);
+    INSERT INTO t VALUES (3, 'remove thing', 3.5);
+    INSERT INTO t VALUES (4, 'keep thing', 4.5);
+    DELETE FROM t WHERE fts_match(x, 'remove');
+    SELECT count(*) FROM t;
+    SELECT sum(val) FROM t;
+    SELECT id, x, val FROM t ORDER BY id;
+}
+expect {
+    2
+    7.0
+    2|keep item|2.5
+    4|keep thing|4.5
+}
+
+@backend cli
+test fts-update-leave-fts-column {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, counter INTEGER);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'searchable', 0);
+    INSERT INTO t VALUES (2, 'also searchable', 0);
+    INSERT INTO t VALUES (3, 'not matched', 0);
+    UPDATE t SET counter = counter + 1 WHERE fts_match(x, 'searchable');
+    SELECT id, x, counter FROM t ORDER BY id;
+}
+expect {
+    1|searchable|1
+    2|also searchable|1
+    3|not matched|0
+}
+
+@backend cli
+test fts-update-non-fts-col-index-still-works {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, counter INTEGER);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'findme', 0);
+    INSERT INTO t VALUES (2, 'other', 0);
+    UPDATE t SET counter = 42 WHERE fts_match(x, 'findme');
+    SELECT id, x, counter FROM t WHERE fts_match(x, 'findme') ORDER BY id;
+}
+expect {
+    1|findme|42
+}
+
+@backend cli
+test fts-bulk-insert-delete {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'noise aaa');
+    INSERT INTO t VALUES (2, 'signal bbb');
+    INSERT INTO t VALUES (3, 'noise ccc');
+    INSERT INTO t VALUES (4, 'signal ddd');
+    INSERT INTO t VALUES (5, 'noise eee');
+    INSERT INTO t VALUES (6, 'signal fff');
+    INSERT INTO t VALUES (7, 'noise ggg');
+    INSERT INTO t VALUES (8, 'signal hhh');
+    INSERT INTO t VALUES (9, 'noise iii');
+    INSERT INTO t VALUES (10, 'signal jjj');
+    INSERT INTO t VALUES (11, 'noise kkk');
+    INSERT INTO t VALUES (12, 'signal lll');
+    INSERT INTO t VALUES (13, 'noise mmm');
+    INSERT INTO t VALUES (14, 'signal nnn');
+    INSERT INTO t VALUES (15, 'noise ooo');
+    DELETE FROM t WHERE fts_match(x, 'noise');
+    SELECT count(*) FROM t;
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    7
+    2
+    4
+    6
+    8
+    10
+    12
+    14
+}
+
+@backend cli
+test fts-bulk-insert-update {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, processed INTEGER);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'todo task aaa', 0);
+    INSERT INTO t VALUES (2, 'done task bbb', 0);
+    INSERT INTO t VALUES (3, 'todo task ccc', 0);
+    INSERT INTO t VALUES (4, 'done task ddd', 0);
+    INSERT INTO t VALUES (5, 'todo task eee', 0);
+    INSERT INTO t VALUES (6, 'done task fff', 0);
+    INSERT INTO t VALUES (7, 'todo task ggg', 0);
+    INSERT INTO t VALUES (8, 'done task hhh', 0);
+    UPDATE t SET processed = 1 WHERE fts_match(x, 'todo');
+    SELECT id, processed FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|0
+    3|1
+    4|0
+    5|1
+    6|0
+    7|1
+    8|0
+}
+
+@backend cli
+test fts-index-coherence-after-churn {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'aaa bbb');
+    INSERT INTO t VALUES (2, 'ccc ddd');
+    INSERT INTO t VALUES (3, 'eee fff');
+    DELETE FROM t WHERE fts_match(x, 'aaa');
+    INSERT INTO t VALUES (4, 'ggg hhh');
+    INSERT INTO t VALUES (5, 'aaa iii');
+    SELECT id, x FROM t WHERE fts_match(x, 'aaa') ORDER BY id;
+}
+expect {
+    5|aaa iii
+}
+@backend cli
+test fts-update-term-swap-verification {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES (1, 'unicorn rainbow');
+    INSERT INTO t VALUES (2, 'dragon fire');
+    UPDATE t SET x = 'phoenix fire' WHERE fts_match(x, 'unicorn');
+    SELECT id FROM t WHERE fts_match(x, 'unicorn') ORDER BY id;
+    SELECT id FROM t WHERE fts_match(x, 'phoenix') ORDER BY id;
+    SELECT id FROM t WHERE fts_match(x, 'fire') ORDER BY id;
+}
+expect {
+    1
+    1
+    2
+}
+
+@backend cli
+test fts-delete-multiple-fts-indexes {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+    CREATE INDEX t_title_fts ON t USING fts (title);
+    CREATE INDEX t_body_fts ON t USING fts (body);
+    INSERT INTO t VALUES (1, 'breaking news', 'a major event happened today');
+    INSERT INTO t VALUES (2, 'sports update', 'the team won the championship');
+    INSERT INTO t VALUES (3, 'breaking analysis', 'deep dive into recent events');
+    DELETE FROM t WHERE fts_match(title, 'breaking');
+    SELECT id, title, body FROM t ORDER BY id;
+}
+expect {
+    2|sports update|the team won the championship
+}
+@backend cli
+test fts-update-multiple-fts-indexes {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+    CREATE INDEX t_title_fts ON t USING fts (title);
+    CREATE INDEX t_body_fts ON t USING fts (body);
+    INSERT INTO t VALUES (1, 'draft post', 'some content here');
+    INSERT INTO t VALUES (2, 'final post', 'other content here');
+    UPDATE t SET body = 'updated content' WHERE fts_match(title, 'draft');
+    SELECT id, title, body FROM t ORDER BY id;
+}
+expect {
+    1|draft post|updated content
+    2|final post|other content here
+}
+
+@backend cli
+test fts-delete-via-one-index-search-via-other {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+    CREATE INDEX t_title_fts ON t USING fts (title);
+    CREATE INDEX t_body_fts ON t USING fts (body);
+    INSERT INTO t VALUES (1, 'remove this', 'alpha content');
+    INSERT INTO t VALUES (2, 'keep this', 'beta content');
+    INSERT INTO t VALUES (3, 'remove also', 'gamma content');
+    DELETE FROM t WHERE fts_match(title, 'remove');
+    SELECT id, body FROM t WHERE fts_match(body, 'beta') ORDER BY id;
+    SELECT id, body FROM t WHERE fts_match(body, 'alpha') ORDER BY id;
+}
+expect {
+    2|beta content
+}
+
+@backend cli
+test fts-delete-rowid-table {
+    CREATE TABLE t (x TEXT, y INTEGER);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES ('remove me', 1);
+    INSERT INTO t VALUES ('keep me', 2);
+    INSERT INTO t VALUES ('remove also', 3);
+    DELETE FROM t WHERE fts_match(x, 'remove');
+    SELECT x, y FROM t ORDER BY y;
+}
+expect {
+    keep me|2
+}
+
+@backend cli
+test fts-update-rowid-table {
+    CREATE TABLE t (x TEXT, y INTEGER);
+    CREATE INDEX t_idx ON t USING fts (x);
+    INSERT INTO t VALUES ('change me', 1);
+    INSERT INTO t VALUES ('leave me', 2);
+    UPDATE t SET y = 99 WHERE fts_match(x, 'change');
+    SELECT x, y FROM t ORDER BY y;
+}
+expect {
+    leave me|2
+    change me|99
+}

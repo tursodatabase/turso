@@ -60,6 +60,11 @@ pub struct IndexMethodDefinition<'a> {
     pub patterns: &'a [ast::Select],
     /// special marker which forces tursodb core to treat index method as backing btree - so it will allocate real btree on disk for that index method
     pub backing_btree: bool,
+    /// Whether `query_start()` materializes all matching rowids up front (e.g. into a Vec/VecDeque).
+    /// When `true`, the cursor is safe to use during DML because it does not lazily stream from
+    /// a live data structure that writes could invalidate.
+    /// When `false`, the emitter will collect rowids into a RowSet/ephemeral table before writing.
+    pub results_materialized: bool,
 }
 
 /// Cost estimate returned by custom index methods for optimizer integration.

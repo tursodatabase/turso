@@ -1882,10 +1882,8 @@ fn emit_delete_insns<'a>(
                 index: Some(index), ..
             } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
         },
-        Operation::IndexMethodQuery(_) => {
-            return Err(crate::LimboError::InternalError(
-                "IndexMethod access is not supported for DELETE statements".to_string(),
-            ));
+        Operation::IndexMethodQuery(query) => {
+            program.resolve_cursor_id(&CursorKey::index(internal_id, query.index.clone()))
         }
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for delete statements")
@@ -3058,9 +3056,9 @@ fn emit_update_insns<'a>(
             ),
         },
         Operation::IndexMethodQuery(_) => {
-            return Err(crate::LimboError::InternalError(
-                "IndexMethod access is not supported for UPDATE operations".to_string(),
-            ));
+            // IndexMethodQuery indexes (e.g. FTS) don't store original column values
+            // like B-tree indexes do, so we must read unchanged columns from the table cursor.
+            (None, false)
         }
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for update operations")
