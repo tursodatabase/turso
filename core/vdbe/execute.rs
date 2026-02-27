@@ -9443,6 +9443,20 @@ pub fn op_set_cookie(
     );
     let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
+    if let Some(mv_store) = mv_store.as_ref() {
+        let Some(tx_id) = program.connection.get_mv_tx_id() else {
+            return Err(LimboError::InternalError(
+                "Header updates in MVCC mode require an active transaction".to_string(),
+            ));
+        };
+        if !mv_store.is_exclusive_tx(&tx_id) {
+            // Header cookies are global metadata with no row-level conflict keys; require
+            // SQLite-style single-writer semantics (same policy as DDL in MVCC).
+            return Err(LimboError::TxError(
+                "Header updates require an exclusive transaction (use BEGIN instead of BEGIN CONCURRENT)".to_string(),
+            ));
+        }
+    }
 
     return_if_io!(with_header_mut(
         &pager,

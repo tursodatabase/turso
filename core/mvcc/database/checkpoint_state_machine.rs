@@ -8,6 +8,7 @@ use crate::schema::Index;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
@@ -129,6 +130,10 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     mvcc_meta_table: Option<(MVTableId, usize)>,
     /// File-backed databases must persist replay boundary durably.
     durable_mvcc_metadata: bool,
+    /// Header staged into pager page 1 before commit; published to global_header on success.
+    staged_checkpoint_header: Option<DatabaseHeader>,
+    /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
+    header_staged_for_commit: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -221,6 +226,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             sync_mode,
             mvcc_meta_table,
             durable_mvcc_metadata,
+            staged_checkpoint_header: None,
+            header_staged_for_commit: false,
         }
     }
 
@@ -350,11 +357,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     ///    * The row is a delete AND it exists in the database file already.
     ///      If the row didn't exist in the database file and was deleted, we can simply not write it.
     fn collect_committed_table_row_versions(&mut self) {
-        // Keep track of the highest timestamp that will be checkpointed in the current checkpoint;
-        // This value will be used at the end of the checkpoint to update the corresponding value in
-        // the MVCC store, so that we don't checkpoint the same row versions again on the next checkpoint.
-        let mut max_timestamp = self.durable_txid_max_old;
-
         // Invariant: RowID ordering is (table_id, row_id) with table_id ascending.
         // Since MV table IDs are negative and sqlite_schema is table_id=-1, iterating
         // in reverse visits sqlite_schema first so CREATE/DROP metadata is applied
@@ -372,15 +374,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             let row_versions = entry.value().read();
-
-            for version in row_versions.iter() {
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
-                    max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
-                }
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
-                    max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
-                }
-            }
 
             if let Some(version) =
                 self.maybe_get_checkpointable_version(&row_versions, key.table_id)
@@ -519,10 +512,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 version.0.row.id.row_id.clone(),
             )
         });
-        self.durable_txid_max_new = max_timestamp
-            .map_or(self.durable_txid_max_new, |max_timestamp| {
-                self.durable_txid_max_new.max(max_timestamp.into())
-            });
     }
 
     /// Collect all committed index row versions that need to be written to the B-tree.
@@ -533,7 +522,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     ///    * The row is not a delete (we inserted or changed an existing row), OR
     ///    * The row is a delete AND it exists in the database file already.
     fn collect_committed_index_row_versions(&mut self) {
-        let mut max_timestamp = self.durable_txid_max_old;
         for entry in self.mvstore.index_rows.iter() {
             let index_id = *entry.key();
 
@@ -546,15 +534,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             for entry in index_rows_map.iter() {
                 let versions = entry.value().read();
 
-                for version in versions.iter() {
-                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
-                        max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
-                    }
-                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
-                        max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
-                    }
-                }
-
                 if let Some(version) = self.maybe_get_checkpointable_version(&versions, index_id) {
                     let is_delete = version.end.is_some();
 
@@ -564,11 +543,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
             }
         }
-
-        self.durable_txid_max_new = max_timestamp
-            .map_or(self.durable_txid_max_new, |max_timestamp| {
-                self.durable_txid_max_new.max(max_timestamp.into())
-            });
     }
 
     /// Get the current row version to write to the B-tree
@@ -744,6 +718,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                 self.collect_committed_index_row_versions();
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
+                // Checkpoint boundary is derived from a stable snapshot under the blocking lock:
+                // old durable boundary plus the latest committed tx watermark. This covers both
+                // row/index commits and header-only commits.
+                let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
+                let committed_max = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
+                self.durable_txid_max_new = durable_old.max(committed_max);
                 self.maybe_stage_mvcc_metadata_write()?;
 
                 if self.write_set.is_empty() && self.index_write_set.is_empty() {
@@ -1264,6 +1244,33 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::CommitPagerTxn => {
+                if !self.header_staged_for_commit {
+                    let mut checkpoint_header =
+                        *self.mvstore.global_header.read().as_ref().ok_or_else(|| {
+                            LimboError::InternalError(
+                                "global_header not initialized during checkpoint".to_string(),
+                            )
+                        })?;
+                    checkpoint_header.schema_cookie =
+                        self.connection.db.schema.lock().schema_version.into();
+                    let staged_header = self.pager.io.block(|| {
+                        self.pager.with_header_mut(|header| {
+                            // Keep pager-maintained fields (for example database_size/change_counter)
+                            // intact, and apply only MVCC header mutations that are authored via
+                            // SetCookie/PRAGMA paths.
+                            header.schema_cookie = checkpoint_header.schema_cookie;
+                            header.user_version = checkpoint_header.user_version;
+                            header.application_id = checkpoint_header.application_id;
+                            header.vacuum_mode_largest_root_page =
+                                checkpoint_header.vacuum_mode_largest_root_page;
+                            header.incremental_vacuum_enabled =
+                                checkpoint_header.incremental_vacuum_enabled;
+                            *header
+                        })
+                    })?;
+                    self.staged_checkpoint_header = Some(staged_header);
+                    self.header_staged_for_commit = true;
+                }
                 // If commit_tx fails, the `?` propagates to step() which rolls back
                 // the pager transaction. durable_txid_max is NOT advanced (only happens
                 // on success below), so a retry will re-stage from the previous boundary.
@@ -1284,12 +1291,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         self.state = CheckpointState::CheckpointWal;
                         self.lock_states.pager_read_tx = false;
                         self.lock_states.pager_write_tx = false;
-                        let header = self.pager.io.block(|| {
-                            self.pager.with_header_mut(|header| {
-                                header.schema_cookie =
-                                    self.connection.db.schema.lock().schema_version.into();
-                                *header
-                            })
+                        // Publish the exact page-1 snapshot that was staged into the pager txn.
+                        let header = self.staged_checkpoint_header.take().ok_or_else(|| {
+                            LimboError::InternalError(
+                                "checkpoint header was not staged before pager commit".to_string(),
+                            )
                         })?;
                         self.mvstore.global_header.write().replace(header);
                         Ok(TransitionResult::Continue)

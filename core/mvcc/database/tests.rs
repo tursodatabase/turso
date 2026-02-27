@@ -1394,6 +1394,90 @@ fn test_meta_recovery_case_2_no_wal_replay_above_metadata_boundary() {
     assert_eq!(rows[2][1].to_string(), "c");
 }
 
+/// What this test checks: Header-only commits are durably replayed from the logical log and
+/// then persisted into the database header by checkpoint.
+/// Why this matters: PRAGMA header mutations (for example user_version) must survive restart
+/// both before and after log truncation, including implicit autocommit statement transactions.
+#[test]
+fn test_header_only_mutation_is_replayed_and_checkpointed() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA user_version = 42").unwrap();
+        let rows = get_rows(&conn, "PRAGMA user_version");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_int().unwrap(), 42);
+    }
+
+    db.restart();
+    {
+        let conn = db.connect();
+        let rows = get_rows(&conn, "PRAGMA user_version");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][0].as_int().unwrap(),
+            42,
+            "header mutation should recover from logical log before checkpoint",
+        );
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+    {
+        let conn = db.connect();
+        let rows = get_rows(&conn, "PRAGMA user_version");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][0].as_int().unwrap(),
+            42,
+            "header mutation should persist in DB header after checkpoint truncates logical log",
+        );
+    }
+}
+
+/// What this test checks: Header PRAGMAs in MVCC require an exclusive transaction and reject
+/// BEGIN CONCURRENT writes.
+/// Why this matters: Header updates have no row-level conflict keys, so they must not run under
+/// optimistic concurrent write mode.
+#[test]
+fn test_mvcc_header_updates_require_exclusive_transaction() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let err = conn.execute("PRAGMA user_version = 42").unwrap_err();
+    assert!(
+        err.to_string().contains("exclusive transaction"),
+        "expected exclusive-transaction error, got: {err:?}"
+    );
+    conn.execute("ROLLBACK").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("PRAGMA user_version = 7").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 7);
+}
+
+/// What this test checks: Header PRAGMAs in MVCC succeed in autocommit mode, where the VM
+/// opens an implicit single-statement write transaction.
+/// Why this matters: The exclusive-transaction gate must block BEGIN CONCURRENT, but not reject
+/// valid autocommit writes that are internally upgraded to exclusive write mode.
+#[test]
+fn test_mvcc_header_updates_allow_autocommit_statement_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("PRAGMA user_version = 19").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 19);
+}
+
 /// What this test checks: Missing/corrupt metadata with logical-log frames and no WAL causes fail-closed startup.
 /// Why this matters: Without metadata boundary recovery cannot choose replay/discard safely.
 #[test]
@@ -2856,6 +2940,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         write_set: SkipSet::new(),
         read_set: SkipSet::new(),
         header: RwLock::new(DatabaseHeader::default()),
+        header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
@@ -4233,6 +4318,7 @@ fn transaction_display() {
         write_set,
         read_set,
         header: RwLock::new(DatabaseHeader::default()),
+        header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),

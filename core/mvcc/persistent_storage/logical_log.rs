@@ -106,7 +106,7 @@ use crate::turso_assert;
 use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
-    storage::sqlite3_ondisk::{read_varint, varint_len, write_varint_to_vec},
+    storage::sqlite3_ondisk::{read_varint, varint_len, write_varint_to_vec, DatabaseHeader},
     types::IndexInfo,
     Buffer, Completion, CompletionError, LimboError, Result,
 };
@@ -132,6 +132,8 @@ const OP_UPSERT_TABLE: u8 = 0;
 const OP_DELETE_TABLE: u8 = 1;
 const OP_UPSERT_INDEX: u8 = 2;
 const OP_DELETE_INDEX: u8 = 3;
+/// Frame-local database-header mutation (payload = serialized `DatabaseHeader`).
+const OP_UPDATE_HEADER: u8 = 4;
 
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 
@@ -326,9 +328,11 @@ impl LogicalLog {
         }
 
         // 2. Serialize Transaction header
-        let op_count = u16::try_from(tx.row_versions.len()).map_err(|_| {
-            LimboError::InternalError("Logical log op_count exceeds u16".to_string())
-        })?;
+        // A header-only transaction is encoded as a single OP_UPDATE_HEADER op.
+        let op_count = u16::try_from(tx.row_versions.len() + usize::from(tx.header.is_some()))
+            .map_err(|_| {
+                LimboError::InternalError("Logical log op_count exceeds u16".to_string())
+            })?;
         let tx_header_start = self.write_buf.len();
         self.write_buf.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
         self.write_buf.extend_from_slice(&op_count.to_le_bytes());
@@ -340,6 +344,9 @@ impl LogicalLog {
         // 3. Serialize ops (both table and index rows)
         for row_version in &tx.row_versions {
             serialize_op_entry(&mut self.write_buf, row_version)?;
+        }
+        if let Some(header) = tx.header {
+            serialize_header_entry(&mut self.write_buf, &header);
         }
 
         let payload_end = self.write_buf.len();
@@ -549,6 +556,15 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
     Ok(())
 }
 
+fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
+    // Header op uses tag-only addressing (table_id=0, flags=0) and fixed payload length.
+    buffer.push(OP_UPDATE_HEADER);
+    buffer.push(0);
+    buffer.extend_from_slice(&0i32.to_le_bytes());
+    write_varint_to_vec(DatabaseHeader::SIZE as u64, buffer);
+    buffer.extend_from_slice(bytemuck::bytes_of(header));
+}
+
 #[derive(Debug)]
 pub enum StreamingResult {
     UpsertTableRow {
@@ -573,6 +589,10 @@ pub enum StreamingResult {
         rowid: RowID,
         commit_ts: u64,
         btree_resident: bool,
+    },
+    UpdateHeader {
+        header: DatabaseHeader,
+        commit_ts: u64,
     },
     Eof,
 }
@@ -797,17 +817,29 @@ impl StreamingLogicalLogReader {
             running_crc = crc32c::crc32c_append(running_crc, &op_bytes);
             let tag = op_bytes[0];
             let flags = op_bytes[1];
-            if flags & !OP_FLAG_BTREE_RESIDENT != 0 {
-                self.last_valid_offset = frame_start;
-                return Ok(ParseResult::InvalidFrame);
-            }
             let table_id_i32 =
                 i32::from_le_bytes([op_bytes[2], op_bytes[3], op_bytes[4], op_bytes[5]]);
-            if table_id_i32 >= 0 {
-                self.last_valid_offset = frame_start;
-                return Ok(ParseResult::InvalidFrame);
-            }
-            let table_id = MVTableId::from(table_id_i32 as i64);
+            let table_id = match tag {
+                OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
+                    if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
+                        self.last_valid_offset = frame_start;
+                        return Ok(ParseResult::InvalidFrame);
+                    }
+                    Some(MVTableId::from(table_id_i32 as i64))
+                }
+                OP_UPDATE_HEADER => {
+                    // Header op must not carry row-level bits or table addressing.
+                    if flags != 0 || table_id_i32 != 0 {
+                        self.last_valid_offset = frame_start;
+                        return Ok(ParseResult::InvalidFrame);
+                    }
+                    None
+                }
+                _ => {
+                    self.last_valid_offset = frame_start;
+                    return Ok(ParseResult::InvalidFrame);
+                }
+            };
             let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
 
             let (payload_len, payload_len_bytes, payload_len_bytes_len) =
@@ -845,6 +877,7 @@ impl StreamingLogicalLogReader {
 
             let parsed_op = match tag {
                 OP_UPSERT_TABLE => {
+                    let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = match read_varint(&payload) {
                         Ok(v) => v,
                         Err(_) => {
@@ -869,6 +902,7 @@ impl StreamingLogicalLogReader {
                     }
                 }
                 OP_DELETE_TABLE => {
+                    let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = match read_varint(&payload) {
                         Ok(v) => v,
                         Err(_) => {
@@ -888,18 +922,39 @@ impl StreamingLogicalLogReader {
                         btree_resident,
                     }
                 }
-                OP_UPSERT_INDEX => ParsedOp::UpsertIndex {
-                    table_id,
-                    payload,
-                    commit_ts,
-                    btree_resident,
-                },
-                OP_DELETE_INDEX => ParsedOp::DeleteIndex {
-                    table_id,
-                    payload,
-                    commit_ts,
-                    btree_resident,
-                },
+                OP_UPSERT_INDEX => {
+                    let table_id = table_id.expect("index op must carry table id");
+                    ParsedOp::UpsertIndex {
+                        table_id,
+                        payload,
+                        commit_ts,
+                        btree_resident,
+                    }
+                }
+                OP_DELETE_INDEX => {
+                    let table_id = table_id.expect("index op must carry table id");
+                    ParsedOp::DeleteIndex {
+                        table_id,
+                        payload,
+                        commit_ts,
+                        btree_resident,
+                    }
+                }
+                OP_UPDATE_HEADER => {
+                    if payload.len() != DatabaseHeader::SIZE {
+                        self.last_valid_offset = frame_start;
+                        return Ok(ParseResult::InvalidFrame);
+                    }
+                    let mut bytes = [0u8; DatabaseHeader::SIZE];
+                    bytes.copy_from_slice(&payload);
+                    let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
+                    // Fail closed on clearly invalid header payloads before handing it to recovery.
+                    if header.magic != *b"SQLite format 3\0" {
+                        self.last_valid_offset = frame_start;
+                        return Ok(ParseResult::InvalidFrame);
+                    }
+                    ParsedOp::UpdateHeader { header, commit_ts }
+                }
                 _ => {
                     self.last_valid_offset = frame_start;
                     return Ok(ParseResult::InvalidFrame);
@@ -1028,6 +1083,9 @@ impl StreamingLogicalLogReader {
                     commit_ts,
                     btree_resident,
                 })
+            }
+            ParsedOp::UpdateHeader { header, commit_ts } => {
+                Ok(StreamingResult::UpdateHeader { header, commit_ts })
             }
         }
     }
@@ -1275,6 +1333,10 @@ enum ParsedOp {
         commit_ts: u64,
         btree_resident: bool,
     },
+    UpdateHeader {
+        header: DatabaseHeader,
+        commit_ts: u64,
+    },
 }
 
 #[cfg(test)]
@@ -1330,6 +1392,7 @@ mod tests {
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: commit_ts,
             row_versions: Vec::new(),
+            header: None,
         };
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
@@ -1433,6 +1496,7 @@ mod tests {
         let tx = crate::mvcc::database::LogRecord {
             tx_timestamp: commit_ts,
             row_versions: vec![row_version],
+            header: None,
         };
         let c = log.log_tx(&tx).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -1861,6 +1925,7 @@ mod tests {
         let mut tx1 = crate::mvcc::database::LogRecord {
             tx_timestamp: 10,
             row_versions: Vec::new(),
+            header: None,
         };
         tx1.row_versions.push(crate::mvcc::database::RowVersion {
             id: 1,
@@ -1875,6 +1940,7 @@ mod tests {
         let mut tx2 = crate::mvcc::database::LogRecord {
             tx_timestamp: 20,
             row_versions: Vec::new(),
+            header: None,
         };
         tx2.row_versions.push(crate::mvcc::database::RowVersion {
             id: 2,
@@ -2041,6 +2107,7 @@ mod tests {
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 123,
             row_versions: Vec::new(),
+            header: None,
         };
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
@@ -2227,6 +2294,7 @@ mod tests {
         let tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 77,
             row_versions: vec![],
+            header: None,
         };
         let c = log.log_tx(&tx).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -2369,6 +2437,7 @@ mod tests {
         let tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 200,
             row_versions: vec![],
+            header: None,
         };
         let c = log.log_tx(&tx).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -2396,6 +2465,7 @@ mod tests {
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 300,
             row_versions: Vec::new(),
+            header: None,
         };
         tx.row_versions.push(crate::mvcc::database::RowVersion {
             id: 1,
@@ -2470,6 +2540,7 @@ mod tests {
             let mut tx = crate::mvcc::database::LogRecord {
                 tx_timestamp: 1_000 + tx_i,
                 row_versions: Vec::new(),
+                header: None,
             };
             let op_count = (rng.next_u64() % 4) as usize;
             for _ in 0..op_count {
@@ -2571,6 +2642,7 @@ mod tests {
             let tx = crate::mvcc::database::LogRecord {
                 tx_timestamp: commit_ts,
                 row_versions: vec![row_version],
+                header: None,
             };
             let Ok(c) = log.log_tx(&tx) else {
                 return false;
@@ -2650,6 +2722,7 @@ mod tests {
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 55,
             row_versions: Vec::new(),
+            header: None,
         };
         let mut row = generate_simple_string_row((-2).into(), 1, "foo");
         row.id.table_id = (-2).into();
@@ -2693,6 +2766,7 @@ mod tests {
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 10,
             row_versions: Vec::new(),
+            header: None,
         };
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
