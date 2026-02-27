@@ -168,6 +168,21 @@ test autoinc-drop-last-table-empties-sequence {
 expect {
 }
 
+# Test: Renaming an AUTOINCREMENT table updates sqlite_sequence in place.
+@cross-check-integrity
+test autoinc-rename-table-updates-sequence-entry {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+    INSERT INTO t1(val) VALUES ('a');
+    ALTER TABLE t1 RENAME TO t2;
+    SELECT name, seq FROM sqlite_sequence ORDER BY name;
+    INSERT INTO t2(val) VALUES ('b');
+    SELECT name, seq FROM sqlite_sequence ORDER BY name;
+}
+expect {
+    t2|1
+    t2|2
+}
+
 # Test: AUTOINCREMENT fails if the maximum rowid is reached. (Assumes 64-bit rowid)
 @cross-check-integrity
 test autoinc-fail-on-max-rowid {

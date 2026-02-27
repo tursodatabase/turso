@@ -18,7 +18,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u16, Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
     LimboError, Numeric, Result, Value,
@@ -92,6 +92,97 @@ fn default_requires_empty_table(expr: &ast::Expr) -> bool {
         }
         _ => false,
     }
+}
+
+fn emit_rename_sqlite_sequence_entry(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    old_table_name_norm: &str,
+    new_table_name_norm: &str,
+) {
+    let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+    }) else {
+        return;
+    };
+
+    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
+    let sequence_name_reg = program.alloc_register();
+    let sequence_value_reg = program.alloc_register();
+    let row_name_to_replace_reg = program.emit_string8_new_reg(old_table_name_norm.to_string());
+    program.mark_last_insn_constant();
+    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name_norm.to_string());
+    program.mark_last_insn_constant();
+
+    let affinity_str = sqlite_sequence
+        .columns
+        .iter()
+        .map(|col| col.affinity().aff_mask())
+        .collect::<String>();
+
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: seq_cursor_id,
+        root_page: RegisterOrLiteral::Literal(sqlite_sequence.root_page),
+        db: database_id,
+    });
+
+    program.cursor_loop(seq_cursor_id, |program, rowid| {
+        program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
+
+        let continue_loop_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: sequence_name_reg,
+            rhs: row_name_to_replace_reg,
+            target_pc: continue_loop_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+
+        program.emit_column_or_rowid(seq_cursor_id, 1, sequence_value_reg);
+
+        let record_start_reg = program.alloc_registers(2);
+        let record_reg = program.alloc_register();
+
+        program.emit_insn(Insn::Copy {
+            src_reg: replacement_row_name_reg,
+            dst_reg: record_start_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: sequence_value_reg,
+            dst_reg: record_start_reg + 1,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(record_start_reg),
+            count: to_u16(2),
+            dest_reg: to_u16(record_reg),
+            index_name: None,
+            affinity_str: Some(affinity_str.clone()),
+        });
+
+        // In MVCC mode, we need to delete before insert to properly
+        // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+        if connection.mvcc_enabled() {
+            program.emit_insn(Insn::Delete {
+                cursor_id: seq_cursor_id,
+                table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+                is_part_of_update: true,
+            });
+        }
+
+        program.emit_insn(Insn::Insert {
+            cursor: seq_cursor_id,
+            key_reg: rowid,
+            record_reg,
+            flag: crate::vdbe::insn::InsertFlags(0),
+            table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+        });
+
+        program.resolve_label(continue_loop_label, program.offset());
+    });
 }
 
 fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
@@ -988,6 +1079,8 @@ pub fn translate_alter_table(
         }
         ast::AlterTableBody::RenameTo(new_name) => {
             let new_name = new_name.as_str();
+            let normalized_old_name = normalize_ident(table_name);
+            let normalized_new_name = normalize_ident(new_name);
 
             if resolver.with_schema(database_id, |s| {
                 s.get_table(new_name).is_some()
@@ -1071,6 +1164,15 @@ pub fn translate_alter_table(
                     table_name: table_name.to_string(),
                 });
             });
+
+            emit_rename_sqlite_sequence_entry(
+                program,
+                resolver,
+                connection,
+                database_id,
+                &normalized_old_name,
+                &normalized_new_name,
+            );
 
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
