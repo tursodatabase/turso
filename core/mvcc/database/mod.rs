@@ -327,11 +327,13 @@ pub enum RowVersionState {
 }
 pub type TxID = u64;
 
-/// A log record contains all the versions inserted and deleted by a transaction.
+/// A log record contains all durable effects of a committed transaction.
+/// Besides row/index version deltas, this can include a header-only mutation.
 #[derive(Clone, Debug)]
 pub struct LogRecord {
     pub(crate) tx_timestamp: TxID,
     pub row_versions: Vec<RowVersion>,
+    pub header: Option<DatabaseHeader>,
 }
 
 impl LogRecord {
@@ -339,6 +341,7 @@ impl LogRecord {
         Self {
             tx_timestamp,
             row_versions: Vec::new(),
+            header: None,
         }
     }
 }
@@ -446,6 +449,8 @@ pub struct Transaction {
     read_set: SkipSet<RowID>,
     /// The transaction header.
     header: RwLock<DatabaseHeader>,
+    /// True when the transaction mutated its local database header snapshot.
+    header_dirty: AtomicBool,
     /// Stack of savepoints for statement-level rollback.
     /// Each savepoint tracks versions created/deleted during that statement.
     savepoint_stack: RwLock<Vec<Savepoint>>,
@@ -474,6 +479,7 @@ impl Transaction {
             write_set: SkipSet::new(),
             read_set: SkipSet::new(),
             header: RwLock::new(header),
+            header_dirty: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
             pager_commit_lock_held: AtomicBool::new(false),
             commit_dep_counter: AtomicU64::new(0),
@@ -1315,7 +1321,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     // table ids are negative, and sqlite_schema has id -1 so we want to sort in descending order of table id
                     b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
                 });
-                if self.write_set.is_empty() {
+                // Header-only writes must not take this fast path; they need durable log records.
+                if self.write_set.is_empty() && !tx.header_dirty.load(Ordering::Acquire) {
                     turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read only transaction should not have commit dependencies on other txns"
@@ -1413,11 +1420,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Err(LimboError::CommitDependencyAborted);
                 }
 
-                // Read-only fast path: if write_set is empty, commit without
+                // Read-only fast path: if write_set is empty and header was not mutated, commit without
                 // going through CommitEnd. CommitEnd updates last_committed_tx_ts
                 // which would make a read-only transaction look like a write,
                 // causing spurious Busy errors from acquire_exclusive_tx.
-                if self.write_set.is_empty() {
+                if self.write_set.is_empty() && !tx.header_dirty.load(Ordering::Acquire) {
                     turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read-only transaction should not have other transactions depending on it"
@@ -1435,6 +1442,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // All dependencies resolved — proceed with timestamp updates
                 // (Hekaton Section 3.3: Postprocessing).
                 let mut log_record = LogRecord::new(*end_ts);
+                if tx.header_dirty.load(Ordering::Acquire) {
+                    // Persist the transaction-local header snapshot in the same logical-log frame.
+                    log_record.header = Some(*tx.header.read());
+                }
                 for id in &self.write_set {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
                         let mut row_versions = row_versions.value().write();
@@ -1508,7 +1519,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
                 tracing::trace!("updated(tx_id={})", self.tx_id);
 
-                if log_record.row_versions.is_empty() {
+                if log_record.row_versions.is_empty() && log_record.header.is_none() {
                     // Nothing to do, just end commit.
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.unlock_commit_lock_if_held(tx);
@@ -3204,7 +3215,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let header = tx.value();
             let mut header = header.header.write();
             tracing::debug!("with_header_mut read: header={:?}", header);
-            Ok(f(&mut header))
+            let out = f(&mut header);
+            // Commit path consults this flag to decide whether a header-only logical-log record
+            // is required even when write_set stays empty.
+            tx.value().header_dirty.store(true, Ordering::Release);
+            Ok(out)
         } else {
             let mut header = self.global_header.write();
             let header = header.as_mut().ok_or_else(|| {
@@ -4607,6 +4622,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         btree_resident,
                     };
                     self.insert_index_version(rowid.table_id, sortable_key, row_version);
+                }
+                StreamingResult::UpdateHeader { header, commit_ts } => {
+                    max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                    if commit_ts <= replay_cutoff_ts {
+                        continue;
+                    }
+                    // Recovery applies only post-boundary header ops; the same value is later
+                    // staged to pager page-1 during checkpoint.
+                    self.global_header.write().replace(header);
                 }
                 StreamingResult::Eof => {
                     let mut log = self.storage.logical_log.write();
