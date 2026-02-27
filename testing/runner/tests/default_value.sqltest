@@ -83,5 +83,5 @@ test default-value-column-name {
     CREATE TABLE t7 (x, y DEFAULT ("x"));
 }
 expect error {
-    is not constant
+    default value of column \[y\] is not constant
 }
