@@ -565,3 +565,94 @@ snapshot-eqp using-clause-join {
         customers c
     INNER JOIN orders o USING (customer_id);
 }
+
+# =============================================================================
+# Regression: multi-table join with multiple constraints on same rowid column
+# The optimizer must not skip usable rowid constraints when an unusable
+# constraint on the same column appears first in the constraint list.
+# =============================================================================
+
+@setup schema
+snapshot-eqp three-table-join-rowid-seek {
+    SELECT
+        oi.product_id,
+        COUNT(DISTINCT c.customer_id) AS unique_customers
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    GROUP BY
+        oi.product_id;
+}
+
+# =============================================================================
+# Regression: verbatim reproduction from testing-bigass.db schema
+# Three-table join where GROUP BY on an indexed column caused the optimizer
+# to miss a usable rowid constraint on the middle table, resulting in a full
+# table scan instead of SeekRowid.
+# =============================================================================
+
+setup bigass_schema {
+    CREATE TABLE customer_support_tickets (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER,
+        order_id INTEGER,
+        ticket_number TEXT,
+        category TEXT,
+        priority TEXT,
+        status TEXT,
+        subject TEXT,
+        description TEXT,
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP,
+        resolved_at TIMESTAMP,
+        assigned_to TEXT,
+        resolution_notes TEXT
+    );
+
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER,
+        order_date TIMESTAMP,
+        total_amount REAL,
+        status TEXT,
+        shipping_address TEXT,
+        shipping_city TEXT,
+        shipping_state TEXT,
+        shipping_zip TEXT,
+        payment_method TEXT,
+        tracking_number TEXT,
+        notes TEXT
+    );
+
+    CREATE TABLE order_items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER,
+        product_id INTEGER,
+        quantity INTEGER,
+        unit_price REAL,
+        discount REAL,
+        tax REAL,
+        total_price REAL
+    );
+
+    CREATE INDEX idx_tickets_user_id ON customer_support_tickets(user_id);
+    CREATE INDEX idx_tickets_status ON customer_support_tickets(status);
+    CREATE INDEX idx_orders_user_id ON orders(user_id);
+    CREATE INDEX idx_orders_status ON orders(status);
+    CREATE INDEX idx_order_items_order_id ON order_items(order_id);
+    CREATE INDEX idx_order_items_product_id ON order_items(product_id);
+}
+
+@setup bigass_schema
+snapshot-eqp bigass-three-table-join-rowid-seek {
+    SELECT
+        oi.product_id,
+        COUNT(DISTINCT t.id) AS support_issues
+    FROM
+        customer_support_tickets t
+    INNER JOIN orders o ON t.order_id = o.id
+    INNER JOIN order_items oi ON o.id = oi.order_id
+    GROUP BY
+        oi.product_id;
+}

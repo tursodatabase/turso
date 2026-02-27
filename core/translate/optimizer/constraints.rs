@@ -1263,11 +1263,30 @@ pub fn usable_constraints_for_join_order<'a>(
         let constraint = &constraints[cref.constraint_vec_pos];
         let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
         if other_side_refers_to_self {
-            break;
+            // For multi-column indexes, a gap at an earlier column position means later
+            // columns can't be used (B-tree prefix rule). But if this unusable constraint
+            // is at the same column position as one we haven't yet filled, another
+            // constraint on the same column might still be usable — so only break when
+            // the column position would advance past a gap.
+            //
+            // Example: given join order [t, o] and evaluating rowid access for `o`:
+            //   refs = [(col=0, o.id = oi.order_id),  -- unusable, oi not in join order
+            //           (col=0, t.order_id = o.id)]    -- usable
+            // Breaking on the first unusable ref would miss the usable constraint,
+            // causing a full table scan instead of SeekRowid.
+            if cref.index_col_pos != current_required_column_pos {
+                break;
+            }
+            continue;
         }
         let all_required_tables_are_on_left_side = lhs_mask.contains_all(&constraint.lhs_mask);
         if !all_required_tables_are_on_left_side {
-            break;
+            // Same logic as above: skip unusable constraints at the current column
+            // position since a usable one may follow; break only at later positions.
+            if cref.index_col_pos != current_required_column_pos {
+                break;
+            }
+            continue;
         }
         if Some(cref.index_col_pos) == usable.last().map(|x| x.index_col_pos) {
             // Two constraints on the same index column can be combined into a single range constraint.

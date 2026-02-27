@@ -1,0 +1,30 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT
+          oi.product_id,
+          COUNT(DISTINCT t.id) AS support_issues
+      FROM
+          customer_support_tickets t
+      INNER JOIN orders o ON t.order_id = o.id
+      INNER JOIN order_items oi ON o.id = oi.order_id
+      GROUP BY
+          oi.product_id;
+info:
+  statement_type: SELECT
+  tables:
+  - customer_support_tickets
+  - o.id
+  - order_items
+  - orders
+  - t.order_id
+  setup_blocks:
+  - bigass_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN customer_support_tickets AS t
+|--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH oi USING INDEX idx_order_items_order_id
+|--USE SORTER FOR GROUP BY
+`--USE HASH TABLE FOR count(DISTINCT)

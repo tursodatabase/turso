@@ -1,0 +1,30 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT
+          oi.product_id,
+          COUNT(DISTINCT c.customer_id) AS unique_customers
+      FROM
+          customers c
+      INNER JOIN orders o ON c.customer_id = o.customer_id
+      INNER JOIN order_items oi ON o.order_id = oi.order_id
+      GROUP BY
+          oi.product_id;
+info:
+  statement_type: SELECT
+  tables:
+  - c.customer_id
+  - customers
+  - o.order_id
+  - order_items
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN orders AS o USING COVERING INDEX idx_orders_customer_id
+|--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH oi USING INDEX idx_order_items_order_id
+|--USE SORTER FOR GROUP BY
+`--USE HASH TABLE FOR count(DISTINCT)
