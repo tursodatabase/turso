@@ -31,6 +31,7 @@ use crate::vdbe::affinity::{
 };
 use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
 use crate::vdbe::insn::InsertFlags;
+use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
     registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
@@ -11579,6 +11580,7 @@ pub fn op_hash_scan_unmatched(
         target_pc.as_offset_int(),
         *payload_dest_reg,
         *num_payload,
+        &mut state.metrics.hash_join,
     )
 }
 
@@ -11611,11 +11613,13 @@ pub fn op_hash_next_unmatched(
         target_pc.as_offset_int(),
         *payload_dest_reg,
         *num_payload,
+        &mut state.metrics.hash_join,
     )
 }
 
 /// Shared logic for HashScanUnmatched/HashNextUnmatched: find the next unmatched
 /// entry, loading spilled partitions as needed.
+#[allow(clippy::too_many_arguments)]
 fn advance_unmatched_scan(
     hash_table: &mut HashTable,
     registers: &mut [Register],
@@ -11624,11 +11628,12 @@ fn advance_unmatched_scan(
     target_pc: u32,
     payload_dest_reg: Option<usize>,
     num_payload: usize,
+    metrics: &mut HashJoinMetrics,
 ) -> Result<InsnFunctionStepResult> {
     if hash_table.has_spilled() {
         if let Some(partition_idx) = hash_table.unmatched_scan_current_partition() {
             if !hash_table.is_partition_loaded(partition_idx) {
-                match hash_table.load_spilled_partition(partition_idx)? {
+                match hash_table.load_spilled_partition(partition_idx, Some(metrics))? {
                     crate::types::IOResult::Done(()) => {}
                     crate::types::IOResult::IO(io) => {
                         return Ok(InsnFunctionStepResult::IO(io));
@@ -11651,7 +11656,7 @@ fn advance_unmatched_scan(
                 if hash_table.has_spilled() {
                     if let Some(partition_idx) = hash_table.unmatched_scan_current_partition() {
                         if !hash_table.is_partition_loaded(partition_idx) {
-                            match hash_table.load_spilled_partition(partition_idx)? {
+                            match hash_table.load_spilled_partition(partition_idx, Some(metrics))? {
                                 crate::types::IOResult::Done(()) => continue,
                                 crate::types::IOResult::IO(io) => {
                                     return Ok(InsnFunctionStepResult::IO(io));
