@@ -1795,7 +1795,7 @@ impl<'a> PropertyDistribution<'a> {
             properties,
             weights,
             query_distr,
-            mvcc: env.profile.experimental_mvcc,
+            mvcc: env.profile.mvcc,
         })
     }
 }

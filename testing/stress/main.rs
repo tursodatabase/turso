@@ -707,8 +707,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
             }
             TxMode::Concurrent => {
-                conn.pragma_update("journal_mode", "experimental_mvcc")
-                    .await?;
+                conn.pragma_update("journal_mode", "mvcc").await?;
             }
         };
 

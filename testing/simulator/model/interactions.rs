@@ -864,7 +864,7 @@ impl InteractionType {
 fn reopen_database(env: &mut SimulatorEnv) {
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
-    let mvcc = env.profile.experimental_mvcc;
+    let mvcc = env.profile.mvcc;
     let num_conns = env.connections.len();
 
     // Clear shadow transaction state for all connections since reopening
@@ -924,7 +924,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
             // Enable MVCC via PRAGMA if requested
             if mvcc {
                 let conn = env.db.as_ref().expect("db to be Some").connect().unwrap();
-                conn.pragma_update("journal_mode", "'experimental_mvcc'")
+                conn.pragma_update("journal_mode", "'mvcc'")
                     .expect("enable mvcc");
             }
 

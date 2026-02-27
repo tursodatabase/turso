@@ -13,7 +13,7 @@ async fn setup_mvcc_db(schema: &str) -> (turso::Database, tempfile::TempDir) {
         .unwrap();
     let conn = db.connect().unwrap();
     let mut rows = conn
-        .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+        .query("PRAGMA journal_mode = 'mvcc'", ())
         .await
         .unwrap();
     while let Ok(Some(_)) = rows.next().await {}

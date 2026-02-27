@@ -23,7 +23,7 @@ pub enum JournalMode {
     Persist,
     Memory,
     Wal,
-    ExperimentalMvcc,
+    Mvcc,
     Off,
 }
 
@@ -31,7 +31,7 @@ impl JournalMode {
     /// Modes that are supported
     #[inline]
     pub fn supported(&self) -> bool {
-        matches!(self, JournalMode::Wal | JournalMode::ExperimentalMvcc)
+        matches!(self, JournalMode::Wal | JournalMode::Mvcc)
     }
 
     /// As the header file version
@@ -39,7 +39,7 @@ impl JournalMode {
     pub fn as_version(&self) -> Option<Version> {
         match self {
             JournalMode::Wal => Some(Version::Wal),
-            JournalMode::ExperimentalMvcc => Some(Version::Mvcc),
+            JournalMode::Mvcc => Some(Version::Mvcc),
             _ => None,
         }
     }
@@ -50,7 +50,7 @@ impl From<Version> for JournalMode {
         match value {
             Version::Legacy => Self::Delete,
             Version::Wal => Self::Wal,
-            Version::Mvcc => Self::ExperimentalMvcc,
+            Version::Mvcc => Self::Mvcc,
         }
     }
 }

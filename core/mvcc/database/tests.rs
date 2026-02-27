@@ -37,8 +37,7 @@ impl MvccTestDb {
         let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
         // Enable MVCC via PRAGMA
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let mvcc_store = db.get_mv_store().clone().unwrap();
         Self {
             mvcc_store,
@@ -56,8 +55,7 @@ impl MvccTestDbNoConn {
             .unwrap();
         // Enable MVCC via PRAGMA
         let conn = db.connect().unwrap();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
         Self {
             db: Some(db),
@@ -91,8 +89,7 @@ impl MvccTestDbNoConn {
         .unwrap();
         // Enable MVCC via PRAGMA
         let conn = db.connect().unwrap();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
         Self {
             db: Some(db),
@@ -907,8 +904,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, &db_path_str).unwrap();
         let conn = db.connect().unwrap();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
     }
 
@@ -6278,8 +6274,7 @@ fn test_checkpoint_root_page_mismatch_with_index() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
-    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
 
     // Create MULTIPLE tables to consume enough page numbers
     // so that test_table's allocated pages diverge from abs(negative_id)
@@ -6684,8 +6679,7 @@ fn test_alter_table_rename_with_index_panics_on_restart() {
     db.restart();
     {
         let conn = db.connect();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.execute("ALTER TABLE old_name RENAME TO new_name")
             .unwrap();
         conn.close().unwrap();
@@ -6694,8 +6688,7 @@ fn test_alter_table_rename_with_index_panics_on_restart() {
     db.restart();
     {
         let conn = db.connect();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let rows = get_rows(&conn, "SELECT * FROM new_name");
         assert_eq!(rows.len(), 1);
     }
@@ -6721,8 +6714,7 @@ fn test_alter_table_rename_with_unique_constraint_panics_on_restart() {
     db.restart();
     {
         let conn = db.connect();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.execute("ALTER TABLE old_name RENAME TO new_name")
             .unwrap();
         conn.close().unwrap();
@@ -6731,8 +6723,7 @@ fn test_alter_table_rename_with_unique_constraint_panics_on_restart() {
     db.restart();
     {
         let conn = db.connect();
-        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
-            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let rows = get_rows(&conn, "SELECT * FROM new_name");
         assert_eq!(rows.len(), 1);
     }

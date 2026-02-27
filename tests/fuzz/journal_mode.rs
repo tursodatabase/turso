@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 /// Minimal reproduction of the journal mode switching bug.
-/// Deletes performed in experimental_mvcc mode are lost when switching to wal mode.
+/// Deletes performed in mvcc mode are lost when switching to wal mode.
 #[test]
 fn journal_mode_delete_lost_on_switch() {
     maybe_setup_tracing();
@@ -23,18 +23,18 @@ fn journal_mode_delete_lost_on_switch() {
     // Open and enable MVCC via PRAGMA
     let limbo_db = TempDatabaseBuilder::new().with_db_path(&db_path).build();
     let conn = limbo_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")
+    conn.pragma_update("journal_mode", "'mvcc'")
         .expect("enable mvcc");
 
     // Create table
     conn.prepare_execute_batch(schema).unwrap();
 
-    // Verify we start in experimental_mvcc mode
+    // Verify we start in mvcc mode
     let mode = get_limbo_journal_mode(&conn);
     println!("Initial mode: {mode}");
-    assert_eq!(mode, "experimental_mvcc");
+    assert_eq!(mode, "mvcc");
 
-    // Insert a row in experimental_mvcc mode
+    // Insert a row in mvcc mode
     conn.execute("INSERT INTO t(id, val) VALUES (1, 'test')")
         .unwrap();
 
@@ -56,15 +56,15 @@ fn journal_mode_delete_lost_on_switch() {
     println!("After switch to WAL: {rows:?}");
     assert_eq!(rows.len(), 1);
 
-    // Switch back to experimental_mvcc
+    // Switch back to mvcc
     let result = conn
-        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .pragma_update("journal_mode", "'mvcc'")
         .expect("switch to mvcc");
     let mode = result[0][0].to_string();
     println!("Switched to: {mode}");
-    assert_eq!(mode, "experimental_mvcc");
+    assert_eq!(mode, "mvcc");
 
-    // Delete the row in experimental_mvcc mode
+    // Delete the row in mvcc mode
     conn.execute("DELETE FROM t WHERE id = 1").unwrap();
 
     // Verify row is deleted
@@ -85,7 +85,7 @@ fn journal_mode_delete_lost_on_switch() {
     assert_eq!(
         rows.len(),
         0,
-        "BUG: Row was deleted but reappeared after switching from experimental_mvcc to wal!"
+        "BUG: Row was deleted but reappeared after switching from mvcc to wal!"
     );
 }
 
@@ -122,7 +122,7 @@ fn journal_mode_update_then_delete_btree_resident() {
     // Open and enable MVCC via PRAGMA
     let limbo_db = TempDatabaseBuilder::new().with_db_path(&db_path).build();
     let conn = limbo_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")
+    conn.pragma_update("journal_mode", "'mvcc'")
         .expect("enable mvcc");
 
     // Create table
@@ -149,10 +149,10 @@ fn journal_mode_update_then_delete_btree_resident() {
     // This is the key step - after this, the row ONLY exists in B-tree,
     // and durable_txid_max will be 0 (None when converted to NonZeroU64)
     let result = conn
-        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .pragma_update("journal_mode", "'mvcc'")
         .expect("switch to mvcc");
     println!("Step 3: Switched to MVCC (new MvStore, row only in B-tree)");
-    assert_eq!(result[0][0].to_string(), "experimental_mvcc");
+    assert_eq!(result[0][0].to_string(), "mvcc");
 
     // Verify row still visible (reading from B-tree)
     let rows: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM t ORDER BY id");
@@ -202,7 +202,7 @@ fn journal_mode_update_then_delete_btree_resident() {
 }
 
 /// Fuzz test that attempts to constantly change the journal mode of the database
-/// between `wal` and `experimental_mvcc`
+/// between `wal` and `mvcc`
 ///
 /// It tries to insert, delete, update some data and do the same thing in SQLite
 /// and constantly checks if the data is exactly the same as in SQLite
@@ -253,7 +253,7 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
 
     // Enable MVCC via PRAGMA
     limbo_conn
-        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .pragma_update("journal_mode", "'mvcc'")
         .expect("enable mvcc");
 
     // If starting with MVCC, create the schema in Limbo
@@ -383,11 +383,7 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
                 }
             }
             Action::SwitchMode => {
-                let new_mode = if current_mode == "wal" {
-                    "experimental_mvcc"
-                } else {
-                    "wal"
-                };
+                let new_mode = if current_mode == "wal" { "mvcc" } else { "wal" };
 
                 let result = limbo_conn
                     .pragma_update("journal_mode", format!("'{new_mode}'"))

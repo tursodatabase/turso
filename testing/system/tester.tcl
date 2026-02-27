@@ -45,7 +45,7 @@ proc evaluate_sql {sqlite_exec db_name sql} {
 
     set mvcc_journal_mode ""
     if {[is_turso_mvcc]} {
-        append mvcc_journal_mode "PRAGMA journal_mode=experimental_mvcc;\n"
+        append mvcc_journal_mode "PRAGMA journal_mode=mvcc;\n"
     }
 
     set statements "${mvcc_journal_mode}${load_commands}${sql}"
@@ -54,7 +54,7 @@ proc evaluate_sql {sqlite_exec db_name sql} {
     set output [exec echo $statements | {*}$command]
 
     if {[is_turso_mvcc]} {
-        # PRAGMA journal_mode=experimental_mvcc returns a single line result
+        # PRAGMA journal_mode=mvcc returns a single line result
         # at the top; drop that first line from the output.
         set lines [split $output "\n"]
         if {[llength $lines] > 0} {

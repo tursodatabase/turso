@@ -474,7 +474,7 @@ pub fn op_checkpoint(
     }
     // Re-fetch mv_store from connection to get the latest value.
     // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
-    // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "experimental_mvcc"`).
+    // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "mvcc"`).
     let mv_store = program.connection.mv_store();
     if let Some(mv_store) = mv_store.as_ref() {
         if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
@@ -11928,7 +11928,7 @@ fn op_journal_mode_inner(
                 pager.clear_page_cache(true);
 
                 // Setup new mode
-                if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc) {
+                if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
                     if program.connection.get_capture_data_changes_info().is_some() {
                         return Err(LimboError::InternalError(
                             "cannot enable MVCC while CDC is active".to_string(),
@@ -12258,7 +12258,7 @@ fn op_vacuum_into_inner(
                 // Enable MVCC on destination if source has it enabled
                 // Must be done before any schema operations to ensure the log file is created
                 if program.connection.db.mvcc_enabled() {
-                    dest_conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
+                    dest_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
                 }
 
                 // Performance optimizations for destination database:
@@ -12273,7 +12273,7 @@ fn op_vacuum_into_inner(
                 dest_conn.execute("BEGIN")?;
 
                 // Exclude the MVCC metadata table from the vacuum destination — it is an
-                // internal artifact of experimental_mvcc mode and must not appear in a
+                // internal artifact of mvcc mode and must not appear in a
                 // standalone SQLite file produced by VACUUM INTO.
                 let schema_sql = format!(
                     "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",

@@ -153,7 +153,7 @@ pub async fn generate_database(config: &GeneratorConfig) -> Result<()> {
     if config.mvcc {
         // Use query instead of execute since PRAGMA returns a result row
         let mut rows = conn
-            .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+            .query("PRAGMA journal_mode = 'mvcc'", ())
             .await
             .context("failed to enable MVCC mode")?;
         // Consume the result row

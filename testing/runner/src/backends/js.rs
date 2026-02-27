@@ -157,7 +157,7 @@ impl JsDatabaseInstance {
 
         // Prepend MVCC pragma if enabled (skip for readonly databases; the generated readonly DBs are already in MVCC mode).
         let sql_to_execute = if self.mvcc && !self.readonly {
-            format!("PRAGMA journal_mode = 'experimental_mvcc';\n{sql}")
+            format!("PRAGMA journal_mode = 'mvcc';\n{sql}")
         } else {
             sql.to_string()
         };
@@ -210,7 +210,7 @@ impl JsDatabaseInstance {
         // Filter out MVCC pragma output if present
         if self.mvcc && !rows.is_empty() {
             if let Some(first_row) = rows.first() {
-                if first_row.len() == 1 && first_row[0] == "experimental_mvcc" {
+                if first_row.len() == 1 && first_row[0] == "mvcc" {
                     rows.remove(0);
                 }
             }

@@ -44,7 +44,7 @@ fn test_concurrent_commit_no_yield_spin() {
 
     let setup = db.connect().expect("setup conn");
     setup
-        .execute("PRAGMA journal_mode = 'experimental_mvcc'")
+        .execute("PRAGMA journal_mode = 'mvcc'")
         .expect("enable mvcc");
     setup
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")

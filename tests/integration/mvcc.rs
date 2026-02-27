@@ -109,7 +109,7 @@ fn test_stmt_rollback_cleans_write_set(tmp_db: TempDatabase) -> anyhow::Result<(
 
     // Enable MVCC — this test is MVCC-specific (uses BEGIN CONCURRENT)
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     // Setup: parent/child tables with FK constraint
     conn.execute("PRAGMA foreign_keys = ON")?;
@@ -147,7 +147,7 @@ fn test_stmt_rollback_cleans_write_set_with_index(tmp_db: TempDatabase) -> anyho
     let _ = env_logger::try_init();
 
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     conn.execute("PRAGMA foreign_keys = ON")?;
     conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")?;

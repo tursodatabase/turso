@@ -454,7 +454,7 @@ fn setup_simulation(
 
     tracing::info!("Generating database interaction plan...");
 
-    let plan = InteractionPlan::new(env.profile.experimental_mvcc);
+    let plan = InteractionPlan::new(env.profile.mvcc);
 
     (seed, env, plan)
 }

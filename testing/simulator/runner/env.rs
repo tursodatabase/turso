@@ -955,8 +955,8 @@ impl SimulatorEnv {
 
         let mut profile = profile.clone();
         // Conditionals here so that we can override some profile options from the CLI
-        if let Some(mvcc) = cli_opts.experimental_mvcc {
-            profile.experimental_mvcc = mvcc;
+        if let Some(mvcc) = cli_opts.mvcc {
+            profile.mvcc = mvcc;
         }
         if let Some(latency_prob) = cli_opts.latency_probability {
             profile.io.latency.latency_probability = latency_prob;
@@ -1019,11 +1019,11 @@ impl SimulatorEnv {
         };
 
         // Switch to MVCC mode if the profile says to use MVCC
-        if profile.experimental_mvcc {
+        if profile.mvcc {
             let conn = db
                 .connect()
                 .expect("Failed to create connection for MVCC setup");
-            conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+            conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
         }
 
