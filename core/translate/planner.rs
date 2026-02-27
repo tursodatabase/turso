@@ -968,7 +968,19 @@ fn parse_table(
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery
         view.process()?;
-        let view_select = view.select_stmt.clone();
+        let mut view_select = view.select_stmt.clone();
+        if let ast::OneSelect::Select {
+            ref mut columns, ..
+        } = view_select.body.select
+        {
+            for (col, result_col) in view.columns.iter().zip(columns.iter_mut()) {
+                if let (Some(name_str), ast::ResultColumn::Expr(_, ref mut alias)) =
+                    (&col.name, result_col)
+                {
+                    *alias = Some(ast::As::As(ast::Name::exact(name_str.clone())));
+                }
+            }
+        }
         let subselect = Box::new(view_select);
 
         // Use the view name as alias if no explicit alias was provided
