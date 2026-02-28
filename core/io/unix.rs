@@ -18,6 +18,17 @@ use tracing::{instrument, trace, Level};
 
 pub struct UnixIO {}
 
+#[inline]
+const fn max_pwrite_bytes() -> usize {
+    // Darwin rejects `pwrite`/`pwritev` counts > INT_MAX with EINVAL.
+    i32::MAX as usize
+}
+
+#[inline]
+fn pwrite_chunk_len(remaining: usize) -> usize {
+    remaining.min(max_pwrite_bytes())
+}
+
 impl UnixIO {
     #[cfg(feature = "fs")]
     pub fn new() -> Result<Self> {
@@ -42,18 +53,29 @@ fn try_pwritev_raw(
     bufs: &[Arc<crate::Buffer>],
     start_idx: usize,
     start_off: usize,
+    max_bytes: usize,
 ) -> std::io::Result<usize> {
     const MAX_IOV: usize = 1024;
+    if max_bytes == 0 {
+        return Ok(0);
+    }
     let iov_len = std::cmp::min(bufs.len() - start_idx, MAX_IOV);
     let mut iov: Vec<libc::iovec> = Vec::with_capacity(iov_len);
 
     let mut last_end: Option<(*const u8, usize)> = None;
     let mut iov_count = 0;
+    let mut remaining_budget = max_bytes;
     for (i, b) in bufs.iter().enumerate().skip(start_idx).take(iov_len) {
+        if remaining_budget == 0 {
+            break;
+        }
         let s = b.as_slice();
         let slice = if i == start_idx { &s[start_off..] } else { s };
+        if slice.is_empty() {
+            continue;
+        }
         let ptr = slice.as_ptr();
-        let len = slice.len();
+        let len = slice.len().min(remaining_budget);
 
         if let Some((last_ptr, last_len)) = last_end {
             // Check if this buffer is adjacent to the last
@@ -61,6 +83,7 @@ fn try_pwritev_raw(
                 // Extend the last iovec instead of adding new
                 iov[iov_count - 1].iov_len += len;
                 last_end = Some((last_ptr, last_len + len));
+                remaining_budget -= len;
                 continue;
             }
         }
@@ -70,6 +93,10 @@ fn try_pwritev_raw(
             iov_base: ptr as *mut libc::c_void,
             iov_len: len,
         });
+        remaining_budget -= len;
+    }
+    if iov.is_empty() {
+        return Ok(0);
     }
     // On Android, off_t is i32. Cast to libc::off_t instead of hardcoding i64 for portability.
     let n = if iov.len().eq(&1) {
@@ -207,11 +234,12 @@ impl File for UnixFile {
 
         while total_written < total_size {
             let remaining_slice = &buf_slice[total_written..];
+            let write_len = pwrite_chunk_len(remaining_slice.len());
             let result = unsafe {
                 libc::pwrite(
                     file.as_raw_fd(),
                     remaining_slice.as_ptr() as *const libc::c_void,
-                    remaining_slice.len(),
+                    write_len,
                     current_pos as libc::off_t,
                 )
             };
@@ -261,7 +289,16 @@ impl File for UnixFile {
 
         let total_size: usize = buffers.iter().map(|b| b.len()).sum();
         while total_written < total_size {
-            match try_pwritev_raw(file.as_raw_fd(), current_pos, &buffers, buf_idx, buf_offset) {
+            let remaining = total_size - total_written;
+            let max_bytes = pwrite_chunk_len(remaining);
+            match try_pwritev_raw(
+                file.as_raw_fd(),
+                current_pos,
+                &buffers,
+                buf_idx,
+                buf_offset,
+                max_bytes,
+            ) {
                 Ok(written) => {
                     if written == 0 {
                         // Unexpected EOF
@@ -378,5 +415,50 @@ mod tests {
     #[test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(UnixIO::new);
+    }
+
+    #[test]
+    fn test_pwrite_chunk_len_is_capped() {
+        assert_eq!(pwrite_chunk_len(0), 0);
+        assert_eq!(pwrite_chunk_len(1234), 1234);
+        assert_eq!(pwrite_chunk_len(i32::MAX as usize), i32::MAX as usize);
+        assert_eq!(pwrite_chunk_len(i32::MAX as usize + 1), i32::MAX as usize);
+    }
+
+    #[test]
+    fn test_try_pwritev_raw_respects_max_bytes() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("limbo_unix_io_test_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let fd = file.as_raw_fd();
+
+        let b1 = Arc::new(crate::Buffer::new(vec![1u8; 32]));
+        let b2 = Arc::new(crate::Buffer::new(vec![2u8; 32]));
+        let bufs = vec![b1, b2];
+
+        let written = try_pwritev_raw(fd, 0, &bufs, 0, 0, 20).unwrap();
+        assert_eq!(written, 20);
+
+        let mut read_back = vec![0u8; 32];
+        let n = unsafe {
+            libc::pread(
+                fd,
+                read_back.as_mut_ptr() as *mut libc::c_void,
+                read_back.len(),
+                0,
+            )
+        };
+        assert_eq!(n, 20);
+        assert_eq!(&read_back[..20], &[1u8; 20]);
+
+        std::fs::remove_file(path).unwrap();
     }
 }
