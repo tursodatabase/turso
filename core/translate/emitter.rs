@@ -49,7 +49,7 @@ use crate::translate::fkeys::{
 };
 use crate::translate::plan::{
     DeletePlan, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinedTable, NonFromClauseSubquery,
-    Plan, QueryDestination, ResultSetColumn, Search,
+    Plan, QueryDestination, ResultSetColumn, Search, SubqueryState,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -434,6 +434,10 @@ pub struct TranslateCtx<'a> {
     pub cdc_cursor_id: Option<usize>,
     pub meta_window: Option<WindowMetadata<'a>>,
     pub unsafe_testing: bool,
+    /// Cloned subquery plans for correlated subqueries in ungrouped aggregate queries.
+    /// When no rows match the outer loop, these are emitted in the fallback path
+    /// so that e.g. COUNT(*) correctly returns 0 instead of NULL.
+    pub deferred_ungrouped_agg_subqueries: Vec<(Box<SelectPlan>, SubqueryType, bool)>,
 }
 
 impl<'a> TranslateCtx<'a> {
@@ -463,6 +467,7 @@ impl<'a> TranslateCtx<'a> {
             cdc_cursor_id: None,
             meta_window: None,
             unsafe_testing,
+            deferred_ungrouped_agg_subqueries: Vec::new(),
         }
     }
 }
@@ -1420,6 +1425,35 @@ pub fn emit_query<'a>(
         // with an unresolved IfNot target.
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(t_ctx.reg_result_cols_start.unwrap());
+    }
+
+    // For ungrouped aggregates with correlated subqueries in non-aggregate result columns,
+    // clone the subquery plans before open_loop consumes them. If the outer loop produces
+    // no rows, we re-emit these subqueries in the fallback path so that e.g.
+    // (SELECT COUNT(*) FROM t2 WHERE t2.a = t1.a) returns 0 instead of NULL.
+    // Skip when contains_constant_false_condition: the Goto skips cursor initialization,
+    // so deferred subqueries would panic accessing unopened cursors.
+    if has_ungrouped_nonagg_cols && !plan.contains_constant_false_condition {
+        for subquery in plan.non_from_clause_subqueries.iter() {
+            if !subquery.correlated || subquery.has_been_evaluated() {
+                continue;
+            }
+            let eval_at =
+                subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?;
+            if !matches!(eval_at, EvalAt::Loop(_)) {
+                continue;
+            }
+            if let SubqueryState::Unevaluated {
+                plan: Some(subquery_plan),
+            } = &subquery.state
+            {
+                t_ctx.deferred_ungrouped_agg_subqueries.push((
+                    subquery_plan.clone(),
+                    subquery.query_type.clone(),
+                    subquery.correlated,
+                ));
+            }
+        }
     }
 
     // Set up main query execution loop
