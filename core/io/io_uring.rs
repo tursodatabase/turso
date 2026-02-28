@@ -7,11 +7,10 @@ use crate::sync::Mutex;
 use crate::turso_assert;
 use crate::error::io_error;
 use crate::{CompletionError, LimboError, Result};
-use rustix::fs::{self, FlockOperation, OFlags};
+use rustix::fs::{self, OFlags};
 use std::ptr::NonNull;
 use std::{
     collections::{HashMap, VecDeque},
-    io::ErrorKind,
     ops::Deref,
     os::{fd::AsFd, unix::io::AsRawFd},
     sync::Arc,
@@ -512,9 +511,12 @@ impl IO for UringIO {
             id,
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            || !flags.contains(OpenFlags::ReadOnly)
+            && !flags.contains(OpenFlags::ReadOnly)
         {
-            uring_file.lock_file(true)?;
+            // SharedLock flag means shared fcntl lock (for multi-process modes).
+            // Otherwise exclusive lock (default, single-process).
+            let shared = flags.contains(OpenFlags::SharedLock);
+            uring_file.lock_file(!shared)?;
         }
         Ok(uring_file)
     }
@@ -698,40 +700,11 @@ crate::assert::assert_send_sync!(UringFile);
 
 impl File for UringFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
-        let fd = self.file.as_fd();
-        // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
-        // or the process exits or after an explicit unlock.
-        fs::fcntl_lock(
-            fd,
-            if exclusive {
-                FlockOperation::NonBlockingLockExclusive
-            } else {
-                FlockOperation::NonBlockingLockShared
-            },
-        )
-        .map_err(|e| {
-            let io_error = std::io::Error::from(e);
-            let message = match io_error.kind() {
-                ErrorKind::WouldBlock => {
-                    "Failed locking file. File is locked by another process".to_string()
-                }
-                _ => format!("Failed locking file, {io_error}"),
-            };
-            LimboError::LockingError(message)
-        })?;
-
-        Ok(())
+        common::fcntl_lock(self.file.as_fd(), exclusive)
     }
 
     fn unlock_file(&self) -> Result<()> {
-        let fd = self.file.as_fd();
-        fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
-            LimboError::LockingError(format!(
-                "Failed to release file lock: {}",
-                std::io::Error::from(e)
-            ))
-        })?;
-        Ok(())
+        common::fcntl_unlock(self.file.as_fd())
     }
 
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
@@ -884,5 +857,20 @@ mod tests {
     #[test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(UringIO::new);
+    }
+
+    #[test]
+    fn test_exclusive_blocks_shared() {
+        common::tests::test_exclusive_blocks_shared(UringIO::new);
+    }
+
+    #[test]
+    fn test_shared_blocks_exclusive() {
+        common::tests::test_shared_blocks_exclusive(UringIO::new);
+    }
+
+    #[test]
+    fn test_shared_allows_shared() {
+        common::tests::test_shared_allows_shared(UringIO::new);
     }
 }

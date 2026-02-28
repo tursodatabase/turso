@@ -54,7 +54,25 @@ fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let (mut app, _guard) = app::Limbo::new()?;
+    let (mut app, _guard) = match app::Limbo::new() {
+        Ok(v) => v,
+        Err(e) => {
+            // Print locking errors without a backtrace — they are user-facing,
+            // not internal bugs.
+            if let Some(core_err) = e.downcast_ref::<turso_core::LimboError>() {
+                match core_err {
+                    turso_core::LimboError::LockingError(_)
+                    | turso_core::LimboError::InvalidArgument(_)
+                    | turso_core::LimboError::Busy => {
+                        eprintln!("Error: {core_err}");
+                        std::process::exit(1);
+                    }
+                    _ => {}
+                }
+            }
+            return Err(e);
+        }
+    };
 
     if app.is_mcp_mode() {
         return run_mcp_server(app);

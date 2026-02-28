@@ -66,7 +66,6 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 
 ### Limitations
 
-* ⛔️ Concurrent access from multiple processes is not supported.
 * ⛔️ Vacuum is not supported.
 
 ## SQLite query language
@@ -167,7 +166,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA journal_size_limit        | ❌ No         |                                              |
 | PRAGMA legacy_alter_table        | ❌ No         |                                              |
 | PRAGMA legacy_file_format        | ✅ Yes        |                                              |
-| PRAGMA locking_mode              | ❌ No         |                                              |
+| PRAGMA locking_mode              | ✅ Yes        | `normal` maps to `shared_writes` for SQLite compat. Also supports `exclusive` (default), `shared_reads`, `shared_writes`. Set via URI: `file:db.sqlite?locking=normal` |
 | PRAGMA max_page_count            | ✅ Yes        |                                              |
 | PRAGMA mmap_size                 | ❌ No         |                                              |
 | PRAGMA module_list               | ❌ No         |                                              |

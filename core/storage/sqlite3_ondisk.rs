@@ -1394,6 +1394,7 @@ pub fn build_shared_wal(
         checkpoint_lock: TursoRwLock::new(),
         initialized: AtomicBool::new(false),
         epoch: AtomicU32::new(0),
+        external_reader_max_frame: AtomicU64::new(0),
     }));
 
     if size < WAL_HEADER_SIZE as u64 {

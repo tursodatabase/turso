@@ -300,6 +300,13 @@ impl Connection {
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
+        // Check if the on-disk schema cookie differs from our in-memory
+        // schema (e.g. another process created/dropped/altered a table).
+        // Must be called outside any transaction because it starts its own
+        // read tx internally.
+        if self.get_tx_state() == TransactionState::None {
+            self.maybe_reparse_schema()?;
+        }
         self.maybe_update_schema();
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
@@ -326,6 +333,9 @@ impl Connection {
     pub fn prepare_stmt(self: &Arc<Connection>, stmt: ast::Stmt) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        if self.get_tx_state() == TransactionState::None {
+            self.maybe_reparse_schema()?;
         }
         self.maybe_update_schema();
         let syms = self.syms.read();
@@ -363,38 +373,59 @@ impl Connection {
             .store(true, Ordering::SeqCst);
     }
 
+    /// Get the effective schema cookie, considering MVCC mode.
+    /// In MVCC mode, the MvStore header has the up-to-date cookie while the
+    /// pager header lags behind until checkpoint. This must match what the
+    /// Transaction opcode's get_schema_cookie() sees to avoid spurious
+    /// SchemaUpdated errors.
+    pub(crate) fn effective_schema_cookie(&self) -> Result<u32> {
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            return mv_store.with_header(|h| h.schema_cookie.get(), None);
+        }
+        let pager = self.pager.load();
+        pager
+            .io
+            .block(|| pager.with_header(|header| header.schema_cookie))
+            .map(|v| v.get())
+    }
+
     /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page
     /// This function must be called outside of any transaction because internally it will start transaction session by itself
-    #[allow(dead_code)]
     fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let pager = self.pager.load().clone();
 
-        // first, quickly read schema_version from the root page in order to check if schema changed
-        pager.begin_read_tx()?;
-        let on_disk_schema_version = pager
-            .io
-            .block(|| pager.with_header(|header| header.schema_cookie));
-
-        let on_disk_schema_version = match on_disk_schema_version {
-            Ok(db_schema_version) => db_schema_version.get(),
-            Err(LimboError::Page1NotAlloc) => {
-                // this means this is a fresh db, so return a schema version of 0
+        // In MVCC mode, read the schema cookie from MvStore (which has the
+        // up-to-date value) rather than the pager header (which lags until
+        // checkpoint). This avoids false mismatches that trigger infinite
+        // reparse_schema recursion.
+        let on_disk_schema_version = if self.mv_store().is_some() {
+            self.effective_schema_cookie().unwrap_or_else(|e| {
+                tracing::warn!("effective_schema_cookie failed in maybe_reparse_schema: {e}");
                 0
-            }
-            Err(err) => {
-                pager.end_read_tx();
-                return Err(err);
-            }
+            })
+        } else {
+            // first, quickly read schema_version from the root page in order to check if schema changed
+            pager.begin_read_tx()?;
+            let result = pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie));
+
+            let version = match result {
+                Ok(db_schema_version) => db_schema_version.get(),
+                Err(LimboError::Page1NotAlloc) => {
+                    // this means this is a fresh db, so return a schema version of 0
+                    0
+                }
+                Err(err) => {
+                    pager.end_read_tx();
+                    return Err(err);
+                }
+            };
+            pager.end_read_tx();
+            version
         };
-        pager.end_read_tx();
 
         let db_schema_version = self.db.schema.lock().schema_version;
-        tracing::debug!(
-            "path: {}, db_schema_version={} vs on_disk_schema_version={}",
-            self.db.path,
-            db_schema_version,
-            on_disk_schema_version
-        );
         // if schema_versions matches - exit early
         if db_schema_version == on_disk_schema_version {
             return Ok(());
@@ -433,13 +464,13 @@ impl Connection {
     }
 
     pub(crate) fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.load().clone();
-
-        // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
-        let cookie = pager
-            .io
-            .block(|| pager.with_header(|header| header.schema_cookie))?
-            .get();
+        // Read cookie before consuming statement program. In MVCC mode, read
+        // from MvStore (the authoritative source) to match what the Transaction
+        // opcode sees, avoiding spurious SchemaUpdated → reprepare recursion.
+        let cookie = self.effective_schema_cookie().unwrap_or_else(|e| {
+            tracing::warn!("effective_schema_cookie failed in reparse_schema: {e}");
+            0
+        });
 
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(self.experimental_custom_types_enabled());
@@ -522,6 +553,9 @@ impl Connection {
                 "The supplied SQL string contains no statements".to_string(),
             ));
         }
+        if self.get_tx_state() == TransactionState::None {
+            self.maybe_reparse_schema()?;
+        }
         self.maybe_update_schema();
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
@@ -556,6 +590,9 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
+        if self.get_tx_state() == TransactionState::None {
+            self.maybe_reparse_schema()?;
+        }
         self.maybe_update_schema();
         tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
@@ -609,6 +646,9 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
+        if self.get_tx_state() == TransactionState::None {
+            self.maybe_reparse_schema()?;
+        }
         self.maybe_update_schema();
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
@@ -671,6 +711,11 @@ impl Connection {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
+        let db_opts = if let Some(locking) = opts.locking {
+            db_opts.with_locking_mode(locking)
+        } else {
+            db_opts
+        };
         if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
             let io = Arc::new(MemoryIO::new());
             let db = Database::open_file_with_flags(io.clone(), MEMORY_PATH, flags, db_opts, None)?;
@@ -742,6 +787,11 @@ impl Connection {
         if encryption_opts.is_some() {
             db_opts = db_opts.with_encryption(true);
         }
+        let db_opts = if let Some(locking) = opts.locking {
+            db_opts.with_locking_mode(locking)
+        } else {
+            db_opts
+        };
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
         let db = Database::open_file_with_flags(
             io.clone(),

@@ -118,7 +118,7 @@ pub enum CheckpointMode {
 }
 
 impl CheckpointMode {
-    fn should_restart_log(&self) -> bool {
+    pub fn should_restart_log(&self) -> bool {
         matches!(
             self,
             CheckpointMode::Truncate { .. } | CheckpointMode::Restart
@@ -816,8 +816,6 @@ pub struct WalFileShared {
     // Frame cache maps a Page to all the frames it has stored in WAL in ascending order.
     // This is to easily find the frame it must checkpoint each connection if a checkpoint is
     // necessary.
-    // One difference between SQLite and limbo is that we will never support multi process, meaning
-    // we don't need WAL's index file. So we can do stuff like this without shared memory.
     // TODO: this will need refactoring because this is incredible memory inefficient.
     pub frame_cache: Arc<SpinLock<FxHashMap<u64, Vec<u64>>>>,
     pub last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
@@ -840,6 +838,11 @@ pub struct WalFileShared {
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
     /// backfilling.
     pub epoch: AtomicU32,
+
+    /// Maximum frame that external (other-process) readers may still be reading.
+    /// Set by MultiProcessWal from TSHM min_reader_frame() before checkpoint.
+    /// 0 means no external readers are active.
+    pub external_reader_max_frame: AtomicU64,
 }
 
 impl fmt::Debug for WalFileShared {
@@ -2161,6 +2164,87 @@ impl WalFile {
         }
     }
 
+    /// Set the external reader max frame (from TSHM) that checkpoint must respect.
+    pub fn set_external_reader_max_frame(&self, frame: u64) {
+        self.with_shared(|shared| {
+            shared
+                .external_reader_max_frame
+                .store(frame, Ordering::Release);
+        });
+    }
+
+    /// Re-read the WAL file from disk and update the shared state.
+    ///
+    /// Used by MultiProcessWal so that a reader process can discover
+    /// frames written by a writer in another process. This rebuilds
+    /// `frame_cache`, `max_frame`, `last_checksum`, and the WAL header
+    /// from the on-disk WAL file. The rebuild is unconditional — the
+    /// caller is responsible for gating calls behind a TSHM writer_state
+    /// check to avoid redundant rescans.
+    pub fn rescan_wal_from_disk(&self) -> Result<()> {
+        let file = self.with_shared(|s| s.file.clone());
+        let file = match file {
+            Some(f) => f,
+            None => return Ok(()), // noop WAL (no file)
+        };
+
+        // Re-read WAL from disk into a fresh temporary WalFileShared.
+        let fresh_shared = crate::storage::sqlite3_ondisk::build_shared_wal(&file, &self.io)?;
+        let fresh = fresh_shared.read();
+
+        // Always apply the fresh state from disk. Even when checkpoint_seq
+        // and max_frame look identical, the frame *contents* may differ
+        // (e.g. after a Truncate checkpoint followed by new writes that
+        // happen to reach the same max_frame count). The frame_cache must
+        // be rebuilt from the actual WAL on disk to stay correct.
+
+        // Copy relevant fields into our shared state.
+        // We deliberately don't touch process-local coordination fields
+        // (read_locks, write_lock, checkpoint_lock, epoch,
+        // external_reader_max_frame).
+        let mut shared = self.shared.write();
+
+        shared
+            .max_frame
+            .store(fresh.max_frame.load(Ordering::Acquire), Ordering::Release);
+        shared.last_checksum = fresh.last_checksum;
+
+        // Reset nbackfills to 0: we don't know the actual checkpoint
+        // progress from just the WAL file, and leaving a stale nbackfills
+        // can cause try_begin_read_tx to take the "fully checkpointed"
+        // path when the WAL actually has uncommitted-to-db frames.
+        shared.nbackfills.store(0, Ordering::Release);
+
+        // Bump transaction_count so db_changed() returns true for any
+        // connection that hasn't seen this rescan yet, forcing page cache
+        // invalidation.
+        shared.transaction_count.fetch_add(1, Ordering::AcqRel);
+
+        {
+            let mut cache = shared.frame_cache.lock();
+            let fresh_cache = fresh.frame_cache.lock();
+            cache.clone_from(&fresh_cache);
+        }
+
+        {
+            let mut hdr = shared.wal_header.lock();
+            let fresh_hdr = fresh.wal_header.lock();
+            let prev_page_size = hdr.page_size;
+            *hdr = *fresh_hdr;
+            // A truncated WAL file has page_size=0 in the default header.
+            // Preserve the known page_size so prepare_frames doesn't panic.
+            if hdr.page_size == 0 {
+                hdr.page_size = prev_page_size;
+            }
+        }
+
+        shared
+            .initialized
+            .store(fresh.initialized.load(Ordering::Acquire), Ordering::Release);
+
+        Ok(())
+    }
+
     fn page_size(&self) -> u32 {
         self.with_shared(|shared| shared.wal_header.lock().page_size)
     }
@@ -2632,6 +2716,12 @@ impl WalFile {
                     }
                 }
             }
+            // Also respect external (other-process) readers tracked via TSHM.
+            let ext = shared.external_reader_max_frame.load(Ordering::Acquire);
+            if ext > 0 && ext < max_safe_frame {
+                max_safe_frame = ext;
+            }
+
             max_safe_frame
         })
     }
@@ -2665,6 +2755,15 @@ impl WalFile {
         if max_frame != nbackfills {
             tracing::debug!(
                 "try_restart_log_before_write: max_frame={max_frame}, nbackfills={nbackfills}, not everything is backfilled to the DB file - can't restart the log"
+            );
+            return Ok(());
+        }
+        // Don't restart if external (other-process) readers are active.
+        // They may still need to read WAL frames from this generation.
+        let ext = self.with_shared(|s| s.external_reader_max_frame.load(Ordering::Acquire));
+        if ext > 0 {
+            tracing::debug!(
+                "try_restart_log_before_write: external readers active (frame={ext}), can't restart the log"
             );
             return Ok(());
         }
@@ -2958,6 +3057,7 @@ impl WalFileShared {
             loaded: AtomicBool::new(true),
             initialized: AtomicBool::new(false),
             epoch: AtomicU32::new(0),
+            external_reader_max_frame: AtomicU64::new(0),
         };
         Arc::new(RwLock::new(shared))
     }
@@ -2990,6 +3090,7 @@ impl WalFileShared {
             loaded: AtomicBool::new(true),
             initialized: AtomicBool::new(false),
             epoch: AtomicU32::new(0),
+            external_reader_max_frame: AtomicU64::new(0),
         };
         Ok(Arc::new(RwLock::new(shared)))
     }
@@ -3041,6 +3142,8 @@ impl WalFileShared {
 
 #[cfg(test)]
 pub mod test {
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    use crate::numeric::Numeric;
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
     use crate::{
@@ -3051,7 +3154,7 @@ pub mod test {
         types::IOResult,
         util::IOExt,
         CheckpointMode, CheckpointResult, Completion, Connection, Database, LimboError, PlatformIO,
-        WalFileShared, IO,
+        Value, WalFileShared, IO,
     };
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -3656,6 +3759,16 @@ pub mod test {
             let wal_any = _wal.as_any();
             if let Some(wal_file) = wal_any.downcast_ref::<crate::WalFile>() {
                 return wal_file.max_frame_read_lock_index.load(Ordering::Acquire)
+                    == _expected_slot;
+            }
+            #[cfg(all(unix, target_pointer_width = "64"))]
+            if let Some(mp_wal) =
+                wal_any.downcast_ref::<crate::storage::multi_process_wal::MultiProcessWal>()
+            {
+                return mp_wal
+                    .inner()
+                    .max_frame_read_lock_index
+                    .load(Ordering::Acquire)
                     == _expected_slot;
             }
         }
@@ -4341,5 +4454,465 @@ pub mod test {
             result.everything_backfilled(),
             "checkpoint must succeed after rollback, not return Busy"
         );
+    }
+
+    /// Test that rescan_wal_from_disk discovers frames written to the WAL
+    /// file on disk. Simulates a reader process that opened the DB before
+    /// the writer wrote any data.
+    #[test]
+    fn test_rescan_wal_from_disk_discovers_new_frames() {
+        use crate::storage::buffer_pool::BufferPool;
+
+        let (db, _path) = get_database();
+        let conn = db.connect().unwrap();
+
+        // Get the WAL file handle BEFORE writing any data — simulates a
+        // reader process that opened the DB at this point.
+        let wal_file_handle = db.shared_wal.read().file.as_ref().unwrap().clone();
+
+        // Build a "stale" WalFileShared from the (currently empty) WAL.
+        let stale_shared = sqlite3_ondisk::build_shared_wal(&wal_file_handle, &db.io).unwrap();
+        let stale_max = stale_shared.read().max_frame.load(Ordering::Acquire);
+        assert_eq!(stale_max, 0, "WAL should be empty before writes");
+
+        // Now write data through the real connection — creates WAL frames.
+        conn.execute("CREATE TABLE test(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("INSERT INTO test(value) VALUES ('hello'), ('world')")
+            .unwrap();
+
+        // The stale shared still shows max_frame=0.
+        assert_eq!(
+            stale_shared.read().max_frame.load(Ordering::Acquire),
+            0,
+            "stale shared must not see new frames"
+        );
+
+        // Create a WalFile with the stale shared (simulates reader process).
+        let last_cksum = stale_shared.read().last_checksum_and_max_frame();
+        let buffer_pool = BufferPool::begin_init(&db.io, 65536);
+        buffer_pool.finalize_with_page_size(4096).unwrap();
+        let reader_wal =
+            super::WalFile::new(db.io.clone(), stale_shared.clone(), last_cksum, buffer_pool);
+
+        // Before rescan: frame_cache is empty.
+        assert!(
+            stale_shared.read().frame_cache.lock().is_empty(),
+            "frame_cache should be empty before rescan"
+        );
+
+        // Rescan from disk.
+        reader_wal.rescan_wal_from_disk().unwrap();
+
+        // After rescan: max_frame > 0 and frame_cache has entries.
+        let refreshed_max = stale_shared.read().max_frame.load(Ordering::Acquire);
+        assert!(
+            refreshed_max > 0,
+            "rescan must discover WAL frames (max_frame={refreshed_max})"
+        );
+        assert!(
+            !stale_shared.read().frame_cache.lock().is_empty(),
+            "frame_cache must have entries after rescan"
+        );
+    }
+
+    /// Test that try_restart_log_before_write does NOT restart the WAL
+    /// when external_reader_max_frame is set (indicating other-process readers).
+    #[test]
+    fn test_restart_blocked_by_external_readers() {
+        let (db, _path) = get_database();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 3, 5);
+
+        // Checkpoint everything so nbackfills == max_frame (restart precondition).
+        {
+            let pager = conn.pager.load();
+            run_checkpoint_until_done(
+                &pager,
+                CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
+            );
+        }
+
+        let max_before = db.shared_wal.read().max_frame.load(Ordering::Acquire);
+        let nbackfills = db.shared_wal.read().nbackfills.load(Ordering::Acquire);
+        assert_eq!(
+            max_before, nbackfills,
+            "everything should be backfilled for restart to be possible"
+        );
+        assert!(max_before > 0, "WAL should have frames");
+
+        // Simulate external readers by setting external_reader_max_frame.
+        db.shared_wal
+            .read()
+            .external_reader_max_frame
+            .store(max_before, Ordering::Release);
+
+        // Now start a write transaction — this calls try_restart_log_before_write
+        // internally, which should be blocked by external readers.
+        {
+            let pager = conn.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            wal.begin_read_tx().unwrap();
+            wal.begin_write_tx().unwrap();
+        }
+
+        // Verify the WAL was NOT restarted — max_frame should still be > 0.
+        let max_after = db.shared_wal.read().max_frame.load(Ordering::Acquire);
+        assert_eq!(
+            max_after, max_before,
+            "WAL restart must be blocked when external readers are active \
+             (max_frame went from {max_before} to {max_after})"
+        );
+
+        // Cleanup: end the write/read transactions.
+        {
+            let pager = conn.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            wal.end_write_tx();
+            wal.end_read_tx();
+        }
+
+        // Clear external readers and verify restart CAN now happen.
+        db.shared_wal
+            .read()
+            .external_reader_max_frame
+            .store(0, Ordering::Release);
+
+        {
+            let pager = conn.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            wal.begin_read_tx().unwrap();
+            wal.begin_write_tx().unwrap();
+        }
+
+        // After clearing external readers and starting a new write tx,
+        // try_restart_log_before_write should have restarted the WAL.
+        let max_final = db.shared_wal.read().max_frame.load(Ordering::Acquire);
+        assert_eq!(
+            max_final, 0,
+            "WAL should be restarted when no external readers (max_frame={max_final})"
+        );
+
+        {
+            let pager = conn.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            wal.end_write_tx();
+            wal.end_read_tx();
+        }
+    }
+
+    /// Test that a second process (simulated via a separate Database instance)
+    /// can see data written by the first process after rescan.
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_cross_process_reader_sees_writer_data() {
+        let (db, path) = get_database();
+        let conn = db.connect().unwrap();
+
+        // Writer: create table and insert data.
+        conn.execute("CREATE TABLE test(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("INSERT INTO test(value) VALUES ('alpha'), ('beta'), ('gamma')")
+            .unwrap();
+
+        // Verify writer can see data.
+        let writer_count = count_test_table(&conn);
+        assert_eq!(writer_count, 3, "writer should see 3 rows");
+
+        // Simulate reader process: open a SECOND Database on the same file.
+        let mut db_path = path;
+        db_path.push("test.db");
+        let io2: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db2 = Database::open_file(io2.clone(), db_path.to_str().unwrap()).unwrap();
+        let conn2 = db2.connect().unwrap();
+
+        // Reader should see the data written by writer (via WAL rescan
+        // that happens in MultiProcessWal::begin_read_tx).
+        let reader_count = count_test_table(&conn2);
+        assert_eq!(
+            reader_count, 3,
+            "reader process must see data written by writer (got {reader_count})"
+        );
+
+        // Writer: insert more data.
+        conn.execute("INSERT INTO test(value) VALUES ('delta')")
+            .unwrap();
+        assert_eq!(count_test_table(&conn), 4, "writer should see 4 rows");
+
+        // Reader: should see the new data after a fresh query (which starts
+        // a new read transaction with WAL rescan).
+        let reader_count2 = count_test_table(&conn2);
+        assert_eq!(
+            reader_count2, 4,
+            "reader must see new data after rescan (got {reader_count2})"
+        );
+    }
+
+    /// Test that when process A creates a new table, process B can see the
+    /// new table's schema and query it. This exercises the reprepare path
+    /// where the DB-level schema is stale and must be reparsed from disk.
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_cross_process_schema_change_visible() {
+        let (db, path) = get_database();
+        let conn = db.connect().unwrap();
+
+        // Writer (process A): create initial table.
+        conn.execute("CREATE TABLE t1(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("INSERT INTO t1(value) VALUES ('hello')")
+            .unwrap();
+
+        // Reader (process B): open a second Database on the same file.
+        let mut db_path = path;
+        db_path.push("test.db");
+        let io2: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db2 = Database::open_file(io2.clone(), db_path.to_str().unwrap()).unwrap();
+        let conn2 = db2.connect().unwrap();
+
+        // Reader can see t1.
+        let mut stmt = conn2.prepare("SELECT value FROM t1").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 1, "reader should see 1 row in t1");
+
+        // Writer: create a SECOND table (increments schema cookie).
+        conn.execute("CREATE TABLE t2(id integer primary key, name text)")
+            .unwrap();
+        conn.execute("INSERT INTO t2(name) VALUES ('world')")
+            .unwrap();
+
+        // Reader: query the new table. This triggers:
+        // 1. WAL rescan (new frames from writer)
+        // 2. Schema cookie mismatch → SchemaUpdated
+        // 3. reprepare → detects stale DB schema → reparses from disk
+        // 4. Successfully re-translates with the new schema
+        let mut stmt2 = conn2.prepare("SELECT name FROM t2").unwrap();
+        let rows2 = stmt2.run_collect_rows().unwrap();
+        assert_eq!(
+            rows2.len(),
+            1,
+            "reader must see data in table created by another process"
+        );
+
+        // Reader: .schema equivalent — query sqlite_schema to see all tables.
+        let mut schema_stmt = conn2
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap();
+        let schema_rows = schema_stmt.run_collect_rows().unwrap();
+        let table_names: Vec<String> = schema_rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Text(s) => s.to_string(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert!(
+            table_names.contains(&"t1".to_string()),
+            "schema should contain t1, got: {table_names:?}"
+        );
+        assert!(
+            table_names.contains(&"t2".to_string()),
+            "schema should contain t2, got: {table_names:?}"
+        );
+    }
+
+    /// Test that a reader process sees a table dropped by the writer.
+    /// After DROP TABLE, prepare("SELECT * FROM t") must fail with "no such table".
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_cross_process_drop_table_visible() {
+        let (db, path) = get_database();
+        let conn = db.connect().unwrap();
+
+        // Writer: create table and insert data.
+        conn.execute("CREATE TABLE t1(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("INSERT INTO t1(value) VALUES ('hello')")
+            .unwrap();
+
+        // Reader: open second Database on the same file.
+        let mut db_path = path;
+        db_path.push("test.db");
+        let io2: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db2 = Database::open_file(io2.clone(), db_path.to_str().unwrap()).unwrap();
+        let conn2 = db2.connect().unwrap();
+
+        // Reader can see t1.
+        let mut stmt = conn2.prepare("SELECT value FROM t1").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Writer: drop the table.
+        conn.execute("DROP TABLE t1").unwrap();
+
+        // Reader: prepare should fail with "no such table".
+        let result = conn2.prepare("SELECT value FROM t1");
+        assert!(result.is_err(), "prepare should fail after DROP TABLE");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("no such table"),
+            "error should mention 'no such table', got: {err_msg}"
+        );
+    }
+
+    /// Test that a reader process sees a table dropped and recreated with
+    /// different columns by the writer.
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_cross_process_drop_and_recreate_table() {
+        let (db, path) = get_database();
+        let conn = db.connect().unwrap();
+
+        // Writer: create table v1.
+        conn.execute("CREATE TABLE t1(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("INSERT INTO t1(value) VALUES ('v1')").unwrap();
+
+        // Reader: open second Database, see t1 v1.
+        let mut db_path = path;
+        db_path.push("test.db");
+        let io2: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db2 = Database::open_file(io2.clone(), db_path.to_str().unwrap()).unwrap();
+        let conn2 = db2.connect().unwrap();
+
+        let mut stmt = conn2.prepare("SELECT value FROM t1").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        match &rows[0][0] {
+            Value::Text(s) => assert_eq!(s.as_str(), "v1"),
+            other => panic!("expected Text, got: {other:?}"),
+        }
+
+        // Writer: drop and recreate with different columns.
+        conn.execute("DROP TABLE t1").unwrap();
+        conn.execute("CREATE TABLE t1(id integer primary key, name text, age integer)")
+            .unwrap();
+        conn.execute("INSERT INTO t1(name, age) VALUES ('alice', 30)")
+            .unwrap();
+
+        // Reader: query new columns. prepare() must detect the schema change,
+        // reparse from disk, and see the new column layout.
+        let mut stmt2 = conn2.prepare("SELECT name, age FROM t1").unwrap();
+        let rows2 = stmt2.run_collect_rows().unwrap();
+        assert_eq!(rows2.len(), 1, "reader should see 1 row in recreated t1");
+        match &rows2[0][0] {
+            Value::Text(s) => assert_eq!(s.as_str(), "alice"),
+            other => panic!("expected Text for name, got: {other:?}"),
+        }
+        match &rows2[0][1] {
+            Value::Numeric(Numeric::Integer(n)) => assert_eq!(*n, 30),
+            other => panic!("expected Integer for age, got: {other:?}"),
+        }
+    }
+
+    /// Test that ALTER TABLE ADD COLUMN by one process is visible to another.
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_cross_process_alter_table_add_column() {
+        let (db, path) = get_database();
+        let conn = db.connect().unwrap();
+
+        // Writer: create table with one column.
+        conn.execute("CREATE TABLE t1(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("INSERT INTO t1(value) VALUES ('hello')")
+            .unwrap();
+
+        // Reader: open second Database and verify existing columns.
+        let mut db_path = path;
+        db_path.push("test.db");
+        let io2: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db2 = Database::open_file(io2.clone(), db_path.to_str().unwrap()).unwrap();
+        let conn2 = db2.connect().unwrap();
+
+        let mut stmt = conn2.prepare("SELECT value FROM t1").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Writer: add a new column.
+        conn.execute("ALTER TABLE t1 ADD COLUMN extra text DEFAULT 'default_val'")
+            .unwrap();
+        conn.execute("INSERT INTO t1(value, extra) VALUES ('world', 'custom')")
+            .unwrap();
+
+        // Reader: query the new column. prepare() should detect stale schema
+        // and reparse from disk.
+        let mut stmt2 = conn2
+            .prepare("SELECT value, extra FROM t1 ORDER BY id")
+            .unwrap();
+        let rows2 = stmt2.run_collect_rows().unwrap();
+        assert_eq!(rows2.len(), 2, "reader should see 2 rows after ALTER TABLE");
+        // First row: extra should be the default value (NULL or 'default_val')
+        // Second row: extra should be 'custom'
+        match &rows2[1][1] {
+            Value::Text(s) => assert_eq!(s.as_str(), "custom"),
+            other => panic!("expected Text 'custom' for extra, got: {other:?}"),
+        }
+    }
+
+    /// Test that sqlite_schema queries work correctly after cross-process
+    /// schema changes (the .schema path).
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_cross_process_sqlite_schema_query() {
+        let (db, path) = get_database();
+        let conn = db.connect().unwrap();
+
+        // Writer: create two tables.
+        conn.execute("CREATE TABLE t1(id integer primary key)")
+            .unwrap();
+        conn.execute("CREATE TABLE t2(id integer primary key)")
+            .unwrap();
+
+        // Reader: open second Database, see both tables via sqlite_schema.
+        let mut db_path = path;
+        db_path.push("test.db");
+        let io2: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db2 = Database::open_file(io2.clone(), db_path.to_str().unwrap()).unwrap();
+        let conn2 = db2.connect().unwrap();
+
+        let table_names = query_table_names(&conn2);
+        assert!(table_names.contains(&"t1".to_string()));
+        assert!(table_names.contains(&"t2".to_string()));
+
+        // Writer: create a third table and drop the first.
+        conn.execute("CREATE TABLE t3(id integer primary key)")
+            .unwrap();
+        conn.execute("DROP TABLE t1").unwrap();
+
+        // Reader: sqlite_schema should reflect the changes.
+        let table_names = query_table_names(&conn2);
+        assert!(
+            !table_names.contains(&"t1".to_string()),
+            "t1 should be dropped, got: {table_names:?}"
+        );
+        assert!(
+            table_names.contains(&"t2".to_string()),
+            "t2 should still exist, got: {table_names:?}"
+        );
+        assert!(
+            table_names.contains(&"t3".to_string()),
+            "t3 should be visible, got: {table_names:?}"
+        );
+    }
+
+    /// Helper: query all table names from sqlite_schema.
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn query_table_names(conn: &Arc<Connection>) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        rows.iter()
+            .map(|r| match &r[0] {
+                Value::Text(s) => s.to_string(),
+                _ => panic!("expected text"),
+            })
+            .collect()
     }
 }
