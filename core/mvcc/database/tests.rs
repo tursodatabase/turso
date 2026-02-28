@@ -2124,8 +2124,12 @@ fn test_rollback() {
         .unwrap()
         .unwrap();
     assert_eq!(row3, row4);
-    db.mvcc_store
-        .rollback_tx(tx1, db.conn.pager.load().clone(), &db.conn);
+    db.mvcc_store.rollback_tx(
+        tx1,
+        db.conn.pager.load().clone(),
+        &db.conn,
+        crate::MAIN_DB_ID,
+    );
     let tx2 = db
         .mvcc_store
         .begin_tx(db.conn.pager.load().clone())
@@ -2379,7 +2383,7 @@ fn test_lost_update() {
     ));
     // hack: in the actual tursodb database we rollback the mvcc tx ourselves, so manually roll it back here
     db.mvcc_store
-        .rollback_tx(tx3, conn3.pager.load().clone(), &conn3);
+        .rollback_tx(tx3, conn3.pager.load().clone(), &conn3, crate::MAIN_DB_ID);
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
@@ -3386,7 +3390,12 @@ fn test_commit_dep_threaded_abort_cascades() {
     signal_rx.recv().unwrap();
 
     // Abort writer → cascade: sets AbortNow on reader, decrements counter
-    mvcc_store.rollback_tx(writer_tx_id, writer_conn.pager.load().clone(), &writer_conn);
+    mvcc_store.rollback_tx(
+        writer_tx_id,
+        writer_conn.pager.load().clone(),
+        &writer_conn,
+        crate::MAIN_DB_ID,
+    );
 
     let (rows, commit_result) = reader_handle.join().unwrap();
 
@@ -3489,7 +3498,12 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
     barrier.wait();
 
     // Abort writer → cascade to ALL readers
-    mvcc_store.rollback_tx(writer_tx_id, writer_conn.pager.load().clone(), &writer_conn);
+    mvcc_store.rollback_tx(
+        writer_tx_id,
+        writer_conn.pager.load().clone(),
+        &writer_conn,
+        crate::MAIN_DB_ID,
+    );
 
     for handle in handles {
         let (rows, commit_result) = handle.join().unwrap();
@@ -3683,7 +3697,12 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
     signal_rx.recv().unwrap();
 
     // Abort writer → cascade to read-only reader
-    mvcc_store.rollback_tx(writer_tx_id, writer_conn.pager.load().clone(), &writer_conn);
+    mvcc_store.rollback_tx(
+        writer_tx_id,
+        writer_conn.pager.load().clone(),
+        &writer_conn,
+        crate::MAIN_DB_ID,
+    );
 
     let (rows, commit_result) = reader_handle.join().unwrap();
 
@@ -4338,6 +4357,30 @@ fn test_should_checkpoint() {
     assert!(mv_store.storage.should_checkpoint());
 }
 
+/// What this test checks: After restart recovery, checkpoint-threshold checks use the recovered log offset.
+/// Why this matters: Shadow-offset drift can suppress auto-checkpoint despite a large recovered log tail.
+#[test]
+fn test_should_checkpoint_after_recovery_uses_recovered_offset() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    }
+
+    db.restart();
+    let _conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+    let recovered_offset = mv_store.storage.logical_log.write().offset;
+
+    mv_store.set_checkpoint_threshold(1);
+    assert!(
+        recovered_offset > 1,
+        "expected recovered log offset > 1 byte"
+    );
+    assert!(mv_store.storage.should_checkpoint());
+}
+
 /// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
@@ -4386,8 +4429,12 @@ fn test_auto_checkpoint_busy_is_ignored() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // Cleanup: release the read lock held by tx2.
-    db.mvcc_store
-        .rollback_tx(tx2, db.conn.pager.load().clone(), &db.conn);
+    db.mvcc_store.rollback_tx(
+        tx2,
+        db.conn.pager.load().clone(),
+        &db.conn,
+        crate::MAIN_DB_ID,
+    );
 }
 
 /// What this test checks: Core MVCC read/write semantics hold for this operation sequence.
@@ -5418,8 +5465,12 @@ fn test_gc_integration_rollback_creates_aborted_garbage() {
         .unwrap();
     let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
     db.mvcc_store.insert(tx1, row).unwrap();
-    db.mvcc_store
-        .rollback_tx(tx1, db.conn.pager.load().clone(), &db.conn);
+    db.mvcc_store.rollback_tx(
+        tx1,
+        db.conn.pager.load().clone(),
+        &db.conn,
+        crate::MAIN_DB_ID,
+    );
 
     // Rollback should leave aborted garbage (begin=None, end=None).
     let entry = db

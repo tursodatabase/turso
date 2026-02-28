@@ -26,6 +26,28 @@ use crate::runner::memory::io::MemorySimIO;
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
 
+/// Pre-create attached DB files with MVCC journal mode so that journal modes
+/// are compatible when ATTACH happens later during simulation.
+fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Item = PathBuf>) {
+    for aux_path in aux_paths {
+        let aux_db = Database::open_file_with_flags(
+            io.clone(),
+            aux_path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new().with_attach(true),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("Failed to open aux DB {aux_path:?}: {e}"));
+        let aux_conn = aux_db
+            .connect()
+            .expect("Failed to connect to aux DB for MVCC setup");
+        aux_conn
+            .execute("PRAGMA journal_mode = 'experimental_mvcc'")
+            .expect("Failed to enable MVCC on aux DB");
+        aux_conn.close().expect("Failed to close aux DB connection");
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum SimulationType {
     Default,
@@ -804,6 +826,7 @@ impl SimulatorEnv {
             std::fs::remove_file(&wal_path).unwrap();
         }
 
+        // Remove MVCC logical log file
         let log_path = db_path.with_extension("db-log");
         if log_path.exists() {
             std::fs::remove_file(&log_path).unwrap();
@@ -842,6 +865,23 @@ impl SimulatorEnv {
                 panic!("error opening simulator test file {db_path:?}: {e:?}");
             }
         };
+
+        // Re-enable MVCC mode if the profile says to use MVCC
+        if self.profile.experimental_mvcc {
+            let conn = db
+                .connect()
+                .expect("Failed to create connection for MVCC setup");
+            conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+                .expect("Failed to enable MVCC mode");
+
+            enable_mvcc_on_attached_dbs(
+                &io,
+                self.attached_dbs
+                    .iter()
+                    .map(|name| self.get_aux_db_path(name)),
+            );
+        }
+
         self.io = io;
         self.db = Some(db);
     }
@@ -932,6 +972,7 @@ impl SimulatorEnv {
             std::fs::remove_file(&wal_path).unwrap();
         }
 
+        // Remove MVCC logical log file
         let log_path = db_path.with_extension("db-log");
         if log_path.exists() {
             std::fs::remove_file(&log_path).unwrap();
@@ -1025,6 +1066,13 @@ impl SimulatorEnv {
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
+
+            enable_mvcc_on_attached_dbs(
+                &io,
+                attached_dbs
+                    .iter()
+                    .map(|name| paths.aux_db(&simulation_type, &SimulationPhase::Test, name)),
+            );
         }
 
         let connections = (0..profile.max_connections)

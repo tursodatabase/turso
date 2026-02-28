@@ -77,7 +77,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 |---------------------------|---------|-----------------------------------------------------------------------------------|
 | ALTER TABLE               | ✅ Yes     |                                                                                   |
 | ANALYZE                   | ✅ Yes     |                                                                                   |
-| ATTACH DATABASE           | 🚧 Partial | Only for reads. All modifications will currently fail to find the table           |
+| ATTACH DATABASE           | ✅ Yes     |                                                                                   |
 | BEGIN TRANSACTION         | ✅ Yes     |                                                                                   |
 | COMMIT TRANSACTION        | ✅ Yes     |                                                                                   |
 | CHECK                     | ✅ Yes     |                                                                                   |

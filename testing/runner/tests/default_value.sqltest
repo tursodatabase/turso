@@ -69,4 +69,19 @@ test default-value-identifier {
 expect {
     asdf
 }
+ 
+test default-value-ident-to-str {
+    CREATE TABLE t7 (x INTEGER NOT NULL, y DEFAULT "x");
+    INSERT INTO t7 (x) VALUES (1);
+    SELECT y FROM t7 WHERE x = 1;
+}
+expect {
+    x
+}
 
+test default-value-column-name {
+    CREATE TABLE t7 (x, y DEFAULT ("x"));
+}
+expect error {
+    default value of column \[y\] is not constant
+}

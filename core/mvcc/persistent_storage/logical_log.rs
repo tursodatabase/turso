@@ -202,7 +202,7 @@ impl LogHeader {
             ));
         }
         let hdr_len = u16::from_le_bytes([buf[6], buf[7]]);
-        if (hdr_len as usize) < LOG_HDR_SIZE {
+        if hdr_len as usize != LOG_HDR_SIZE {
             return Err(LimboError::Corrupt(format!(
                 "Invalid logical log header length {hdr_len}"
             )));
@@ -686,19 +686,11 @@ impl StreamingLogicalLogReader {
             return Ok(HeaderReadResult::NoLog);
         }
 
-        let mut header_bytes = self.read_exact_at(io, 0, LOG_HDR_SIZE)?;
+        let header_bytes = self.read_exact_at(io, 0, LOG_HDR_SIZE)?;
         let hdr_len = u16::from_le_bytes([header_bytes[6], header_bytes[7]]) as usize;
-        if hdr_len < LOG_HDR_SIZE {
+        if hdr_len != LOG_HDR_SIZE {
             self.set_invalid_header_state();
             return Ok(HeaderReadResult::Invalid);
-        }
-        if self.file_size < hdr_len {
-            self.set_invalid_header_state();
-            return Ok(HeaderReadResult::Invalid);
-        }
-        if hdr_len > LOG_HDR_SIZE {
-            let extra = self.read_exact_at(io, LOG_HDR_SIZE as u64, hdr_len - LOG_HDR_SIZE)?;
-            header_bytes.extend_from_slice(&extra);
         }
 
         match LogHeader::decode(&header_bytes) {
@@ -846,9 +838,14 @@ impl StreamingLogicalLogReader {
             let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
 
             let (payload_len, payload_len_bytes, payload_len_bytes_len) =
-                match self.consume_varint_bytes(io)? {
-                    Some((value, bytes, len)) => (value, bytes, len),
-                    None => return Ok(ParseResult::Eof),
+                match self.consume_varint_bytes(io) {
+                    Ok(Some((value, bytes, len))) => (value, bytes, len),
+                    Ok(None) => return Ok(ParseResult::Eof),
+                    Err(LimboError::Corrupt(_)) => {
+                        self.last_valid_offset = frame_start;
+                        return Ok(ParseResult::InvalidFrame);
+                    }
+                    Err(err) => return Err(err),
                 };
             running_crc =
                 crc32c::crc32c_append(running_crc, &payload_len_bytes[..payload_len_bytes_len]);
@@ -2146,6 +2143,53 @@ mod tests {
         assert!(matches!(res.unwrap(), StreamingResult::Eof));
     }
 
+    /// What this test checks: Malformed payload-length varint in newest frame is treated as invalid tail.
+    /// Why this matters: Recovery must preserve already-validated commits instead of failing hard.
+    #[test]
+    fn test_logical_log_payload_len_varint_corrupt_tail_keeps_prefix() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file(
+                "payload-len-varint-corrupt.db-log",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone());
+
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 1, false, false, "first");
+        let frame2_start = log.offset;
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 2, false, false, "second");
+
+        // Corrupt frame-2 payload_len varint into an invalid 9-byte varint sequence.
+        let payload_len_offset = frame2_start + (TX_HEADER_SIZE + 6) as u64;
+        let mut bad_varint = vec![0x80; 8];
+        bad_varint.push(0x00);
+        let c = file
+            .pwrite(
+                payload_len_offset,
+                Arc::new(Buffer::new(bad_varint)),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let read_back = read_table_ops(file, &io);
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(
+            read_back[0],
+            ExpectedTableOp::Upsert {
+                rowid: 1,
+                payload: generate_simple_string_row((-2).into(), 1, "first")
+                    .payload()
+                    .to_vec(),
+                commit_ts: 1,
+                btree_resident: false,
+            }
+        );
+    }
+
     /// What this test checks: Frames with invalid trailer end-magic are treated as invalid tail.
     /// Why this matters: End-magic damage in newest bytes should not fail startup.
     #[test]
@@ -2335,6 +2379,40 @@ mod tests {
         io.wait_for_completion(c).unwrap();
 
         let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let res = reader.read_header(&io);
+        assert!(res.is_err());
+    }
+
+    /// What this test checks: v2 headers must use the fixed 56-byte length.
+    /// Why this matters: Accepting larger lengths can misalign frame parsing and drop valid commits.
+    #[test]
+    fn test_logical_log_header_non_default_len_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let (file, _) = write_single_table_tx(&io, "header-len.db-log", 106);
+
+        let header_buf = Arc::new(Buffer::new_temporary(LOG_HDR_SIZE));
+        let c = file
+            .pread(0, Completion::new_read(header_buf.clone(), |_| None))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        let mut header_bytes = header_buf.as_slice()[..LOG_HDR_SIZE].to_vec();
+
+        header_bytes[6..8].copy_from_slice(&(LOG_HDR_SIZE as u16 + 1).to_le_bytes());
+        header_bytes[LOG_HDR_CRC_START..LOG_HDR_SIZE].fill(0);
+        let new_crc = crc32c::crc32c(&header_bytes);
+        header_bytes[LOG_HDR_CRC_START..LOG_HDR_SIZE].copy_from_slice(&new_crc.to_le_bytes());
+
+        let c = file
+            .pwrite(
+                0,
+                Arc::new(Buffer::new(header_bytes)),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file);
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }

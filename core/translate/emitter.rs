@@ -1414,6 +1414,11 @@ pub fn emit_query<'a>(
 
     if plan.is_simple_count() {
         emit_simple_count(program, t_ctx, plan)?;
+        // Keep LIMIT's early-exit jump target valid even on the simple_count fast path.
+        // init_limit may emit an IfNot to after_main_loop_label (e.g. scalar subquery injects LIMIT 1).
+        // Without resolving this label before the early return, bytecode assembly fails
+        // with an unresolved IfNot target.
+        program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(t_ctx.reg_result_cols_start.unwrap());
     }
 

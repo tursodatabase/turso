@@ -1059,7 +1059,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// Validates a single version chain against the current transaction's commit timestamp.
     ///
     /// This enforces snapshot-isolation conflict checks for both:
-    /// 1. versions ended by concurrent commits (`end >= tx.begin_ts`), and
+    /// 1. versions ended by concurrent commits (`end > tx.begin_ts`), and
     /// 2. live versions owned by concurrent transactions (state/ts tie-breaking).
     fn check_version_conflicts(
         &self,
@@ -1074,7 +1074,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             // committed transaction after our begin timestamp. Even if that
             // version is now "ended", this is still a write-write conflict.
             if let Some(TxTimestampOrID::Timestamp(end_ts)) = version.end {
-                if end_ts >= tx.begin_ts {
+                turso_assert!(
+                    end_ts != tx.begin_ts,
+                    "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic"
+                );
+                if end_ts > tx.begin_ts {
                     return Err(LimboError::WriteWriteConflict);
                 }
             }
@@ -3256,6 +3260,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(state_machine)
     }
 
+    /// Returns true if the transaction can be rolled back (Active or Preparing).
+    pub fn is_tx_rollbackable(&self, tx_id: TxID) -> bool {
+        self.txs.get(&tx_id).is_some_and(|tx| {
+            matches!(
+                tx.value().state.load(),
+                TransactionState::Active | TransactionState::Preparing(_)
+            )
+        })
+    }
+
     /// Rolls back a transaction with the specified ID.
     ///
     /// This function rolls back a transaction with the specified `tx_id` by
@@ -3264,13 +3278,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to abort.
-    pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection) {
+    /// * `db` - The database index this transaction belongs to.
+    pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection, db: usize) {
         let tx_unlocked = self
             .txs
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
-        connection.set_mv_tx(None);
+        connection.set_mv_tx_for_db(db, None);
         turso_assert!(matches!(
             tx.state.load(),
             TransactionState::Active | TransactionState::Preparing(_)
@@ -4640,9 +4655,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     self.global_header.write().replace(header);
                 }
                 StreamingResult::Eof => {
-                    let mut log = self.storage.logical_log.write();
-                    log.offset = reader.last_valid_offset() as u64;
-                    log.running_crc = reader.running_crc();
+                    let recovered_offset = reader.last_valid_offset() as u64;
+                    let recovered_running_crc = reader.running_crc();
+                    self.storage.restore_logical_log_state_after_recovery(
+                        recovered_offset,
+                        recovered_running_crc,
+                    );
                     break;
                 }
             }
@@ -4882,8 +4900,12 @@ impl RowVersion {
         // Check if this version represents a deletion/update that affects us
         match self.end {
             Some(TxTimestampOrID::Timestamp(end_ts)) => {
-                // Row was deleted at end_ts. If we started at or after end_ts, we shouldn't see it
-                tx.begin_ts >= end_ts
+                // Row was deleted at end_ts. If we started after end_ts, we shouldn't see it
+                turso_assert!(
+                    tx.begin_ts != end_ts,
+                    "begin_ts and committed end_ts cannot be equal: txn timestamps are strictly monotonic"
+                );
+                tx.begin_ts > end_ts
             }
             Some(TxTimestampOrID::TxID(end_tx_id)) => {
                 // Row is being deleted/updated by another transaction
@@ -4993,7 +5015,13 @@ fn is_begin_visible(
     rv: &RowVersion,
 ) -> bool {
     match rv.begin {
-        Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => tx.begin_ts >= rv_begin_ts,
+        Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => {
+            turso_assert!(
+                tx.begin_ts != rv_begin_ts,
+                "begin_ts and committed rv_begin_ts cannot be equal: txn timestamps are strictly monotonic"
+            );
+            tx.begin_ts > rv_begin_ts
+        }
         Some(TxTimestampOrID::TxID(rv_begin)) => {
             let visible = match txs.get(&rv_begin) {
                 Some(tb_entry) => {
@@ -5002,21 +5030,31 @@ fn is_begin_visible(
                         TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
                         TransactionState::Preparing(end_ts) => {
                             // Hekaton Table 1 / Section 2.5: speculative read of TB.
-                            // If begin_ts >= end_ts, the version would be visible once TB
+                            // If begin_ts > end_ts, the version would be visible once TB
                             // commits. Speculatively return true and register a dependency.
                             // Fixes partial commit visibility (Bug #8).
                             turso_assert!(
                                 tx.tx_id != tb.tx_id,
                                 "a txn cannot read its own row versions during prepare"
                             );
-                            if tx.begin_ts >= end_ts {
+                            turso_assert!(
+                                tx.begin_ts != end_ts,
+                                "begin_ts and preparing end_ts cannot be equal: txn timestamps are strictly monotonic"
+                            );
+                            if tx.begin_ts > end_ts {
                                 register_commit_dependency(txs, tx, rv_begin);
                                 true
                             } else {
                                 false
                             }
                         }
-                        TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
+                        TransactionState::Committed(committed_ts) => {
+                            turso_assert!(
+                                tx.begin_ts != committed_ts,
+                                "begin_ts and committed_ts cannot be equal: txn timestamps are strictly monotonic"
+                            );
+                            tx.begin_ts > committed_ts
+                        }
                         TransactionState::Aborted => false,
                         TransactionState::Terminated => {
                             tracing::debug!(
@@ -5033,7 +5071,13 @@ fn is_begin_visible(
                     visible
                 }
                 None => match lookup_finalized_tx_state(finalized_tx_states, rv_begin) {
-                    Some(TransactionState::Committed(committed_ts)) => tx.begin_ts >= committed_ts,
+                    Some(TransactionState::Committed(committed_ts)) => {
+                        turso_assert!(
+                            tx.begin_ts != committed_ts,
+                            "begin_ts and committed_ts cannot be equal: txn timestamps are strictly monotonic"
+                        );
+                        tx.begin_ts > committed_ts
+                    }
                     Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => false,
                     Some(TransactionState::Active) | Some(TransactionState::Preparing(_)) => {
                         unreachable!(
@@ -5072,7 +5116,7 @@ fn is_end_visible(
                         // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
                         // Source: https://avi.im/blag/2023/hekaton-paper-typo/
                         TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                        // Hekaton Table 2: speculative ignore of TE. If end_ts <= begin_ts,
+                        // Hekaton Table 2: speculative ignore of TE. If end_ts < begin_ts,
                         // we speculatively ignore V (treat deletion as committed). Register a
                         // dependency in case TE aborts (then V should have been visible).
                         TransactionState::Preparing(end_ts) => {
