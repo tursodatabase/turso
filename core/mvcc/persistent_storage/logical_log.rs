@@ -24,9 +24,10 @@
 //! - `reserved: [u8; 36]` (must be zero for current format)
 //! - `hdr_crc32c: u32` (CRC32C of the header with this field zeroed)
 //!
-//! ### Transaction frame
+//! ### Transaction frame (LOG_VERSION = 2)
 //!
-//! Header (`TX_HEADER_SIZE = 16`):
+//! Header (`TX_HEADER_SIZE = 24`):
+//! - `payload_size: u64` (total bytes of all op entries)
 //! - `frame_magic: u32` (`FRAME_MAGIC`)
 //! - `op_count: u32`
 //! - `commit_ts: u64`
@@ -39,8 +40,7 @@
 //!   - `payload_len: sqlite varint`
 //!   - `payload: [u8; payload_len]`
 //!
-//! Trailer (`TX_TRAILER_SIZE = 16`):
-//! - `payload_size: u64` (total bytes of all op entries)
+//! Trailer (`TX_TRAILER_SIZE = 8`):
 //! - `crc32c: u32` (chained CRC32C: `crc32c_append(prev_frame_crc, tx_header || payload)`;
 //!   the first frame uses `crc32c(salt.to_le_bytes())` as its seed)
 //! - `end_magic: u32` (`END_MAGIC`)
@@ -137,9 +137,9 @@ const OP_UPDATE_HEADER: u8 = 4;
 
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 
-const TX_HEADER_SIZE: usize = 16;
-const TX_TRAILER_SIZE: usize = 16;
-const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE;
+const TX_HEADER_SIZE: usize = 24; // payload_size(8) + FRAME_MAGIC(4) + op_count(4) + commit_ts(8)
+const TX_TRAILER_SIZE: usize = 8; // crc32c(4) + END_MAGIC(4)
+const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
 
 /// Log's Header, the first 56 bytes of any logical log file.
 #[derive(Clone, Debug)]
@@ -327,43 +327,49 @@ impl LogicalLog {
             self.write_buf.extend_from_slice(&header_bytes);
         }
 
-        // 2. Serialize Transaction header
+        // 2. Serialize Transaction header.
         // A header-only transaction is encoded as a single OP_UPDATE_HEADER op.
+        // payload_size must appear first in the header but is only known after serializing all
+        // ops. We reserve TX_HEADER_SIZE bytes as a placeholder and backfill in step 4.
         let op_count = u32::try_from(tx.row_versions.len() + usize::from(tx.header.is_some()))
             .map_err(|_| {
                 LimboError::InternalError("Logical log op_count exceeds u32".to_string())
             })?;
+        let commit_ts = tx.tx_timestamp;
         let tx_header_start = self.write_buf.len();
-        self.write_buf.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
-        self.write_buf.extend_from_slice(&op_count.to_le_bytes());
-        self.write_buf
-            .extend_from_slice(&tx.tx_timestamp.to_le_bytes());
-
-        let payload_start = self.write_buf.len();
+        self.write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
 
         // 3. Serialize ops (both table and index rows)
+        let payload_start = self.write_buf.len();
         for row_version in &tx.row_versions {
             serialize_op_entry(&mut self.write_buf, row_version)?;
         }
         if let Some(header) = tx.header {
             serialize_header_entry(&mut self.write_buf, &header);
         }
-
+        let payload_size = (self.write_buf.len() - payload_start) as u64;
         let payload_end = self.write_buf.len();
-        let payload_size = (payload_end - payload_start) as u64;
-        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
+
+        // 4. Backfill TX HEADER: payload_size(8) | FRAME_MAGIC(4) | op_count(4) | commit_ts(8)
+        self.write_buf[tx_header_start..tx_header_start + 8]
+            .copy_from_slice(&payload_size.to_le_bytes());
+        self.write_buf[tx_header_start + 8..tx_header_start + 12]
+            .copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        self.write_buf[tx_header_start + 12..tx_header_start + 16]
+            .copy_from_slice(&op_count.to_le_bytes());
+        self.write_buf[tx_header_start + 16..tx_header_start + 24]
+            .copy_from_slice(&commit_ts.to_le_bytes());
+
+        // 5. Serialize trailer: chained CRC over TX_HEADER (24 B) + payload, then END_MAGIC.
+        // Seed from running_crc (derived from salt, or previous frame's CRC).
         let crc = crc32c::crc32c_append(
             self.running_crc,
             &self.write_buf[tx_header_start..payload_end],
         );
-
-        // 4. Serialize trailer
-        self.write_buf
-            .extend_from_slice(&payload_size.to_le_bytes());
         self.write_buf.extend_from_slice(&crc.to_le_bytes());
         self.write_buf.extend_from_slice(&END_MAGIC.to_le_bytes());
 
-        // 5. Write to disk
+        // 6. Write to disk
         let buffer = Arc::new(Buffer::new(self.write_buf.clone()));
         let c = Completion::new_write({
             let buffer_len = buffer.len();
@@ -772,31 +778,42 @@ impl StreamingLogicalLogReader {
             None => return Ok(ParseResult::Eof),
         };
 
-        let frame_magic = u32::from_le_bytes([
+        // TX HEADER layout (24 bytes): payload_size(8) | FRAME_MAGIC(4) | op_count(4) | commit_ts(8)
+        let payload_size = u64::from_le_bytes([
             header_bytes[0],
             header_bytes[1],
             header_bytes[2],
             header_bytes[3],
+            header_bytes[4],
+            header_bytes[5],
+            header_bytes[6],
+            header_bytes[7],
+        ]);
+        let frame_magic = u32::from_le_bytes([
+            header_bytes[8],
+            header_bytes[9],
+            header_bytes[10],
+            header_bytes[11],
         ]);
         if frame_magic != FRAME_MAGIC {
             self.last_valid_offset = frame_start;
             return Ok(ParseResult::InvalidFrame);
         }
         let op_count = u32::from_le_bytes([
-            header_bytes[4],
-            header_bytes[5],
-            header_bytes[6],
-            header_bytes[7],
-        ]);
-        let commit_ts = u64::from_le_bytes([
-            header_bytes[8],
-            header_bytes[9],
-            header_bytes[10],
-            header_bytes[11],
             header_bytes[12],
             header_bytes[13],
             header_bytes[14],
             header_bytes[15],
+        ]);
+        let commit_ts = u64::from_le_bytes([
+            header_bytes[16],
+            header_bytes[17],
+            header_bytes[18],
+            header_bytes[19],
+            header_bytes[20],
+            header_bytes[21],
+            header_bytes[22],
+            header_bytes[23],
         ]);
 
         // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
@@ -969,29 +986,21 @@ impl StreamingLogicalLogReader {
             None => return Ok(ParseResult::Eof),
         };
 
-        let payload_size = u64::from_le_bytes([
+        // TX TRAILER layout (8 bytes): crc32c(4) | END_MAGIC(4)
+        let crc32c_expected = u32::from_le_bytes([
             trailer_bytes[0],
             trailer_bytes[1],
             trailer_bytes[2],
             trailer_bytes[3],
+        ]);
+        let end_magic = u32::from_le_bytes([
             trailer_bytes[4],
             trailer_bytes[5],
             trailer_bytes[6],
             trailer_bytes[7],
         ]);
-        let crc32c_expected = u32::from_le_bytes([
-            trailer_bytes[8],
-            trailer_bytes[9],
-            trailer_bytes[10],
-            trailer_bytes[11],
-        ]);
-        let end_magic = u32::from_le_bytes([
-            trailer_bytes[12],
-            trailer_bytes[13],
-            trailer_bytes[14],
-            trailer_bytes[15],
-        ]);
 
+        // Validate payload_size from frame header against bytes actually consumed
         if payload_size != payload_bytes_read {
             self.last_valid_offset = frame_start;
             return Ok(ParseResult::InvalidFrame);
@@ -1363,14 +1372,14 @@ mod tests {
             MVTableId, Row, RowID, RowKey, SortableIndexKey,
         },
         schema::Table,
-        storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
+        storage::sqlite3_ondisk::{read_varint, varint_len, write_varint, DatabaseHeader},
         types::{ImmutableRecord, IndexInfo, Text},
         Buffer, Completion, LimboError, Value, ValueRef,
     };
 
     use super::{
-        HeaderReadResult, LogHeader, LogicalLog, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START,
-        LOG_HDR_SIZE, TX_HEADER_SIZE, TX_TRAILER_SIZE,
+        HeaderReadResult, LogHeader, LogicalLog, FRAME_MAGIC, LOG_HDR_CRC_START,
+        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_MAGIC, TX_HEADER_SIZE, TX_TRAILER_SIZE,
     };
     use super::{ParseResult, StreamingLogicalLogReader, StreamingResult};
     use crate::OpenFlags;
@@ -2067,8 +2076,13 @@ mod tests {
         }
     }
 
-    /// What this test checks: Rowid varint encoding/decoding is consistent for negative i64-style values used by this path.
+    /// What this test checks: Rowid varint encoding/decoding is consistent for negative i64-style
+    /// values, and the deferred-offset write path (log_tx_deferred_offset) does not advance the
+    /// writer offset until advance_offset_after_success is called, after which all frames are
+    /// readable with a valid CRC chain.
     /// Why this matters: Rowid decoding mismatches would replay to the wrong keys.
+    ///   The MVCC commit path uses deferred writes so an aborted commit can be silently overwritten;
+    ///   the offset must not advance before confirmation.
     #[test]
     fn test_logical_log_rowid_negative_varint_roundtrip() {
         init_tracing();
@@ -2084,15 +2098,47 @@ mod tests {
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), -1, 1, false, false, "neg");
         append_single_table_op_tx(&mut log, &io, (-2).into(), -1, 2, true, false, "neg");
+        let offset_after_frame2 = log.offset;
+
+        // Frame 3: deferred path — offset must not advance until confirmed.
+        let row3 = generate_simple_string_row((-2).into(), 3, "deferred");
+        let tx3 = crate::mvcc::database::LogRecord {
+            tx_timestamp: 3,
+            row_versions: vec![crate::mvcc::database::RowVersion {
+                id: 3,
+                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(3)),
+                end: None,
+                row: row3,
+                btree_resident: false,
+            }],
+            header: None,
+        };
+        let (c, bytes_written) = log.log_tx_deferred_offset(&tx3).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        assert_eq!(
+            log.offset, offset_after_frame2,
+            "deferred write must not advance offset before advance_offset_after_success"
+        );
+        log.advance_offset_after_success(bytes_written);
+        assert_eq!(
+            log.offset,
+            offset_after_frame2 + bytes_written,
+            "offset must advance by exactly bytes_written after confirmation"
+        );
 
         let read_back = read_table_ops(file, &io);
-        assert_eq!(read_back.len(), 2);
+        assert_eq!(read_back.len(), 3);
         match &read_back[0] {
             ExpectedTableOp::Upsert { rowid, .. } => assert_eq!(*rowid, -1),
             other => panic!("unexpected op: {other:?}"),
         }
         match &read_back[1] {
             ExpectedTableOp::Delete { rowid, .. } => assert_eq!(*rowid, -1),
+            other => panic!("unexpected op: {other:?}"),
+        }
+        match &read_back[2] {
+            ExpectedTableOp::Upsert { rowid, .. } => assert_eq!(*rowid, 3),
             other => panic!("unexpected op: {other:?}"),
         }
     }
@@ -2125,10 +2171,12 @@ mod tests {
         let c = log.log_tx(&tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        // Flip one byte in the op payload.
+        // Flip one byte in the op data (varint payload_len).
         let mut reader = StreamingLogicalLogReader::new(file.clone());
         reader.read_header(&io).unwrap();
-        let offset = reader.offset + TX_HEADER_SIZE + 6 + 1; // header + fixed op + first payload byte
+        // After read_header, reader.offset = LOG_HDR_SIZE.
+        // Skip frame header (TX_HEADER_SIZE) + fixed op prefix (tag+flags+table_id = 6 bytes).
+        let offset = reader.offset + TX_HEADER_SIZE + 6; // first byte of varint payload_len
         let buf = Arc::new(Buffer::new(vec![0xFF]));
         let c = file
             .pwrite(offset as u64, buf, Completion::new_write(|_| {}))
@@ -2198,10 +2246,11 @@ mod tests {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let (file, op_size) = write_single_table_tx(&io, "end-magic.db-log", 100);
         let trailer_offset = LOG_HDR_SIZE + TX_HEADER_SIZE + op_size;
+        // TX trailer layout: [crc32c(4)][END_MAGIC(4)]; END_MAGIC is at offset +4.
         let bad = Arc::new(Buffer::new(0u32.to_le_bytes().to_vec()));
         let c = file
             .pwrite(
-                (trailer_offset + 8) as u64,
+                (trailer_offset + 4) as u64,
                 bad,
                 Completion::new_write(|_| {}),
             )
@@ -2216,18 +2265,19 @@ mod tests {
         assert!(matches!(res.unwrap(), StreamingResult::Eof));
     }
 
-    /// What this test checks: Trailer payload-size mismatch in the newest frame is treated as invalid tail.
+    /// What this test checks: Header payload-size mismatch in the newest frame is treated as invalid tail.
     /// Why this matters: Prefix-preserving recovery should not hard-fail on newest damaged frame.
     #[test]
     fn test_logical_log_payload_size_corruption() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let (file, op_size) = write_single_table_tx(&io, "payload-size.db-log", 101);
-        let trailer_offset = LOG_HDR_SIZE + TX_HEADER_SIZE + op_size;
+        // TX header layout: [payload_size(8)][FRAME_MAGIC(4)][op_count(4)][commit_ts(8)]
+        // payload_size is at byte 0 of the frame (right after LOG_HDR_SIZE).
         let bad_payload_size = (op_size as u64 + 1).to_le_bytes().to_vec();
         let bad = Arc::new(Buffer::new(bad_payload_size));
         let c = file
-            .pwrite(trailer_offset as u64, bad, Completion::new_write(|_| {}))
+            .pwrite(LOG_HDR_SIZE as u64, bad, Completion::new_write(|_| {}))
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -2247,9 +2297,15 @@ mod tests {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let (file, _) = write_single_table_tx(&io, "frame-magic.db-log", 103);
 
+        // TX header layout: [payload_size(8)][FRAME_MAGIC(4)][op_count(4)][commit_ts(8)]
+        // FRAME_MAGIC is at offset +8 from frame start.
         let bad = Arc::new(Buffer::new(0u32.to_le_bytes().to_vec()));
         let c = file
-            .pwrite(LOG_HDR_SIZE as u64, bad, Completion::new_write(|_| {}))
+            .pwrite(
+                (LOG_HDR_SIZE + 8) as u64,
+                bad,
+                Completion::new_write(|_| {}),
+            )
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -2269,13 +2325,10 @@ mod tests {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let (file, op_size) = write_single_table_tx(&io, "crc-field.db-log", 104);
         let trailer_offset = LOG_HDR_SIZE + TX_HEADER_SIZE + op_size;
+        // TX trailer layout: [crc32c(4)][END_MAGIC(4)]; crc32c is at offset +0.
         let bad = Arc::new(Buffer::new(0u32.to_le_bytes().to_vec()));
         let c = file
-            .pwrite(
-                (trailer_offset + 8) as u64,
-                bad,
-                Completion::new_write(|_| {}),
-            )
+            .pwrite(trailer_offset as u64, bad, Completion::new_write(|_| {}))
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -2308,7 +2361,8 @@ mod tests {
         let after_second = log.offset as usize;
         let second_frame_len = after_second - after_first;
 
-        let second_trailer_crc_offset = after_first + second_frame_len - TX_TRAILER_SIZE + 8;
+        // TX trailer layout: [crc32c(4)][END_MAGIC(4)]; crc32c is at trailer offset +0.
+        let second_trailer_crc_offset = after_first + second_frame_len - TX_TRAILER_SIZE;
         let c = file
             .pwrite(
                 second_trailer_crc_offset as u64,
@@ -2383,8 +2437,9 @@ mod tests {
         assert!(res.is_err());
     }
 
-    /// What this test checks: v2 headers must use the fixed 56-byte length.
+    /// What this test checks: v2 headers must use the fixed 56-byte length and a known version byte.
     /// Why this matters: Accepting larger lengths can misalign frame parsing and drop valid commits.
+    ///   Unknown versions must not be silently misread.
     #[test]
     fn test_logical_log_header_non_default_len_rejected() {
         init_tracing();
@@ -2396,8 +2451,10 @@ mod tests {
             .pread(0, Completion::new_read(header_buf.clone(), |_| None))
             .unwrap();
         io.wait_for_completion(c).unwrap();
-        let mut header_bytes = header_buf.as_slice()[..LOG_HDR_SIZE].to_vec();
+        let original_header_bytes = header_buf.as_slice()[..LOG_HDR_SIZE].to_vec();
 
+        // Test 1: non-default header length (LOG_HDR_SIZE + 1) with valid CRC is rejected.
+        let mut header_bytes = original_header_bytes.clone();
         header_bytes[6..8].copy_from_slice(&(LOG_HDR_SIZE as u16 + 1).to_le_bytes());
         header_bytes[LOG_HDR_CRC_START..LOG_HDR_SIZE].fill(0);
         let new_crc = crc32c::crc32c(&header_bytes);
@@ -2412,9 +2469,32 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file.clone());
         let res = reader.read_header(&io);
         assert!(res.is_err());
+
+        // Test 2: unknown version byte (99) with valid CRC is rejected as Invalid.
+        let mut header_bytes = original_header_bytes.clone();
+        header_bytes[4] = 99; // unknown version
+        header_bytes[LOG_HDR_CRC_START..LOG_HDR_SIZE].fill(0);
+        let new_crc = crc32c::crc32c(&header_bytes);
+        header_bytes[LOG_HDR_CRC_START..LOG_HDR_SIZE].copy_from_slice(&new_crc.to_le_bytes());
+
+        let c = file
+            .pwrite(
+                0,
+                Arc::new(Buffer::new(header_bytes)),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file);
+        let result = reader.try_read_header(&io).unwrap();
+        assert!(
+            matches!(result, HeaderReadResult::Invalid),
+            "unknown version header must be rejected as Invalid, got {result:?}"
+        );
     }
 
     /// What this test checks: Non-zero reserved bytes in the file header are rejected for this format version.
@@ -2508,8 +2588,11 @@ mod tests {
         assert!(matches!(res.unwrap(), StreamingResult::Eof));
     }
 
-    /// What this test checks: Zero-operation frames are valid and round-trip correctly.
+    /// What this test checks: Zero-operation frames are silently skipped by the reader, and a
+    /// LogRecord carrying a DatabaseHeader round-trips as UpdateHeader with all fields intact.
     /// Why this matters: Edge-case frame shapes must remain parseable to keep format handling robust.
+    ///   UPDATE_HEADER is a distinct op type with its own fixed-size payload, zero-flags constraint,
+    ///   zero-table_id constraint, and magic validation — none of which the table/index op tests cover.
     #[test]
     fn test_logical_log_empty_transaction_frame() {
         init_tracing();
@@ -2519,6 +2602,7 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone());
 
+        // Frame 1: empty tx (no ops). The reader must skip it silently (ops.is_empty() → continue).
         let tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 200,
             row_versions: vec![],
@@ -2527,14 +2611,45 @@ mod tests {
         let c = log.log_tx(&tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
+        // Frame 2: header-only tx. DatabaseHeader::default() has the SQLite magic that passes
+        // the reader's magic validation check.
+        let commit_ts = 201u64;
+        let db_header = DatabaseHeader::default();
+        let header_tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: commit_ts,
+            row_versions: vec![],
+            header: Some(db_header),
+        };
+        let c = log.log_tx(&header_tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
         let mut reader = StreamingLogicalLogReader::new(file.clone());
         reader.read_header(&io).unwrap();
+
+        // The reader skips the empty frame and returns the UpdateHeader from frame 2.
         let rec = reader
             .next_record(&io, |_id| {
                 Err(LimboError::InternalError("no index".to_string()))
             })
             .unwrap();
-        assert!(matches!(rec, StreamingResult::Eof));
+        match rec {
+            StreamingResult::UpdateHeader {
+                header: recovered,
+                commit_ts: recovered_ts,
+            } => {
+                assert_eq!(recovered_ts, commit_ts);
+                assert_eq!(recovered.magic, db_header.magic);
+            }
+            other => panic!("expected UpdateHeader, got {other:?}"),
+        }
+
+        // Nothing left after frame 2.
+        let eof = reader
+            .next_record(&io, |_id| {
+                Err(LimboError::InternalError("no index".to_string()))
+            })
+            .unwrap();
+        assert!(matches!(eof, StreamingResult::Eof));
     }
 
     /// What this test checks: Every single-bit flip in a full frame is either detected or safely rejected.
@@ -2675,6 +2790,37 @@ mod tests {
             io.wait_for_completion(c).unwrap();
         }
 
+        // Large-payload frame: 30 rows × 200 bytes ≈ 6 KB — well above the 4096-byte internal
+        // read-chunk boundary. This verifies the reader stitches together multiple pread results
+        // correctly when a single frame spans chunk boundaries.
+        let large_commit_ts = 1_000 + 128u64;
+        let large_text: String = "x".repeat(200);
+        let mut large_tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: large_commit_ts,
+            row_versions: Vec::new(),
+            header: None,
+        };
+        for rowid in 1..=30i64 {
+            let row = generate_simple_string_row((-3).into(), rowid, &large_text);
+            expected.push(ExpectedTableOp::Upsert {
+                rowid,
+                payload: row.payload().to_vec(),
+                commit_ts: large_commit_ts,
+                btree_resident: false,
+            });
+            large_tx.row_versions.push(crate::mvcc::database::RowVersion {
+                id: rowid as u64,
+                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
+                    large_commit_ts,
+                )),
+                end: None,
+                row,
+                btree_resident: false,
+            });
+        }
+        let c = log.log_tx(&large_tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
         let got = read_table_ops(file.clone(), &io);
         assert_eq!(got, expected);
     }
@@ -2793,8 +2939,11 @@ mod tests {
         }
     }
 
-    /// What this test checks: The btree_resident flag survives write/read round-trip unchanged.
+    /// What this test checks: The btree_resident flag survives write/read round-trip unchanged,
+    /// and the on-disk frame header has the correct binary layout (payload_size as u64 at [0..8],
+    /// FRAME_MAGIC at [8..12]).
     /// Why this matters: This flag affects tombstone and checkpoint behavior after recovery.
+    ///   The frame layout check is baseline confirmation that the serialized format is self-consistent.
     #[test]
     fn test_logical_log_btree_resident_roundtrip() {
         init_tracing();
@@ -2821,6 +2970,26 @@ mod tests {
         tx.row_versions.push(version);
         let c = log.log_tx(&tx).unwrap();
         io.wait_for_completion(c).unwrap();
+
+        // Verify the on-disk frame header binary layout.
+        let frame_hdr_buf = Arc::new(Buffer::new_temporary(TX_HEADER_SIZE));
+        let c = file
+            .pread(
+                LOG_HDR_SIZE as u64,
+                Completion::new_read(frame_hdr_buf.clone(), |_| None),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        let frame_hdr = frame_hdr_buf.as_slice()[..TX_HEADER_SIZE].to_vec();
+        assert_eq!(
+            u32::from_le_bytes(frame_hdr[8..12].try_into().unwrap()),
+            FRAME_MAGIC,
+            "FRAME_MAGIC at bytes [8..12]"
+        );
+        assert!(
+            u64::from_le_bytes(frame_hdr[0..8].try_into().unwrap()) > 0,
+            "payload_size at bytes [0..8] must be non-zero for a non-empty op"
+        );
 
         let mut reader = StreamingLogicalLogReader::new(file.clone());
         reader.read_header(&io).unwrap();
@@ -3121,4 +3290,5 @@ mod tests {
             }
         }
     }
+
 }
