@@ -1438,8 +1438,7 @@ pub fn emit_query<'a>(
             if !subquery.correlated || subquery.has_been_evaluated() {
                 continue;
             }
-            let eval_at =
-                subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?;
+            let eval_at = subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?;
             if !matches!(eval_at, EvalAt::Loop(_)) {
                 continue;
             }
