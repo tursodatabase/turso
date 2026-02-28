@@ -720,6 +720,31 @@ def test_fuzzy():
     )
 
 
+def test_decimal():
+    turso = TestTursoShell()
+    ext_path = "./target/debug/liblimbo_decimal"
+    turso.run_test_fn(
+        "SELECT decimal('0.1');",
+        lambda res: "error: no such function: " in res,
+        "decimal function returns null when ext not loaded",
+    )
+    turso.execute_dot(f".load {ext_path}")
+    turso.run_test_fn(
+        "SELECT decimal('0.1');",
+        lambda res: "0.1" == res,
+        "decimal(0.1) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal('1.0e72');",
+        lambda res: "1000000000000000000000000000000000000000000000000000000000000000000000000"== res,
+        "decimal('1.0e72') function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_exp('+123e+4');",
+        lambda res: "+1.23e+06" == res,
+        "decimal_exp('+123e+4') function return correctly",
+    )
+    
 def test_vfs():
     turso = TestTursoShell()
     ext_path = "target/debug/libturso_ext_tests"
@@ -977,6 +1002,7 @@ def main():
         test_csv()
         test_tablestats()
         test_fuzzy()
+        test_decimal()
     except Exception as e:
         console.error(f"Test FAILED: {e}")
         cleanup()
