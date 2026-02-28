@@ -198,6 +198,141 @@ impl Decimal {
         Some(p)
     }
 
+    fn from_double(r: f64) -> Option<Self> {
+        let mut r = r;
+        let is_neg;
+
+        if r < 0.0 {
+            is_neg = true;
+            r = -r;
+        } else {
+            is_neg = false;
+        }
+        // as raw bits IEEE 754
+        let a = r.to_bits() as i64;
+
+        let (m, e): (i64, i32);
+
+        if a == 0 || a == (0x8000000000000000u64 as i64) {
+            e = 0;
+            m = 0;
+        } else {
+            // sign = [63]
+            // exponent = [62-52]
+            // mantissa = [51-0]
+            let mut exp = (a >> 52) as i32; // eksponent biased
+            let mut man = a & ((1i64 << 52) - 1); // mantissa without implicit bit
+
+            if exp == 0 {
+                //subnormal
+                man <<= 1;
+            } else {
+                //nomarl
+                man |= 1i64 << 52;
+            }
+
+            // delete trailing zeros from mantissa
+            while exp < 1075 && man > 0 && (man & 1) == 0 {
+                man >>= 1;
+                exp += 1;
+            }
+
+            if is_neg {
+                man = -man;
+            }
+            //change eksponent from biased to actual
+            exp -= 1075;
+            if exp > 971 {
+                return None;
+            }
+
+            m = man;
+            e = exp;
+        }
+
+        let z_num = m.to_string();
+        let mut p_a = Decimal::from_text(&z_num)?;
+        let p_x = Decimal::pow2(e)?;
+        p_a.mul(&p_x);
+
+        Some(p_a)
+    }
+
+    fn pow2(n: i32) -> Option<Self> {
+        if !(-20000..=20000).contains(&n) {
+            return None;
+        }
+
+        let mut p_a = Decimal::from_text("1.0")?;
+
+        if n == 0 {
+            return Some(p_a);
+        }
+
+        let mut n = n;
+        let mut p_x = if n > 0 {
+            Decimal::from_text("2.0")?
+        } else {
+            n = -n;
+            Decimal::from_text("0.5")?
+        };
+
+        loop {
+            // rightmost bit
+            if n & 1 == 1 {
+                p_a.mul(&p_x);
+            }
+
+            n >>= 1;
+            if n == 0 {
+                break;
+            }
+
+            let p_x_clone = p_x.clone();
+            p_x.mul(&p_x_clone);
+        }
+
+        Some(p_a)
+    }
+
+    fn mul(&mut self, p_b: &Decimal) {
+        if self.is_null || p_b.is_null {
+            return;
+        }
+
+        let acc_len = self.n_digit + p_b.n_digit + 2;
+        let mut acc = vec![0i32; acc_len];
+
+        let min_frac = self.n_frac.min(p_b.n_frac);
+
+        for i in (0..self.n_digit).rev() {
+            let f = self.a[i] as i32;
+            let mut carry = 0i32;
+
+            for j in (0..p_b.n_digit).rev() {
+                let k = i + j + 3;
+                let x = acc[k] + f * (p_b.a[j] as i32) + carry;
+                acc[k] = x % 10;
+                carry = x / 10;
+            }
+
+            let k = i + 2;
+            let x = acc[k] + carry;
+            acc[k] = x % 10;
+            acc[k - 1] += x / 10;
+        }
+
+        self.a = acc.iter().map(|&x| x as u8).collect();
+        self.n_digit += p_b.n_digit + 2;
+        self.n_frac += p_b.n_frac;
+        self.sign ^= p_b.sign;
+
+        while self.n_frac > min_frac && self.n_digit > 0 && self.a[self.n_digit - 1] == 0 {
+            self.n_frac -= 1;
+            self.n_digit -= 1;
+        }
+    }
+
     fn decimal_result(&self) -> Option<String> {
         if self.is_null {
             return None;
@@ -251,6 +386,16 @@ impl Decimal {
             ValueType::Text | ValueType::Integer => Decimal::from_text(arg.to_text()?),
             ValueType::Float if b_text_only => Decimal::from_text(arg.to_text()?),
             ValueType::Blob if b_text_only => Decimal::from_text(arg.to_text()?),
+            ValueType::Float => Decimal::from_double(arg.to_float()?),
+            ValueType::Blob => {
+                let bytes = arg.to_blob()?;
+                //IEEE-754 double -> blob with 8 byte only
+                if bytes.len() != 8 {
+                    return None;
+                }
+                let v = bytes.iter().fold(0u64, |acc, &b| (acc << 8) | (b as u64));
+                Decimal::from_double(f64::from_bits(v))
+            }
             _ => None,
         }
     }
@@ -437,7 +582,15 @@ mod tests {
             Some("0.0".to_string())
         );
 
-        // 1042 not yet
+        // 1042
+        assert_eq!(
+            Decimal::from_double(0.0)
+                .expect("this is a valid decimal")
+                .decimal_result(),
+            Decimal::from_double(-0.0)
+                .expect("this is a valid decimal")
+                .decimal_result()
+        );
 
         // 1050
         assert_eq!(
@@ -495,12 +648,60 @@ mod tests {
     }
 
     #[test]
-
     fn test_result_sci_n_param() {
         let d = Decimal::from_text("3.14000").expect("'3.14000' is valid decimal string");
         assert_eq!(d.decimal_result_sci(0), Some("+3.14e+00".to_string()));
 
         let d2 = Decimal::from_text("3.14000").expect("'3.14000' is valid decimal string");
         assert_eq!(d2.decimal_result_sci(5), Some("+3.1400e+00".to_string()));
+    }
+
+    #[test]
+    fn test_from_double() {
+        assert_eq!(
+            Decimal::from_double(0.99)
+                .expect("0.99 is a valid f64")
+                .decimal_result(),
+            Some("0.9899999999999999911182158029987476766109466552734375".to_string())
+        );
+        assert_eq!(
+            Decimal::from_double(1.0)
+                .expect("1.0 is a valid f64")
+                .decimal_result(),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            Decimal::from_double(-1.0)
+                .expect("-1.0 is a valid f64")
+                .decimal_result(),
+            Some("-1".to_string())
+        );
+        assert_eq!(
+            Decimal::from_double(0.0)
+                .expect("0.0 is a valid f64")
+                .decimal_result(),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            Decimal::from_double(-0.0)
+                .expect("-0.0 is a valid f64")
+                .decimal_result(),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            Decimal::from_double(0.5)
+                .expect("0.5 is a valid f64")
+                .decimal_result(),
+            Some("0.5".to_string())
+        );
+        assert_eq!(
+            Decimal::from_double(0.25)
+                .expect("0.25 is a valid f64")
+                .decimal_result(),
+            Some("0.25".to_string())
+        );
+        assert!(Decimal::from_double(f64::NAN).is_none());
+        assert!(Decimal::from_double(f64::INFINITY).is_none());
+        assert!(Decimal::from_double(f64::NEG_INFINITY).is_none());
     }
 }

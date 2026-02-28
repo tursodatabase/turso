@@ -721,7 +721,7 @@ def test_fuzzy():
 
 
 def test_decimal():
-    turso = TestTursoShell()
+    turso = TestTursoShell(init_commands="")
     ext_path = "./target/debug/liblimbo_decimal"
     turso.run_test_fn(
         "SELECT decimal('0.1');",
@@ -744,7 +744,27 @@ def test_decimal():
         lambda res: "+1.23e+06" == res,
         "decimal_exp('+123e+4') function return correctly",
     )
-    
+    turso.run_test_fn(
+        "SELECT decimal_exp(0.99);",
+        lambda res: "+9.899999999999999911182158029987476766109466552734375e-01"== res,
+        "decimal_exp(0.99) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal(0.55);",
+        lambda res: "0.5500000000000000444089209850062616169452667236328125"== res,
+        "decimal(0.55) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal(X'3FE0000000000000');",
+        lambda res: "0.5"== res,
+        "decimal(X'3FE0000000000000') function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal(X'DEADBEEF');",
+        lambda res: "" == res,
+        "decimal(X'DEADBEEF') function return correctly",
+    )
+
 def test_vfs():
     turso = TestTursoShell()
     ext_path = "target/debug/libturso_ext_tests"
