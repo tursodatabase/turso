@@ -465,6 +465,7 @@ impl ProgramState {
             op_insert_state: OpInsertState {
                 sub_state: OpInsertSubState::MaybeCaptureRecord,
                 old_record: None,
+                is_noop_update: false,
             },
             op_no_conflict_state: OpNoConflictState::Start,
             op_hash_build_state: None,
@@ -572,6 +573,7 @@ impl ProgramState {
         self.op_insert_state = OpInsertState {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
             old_record: None,
+            is_noop_update: false,
         };
         self.op_no_conflict_state = OpNoConflictState::Start;
         self.seek_state = OpSeekState::Start;

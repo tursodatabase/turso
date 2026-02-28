@@ -7447,6 +7447,9 @@ pub fn op_yield(
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
     pub old_record: Option<(i64, Vec<Value>)>,
+    /// Set by the NoopCheck sub-state to indicate the row already has the exact
+    /// same payload, so the physical write can be skipped.
+    pub is_noop_update: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -7464,6 +7467,10 @@ pub enum OpInsertSubState {
     /// Capture the old record at the current cursor position for IVM.
     /// The cursor must already be positioned (by a prior seek or by NotExists/NewRowid).
     CaptureRecord,
+    /// Check whether the update is a no-op (existing record matches new record).
+    /// Must complete before Insert so that cursor.rowid()/record() are never
+    /// interleaved with a partially-completed cursor.insert().
+    NoopCheck,
     /// Insert the row into the table.
     Insert,
     /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
@@ -7511,7 +7518,7 @@ pub fn op_insert(
                 } else if needs_capture {
                     state.op_insert_state.sub_state = OpInsertSubState::CaptureRecord;
                 } else {
-                    state.op_insert_state.sub_state = OpInsertSubState::Insert;
+                    state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
                 }
                 continue;
             }
@@ -7541,7 +7548,7 @@ pub fn op_insert(
                 if needs_capture {
                     state.op_insert_state.sub_state = OpInsertSubState::CaptureRecord;
                 } else {
-                    state.op_insert_state.sub_state = OpInsertSubState::Insert;
+                    state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
                 }
                 continue;
             }
@@ -7578,33 +7585,70 @@ pub fn op_insert(
                     None
                 };
                 state.op_insert_state.old_record = old_record;
+                state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
+                continue;
+            }
+            // TODO: add some InsertFlags that allows us to skip this check when we know for
+            // certain that the update is not a no-op to avoid the branch.
+            OpInsertSubState::NoopCheck => {
+                // UPDATE fast path: skip the physical write if the target row already
+                // has the exact same record payload. This check is isolated in its own
+                // sub-state so that cursor.rowid()/record() IO yields never interleave
+                // with a partially-completed cursor.insert().
+                state.op_insert_state.is_noop_update = false;
+                if flag.has(InsertFlags::SKIP_LAST_ROWID)
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                {
+                    let key = match &state.registers[*key_reg].get_value() {
+                        Value::Numeric(Numeric::Integer(i)) => *i,
+                        _ => unreachable!("expected integer key"),
+                    };
+                    let cursor = get_cursor!(state, *cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    let existing_key = return_if_io!(cursor.rowid());
+                    if existing_key == Some(key) {
+                        let record = match &state.registers[*record_reg] {
+                            Register::Record(r) => std::borrow::Cow::Borrowed(r),
+                            Register::Value(value) => {
+                                let values = [value];
+                                let record = ImmutableRecord::from_values(values, values.len());
+                                std::borrow::Cow::Owned(record)
+                            }
+                            Register::Aggregate(..) => {
+                                unreachable!("Cannot insert an aggregate value.")
+                            }
+                        };
+                        let existing_record = return_if_io!(cursor.record());
+                        if existing_record.is_some_and(|r| r == record.as_ref()) {
+                            state.op_insert_state.is_noop_update = true;
+                        }
+                    }
+                }
                 state.op_insert_state.sub_state = OpInsertSubState::Insert;
                 continue;
             }
             OpInsertSubState::Insert => {
-                let key = match &state.registers[*key_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(i)) => *i,
-                    _ => unreachable!("expected integer key"),
-                };
-                let record = match &state.registers[*record_reg] {
-                    Register::Record(r) => std::borrow::Cow::Borrowed(r),
-                    Register::Value(value) => {
-                        let values = [value];
-                        let record = ImmutableRecord::from_values(values, values.len());
-                        std::borrow::Cow::Owned(record)
-                    }
-                    Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
-                };
-
-                {
+                if !state.op_insert_state.is_noop_update {
+                    let key = match &state.registers[*key_reg].get_value() {
+                        Value::Numeric(Numeric::Integer(i)) => *i,
+                        _ => unreachable!("expected integer key"),
+                    };
+                    let record = match &state.registers[*record_reg] {
+                        Register::Record(r) => std::borrow::Cow::Borrowed(r),
+                        Register::Value(value) => {
+                            let values = [value];
+                            let record = ImmutableRecord::from_values(values, values.len());
+                            std::borrow::Cow::Owned(record)
+                        }
+                        Register::Aggregate(..) => {
+                            unreachable!("Cannot insert an aggregate value.")
+                        }
+                    };
                     let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
-
                     return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
+                    state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
                 }
-                // Increment metrics for row write
-                state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
-
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
                 let root_page = {
                     let cursor = state.get_cursor(*cursor_id);
@@ -7711,6 +7755,7 @@ pub fn op_insert(
     }
 
     state.op_insert_state.sub_state = OpInsertSubState::MaybeCaptureRecord;
+    state.op_insert_state.is_noop_update = false;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
