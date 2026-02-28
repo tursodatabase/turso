@@ -81,6 +81,9 @@ pub(crate) fn validate_check_expr(
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
+                    if matches!(func, Func::Window(..)) {
+                        bail_parse_error!("misuse of window function {}()", name.as_str());
+                    }
                 } else {
                     bail_parse_error!("no such function: {}", name.as_str());
                 }
@@ -92,6 +95,9 @@ pub(crate) fn validate_check_expr(
                 if let Some(func) = resolver.resolve_function(name.as_str(), 0) {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
+                    }
+                    if matches!(func, Func::Window(..)) {
+                        bail_parse_error!("misuse of window function {}()", name.as_str());
                     }
                 } else {
                     bail_parse_error!("no such function: {}", name.as_str());

@@ -1,0 +1,113 @@
+---
+source: windows.sqltest
+expression: |-
+  SELECT
+          department,
+          COUNT(*) AS emp_count,
+          SUM(salary) AS total_salary,
+          ROW_NUMBER() OVER (ORDER BY SUM(salary) DESC) AS dept_salary_rank
+      FROM employees
+      GROUP BY department;
+info:
+  statement_type: SELECT
+  tables:
+  - employees
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN window_subquery_0
+   |--SCAN employees USING INDEX idx_employees_department
+   `--USE SORTER FOR ORDER BY
+
+BYTECODE
+addr  opcode                    p1  p2  p3  p4                     p5  comment
+   0            Init             0  85   0                          0  Start at 85
+   1            InitCoroutine    1  51   2                          0
+   2            SorterOpen       0   1   0  k(1,-B)                 0  cursor=0
+   3            Null             0  11  12                          0  r[11..12]=NULL
+   4            Integer          0   8   0                          0  r[8]=0; clear group by abort flag
+   5            Null             0   9   0                          0  r[9]=NULL; initialize group by comparison registers to NULL
+   6            Gosub           16  39   0                          0  ; go to clear accumulator subroutine
+   7            OpenRead         1   2   0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
+   8            OpenRead         2   4   0  k(2,B)                  0  index=idx_employees_department, root=4, iDb=0
+   9            Rewind           2  25   0                          0  Rewind index idx_employees_department
+  10              DeferredSeek   2   1   0                          0
+  11              Column         1   2  14                          0  r[14]=employees.department
+  12              Column         1   3  15                          0  r[15]=employees.salary
+  13              Compare        9  14   1  k(1, Binary)            0  r[9..9]==r[14..14]
+  14              Jump          15  19  15                          0  ; start new group if comparison is not equal
+  15              Gosub          6  29   0                          0  ; check if ended group had data, and output if so
+  16              Move          14   9   1                          0  r[9..9]=r[14..14]
+  17              IfPos          8  42   0                          0  r[8]>0 -> r[8]-=0, goto 42; check abort flag
+  18              Gosub         16  39   0                          0  ; goto clear accumulator subroutine
+  19              AggStep        0  17  11  count                   0  accum=r[11] step(r[17])
+  20              AggStep        0  15  12  sum                     0  accum=r[12] step(r[15])
+  21              If             7  23   0                          0  if r[7] goto 23; don't emit group columns if continuing existing group
+  22              Column         1   2  10                          0  r[10]=employees.department
+  23              Integer        1   7   0                          0  r[7]=1; indicate data in accumulator
+  24            Next             2  10   0                          0
+  25            Gosub            6  29   0                          0  ; emit row for final group
+  26            Goto             0  42   0                          0  ; group by finished
+  27            Integer          1   8   0                          0  r[8]=1
+  28          Return             6   0   0                          0
+  29          IfPos              7  31   0                          0  r[7]>0 -> r[7]-=0, goto 31; output group by row subroutine start
+  30        Return               6   0   0                          0
+  31        AggFinal             0  11   0  count                   0  accum=r[11]
+  32        AggFinal             0  12   0  sum                     0  accum=r[12]
+  33        Copy                12  18   0                          0  r[18]=r[12]
+  34        Copy                10  19   0                          0  r[19]=r[10]
+  35        Copy                11  20   0                          0  r[20]=r[11]
+  36        MakeRecord          18   3   5                          0  r[5]=mkrec(r[18..20])
+  37        SorterInsert         0   5   0  0                       0  key=r[5]
+  38      Return                 6   0   0                          0
+  39      Null                   0  10  12                          0  r[10..12]=NULL; clear accumulator subroutine start
+  40      Integer                0   7   0                          0  r[7]=0
+  41    Return                  16   0   0                          0
+  42    OpenPseudo               3   5   3                          0  3 columns in r[5]
+  43    SorterSort               0  50   0                          0
+  44      SorterData             0   5   3                          0  r[5]=data
+  45      Column                 3   0   2                          0  r[2]=pseudo.column 0
+  46      Column                 3   1   3                          0  r[3]=pseudo.column 1
+  47      Column                 3   2   4                          0  r[4]=pseudo.column 2
+  48      Yield                  1   0   0                          0
+  49    SorterNext               0  44   0                          0
+  50    EndCoroutine             1   0   0                          0
+  51    OpenEphemeral            4   1   0                          0  cursor=4 is_table=true
+  52    OpenDup                  5   4   0                          0  new_cursor=5, original_cursor=4
+  53    Null                     0  30   0                          0  r[30]=NULL
+  54    InitCoroutine            1   0   2                          0
+  55      Yield                  1  69   0                          0
+  56      Copy                   2  33   0                          0  r[33]=r[2]
+  57      NotNull               30  61   0                          0  r[30]!=NULL -> goto 61
+  58      Copy                  33  32   0                          0  r[32]=r[33]; initialize previous peer register for new partition
+  59      Null                   0  25  25                          0  r[25..25]=NULL; reset accumulator registers
+  60      Integer                0  25   0                          0  r[25]=0
+  61      Compare               32  33   1  k(1, Binary)            0  r[32..32]==r[33..33]; compare ORDER BY columns to detect peer
+  62      Jump                  63  65  63                          0
+  63      Gosub                 31  70   0                          0  ; detected non-peer row
+  64      Copy                  33  32   0                          0  r[32]=r[33]
+  65      MakeRecord             2   3  34                          0  r[34]=mkrec(r[2..4])
+  66      NewRowid               5  30   0                          0  r[30]=rowid
+  67      Insert                 5  34  30  buffer_table_window_0   0  intkey=r[30] data=r[34]
+  68    Goto                     0  55   0                          0
+  69    Null                     0  31   0                          0  r[31]=NULL; return remaining buffered rows
+  70    Rewind                   4  82   0                          0  Rewind  ephemeral(buffer_table_window_0)
+  71      Column                 4   1  27                          0  r[27]=ephemeral(buffer_table_window_0).department
+  72      Column                 4   2  28                          0  r[28]=ephemeral(buffer_table_window_0).column 2
+  73      Column                 4   0  29                          0  r[29]=ephemeral(buffer_table_window_0).column 0
+  74      AddImm                25   1   0                          0  r[25]=r[25]+1
+  75      Copy                  25  26   0                          0  r[26]=r[25]
+  76      Copy                  27  21   0                          0  r[21]=r[27]
+  77      Copy                  28  22   0                          0  r[22]=r[28]
+  78      Copy                  29  23   0                          0  r[23]=r[29]
+  79      Copy                  26  24   0                          0  r[24]=r[26]
+  80      ResultRow             21   4   0                          0  output=r[21..24]
+  81    Next                     4  71   0                          0
+  82    ResetSorter              4   0   0                          0  cursor=4
+  83  Return                    31   0   1                          0
+  84  Halt                       0   0   0                          0
+  85  Transaction                0   1   7                          0  iDb=0 tx_mode=Read
+  86  Integer                    1  17   0                          0  r[17]=1
+  87  Goto                       0   1   0                          0
