@@ -960,36 +960,37 @@ impl TursoStatement {
                 "bind index must be non-zero".to_string(),
             ));
         };
-        // bind_at is safe to call with any index as it will put pair (index, value) into the map
+        if !self.statement.parameters().has_slot(index) {
+            return Err(TursoError::Misuse(format!(
+                "bind index {index} is out of bounds"
+            )));
+        }
         self.statement.bind_at(index, value);
         Ok(())
     }
-    /// named parameter position (name MUST omit named-parameter control character, e.g. '@', '$' or ':')
+    /// named parameter position.
+    ///
+    /// The name must include the SQL placeholder prefix, e.g. `:name`, `@name`, `$name`, or `?1`.
     pub fn named_position(&mut self, name: impl AsRef<str>) -> Result<usize, TursoError> {
-        let parameters = self.statement.parameters();
-        for i in 1..parameters.next_index().get() {
-            // i is positive - so conversion to NonZero<> type will always succeed
-            let index = i.try_into().unwrap();
-            let Some(parameter) = parameters.name(index) else {
-                continue;
-            };
-            if !(parameter.starts_with(":")
-                || parameter.starts_with("@")
-                || parameter.starts_with("$")
-                || parameter.starts_with("?"))
-            {
-                return Err(TursoError::Error(format!(
-                    "internal error: unexpected internal parameter name: {parameter}"
-                )));
-            }
-            if name.as_ref() == parameter {
-                return Ok(index.into());
+        let name = name.as_ref();
+        if let Some(index) = self.statement.parameter_index(name) {
+            return Ok(index.into());
+        }
+
+        if name.starts_with('?') {
+            let maybe_index = name
+                .strip_prefix('?')
+                .and_then(|value| value.parse::<usize>().ok())
+                .and_then(|value| value.try_into().ok());
+            if let Some(index) = maybe_index {
+                if self.statement.parameters().is_indexed(index) {
+                    return Ok(index.into());
+                }
             }
         }
 
         Err(TursoError::Error(format!(
-            "named parameter {} not found",
-            name.as_ref()
+            "named parameter {name} not found"
         )))
     }
     /// make one execution step of the statement
@@ -1145,6 +1146,7 @@ impl TursoStatement {
 #[cfg(test)]
 mod tests {
     use crate::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode};
+    use turso_core::Value;
 
     #[test]
     pub fn test_db_concurrent_use() {
@@ -1229,6 +1231,386 @@ mod tests {
             .prepare_single("SELECT * FROM generate_series(1, 10000)")
             .unwrap();
         assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+    }
+
+    #[test]
+    pub fn test_named_position_requires_prefixed_name() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn
+            .prepare_single("SELECT :new_name, @other_name, $third_name")
+            .unwrap();
+
+        assert_eq!(stmt.named_position(":new_name").unwrap(), 1);
+        assert!(stmt.named_position("new_name").is_err());
+        assert!(stmt.named_position("?1").is_err());
+
+        assert_eq!(stmt.named_position("@other_name").unwrap(), 2);
+        assert!(stmt.named_position("other_name").is_err());
+
+        assert_eq!(stmt.named_position("$third_name").unwrap(), 3);
+        assert!(stmt.named_position("third_name").is_err());
+    }
+
+    #[test]
+    pub fn test_bind_positional_rejects_out_of_bounds_index() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare_single("SELECT ?1").unwrap();
+
+        stmt.bind_positional(1, Value::from_i64(42)).unwrap();
+
+        let err = stmt.bind_positional(2, Value::from_i64(7)).unwrap_err();
+        assert!(matches!(err, TursoError::Misuse(_)));
+    }
+
+    #[test]
+    pub fn test_execute_update_with_prefixed_named_parameters() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+
+        let mut create_stmt = conn
+            .prepare_single("CREATE TABLE simple (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap();
+        assert_eq!(
+            create_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut insert_stmt = conn
+            .prepare_single("INSERT INTO simple (name) VALUES ('original_name')")
+            .unwrap();
+        assert_eq!(
+            insert_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut update_stmt = conn
+            .prepare_single("UPDATE simple SET name = :new_name WHERE name = :old_name")
+            .unwrap();
+
+        let new_name_position = update_stmt.named_position(":new_name").unwrap();
+        update_stmt
+            .bind_positional(new_name_position, Value::build_text("updated_name"))
+            .unwrap();
+        let old_name_position = update_stmt.named_position(":old_name").unwrap();
+        update_stmt
+            .bind_positional(old_name_position, Value::build_text("original_name"))
+            .unwrap();
+
+        let update_result = update_stmt.execute(None).unwrap();
+        assert_eq!(update_result.status, TursoStatusCode::Done);
+        assert_eq!(update_result.rows_changed, 1);
+    }
+
+    #[test]
+    pub fn test_execute_update_with_mixed_placeholders() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+
+        let mut create_stmt = conn
+            .prepare_single("CREATE TABLE mixed (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT, age INTEGER)")
+            .unwrap();
+        assert_eq!(
+            create_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut insert_stmt = conn
+            .prepare_single(
+                "INSERT INTO mixed (name, email, age) VALUES ('alice', 'alice@old.com', 25)",
+            )
+            .unwrap();
+        assert_eq!(
+            insert_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut update_stmt = conn
+            .prepare_single("UPDATE mixed SET email = ?, age = :new_age WHERE name = ?")
+            .unwrap();
+
+        assert_eq!(update_stmt.named_position("?1").unwrap(), 1);
+        assert_eq!(update_stmt.named_position(":new_age").unwrap(), 2);
+        assert!(update_stmt.named_position("new_age").is_err());
+        assert_eq!(update_stmt.named_position("?3").unwrap(), 3);
+
+        update_stmt
+            .bind_positional(1, Value::build_text("alice@new.com"))
+            .unwrap();
+        let age_position = update_stmt.named_position(":new_age").unwrap();
+        update_stmt
+            .bind_positional(age_position, Value::from_i64(30))
+            .unwrap();
+        update_stmt
+            .bind_positional(3, Value::build_text("alice"))
+            .unwrap();
+
+        let update_result = update_stmt.execute(None).unwrap();
+        assert_eq!(update_result.status, TursoStatusCode::Done);
+        assert_eq!(update_result.rows_changed, 1);
+    }
+
+    #[test]
+    pub fn test_select_named_and_positional_mapping_stays_sql_order() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut create_stmt = conn
+            .prepare_single("CREATE TABLE simple (name TEXT NOT NULL)")
+            .unwrap();
+        assert_eq!(
+            create_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut stmt = conn
+            .prepare_single("SELECT :named FROM simple WHERE name = ?")
+            .unwrap();
+
+        assert_eq!(stmt.named_position(":named").unwrap(), 1);
+        assert!(stmt.named_position("named").is_err());
+        assert_eq!(stmt.named_position("?2").unwrap(), 2);
+    }
+
+    #[test]
+    pub fn test_named_and_indexed_alias_share_slot() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn
+            .prepare_single("SELECT :v AS named_slot, ?1 AS pos_slot")
+            .unwrap();
+
+        assert_eq!(stmt.named_position(":v").unwrap(), 1);
+        assert!(stmt.named_position("v").is_err());
+        assert!(stmt.named_position("?1").is_err());
+
+        stmt.bind_positional(1, Value::from_i64(7)).unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(stmt.row_value(0).unwrap().as_int(), Some(7));
+        assert_eq!(stmt.row_value(1).unwrap().as_int(), Some(7));
+    }
+
+    #[test]
+    pub fn test_sparse_positional_index_uses_declared_slot() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare_single("SELECT ?3").unwrap();
+
+        assert_eq!(stmt.parameters_count(), 3);
+        stmt.bind_positional(1, Value::from_i64(1)).unwrap();
+
+        stmt.bind_positional(3, Value::from_i64(9)).unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(stmt.row_value(0).unwrap().as_int(), Some(9));
+    }
+
+    #[test]
+    pub fn test_sparse_positional_index_count_matches_sqlite() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare_single("SELECT ?3").unwrap();
+
+        assert_eq!(stmt.parameters_count(), 3);
+        assert!(stmt.named_position("?1").is_err());
+        assert_eq!(stmt.named_position("?3").unwrap(), 3);
+
+        stmt.bind_positional(3, Value::from_i64(11)).unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(stmt.row_value(0).unwrap().as_int(), Some(11));
+    }
+
+    #[test]
+    pub fn test_insert_with_mixed_placeholders() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut create_stmt = conn
+            .prepare_single("CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)")
+            .unwrap();
+        assert_eq!(
+            create_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut insert_stmt = conn
+            .prepare_single("INSERT INTO users (name, age) VALUES (?, :age)")
+            .unwrap();
+
+        assert_eq!(insert_stmt.named_position("?1").unwrap(), 1);
+        assert_eq!(insert_stmt.named_position(":age").unwrap(), 2);
+        assert!(insert_stmt.named_position("age").is_err());
+
+        insert_stmt
+            .bind_positional(1, Value::build_text("alice"))
+            .unwrap();
+        let age_position = insert_stmt.named_position(":age").unwrap();
+        insert_stmt
+            .bind_positional(age_position, Value::from_i64(30))
+            .unwrap();
+
+        let insert_result = insert_stmt.execute(None).unwrap();
+        assert_eq!(insert_result.status, TursoStatusCode::Done);
+        assert_eq!(insert_result.rows_changed, 1);
+
+        let mut verify_stmt = conn
+            .prepare_single("SELECT age FROM users WHERE name = 'alice'")
+            .unwrap();
+        assert_eq!(verify_stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(verify_stmt.row_value(0).unwrap().as_int(), Some(30));
+    }
+
+    #[test]
+    pub fn test_delete_with_mixed_placeholders() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut create_stmt = conn
+            .prepare_single("CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)")
+            .unwrap();
+        assert_eq!(
+            create_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut seed_stmt = conn
+            .prepare_single("INSERT INTO users (name, age) VALUES ('alice', 30), ('bob', 40)")
+            .unwrap();
+        assert_eq!(
+            seed_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut delete_stmt = conn
+            .prepare_single("DELETE FROM users WHERE name = ? AND age = :age")
+            .unwrap();
+
+        assert_eq!(delete_stmt.named_position("?1").unwrap(), 1);
+        assert_eq!(delete_stmt.named_position(":age").unwrap(), 2);
+        assert!(delete_stmt.named_position("age").is_err());
+
+        delete_stmt
+            .bind_positional(1, Value::build_text("alice"))
+            .unwrap();
+        let age_position = delete_stmt.named_position(":age").unwrap();
+        delete_stmt
+            .bind_positional(age_position, Value::from_i64(30))
+            .unwrap();
+
+        let delete_result = delete_stmt.execute(None).unwrap();
+        assert_eq!(delete_result.status, TursoStatusCode::Done);
+        assert_eq!(delete_result.rows_changed, 1);
+
+        let mut verify_stmt = conn.prepare_single("SELECT count(*) FROM users").unwrap();
+        assert_eq!(verify_stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(verify_stmt.row_value(0).unwrap().as_int(), Some(1));
     }
 
     #[cfg(feature = "encryption")]
