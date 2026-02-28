@@ -6,7 +6,7 @@ use super::plan::{
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::emitter::{OperationMode, Resolver};
-use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
+use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
@@ -14,6 +14,7 @@ use crate::translate::planner::{
     break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
     plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
+use crate::translate::scope::{AliasScope, ChainedScope, FullTableScope, LocalTableScope};
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
 use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -338,22 +339,12 @@ fn prepare_one_select_plan(
                 let mut window = Window::new(Some(name), &window_def.window)?;
 
                 for expr in window.partition_by.iter_mut() {
-                    bind_and_rewrite_expr(
-                        expr,
-                        Some(&mut plan.table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::ResultColumnsNotAllowed,
-                    )?;
+                    let mut scope = FullTableScope::new(&mut plan.table_references);
+                    bind_and_rewrite_expr(expr, &mut scope, resolver, false)?;
                 }
                 for (expr, _) in window.order_by.iter_mut() {
-                    bind_and_rewrite_expr(
-                        expr,
-                        Some(&mut plan.table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::ResultColumnsNotAllowed,
-                    )?;
+                    let mut scope = FullTableScope::new(&mut plan.table_references);
+                    bind_and_rewrite_expr(expr, &mut scope, resolver, false)?;
                 }
 
                 windows.push(window);
@@ -410,13 +401,8 @@ fn prepare_one_select_plan(
                         }
                     }
                     ResultColumn::Expr(mut expr, maybe_alias) => {
-                        bind_and_rewrite_expr(
-                            &mut expr,
-                            Some(&mut plan.table_references),
-                            None,
-                            resolver,
-                            BindingBehavior::ResultColumnsNotAllowed,
-                        )?;
+                        let mut scope = FullTableScope::new(&mut plan.table_references);
+                        bind_and_rewrite_expr(&mut expr, &mut scope, resolver, false)?;
                         let contains_aggregates = resolve_window_and_aggregate_functions(
                             &expr,
                             resolver,
@@ -471,13 +457,11 @@ fn prepare_one_select_plan(
                     // Normal GROUP BY with expressions
                     for expr in group_by.exprs.iter_mut() {
                         replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
-                        bind_and_rewrite_expr(
-                            expr,
-                            Some(&mut plan.table_references),
-                            Some(&plan.result_columns),
-                            resolver,
-                            BindingBehavior::TryResultColumnsFirst,
-                        )?;
+                        let mut scope = ChainedScope {
+                            inner: AliasScope::new(&plan.result_columns),
+                            outer: LocalTableScope::new(&mut plan.table_references),
+                        };
+                        bind_and_rewrite_expr(expr, &mut scope, resolver, false)?;
                     }
 
                     plan.group_by = Some(GroupBy {
@@ -513,13 +497,11 @@ fn prepare_one_select_plan(
             for mut o in order_by {
                 replace_column_number_with_copy_of_column_expr(&mut o.expr, &plan.result_columns)?;
 
-                bind_and_rewrite_expr(
-                    &mut o.expr,
-                    Some(&mut plan.table_references),
-                    Some(&plan.result_columns),
-                    resolver,
-                    BindingBehavior::TryResultColumnsFirst,
-                )?;
+                let mut scope = ChainedScope {
+                    inner: AliasScope::new(&plan.result_columns),
+                    outer: LocalTableScope::new(&mut plan.table_references),
+                };
+                bind_and_rewrite_expr(&mut o.expr, &mut scope, resolver, false)?;
                 resolve_window_and_aggregate_functions(
                     &o.expr,
                     resolver,
@@ -639,14 +621,9 @@ fn prepare_one_select_plan(
             for value_row in values.iter_mut() {
                 for value in value_row.iter_mut() {
                     // Before binding, we check for unquoted literals. Sqlite throws an error in this case
-                    bind_and_rewrite_expr(
-                        value,
-                        Some(&mut table_references),
-                        None,
-                        resolver,
-                        // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
+                    let mut scope = FullTableScope::new(&mut table_references);
+                    // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
+                    bind_and_rewrite_expr(value, &mut scope, resolver, false)?;
                 }
             }
 
@@ -776,13 +753,11 @@ fn add_vtab_predicates_to_where_clause(
     resolver: &Resolver,
 ) -> Result<()> {
     for expr in vtab_predicates.iter_mut() {
-        bind_and_rewrite_expr(
-            expr,
-            Some(&mut plan.table_references),
-            Some(&plan.result_columns),
-            resolver,
-            BindingBehavior::TryCanonicalColumnsFirst,
-        )?;
+        let mut scope = ChainedScope {
+            inner: FullTableScope::new(&mut plan.table_references),
+            outer: AliasScope::new(&plan.result_columns),
+        };
+        bind_and_rewrite_expr(expr, &mut scope, resolver, false)?;
     }
     for expr in vtab_predicates.drain(..) {
         // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
@@ -1241,13 +1216,11 @@ fn process_having_clause(
     }
 
     for expr in predicates.iter_mut() {
-        bind_and_rewrite_expr(
-            expr,
-            Some(table_references),
-            Some(result_columns),
-            resolver,
-            BindingBehavior::TryResultColumnsFirst,
-        )?;
+        let mut scope = ChainedScope {
+            inner: AliasScope::new(result_columns),
+            outer: LocalTableScope::new(table_references),
+        };
+        bind_and_rewrite_expr(expr, &mut scope, resolver, false)?;
         resolve_window_and_aggregate_functions(expr, resolver, aggregate_expressions, None)?;
     }
 

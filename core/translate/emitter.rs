@@ -39,7 +39,7 @@ use crate::schema::{
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back, rewrite_between_expr,
-    translate_expr_no_constant_opt, walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason,
+    translate_expr_no_constant_opt, walk_expr, walk_expr_mut, NoConstantOptReason,
     ReturningBufferCtx, WalkControl,
 };
 use crate::translate::fkeys::{
@@ -53,6 +53,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::planner::{table_mask_from_expr, TableMask};
+use crate::translate::scope::FullTableScope;
 use crate::translate::subquery::emit_non_from_clause_subquery;
 use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
@@ -5256,13 +5257,8 @@ fn emit_index_column_value_old_image(
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
+        let mut scope = FullTableScope::new(table_references);
+        bind_and_rewrite_expr(&mut expr, &mut scope, resolver, false)?;
         translate_expr_no_constant_opt(
             program,
             Some(table_references),
@@ -5358,13 +5354,8 @@ fn emit_check_constraint_bytecode(
                 // even when the query references the table through an alias.
                 joined_table.identifier = table_name.to_string();
             }
-            bind_and_rewrite_expr(
-                &mut rewritten_expr,
-                Some(&mut binding_tables),
-                None,
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
+            let mut scope = FullTableScope::new(&mut binding_tables);
+            bind_and_rewrite_expr(&mut rewritten_expr, &mut scope, resolver, false)?;
         }
 
         translate_expr_no_constant_opt(

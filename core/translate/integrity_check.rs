@@ -4,9 +4,10 @@ use crate::{
         emitter::Resolver,
         expr::{
             bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
-            BindingBehavior, ConditionMetadata, NoConstantOptReason,
+            ConditionMetadata, NoConstantOptReason,
         },
         plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
+        scope::FullTableScope,
     },
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
@@ -114,13 +115,8 @@ fn bind_expr_for_table(
     resolver: &Resolver,
 ) -> crate::Result<ast::Expr> {
     let mut out = expr.clone();
-    bind_and_rewrite_expr(
-        &mut out,
-        Some(table_references),
-        None,
-        resolver,
-        BindingBehavior::ResultColumnsNotAllowed,
-    )?;
+    let mut scope = FullTableScope::new(table_references);
+    bind_and_rewrite_expr(&mut out, &mut scope, resolver, false)?;
     Ok(out)
 }
 
