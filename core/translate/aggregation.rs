@@ -19,6 +19,7 @@ use super::{
     },
     plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
     result_row::emit_select_result,
+    subquery::emit_non_from_clause_subquery,
 };
 
 /// Emits the bytecode for processing an aggregate without a GROUP BY clause.
@@ -124,6 +125,21 @@ pub fn emit_ungrouped_aggregation<'a>(
                     }
                 }
             }
+        }
+        // Emit deferred correlated subqueries so that e.g. (SELECT COUNT(*) FROM t2 WHERE
+        // t2.a = t1.a) returns 0 instead of NULL when the outer loop produced no rows.
+        // Cursors are in NullRow state, so correlated column refs resolve to NULL and
+        // COUNT(*) correctly returns 0.
+        for (subquery_plan, query_type, is_correlated) in
+            t_ctx.deferred_ungrouped_agg_subqueries.drain(..)
+        {
+            emit_non_from_clause_subquery(
+                program,
+                &t_ctx.resolver,
+                *subquery_plan,
+                &query_type,
+                is_correlated,
+            )?;
         }
         // Evaluate non-aggregate columns now (with cursor in invalid state, columns return NULL)
         // Must use no_constant_opt to prevent constant hoisting which would place the label
