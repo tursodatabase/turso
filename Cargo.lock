@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_decimal"
-version = "0.5.0-pre.15"
+version = "0.5.0-pre.16"
 dependencies = [
  "mimalloc",
  "turso_ext",

@@ -374,6 +374,119 @@ mod tests {
     }
 
     #[test]
+    fn test_decimal() {
+        // 1000
+        assert_eq!(
+            Decimal::from_text("1")
+                .expect("'1' is a valid decimal")
+                .decimal_result(),
+            Some("1".to_string())
+        );
+
+        // 1001
+        assert_eq!(
+            Decimal::from_text("+0")
+                .expect("'+0' is a valid decimal")
+                .decimal_result(),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            Decimal::from_text("-0")
+                .expect("'-0' is a valid decimal")
+                .decimal_result(),
+            Some("0".to_string())
+        );
+
+        // 1010
+        assert_eq!(
+            Decimal::from_text("1.0")
+                .expect("'1.0' is a valid decimal")
+                .decimal_result(),
+            Some("1.0".to_string())
+        );
+
+        // 1020
+        assert_eq!(
+            Decimal::from_text("0001.0")
+                .expect("'0001.0' is a valid decimal")
+                .decimal_result(),
+            Some("1.0".to_string())
+        );
+
+        // 1030
+        assert_eq!(
+            Decimal::from_text("+0001.0")
+                .expect("'+0001.0' is a valid decimal")
+                .decimal_result(),
+            Some("1.0".to_string())
+        );
+
+        // 1040
+        assert_eq!(
+            Decimal::from_text("-0001.0")
+                .expect("'-0001.0' is a valid decimal")
+                .decimal_result(),
+            Some("-1.0".to_string())
+        );
+
+        // 1041
+        assert_eq!(
+            Decimal::from_text("-0000.0")
+                .expect("'-0000.0' is a valid decimal")
+                .decimal_result(),
+            Some("0.0".to_string())
+        );
+
+        // 1042 not yet
+
+        // 1050
+        assert_eq!(
+            Decimal::from_text("1.0e72")
+                .expect("'1.0e72' is a valid decimal")
+                .decimal_result(),
+            Some(
+                "1000000000000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string()
+            )
+        );
+
+        // 1060
+        assert_eq!(
+            Decimal::from_text("1.0e-72")
+                .expect("'1.0e-72' is a valid decimal")
+                .decimal_result(),
+            Some(
+                "0.0000000000000000000000000000000000000000000000000000000000000000000000010"
+                    .to_string()
+            )
+        );
+
+        // 1070
+        assert_eq!(
+            Decimal::from_text("-123e-4")
+                .expect("'-123e-4' is a valid decimal")
+                .decimal_result(),
+            Some("-0.0123".to_string())
+        );
+
+        // 1080
+        assert_eq!(
+            Decimal::from_text("+123e+4")
+                .expect("'+123e+4' is a valid decimal")
+                .decimal_result(),
+            Some("1230000".to_string())
+        );
+
+        // 1081
+        assert_eq!(
+            Decimal::from_text("+123e+4")
+                .expect("'+123e+4' is a valid decimal")
+                .decimal_result_sci(0),
+            Some("+1.23e+06".to_string())
+        );
+    }
+
+    #[test]
     fn test_decimal_round() {
         let mut d = Decimal::from_text("999").expect("must be not None");
         assert_eq!(d.n_frac, 0);
