@@ -222,7 +222,7 @@ impl TempDatabaseBuilder {
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {
             let conn = db.connect().unwrap();
-            conn.pragma_update("journal_mode", "'experimental_mvcc'")
+            conn.pragma_update("journal_mode", "'mvcc'")
                 .expect("enable mvcc");
         }
 
@@ -256,7 +256,7 @@ impl TempDatabase {
     pub fn new_with_mvcc(db_name: &str) -> Self {
         let db = Self::new(db_name);
         let conn = db.connect_limbo();
-        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+        conn.pragma_update("journal_mode", "'mvcc'")
             .expect("enable mvcc");
         db
     }

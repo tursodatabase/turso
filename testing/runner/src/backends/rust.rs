@@ -108,7 +108,7 @@ impl SqlBackend for RustBackend {
         // Prepend MVCC pragma if enabled (skip for readonly databases; the generated readonly DBs are already in MVCC mode).
         if self.mvcc && !config.readonly {
             let mut rows = conn
-                .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+                .query("PRAGMA journal_mode = 'mvcc'", ())
                 .await
                 .map_err(|e| {
                     BackendError::CreateDatabase(format!("failed to enable MVCC mode: {e}"))

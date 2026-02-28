@@ -495,7 +495,7 @@ impl Whopper {
 
         // Enable MVCC if requested
         if opts.enable_mvcc {
-            bootstrap_conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
+            bootstrap_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
         }
 
         let schema = create_initial_schema(&mut rng);

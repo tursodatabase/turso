@@ -1,6 +1,6 @@
 ---
 name: mvcc
-description: Experimental MVCC feature - snapshot isolation, versioning, limitations
+description: MVCC feature - snapshot isolation, versioning, limitations
 ---
 # MVCC Guide (Experimental)
 
@@ -11,7 +11,7 @@ Multi-Version Concurrency Control. **Work in progress, not production-ready.**
 ## Enabling MVCC
 
 ```sql
-PRAGMA journal_mode = 'experimental_mvcc';
+PRAGMA journal_mode = 'mvcc';
 ```
 
 Runtime configuration, not a compile-time feature flag. Per-database setting.

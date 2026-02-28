@@ -49,7 +49,7 @@ pub struct SimConfig {
     pub coverage: bool,
     /// Coverage report tree mode.
     pub tree_mode: TreeMode,
-    /// Whether to enable experimental MVCC mode.
+    /// Whether to enable MVCC mode.
     pub mvcc: bool,
 }
 
@@ -231,7 +231,7 @@ impl Fuzzer {
         // Enable MVCC after ATTACH (ATTACH is not supported in MVCC mode)
         if config.mvcc {
             turso_conn
-                .execute("PRAGMA journal_mode = 'experimental_mvcc'")
+                .execute("PRAGMA journal_mode = 'mvcc'")
                 .context("Failed to enable MVCC mode")?;
         }
 

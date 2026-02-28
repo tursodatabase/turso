@@ -28,8 +28,7 @@ pub mod query;
 #[schemars(deny_unknown_fields)]
 pub struct Profile {
     #[garde(skip)]
-    /// Experimental MVCC feature
-    pub experimental_mvcc: bool,
+    pub mvcc: bool,
     #[garde(range(min = 1, max = 64))]
     pub max_connections: usize,
     #[garde(dive)]
@@ -43,7 +42,7 @@ pub struct Profile {
 impl Default for Profile {
     fn default() -> Self {
         Self {
-            experimental_mvcc: false,
+            mvcc: false,
             max_connections: 10,
             io: Default::default(),
             query: Default::default(),
@@ -162,7 +161,7 @@ impl Profile {
                 create_index_weight: 0,
                 ..Default::default()
             },
-            experimental_mvcc: true,
+            mvcc: true,
             max_connections: 2,
             cache_size_pages: Some(2000),
         };

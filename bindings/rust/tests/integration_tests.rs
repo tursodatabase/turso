@@ -1524,7 +1524,7 @@ async fn setup_mvcc_db_with_options(
     let conn = db.connect().unwrap();
     // PRAGMA journal_mode returns a row, so use query() to consume it
     let mut rows = conn
-        .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+        .query("PRAGMA journal_mode = 'mvcc'", ())
         .await
         .unwrap();
     while let Ok(Some(_)) = rows.next().await {}

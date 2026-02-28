@@ -75,7 +75,7 @@ fn open_with_limbo_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
 
     // Enable MVCC if requested
     if enable_mvcc {
-        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+        conn.pragma_update("journal_mode", "'mvcc'")
             .expect("enable mvcc");
     }
 
@@ -294,7 +294,7 @@ fn create_wal_db_with_pending_wal(db_path: &Path) {
 /// Test switching from WAL to MVCC mode via PRAGMA when there's a non-empty WAL.
 /// This tests the scenario where:
 /// 1. A database is opened in WAL mode with pending WAL data
-/// 2. User runs `PRAGMA journal_mode = "experimental_mvcc"` to switch to MVCC
+/// 2. User runs `PRAGMA journal_mode = "mvcc"` to switch to MVCC
 /// 3. The Checkpoint instruction should use the newly opened MvStore
 #[test]
 fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
@@ -356,15 +356,15 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
     // Switch to MVCC mode via PRAGMA
     // This should work even with pending WAL data
     let result = conn
-        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .pragma_update("journal_mode", "'mvcc'")
         .expect("PRAGMA journal_mode update should not fail");
 
     // Verify the journal mode was set
     assert!(!result.is_empty(), "PRAGMA should return a result");
     let mode = result[0][0].to_string();
     assert_eq!(
-        mode, "experimental_mvcc",
-        "Journal mode should be experimental_mvcc after PRAGMA, got {mode}"
+        mode, "mvcc",
+        "Journal mode should be mvcc after PRAGMA, got {mode}"
     );
 
     // Verify we can still query data (both original and new data)
@@ -430,8 +430,8 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
         let conn = db.connect().unwrap();
 
         // Switch to MVCC mode via PRAGMA
-        conn.pragma_update("journal_mode", "'experimental_mvcc'")
-            .expect("PRAGMA journal_mode = 'experimental_mvcc' should work");
+        conn.pragma_update("journal_mode", "'mvcc'")
+            .expect("PRAGMA journal_mode = 'mvcc' should work");
 
         // Insert some data in MVCC mode
         conn.execute("INSERT INTO t (val) VALUES ('mvcc_data')")
@@ -469,7 +469,7 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
     assert!(!result.is_empty(), "PRAGMA should return a result");
     let mode = result[0][0].to_string();
     assert_eq!(
-        mode, "experimental_mvcc",
+        mode, "mvcc",
         "Journal mode should be wal after PRAGMA, got {mode}"
     );
 
@@ -540,9 +540,9 @@ fn test_pragma_journal_mode_multiple_switches() {
 
     // Switch to MVCC
     let result = conn
-        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .pragma_update("journal_mode", "'mvcc'")
         .expect("Switch to MVCC should work");
-    assert_eq!(result[0][0].to_string(), "experimental_mvcc");
+    assert_eq!(result[0][0].to_string(), "mvcc");
 
     // Verify header is MVCC (version 255)
     let (write_ver, read_ver) = read_header_versions(&db_path);
@@ -570,9 +570,9 @@ fn test_pragma_journal_mode_multiple_switches() {
 
     // Switch to MVCC again
     let result = conn
-        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .pragma_update("journal_mode", "'mvcc'")
         .expect("Switch to MVCC again should work");
-    assert_eq!(result[0][0].to_string(), "experimental_mvcc");
+    assert_eq!(result[0][0].to_string(), "mvcc");
 
     let (write_ver, read_ver) = read_header_versions(&db_path);
     assert_eq!(write_ver, 255, "mode should be MVCC (write_version=255)");
@@ -660,7 +660,7 @@ fn test_pragma_journal_mode_query() {
     drop(conn);
     drop(db);
 
-    // Now open and switch to MVCC via PRAGMA, then verify query returns experimental_mvcc
+    // Now open and switch to MVCC via PRAGMA, then verify query returns mvcc
     let opts = DatabaseOpts::new();
 
     let db = Database::open_file_with_flags(
@@ -675,16 +675,16 @@ fn test_pragma_journal_mode_query() {
     let conn = db.connect().unwrap();
 
     // Switch to MVCC mode via PRAGMA
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")
-        .expect("PRAGMA journal_mode = 'experimental_mvcc' should work");
+    conn.pragma_update("journal_mode", "'mvcc'")
+        .expect("PRAGMA journal_mode = 'mvcc' should work");
 
-    // Query current journal mode (should be experimental_mvcc after switching)
+    // Query current journal mode (should be mvcc after switching)
     if let Some(mut stmt) = conn.query("PRAGMA journal_mode").unwrap() {
         stmt.run_with_row_callback(|row| {
             let mode: String = row.get::<String>(0).unwrap();
             assert_eq!(
-                mode, "experimental_mvcc",
-                "Mode should be experimental_mvcc after PRAGMA switch, got {mode}"
+                mode, "mvcc",
+                "Mode should be mvcc after PRAGMA switch, got {mode}"
             );
             Ok(())
         })
@@ -721,7 +721,7 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
         let conn = db.connect().unwrap();
 
         // Switch to MVCC
-        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+        conn.pragma_update("journal_mode", "'mvcc'")
             .expect("Switch to MVCC should work");
 
         // Insert data after switch
@@ -784,7 +784,7 @@ fn open_with_limbo_readonly_and_check(db_path: &Path, enable_mvcc: bool) -> (u8,
 
     // Try to enable MVCC if requested (will fail in readonly mode, which is expected)
     if enable_mvcc {
-        let _ = conn.pragma_update("journal_mode", "'experimental_mvcc'");
+        let _ = conn.pragma_update("journal_mode", "'mvcc'");
     }
 
     // Do a simple query to ensure everything is initialized
@@ -911,7 +911,7 @@ fn test_readonly_pragma_journal_mode_cannot_change() {
 
     // Try to switch to MVCC mode via PRAGMA - this should return an error
     // because we cannot change mode on readonly databases
-    let result = conn.pragma_update("journal_mode", "'experimental_mvcc'");
+    let result = conn.pragma_update("journal_mode", "'mvcc'");
 
     // The result should be a ReadOnly error
     assert!(
@@ -960,8 +960,8 @@ fn test_readonly_mvcc_db_can_be_read() {
         let conn = db.connect().unwrap();
 
         // Switch to MVCC mode via PRAGMA
-        conn.pragma_update("journal_mode", "'experimental_mvcc'")
-            .expect("PRAGMA journal_mode = 'experimental_mvcc' should work");
+        conn.pragma_update("journal_mode", "'mvcc'")
+            .expect("PRAGMA journal_mode = 'mvcc' should work");
 
         // Insert some data in MVCC mode
         conn.execute("INSERT INTO t (val) VALUES ('mvcc_readonly_test')")

@@ -7,7 +7,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 TURSODB="$PROJECT_ROOT/target/debug/tursodb"
 
 # Add experimental features for testing
-# Note: MVCC is enabled via PRAGMA journal_mode = 'experimental_mvcc'
+# Note: MVCC is enabled via PRAGMA journal_mode = 'mvcc'
 EXPERIMENTAL_FLAGS="--experimental-views --experimental-triggers --experimental-attach"
 
 # if RUST_LOG is non-empty, enable tracing output
