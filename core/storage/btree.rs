@@ -44,7 +44,8 @@ use crate::{
     numeric::Numeric,
     return_corrupt, return_if_io,
     types::{
-        compare_immutable, AsValueRef, IOResult, ImmutableRecord, SeekKey, SeekOp, Value, ValueRef,
+        compare_immutable, AsValueRef, IOResult, ImmutableRecord, SeekKey, SeekOp, SerialType,
+        SerialTypeKind, Value, ValueRef,
     },
     LimboError, Result,
 };
@@ -5854,6 +5855,10 @@ pub enum IntegrityCheckError {
     FreelistPointerOutOfRange { page_id: i64, pointer: i64 },
     #[error("overflow list length is {got} but should be {expected}")]
     OverflowListLengthMismatch { got: usize, expected: usize },
+    #[error("rowid not at end of record on page {page_id}")]
+    RowidNotAtEndOfRecord { page_id: i64 },
+    #[error("corrupt index record on page {page_id}: {error}")]
+    IndexRecordCorrupt { page_id: i64, error: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5972,6 +5977,57 @@ fn overflow_pages_expected_for_cell(
     }
     let overflow_page_payload = usable_space.saturating_sub(4).max(1);
     remaining_payload.div_ceil(overflow_page_payload)
+}
+
+fn index_record_rowid_at_end(payload: &[u8], payload_size: u64) -> Result<Option<bool>> {
+    if payload.is_empty() {
+        return Err(LimboError::Corrupt("Index record payload is empty".into()));
+    }
+
+    let (header_size, header_varint_len) = read_varint(payload)?;
+    let header_size = header_size as usize;
+    let payload_size = usize::try_from(payload_size).unwrap_or(usize::MAX);
+
+    if header_size > payload_size {
+        return Err(LimboError::Corrupt(
+            "Index record header exceeds payload size".into(),
+        ));
+    }
+
+    if header_size > payload.len() || header_varint_len > payload.len() {
+        // Header spills into overflow pages; skip rowid position check.
+        return Ok(None);
+    }
+
+    let mut header = &payload[header_varint_len..header_size];
+    if header.is_empty() {
+        return Err(LimboError::Corrupt(
+            "Index record has no serial types".into(),
+        ));
+    }
+
+    let mut last_serial_type: Option<SerialType> = None;
+    while !header.is_empty() {
+        let (serial_type_raw, bytes_read) = read_varint(header)?;
+        header = &header[bytes_read..];
+        let serial_type = SerialType::try_from(serial_type_raw)?;
+        last_serial_type = Some(serial_type);
+    }
+
+    let last_serial_type = last_serial_type
+        .ok_or_else(|| LimboError::Corrupt("Index record has no serial types".into()))?;
+
+    Ok(Some(matches!(
+        last_serial_type.kind(),
+        SerialTypeKind::I8
+            | SerialTypeKind::I16
+            | SerialTypeKind::I24
+            | SerialTypeKind::I32
+            | SerialTypeKind::I48
+            | SerialTypeKind::I64
+            | SerialTypeKind::ConstInt0
+            | SerialTypeKind::ConstInt1
+    )))
 }
 
 /// Perform integrity check on a whole table/index. We check for:
@@ -6312,6 +6368,23 @@ pub fn integrity_check(
                             errors,
                         );
                     }
+                    match index_record_rowid_at_end(
+                        index_interior_cell.payload,
+                        index_interior_cell.payload_size,
+                    ) {
+                        Ok(Some(true)) | Ok(None) => {}
+                        Ok(Some(false)) => {
+                            errors.push(IntegrityCheckError::RowidNotAtEndOfRecord {
+                                page_id: page.get().id as i64,
+                            });
+                        }
+                        Err(err) => {
+                            errors.push(IntegrityCheckError::IndexRecordCorrupt {
+                                page_id: page.get().id as i64,
+                                error: err.to_string(),
+                            });
+                        }
+                    }
                 }
                 BTreeCell::IndexLeafCell(index_leaf_cell) => {
                     // check depth of leaf pages are equal
@@ -6344,6 +6417,23 @@ pub fn integrity_check(
                             page.get().id as i64,
                             errors,
                         );
+                    }
+                    match index_record_rowid_at_end(
+                        index_leaf_cell.payload,
+                        index_leaf_cell.payload_size,
+                    ) {
+                        Ok(Some(true)) | Ok(None) => {}
+                        Ok(Some(false)) => {
+                            errors.push(IntegrityCheckError::RowidNotAtEndOfRecord {
+                                page_id: page.get().id as i64,
+                            });
+                        }
+                        Err(err) => {
+                            errors.push(IntegrityCheckError::IndexRecordCorrupt {
+                                page_id: page.get().id as i64,
+                                error: err.to_string(),
+                            });
+                        }
                     }
                 }
             }
