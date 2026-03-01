@@ -60,6 +60,22 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-add-column-quoted-table-name-issue-5633 {
+    CREATE TABLE "t' OR 1=1 -- " (a);
+    CREATE TABLE ok (x);
+    INSERT INTO ok VALUES (1);
+
+    ALTER TABLE "t' OR 1=1 -- " ADD COLUMN b;
+    SELECT name, sql FROM sqlite_schema WHERE type = 'table' ORDER BY name;
+    SELECT * FROM ok;
+}
+expect {
+    ok|CREATE TABLE ok (x)
+    t' or 1=1 -- |CREATE TABLE t' or 1=1 --  (a, b)
+    1
+}
+
+@cross-check-integrity
 test alter-table-add-column-typed {
     CREATE TABLE t (a);
     ALTER TABLE t ADD b DEFAULT 0;
@@ -215,6 +231,22 @@ test alter-table-drop-column-special-name {
 expect {
     3
     CREATE TABLE t (a, [c c])
+}
+
+@cross-check-integrity
+test alter-table-drop-column-quoted-table-name-issue-5633 {
+    CREATE TABLE "t' OR 1=1 -- " (a, b);
+    CREATE TABLE ok (x);
+    INSERT INTO ok VALUES (1);
+
+    ALTER TABLE "t' OR 1=1 -- " DROP COLUMN b;
+    SELECT name, sql FROM sqlite_schema WHERE type = 'table' ORDER BY name;
+    SELECT * FROM ok;
+}
+expect {
+    ok|CREATE TABLE ok (x)
+    t' or 1=1 -- |CREATE TABLE t' or 1=1 --  (a)
+    1
 }
 
 @cross-check-integrity
