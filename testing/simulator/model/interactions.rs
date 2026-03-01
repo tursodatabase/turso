@@ -17,7 +17,6 @@ use turso_core::{Connection, Result, StepResult};
 use crate::{
     generation::Shadow,
     model::{
-        Query, ResultSet,
         metrics::InteractionStats,
         property::{Property, PropertyDiscriminants},
     },
@@ -37,6 +36,13 @@ pub(crate) struct InteractionPlan {
     /// This field is only necessary and valid when generating interactions. For static iteration, we do not care about this field
     len_properties: usize,
     next_interaction_id: NonZeroUsize,
+
+    /// Tracks which connection has a pending (generated but not executed) transaction.
+    /// Used in non-MVCC mode to prevent generating nested transactions.
+    pending_txn_conn: Option<usize>,
+
+    /// Pending setup queries for coordinated matview scenario
+    pub coordinated_matview_scenario_queries: Option<Vec<Query>>,
 }
 
 impl InteractionPlan {
@@ -48,7 +54,19 @@ impl InteractionPlan {
             mvcc,
             len_properties: 0,
             next_interaction_id: NonZeroUsize::new(1).unwrap(),
+            pending_txn_conn: None,
+            coordinated_matview_scenario_queries: None,
         }
+    }
+
+    /// Returns the connection index that has a pending (generated but not executed) transaction
+    pub fn pending_txn_conn(&self) -> Option<usize> {
+        self.pending_txn_conn
+    }
+
+    /// Sets the pending transaction connection
+    pub fn set_pending_txn_conn(&mut self, conn: Option<usize>) {
+        self.pending_txn_conn = conn;
     }
 
     /// Count of interactions
@@ -865,6 +883,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
     let mvcc = env.profile.experimental_mvcc;
+    let enable_views = env.profile.enable_views;
     let num_conns = env.connections.len();
 
     // Clear shadow transaction state for all connections since reopening
@@ -899,13 +918,15 @@ fn reopen_database(env: &mut SimulatorEnv) {
         }
         SimulationType::Default | SimulationType::Doublecheck => {
             env.db = None;
+            let mut db_opts = turso_core::DatabaseOpts::new().with_autovacuum(true);
+            if mvcc || enable_views {
+                db_opts = db_opts.with_views(true);
+            }
             let db = match turso_core::Database::open_file_with_flags(
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
                 turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new()
-                    .with_autovacuum(true)
-                    .with_attach(true),
+                db_opts.with_attach(true),
                 None,
             ) {
                 Ok(db) => db,

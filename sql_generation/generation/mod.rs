@@ -211,11 +211,16 @@ mod tests {
     pub struct TestContext {
         pub opts: Opts,
         pub tables: Vec<Table>,
+        pub views: Vec<crate::model::view::View>,
     }
 
     impl GenerationContext for TestContext {
         fn tables(&self) -> &Vec<Table> {
             &self.tables
+        }
+
+        fn views(&self) -> &Vec<crate::model::view::View> {
+            &self.views
         }
 
         fn opts(&self) -> &Opts {

@@ -30,6 +30,9 @@ pub struct Profile {
     #[garde(skip)]
     /// Experimental MVCC feature
     pub experimental_mvcc: bool,
+    #[garde(skip)]
+    /// Enable views (including materialized views)
+    pub enable_views: bool,
     #[garde(range(min = 1, max = 64))]
     pub max_connections: usize,
     #[garde(dive)]
@@ -38,16 +41,27 @@ pub struct Profile {
     pub query: QueryProfile,
     #[garde(range(min = 200, max = 2000))]
     pub cache_size_pages: Option<usize>,
+    #[garde(skip)]
+    /// Require differential testing for this profile (verifies content correctness)
+    pub differential_required: bool,
+    #[garde(skip)]
+    /// Probability (0.0-1.0) of running integrity check after each query.
+    /// Default is 0.1 (10%). Set to 0.0 to disable, 1.0 for every query.
+    /// Note: Integrity checks are skipped during write transactions and with MVCC.
+    pub integrity_check_probability: f64,
 }
 
 impl Default for Profile {
     fn default() -> Self {
         Self {
             experimental_mvcc: false,
+            enable_views: false,
             max_connections: 10,
             io: Default::default(),
             query: Default::default(),
             cache_size_pages: Some(2000),
+            differential_required: false,
+            integrity_check_probability: 0.1, // 10% by default
         }
     }
 }
@@ -163,8 +177,57 @@ impl Profile {
                 ..Default::default()
             },
             experimental_mvcc: true,
+            enable_views: false,
             max_connections: 2,
             cache_size_pages: Some(2000),
+            differential_required: false,
+            integrity_check_probability: 0.0, // MVCC skips integrity checks anyway
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
+    /// Profile for testing materialized views with CDC enabled
+    /// Uses plan-level transaction batching to naturally test IVM with multiple
+    /// DML operations in a single transaction (targets bugs like JoinOperator panic)
+    /// Note: MVCC is disabled because views/matviews are not yet supported with MVCC
+    /// Note: differential_required=true ensures content correctness is verified
+    pub fn matview_cdc() -> Self {
+        let profile = Profile {
+            io: IOProfile {
+                fault: FaultProfile {
+                    enable: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            query: QueryProfile {
+                check_after_dml: false,
+                select_weight: 20,
+                create_table_weight: 10,
+                create_index_weight: 0,
+                insert_weight: 40,
+                update_weight: 10,
+                delete_weight: 5,
+                drop_table_weight: 0,
+                alter_table_weight: 0,
+                drop_index: 0,
+                pragma_weight: 0,
+                create_matview_weight: 30,
+                drop_matview_weight: 10,
+                enable_cdc_weight: 20,
+                // Higher probabilities to increase chance of multi-DML transactions
+                enable_transaction_batching: true,
+                transaction_batch_start_probability: 0.4,
+                transaction_batch_commit_probability: 0.25,
+                ..Default::default()
+            },
+            experimental_mvcc: false, // MVCC disabled: views not yet supported with MVCC
+            enable_views: true,       // Required for materialized views
+            max_connections: 1, // Single connection to avoid locking issues with BEGIN IMMEDIATE
+            cache_size_pages: Some(2000),
+            differential_required: true, // Verify matview content matches rusqlite view
+            integrity_check_probability: 0.1,
         };
         profile.validate().unwrap();
         profile
@@ -178,6 +241,7 @@ impl Profile {
             ProfileType::Faultless => Self::faultless(),
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
             ProfileType::WriteStress => Self::write_stress(),
+            ProfileType::MatviewCdc => Self::matview_cdc(),
             ProfileType::Custom(path) => {
                 Self::parse(path).with_context(|| "failed to parse JSON profile")?
             }
@@ -219,6 +283,7 @@ pub enum ProfileType {
     Faultless,
     SimpleMvcc,
     WriteStress,
+    MatviewCdc,
     #[strum(disabled)]
     Custom(PathBuf),
 }

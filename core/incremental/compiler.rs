@@ -36,7 +36,13 @@ pub enum WriteRowView {
     #[default]
     GetRecord,
     Delete,
+    /// Seek completed, delete operation in progress
+    Deleting,
     Insert {
+        final_weight: isize,
+    },
+    /// Seek completed, insert operation in progress
+    Inserting {
         final_weight: isize,
     },
     Done,
@@ -105,13 +111,24 @@ impl WriteRowView {
                     }
                 }
                 WriteRowView::Delete => {
-                    // Mark as Done before delete to avoid retry on I/O
-                    *self = WriteRowView::Done;
+                    // Transition to Deleting state before the delete operation
+                    // so we can resume if I/O occurs during delete/balance
+                    *self = WriteRowView::Deleting;
+                }
+                WriteRowView::Deleting => {
                     return_if_io!(cursor.delete());
+                    *self = WriteRowView::Done;
                 }
                 WriteRowView::Insert { final_weight } => {
                     return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
 
+                    // Transition to Inserting state after seek completes
+                    // so we can resume the insert if I/O occurs during insert/balance
+                    *self = WriteRowView::Inserting {
+                        final_weight: *final_weight,
+                    };
+                }
+                WriteRowView::Inserting { final_weight } => {
                     // Extract the row ID from the key
                     let key_i64 = match key {
                         SeekKey::TableRowId(id) => id,
@@ -130,9 +147,8 @@ impl WriteRowView {
                         ImmutableRecord::from_values(&record_values, record_values.len());
                     let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
 
-                    // Mark as Done before insert to avoid retry on I/O
-                    *self = WriteRowView::Done;
                     return_if_io!(cursor.insert(&btree_key));
+                    *self = WriteRowView::Done;
                 }
                 WriteRowView::Done => {
                     return Ok(IOResult::Done(()));

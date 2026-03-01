@@ -10,27 +10,57 @@ use turso_core::{Connection, LimboError, Result, Value};
 ///
 /// - WriteWriteConflict: MVCC conflict, the DB rolled back the transaction
 /// - TxError: Transaction state error (e.g., BEGIN twice, COMMIT with no transaction)
+/// - Busy: Database is temporarily busy (e.g., another connection holds a lock)
+/// - BusySnapshot: Snapshot is stale, transaction needs to be retried
 fn is_recoverable_tx_error(err: &LimboError) -> bool {
-    matches!(err, LimboError::WriteWriteConflict | LimboError::TxError(_))
+    matches!(
+        err,
+        LimboError::WriteWriteConflict
+            | LimboError::TxError(_)
+            | LimboError::Busy
+            | LimboError::BusySnapshot
+    )
 }
 
 /// Returns true if the error indicates the transaction was rolled back by the database.
 fn error_causes_rollback(err: &LimboError) -> bool {
-    matches!(err, LimboError::WriteWriteConflict)
+    matches!(
+        err,
+        LimboError::WriteWriteConflict | LimboError::BusySnapshot
+    )
 }
 
 use crate::{
     generation::Shadow as _,
     model::{
-        Query, ResultSet,
         interactions::{
             ConnectionState, Interaction, InteractionBuilder, InteractionPlanIterator,
             InteractionPlanState, InteractionType,
         },
     },
 };
+use sql_generation::model::query::pragma::Pragma;
 
 use super::env::{SimConnection, SimulatorEnv};
+
+/// Translates a Turso-specific query to a rusqlite-compatible query.
+/// - MATERIALIZED VIEW -> regular VIEW
+/// - CDC pragmas are skipped (returns None)
+fn translate_query_for_rusqlite(query: &Query) -> Option<Query> {
+    match query {
+        Query::CreateMaterializedView(matview) => {
+            Some(Query::CreateView(matview.to_regular_view()))
+        }
+        Query::DropMaterializedView(drop_matview) => {
+            Some(Query::DropView(drop_matview.to_regular_drop_view()))
+        }
+        Query::Pragma(Pragma::CaptureDataChanges(_)) => {
+            // CDC pragma not supported in rusqlite, skip it
+            None
+        }
+        other => Some(other.clone()),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Execution {
@@ -247,8 +277,7 @@ pub fn execute_interaction_turso(
             }
 
             stack.push(results);
-            // TODO: skip integrity check with mvcc
-            if !env.profile.experimental_mvcc && env.rng.random_ratio(1, 10) {
+            if should_run_integrity_check(env) {
                 let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
                 else {
                     unreachable!()
@@ -294,7 +323,7 @@ pub fn execute_interaction_turso(
         InteractionType::Fault(_) => {
             interaction.execute_fault(env, connection_index)?;
         }
-        InteractionType::FaultyQuery(_) => {
+        InteractionType::FaultyQuery(query) => {
             let conn = {
                 let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
                 else {
@@ -306,12 +335,42 @@ pub fn execute_interaction_turso(
                 .execute_faulty_query(&conn, env)
                 .inspect_err(|err| tracing::error!(?err));
 
-            stack.push(results);
-            // Reset fault injection
+            // Reset fault injection before handling errors
             env.io.inject_fault(false);
-            // TODO: skip integrity check with mvcc
-            if !env.profile.experimental_mvcc && env.rng.random_ratio(1, 10) {
+
+            // Handle errors similar to regular Query: recoverable tx errors continue,
+            // others fail the simulation
+            let skip_shadow = if let Err(err) = &results {
+                if is_recoverable_tx_error(err) {
+                    // Only rollback shadow state if the DB actually rolled back
+                    if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
+                        env.rollback_conn(connection_index);
+                    }
+                    true // skip shadowing this failed query
+                } else {
+                    // For non-recoverable errors during faulty query execution,
+                    // we don't fail the simulation since we expect faults to cause errors.
+                    // But we should skip shadowing to keep state consistent.
+                    tracing::warn!(
+                        "Non-recoverable error during faulty query, skipping shadow: {:?}",
+                        err
+                    );
+                    true
+                }
+            } else {
+                false
+            };
+
+            stack.push(results);
+
+            if should_run_integrity_check(env) {
                 limbo_integrity_check(&conn)?;
+            }
+
+            env.update_conn_last_interaction(connection_index, Some(query));
+
+            if skip_shadow {
+                return Ok(ExecutionContinuation::NextInteractionOutsideThisProperty);
             }
         }
     }
@@ -323,7 +382,31 @@ pub fn execute_interaction_turso(
     Ok(ExecutionContinuation::NextInteraction)
 }
 
+/// Returns true if we should run an integrity check based on profile settings.
+/// MVCC mode always skips integrity checks (not yet supported).
+/// Otherwise uses the profile's integrity_check_probability.
+fn should_run_integrity_check(env: &mut SimulatorEnv) -> bool {
+    if env.profile.experimental_mvcc {
+        return false;
+    }
+    let prob = env.profile.integrity_check_probability;
+    if prob <= 0.0 {
+        return false;
+    }
+    if prob >= 1.0 {
+        return true;
+    }
+    env.rng.random_bool(prob)
+}
+
 fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
+    // Skip integrity check if connection is in a write transaction.
+    // The integrity check would see uncommitted page allocations (inflated db_size)
+    // but the schema doesn't include uncommitted tables yet, causing false positives.
+    if conn.is_in_write_tx() {
+        tracing::debug!("Skipping integrity check: connection is in write transaction");
+        return Ok(());
+    }
     let mut rows = conn.query("PRAGMA integrity_check;")?.unwrap();
     let mut result = Vec::new();
 
@@ -364,8 +447,21 @@ fn execute_interaction_rusqlite(
     };
     match &interaction.interaction {
         InteractionType::Query(query) => {
+            // Translate Turso-specific queries for rusqlite
+            let translated = translate_query_for_rusqlite(query);
+            let Some(translated_query) = translated else {
+                // Query should be skipped for rusqlite (e.g., CDC pragma)
+                tracing::debug!("Skipping Turso-specific query for rusqlite: {}", query);
+                stack.push(Ok(vec![]));
+                env.update_conn_last_interaction(interaction.connection_index, Some(query));
+                // Still run shadow to keep state in sync
+                let _ =
+                    interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
+                return Ok(ExecutionContinuation::NextInteraction);
+            };
+
             tracing::debug!("{}", interaction);
-            let raw_result = execute_query_rusqlite(conn, query, &attached_dbs);
+            let raw_result = execute_query_rusqlite(conn, &translated_query, &attached_dbs);
 
             let is_constraint_error = matches!(
                 &raw_result,
