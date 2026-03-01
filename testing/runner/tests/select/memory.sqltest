@@ -1087,6 +1087,18 @@ expect {
 }
 
 @cross-check-integrity
+test rowid-column-overrides-implicit-rowid-in-join {
+    CREATE TABLE a(x TEXT);
+    CREATE TABLE b(rowid TEXT);
+    INSERT INTO a VALUES ('sku1');
+    INSERT INTO b VALUES ('sku1');
+    SELECT rowid FROM a JOIN b ON a.x = b.rowid;
+}
+expect {
+    sku1
+}
+
+@cross-check-integrity
 test _rowid_-column-overrides-rowid-alias {
     CREATE TABLE t3 (_rowid_ TEXT, val INTEGER);
     INSERT INTO t3 VALUES ('custom', 42);
