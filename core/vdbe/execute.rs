@@ -10734,11 +10734,12 @@ pub fn op_add_column(
     );
 
     let conn = program.connection.clone();
+    let normalized_table_name = normalize_ident(table.as_str());
 
     conn.with_database_schema_mut(*db, |schema| {
         let table_ref = schema
             .tables
-            .get_mut(table)
+            .get_mut(&normalized_table_name)
             .expect("table being altered should be in schema");
 
         let table_ref = Arc::make_mut(table_ref);
