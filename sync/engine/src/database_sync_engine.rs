@@ -29,8 +29,8 @@ use crate::{
     types::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
         DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
-        DbChangesStatus, PartialSyncOpts, SyncEngineIoResult, SyncEngineStats,
-        DATABASE_METADATA_VERSION,
+        DbChangesStatus, LazyParams, PartialSyncOpts, SharedLazyParams, SyncEngineIoResult,
+        SyncEngineStats, DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
@@ -91,6 +91,8 @@ pub struct DatabaseSyncEngine<IO: SyncEngineIo> {
     opts: DatabaseSyncEngineOpts,
     meta: Mutex<DatabaseMetadata>,
     client_unique_id: String,
+    /// Shared lazy parameters that can be updated at runtime
+    lazy_params: SharedLazyParams,
 }
 
 fn db_size_from_page(page: &[u8]) -> u32 {
@@ -442,6 +444,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let changes_path = create_changes_path(&main_db_path);
         let changes_file = main_db_io.open_file(&changes_path, OpenFlags::Create, false)?;
 
+        // Initialize lazy params from opts and metadata
+        let lazy_params = Arc::new(std::sync::RwLock::new(LazyParams::new(
+            meta.remote_url().or_else(|| opts.remote_url.clone()),
+            None, // auth_token is not stored in opts, will be set later via setter
+            opts.remote_encryption_key.clone(),
+        )));
+
         let db = Self {
             io: main_db_io,
             sync_engine_io,
@@ -455,6 +464,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             opts,
             meta: Mutex::new(meta.clone()),
             client_unique_id: meta.client_unique_id.clone(),
+            lazy_params,
         };
 
         let synced_revision = meta.synced_revision.as_ref();
@@ -769,8 +779,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let ctx = &SyncOperationCtx::new(
             coro,
             &self.sync_engine_io,
-            self.meta().remote_url(),
-            self.opts.remote_encryption_key.as_deref(),
+            self.lazy_remote_url().or_else(|| self.meta().remote_url()),
+            self.lazy_encryption_key().as_deref(),
         );
         let next_revision = wal_pull_to_file(
             ctx,
@@ -1024,8 +1034,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 let ctx = &SyncOperationCtx::new(
                     coro,
                     &self.sync_engine_io,
-                    self.meta().remote_url(),
-                    self.opts.remote_encryption_key.as_deref(),
+                    self.lazy_remote_url().or_else(|| self.meta().remote_url()),
+                    self.lazy_encryption_key().as_deref(),
                 );
                 Some(apply_transformation(ctx, &local_changes, &replay.generator).await?)
             } else {
@@ -1069,8 +1079,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let ctx = &SyncOperationCtx::new(
             coro,
             &self.sync_engine_io,
-            self.meta().remote_url(),
-            self.opts.remote_encryption_key.as_deref(),
+            self.lazy_remote_url().or_else(|| self.meta().remote_url()),
+            self.lazy_encryption_key().as_deref(),
         );
         let (_, change_id) =
             push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
@@ -1131,5 +1141,113 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
         *self.meta.lock().unwrap() = meta;
         Ok(())
+    }
+
+    /// Get the shared lazy params reference for sharing with LazyDatabaseStorage.
+    pub fn lazy_params(&self) -> SharedLazyParams {
+        self.lazy_params.clone()
+    }
+
+    /// Get the current remote URL from lazy params.
+    fn lazy_remote_url(&self) -> Option<String> {
+        self.lazy_params.read().unwrap().remote_url.clone()
+    }
+
+    /// Get the current encryption key from lazy params.
+    fn lazy_encryption_key(&self) -> Option<String> {
+        self.lazy_params
+            .read()
+            .unwrap()
+            .remote_encryption_key
+            .clone()
+    }
+
+    /// Set the remote URL for sync operations.
+    ///
+    /// This method allows lazy initialization of the remote URL. The URL can only be:
+    /// - Set from None to Some(value)
+    /// - Set to the same value as before
+    ///
+    /// Attempting to change from one URL to a different URL will return an error.
+    pub fn set_url(&self, url: Option<String>) -> Result<()> {
+        let mut params = self.lazy_params.write().unwrap();
+        match (&params.remote_url, &url) {
+            // Allow setting from None to Some
+            (None, Some(_)) => {
+                params.remote_url = url;
+                Ok(())
+            }
+            // Allow setting to the same value
+            (Some(current), Some(new)) if current == new => Ok(()),
+            // Allow setting None to None (no-op)
+            (None, None) => Ok(()),
+            // Disallow unsetting
+            (Some(current), None) => Err(Error::DatabaseSyncEngineError(format!(
+                "cannot unset remote_url: current value is '{current}'"
+            ))),
+            // Disallow changing from one value to another
+            (Some(current), Some(new)) => Err(Error::DatabaseSyncEngineError(format!(
+                "cannot change remote_url from '{current}' to '{new}'"
+            ))),
+        }
+    }
+
+    /// Set the authorization token for HTTP requests.
+    ///
+    /// This method allows changing the auth token at any time. The token is used
+    /// for Authorization header in HTTP requests to Turso Cloud.
+    pub fn set_auth_token(&self, auth_token: Option<String>) {
+        let mut params = self.lazy_params.write().unwrap();
+        params.auth_token = auth_token;
+    }
+
+    /// Set the encryption key for Turso Cloud encrypted databases.
+    ///
+    /// This method allows lazy initialization of the encryption key. The key can only be:
+    /// - Set from None to Some(value)
+    /// - Set to the same value as before
+    ///
+    /// Attempting to change from one key to a different key will return an error.
+    /// The key should be base64-encoded.
+    pub fn set_encryption_key(&self, key: Option<String>) -> Result<()> {
+        let mut params = self.lazy_params.write().unwrap();
+        match (&params.remote_encryption_key, &key) {
+            // Allow setting from None to Some
+            (None, Some(_)) => {
+                params.remote_encryption_key = key;
+                Ok(())
+            }
+            // Allow setting to the same value
+            (Some(current), Some(new)) if current == new => Ok(()),
+            // Allow setting None to None (no-op)
+            (None, None) => Ok(()),
+            // Disallow unsetting
+            (Some(_), None) => Err(Error::DatabaseSyncEngineError(
+                "cannot unset remote_encryption_key".to_string(),
+            )),
+            // Disallow changing from one value to another
+            (Some(_), Some(_)) => Err(Error::DatabaseSyncEngineError(
+                "cannot change remote_encryption_key to a different value".to_string(),
+            )),
+        }
+    }
+
+    /// Get the current remote URL.
+    pub fn get_url(&self) -> Option<String> {
+        self.lazy_params.read().unwrap().remote_url.clone()
+    }
+
+    /// Get the current auth token.
+    pub fn get_auth_token(&self) -> Option<String> {
+        self.lazy_params.read().unwrap().auth_token.clone()
+    }
+
+    /// Get the current encryption key.
+    pub fn get_encryption_key(&self) -> Option<String> {
+        self.lazy_params
+            .read()
+            .unwrap()
+            .remote_encryption_key
+            .clone()
     }
 }

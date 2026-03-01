@@ -186,7 +186,7 @@ impl<F: std::future::Future<Output = turso_sync_engine::Result<()>>> TursoAsyncO
                     return Ok(TursoAsyncOperationStatus {
                         status: status.status,
                         result: None,
-                    })
+                    });
                 }
                 Err(err) => return Err(err.clone()),
             }
