@@ -2700,6 +2700,13 @@ impl Cursor {
             _ => panic!("set_null_flag on unexpected cursor type"),
         }
     }
+
+    pub fn get_null_flag(&self) -> bool {
+        match self {
+            Self::BTree(cursor) => cursor.get_null_flag(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]

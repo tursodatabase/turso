@@ -3487,6 +3487,14 @@ pub fn op_idx_row_id(
         .as_mut()
         .expect("cursor should exist");
 
+    // If cursor is in NullRow state (e.g. from an outer join or empty aggregate),
+    // return NULL instead of reading a stale rowid.
+    if cursor.get_null_flag() {
+        state.registers[*dest] = Register::Value(Value::Null);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     let rowid = match cursor {
         Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
         Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
