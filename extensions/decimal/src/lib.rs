@@ -11,7 +11,7 @@ struct Decimal {
 }
 
 register_extension! {
-    scalars: {decimal_func, decimal_func_exp, decimal_func_add}
+    scalars: {decimal_func, decimal_func_exp, decimal_func_add, decimal_func_sub}
 }
 
 #[scalar(name = "decimal")]
@@ -70,6 +70,40 @@ fn decimal_func_add(args: &[Value]) -> Value {
     }
     let pa = Decimal::decimal_new(&args[0], true);
     let pb = Decimal::decimal_new(&args[1], true);
+
+    match (pa, pb) {
+        (Some(mut a), Some(mut b)) => {
+            a.add(&mut b);
+            match a.decimal_result() {
+                Some(res) => Value::from_text(res),
+                None => Value::null(),
+            }
+        }
+        (Some(a), None) => match a.decimal_result() {
+            Some(res) => Value::from_text(res),
+            None => Value::null(),
+        },
+        (None, Some(b)) => match b.decimal_result() {
+            Some(res) => Value::from_text(res),
+            None => Value::null(),
+        },
+        _ => Value::null(),
+    }
+}
+#[scalar(name = "decimal_sub")]
+fn decimal_func_sub(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
+
+    let pa = Decimal::decimal_new(&args[0], true);
+    let pb = match Decimal::decimal_new(&args[1], true) {
+        Some(mut b) => {
+            b.sign = !b.sign;
+            Some(b)
+        }
+        None => None,
+    };
 
     match (pa, pb) {
         (Some(mut a), Some(mut b)) => {
@@ -418,11 +452,8 @@ impl Decimal {
             }
             ValueType::Blob if b_text_only => {
                 let bytes = arg.to_blob()?;
-                if bytes.len() != 8 {
-                    return None;
-                }
-                let v = bytes.iter().fold(0u64, |acc, &b| (acc << 8) | (b as u64));
-                Decimal::from_text(f64::from_bits(v).to_string().as_str())
+                let s = std::str::from_utf8(bytes.as_slice()).unwrap_or("");
+                Decimal::from_text(s)
             }
             ValueType::Float => Decimal::from_double(arg.to_float()?),
             ValueType::Blob => {

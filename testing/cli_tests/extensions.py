@@ -776,13 +776,28 @@ def test_decimal():
     )
     turso.run_test_fn(
         "SELECT decimal_add(X'3FE0000000000000', 2.2);",
-        lambda res: "2.7" == res,
+        lambda res: "2.2" == res,
         "decimal_add(X'3FE0000000000000', 2.2) function return correctly",
     )
     turso.run_test_fn(
         "SELECT decimal_add('2.5', '1.1');",
         lambda res: "3.6" == res,
         "decimal_add('2.5', '1.1') function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_sub('2.5', '1.1');",
+        lambda res: "1.4" == res,
+        "decimal_sub('2.5', '1.1') function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_sub(3.1, 2);",
+        lambda res: "1.1" == res,
+        "decimal_sub(3.1, 2) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_sub(X'3FE0000000000000', 2.2);",
+        lambda res: "-2.2" == res,
+        "decimal_sub(X'3FE0000000000000', 2.2) function return correctly",
     )
 
 def test_vfs():
