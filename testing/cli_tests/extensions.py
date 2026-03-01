@@ -720,6 +720,86 @@ def test_fuzzy():
     )
 
 
+def test_decimal():
+    turso = TestTursoShell(init_commands="")
+    ext_path = "./target/debug/liblimbo_decimal"
+    turso.run_test_fn(
+        "SELECT decimal('0.1');",
+        lambda res: "error: no such function: " in res,
+        "decimal function returns null when ext not loaded",
+    )
+    turso.execute_dot(f".load {ext_path}")
+    turso.run_test_fn(
+        "SELECT decimal('0.1');",
+        lambda res: "0.1" == res,
+        "decimal(0.1) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal('1.0e72');",
+        lambda res: "1000000000000000000000000000000000000000000000000000000000000000000000000"== res,
+        "decimal('1.0e72') function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_exp('+123e+4');",
+        lambda res: "+1.23e+06" == res,
+        "decimal_exp('+123e+4') function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_exp(0.99);",
+        lambda res: "+9.899999999999999911182158029987476766109466552734375e-01"== res,
+        "decimal_exp(0.99) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal(0.55);",
+        lambda res: "0.5500000000000000444089209850062616169452667236328125"== res,
+        "decimal(0.55) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal(X'3FE0000000000000');",
+        lambda res: "0.5"== res,
+        "decimal(X'3FE0000000000000') function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal(X'DEADBEEF');",
+        lambda res: "" == res,
+        "decimal(X'DEADBEEF') function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_add(0.69, 2.2222222);",
+        lambda res: "2.9122222" == res,
+        "decimal_add(0.69, 2.2222222) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_add(X'3EEEEE', 2.2);",
+        lambda res: "2.2" == res,
+        "decimal_add(X'3EEEEE', 2.2) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_add(X'3FE0000000000000', 2.2);",
+        lambda res: "2.2" == res,
+        "decimal_add(X'3FE0000000000000', 2.2) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_add('2.5', '1.1');",
+        lambda res: "3.6" == res,
+        "decimal_add('2.5', '1.1') function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_sub('2.5', '1.1');",
+        lambda res: "1.4" == res,
+        "decimal_sub('2.5', '1.1') function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_sub(3.1, 2);",
+        lambda res: "1.1" == res,
+        "decimal_sub(3.1, 2) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_sub(X'3FE0000000000000', 2.2);",
+        lambda res: "-2.2" == res,
+        "decimal_sub(X'3FE0000000000000', 2.2) function return correctly",
+    )
+
 def test_vfs():
     turso = TestTursoShell()
     ext_path = "target/debug/libturso_ext_tests"
@@ -977,6 +1057,7 @@ def main():
         test_csv()
         test_tablestats()
         test_fuzzy()
+        test_decimal()
     except Exception as e:
         console.error(f"Test FAILED: {e}")
         cleanup()

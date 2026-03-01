@@ -20,6 +20,7 @@ members = [
     "extensions/regexp",
     "extensions/tests",
     "extensions/fuzzy",
+    "extensions/decimal",
     "macros",
     "testing/simulator",
     "sqlite3",
