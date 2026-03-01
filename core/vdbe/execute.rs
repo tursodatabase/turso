@@ -4570,11 +4570,18 @@ fn update_agg_payload(
                 },
                 Value::Text(t) => {
                     let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
-                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, false);
+                    handle_text_sum(
+                        acc,
+                        &mut sum_state,
+                        parsed_number,
+                        parse_result,
+                        false,
+                        func,
+                    )?;
                 }
                 Value::Blob(b) => {
                     let (parse_result, parsed_number) = try_for_float(&b);
-                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, true);
+                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, true, func)?;
                 }
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
@@ -10965,7 +10972,8 @@ fn handle_text_sum(
     parsed_number: ParsedNumber,
     parse_result: NumericParseResult,
     force_approx: bool,
-) {
+    func: &AggFunc,
+) -> Result<()> {
     // SQLite treats text that only partially parses as numeric (ValidPrefixOnly)
     // as approximate, so SUM returns real instead of integer. Non-integer inputs
     // (e.g. BLOB) should also force approximate results.
@@ -10995,11 +11003,15 @@ fn handle_text_sum(
                     Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(i) {
                         Some(sum) => *acc = Value::from_i64(sum),
                         None => {
-                            let acc_f = *acc_i as f64;
-                            *acc = Value::from_f64(acc_f);
-                            sum_state.approx = true;
-                            sum_state.ovrfl = true;
-                            apply_kbn_step_int(acc, i, sum_state);
+                            if matches!(func, AggFunc::Total) {
+                                let acc_f = *acc_i as f64;
+                                *acc = Value::from_f64(acc_f);
+                                sum_state.approx = true;
+                                sum_state.ovrfl = true;
+                                apply_kbn_step_int(acc, i, sum_state);
+                            } else {
+                                return Err(LimboError::IntegerOverflow);
+                            }
                         }
                     },
                     Value::Numeric(Numeric::Float(_)) => {
@@ -11031,6 +11043,7 @@ fn handle_text_sum(
             }
         }
     }
+    Ok(())
 }
 
 pub fn op_fk_counter(

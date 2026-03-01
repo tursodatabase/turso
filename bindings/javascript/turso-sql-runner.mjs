@@ -9,8 +9,8 @@
  * the @tursodatabase/database package is available.
  *
  * Known limitations:
- * - JavaScript's number type doesn't distinguish between 1 and 1.0, so float
- *   formatting may differ from the Rust backend for whole-number floats.
+ * - With safe_integers enabled, DB integers arrive as BigInt and floats as
+ *   number. Whole-number floats (e.g. 30.0) get ".0" appended to match SQLite.
  * - Very large integers (exceeding i64) may have precision loss as JavaScript
  *   numbers are IEEE 754 doubles with 53 bits of mantissa precision.
  */
@@ -44,13 +44,17 @@ function formatValue(value) {
         if (Number.isNaN(value)) {
             return '';  // SQLite returns NULL for NaN
         }
-        // For integers, use toString() directly
-        if (Number.isInteger(value)) {
-            return value.toString();
-        }
+        // With safe_integers enabled, all DB integers arrive as BigInt.
+        // Any `number` here came from a REAL column in the database.
         // SQLite uses %.15g format (15 significant digits, trailing zeros removed)
         // toPrecision gives significant digits, parseFloat removes trailing zeros
-        return parseFloat(value.toPrecision(15)).toString();
+        let str = parseFloat(value.toPrecision(15)).toString();
+        // Ensure float values always include a decimal point (e.g., 30 -> "30.0")
+        // to match SQLite output which distinguishes reals from integers.
+        if (!str.includes('.') && !str.includes('e') && !str.includes('E')) {
+            str += '.0';
+        }
+        return str;
     }
     if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
         // Output blob as raw bytes (matches SQLite/Rust backend behavior)

@@ -63,8 +63,8 @@ simulator covers and tests.
 | SELECT ... WHERE ... LIKE | No      |                                                                                   |
 | SELECT ... LIMIT          | Partial | TODO                                                                              |
 | SELECT ... ORDER BY       | Partial | TODO                                                                              |
-| SELECT ... GROUP BY       | No      |                                                                                   |
-| SELECT ... HAVING         | No      |                                                                                   |
+| SELECT ... GROUP BY       | Partial | GROUP BY with COUNT, COUNT(*), SUM, MIN, MAX aggregates                           |
+| SELECT ... HAVING         | Partial | HAVING with COUNT(*) > N                                                          |
 | SELECT ... JOIN           | Partial | TODO                                                                              |
 | SELECT ... CROSS JOIN     | No      | SQLite CROSS JOIN means "do not reorder joins". We don't support that yet anyway. |
 | SELECT ... INNER JOIN     | Partial | TODO                                                                              |
@@ -288,14 +288,14 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | Function          | Status | Comment |
 | ----------------- | ------ | ------- |
 | avg(X)            | No     |         |
-| count()           | No     |         |
-| count(*)          | No     |         |
+| count()           | Yes    | via GroupByAggregateCheck property |
+| count(*)          | Yes    | via GroupByAggregateCheck property |
 | group_concat(X)   | No     |         |
 | group_concat(X,Y) | No     |         |
 | string_agg(X,Y)   | No     |         |
-| max(X)            | No     |         |
-| min(X)            | No     |         |
-| sum(X)            | No     |         |
+| max(X)            | Yes    | via GroupByAggregateCheck property |
+| min(X)            | Yes    | via GroupByAggregateCheck property |
+| sum(X)            | Yes    | via GroupByAggregateCheck property |
 | total(X)          | No     |         |
 
 #### Date and time functions
