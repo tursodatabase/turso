@@ -421,6 +421,18 @@ expect {
     3|3
 }
 
+# Regression test for: https://github.com/tursodatabase/turso/issues/5233
+# LEFT JOIN with empty left table + ungrouped aggregate panics because
+# OpenAutoindex (inside the loop body) never executes when Rewind skips the loop,
+# but the post-loop aggregation path tries to read from the never-opened cursor.
+test left-join-empty-table-ungrouped-aggregate {
+    CREATE TABLE t(x);
+    SELECT b.x, COUNT(*) FROM t a LEFT JOIN t b ON a.x=b.x;
+}
+expect {
+    |0
+}
+
 @skip-if sqlite "sqlite supports full outer joins"
 @cross-check-integrity
 test full-outer-join {
