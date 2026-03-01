@@ -1,5 +1,5 @@
 // Adapted from https://github.com/sqlite/sqlite/blob/master/ext/misc/decimal.c
-use turso_ext::{register_extension, scalar, Value, ValueType};
+use turso_ext::{register_extension, scalar, ResultCode, Value, ValueType};
 
 #[derive(Clone)]
 struct Decimal {
@@ -11,7 +11,7 @@ struct Decimal {
 }
 
 register_extension! {
-    scalars: {decimal_func, decimal_func_exp}
+    scalars: {decimal_func, decimal_func_exp, decimal_func_add}
 }
 
 #[scalar(name = "decimal")]
@@ -60,6 +60,34 @@ fn decimal_func_exp(args: &[Value]) -> Value {
     match result {
         Some(s) => Value::from_text(s),
         None => Value::null(),
+    }
+}
+
+#[scalar(name = "decimal_add")]
+fn decimal_func_add(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
+    let pa = Decimal::decimal_new(&args[0], true);
+    let pb = Decimal::decimal_new(&args[1], true);
+
+    match (pa, pb) {
+        (Some(mut a), Some(mut b)) => {
+            a.add(&mut b);
+            match a.decimal_result() {
+                Some(res) => Value::from_text(res),
+                None => Value::null(),
+            }
+        }
+        (Some(a), None) => match a.decimal_result() {
+            Some(res) => Value::from_text(res),
+            None => Value::null(),
+        },
+        (None, Some(b)) => match b.decimal_result() {
+            Some(res) => Value::from_text(res),
+            None => Value::null(),
+        },
+        _ => Value::null(),
     }
 }
 
@@ -383,13 +411,22 @@ impl Decimal {
 
     fn decimal_new(arg: &Value, b_text_only: bool) -> Option<Decimal> {
         match arg.value_type() {
-            ValueType::Text | ValueType::Integer => Decimal::from_text(arg.to_text()?),
-            ValueType::Float if b_text_only => Decimal::from_text(arg.to_text()?),
-            ValueType::Blob if b_text_only => Decimal::from_text(arg.to_text()?),
+            ValueType::Text => Decimal::from_text(arg.to_text()?),
+            ValueType::Integer => Decimal::from_text(arg.to_integer()?.to_string().as_str()),
+            ValueType::Float if b_text_only => {
+                Decimal::from_text(arg.to_float()?.to_string().as_str())
+            }
+            ValueType::Blob if b_text_only => {
+                let bytes = arg.to_blob()?;
+                if bytes.len() != 8 {
+                    return None;
+                }
+                let v = bytes.iter().fold(0u64, |acc, &b| (acc << 8) | (b as u64));
+                Decimal::from_text(f64::from_bits(v).to_string().as_str())
+            }
             ValueType::Float => Decimal::from_double(arg.to_float()?),
             ValueType::Blob => {
                 let bytes = arg.to_blob()?;
-                //IEEE-754 double -> blob with 8 byte only
                 if bytes.len() != 8 {
                     return None;
                 }
@@ -495,6 +532,95 @@ impl Decimal {
         }
 
         Some(z)
+    }
+
+    fn expand(&mut self, n_digit: usize, n_frac: usize) {
+        let n_add_frac = n_frac as isize - self.n_frac as isize;
+        let n_add_sig = (n_digit as isize - self.n_digit as isize) - n_add_frac;
+
+        if n_add_frac == 0 && n_add_sig == 0 {
+            return;
+        }
+
+        if n_digit < self.n_digit {
+            return;
+        }
+
+        self.a.resize(n_digit + 1, 0);
+
+        if n_add_sig > 0 {
+            let n_add_sig = n_add_sig as usize;
+            self.a.copy_within(0..self.n_digit, n_add_sig);
+            self.a[..n_add_sig].fill(0);
+            self.n_digit += n_add_sig;
+        }
+
+        if n_add_frac > 0 {
+            let n_add_frac = n_add_frac as usize;
+            self.a[self.n_digit..self.n_digit + n_add_frac].fill(0);
+            self.n_digit += n_add_frac;
+            self.n_frac += n_add_frac;
+        }
+    }
+
+    fn add(&mut self, p_b: &mut Decimal) {
+        if self.is_null || p_b.is_null {
+            self.is_null = true;
+            return;
+        }
+
+        let mut n_sig = self.n_digit as isize - self.n_frac as isize;
+        if n_sig > 0 && !self.a.is_empty() && self.a[0] == 0 {
+            n_sig -= 1;
+        }
+        let b_sig = p_b.n_digit as isize - p_b.n_frac as isize;
+        if n_sig < b_sig {
+            n_sig = b_sig;
+        }
+
+        let n_frac = self.n_frac.max(p_b.n_frac);
+        //let n_digit = n_sig as usize + n_frac + 1;
+        let n_digit = (n_sig.max(0) as usize) + n_frac + 1;
+
+        self.expand(n_digit, n_frac);
+        p_b.expand(n_digit, n_frac);
+
+        if self.sign == p_b.sign {
+            // same sign  addition with carry
+            let mut carry = 0i32;
+            for i in (0..n_digit).rev() {
+                let x = self.a[i] as i32 + p_b.a[i] as i32 + carry;
+                if x >= 10 {
+                    carry = 1;
+                    self.a[i] = (x - 10) as u8;
+                } else {
+                    carry = 0;
+                    self.a[i] = x as u8;
+                }
+            }
+        } else {
+            // different sign → subtraction with borrow
+            let rc = self.a[..n_digit].cmp(&p_b.a[..n_digit]);
+
+            let (a_a, a_b) = if rc == std::cmp::Ordering::Less {
+                self.sign = !self.sign;
+                (p_b.a.clone(), self.a.clone())
+            } else {
+                (self.a.clone(), p_b.a.clone())
+            };
+
+            let mut borrow = 0i32;
+            for i in (0..n_digit).rev() {
+                let x = a_a[i] as i32 - a_b[i] as i32 - borrow;
+                if x < 0 {
+                    self.a[i] = (x + 10) as u8;
+                    borrow = 1;
+                } else {
+                    self.a[i] = x as u8;
+                    borrow = 0;
+                }
+            }
+        }
     }
 }
 #[cfg(test)]
@@ -703,5 +829,22 @@ mod tests {
         assert!(Decimal::from_double(f64::NAN).is_none());
         assert!(Decimal::from_double(f64::INFINITY).is_none());
         assert!(Decimal::from_double(f64::NEG_INFINITY).is_none());
+    }
+    #[test]
+    fn test_add() {
+        let mut a = Decimal::from_text("1").expect("valid");
+        let mut b = Decimal::from_text("2").expect("valid");
+        a.add(&mut b);
+        assert_eq!(a.decimal_result(), Some("3".to_string()));
+
+        let mut a = Decimal::from_text("6").expect("valid");
+        let mut b = Decimal::from_text("0.5").expect("valid");
+        a.add(&mut b);
+        assert_eq!(a.decimal_result(), Some("6.5".to_string()));
+
+        let mut a = Decimal::from_text("10").expect("valid");
+        let mut b = Decimal::from_text("-3").expect("valid");
+        a.add(&mut b);
+        assert_eq!(a.decimal_result(), Some("7".to_string()));
     }
 }

@@ -764,6 +764,26 @@ def test_decimal():
         lambda res: "" == res,
         "decimal(X'DEADBEEF') function return correctly",
     )
+    turso.run_test_fn(
+        "SELECT decimal_add(0.69, 2.2222222);",
+        lambda res: "2.9122222" == res,
+        "decimal_add(0.69, 2.2222222) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_add(X'3EEEEE', 2.2);",
+        lambda res: "2.2" == res,
+        "decimal_add(X'3EEEEE', 2.2) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_add(X'3FE0000000000000', 2.2);",
+        lambda res: "2.7" == res,
+        "decimal_add(X'3FE0000000000000', 2.2) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_add('2.5', '1.1');",
+        lambda res: "3.6" == res,
+        "decimal_add('2.5', '1.1') function return correctly",
+    )
 
 def test_vfs():
     turso = TestTursoShell()
