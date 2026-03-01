@@ -1617,6 +1617,7 @@ pub fn translate_drop_table(
             });
         }
         Table::FromClauseSubquery(..) => panic!("FromClauseSubquery can't be dropped"),
+        Table::RecursiveCte(..) => panic!("RecursiveCte can't be dropped"),
     };
 
     let schema_data_register = program.alloc_register();

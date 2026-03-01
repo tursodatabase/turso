@@ -1088,11 +1088,20 @@ fn parse_table(
     if let Some(outer_ref) =
         table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
     {
-        if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
+        if matches!(
+            outer_ref.table,
+            Table::FromClauseSubquery(_) | Table::RecursiveCte(_)
+        ) {
+            let alias = maybe_alias
+                .map(|a| match a {
+                    ast::As::As(id) => id,
+                    ast::As::Elided(id) => id,
+                })
+                .map(|a| normalize_ident(a.as_str()));
             table_references.add_joined_table(JoinedTable {
                 op: Operation::default_scan_for(&outer_ref.table),
                 table: outer_ref.table.clone(),
-                identifier: outer_ref.identifier.clone(),
+                identifier: alias.unwrap_or_else(|| outer_ref.identifier.clone()),
                 internal_id: program.table_reference_counter.next(),
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),

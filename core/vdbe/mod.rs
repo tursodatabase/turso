@@ -1301,7 +1301,19 @@ impl Program {
 
                     // Collect materialized views - they should all have storage
                     let mut views = Vec::new();
-                    for view_name in self.connection.view_transaction_states.get_view_names() {
+                    let mut visited = std::collections::HashSet::new();
+
+                    // Start with views that have direct changes from base table modifications
+                    let direct_views = self.connection.view_transaction_states.get_view_names();
+
+                    // Use BFS to collect all transitively dependent views in topological order
+                    let mut queue = std::collections::VecDeque::from(direct_views.clone());
+
+                    while let Some(view_name) = queue.pop_front() {
+                        if visited.contains(&view_name) {
+                            continue;
+                        }
+
                         if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
                             let view = view_mutex.lock();
                             let root_page = view.get_root_page();
@@ -1313,7 +1325,22 @@ impl Program {
                                 { "view_name": view_name }
                             );
 
-                            views.push(view_name);
+                            visited.insert(view_name.clone());
+                            views.push(view_name.clone());
+
+                            // Add views that depend on this view (for cascading updates)
+                            for dependent_view in
+                                schema.get_dependent_materialized_views(&view_name)
+                            {
+                                if !visited.contains(&dependent_view) {
+                                    // Ensure the dependent view has a transaction state
+                                    // (it may not have one yet if it only depends on other views)
+                                    self.connection
+                                        .view_transaction_states
+                                        .get_or_create(&dependent_view);
+                                    queue.push_back(dependent_view);
+                                }
+                            }
                         }
                     }
 
@@ -1356,7 +1383,7 @@ impl Program {
 
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
                         match view.merge_delta(delta_set, pager.clone())? {
-                            IOResult::Done(_) => {
+                            IOResult::Done(()) => {
                                 // Move to next view
                                 state.view_delta_state = ViewDeltaCommitState::Processing {
                                     views: views.clone(),

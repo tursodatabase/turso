@@ -235,11 +235,15 @@ pub fn translate_inner(
             ..
         } => view::translate_create_view(&view_name, resolver, &select, &columns, program)?,
         ast::Stmt::CreateMaterializedView {
-            view_name, select, ..
+            view_name,
+            select,
+            if_not_exists,
+            ..
         } => view::translate_create_materialized_view(
             &view_name,
             resolver,
             &select,
+            if_not_exists,
             connection.clone(),
             program,
         )?,

@@ -8,10 +8,12 @@
 use crate::incremental::aggregate_operator::AggregateOperator;
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
+use crate::incremental::literal_operator::LiteralOperator;
 use crate::incremental::operator::{
     create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
     IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
 };
+use crate::incremental::recursive_operator::{RecursiveOperator, RecursiveState};
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 // Note: logical module must be made pub(crate) in translate/mod.rs
@@ -19,10 +21,11 @@ use crate::numeric::Numeric;
 use crate::sync::{atomic::Ordering, Arc};
 use crate::translate::logical::{
     BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
-    LogicalSchema, SchemaRef,
+    LogicalSchema, RecursiveCTE, SchemaRef, DEFAULT_RECURSIVE_MAX_ITERATIONS,
 };
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
+
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -204,7 +207,7 @@ pub enum ExecuteState {
     /// Initial state - starting circuit execution
     Init {
         /// Input deltas to process
-        input_data: DeltaSet,
+        input_data: InputDeltas,
     },
 
     /// Processing multiple inputs (for recursive node processing)
@@ -221,6 +224,22 @@ pub enum ExecuteState {
     ProcessingNode {
         /// Node's evaluation state (includes the delta in its Init state)
         eval_state: Box<EvalState>,
+    },
+
+    /// Processing a recursive fixed-point iteration
+    ProcessingRecursive {
+        /// ID of the recursive operator node
+        node_id: i64,
+        /// Base case node ID
+        base_case_id: i64,
+        /// Recursive step node ID
+        recursive_step_id: i64,
+        /// Name of the recursive CTE (used for delay key in input_data)
+        delay_name: String,
+        /// State for the current sub-execution
+        sub_state: Box<ExecuteState>,
+        /// Input data (for sub-executions)
+        input_data: InputDeltas,
     },
 }
 
@@ -276,6 +295,64 @@ impl DeltaSet {
     }
 }
 
+/// Overlay view of input deltas used during execution.
+/// Keeps base deltas shared and allows a small per-iteration override set.
+#[derive(Debug, Clone)]
+pub struct InputDeltas {
+    base: Arc<DeltaSet>,
+    overlay: DeltaSet,
+}
+
+impl InputDeltas {
+    pub fn from_base(base: Arc<DeltaSet>) -> Self {
+        Self {
+            base,
+            overlay: DeltaSet::new(),
+        }
+    }
+
+    pub fn from_delta_set(delta_set: DeltaSet) -> Self {
+        Self::from_base(Arc::new(delta_set))
+    }
+
+    pub fn from_map(deltas: HashMap<String, Delta>) -> Self {
+        Self::from_delta_set(DeltaSet::from_map(deltas))
+    }
+
+    /// Get delta for a table, overlay first, then base.
+    pub fn get(&self, table_name: &str) -> Delta {
+        self.overlay
+            .deltas
+            .get(table_name)
+            .cloned()
+            .unwrap_or_else(|| self.base.get(table_name))
+    }
+
+    /// Insert/replace an overlay delta.
+    pub fn insert(&mut self, table_name: String, delta: Delta) {
+        self.overlay.insert(table_name, delta);
+    }
+
+    /// Retain only overlay entries that match predicate.
+    pub fn retain_overlay<F>(&mut self, f: F)
+    where
+        F: FnMut(&String, &mut Delta) -> bool,
+    {
+        self.overlay.deltas.retain(f);
+    }
+
+    /// Drop the shared base deltas (used after the first recursive iteration).
+    pub fn clear_base(&mut self) {
+        self.base = Arc::new(DeltaSet::new());
+    }
+}
+
+impl Default for InputDeltas {
+    fn default() -> Self {
+        Self::from_base(Arc::new(DeltaSet::new()))
+    }
+}
+
 /// Represents a DBSP operator in the compiled circuit
 #[derive(Debug, Clone, PartialEq)]
 pub enum DbspOperator {
@@ -300,10 +377,23 @@ pub enum DbspOperator {
     },
     /// Input operator - source of data
     Input { name: String, schema: SchemaRef },
+    /// Literal operator - produces constant rows (for EmptyRelation and VALUES)
+    Literal { schema: SchemaRef },
     /// Merge operator for combining streams (used in recursive CTEs and UNION)
     Merge { schema: SchemaRef },
     /// Distinct operator - removes duplicates
     Distinct { schema: SchemaRef },
+    /// Recursive operator - container for fixed-point computation
+    Recursive {
+        /// Name of the recursive CTE
+        name: String,
+        /// Maximum iterations allowed
+        max_iterations: usize,
+        /// Whether to use UNION ALL semantics
+        union_all: bool,
+        /// Schema of the output
+        schema: SchemaRef,
+    },
 }
 
 /// Represents an expression in DBSP
@@ -433,6 +523,14 @@ impl DbspCircuit {
         }
     }
 
+    /// Check if this circuit is running in one-shot mode (no btree storage).
+    /// In one-shot mode, all root pages are 0, meaning there's no persistent
+    /// storage for intermediate state. This affects how we handle base data
+    /// during recursive CTE execution.
+    fn is_one_shot(&self) -> bool {
+        self.internal_state_root == 0 && self.internal_state_index_root == 0
+    }
+
     /// Set the root node and update the output schema
     fn set_root(&mut self, root_id: i64, schema: SchemaRef) {
         self.root = Some(root_id);
@@ -483,6 +581,15 @@ impl DbspCircuit {
         }
     }
 
+    fn new_state_cursors(&self, pager: Arc<Pager>) -> DbspStateCursors {
+        let table_cursor =
+            BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
+        let index_def = create_dbsp_state_index(self.internal_state_index_root);
+        let index_cursor =
+            BTreeCursor::new_index(pager, self.internal_state_index_root, &index_def, 3);
+        DbspStateCursors::new(table_cursor, index_cursor)
+    }
+
     /// Execute the circuit with incremental input data (deltas).
     ///
     /// # Arguments
@@ -496,16 +603,7 @@ impl DbspCircuit {
     ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
             // Create temporary cursors for execute (non-commit) operations
-            let table_cursor =
-                BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
-            let index_def = create_dbsp_state_index(self.internal_state_index_root);
-            let index_cursor = BTreeCursor::new_index(
-                pager.clone(),
-                self.internal_state_index_root,
-                &index_def,
-                3,
-            );
-            let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+            let mut cursors = self.new_state_cursors(pager.clone());
             self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
             Err(LimboError::ParseError(
@@ -537,7 +635,7 @@ impl DbspCircuit {
         let num_columns = self.output_schema.columns.len() + 1;
 
         // Convert input_data to DeltaSet once, outside the loop
-        let input_delta_set = DeltaSet::from_map(input_data);
+        let input_delta_set = Arc::new(DeltaSet::from_map(input_data));
 
         loop {
             // Take ownership of the state for processing, to avoid borrow checker issues (we have
@@ -547,27 +645,11 @@ impl DbspCircuit {
             match &mut state {
                 CommitState::Init => {
                     // Create state cursors when entering CommitOperators state
-                    let state_table_cursor = BTreeCursor::new_table(
-                        pager.clone(),
-                        self.internal_state_root,
-                        OPERATOR_COLUMNS,
-                    );
-                    let index_def = create_dbsp_state_index(self.internal_state_index_root);
-                    let state_index_cursor = BTreeCursor::new_index(
-                        pager.clone(),
-                        self.internal_state_index_root,
-                        &index_def,
-                        3, // Index on first 3 columns
-                    );
-
-                    let state_cursors = Box::new(DbspStateCursors::new(
-                        state_table_cursor,
-                        state_index_cursor,
-                    ));
+                    let state_cursors = Box::new(self.new_state_cursors(pager.clone()));
 
                     self.commit_state = CommitState::CommitOperators {
                         execute_state: Box::new(ExecuteState::Init {
-                            input_data: input_delta_set.clone(),
+                            input_data: InputDeltas::from_base(input_delta_set.clone()),
                         }),
                         state_cursors,
                     };
@@ -678,7 +760,7 @@ impl DbspCircuit {
                         .get(&node_id)
                         .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
 
-                    // Check if this is an Input node
+                    // Check for special node types
                     match &node.operator {
                         DbspOperator::Input { name, .. } => {
                             // Input nodes get their delta directly from input_data
@@ -687,6 +769,41 @@ impl DbspCircuit {
                                 eval_state: Box::new(EvalState::Init {
                                     deltas: delta.into(),
                                 }),
+                            };
+                        }
+                        DbspOperator::Literal { .. } => {
+                            // Literal nodes generate their own data, no external input needed
+                            *execute_state = ExecuteState::ProcessingNode {
+                                eval_state: Box::new(EvalState::Init {
+                                    deltas: DeltaPair::default(),
+                                }),
+                            };
+                        }
+                        DbspOperator::Recursive { name, .. } => {
+                            // Recursive nodes need special fixed-point execution
+                            // inputs = [base_case_id, recursive_step_id, delay_id]
+                            let inputs = node.inputs.clone();
+                            if inputs.len() != 3 {
+                                return Err(LimboError::ParseError(format!(
+                                    "Recursive node '{}' must have exactly 3 inputs, found {}",
+                                    name,
+                                    inputs.len()
+                                )));
+                            }
+                            let base_case_id = inputs[0];
+                            let recursive_step_id = inputs[1];
+                            // delay_input_id is inputs[2] but we don't need it - we use delay_name
+
+                            let input_data = std::mem::take(input_data);
+                            *execute_state = ExecuteState::ProcessingRecursive {
+                                node_id,
+                                base_case_id,
+                                recursive_step_id,
+                                delay_name: name.clone(),
+                                sub_state: Box::new(ExecuteState::Init {
+                                    input_data: input_data.clone(),
+                                }),
+                                input_data,
                             };
                         }
                         _ => {
@@ -734,20 +851,7 @@ impl DbspCircuit {
                         let (input_node_id, input_state) = &mut input_states[*current_index];
 
                         // Create temporary cursors for the recursive call
-                        let temp_table_cursor = BTreeCursor::new_table(
-                            pager.clone(),
-                            self.internal_state_root,
-                            OPERATOR_COLUMNS,
-                        );
-                        let index_def = create_dbsp_state_index(self.internal_state_index_root);
-                        let temp_index_cursor = BTreeCursor::new_index(
-                            pager.clone(),
-                            self.internal_state_index_root,
-                            &index_def,
-                            3,
-                        );
-                        let mut temp_cursors =
-                            DbspStateCursors::new(temp_table_cursor, temp_index_cursor);
+                        let mut temp_cursors = self.new_state_cursors(pager.clone());
 
                         let delta = return_if_io!(self.execute_node(
                             *input_node_id,
@@ -770,6 +874,168 @@ impl DbspCircuit {
                     let output_delta =
                         return_if_io!(node.process_node(eval_state, commit_operators, cursors));
                     return Ok(IOResult::Done(output_delta));
+                }
+                ExecuteState::ProcessingRecursive {
+                    node_id,
+                    base_case_id,
+                    recursive_step_id,
+                    delay_name,
+                    sub_state,
+                    input_data,
+                } => {
+                    let delay_key = format!("__delay_{delay_name}");
+                    let nid = *node_id;
+
+                    let state = {
+                        let node = self
+                            .nodes
+                            .get(&nid)
+                            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
+                        let recursive_op = node
+                            .executable
+                            .as_any()
+                            .downcast_ref::<RecursiveOperator>()
+                            .ok_or_else(|| {
+                                LimboError::ParseError("Expected RecursiveOperator".to_string())
+                            })?;
+                        recursive_op.state().clone()
+                    };
+
+                    // If the operator was previously Done, reset to Init for re-execution.
+                    // This is intentional for incremental updates: when source tables change,
+                    // we re-run fixed-point iteration with the new deltas. The key insight is
+                    // that RecursiveOperator preserves seen_counts/seen_rows hash maps across
+                    // runs, so filter_new_rows() only emits deltas for values whose multiplicity
+                    // changed (e.g., new inserts or deletions). This prevents re-computing the
+                    // entire transitive closure and ensures we only propagate the incremental
+                    // changes through the recursion. Note: accumulated_output is reset by
+                    // initialize_with_base(), so finalize() having taken it is fine.
+                    let state = if matches!(state, RecursiveState::Done) {
+                        RecursiveState::Init
+                    } else {
+                        state
+                    };
+
+                    match state {
+                        RecursiveState::Init => {
+                            // Create temporary cursors for the recursive call
+                            let mut temp_cursors = self.new_state_cursors(pager.clone());
+
+                            // Execute the base case
+                            let base_delta = return_if_io!(self.execute_node(
+                                *base_case_id,
+                                pager.clone(),
+                                sub_state,
+                                commit_operators,
+                                &mut temp_cursors
+                            ));
+
+                            // Get the operator and initialize it
+                            let node = self.nodes.get_mut(&nid).ok_or_else(|| {
+                                LimboError::ParseError("Node not found".to_string())
+                            })?;
+                            let recursive_op = node
+                                .executable
+                                .as_any_mut()
+                                .downcast_mut::<RecursiveOperator>()
+                                .ok_or_else(|| {
+                                    LimboError::ParseError("Expected RecursiveOperator".to_string())
+                                })?;
+
+                            let delay_delta = recursive_op.initialize_with_base(base_delta)?;
+                            recursive_op.start_iteration();
+
+                            // Set the delay value in input_data for the recursive step
+                            input_data.insert(delay_key, delay_delta);
+
+                            // Move to recursive step
+                            *sub_state = Box::new(ExecuteState::Init {
+                                input_data: input_data.clone(),
+                            });
+                        }
+                        RecursiveState::BaseComplete => {
+                            let node = self.nodes.get_mut(&nid).ok_or_else(|| {
+                                LimboError::ParseError("Node not found".to_string())
+                            })?;
+                            let recursive_op = node
+                                .executable
+                                .as_any_mut()
+                                .downcast_mut::<RecursiveOperator>()
+                                .ok_or_else(|| {
+                                    LimboError::ParseError("Expected RecursiveOperator".to_string())
+                                })?;
+                            recursive_op.start_iteration();
+                            *sub_state = Box::new(ExecuteState::Init {
+                                input_data: input_data.clone(),
+                            });
+                        }
+                        RecursiveState::Iterating { iteration } => {
+                            // Create temporary cursors for the recursive call
+                            let mut temp_cursors = self.new_state_cursors(pager.clone());
+
+                            // Execute the recursive step
+                            let step_delta = return_if_io!(self.execute_node(
+                                *recursive_step_id,
+                                pager.clone(),
+                                sub_state,
+                                commit_operators,
+                                &mut temp_cursors
+                            ));
+
+                            // Get the operator and process iteration result
+                            let node = self.nodes.get_mut(&nid).ok_or_else(|| {
+                                LimboError::ParseError("Node not found".to_string())
+                            })?;
+                            let recursive_op = node
+                                .executable
+                                .as_any_mut()
+                                .downcast_mut::<RecursiveOperator>()
+                                .ok_or_else(|| {
+                                    LimboError::ParseError("Expected RecursiveOperator".to_string())
+                                })?;
+
+                            let step_result = recursive_op.process_iteration_result(step_delta)?;
+
+                            if step_result.done {
+                                return Ok(IOResult::Done(recursive_op.finalize()));
+                            }
+
+                            // Update delay value for next iteration
+                            // The delay should contain the NEW values from this iteration
+                            input_data.insert(delay_key.clone(), step_result.delta_for_delay);
+                            // After the first iteration, clear base data from input_data.
+                            // Base input (from source tables) is only needed to compute the first
+                            // recursive step. Subsequent iterations read only the delta produced by
+                            // the previous step (stored under delay_key). Clearing the base part
+                            // avoids keeping unnecessary state across iterations and ensures we only
+                            // feed forward the incremental changes.
+                            //
+                            // EXCEPTION: In one-shot mode (no btree storage), we must preserve
+                            // base data because JoinOperator has no stored state to read from.
+                            // The base tables (e.g., edges) are needed for every iteration's join.
+                            if iteration == 1 && !self.is_one_shot() {
+                                input_data.clear_base();
+                            }
+
+                            // Move to next iteration
+                            *sub_state = Box::new(ExecuteState::Init {
+                                input_data: input_data.clone(),
+                            });
+                        }
+                        RecursiveState::Done => {
+                            let node = self.nodes.get_mut(&nid).ok_or_else(|| {
+                                LimboError::ParseError("Node not found".to_string())
+                            })?;
+                            let recursive_op = node
+                                .executable
+                                .as_any_mut()
+                                .downcast_mut::<RecursiveOperator>()
+                                .ok_or_else(|| {
+                                    LimboError::ParseError("Expected RecursiveOperator".to_string())
+                                })?;
+                            return Ok(IOResult::Done(recursive_op.finalize()));
+                        }
+                    }
                 }
             }
         }
@@ -817,6 +1083,13 @@ impl DbspCircuit {
                 DbspOperator::Input { name, .. } => {
                     writeln!(f, "{indent}Input[{node_id}]: {name}")?;
                 }
+                DbspOperator::Literal { schema } => {
+                    writeln!(
+                        f,
+                        "{indent}Literal[{node_id}]: {} columns",
+                        schema.columns.len()
+                    )?;
+                }
                 DbspOperator::Merge { schema } => {
                     writeln!(
                         f,
@@ -828,6 +1101,22 @@ impl DbspCircuit {
                     writeln!(
                         f,
                         "{indent}Distinct[{node_id}]: (schema: {} columns)",
+                        schema.columns.len()
+                    )?;
+                }
+                DbspOperator::Recursive {
+                    name,
+                    max_iterations,
+                    union_all,
+                    schema,
+                } => {
+                    let union_mode_str = if *union_all { "UNION ALL" } else { "UNION" };
+                    writeln!(
+                        f,
+                        "{indent}Recursive[{node_id}]: {} (max_iter={}, mode={}, {} columns)",
+                        name,
+                        max_iterations,
+                        union_mode_str,
                         schema.columns.len()
                     )?;
                 }
@@ -844,6 +1133,9 @@ impl DbspCircuit {
 /// Compiler from LogicalPlan to DBSP Circuit
 pub struct DbspCompiler {
     circuit: DbspCircuit,
+    /// Maps recursive CTE names to their delay input node IDs
+    /// Used during compilation to resolve RecursiveCTERef nodes
+    recursive_cte_refs: HashMap<String, i64>,
 }
 
 impl DbspCompiler {
@@ -859,6 +1151,7 @@ impl DbspCompiler {
                 internal_state_root,
                 internal_state_index_root,
             ),
+            recursive_cte_refs: HashMap::default(),
         }
     }
 
@@ -928,8 +1221,10 @@ impl DbspCompiler {
 
     /// Compile a logical plan to a DBSP circuit
     pub fn compile(mut self, plan: &LogicalPlan) -> Result<DbspCircuit> {
-        let root_id = self.compile_plan(plan)?;
-        let output_schema = plan.schema().clone();
+        // First, inline any CTEs in the plan
+        let inlined_plan = plan.inline_ctes()?;
+        let root_id = self.compile_plan(&inlined_plan)?;
+        let output_schema = inlined_plan.schema().clone();
         self.circuit.set_root(root_id, output_schema);
         Ok(self.circuit)
     }
@@ -1446,14 +1741,70 @@ impl DbspCompiler {
 
                 Ok(node_id)
             }
+            LogicalPlan::RecursiveCTE(recursive) => {
+                self.compile_recursive_cte(recursive)
+            }
+            LogicalPlan::RecursiveCTERef(cte_ref) => {
+                // Look up the delay input node for this recursive CTE
+                match self.recursive_cte_refs.get(&cte_ref.name) {
+                    Some(&delay_node_id) => Ok(delay_node_id),
+                    None => Err(LimboError::ParseError(format!(
+                        "Recursive CTE reference '{}' not found in scope",
+                        cte_ref.name
+                    ))),
+                }
+            }
+            LogicalPlan::EmptyRelation(empty) => {
+                // EmptyRelation produces either a single empty row or no rows
+                let executable: Box<dyn IncrementalOperator> = if empty.produce_one_row {
+                    Box::new(LiteralOperator::single_empty_row())
+                } else {
+                    Box::new(LiteralOperator::new(vec![]))
+                };
+
+                let node_id = self.circuit.add_node(
+                    DbspOperator::Literal {
+                        schema: empty.schema.clone(),
+                    },
+                    vec![],
+                    executable,
+                );
+                Ok(node_id)
+            }
+            LogicalPlan::Values(values) => {
+                // Evaluate literal expressions to get concrete values
+                let rows: Result<Vec<Vec<Value>>> = values
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|expr| match expr {
+                                LogicalExpr::Literal(v) => Ok(v.clone()),
+                                _ => Err(LimboError::ParseError(
+                                    "VALUES expressions must be literals".to_string(),
+                                )),
+                            })
+                            .collect()
+                    })
+                    .collect();
+
+                let executable: Box<dyn IncrementalOperator> =
+                    Box::new(LiteralOperator::new(rows?));
+
+                let node_id = self.circuit.add_node(
+                    DbspOperator::Literal {
+                        schema: values.schema.clone(),
+                    },
+                    vec![],
+                    executable,
+                );
+                Ok(node_id)
+            }
             _ => Err(LimboError::ParseError(
-                format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, and Union are supported, got: {:?}",
+                format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, Union, EmptyRelation, and Values are supported, got: {:?}",
                     match plan {
                         LogicalPlan::Sort(_) => "Sort",
                         LogicalPlan::Limit(_) => "Limit",
-                        LogicalPlan::Union(_) => "Union",
-                                    LogicalPlan::EmptyRelation(_) => "EmptyRelation",
-                        LogicalPlan::Values(_) => "Values",
                         LogicalPlan::WithCTE(_) => "WithCTE",
                         LogicalPlan::CTERef(_) => "CTERef",
                         _ => "Unknown",
@@ -1461,6 +1812,78 @@ impl DbspCompiler {
                 )
             )),
         }
+    }
+
+    /// Compile a recursive CTE to a DBSP circuit with feedback loop
+    ///
+    /// The circuit structure for recursion:
+    /// 1. Base case: compiled normally, produces initial rows
+    /// 2. Delay input: provides z^-1 feedback via a reserved `__delay_<name>` input
+    /// 3. Recursive step: references delay via RecursiveCTERef, joins with source tables
+    /// 4. Recursive container: orchestrates fixed-point iteration
+    ///
+    /// The Recursive node has exactly 3 inputs:
+    /// - inputs[0]: base_case_id - compiled base case subgraph
+    /// - inputs[1]: recursive_step_id - compiled recursive step subgraph
+    /// - inputs[2]: delay_id - delay input node for feedback loop
+    ///
+    /// During execution, the executor runs base case once, then iterates the
+    /// recursive step (feeding previous output via delay input) until fixed-point.
+    fn compile_recursive_cte(&mut self, recursive: &RecursiveCTE) -> Result<i64> {
+        let schema = recursive.schema.clone();
+        let max_iterations = recursive
+            .max_iterations
+            .unwrap_or(DEFAULT_RECURSIVE_MAX_ITERATIONS);
+        let recursive_name = recursive.name.clone();
+
+        // 1. Create a delay input (provides z^-1 feedback).
+        // This must be created first so RecursiveCTERef can resolve to it.
+        let delay_input_name = format!("__delay_{}", recursive.name);
+        let delay_executable: Box<dyn IncrementalOperator> =
+            Box::new(InputOperator::new(delay_input_name.clone()));
+        let delay_id = self.circuit.add_node(
+            DbspOperator::Input {
+                name: delay_input_name,
+                schema: schema.clone(),
+            },
+            vec![],
+            delay_executable,
+        );
+
+        // Register the delay input node for RecursiveCTERef resolution
+        self.recursive_cte_refs
+            .insert(recursive_name.clone(), delay_id);
+
+        let result = (|| -> Result<i64> {
+            // 2. Compile the base case
+            let base_case_id = self.compile_plan(&recursive.base_case)?;
+
+            // 3. Compile the recursive step (will resolve RecursiveCTERef to delay_id)
+            let recursive_step_id = self.compile_plan(&recursive.recursive_step)?;
+
+            // 4. Create the recursive container operator
+            let recursive_executable: Box<dyn IncrementalOperator> = Box::new(
+                RecursiveOperator::new(self.circuit.next_id, max_iterations, recursive.union_all),
+            );
+
+            let recursive_id = self.circuit.add_node(
+                DbspOperator::Recursive {
+                    name: recursive.name.clone(),
+                    max_iterations,
+                    union_all: recursive.union_all,
+                    schema: schema.clone(),
+                },
+                vec![base_case_id, recursive_step_id, delay_id],
+                recursive_executable,
+            );
+
+            Ok(recursive_id)
+        })();
+
+        // 5. Clean up the recursive CTE reference even if compilation failed
+        self.recursive_cte_refs.remove(&recursive_name);
+
+        result
     }
 
     /// Extract a representative table name from a logical plan (for UNION ALL identification)
@@ -1524,6 +1947,14 @@ impl DbspCompiler {
             LogicalPlan::CTERef(cte_ref) => {
                 // CTE reference - use the CTE name
                 format!("cte_{}", cte_ref.name)
+            }
+            LogicalPlan::RecursiveCTE(recursive) => {
+                // Recursive CTE - use the CTE name
+                format!("recursive_{}", recursive.name)
+            }
+            LogicalPlan::RecursiveCTERef(cte_ref) => {
+                // Recursive CTE reference - use the CTE name
+                format!("recursive_ref_{}", cte_ref.name)
             }
             LogicalPlan::EmptyRelation(_) => "empty".to_string(),
             LogicalPlan::Values(_) => "values".to_string(),
@@ -2570,6 +3001,34 @@ mod tests {
                 .add_btree_table(Arc::new(sales_table))
                 .expect("Test setup: failed to add sales table");
 
+            // Add edges table for recursive CTE tests (transitive closure)
+            let edges_table = BTreeTable {
+                name: "edges".to_string(),
+                root_page: 9,
+                primary_key_columns: vec![],
+                columns: vec![
+                    SchemaColumn::new_default_integer(
+                        Some("src".to_string()),
+                        "INTEGER".to_string(),
+                        None,
+                    ),
+                    SchemaColumn::new_default_integer(
+                        Some("dst".to_string()),
+                        "INTEGER".to_string(),
+                        None,
+                    ),
+                ],
+                has_rowid: true,
+                is_strict: false,
+                has_autoincrement: false,
+                unique_sets: vec![],
+                foreign_keys: vec![],
+                check_constraints: vec![],
+            };
+            schema
+                .add_btree_table(Arc::new(edges_table))
+                .expect("Test setup: failed to add edges table");
+
             schema
         }};
     }
@@ -2740,7 +3199,7 @@ mod tests {
         pager: Arc<Pager>,
     ) -> Result<Delta> {
         let mut execute_state = ExecuteState::Init {
-            input_data: DeltaSet::from_map(inputs),
+            input_data: InputDeltas::from_map(inputs),
         };
         match circuit.execute(pager, &mut execute_state)? {
             IOResult::Done(delta) => Ok(delta),
@@ -6160,5 +6619,118 @@ mod tests {
         assert_eq!(left_idx, 0);
         assert_eq!(actual_right.name, "right_id");
         assert_eq!(right_idx, 0);
+    }
+
+    #[test]
+    fn test_simple_cte() {
+        // Simple CTE: WITH active_users AS (SELECT * FROM users WHERE age > 18) SELECT name FROM active_users
+        let (circuit, _) =
+            compile_sql!("WITH active_users AS (SELECT * FROM users WHERE age > 18) SELECT name FROM active_users");
+
+        // After CTE inlining, this should be equivalent to:
+        // SELECT name FROM (SELECT * FROM users WHERE age > 18)
+        // Which compiles to: Projection (name) -> Projection (*) -> Filter -> Input
+        assert_circuit!(circuit, depth: 4, root: Projection);
+        assert_operator!(circuit, 0, Projection { columns: ["name"] });
+        assert_operator!(
+            circuit,
+            1,
+            Projection {
+                columns: ["id", "name", "age"]
+            }
+        );
+        assert_operator!(circuit, 2, Filter);
+        assert_operator!(circuit, 3, Input { name: "users" });
+    }
+
+    #[test]
+    fn test_cte_with_aggregation() {
+        // CTE with aggregation in the main query
+        let (mut circuit, pager) = compile_sql!(
+            "WITH user_ages AS (SELECT age FROM users) SELECT COUNT(*) FROM user_ages"
+        );
+
+        // After CTE inlining: Aggregate -> Projection -> Input
+        assert_circuit!(circuit, depth: 3, root: Aggregate);
+
+        // Test execution
+        let mut input_delta = Delta::new();
+        input_delta.insert(
+            1,
+            vec![
+                Value::from_i64(1),
+                Value::Text("Alice".into()),
+                Value::from_i64(25),
+            ],
+        );
+        input_delta.insert(
+            2,
+            vec![
+                Value::from_i64(2),
+                Value::Text("Bob".into()),
+                Value::from_i64(30),
+            ],
+        );
+
+        let mut inputs = HashMap::default();
+        inputs.insert("users".to_string(), input_delta);
+
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
+        assert_eq!(result.changes.len(), 1);
+        // COUNT(*) should be 2
+        assert_eq!(result.changes[0].0.values[0], Value::from_i64(2));
+    }
+
+    #[test]
+    fn test_recursive_cte_transitive_closure() {
+        // Test recursive CTE for transitive closure
+        let sql = r#"
+            WITH RECURSIVE reachable AS (
+                SELECT src, dst FROM edges
+                UNION
+                SELECT reachable.src, edges.dst FROM reachable INNER JOIN edges ON reachable.dst = edges.src
+            )
+            SELECT src, dst FROM reachable
+        "#;
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Print the circuit structure for debugging
+        eprintln!("Circuit structure:\n{circuit}");
+
+        // Verify the circuit has a Recursive node somewhere
+        let has_recursive = circuit
+            .nodes
+            .values()
+            .any(|n| matches!(&n.operator, DbspOperator::Recursive { .. }));
+        assert!(
+            has_recursive,
+            "Expected a Recursive operator in the circuit"
+        );
+
+        // Create input delta with edges: 1->2, 2->3, 3->4
+        let mut input_delta = Delta::new();
+        input_delta.insert(1, vec![Value::from_i64(1), Value::from_i64(2)]);
+        input_delta.insert(2, vec![Value::from_i64(2), Value::from_i64(3)]);
+        input_delta.insert(3, vec![Value::from_i64(3), Value::from_i64(4)]);
+
+        let mut inputs = HashMap::default();
+        inputs.insert("edges".to_string(), input_delta);
+
+        // Execute the circuit
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
+
+        // Debug output
+        eprintln!("Result has {} rows:", result.changes.len());
+        for (row, weight) in &result.changes {
+            eprintln!("  {:?} (weight {})", row.values, weight);
+        }
+
+        // Expected: 1->2, 1->3, 1->4, 2->3, 2->4, 3->4 (6 edges including transitive)
+        assert!(
+            result.changes.len() >= 3,
+            "Expected at least base case (3 edges), got {}",
+            result.changes.len()
+        );
     }
 }

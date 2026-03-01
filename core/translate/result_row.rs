@@ -328,6 +328,68 @@ pub fn emit_columns_to_destination(
                 value_reg: start_reg,
             });
         }
+        QueryDestination::RecursiveCte {
+            result_cursor,
+            queue_cursor,
+            num_cols,
+            is_union_all,
+        } => {
+            let record_reg = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u16(start_reg),
+                count: to_u16(*num_cols),
+                dest_reg: to_u16(record_reg),
+                index_name: None,
+                affinity_str: None,
+            });
+
+            // For UNION (not UNION ALL), check if the row already exists in the result table
+            if !*is_union_all {
+                let label_skip = program.allocate_label();
+                program.emit_insn(Insn::Found {
+                    cursor_id: *result_cursor,
+                    target_pc: label_skip,
+                    record_reg: start_reg,
+                    num_regs: *num_cols,
+                });
+
+                // Row not found - insert into result table
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: *result_cursor,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new(),
+                });
+
+                // Insert into queue table
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: *queue_cursor,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new(),
+                });
+
+                program.preassign_label_to_next_insn(label_skip);
+            } else {
+                // UNION ALL - no deduplication, insert into both tables
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: *result_cursor,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new(),
+                });
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: *queue_cursor,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new(),
+                });
+            }
+        }
         QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }
     Ok(())

@@ -3070,6 +3070,11 @@ pub fn translate_expr(
                     });
                     Ok(target_register)
                 }
+                Table::RecursiveCte(recursive_cte) => {
+                    // Read from the ephemeral queue cursor
+                    program.emit_column_or_rowid(recursive_cte.cursor_id, *column, target_register);
+                    Ok(target_register)
+                }
             }
         }
         ast::Expr::RowId {
