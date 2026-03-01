@@ -2291,6 +2291,7 @@ pub mod tests {
             type_name: Some(Type {
                 name: "INTEGER".to_string(),
                 size: None,
+                size_text: None,
             }),
         };
 
@@ -2299,6 +2300,7 @@ pub mod tests {
             type_name: Some(Type {
                 name: "integer".to_string(),
                 size: None,
+                size_text: None,
             }),
         };
         assert!(exprs_are_equivalent(&cast1, &cast2));

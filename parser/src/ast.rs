@@ -1799,14 +1799,28 @@ pub struct CommonTableExpr {
 
 /// Column type
 // https://sqlite.org/syntax/type-name.html
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Type {
     /// type name
     pub name: String, // TODO Validate: Ids+
     /// type size
     pub size: Option<TypeSize>,
+    /// original text from end of type name through closing ')', when a size is present
+    ///
+    /// examples: " ( 255)", "( 255)", "(10, 2)"
+    pub size_text: Option<String>,
 }
+
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        // `size_text` only preserves original formatting and should not affect
+        // semantic equality of types.
+        self.name == other.name && self.size == other.size
+    }
+}
+
+impl Eq for Type {}
 
 /// Column type size limit(s)
 // https://sqlite.org/syntax/type-name.html
