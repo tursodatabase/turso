@@ -113,6 +113,7 @@ impl Profile {
                         update: UpdateOpts {
                             padding_size: Some(20_000),
                             force_late_failure: true,
+                            or_replace_prob: 0.0,
                         },
                         ..Default::default()
                     },
@@ -135,6 +136,15 @@ impl Profile {
             io: IOProfile {
                 fault: FaultProfile {
                     enable: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            query: QueryProfile {
+                gen_opts: Opts {
+                    query: QueryOpts {
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 ..Default::default()

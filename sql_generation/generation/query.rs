@@ -16,9 +16,9 @@ use crate::model::table::{
     Column, ColumnType, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
 };
 use indexmap::IndexSet;
-use rand::seq::IndexedRandom;
+use rand::seq::{IndexedRandom, IteratorRandom};
 use rand::Rng;
-use turso_parser::ast::{ColumnConstraint, Expr, SortOrder};
+use turso_parser::ast::{ColumnConstraint, Expr, ResolveType, SortOrder};
 
 use super::{backtrack, pick};
 
@@ -631,6 +631,14 @@ impl Arbitrary for CreateIndex {
 
 impl Arbitrary for Update {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+        if env.opts().query.update.or_replace_prob > 0.0
+            && rng.random_bool(env.opts().query.update.or_replace_prob)
+        {
+            if let Some(update) = gen_update_or_replace(rng, env) {
+                return update;
+            }
+        }
+
         let table = pick(env.tables(), rng);
         let update_opts = &env.opts().query.update;
 
@@ -740,10 +748,137 @@ impl Arbitrary for Update {
 
         Update {
             table: table.name.clone(),
+            or_conflict: None,
             set_values,
             predicate,
         }
     }
+}
+
+fn gen_update_or_replace<R: Rng + ?Sized, C: GenerationContext>(
+    rng: &mut R,
+    env: &C,
+) -> Option<Update> {
+    let tables = env.tables();
+    if tables.is_empty() {
+        return None;
+    }
+
+    let has_replaceable_unique_col = |t: &Table| {
+        t.columns
+            .iter()
+            .any(|c| c.has_unique_or_pk() && !matches!(c.column_type, ColumnType::Blob))
+    };
+    let has_secondary_index_on_nonunique_col = |t: &Table| {
+        for idx in &t.indexes {
+            for (name, _) in &idx.columns {
+                if let Some(col) = t.columns.iter().find(|c| c.name == name.as_str()) {
+                    if !col.has_unique_or_pk() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    };
+
+    let table = tables
+        .iter()
+        .filter(|t| {
+            t.rows.len() >= 2
+                && has_replaceable_unique_col(t)
+                && !t.indexes.is_empty()
+                && has_secondary_index_on_nonunique_col(t)
+        })
+        .choose(rng)
+        .or_else(|| {
+            tables
+                .iter()
+                .filter(|t| t.rows.len() >= 2 && has_replaceable_unique_col(t))
+                .choose(rng)
+        })?;
+
+    // Prefer INTEGER PRIMARY KEY (rowid alias) for REPLACE updates.
+    let ipk_idx = table.columns.iter().enumerate().find_map(|(i, c)| {
+        (matches!(c.column_type, ColumnType::Integer) && c.is_primary_key()).then_some(i)
+    });
+    let unique_col_idx = ipk_idx.or_else(|| {
+        table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.has_unique_or_pk() && !matches!(c.column_type, ColumnType::Blob))
+            .map(|(i, _)| i)
+            .choose(rng)
+    })?;
+    let unique_col = &table.columns[unique_col_idx];
+
+    let source_row_idx = table
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.get(unique_col_idx)
+                .is_some_and(|v| v.0 != turso_core::Value::Null)
+        })
+        .map(|(i, _)| i)
+        .choose(rng)?;
+
+    let source_unique_val = table.rows[source_row_idx][unique_col_idx].clone();
+
+    let conflict_row_idx = table
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| {
+            *i != source_row_idx
+                && r.get(unique_col_idx)
+                    .is_some_and(|v| v.0 != turso_core::Value::Null && v != &source_unique_val)
+        })
+        .map(|(i, _)| i)
+        .choose(rng)?;
+
+    let conflict_row = &table.rows[conflict_row_idx];
+    let conflict_unique_val = conflict_row[unique_col_idx].clone();
+
+    let indexed_col_idx = 'outer: {
+        for idx in &table.indexes {
+            for (name, _) in &idx.columns {
+                let Some(col_idx) = table.columns.iter().position(|c| c.name == name.as_str())
+                else {
+                    continue;
+                };
+                if col_idx != unique_col_idx && !table.columns[col_idx].has_unique_or_pk() {
+                    break 'outer Some(col_idx);
+                }
+            }
+        }
+        None
+    };
+
+    let mut set_values = vec![(
+        unique_col.name.clone(),
+        SetValue::Simple(conflict_unique_val),
+    )];
+    if let Some(idx_col_idx) = indexed_col_idx {
+        let idx_col = &table.columns[idx_col_idx];
+        set_values.push((
+            idx_col.name.clone(),
+            SetValue::Simple(conflict_row[idx_col_idx].clone()),
+        ));
+    }
+
+    let predicate = Predicate::eq(
+        Predicate::column(unique_col.name.clone()),
+        Predicate::value(source_unique_val),
+    );
+
+    Some(Update {
+        table: table.name.clone(),
+        or_conflict: Some(ResolveType::Replace),
+        set_values,
+        predicate,
+    })
 }
 
 const ALTER_TABLE_ALL: &[AlterTableTypeDiscriminants] = &[

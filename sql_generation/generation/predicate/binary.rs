@@ -77,20 +77,20 @@ impl Predicate {
                     1,
                     Box::new(|rng| {
                         let v = SimValue::arbitrary_from(rng, context, &column.column_type);
-                        if &v == value {
-                            None
-                        } else {
-                            Some(Expr::Binary(
-                                Box::new(qualified_column_expr(&table_name, &column.name)),
-                                ast::Operator::NotEquals,
-                                Box::new(Expr::Literal(v.into())),
-                            ))
-                        }
+                        (&v != value).then_some(Expr::Binary(
+                            Box::new(qualified_column_expr(&table_name, &column.name)),
+                            ast::Operator::NotEquals,
+                            Box::new(Expr::Literal(v.into())),
+                        ))
                     }),
                 ),
                 (
                     1,
                     Box::new(|rng| {
+                        // For empty strings, LTValue cannot produce a strictly smaller string.
+                        if matches!(&value.0, turso_core::Value::Text(t) if t.value.is_empty()) {
+                            return None;
+                        }
                         let lt_value =
                             LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                         Some(Expr::Binary(
@@ -226,6 +226,29 @@ impl SimplePredicate {
         let column = columns[column_index];
         let column_value = &row[column_index];
         let table_name = column.table_name;
+
+        if matches!(&column_value.0, turso_core::Value::Text(t) if t.value.is_empty()) {
+            let expr = if rng.random_bool(0.5) {
+                Expr::Binary(
+                    Box::new(qualified_column_expr(table_name, &column.column.name)),
+                    ast::Operator::Equals,
+                    Box::new(Expr::Literal(column_value.into())),
+                )
+            } else {
+                let gt_value = GTValue::arbitrary_from(
+                    rng,
+                    context,
+                    (column_value, column.column.column_type),
+                )
+                .0;
+                Expr::Binary(
+                    Box::new(qualified_column_expr(table_name, &column.column.name)),
+                    ast::Operator::Less,
+                    Box::new(Expr::Literal(gt_value.into())),
+                )
+            };
+            return SimplePredicate(Predicate(expr));
+        }
 
         let expr = one_of(
             vec![

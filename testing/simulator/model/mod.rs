@@ -18,7 +18,7 @@ use sql_generation::model::{
 };
 use turso_core::Value;
 use turso_core::turso_assert_eq;
-use turso_parser::ast::Distinctness;
+use turso_parser::ast::{Distinctness, ResolveType};
 
 use crate::runner::env::TransactionMode;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
@@ -999,6 +999,10 @@ impl Shadow for Update {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        if matches!(self.or_conflict, Some(ResolveType::Replace)) {
+            return shadow_update_or_replace(self, tables);
+        }
+
         // First pass: find rows to update and compute old/new values
         let (updates, columns) = {
             let table = tables.iter().find(|t| t.name == self.table);
@@ -1011,39 +1015,18 @@ impl Shadow for Update {
                 ));
             };
 
-            let t2 = table.clone();
+            let snapshot = table.clone();
             let columns = table.columns.clone();
 
             let updates: Vec<(usize, Vec<SimValue>, Vec<SimValue>)> = table
                 .rows
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| self.predicate.test(r, &t2))
+                .filter(|(_, r)| self.predicate.test(r, &snapshot))
                 .map(|(row_idx, old_row)| {
-                    let mut new_row = old_row.clone();
-                    for (column, set_value) in &self.set_values {
-                        if let Some((idx, _)) =
-                            columns.iter().enumerate().find(|(_, c)| &c.name == column)
-                        {
-                            match set_value {
-                                SetValue::Simple(v) => {
-                                    new_row[idx] = v.clone();
-                                }
-                                SetValue::CaseWhen {
-                                    condition,
-                                    then_value,
-                                    else_column,
-                                } => {
-                                    #[cfg(debug_assertions)]
-                                    turso_assert_eq!(else_column, column);
-                                    if condition.test(old_row, &t2) {
-                                        new_row[idx] = then_value.clone();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    (row_idx, old_row.clone(), new_row)
+                    let old_row = old_row.clone();
+                    let new_row = apply_set_values(&old_row, &snapshot, &columns, &self.set_values);
+                    (row_idx, old_row, new_row)
                 })
                 .collect();
 
@@ -1112,6 +1095,125 @@ impl Shadow for Update {
 
         Ok(vec![])
     }
+}
+
+fn apply_set_values(
+    old_row: &[SimValue],
+    eval_table: &Table,
+    columns: &[Column],
+    set_values: &[(String, SetValue)],
+) -> Vec<SimValue> {
+    let mut new_row = old_row.to_vec();
+    for (col_name, set_value) in set_values {
+        let Some(idx) = columns.iter().position(|c| c.name == *col_name) else {
+            continue;
+        };
+        match set_value {
+            SetValue::Simple(v) => new_row[idx] = v.clone(),
+            SetValue::CaseWhen {
+                condition,
+                then_value,
+                else_column,
+            } => {
+                #[cfg(debug_assertions)]
+                turso_assert_eq!(else_column, &columns[idx].name);
+                if condition.test(old_row, eval_table) {
+                    new_row[idx] = then_value.clone();
+                }
+            }
+        }
+    }
+    new_row
+}
+
+fn collect_unique_conflicts(
+    columns: &[Column],
+    rows: &[Vec<SimValue>],
+    except_pos: usize,
+    new_row: &[SimValue],
+) -> Vec<Vec<SimValue>> {
+    let mut conflicts = Vec::new();
+    for (col_idx, col) in columns.iter().enumerate() {
+        if !col.has_unique_or_pk() || new_row[col_idx].0 == Value::Null {
+            continue;
+        }
+        if let Some((_i, r)) = rows
+            .iter()
+            .enumerate()
+            .find(|(i, r)| *i != except_pos && r[col_idx] == new_row[col_idx])
+        {
+            conflicts.push(r.clone());
+        }
+    }
+    conflicts.sort_unstable();
+    conflicts.dedup();
+    conflicts
+}
+
+fn shadow_update_or_replace(
+    update: &Update,
+    tables: &mut ShadowTablesMut<'_>,
+) -> anyhow::Result<Vec<Vec<SimValue>>> {
+    let table_pos = tables
+        .iter()
+        .position(|t| t.name == update.table)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Table {} does not exist. UPDATE statement ignored.",
+                update.table
+            )
+        })?;
+
+    let columns = tables[table_pos].columns.clone();
+    let pk_idx_opt = integer_pk_index(&columns);
+
+    // Snapshot is used for predicate / CASE WHEN evaluation so it is not affected by
+    // deletes and updates performed as part of REPLACE conflict resolution.
+    let snapshot = tables[table_pos].clone();
+
+    let targets: Vec<Vec<SimValue>> = snapshot
+        .rows
+        .iter()
+        .filter(|r| update.predicate.test(r, &snapshot))
+        .cloned()
+        .collect();
+
+    for old_row in targets {
+        // The row may have been deleted by a prior REPLACE operation.
+        let Some(src_pos) = tables[table_pos].rows.iter().position(|r| r == &old_row) else {
+            continue;
+        };
+
+        let new_row = apply_set_values(&old_row, &snapshot, &columns, &update.set_values);
+
+        if let Some(pk_idx) = pk_idx_opt {
+            validate_integer_pk_row_non_null(&update.table, &columns, pk_idx, &new_row)?;
+        }
+
+        let conflicts =
+            collect_unique_conflicts(&columns, &tables[table_pos].rows, src_pos, &new_row);
+
+        // Apply deletes first so commit replay is deterministic even if the replacement
+        // row becomes byte-for-byte equal to a deleted conflicting row.
+        for conflict_row in conflicts {
+            tables.record_delete(update.table.clone(), conflict_row.clone());
+            if let Some(pos) = tables[table_pos]
+                .rows
+                .iter()
+                .position(|r| r == &conflict_row)
+            {
+                tables[table_pos].rows.remove(pos);
+            }
+        }
+
+        // Apply the update to the source row if it still exists.
+        if let Some(pos) = tables[table_pos].rows.iter().position(|r| r == &old_row) {
+            tables.record_update(update.table.clone(), old_row.clone(), new_row.clone());
+            tables[table_pos].rows[pos].clone_from(&new_row);
+        }
+    }
+
+    Ok(vec![])
 }
 
 impl Shadow for AlterTable {
