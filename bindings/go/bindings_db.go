@@ -59,6 +59,23 @@ const (
 
 type TursoTracingLevel int32
 
+func (l TursoTracingLevel) String() string {
+	switch l {
+	case TURSO_TRACING_LEVEL_ERROR:
+		return "ERROR"
+	case TURSO_TRACING_LEVEL_WARN:
+		return "WARN"
+	case TURSO_TRACING_LEVEL_INFO:
+		return "INFO"
+	case TURSO_TRACING_LEVEL_DEBUG:
+		return "DEBUG"
+	case TURSO_TRACING_LEVEL_TRACE:
+		return "TRACE"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 const (
 	TURSO_TRACING_LEVEL_ERROR TursoTracingLevel = 1
 	TURSO_TRACING_LEVEL_WARN  TursoTracingLevel = 2
