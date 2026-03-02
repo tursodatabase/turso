@@ -1379,7 +1379,7 @@ mod tests {
 
     use super::{
         HeaderReadResult, LogHeader, LogicalLog, FRAME_MAGIC, LOG_HDR_CRC_START,
-        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_MAGIC, TX_HEADER_SIZE, TX_TRAILER_SIZE,
+        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, TX_HEADER_SIZE, TX_TRAILER_SIZE,
     };
     use super::{ParseResult, StreamingLogicalLogReader, StreamingResult};
     use crate::OpenFlags;
@@ -2474,7 +2474,7 @@ mod tests {
         assert!(res.is_err());
 
         // Test 2: unknown version byte (99) with valid CRC is rejected as Invalid.
-        let mut header_bytes = original_header_bytes.clone();
+        let mut header_bytes = original_header_bytes;
         header_bytes[4] = 99; // unknown version
         header_bytes[LOG_HDR_CRC_START..LOG_HDR_SIZE].fill(0);
         let new_crc = crc32c::crc32c(&header_bytes);
@@ -2808,15 +2808,17 @@ mod tests {
                 commit_ts: large_commit_ts,
                 btree_resident: false,
             });
-            large_tx.row_versions.push(crate::mvcc::database::RowVersion {
-                id: rowid as u64,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                    large_commit_ts,
-                )),
-                end: None,
-                row,
-                btree_resident: false,
-            });
+            large_tx
+                .row_versions
+                .push(crate::mvcc::database::RowVersion {
+                    id: rowid as u64,
+                    begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
+                        large_commit_ts,
+                    )),
+                    end: None,
+                    row,
+                    btree_resident: false,
+                });
         }
         let c = log.log_tx(&large_tx).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -3290,5 +3292,4 @@ mod tests {
             }
         }
     }
-
 }
