@@ -1,5 +1,7 @@
 // Adapted from https://github.com/sqlite/sqlite/blob/master/ext/misc/decimal.c
-use turso_ext::{register_extension, scalar, ResultCode, Value, ValueType};
+use turso_ext::{
+    register_extension, scalar, AggFunc, AggregateDerive, ResultCode, Value, ValueType,
+};
 
 #[derive(Clone)]
 struct Decimal {
@@ -11,7 +13,8 @@ struct Decimal {
 }
 
 register_extension! {
-    scalars: {decimal_func, decimal_func_exp, decimal_func_add, decimal_func_sub, decimal_func_mul, decimal_func_pow2, decimal_func_cmp}
+    scalars: {decimal_func, decimal_func_exp, decimal_func_add, decimal_func_sub, decimal_func_mul, decimal_func_pow2, decimal_func_cmp},
+    aggregates: {DecimalSum},
 }
 
 #[scalar(name = "decimal")]
@@ -210,6 +213,48 @@ fn decimal_func_cmp(args: &[Value]) -> Value {
         0
     };
     Value::from_integer(res as i64)
+}
+
+#[derive(AggregateDerive)]
+struct DecimalSum;
+
+impl AggFunc for DecimalSum {
+    type State = Option<Decimal>;
+    type Error = &'static str;
+    const NAME: &'static str = "decimal_sum";
+    const ARGS: i32 = 1;
+
+    fn step(state: &mut Self::State, args: &[Value]) {
+        let arg = match args.first() {
+            Some(v) => v,
+            None => return,
+        };
+        if arg.value_type() == ValueType::Null {
+            return;
+        }
+
+        let mut val = match Decimal::decimal_new(arg, true) {
+            Some(v) => v,
+            None => return,
+        };
+
+        match state {
+            Some(acc) => acc.add(&mut val),
+            None => {
+                *state = Some(val);
+            }
+        }
+    }
+
+    fn finalize(state: Self::State) -> Result<Value, Self::Error> {
+        match state {
+            Some(acc) => match acc.decimal_result() {
+                Some(res) => Ok(Value::from_text(res)),
+                None => Ok(Value::null()),
+            },
+            None => Ok(Value::null()),
+        }
+    }
 }
 
 impl Decimal {

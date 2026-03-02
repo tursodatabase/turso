@@ -844,7 +844,15 @@ def test_decimal():
         lambda res: "1" == res,
         "decimal_cmp('+4.0e+00', 0.4)  function return correctly",
     )
-     
+    turso.run_test_fn(
+        """CREATE TABLE fin (val TEXT);
+        INSERT INTO fin VALUES ('123456789012345678.99');
+        INSERT INTO fin VALUES ('0.01');
+        SELECT decimal_sum(val) FROM fin;""",
+        lambda res: "123456789012345679.00" == res,
+        "decimal_sum preserves full precision",
+    )
+
 
 def test_vfs():
     turso = TestTursoShell()
