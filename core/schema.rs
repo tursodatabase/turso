@@ -3967,8 +3967,14 @@ mod tests {
     #[test]
     fn test_special_table_names_are_quoted_in_to_sql() -> Result<()> {
         let tests = [
-            (r#"CREATE TABLE "t t" (x TEXT)"#, r#"CREATE TABLE "t t" (x TEXT)"#),
-            (r#"CREATE TABLE "123table" (x TEXT)"#, r#"CREATE TABLE "123table" (x TEXT)"#),
+            (
+                r#"CREATE TABLE "t t" (x TEXT)"#,
+                r#"CREATE TABLE "t t" (x TEXT)"#,
+            ),
+            (
+                r#"CREATE TABLE "123table" (x TEXT)"#,
+                r#"CREATE TABLE "123table" (x TEXT)"#,
+            ),
             (
                 r#"CREATE TABLE "t""t" (x TEXT)"#,
                 r#"CREATE TABLE "t""t" (x TEXT)"#,
