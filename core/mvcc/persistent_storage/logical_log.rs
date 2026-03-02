@@ -27,8 +27,8 @@
 //! ### Transaction frame (LOG_VERSION = 2)
 //!
 //! Header (`TX_HEADER_SIZE = 24`):
-//! - `payload_size: u64` (total bytes of all op entries)
 //! - `frame_magic: u32` (`FRAME_MAGIC`)
+//! - `payload_size: u64` (total bytes of all op entries)
 //! - `op_count: u32`
 //! - `commit_ts: u64`
 //!
@@ -137,7 +137,7 @@ const OP_UPDATE_HEADER: u8 = 4;
 
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 
-const TX_HEADER_SIZE: usize = 24; // payload_size(8) + FRAME_MAGIC(4) + op_count(4) + commit_ts(8)
+const TX_HEADER_SIZE: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
 const TX_TRAILER_SIZE: usize = 8; // crc32c(4) + END_MAGIC(4)
 const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
 
@@ -329,8 +329,8 @@ impl LogicalLog {
 
         // 2. Serialize Transaction header.
         // A header-only transaction is encoded as a single OP_UPDATE_HEADER op.
-        // payload_size must appear first in the header but is only known after serializing all
-        // ops. We reserve TX_HEADER_SIZE bytes as a placeholder and backfill in step 4.
+        // payload_size is only known after serializing all ops. We reserve TX_HEADER_SIZE bytes
+        // as a placeholder and backfill all header fields in step 4.
         let op_count = u32::try_from(tx.row_versions.len() + usize::from(tx.header.is_some()))
             .map_err(|_| {
                 LimboError::InternalError("Logical log op_count exceeds u32".to_string())
@@ -350,11 +350,11 @@ impl LogicalLog {
         let payload_size = (self.write_buf.len() - payload_start) as u64;
         let payload_end = self.write_buf.len();
 
-        // 4. Backfill TX HEADER: payload_size(8) | FRAME_MAGIC(4) | op_count(4) | commit_ts(8)
-        self.write_buf[tx_header_start..tx_header_start + 8]
-            .copy_from_slice(&payload_size.to_le_bytes());
-        self.write_buf[tx_header_start + 8..tx_header_start + 12]
+        // 4. Backfill TX HEADER: FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        self.write_buf[tx_header_start..tx_header_start + 4]
             .copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        self.write_buf[tx_header_start + 4..tx_header_start + 12]
+            .copy_from_slice(&payload_size.to_le_bytes());
         self.write_buf[tx_header_start + 12..tx_header_start + 16]
             .copy_from_slice(&op_count.to_le_bytes());
         self.write_buf[tx_header_start + 16..tx_header_start + 24]
@@ -778,27 +778,27 @@ impl StreamingLogicalLogReader {
             None => return Ok(ParseResult::Eof),
         };
 
-        // TX HEADER layout (24 bytes): payload_size(8) | FRAME_MAGIC(4) | op_count(4) | commit_ts(8)
-        let payload_size = u64::from_le_bytes([
+        // TX HEADER layout (24 bytes): FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        let frame_magic = u32::from_le_bytes([
             header_bytes[0],
             header_bytes[1],
             header_bytes[2],
             header_bytes[3],
-            header_bytes[4],
-            header_bytes[5],
-            header_bytes[6],
-            header_bytes[7],
-        ]);
-        let frame_magic = u32::from_le_bytes([
-            header_bytes[8],
-            header_bytes[9],
-            header_bytes[10],
-            header_bytes[11],
         ]);
         if frame_magic != FRAME_MAGIC {
             self.last_valid_offset = frame_start;
             return Ok(ParseResult::InvalidFrame);
         }
+        let payload_size = u64::from_le_bytes([
+            header_bytes[4],
+            header_bytes[5],
+            header_bytes[6],
+            header_bytes[7],
+            header_bytes[8],
+            header_bytes[9],
+            header_bytes[10],
+            header_bytes[11],
+        ]);
         let op_count = u32::from_le_bytes([
             header_bytes[12],
             header_bytes[13],
@@ -2272,12 +2272,16 @@ mod tests {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let (file, op_size) = write_single_table_tx(&io, "payload-size.db-log", 101);
-        // TX header layout: [payload_size(8)][FRAME_MAGIC(4)][op_count(4)][commit_ts(8)]
-        // payload_size is at byte 0 of the frame (right after LOG_HDR_SIZE).
+        // TX header layout: [FRAME_MAGIC(4)][payload_size(8)][op_count(4)][commit_ts(8)]
+        // payload_size is at byte 4 of the frame (right after FRAME_MAGIC).
         let bad_payload_size = (op_size as u64 + 1).to_le_bytes().to_vec();
         let bad = Arc::new(Buffer::new(bad_payload_size));
         let c = file
-            .pwrite(LOG_HDR_SIZE as u64, bad, Completion::new_write(|_| {}))
+            .pwrite(
+                (LOG_HDR_SIZE + 4) as u64,
+                bad,
+                Completion::new_write(|_| {}),
+            )
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -2297,15 +2301,11 @@ mod tests {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let (file, _) = write_single_table_tx(&io, "frame-magic.db-log", 103);
 
-        // TX header layout: [payload_size(8)][FRAME_MAGIC(4)][op_count(4)][commit_ts(8)]
-        // FRAME_MAGIC is at offset +8 from frame start.
+        // TX header layout: [FRAME_MAGIC(4)][payload_size(8)][op_count(4)][commit_ts(8)]
+        // FRAME_MAGIC is at offset +0 from frame start.
         let bad = Arc::new(Buffer::new(0u32.to_le_bytes().to_vec()));
         let c = file
-            .pwrite(
-                (LOG_HDR_SIZE + 8) as u64,
-                bad,
-                Completion::new_write(|_| {}),
-            )
+            .pwrite(LOG_HDR_SIZE as u64, bad, Completion::new_write(|_| {}))
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -2942,8 +2942,8 @@ mod tests {
     }
 
     /// What this test checks: The btree_resident flag survives write/read round-trip unchanged,
-    /// and the on-disk frame header has the correct binary layout (payload_size as u64 at [0..8],
-    /// FRAME_MAGIC at [8..12]).
+    /// and the on-disk frame header has the correct binary layout (FRAME_MAGIC at [0..4],
+    /// payload_size as u64 at [4..12]).
     /// Why this matters: This flag affects tombstone and checkpoint behavior after recovery.
     ///   The frame layout check is baseline confirmation that the serialized format is self-consistent.
     #[test]
@@ -2984,13 +2984,13 @@ mod tests {
         io.wait_for_completion(c).unwrap();
         let frame_hdr = frame_hdr_buf.as_slice()[..TX_HEADER_SIZE].to_vec();
         assert_eq!(
-            u32::from_le_bytes(frame_hdr[8..12].try_into().unwrap()),
+            u32::from_le_bytes(frame_hdr[0..4].try_into().unwrap()),
             FRAME_MAGIC,
-            "FRAME_MAGIC at bytes [8..12]"
+            "FRAME_MAGIC at bytes [0..4]"
         );
         assert!(
-            u64::from_le_bytes(frame_hdr[0..8].try_into().unwrap()) > 0,
-            "payload_size at bytes [0..8] must be non-zero for a non-empty op"
+            u64::from_le_bytes(frame_hdr[4..12].try_into().unwrap()) > 0,
+            "payload_size at bytes [4..12] must be non-zero for a non-empty op"
         );
 
         let mut reader = StreamingLogicalLogReader::new(file.clone());
