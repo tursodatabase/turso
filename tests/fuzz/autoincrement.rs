@@ -124,16 +124,12 @@ mod autoincrement_fuzz_tests {
                 let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &stmt);
                 assert_eq!(
                     limbo_rows, sqlite_rows,
-                    "RETURNING mismatch\n{}\nlimbo={:?}\nsqlite={:?}",
-                    ctx, limbo_rows, sqlite_rows
+                    "RETURNING mismatch\n{ctx}\nlimbo={limbo_rows:?}\nsqlite={sqlite_rows:?}"
                 );
                 let inserted_id = single_int(&limbo_rows, "RETURNING id");
                 assert!(
                     inserted_id > last_auto_id,
-                    "auto rowid regressed: prev={} new={}\n{}",
-                    last_auto_id,
-                    inserted_id,
-                    ctx
+                    "auto rowid regressed: prev={last_auto_id} new={inserted_id}\n{ctx}"
                 );
                 last_auto_id = inserted_id;
             } else {
@@ -144,22 +140,15 @@ mod autoincrement_fuzz_tests {
             let sqlite_seq = read_sqlite_seq(&sqlite_conn);
             assert_eq!(
                 limbo_seq, sqlite_seq,
-                "sqlite_sequence parity mismatch\n{}\nlimbo_seq={}\nsqlite_seq={}",
-                ctx, limbo_seq, sqlite_seq
+                "sqlite_sequence parity mismatch\n{ctx}\nlimbo_seq={limbo_seq}\nsqlite_seq={sqlite_seq}"
             );
             assert!(
                 limbo_seq >= last_seq,
-                "sqlite_sequence decreased: prev={} new={}\n{}",
-                last_seq,
-                limbo_seq,
-                ctx
+                "sqlite_sequence decreased: prev={last_seq} new={limbo_seq}\n{ctx}"
             );
             assert!(
                 limbo_seq >= last_auto_id,
-                "sqlite_sequence below last auto id: seq={} last_auto={}\n{}",
-                limbo_seq,
-                last_auto_id,
-                ctx
+                "sqlite_sequence below last auto id: seq={limbo_seq} last_auto={last_auto_id}\n{ctx}"
             );
             last_seq = limbo_seq;
 
@@ -268,9 +257,7 @@ mod autoincrement_fuzz_tests {
             let seq = read_limbo_seq(&admin);
             assert!(
                 seq >= last_seq,
-                "sqlite_sequence decreased (seed={seed}, round={round}): {} -> {}",
-                last_seq,
-                seq
+                "sqlite_sequence decreased (seed={seed}, round={round}): {last_seq} -> {seq}"
             );
             last_seq = seq;
         }
@@ -278,8 +265,7 @@ mod autoincrement_fuzz_tests {
         for pair in generated_ids.windows(2) {
             assert!(
                 pair[1] > pair[0],
-                "auto rowid allocation regressed (seed={seed}): {:?}",
-                pair
+                "auto rowid allocation regressed (seed={seed}): {pair:?}"
             );
         }
 
@@ -287,9 +273,7 @@ mod autoincrement_fuzz_tests {
         let final_seq = read_limbo_seq(&admin);
         assert!(
             final_seq >= max_generated,
-            "final sqlite_sequence below max generated id (seed={seed}): seq={} max_generated={}",
-            final_seq,
-            max_generated
+            "final sqlite_sequence below max generated id (seed={seed}): seq={final_seq} max_generated={max_generated}"
         );
 
         let integrity = limbo_exec_rows(&admin, "PRAGMA integrity_check");
