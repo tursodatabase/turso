@@ -272,6 +272,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek,
+    suppress_rowid_allocator_update_once: bool,
 }
 
 pub enum NextRowidResult {
@@ -315,6 +316,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             count_state: None,
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
+            suppress_rowid_allocator_update_once: false,
         })
     }
 
@@ -429,6 +431,31 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             allocator.unlock();
             self.creating_new_rowid = false;
         }
+    }
+
+    /// Marks this cursor's table-id as `sqlite_sequence` in the MV store so
+    /// sqlite_sequence-specific MVCC rules can be applied.
+    pub fn register_sqlite_sequence_table_id(&self) {
+        self.db.register_sqlite_sequence_table_id(self.table_id);
+    }
+
+    /// Suppresses a single allocator bump on the next table insert through
+    /// this cursor.
+    ///
+    /// Used for UPDATE rowid rewrite paths (`DELETE` + `INSERT`) so those
+    /// inserts do not advance AUTOINCREMENT allocator state as if they were
+    /// fresh auto-generated rowids.
+    pub fn suppress_next_rowid_allocator_update(&mut self) {
+        self.suppress_rowid_allocator_update_once = true;
+    }
+
+    /// Raises the rowid allocator floor to at least `rowid`.
+    ///
+    /// This is used by `NewRowid` when a caller provides a `prev_largest_reg`
+    /// floor (e.g. AUTOINCREMENT floor derived from sequence/table max).
+    pub fn bump_rowid_floor(&self, rowid: i64) {
+        let allocator = self.db.get_rowid_allocator(&self.table_id);
+        allocator.insert_row_id_maybe_update(rowid);
     }
 
     fn get_immutable_record_or_create(&mut self) -> Option<&mut ImmutableRecord> {
@@ -1236,6 +1263,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     /// Insert a row into the table or index.
     /// Sets the cursor to the inserted row.
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
+        let suppress_allocator_update = self.suppress_rowid_allocator_update_once;
+        self.suppress_rowid_allocator_update_once = false;
+
         let row_id = match key {
             BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
             BTreeKey::IndexKey(record) => {
@@ -1292,7 +1322,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             .is_some()
         {
             self.db
-                .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .update_to_table_or_index_with_allocator_update(
+                    self.tx_id,
+                    row,
+                    maybe_index_id,
+                    !suppress_allocator_update,
+                )
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
@@ -1306,7 +1341,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 })?;
         } else {
             self.db
-                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_to_table_or_index_with_allocator_update(
+                    self.tx_id,
+                    row,
+                    maybe_index_id,
+                    !suppress_allocator_update,
+                )
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
