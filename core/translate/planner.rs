@@ -7,7 +7,7 @@ use super::{
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, ResultSetColumn, Scan, TableReference, TableReferences, WhereTerm,
+        Plan, QueryDestination, Scan, TableReference, TableReferences, WhereTerm,
     },
     select::prepare_select_plan,
 };
@@ -15,7 +15,7 @@ use crate::translate::{
     emitter::Resolver,
     expr::{unwrap_parens, WalkControl},
     plan::{NonFromClauseSubquery, SubqueryState},
-    scope::{AliasScope, ChainedScope, EmptyScope, FullTableScope},
+    scope::{EmptyScope, FullTableScope},
 };
 use crate::{
     ast::Limit,
@@ -1332,7 +1332,6 @@ pub fn parse_from(
 pub fn parse_where(
     where_clause: Option<&Expr>,
     table_references: &mut TableReferences,
-    result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -1340,16 +1339,8 @@ pub fn parse_where(
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
-            if let Some(result_columns) = result_columns {
-                let mut scope = ChainedScope {
-                    inner: FullTableScope::new(table_references),
-                    outer: AliasScope::new(result_columns),
-                };
-                bind_and_rewrite_expr(&mut expr.expr, &mut scope, resolver, false)?;
-            } else {
-                let mut scope = FullTableScope::new(table_references);
-                bind_and_rewrite_expr(&mut expr.expr, &mut scope, resolver, false)?;
-            }
+            let mut scope = FullTableScope::new(table_references);
+            bind_and_rewrite_expr(&mut expr.expr, &mut scope, resolver, false)?;
         }
         // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
         // Re-break any ANDs that were created so they become separate WhereTerms for

@@ -56,7 +56,7 @@ fn infer_type_from_expr(
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
     pub expr: ast::Expr,
-    pub alias: Option<String>,
+    pub alias: Option<Arc<str>>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
 }

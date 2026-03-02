@@ -417,17 +417,26 @@ impl<'a> AliasScope<'a> {
 impl Scope for AliasScope<'_> {
     fn resolve_column(&mut self, name: &str) -> Result<LookupResult> {
         let normalized_name = normalize_ident(name);
+        let mut found: Option<&ResultSetColumn> = None;
         for result_column in self.result_columns {
             if let Some(alias) = &result_column.alias {
                 if alias.eq_ignore_ascii_case(&normalized_name) {
-                    return Ok(LookupResult::Found(ResolvedColumn::AliasExpansion {
-                        expr: Box::new(result_column.expr.clone()),
-                    }));
+                    if found.is_some() {
+                        return Ok(LookupResult::Ambiguous(format!(
+                            "ambiguous column alias: {name}"
+                        )));
+                    }
+                    found = Some(result_column);
                 }
             }
         }
 
-        Ok(LookupResult::NotFound)
+        match found {
+            Some(result_column) => Ok(LookupResult::Found(ResolvedColumn::AliasExpansion {
+                expr: Box::new(result_column.expr.clone()),
+            })),
+            None => Ok(LookupResult::NotFound),
+        }
     }
 
     fn resolve_qualified(&mut self, _table: &str, _col: &str) -> Result<LookupResult> {

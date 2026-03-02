@@ -195,7 +195,6 @@ pub fn prepare_delete_plan(
     parse_where(
         where_clause.as_deref(),
         &mut table_references,
-        None,
         &mut where_predicates,
         resolver,
     )?;

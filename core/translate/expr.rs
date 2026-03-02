@@ -5620,8 +5620,8 @@ pub fn process_returning_clause(
     let mut result_columns = Vec::with_capacity(returning.len());
 
     let alias_to_string = |alias: &ast::As| match alias {
-        ast::As::Elided(alias) => alias.as_str().to_string(),
-        ast::As::As(alias) => alias.as_str().to_string(),
+        ast::As::Elided(alias) => alias.as_str().into(),
+        ast::As::As(alias) => alias.as_str().into(),
     };
 
     for rc in returning.iter_mut() {
@@ -5663,7 +5663,7 @@ pub fn process_returning_clause(
 
                     result_columns.push(ResultSetColumn {
                         expr: column_expr,
-                        alias: column.name.clone(),
+                        alias: column.name.clone().map(Into::into),
                         contains_aggregates: false,
                     });
                 }

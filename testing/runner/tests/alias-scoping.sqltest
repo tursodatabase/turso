@@ -1,0 +1,26 @@
+@database :memory:
+
+test where-cannot-see-column-aliases {
+    CREATE TABLE t1(x INT, y INT);
+    INSERT INTO t1 VALUES (1, 2);
+    SELECT x AS z FROM t1 WHERE z = 1;
+}
+expect error {
+}
+
+test duplicate-aliases-ambiguous-in-order-by {
+    CREATE TABLE t2(x INT, y INT);
+    INSERT INTO t2 VALUES (1, 2);
+    SELECT x AS a, y AS a FROM t2 ORDER BY a;
+}
+expect error {
+}
+
+test aliases-work-in-group-by-and-order-by {
+    CREATE TABLE t3(x INT, y INT);
+    INSERT INTO t3 VALUES (1, 2);
+    SELECT x AS val FROM t3 GROUP BY val ORDER BY val;
+}
+expect {
+    1
+}

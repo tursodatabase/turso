@@ -411,8 +411,8 @@ fn prepare_one_select_plan(
                         )?;
                         plan.result_columns.push(ResultSetColumn {
                             alias: maybe_alias.as_ref().map(|alias| match alias {
-                                ast::As::Elided(alias) => alias.as_str().to_string(),
-                                ast::As::As(alias) => alias.as_str().to_string(),
+                                ast::As::Elided(alias) => alias.as_str().into(),
+                                ast::As::As(alias) => alias.as_str().into(),
                             }),
                             expr: *expr,
                             contains_aggregates,
@@ -434,7 +434,6 @@ fn prepare_one_select_plan(
             parse_where(
                 where_clause.as_deref(),
                 &mut plan.table_references,
-                Some(&plan.result_columns),
                 &mut plan.where_clause,
                 resolver,
             )?;
@@ -608,7 +607,7 @@ fn prepare_one_select_plan(
                 result_columns.push(ResultSetColumn {
                     // these result_columns work as placeholders for the values, so the expr doesn't matter
                     expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
-                    alias: Some(format!("column{}", i + 1)),
+                    alias: Some(format!("column{}", i + 1).into()),
                     contains_aggregates: false,
                 });
             }
@@ -753,10 +752,7 @@ fn add_vtab_predicates_to_where_clause(
     resolver: &Resolver,
 ) -> Result<()> {
     for expr in vtab_predicates.iter_mut() {
-        let mut scope = ChainedScope {
-            inner: FullTableScope::new(&mut plan.table_references),
-            outer: AliasScope::new(&plan.result_columns),
-        };
+        let mut scope = FullTableScope::new(&mut plan.table_references);
         bind_and_rewrite_expr(expr, &mut scope, resolver, false)?;
     }
     for expr in vtab_predicates.drain(..) {

@@ -382,7 +382,6 @@ pub fn prepare_update_plan(
     parse_where(
         body.where_clause.as_deref(),
         &mut table_references,
-        Some(&result_columns),
         &mut where_clause,
         resolver,
     )?;

@@ -30,7 +30,6 @@ expect {
     3
 }
 
-@skip "known deviation: column aliases are currently visible in WHERE in turso"
 test col-alias-not-visible-where {
     CREATE TABLE t_where(x INT);
     INSERT INTO t_where VALUES (10), (20);

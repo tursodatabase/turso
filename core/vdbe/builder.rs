@@ -733,7 +733,7 @@ impl ProgramBuilder {
         let expr = ast::Expr::Id(ast::Name::exact("".to_string()));
         self.result_columns.push(ResultSetColumn {
             expr,
-            alias: Some(col_name),
+            alias: Some(col_name.into()),
             contains_aggregates: false,
         });
     }
