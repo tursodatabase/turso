@@ -822,8 +822,10 @@ test alter_table_add_column_with_single_quote_in_name {
     CREATE TABLE "z' OR 1=1 -- "(x);
     ALTER TABLE "z' OR 1=1 -- " ADD COLUMN y;
 
-    SELECT rtrim(name) FROM sqlite_schema WHERE type = 'table' ORDER BY name;
-    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name LIKE 'z'' or 1=1 -- %';
+    SELECT lower(rtrim(name)) FROM sqlite_schema WHERE type = 'table' ORDER BY lower(name);
+    SELECT replace(replace(lower(sql), '"', ''), ' ', '')
+    FROM sqlite_schema
+    WHERE type = 'table' AND lower(name) LIKE 'z'' or 1=1 -- %';
     PRAGMA integrity_check;
 }
 expect {
@@ -831,6 +833,27 @@ expect {
     t2
     t3
     z' or 1=1 --
-    CREATE TABLE "z' or 1=1 -- " (x, y)
+    createtablez'or1=1--(x,y)
+    ok
+}
+
+# https://github.com/tursodatabase/turso/issues/5632
+@cross-check-integrity
+test alter_table_drop_column_with_single_quote_in_name {
+    CREATE TABLE "z' OR 1=1 -- "(x, y);
+    CREATE TABLE ok(v);
+    INSERT INTO ok VALUES(1);
+
+    ALTER TABLE "z' OR 1=1 -- " DROP COLUMN y;
+
+    SELECT * FROM ok;
+    SELECT replace(replace(lower(sql), '"', ''), ' ', '')
+    FROM sqlite_schema
+    WHERE type = 'table' AND lower(name) LIKE 'z'' or 1=1 -- %';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    createtablez'or1=1--(x)
     ok
 }
