@@ -824,7 +824,27 @@ def test_decimal():
         lambda res: "+4.0e+00" == res,
         "decimal_pow2(2) function return correctly",
     )
-    
+    turso.run_test_fn(
+        "SELECT decimal_cmp(2.22222, 0.222);",
+        lambda res: "1" == res,
+        "decimal_cmp(2.22222, 0.222) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_cmp(0.2, 0.3);",
+        lambda res: "-1" == res,
+        "decimal_cmp(0.2, 0.3) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_cmp(0.4, '0.4');",
+        lambda res: "0" == res,
+        "decimal_cmp(0.4, '0.4')  function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_cmp('+4.0e+00', 0.4);",
+        lambda res: "1" == res,
+        "decimal_cmp('+4.0e+00', 0.4)  function return correctly",
+    )
+     
 
 def test_vfs():
     turso = TestTursoShell()

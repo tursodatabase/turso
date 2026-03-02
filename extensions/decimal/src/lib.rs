@@ -11,7 +11,7 @@ struct Decimal {
 }
 
 register_extension! {
-    scalars: {decimal_func, decimal_func_exp, decimal_func_add, decimal_func_sub, decimal_func_mul, decimal_func_pow2}
+    scalars: {decimal_func, decimal_func_exp, decimal_func_add, decimal_func_sub, decimal_func_mul, decimal_func_pow2, decimal_func_cmp}
 }
 
 #[scalar(name = "decimal")]
@@ -178,6 +178,38 @@ fn decimal_func_pow2(args: &[Value]) -> Value {
         Some(res) => Value::from_text(res),
         None => Value::null(),
     }
+}
+
+//The decimal_cmp(A,B) function compares two decimal values A and B. The result will be negative, zero, or positive if A is less than, equal to, or greater than B, respectively
+#[scalar(name = "decimal_cmp")]
+fn decimal_func_cmp(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
+
+    let mut pa = match Decimal::decimal_new(&args[0], true) {
+        Some(a) => a,
+        None => return Value::null(),
+    };
+
+    let mut pb = match Decimal::decimal_new(&args[1], true) {
+        Some(b) => b,
+        None => return Value::null(),
+    };
+
+    if pa.is_null || pb.is_null {
+        return Value::null();
+    }
+
+    let res = pa.cmp(&mut pb);
+    let res = if res < 0 {
+        -1
+    } else if res > 0 {
+        1
+    } else {
+        0
+    };
+    Value::from_integer(res as i64)
 }
 
 impl Decimal {
@@ -706,6 +738,46 @@ impl Decimal {
                     borrow = 0;
                 }
             }
+        }
+    }
+
+    //
+    // Compare to Decimal objects.  Return negative, 0, or positive if the
+    // first object is less than, equal to, or greater than the second.
+    //
+    fn cmp(&mut self, p_b: &mut Decimal) -> i32 {
+        while self.n_frac > 0 && self.n_digit > 0 && self.a[self.n_digit - 1] == 0 {
+            self.n_digit -= 1;
+            self.n_frac -= 1;
+        }
+        while p_b.n_frac > 0 && p_b.n_digit > 0 && p_b.a[p_b.n_digit - 1] == 0 {
+            p_b.n_digit -= 1;
+            p_b.n_frac -= 1;
+        }
+
+        if self.sign != p_b.sign {
+            return if self.sign { -1 } else { 1 };
+        }
+
+        let (a, b) = if self.sign {
+            (p_b as &Decimal, self as &Decimal)
+        } else {
+            (self as &Decimal, p_b as &Decimal)
+        };
+
+        let n_a_sig = a.n_digit as i32 - a.n_frac as i32;
+        let n_b_sig = b.n_digit as i32 - b.n_frac as i32;
+        if n_a_sig != n_b_sig {
+            return n_a_sig - n_b_sig;
+        }
+
+        let n = a.n_digit.min(b.n_digit);
+        let rc = a.a[..n].cmp(&b.a[..n]);
+
+        match rc {
+            std::cmp::Ordering::Equal => a.n_digit as i32 - b.n_digit as i32,
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Greater => 1,
         }
     }
 }
