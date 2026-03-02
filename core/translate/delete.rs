@@ -18,7 +18,7 @@ use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent, With};
 
-use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
+use super::plan::{ColumnUsedMask, JoinedTable, TableReference, TableReferences, WhereTerm};
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_delete(
@@ -177,13 +177,12 @@ pub fn prepare_delete_plan(
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         table,
-        identifier: tbl_name,
+        reference: TableReference::unaliased(tbl_name, database_id),
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 

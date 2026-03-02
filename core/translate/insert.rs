@@ -20,7 +20,7 @@ use crate::{
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
+            TableReference, TableReferences,
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         scope::{EmptyScope, FullTableScope},
@@ -320,14 +320,13 @@ pub fn translate_insert(
                     .btree()
                     .expect("we shouldn't have got here without a BTree table"),
             ),
-            identifier: table_name.to_string(),
+            reference: TableReference::unaliased(normalize_ident(table_name.as_str()), database_id),
             internal_id: program.table_reference_counter.next(),
             op: Operation::default_scan_for(&table),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id,
         }],
         vec![],
     );

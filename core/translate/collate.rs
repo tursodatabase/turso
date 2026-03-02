@@ -183,7 +183,9 @@ mod tests {
 
     use crate::{
         schema::{BTreeTable, ColDef, Column, Table, Type},
-        translate::plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan},
+        translate::plan::{
+            ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReference,
+        },
     };
 
     use super::*;
@@ -488,8 +490,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
-            identifier: "foo".to_string(),
+            reference: TableReference::unaliased("foo", 0),
             internal_id: TableInternalId::from(1),
             join_info: None,
             table,
@@ -512,8 +513,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
-            identifier: "t1".to_string(),
+            reference: TableReference::unaliased("t1", 0),
             internal_id: TableInternalId::from(1),
             join_info: None,
             table: Table::BTree(Arc::new(BTreeTable {
@@ -546,8 +546,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
-            identifier: "t2".to_string(),
+            reference: TableReference::unaliased("t2", 0),
             internal_id: TableInternalId::from(2),
             join_info: None,
             table: Table::BTree(Arc::new(BTreeTable {
@@ -587,8 +586,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
-            identifier: "bar".to_string(),
+            reference: TableReference::unaliased("bar", 0),
             internal_id: TableInternalId::from(1),
             join_info: None,
             table: Table::BTree(Arc::new(BTreeTable {

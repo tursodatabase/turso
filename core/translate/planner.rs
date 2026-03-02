@@ -7,7 +7,7 @@ use super::{
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        Plan, QueryDestination, ResultSetColumn, Scan, TableReference, TableReferences, WhereTerm,
     },
     select::prepare_select_plan,
 };
@@ -456,7 +456,7 @@ fn plan_cte(
         // This avoids exponential re-planning when CTEs have transitive dependencies.
         if outer_query_refs
             .iter()
-            .any(|r| &r.identifier == ref_cte_name)
+            .any(|r| r.reference.matches_lookup_name(ref_cte_name))
         {
             continue;
         }
@@ -474,7 +474,7 @@ fn plan_cte(
             false,
         )?;
         outer_query_refs.push(OuterQueryReference {
-            identifier: referenced_table.identifier.clone(),
+            reference: referenced_table.reference.clone(),
             internal_id: referenced_table.internal_id,
             table: referenced_table.table.clone(),
             col_used_mask: ColumnUsedMask::default(),
@@ -537,7 +537,7 @@ fn plan_cte(
 
     match cte_plan {
         Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
-            cte_def.name.clone(),
+            TableReference::unaliased(cte_def.name.clone(), 0),
             cte_plan,
             None,
             program.table_reference_counter.next(),
@@ -583,7 +583,7 @@ pub fn plan_ctes_as_outer_refs(
         if table_references
             .outer_query_refs()
             .iter()
-            .any(|r| r.identifier == cte_name)
+            .any(|r| r.reference.matches_lookup_name(&cte_name))
         {
             crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
         }
@@ -617,7 +617,7 @@ pub fn plan_ctes_as_outer_refs(
         };
         let joined_table = match cte_plan {
             Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
-                cte_name.clone(),
+                TableReference::unaliased(cte_name.clone(), 0),
                 cte_plan,
                 None,
                 program.table_reference_counter.next(),
@@ -636,7 +636,7 @@ pub fn plan_ctes_as_outer_refs(
         // resolution (e.g. UPDATE t SET b = c.v which SQLite rejects as
         // "no such column").
         table_references.add_outer_query_reference(OuterQueryReference {
-            identifier: cte_name,
+            reference: TableReference::unaliased(cte_name, 0),
             internal_id: joined_table.internal_id,
             table: joined_table.table,
             col_used_mask: ColumnUsedMask::default(),
@@ -692,7 +692,7 @@ fn parse_from_clause_table(
                 // This avoids exponential re-planning when CTEs have transitive dependencies.
                 if outer_query_refs_for_subquery
                     .iter()
-                    .any(|r| r.identifier == cte_def.name)
+                    .any(|r| r.reference.matches_lookup_name(&cte_def.name))
                 {
                     continue;
                 }
@@ -711,7 +711,7 @@ fn parse_from_clause_table(
                     false,
                 )?;
                 outer_query_refs_for_subquery.push(OuterQueryReference {
-                    identifier: cte_def.name.clone(),
+                    reference: TableReference::unaliased(cte_def.name.clone(), 0),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
                     col_used_mask: ColumnUsedMask::default(),
@@ -740,15 +740,16 @@ fn parse_from_clause_table(
                 }
             }
             let cur_table_index = table_references.joined_tables().len();
-            let identifier = maybe_alias
+            let table_name = format!("subquery_{cur_table_index}");
+            let alias = maybe_alias
                 .map(|a| match a {
                     ast::As::As(id) => id,
                     ast::As::Elided(id) => id,
                 })
                 .map(|id| normalize_ident(id.as_str()))
-                .unwrap_or_else(|| format!("subquery_{cur_table_index}"));
+                .map(Into::into);
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
-                identifier,
+                TableReference::new(table_name, alias, 0),
                 subplan,
                 None,
                 program.table_reference_counter.next(),
@@ -816,7 +817,7 @@ fn parse_table(
                 ast::As::As(id) => id,
                 ast::As::Elided(id) => id,
             };
-            cte_table.identifier = normalize_ident(alias.as_str());
+            cte_table.reference.alias = Some(normalize_ident(alias.as_str()).into());
         }
 
         // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
@@ -899,7 +900,7 @@ fn parse_table(
             // Use the CTE name for the subquery name so query plans show
             // "SCAN cte_name AS alias" instead of just "SCAN alias".
             let mut jt = JoinedTable::new_subquery_from_plan(
-                normalized_qualified_name.clone(),
+                TableReference::unaliased(normalized_qualified_name.clone(), database_id),
                 cte_plan,
                 None,
                 program.table_reference_counter.next(),
@@ -908,22 +909,25 @@ fn parse_table(
                 materialize_hint,
             )?;
             if let Some(alias) = alias {
-                jt.identifier = alias;
+                jt.reference.alias = Some(alias.into());
             }
-            jt.database_id = database_id;
+            jt.reference.database_id = database_id;
             table_references.add_joined_table(jt);
         } else {
             let internal_id = program.table_reference_counter.next();
             table_references.add_joined_table(JoinedTable {
                 op: Operation::default_scan_for(&outer_table),
                 table: outer_table,
-                identifier: alias.unwrap_or(normalized_qualified_name),
+                reference: TableReference::new(
+                    normalized_qualified_name,
+                    alias.map(Into::into),
+                    database_id,
+                ),
                 internal_id,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
-                database_id,
             });
         }
         return Ok(());
@@ -953,13 +957,16 @@ fn parse_table(
         table_references.add_joined_table(JoinedTable {
             op: Operation::default_scan_for(&tbl_ref),
             table: tbl_ref,
-            identifier: alias.unwrap_or(normalized_qualified_name),
+            reference: TableReference::new(
+                normalized_qualified_name,
+                alias.map(Into::into),
+                database_id,
+            ),
             internal_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id,
         });
         return Ok(());
     };
@@ -1068,13 +1075,16 @@ fn parse_table(
                 index: None,
             }),
             table: Table::BTree(btree_table),
-            identifier: alias.unwrap_or(normalized_qualified_name),
+            reference: TableReference::new(
+                normalized_qualified_name,
+                alias.map(Into::into),
+                database_id,
+            ),
             internal_id: program.table_reference_counter.next(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id,
         });
         return Ok(());
     }
@@ -1093,13 +1103,16 @@ fn parse_table(
             table_references.add_joined_table(JoinedTable {
                 op: Operation::default_scan_for(&outer_ref.table),
                 table: outer_ref.table.clone(),
-                identifier: outer_ref.identifier.clone(),
+                reference: TableReference::new(
+                    outer_ref.reference.table_name.clone(),
+                    outer_ref.reference.alias.clone(),
+                    database_id,
+                ),
                 internal_id: program.table_reference_counter.next(),
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
-                database_id,
             });
             return Ok(());
         }
@@ -1178,7 +1191,11 @@ fn base_outer_refs_for_cte_planning(
     cte_definitions: &[CteDefinition],
 ) -> Vec<OuterQueryReference> {
     refs.iter()
-        .filter(|r| !cte_definitions.iter().any(|cte| cte.name == r.identifier))
+        .filter(|r| {
+            !cte_definitions
+                .iter()
+                .any(|cte| r.reference.matches_lookup_name(&cte.name))
+        })
         .cloned()
         .map(|mut r| {
             if matches!(r.table, Table::FromClauseSubquery(_)) {
@@ -1267,7 +1284,7 @@ pub fn parse_from(
                     false,
                 )?;
                 table_references.add_outer_query_reference(OuterQueryReference {
-                    identifier: cte_def.name.clone(),
+                    reference: TableReference::unaliased(cte_def.name.clone(), 0),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
                     col_used_mask: ColumnUsedMask::default(),
@@ -1741,7 +1758,7 @@ fn parse_join(
         .joined_tables()
         .iter()
         .take(table_references.joined_tables().len() - 1)
-        .any(|t| t.identifier == rightmost_table.identifier);
+        .any(|t| t.reference.lookup_name() == rightmost_table.reference.lookup_name());
 
     if has_duplicate
         && !natural
@@ -1752,7 +1769,7 @@ fn parse_join(
         // Duplicate table names are only allowed for NATURAL or USING joins
         crate::bail_parse_error!(
             "table name {} specified more than once - use an alias to disambiguate",
-            rightmost_table.identifier
+            rightmost_table.reference.lookup_name()
         );
     }
     let constraint = if natural {

@@ -777,6 +777,70 @@ impl JoinInfo {
     }
 }
 
+/// Identifies a table reference in a query, separating base table identity
+/// from the optional alias visible to name resolution.
+#[derive(Debug, Clone)]
+pub struct TableReference {
+    /// Original normalized table name, or synthetic/CTE name for subqueries.
+    pub table_name: Arc<str>,
+    /// Normalized alias from AS/implicit alias clauses.
+    pub alias: Option<Arc<str>>,
+    /// Database index. 0 = main, 1 = temp, 2+ = attached.
+    pub database_id: usize,
+}
+
+impl TableReference {
+    pub fn new(
+        table_name: impl Into<Arc<str>>,
+        alias: Option<Arc<str>>,
+        database_id: usize,
+    ) -> Self {
+        Self {
+            table_name: table_name.into(),
+            alias,
+            database_id,
+        }
+    }
+
+    pub fn unaliased(table_name: impl Into<Arc<str>>, database_id: usize) -> Self {
+        Self::new(table_name, None, database_id)
+    }
+
+    pub fn aliased(
+        table_name: impl Into<Arc<str>>,
+        alias: impl Into<Arc<str>>,
+        database_id: usize,
+    ) -> Self {
+        Self::new(table_name, Some(alias.into()), database_id)
+    }
+
+    /// Name used by single-qualifier lookups (`alias.col` or `table.col`).
+    pub fn lookup_name(&self) -> &str {
+        self.alias
+            .as_deref()
+            .unwrap_or_else(|| self.table_name.as_ref())
+    }
+
+    pub fn is_aliased(&self) -> bool {
+        self.alias.is_some()
+    }
+
+    pub fn matches_table_name(&self, name: &str) -> bool {
+        self.table_name.as_ref() == name
+    }
+
+    pub fn matches_lookup_name(&self, name: &str) -> bool {
+        self.lookup_name() == name
+    }
+
+    pub fn display_name(&self) -> String {
+        match &self.alias {
+            Some(alias) => format!("{} AS {}", self.table_name, alias),
+            None => self.table_name.to_string(),
+        }
+    }
+}
+
 /// A joined table in the query plan.
 /// For example,
 /// ```sql
@@ -793,8 +857,8 @@ pub struct JoinedTable {
     pub op: Operation,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
-    /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
+    /// Base table identity and optional alias visible in this scope.
+    pub reference: TableReference,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
@@ -816,14 +880,12 @@ pub struct JoinedTable {
     /// expression? If yes, all columns that *only* feed this expression can be
     /// removed from the required-column set.
     pub expression_index_usages: Vec<ExpressionIndexUsage>,
-    /// The index of the database. "main" is always zero.
-    pub database_id: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct OuterQueryReference {
-    /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
+    /// Base table identity and optional alias visible in this scope.
+    pub reference: TableReference,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
@@ -1037,12 +1099,12 @@ impl TableReferences {
     pub fn find_table_by_identifier(&self, identifier: &str) -> Option<&Table> {
         self.joined_tables
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.reference.matches_lookup_name(identifier))
             .map(|t| &t.table)
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.identifier == identifier)
+                    .find(|t| t.reference.matches_lookup_name(identifier))
                     .map(|t| &t.table)
             })
     }
@@ -1056,12 +1118,12 @@ impl TableReferences {
     pub fn find_table_by_table_name(&self, name: &str) -> Option<&Table> {
         self.joined_tables
             .iter()
-            .find(|t| t.table.get_name() == name)
+            .find(|t| t.reference.matches_table_name(name))
             .map(|t| &t.table)
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.table.get_name() == name)
+                    .find(|t| t.reference.matches_table_name(name))
                     .map(|t| &t.table)
             })
     }
@@ -1074,7 +1136,7 @@ impl TableReferences {
     ) -> Option<&OuterQueryReference> {
         self.outer_query_refs
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.reference.matches_lookup_name(identifier))
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -1086,7 +1148,7 @@ impl TableReferences {
         if let Some(outer_ref) = self
             .outer_query_refs
             .iter_mut()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.reference.matches_lookup_name(identifier))
         {
             outer_ref.cte_definition_only = true;
         }
@@ -1099,12 +1161,12 @@ impl TableReferences {
     ) -> Option<(TableInternalId, &Table)> {
         self.joined_tables
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.reference.matches_lookup_name(identifier))
             .map(|t| (t.internal_id, &t.table))
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.identifier == identifier && !t.cte_definition_only)
+                    .find(|t| t.reference.matches_lookup_name(identifier) && !t.cte_definition_only)
                     .map(|t| (t.internal_id, &t.table))
             })
     }
@@ -1515,7 +1577,7 @@ impl JoinedTable {
 
     /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
-        identifier: String,
+        reference: TableReference,
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
@@ -1546,7 +1608,7 @@ impl JoinedTable {
         }
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
-            name: identifier.clone(),
+            name: reference.table_name.to_string(),
             plan: Box::new(Plan::Select(plan)),
             columns,
             result_columns_start_reg: None,
@@ -1556,13 +1618,12 @@ impl JoinedTable {
         Ok(Self {
             op: Operation::default_scan_for(&table),
             table,
-            identifier,
+            reference,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
         })
     }
 
@@ -1572,7 +1633,7 @@ impl JoinedTable {
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
     pub fn new_subquery_from_plan(
-        identifier: String,
+        reference: TableReference,
         plan: Plan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
@@ -1638,7 +1699,7 @@ impl JoinedTable {
         // Multi-reference CTEs are also detected at emission time via reference counting,
         // and they may be materialized regardless of explicit keyword usage.
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
-            name: identifier.clone(),
+            name: reference.table_name.to_string(),
             plan: Box::new(plan),
             columns,
             result_columns_start_reg: None,
@@ -1648,13 +1709,12 @@ impl JoinedTable {
         Ok(Self {
             op: Operation::default_scan_for(&table),
             table,
-            identifier,
+            reference,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
         })
     }
 

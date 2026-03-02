@@ -21,7 +21,8 @@ use super::emitter::emit_program;
 use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
+    ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, TableReference,
+    TableReferences, UpdatePlan,
 };
 use super::planner::{parse_where, plan_ctes_as_outer_refs};
 use super::subquery::{
@@ -257,9 +258,13 @@ pub fn prepare_update_plan(
             Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
             _ => unreachable!(),
         },
-        identifier: body.tbl_name.alias.as_ref().map_or_else(
-            || table_name.to_string(),
-            |alias| alias.as_str().to_string(),
+        reference: TableReference::new(
+            table_name.to_string(),
+            body.tbl_name
+                .alias
+                .as_ref()
+                .map(|alias| normalize_ident(alias.as_str()).into()),
+            database_id,
         ),
         internal_id: program.table_reference_counter.next(),
         op: build_scan_op(&table, iter_dir),
@@ -267,7 +272,6 @@ pub fn prepare_update_plan(
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 

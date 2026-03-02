@@ -15,7 +15,7 @@ use crate::{
         plan::{
             ColumnUsedMask, DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
-            SeekKeyComponent, SubqueryState,
+            SeekKeyComponent, SubqueryState, TableReference,
         },
         trigger_exec::has_relevant_triggers_type_only,
     },
@@ -667,7 +667,7 @@ fn first_update_safety_reason(
 
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
-        let database_id = table_ref.database_id;
+        let database_id = table_ref.reference.database_id;
         if resolver.with_schema(database_id, |s| {
             has_relevant_triggers_type_only(
                 s,
@@ -791,7 +791,7 @@ fn add_ephemeral_table_to_update_plan(
     let table_references_update = TableReferences::new(
         vec![JoinedTable {
             table: Table::BTree(ephemeral_table.clone()),
-            identifier: "ephemeral_scratch".to_string(),
+            reference: TableReference::unaliased("ephemeral_scratch", 0),
             internal_id,
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -801,7 +801,6 @@ fn add_ephemeral_table_to_update_plan(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
         }],
         vec![],
     );
@@ -815,7 +814,7 @@ fn add_ephemeral_table_to_update_plan(
         // The update loop needs to reference columns from the original source table, so we add it as an outer query reference.
         plan.table_references
             .add_outer_query_reference(OuterQueryReference {
-                identifier: table.identifier.clone(),
+                reference: table.reference.clone(),
                 internal_id: table.internal_id,
                 table: table.table.clone(),
                 col_used_mask: table.col_used_mask.clone(),

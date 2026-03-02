@@ -17,7 +17,8 @@ use crate::translate::expr::{
 };
 use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
+    ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReference,
+    TableReferences,
 };
 use crate::translate::scope::FullTableScope;
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
@@ -217,13 +218,12 @@ pub fn translate_create_index(
                 index: None,
             }),
             table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
+            reference: TableReference::unaliased(tbl_name.clone(), 0),
             internal_id: table_ref,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
         }],
         vec![],
     );

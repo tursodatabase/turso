@@ -12,7 +12,7 @@ use crate::{
     translate::{
         emitter::Resolver,
         expr::{rewrite_between_expr, translate_expr, walk_expr, walk_expr_mut, WalkControl},
-        plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
+        plan::{ColumnUsedMask, OuterQueryReference, TableReference, TableReferences},
     },
     util::{check_expr_references_column, normalize_ident, parse_numeric_literal},
     vdbe::{
@@ -582,7 +582,10 @@ pub fn translate_alter_table(
                     let mut table_references = TableReferences::new(
                         vec![],
                         vec![OuterQueryReference {
-                            identifier: table_name.to_string(),
+                            reference: TableReference::unaliased(
+                                table_name.to_string(),
+                                database_id,
+                            ),
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
                             col_used_mask: ColumnUsedMask::default(),

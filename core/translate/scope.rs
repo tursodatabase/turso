@@ -161,7 +161,7 @@ fn resolve_qualified_in_joined_tables(
     let Some(joined_table) = refs
         .joined_tables()
         .iter()
-        .find(|t| t.identifier == normalized_table)
+        .find(|t| t.reference.matches_lookup_name(&normalized_table))
     else {
         return Ok(LookupResult::NotFound);
     };
@@ -213,7 +213,7 @@ fn resolve_qualified_in_outer_refs(
     let Some(outer_ref) = refs
         .outer_query_refs()
         .iter()
-        .find(|t| t.identifier == normalized_table && !t.cte_definition_only)
+        .find(|t| t.reference.matches_lookup_name(&normalized_table) && !t.cte_definition_only)
     else {
         return Ok(LookupResult::NotFound);
     };
@@ -298,12 +298,11 @@ impl Scope for FullTableScope<'_> {
             .refs
             .joined_tables()
             .iter()
-            .any(|t| t.identifier == normalized_table);
-        let outer_table_exists = self
-            .refs
-            .outer_query_refs()
-            .iter()
-            .any(|t| t.identifier == normalized_table && !t.cte_definition_only);
+            .any(|t| t.reference.matches_lookup_name(&normalized_table));
+        let outer_table_exists =
+            self.refs.outer_query_refs().iter().any(|t| {
+                t.reference.matches_lookup_name(&normalized_table) && !t.cte_definition_only
+            });
 
         if !local_table_exists && !outer_table_exists {
             return Ok(LookupResult::Ambiguous(format!(
@@ -380,7 +379,7 @@ impl Scope for LocalTableScope<'_> {
             .refs
             .joined_tables()
             .iter()
-            .any(|t| t.identifier == normalized_table);
+            .any(|t| t.reference.matches_lookup_name(&normalized_table));
         if !table_exists {
             return Ok(LookupResult::Ambiguous(format!(
                 "no such table: {normalized_table}",

@@ -94,11 +94,7 @@ impl Display for SelectPlan {
 
             match &reference.op {
                 Operation::Scan(scan) => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
-                    } else {
-                        format!("{} AS {}", reference.table.get_name(), reference.identifier)
-                    };
+                    let table_name = reference.reference.display_name();
 
                     match scan {
                         Scan::BTreeTable { index, .. } => {
@@ -130,7 +126,8 @@ impl Display for SelectPlan {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                            indent, reference.identifier
+                            indent,
+                            reference.reference.lookup_name()
                         )?;
                     }
                     Search::Seek {
@@ -139,7 +136,9 @@ impl Display for SelectPlan {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}",
-                            indent, reference.identifier, index.name
+                            indent,
+                            reference.reference.lookup_name(),
+                            index.name
                         )?;
                     }
                 },
@@ -173,7 +172,7 @@ impl Display for SelectPlan {
                     writeln!(
                         f,
                         "{indent}{op_name} {} ({}) ",
-                        reference.identifier,
+                        reference.reference.lookup_name(),
                         index_names.join(", ")
                     )?;
                 }
@@ -193,11 +192,7 @@ impl Display for DeletePlan {
 
             match &reference.op {
                 Operation::Scan(scan) => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
-                    } else {
-                        format!("{} AS {}", reference.table.get_name(), reference.identifier)
-                    };
+                    let table_name = reference.reference.display_name();
 
                     match scan {
                         Scan::BTreeTable { index, .. } => {
@@ -229,7 +224,8 @@ impl Display for DeletePlan {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                            indent, reference.identifier
+                            indent,
+                            reference.reference.lookup_name()
                         )?;
                     }
                     Search::Seek {
@@ -238,7 +234,9 @@ impl Display for DeletePlan {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}",
-                            indent, reference.identifier, index.name
+                            indent,
+                            reference.reference.lookup_name(),
+                            index.name
                         )?;
                     }
                 },
@@ -272,7 +270,7 @@ impl Display for DeletePlan {
                     writeln!(
                         f,
                         "{indent}{op_name} {} ({})",
-                        reference.identifier,
+                        reference.reference.lookup_name(),
                         index_names.join(", ")
                     )?;
                 }
@@ -300,11 +298,7 @@ impl fmt::Display for UpdatePlan {
 
             match &reference.op {
                 Operation::Scan(scan) => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
-                    } else {
-                        format!("{} AS {}", reference.table.get_name(), reference.identifier)
-                    };
+                    let table_name = reference.reference.display_name();
 
                     match scan {
                         Scan::BTreeTable { index, .. } => {
@@ -341,7 +335,8 @@ impl fmt::Display for UpdatePlan {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                            indent, reference.identifier
+                            indent,
+                            reference.reference.lookup_name()
                         )?;
                     }
                     Search::Seek {
@@ -350,7 +345,9 @@ impl fmt::Display for UpdatePlan {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}",
-                            indent, reference.identifier, index.name
+                            indent,
+                            reference.reference.lookup_name(),
+                            index.name
                         )?;
                     }
                 },
@@ -422,9 +419,9 @@ impl ToSqlContext for PlanContext<'_> {
         let joined_table = table_ref.find_joined_table_by_internal_id(id);
         let outer_query = table_ref.find_outer_query_ref_by_internal_id(id);
         match (joined_table, outer_query) {
-            (Some(table), None) => Some(&table.identifier),
-            (None, Some(table)) => Some(&table.identifier),
-            (Some(table), Some(_)) => Some(&table.identifier),
+            (Some(table), None) => Some(table.reference.lookup_name()),
+            (None, Some(table)) => Some(table.reference.lookup_name()),
+            (Some(table), Some(_)) => Some(table.reference.lookup_name()),
             (None, None) => unreachable!(),
         }
     }
@@ -507,11 +504,11 @@ impl ToTokens for JoinedTable {
     ) -> Result<(), S::Error> {
         match &self.table {
             Table::BTree(..) | Table::Virtual(..) => {
-                let name = self.table.get_name();
+                let name = self.reference.table_name.as_ref();
                 s.append(TokenType::TK_ID, Some(name))?;
-                if self.identifier != name {
+                if let Some(alias) = &self.reference.alias {
                     s.append(TokenType::TK_AS, None)?;
-                    s.append(TokenType::TK_ID, Some(&self.identifier))?;
+                    s.append(TokenType::TK_ID, Some(alias.as_ref()))?;
                 }
             }
             Table::FromClauseSubquery(from_clause_subquery) => {
@@ -521,7 +518,7 @@ impl ToTokens for JoinedTable {
                 s.append(TokenType::TK_RP, None)?;
 
                 s.append(TokenType::TK_AS, None)?;
-                s.append(TokenType::TK_ID, Some(&self.identifier))?;
+                s.append(TokenType::TK_ID, Some(self.reference.lookup_name()))?;
             }
         };
 

@@ -7,7 +7,7 @@ use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::order_by::order_by_sorter_insert;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    SelectPlan, TableReferences, Window,
+    SelectPlan, TableReference, TableReferences, Window,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
@@ -227,7 +227,10 @@ fn prepare_window_subquery(
     )?;
 
     let subquery = JoinedTable::new_subquery(
-        format!("window_subquery_{processed_window_count}"),
+        TableReference::unaliased(
+            format!("window_subquery_{processed_window_count}"),
+            SUBQUERY_DATABASE_ID,
+        ),
         inner_plan,
         None,
         subquery_id,
@@ -236,7 +239,7 @@ fn prepare_window_subquery(
     // Verify that the subquery has the expected database ID.
     // This is required to ensure that assumptions in `rewrite_terminal_expr` are valid.
     turso_assert_eq!(
-        subquery.database_id,
+        subquery.reference.database_id,
         SUBQUERY_DATABASE_ID,
         "subquery database id must be SUBQUERY_DATABASE_ID",
         {"SUBQUERY_DATABASE_ID": SUBQUERY_DATABASE_ID}

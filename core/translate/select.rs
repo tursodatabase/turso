@@ -297,7 +297,7 @@ fn prepare_one_select_plan(
                         ResultColumn::TableStar(n) => table_references
                             .joined_tables()
                             .iter()
-                            .find(|t| t.identifier == n.as_str())
+                            .find(|t| t.reference.matches_lookup_name(n.as_str()))
                             .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
                             .unwrap_or(5),
                         // Otherwise allocate space for 1 column
@@ -375,7 +375,7 @@ fn prepare_one_select_plan(
                             .table_references
                             .joined_tables_mut()
                             .iter_mut()
-                            .find(|t| t.identifier == name_normalized);
+                            .find(|t| t.reference.matches_lookup_name(&name_normalized));
 
                         if referenced_table.is_none() {
                             crate::bail_parse_error!("no such table: {}", name.as_str());

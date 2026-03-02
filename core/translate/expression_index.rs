@@ -96,7 +96,8 @@ pub fn expression_index_column_usage(
     let mut bound_expr = expr.clone();
     let mut binding_table = table_reference.clone();
     if let Some(btree_table) = binding_table.table.btree() {
-        binding_table.identifier.clone_from(&btree_table.name);
+        binding_table.reference.table_name = btree_table.name.clone().into();
+        binding_table.reference.alias = None;
     }
     let mut binding_tables = TableReferences::new(vec![binding_table], vec![]);
     let mut scope = FullTableScope::new(&mut binding_tables);

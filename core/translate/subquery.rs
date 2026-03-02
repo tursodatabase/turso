@@ -291,7 +291,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                 };
                 OuterQueryReference {
                     table: t.table.clone(),
-                    identifier: t.identifier.clone(),
+                    reference: t.reference.clone(),
                     internal_id: t.internal_id,
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: None,
@@ -307,7 +307,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     .iter()
                     .map(|t| OuterQueryReference {
                         table: t.table.clone(),
-                        identifier: t.identifier.clone(),
+                        reference: t.reference.clone(),
                         internal_id: t.internal_id,
                         col_used_mask: ColumnUsedMask::default(),
                         cte_select: t.cte_select.clone(),
@@ -895,16 +895,7 @@ pub fn emit_from_clause_subqueries(
             true,
             match &table_reference.op {
                 Operation::Scan(scan) => {
-                    let table_name =
-                        if table_reference.table.get_name() == table_reference.identifier {
-                            table_reference.identifier.clone()
-                        } else {
-                            format!(
-                                "{} AS {}",
-                                table_reference.table.get_name(),
-                                table_reference.identifier
-                            )
-                        };
+                    let table_name = table_reference.reference.display_name();
 
                     match scan {
                         Scan::BTreeTable { index, .. } => {
@@ -927,7 +918,7 @@ pub fn emit_from_clause_subqueries(
                     Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
                         format!(
                             "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                            table_reference.identifier
+                            table_reference.reference.lookup_name()
                         )
                     }
                     Search::Seek {
@@ -935,7 +926,8 @@ pub fn emit_from_clause_subqueries(
                     } => {
                         format!(
                             "SEARCH {} USING INDEX {}",
-                            table_reference.identifier, index.name
+                            table_reference.reference.lookup_name(),
+                            index.name
                         )
                     }
                 },
@@ -947,16 +939,7 @@ pub fn emit_from_clause_subqueries(
                     )
                 }
                 Operation::HashJoin(_) => {
-                    let table_name =
-                        if table_reference.table.get_name() == table_reference.identifier {
-                            table_reference.identifier.clone()
-                        } else {
-                            format!(
-                                "{} AS {}",
-                                table_reference.table.get_name(),
-                                table_reference.identifier
-                            )
-                        };
+                    let table_name = table_reference.reference.display_name();
                     format!("HASH JOIN {table_name}")
                 }
                 Operation::MultiIndexScan(multi_idx) => {
@@ -976,7 +959,7 @@ pub fn emit_from_clause_subqueries(
                             SetOperation::Union => "OR",
                             SetOperation::Intersection => "AND",
                         },
-                        table_reference.identifier,
+                        table_reference.reference.lookup_name(),
                         index_names.join(", ")
                     )
                 }

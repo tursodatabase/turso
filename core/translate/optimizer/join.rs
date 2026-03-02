@@ -15,6 +15,8 @@ use super::{
     order::OrderTarget,
     IndexMethodCandidate,
 };
+#[cfg(test)]
+use crate::translate::plan::TableReference;
 use crate::{
     schema::{Index, Schema},
     stats::AnalyzeStats,
@@ -2831,12 +2833,11 @@ mod tests {
             op: Operation::default_scan_for(&table),
             table,
             internal_id: table_id_counter.next(),
-            identifier: "t1".to_string(),
+            reference: TableReference::unaliased("t1", 0),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
         });
 
         // Create where clause that only references second column
@@ -2946,12 +2947,11 @@ mod tests {
             op: Operation::default_scan_for(&table),
             table,
             internal_id: table_id_counter.next(),
-            identifier: "t1".to_string(),
+            reference: TableReference::unaliased("t1", 0),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
         });
 
         // Create where clause that references first and third columns
@@ -3081,12 +3081,11 @@ mod tests {
             op: Operation::default_scan_for(&table),
             table,
             internal_id: table_id_counter.next(),
-            identifier: "t1".to_string(),
+            reference: TableReference::unaliased("t1", 0),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
         });
 
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
@@ -3246,13 +3245,12 @@ mod tests {
         JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
-            identifier: name,
+            reference: TableReference::unaliased(name, 0),
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
         }
     }
 

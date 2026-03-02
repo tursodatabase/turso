@@ -6,7 +6,10 @@ use crate::{
             bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
             ConditionMetadata, NoConstantOptReason,
         },
-        plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
+        plan::{
+            ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReference,
+            TableReferences,
+        },
         scope::FullTableScope,
     },
     vdbe::{
@@ -216,13 +219,12 @@ fn translate_integrity_check_impl(
                     index: None,
                 }),
                 table: Table::BTree(btree_table.clone()),
-                identifier: btree_table.name.clone(),
+                reference: TableReference::unaliased(btree_table.name.clone(), database_id),
                 internal_id: table_ref_id,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
-                database_id,
             }],
             vec![],
         );

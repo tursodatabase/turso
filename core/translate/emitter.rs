@@ -49,7 +49,7 @@ use crate::translate::fkeys::{
 };
 use crate::translate::plan::{
     DeletePlan, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinedTable, NonFromClauseSubquery,
-    Plan, QueryDestination, ResultSetColumn, Search,
+    Plan, QueryDestination, ResultSetColumn, Search, TableReference,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -712,15 +712,7 @@ fn emit_materialized_build_inputs(
     // Now we emit each of the materialization subplans into an ephemeral table.
     for spec in materializations.iter() {
         let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
-        let build_table_name = if build_table.table.get_name() == build_table.identifier {
-            build_table.identifier.clone()
-        } else {
-            format!(
-                "{} AS {}",
-                build_table.table.get_name(),
-                build_table.identifier
-            )
-        };
+        let build_table_name = build_table.reference.display_name();
         let internal_id = program.table_reference_counter.next();
         let columns = match &spec.mode {
             MaterializedBuildInputMode::RowidOnly => vec![build_rowid_column()],
@@ -1605,13 +1597,14 @@ fn emit_program_for_delete(
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: table_cursor_id,
                 root_page: RegisterOrLiteral::Literal(btree_table.root_page),
-                db: table_ref.database_id,
+                db: table_ref.reference.database_id,
             });
 
             // Open all indexes for writing (needed for DELETE)
-            let write_indices: Vec<_> = resolver.with_schema(table_ref.database_id, |s| {
-                s.get_indices(table_ref.table.get_name()).cloned().collect()
-            });
+            let write_indices: Vec<_> = resolver
+                .with_schema(table_ref.reference.database_id, |s| {
+                    s.get_indices(table_ref.table.get_name()).cloned().collect()
+                });
             for index in &write_indices {
                 let index_cursor_id = program.alloc_cursor_index(
                     Some(CursorKey::index(table_ref.internal_id, index.clone())),
@@ -1620,7 +1613,7 @@ fn emit_program_for_delete(
                 program.emit_insn(Insn::OpenWrite {
                     cursor_id: index_cursor_id,
                     root_page: RegisterOrLiteral::Literal(index.root_page),
-                    db: table_ref.database_id,
+                    db: table_ref.reference.database_id,
                 });
             }
         }
@@ -1899,7 +1892,7 @@ fn emit_delete_insns<'a>(
         }
     };
     let btree_table = unsafe { &*table_reference }.btree();
-    let database_id = unsafe { (*table_reference).database_id };
+    let database_id = unsafe { (*table_reference).reference.database_id };
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
@@ -2049,7 +2042,7 @@ fn emit_delete_row_common(
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let delete_db_id = unsafe { (*table_reference).database_id };
+        let delete_db_id = unsafe { (*table_reference).reference.database_id };
         if let Some(table) = unsafe { &*table_reference }.btree() {
             let prepared = if t_ctx
                 .resolver
@@ -2100,7 +2093,7 @@ fn emit_delete_row_common(
         });
     } else {
         // Delete from all indexes before deleting from the main table.
-        let db_id = unsafe { (*table_reference).database_id };
+        let db_id = unsafe { (*table_reference).reference.database_id };
         let all_indices: Vec<_> = t_ctx
             .resolver
             .with_schema(db_id, |s| s.get_indices(table_name).cloned().collect());
@@ -2230,7 +2223,7 @@ fn emit_delete_row_common(
     // Per SQLite docs, the parent row must be deleted before FK cascade actions fire,
     // so triggers during cascade see the parent row as already deleted.
     {
-        let delete_db_id = unsafe { (*table_reference).database_id };
+        let delete_db_id = unsafe { (*table_reference).reference.database_id };
         prepared_fk_actions.fire_prepared_fk_delete_actions(
             program,
             &mut t_ctx.resolver,
@@ -2274,7 +2267,7 @@ fn emit_delete_insns_when_triggers_present(
         return Err(crate::LimboError::ReadOnly);
     }
     let btree_table = unsafe { &*table_reference }.btree();
-    let database_id = unsafe { (*table_reference).database_id };
+    let database_id = unsafe { (*table_reference).reference.database_id };
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
         t_ctx.resolver.with_schema(database_id, |s| {
@@ -2593,10 +2586,10 @@ fn emit_program_for_update(
     )?;
 
     // Prepare index cursors
-    // Use target_table.database_id because in the PrebuiltEphemeralTable case,
+    // Use target_table.reference.database_id because in the PrebuiltEphemeralTable case,
     // plan.table_references contains the ephemeral table (database_id=0),
     // not the actual target table.
-    let target_database_id = target_table.database_id;
+    let target_database_id = target_table.reference.database_id;
     let mut index_cursors = Vec::with_capacity(plan.indexes_to_update.len());
     for index in &plan.indexes_to_update {
         let index_cursor = if let Some(cursor) = program.resolve_cursor_id_safe(&CursorKey::index(
@@ -3229,7 +3222,7 @@ fn emit_update_insns<'a>(
     }
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
-    let update_database_id = target_table.database_id;
+    let update_database_id = target_table.reference.database_id;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
         target_table.table.btree()
     {
@@ -4365,7 +4358,7 @@ fn emit_update_insns<'a>(
             } else {
                 InsertFlags::new().skip_last_rowid()
             },
-            table_name: target_table.identifier.clone(),
+            table_name: target_table.reference.lookup_name().to_string(),
         });
 
         // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
@@ -5368,7 +5361,10 @@ fn emit_check_constraint_bytecode(
             if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
                 // CHECK expressions come from schema SQL and may use the base table name
                 // even when the query references the table through an alias.
-                joined_table.identifier = table_name.to_string();
+                joined_table.reference = TableReference::unaliased(
+                    table_name.to_string(),
+                    joined_table.reference.database_id,
+                );
             }
             let mut scope = FullTableScope::new(&mut binding_tables);
             bind_and_rewrite_expr(&mut rewritten_expr, &mut scope, resolver, false)?;
