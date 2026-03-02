@@ -43,6 +43,17 @@ impl Storage {
         self.logical_log.write().log_tx_deferred_offset(m)
     }
 
+    /// Write log record AND immediately advance offset and CRC chain.
+    /// Used by group commit where the caller holds the commit lock to serialize
+    /// writes, and durability is guaranteed by a later batched fsync.
+    pub fn log_tx_and_advance(&self, m: &LogRecord) -> Result<Completion> {
+        let mut log = self.logical_log.write();
+        let (c, bytes) = log.log_tx_with_byte_count(m)?;
+        drop(log);
+        self.shadow_offset_advance(bytes);
+        Ok(c)
+    }
+
     pub fn read_tx_log(&self) -> Result<Vec<LogRecord>> {
         todo!()
     }

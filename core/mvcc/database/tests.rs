@@ -7115,3 +7115,141 @@ fn test_double_delete_btree_resident_row_with_unique_index() {
         "Index corruption after concurrent double-delete of B-tree-resident row"
     );
 }
+
+// -- Group commit tests --
+
+/// What this test checks: Single transaction commits correctly with group commit enabled.
+/// Why this matters: The group commit code path must handle the degenerate case of a
+/// single member in the sync group (which also becomes the leader).
+#[test]
+fn test_group_commit_single_transaction() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+    mv_store.set_group_commit_delay_us(0);
+    // Enable with a minimal window — single tx should still commit fine.
+    mv_store.set_group_commit_delay_us(1);
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (42)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "42");
+}
+
+/// What this test checks: Existing commit behavior is unchanged when group commit is disabled.
+/// Why this matters: Regression test — the default (group_commit_delay_us=0) must use the
+/// legacy per-tx fsync path.
+#[test]
+fn test_group_commit_disabled_regression() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+    assert_eq!(mv_store.group_commit_delay_us(), 0);
+    assert!(!mv_store.commit_coordinator.is_group_commit_enabled());
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT * FROM t ORDER BY x");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].to_string(), "1");
+    assert_eq!(rows[1][0].to_string(), "2");
+}
+
+/// What this test checks: The group_commit_delay_us PRAGMA reads and writes correctly.
+/// Why this matters: The PRAGMA is the user-facing configuration surface.
+#[test]
+fn test_group_commit_pragma() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // Default is 0 (disabled).
+    let rows = get_rows(&conn, "PRAGMA group_commit_delay_us");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "0");
+
+    // Set to 5000 (5ms).
+    conn.execute("PRAGMA group_commit_delay_us = 5000").unwrap();
+    let rows = get_rows(&conn, "PRAGMA group_commit_delay_us");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "5000");
+
+    // Set back to 0.
+    conn.execute("PRAGMA group_commit_delay_us = 0").unwrap();
+    let rows = get_rows(&conn, "PRAGMA group_commit_delay_us");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "0");
+}
+
+/// What this test checks: Group commit works with auto-checkpoint.
+/// Why this matters: Checkpoint is triggered in CommitEnd after the group sync completes.
+/// The offset must be correctly advanced for should_checkpoint() to trigger.
+#[test]
+fn test_group_commit_with_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+
+    // Enable group commit with minimal window.
+    mv_store.set_group_commit_delay_us(1);
+    // Force checkpoint on every commit.
+    mv_store.set_checkpoint_threshold(0);
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT * FROM t ORDER BY x");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].to_string(), "1");
+    assert_eq!(rows[1][0].to_string(), "2");
+}
+
+/// What this test checks: Multiple sequential transactions commit correctly with group commit.
+/// Why this matters: Each transaction creates/joins a sync group. Sequential transactions
+/// should each get their own group (window expired by the time the next one commits).
+#[test]
+fn test_group_commit_multiple_sequential_transactions() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+
+    // Enable group commit with 1us window — effectively immediate for sequential txns.
+    mv_store.set_group_commit_delay_us(1);
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    for i in 0..10 {
+        conn.execute(format!("INSERT INTO t VALUES ({i})"))
+            .unwrap();
+    }
+
+    let rows = get_rows(&conn, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].to_string(), "10");
+}
+
+/// What this test checks: Group commit with restart (recovery) preserves data.
+/// Why this matters: After a restart, the logical log is replayed. Group-committed
+/// transactions that were fsynced must be recovered correctly.
+#[test]
+fn test_group_commit_restart_recovery() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        let mv_store = db.get_mvcc_store();
+        mv_store.set_group_commit_delay_us(1);
+
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (100)").unwrap();
+        conn.execute("INSERT INTO t VALUES (200)").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT * FROM t ORDER BY x");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].to_string(), "100");
+    assert_eq!(rows[1][0].to_string(), "200");
+}

@@ -396,6 +396,13 @@ impl LogicalLog {
         Ok(c)
     }
 
+    /// Writes a transaction to the log, immediately advances the writer offset,
+    /// and returns `(completion, bytes_written)`. Used by group commit where the
+    /// caller needs the byte count for shadow offset tracking.
+    pub fn log_tx_with_byte_count(&mut self, tx: &LogRecord) -> Result<(Completion, u64)> {
+        self.serialize_and_pwrite_tx(tx, true)
+    }
+
     /// Writes a transaction to the log but does NOT advance the writer offset.
     /// Returns `(completion, bytes_written)`. The caller must call
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.

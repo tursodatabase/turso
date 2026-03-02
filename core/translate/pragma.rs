@@ -481,6 +481,15 @@ fn update_pragma(
             connection.set_mvcc_checkpoint_threshold(threshold)?;
             Ok(TransactionMode::None)
         }
+        PragmaName::ExperimentalGroupCommitDelayUs => {
+            let delay = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(size)) if size >= 0 => size as u64,
+                _ => bail_parse_error!("experimental_group_commit_delay_us must be 0 or a positive integer"),
+            };
+
+            connection.set_group_commit_delay_us(delay)?;
+            Ok(TransactionMode::None)
+        }
         PragmaName::ForeignKeys => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_foreign_keys_enabled(enabled);
@@ -1191,6 +1200,14 @@ fn query_pragma(
             let threshold = connection.mvcc_checkpoint_threshold()?;
             let register = program.alloc_register();
             program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::ExperimentalGroupCommitDelayUs => {
+            let delay = connection.group_commit_delay_us()?;
+            let register = program.alloc_register();
+            program.emit_int(delay as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

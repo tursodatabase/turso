@@ -1,3 +1,4 @@
+import os
 import sys
 
 import matplotlib.pyplot as plt
@@ -5,7 +6,7 @@ import numpy as np
 import pandas as pd
 import scienceplots  # noqa: F401
 
-plt.style.use(["science"])
+plt.style.use(["science", "no-latex"])
 
 # Get CSV filenames from command line arguments
 if len(sys.argv) < 2:
@@ -17,8 +18,17 @@ csv_filenames = sys.argv[1:]
 # Output filename
 output_filename = "thread-scaling.pdf"
 
-# Read data from all CSV files and concatenate
-dfs = [pd.read_csv(filename) for filename in csv_filenames]
+# Read data from all CSV files, using the filename stem as the system name
+# when multiple files share the same system column value.
+dfs = []
+for filename in csv_filenames:
+    frame = pd.read_csv(filename)
+    # Use filename stem (e.g. "turso-mvcc-group") as the system label
+    # so that multiple CSVs with "Turso" in the system column are
+    # distinguishable on the plot.
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    frame["system"] = stem
+    dfs.append(frame)
 df = pd.concat(dfs, ignore_index=True)
 
 # Filter for compute time = 0
@@ -35,21 +45,23 @@ fig, ax = plt.subplots(figsize=(10, 6))
 x_pos = np.arange(len(threads))
 bar_width = 0.35
 
-# Colors and hatching patterns matching TPC-H plot
-system_colors = {"Turso": "#2E7D32", "SQLite": "#1976D2"}
-system_hatches = {"Turso": "//", "SQLite": "///"}
+# Colors and hatching patterns — one per CSV / system label
+palette = ["#2E7D32", "#1976D2", "#D32F2F", "#F57C00", "#7B1FA2"]
+hatch_pool = ["//", "///", "\\\\", "xx", ""]
 
 # Plot bars for each system
+n_systems = len(systems)
+bar_width = 0.8 / max(n_systems, 1)
 for i, system in enumerate(systems):
     system_data = df_filtered[df_filtered["system"] == system].sort_values("threads")
     throughput = system_data["throughput"].tolist()
 
-    offset = (i - len(systems)/2 + 0.5) * bar_width
+    offset = (i - n_systems / 2 + 0.5) * bar_width
     bars = ax.bar(x_pos + offset, throughput, bar_width,
                    label=system,
-                   color=system_colors.get(system, "#888888"),
+                   color=palette[i % len(palette)],
                    edgecolor="black", linewidth=0.5,
-                   hatch=system_hatches.get(system, ""),
+                   hatch=hatch_pool[i % len(hatch_pool)],
                    rasterized=True)
 
 # Customize the plot

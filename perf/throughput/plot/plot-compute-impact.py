@@ -1,15 +1,11 @@
+import os
 import sys
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import scienceplots  # noqa: F401
 
-plt.style.use(["science"])
-plt.rcParams.update({
-  "text.usetex": True,
-  "font.family": "serif",
-  "font.serif": ["Times"],
-})
+plt.style.use(["science", "no-latex"])
 
 # Get CSV filenames from command line arguments
 if len(sys.argv) < 2:
@@ -21,8 +17,13 @@ csv_filenames = sys.argv[1:]
 # Output filename
 output_filename = "compute-impact.pdf"
 
-# Read data from all CSV files and concatenate
-dfs = [pd.read_csv(filename) for filename in csv_filenames]
+# Read data from all CSV files, using the filename stem as the system name.
+dfs = []
+for filename in csv_filenames:
+    frame = pd.read_csv(filename)
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    frame["system"] = stem
+    dfs.append(frame)
 df = pd.concat(dfs, ignore_index=True)
 
 # Create figure and axis
@@ -55,7 +56,7 @@ for sys_idx, system in enumerate(systems):
             plot_idx += 1
 
 # Customize the plot
-ax.set_xlabel(r"Compute Time (microseconds)", fontsize=14, fontweight="bold")
+ax.set_xlabel("Compute Time (microseconds)", fontsize=14, fontweight="bold")
 ax.set_ylabel("Throughput (rows/second)", fontsize=14, fontweight="bold")
 
 # Set y-axis to start from 0 with dynamic upper limit
