@@ -1474,7 +1474,7 @@ fn init_autoincrement(
 
     let seq_col_reg = program.alloc_register();
     program.emit_column_or_rowid(seq_cursor_id, 1, seq_col_reg);
-    program.emit_insn(Insn::Le {
+    program.emit_insn(Insn::Lt {
         lhs: seq_col_reg,
         rhs: r_seq,
         target_pc: skip_update_label,
