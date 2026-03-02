@@ -379,6 +379,7 @@ pub fn translate_inner(
 mod tests {
     use super::*;
     use crate::io::MemoryIO;
+    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::Database;
 
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
@@ -416,19 +417,30 @@ mod tests {
     }
 
     #[test]
-    fn test_create_autoincrement_requires_sqlite_schema() {
+    fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
 
         let mut schema = db.schema.lock().as_ref().clone();
-        schema.tables.remove("sqlite_schema");
+        let seq_root_page = schema
+            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
+            .root_page;
+        let malformed_seq =
+            BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
+                .expect("malformed sqlite_sequence SQL should parse");
+        schema.tables.insert(
+            SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            Arc::new(Table::BTree(Arc::new(malformed_seq))),
+        );
+
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let mut parser = turso_parser::parser::Parser::new(
-            b"CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT)",
-        );
+        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
         let cmd = parser.next().unwrap().unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
@@ -436,11 +448,49 @@ mod tests {
         };
 
         let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
-            .expect_err("translation should fail without sqlite_schema")
-            .to_string();
-        assert!(
-            err.contains("sqlite_schema table not found in schema"),
-            "expected missing sqlite_schema error, got: {err}"
-        );
+            .expect_err("translation should fail with malformed sqlite_sequence");
+        match err {
+            crate::LimboError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("sqlite_sequence"),
+                    "expected sqlite_sequence corruption error, got: {msg}"
+                );
+            }
+            other => panic!("expected LimboError::Corrupt, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+
+        let mut schema = db.schema.lock().as_ref().clone();
+        schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
+
+        let pager = conn.pager.load().clone();
+        let syms = SymbolTable::new();
+
+        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
+            .expect_err("translation should fail with missing sqlite_sequence");
+        match err {
+            crate::LimboError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("missing sqlite_sequence"),
+                    "expected missing sqlite_sequence error, got: {msg}"
+                );
+            }
+            other => panic!("expected LimboError::Corrupt, got: {other}"),
+        }
     }
 }
