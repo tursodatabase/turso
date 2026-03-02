@@ -1692,7 +1692,7 @@ fn test_update_pk_on_attached_table_with_unique_index(tmp_db: TempDatabase) -> a
         .path
         .parent()
         .unwrap()
-        .join("aux.db")
+        .join("aux_update.db")
         .to_string_lossy()
         .to_string();
     conn.execute(format!("ATTACH '{aux_path}' AS aux1"))?;
