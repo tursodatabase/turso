@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 
 # Test: Create an AUTOINCREMENT table and verify sqlite_sequence is also created.
 @cross-check-integrity
@@ -244,7 +245,6 @@ expect {
 }
 
 # refer https://github.com/tursodatabase/turso/pull/2983#issuecomment-3322404270 was discovered while adding autoincr to fuzz tests
-@skip-if mvcc "not supported in MVCC mode"
 @cross-check-integrity
 test autoinc-conflict-on-nothing {
     CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT);

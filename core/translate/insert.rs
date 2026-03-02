@@ -86,6 +86,11 @@ fn validate(
     if table.btree().is_some_and(|t| !t.has_rowid) {
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
     }
+    if table.btree().is_some_and(|t| t.has_autoincrement) && conn.mvcc_enabled() {
+        crate::bail_parse_error!(
+            "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
+        );
+    }
 
     Ok(())
 }
