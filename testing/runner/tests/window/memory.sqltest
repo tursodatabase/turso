@@ -111,3 +111,235 @@ expect {
     2
     3
 }
+
+test window-row-number-nulls-in-order-by {
+    CREATE TABLE rn_null_ord (a INTEGER, c INTEGER);
+    INSERT INTO rn_null_ord VALUES (1, NULL), (2, 10), (3, NULL), (4, 20), (5, 30);
+    SELECT a, c, ROW_NUMBER() OVER (ORDER BY c) AS rn FROM rn_null_ord;
+}
+expect {
+    1||1
+    3||2
+    2|10|3
+    4|20|4
+    5|30|5
+}
+
+test window-row-number-nulls-in-partition-by {
+    CREATE TABLE rn_null_part (a INTEGER, b TEXT);
+    INSERT INTO rn_null_part VALUES (1, 'x'), (2, 'x'), (3, 'y'), (4, 'y'), (5, NULL);
+    SELECT a, b, ROW_NUMBER() OVER (PARTITION BY b ORDER BY a) AS rn FROM rn_null_part;
+}
+expect {
+    5||1
+    1|x|1
+    2|x|2
+    3|y|1
+    4|y|2
+}
+
+test window-row-number-all-null-partition {
+    CREATE TABLE rn_all_null (a INTEGER, b TEXT);
+    INSERT INTO rn_all_null VALUES (1, NULL), (2, NULL), (3, NULL);
+    SELECT a, ROW_NUMBER() OVER (PARTITION BY b ORDER BY a) AS rn FROM rn_all_null;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+test window-row-number-with-where {
+    CREATE TABLE rn_where (a INTEGER, b TEXT);
+    INSERT INTO rn_where VALUES (1, 'x'), (2, 'x'), (3, 'y'), (4, 'y'), (5, 'z');
+    SELECT a, b, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM rn_where WHERE b = 'x';
+}
+expect {
+    1|x|1
+    2|x|2
+}
+
+test window-row-number-with-limit-offset {
+    CREATE TABLE rn_limit (a INTEGER);
+    INSERT INTO rn_limit VALUES (10), (20), (30), (40), (50);
+    SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM rn_limit LIMIT 3 OFFSET 1;
+}
+expect {
+    20|2
+    30|3
+    40|4
+}
+
+test window-row-number-top-n-per-group {
+    CREATE TABLE rn_topn (name TEXT, grp TEXT, val INTEGER);
+    INSERT INTO rn_topn VALUES ('a', 'g1', 30), ('b', 'g1', 10), ('c', 'g1', 20),
+                               ('d', 'g2', 50), ('e', 'g2', 40);
+    SELECT * FROM (
+        SELECT name, grp, val,
+            ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val DESC) AS rn
+        FROM rn_topn
+    ) WHERE rn <= 2 ORDER BY grp, rn;
+}
+expect {
+    a|g1|30|1
+    c|g1|20|2
+    d|g2|50|1
+    e|g2|40|2
+}
+
+test window-row-number-combined-with-aggregate-window {
+    CREATE TABLE rn_combo (a INTEGER, b TEXT, c INTEGER);
+    INSERT INTO rn_combo VALUES (1, 'x', NULL), (2, 'x', 10), (3, 'y', NULL), (4, 'y', 20), (5, 'z', 30);
+    SELECT a, b,
+        ROW_NUMBER() OVER (ORDER BY a) AS rn,
+        SUM(c) OVER (ORDER BY a) AS running_sum
+    FROM rn_combo;
+}
+expect {
+    1|x|1|
+    2|x|2|10
+    3|y|3|10
+    4|y|4|30
+    5|z|5|60
+}
+
+test window-row-number-empty-table {
+    CREATE TABLE rn_empty (a INTEGER);
+    SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM rn_empty;
+}
+expect {
+}
+
+test window-row-number-single-row {
+    CREATE TABLE rn_single (a INTEGER);
+    INSERT INTO rn_single VALUES (42);
+    SELECT a, ROW_NUMBER() OVER () AS rn FROM rn_single;
+}
+expect {
+    42|1
+}
+
+test window-row-number-multiple-partition-keys {
+    CREATE TABLE rn_multi_part (a INTEGER, b TEXT, c TEXT, d INTEGER);
+    INSERT INTO rn_multi_part VALUES (1, 'x', 'p', 10), (2, 'x', 'p', 20),
+                                     (3, 'x', 'q', 30), (4, 'y', 'p', 40), (5, 'y', 'q', 50);
+    SELECT a, b, c, ROW_NUMBER() OVER (PARTITION BY b, c ORDER BY d DESC) AS rn
+    FROM rn_multi_part ORDER BY b, c, rn;
+}
+expect {
+    2|x|p|1
+    1|x|p|2
+    3|x|q|1
+    4|y|p|1
+    5|y|q|1
+}
+
+test window-row-number-multiple-different-windows {
+    CREATE TABLE rn_multi_win (a INTEGER, b TEXT);
+    INSERT INTO rn_multi_win VALUES (1, 'x'), (2, 'x'), (3, 'y'), (4, 'y');
+    SELECT a, b,
+        ROW_NUMBER() OVER (ORDER BY a) AS global_rn,
+        ROW_NUMBER() OVER (PARTITION BY b ORDER BY a) AS group_rn
+    FROM rn_multi_win;
+}
+expect {
+    1|x|1|1
+    2|x|2|2
+    3|y|3|1
+    4|y|4|2
+}
+
+test window-row-number-in-expression {
+    CREATE TABLE rn_expr (a INTEGER, b TEXT);
+    INSERT INTO rn_expr VALUES (10, 'x'), (20, 'x'), (30, 'y'), (40, 'y');
+    SELECT a, b, a * ROW_NUMBER() OVER (ORDER BY a) AS weighted FROM rn_expr;
+}
+expect {
+    10|x|10
+    20|x|40
+    30|y|90
+    40|y|160
+}
+
+test window-row-number-with-join {
+    CREATE TABLE rn_customers (id INTEGER, name TEXT);
+    CREATE TABLE rn_orders (id INTEGER, cust_id INTEGER, amount INTEGER);
+    INSERT INTO rn_customers VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO rn_orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150), (4, 2, 300), (5, 2, 50);
+    SELECT c.name, o.amount,
+        ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY o.amount DESC) AS rn
+    FROM rn_orders o JOIN rn_customers c ON o.cust_id = c.id
+    ORDER BY c.name, rn;
+}
+expect {
+    Alice|200|1
+    Alice|100|2
+    Bob|300|1
+    Bob|150|2
+    Bob|50|3
+}
+
+test window-row-number-with-named-window {
+    CREATE TABLE rn_named (a INTEGER, b TEXT);
+    INSERT INTO rn_named VALUES (1, 'x'), (2, 'x'), (3, 'y'), (4, 'y');
+    SELECT a, b, ROW_NUMBER() OVER w AS rn
+    FROM rn_named
+    WINDOW w AS (PARTITION BY b ORDER BY a)
+    ORDER BY b, rn;
+}
+expect {
+    1|x|1
+    2|x|2
+    3|y|1
+    4|y|2
+}
+
+test window-row-number-alias-in-order-by {
+    CREATE TABLE rn_alias (a INTEGER, b TEXT);
+    INSERT INTO rn_alias VALUES (1, 'c'), (2, 'a'), (3, 'b');
+    SELECT a, b, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM rn_alias ORDER BY rn DESC;
+}
+expect {
+    1|c|3
+    3|b|2
+    2|a|1
+}
+
+test window-row-number-over-group-by {
+    CREATE TABLE rn_grp (a INTEGER, b TEXT);
+    INSERT INTO rn_grp VALUES (1, 'x'), (2, 'x'), (3, 'x'), (4, 'y'), (5, 'y');
+    SELECT b, count(*) AS cnt,
+        ROW_NUMBER() OVER (ORDER BY count(*) DESC) AS rn
+    FROM rn_grp GROUP BY b;
+}
+expect {
+    x|3|1
+    y|2|2
+}
+
+test window-row-number-distinct {
+    CREATE TABLE rn_dist (a INTEGER);
+    INSERT INTO rn_dist VALUES (1), (1), (2), (2), (3);
+    SELECT DISTINCT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM rn_dist;
+}
+expect {
+    1|1
+    1|2
+    2|3
+    2|4
+    3|5
+}
+
+test window-row-number-wrong-arg-count {
+    SELECT ROW_NUMBER(1) OVER () FROM (SELECT 1);
+}
+expect error {
+    wrong number of arguments to function ROW_NUMBER()
+}
+
+test window-row-number-in-check-constraint {
+    CREATE TABLE bad(a INTEGER CHECK(ROW_NUMBER() OVER () > 0));
+}
+expect error {
+    misuse of window function ROW_NUMBER()
+}
