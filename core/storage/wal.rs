@@ -4,6 +4,7 @@ use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
 use crate::{turso_assert, turso_assert_greater_than, turso_debug_assert};
+use branches::mark_unlikely;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
@@ -1970,11 +1971,10 @@ impl Wal for WalFile {
                 shared.enabled.load(Ordering::Relaxed),
                 "WAL must be enabled"
             );
-            shared
-                .file
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| LimboError::InternalError("WAL file not open".into()))
+            shared.file.as_ref().cloned().ok_or_else(|| {
+                mark_unlikely();
+                LimboError::InternalError("WAL file not open".into())
+            })
         })
     }
 
@@ -2384,6 +2384,7 @@ impl WalFile {
                         tracing::trace!("Drained reads into batch");
                     }
                     if let Some(e) = ongoing_chkpt.first_write_error() {
+                        mark_unlikely();
                         // cancel everything still in-flight to avoid leaks
                         let to_cancel: Vec<Completion> = ongoing_chkpt
                             .inflight_reads
@@ -2469,6 +2470,7 @@ impl WalFile {
                         ongoing_chkpt.state = CheckpointState::DetermineResult;
                     } else {
                         // This should be impossible now so we treat it as logic error.
+                        mark_unlikely();
                         return Err(LimboError::InternalError(
                             "checkpoint stuck: no inflight completions but not complete".into(),
                         ));
@@ -2769,6 +2771,7 @@ impl WalFile {
             shared.read_locks[idx].unlock();
         }
         if let Some(e) = e {
+            mark_unlikely();
             tracing::error!(
                 "Failed to restart WAL header: {:?}, releasing read locks",
                 e

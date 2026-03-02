@@ -63,6 +63,7 @@ use crate::{
     IOExt, MvCursor, QueryMode,
 };
 use crate::{CdcVersion, Statement};
+use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
@@ -139,14 +140,17 @@ macro_rules! return_if_io {
         match $expr {
             Ok(IOResult::Done(v)) => v,
             Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-            Err(err) => return Err(err),
+            Err(err) => {
+                mark_unlikely();
+                return Err(err);
+            }
         }
     };
 }
 
 macro_rules! check_arg_count {
     ($actual:expr, $expected:expr) => {
-        if $actual != $expected {
+        if unlikely($actual != $expected) {
             return Err(LimboError::InternalError(format!(
                 "expected {} argument(s), got {}",
                 $expected, $actual
@@ -288,7 +292,7 @@ pub fn op_init(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Init { target_pc }, insn);
-    if !target_pc.is_offset() {
+    if unlikely(!target_pc.is_offset()) {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
     state.pc = target_pc.as_offset_int();
@@ -571,7 +575,10 @@ pub fn op_null(
                 state.rowsets.remove(dest);
             }
         }
-        _ => unreachable!("unexpected Insn {:?}", insn),
+        _ => {
+            mark_unlikely();
+            unreachable!("unexpected Insn {:?}", insn)
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -608,7 +615,7 @@ pub fn op_compare(
     let start_reg_b = *start_reg_b;
     let count = *count;
 
-    if start_reg_a + count > start_reg_b {
+    if unlikely(start_reg_a + count > start_reg_b) {
         return Err(LimboError::InternalError(
             "Compare registers overlap".to_string(),
         ));
@@ -645,7 +652,7 @@ pub fn op_jump(
     assert!(target_pc_eq.is_offset());
     assert!(target_pc_gt.is_offset());
     let cmp = state.last_compare.take();
-    if cmp.is_none() {
+    if unlikely(cmp.is_none()) {
         return Err(LimboError::InternalError(
             "Jump without compare".to_string(),
         ));
@@ -714,6 +721,7 @@ pub fn op_if_pos(
             state.pc += 1;
         }
         _ => {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "IfPos: the value in the register is not an integer".into(),
             ));
@@ -1170,6 +1178,7 @@ pub fn op_vcreate(
                 .map(|v| v.map(|v| v.to_ffi()))
                 .collect::<Result<_, _>>()?
         } else {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "VCreate: args_reg is not a record".to_string(),
             ));
@@ -1294,7 +1303,7 @@ pub fn op_vupdate(
         return Err(LimboError::ReadOnly);
     }
 
-    if *arg_count < 2 {
+    if unlikely(*arg_count < 2) {
         return Err(LimboError::InternalError(
             "VUpdate: arg_count must be at least 2 (rowid and insert_rowid)".to_string(),
         ));
@@ -1304,6 +1313,7 @@ pub fn op_vupdate(
         if let Some(value) = state.registers.get(*start_reg + i) {
             argv.push(value.get_value().clone());
         } else {
+            mark_unlikely();
             return Err(LimboError::InternalError(format!(
                 "VUpdate: register out of bounds at {}",
                 *start_reg + i
@@ -1336,6 +1346,7 @@ pub fn op_vupdate(
         }
         Err(e) => {
             // virtual table update failed
+            mark_unlikely();
             return Err(LimboError::ExtensionError(format!(
                 "Virtual table update failed: {e}"
             )));
@@ -1382,6 +1393,7 @@ pub fn op_vdestroy(
     let conn = program.connection.clone();
     {
         let Some(vtab) = conn.syms.write().vtabs.remove(table_name) else {
+            mark_unlikely();
             return Err(crate::LimboError::InternalError(
                 "Could not find Virtual Table to Destroy".to_string(),
             ));
@@ -1869,7 +1881,7 @@ pub fn op_make_record(
     let dest_reg = *dest_reg as usize;
 
     if let Some(affinity_str) = affinity_str {
-        if affinity_str.len() != count {
+        if unlikely(affinity_str.len() != count) {
             return Err(LimboError::InternalError(format!(
                 "MakeRecord: the length of affinity string ({}) does not match the count ({})",
                 affinity_str.len(),
@@ -2473,6 +2485,7 @@ pub fn op_transaction_inner(
                             if conn_has_executed_begin_deferred
                                 && *tx_mode == TransactionMode::Concurrent
                             {
+                                mark_unlikely();
                                 return Err(LimboError::TxError(
                                     "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
                                         .to_string(),
@@ -2534,6 +2547,7 @@ pub fn op_transaction_inner(
                         if conn_has_executed_begin_deferred
                             && *tx_mode == TransactionMode::Concurrent
                         {
+                            mark_unlikely();
                             return Err(LimboError::TxError(
                                 "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
                                     .to_string(),
@@ -2583,6 +2597,7 @@ pub fn op_transaction_inner(
                     }
                 } else {
                     if matches!(tx_mode, TransactionMode::Concurrent) {
+                        mark_unlikely();
                         return Err(LimboError::TxError(
                             "Concurrent transaction mode is only supported when MVCC is enabled"
                                 .to_string(),
@@ -2990,6 +3005,7 @@ pub fn op_savepoint(
             }
             match release_result {
                 SavepointResult::NotFound => {
+                    mark_unlikely();
                     return Err(LimboError::TxError(format!("no such savepoint: {name}")));
                 }
                 SavepointResult::Release => {
@@ -3025,6 +3041,7 @@ pub fn op_savepoint(
             };
 
             let Some(deferred_fk_snapshot) = deferred_fk_snapshot else {
+                mark_unlikely();
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")));
             };
             conn.fk_deferred_violations
@@ -3102,7 +3119,7 @@ pub fn op_return(
             .unwrap_or_else(|_| panic!("Return register is negative: {pc}"));
         state.pc = pc;
     } else {
-        if !*can_fallthrough {
+        if unlikely(!*can_fallthrough) {
             return Err(LimboError::InternalError(
                 "Return register is not an integer".to_string(),
             ));
@@ -3324,6 +3341,7 @@ pub fn op_row_data(
         let record_option = return_if_io!(cursor.record());
 
         let record = record_option.ok_or_else(|| {
+            mark_unlikely();
             LimboError::InternalError("RowData: cursor has no record".to_string())
         })?;
 
@@ -3458,6 +3476,7 @@ pub fn op_row_id(
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
                 } else {
+                    mark_unlikely();
                     return Err(LimboError::InternalError(
                         "RowId: cursor is not a table, virtual, or materialized view cursor"
                             .to_string(),
@@ -4311,6 +4330,7 @@ pub fn op_decr_jump_zero(
             bail_constraint_error!("datatype mismatch");
         }
         Register::Aggregate(_) => {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "DecrJumpZero: unexpected aggregate register".into(),
             ));
@@ -4385,6 +4405,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
             payload.push(Value::Null);
         }
         AggFunc::External(_) => {
+            mark_unlikely();
             // External aggregates use ExternalAggState, not flat payload
             return Err(LimboError::InternalError(
                 "External aggregate not supported in init_agg_payload".to_string(),
@@ -4440,6 +4461,7 @@ fn update_agg_payload(
             if !matches!(arg, Value::Null) {
                 // invariant as per init_agg_payload: payload[0] is always an integer
                 let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
+                    mark_unlikely();
                     return Err(LimboError::InternalError(
                         "Count: payload is not an integer".to_string(),
                     ));
@@ -4450,6 +4472,7 @@ fn update_agg_payload(
         AggFunc::Count0 => {
             // invariant as per init_agg_payload: payload[0] is always an integer
             let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Count0: payload is not an integer".to_string(),
                 ));
@@ -4462,12 +4485,14 @@ fn update_agg_payload(
             }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
             let [sum_val, r_err_val, count_val, ..] = payload else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Avg: payload too short".to_string(),
                 ));
             };
             let r_err = r_err_val.as_float();
             let Value::Numeric(Numeric::Integer(count)) = count_val else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Avg: payload[2] is not an integer".to_string(),
                 ));
@@ -4513,11 +4538,13 @@ fn update_agg_payload(
             };
             let r_err_f = r_err_val.as_float();
             let Value::Numeric(Numeric::Integer(approx_i)) = approx_val else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload[2] is not an integer".to_string(),
                 ));
             };
             let Value::Numeric(Numeric::Integer(ovrfl_i)) = ovrfl_val else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload[3] is not an integer".to_string(),
                 ));
@@ -4543,6 +4570,7 @@ fn update_agg_payload(
                                 sum_state.ovrfl = true;
                                 apply_kbn_step_int(acc, i, &mut sum_state);
                             } else {
+                                mark_unlikely();
                                 return Err(LimboError::IntegerOverflow);
                             }
                         }
@@ -4622,6 +4650,7 @@ fn update_agg_payload(
             }
         }
         AggFunc::External(_) => {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "External aggregate not supported in update_agg_payload".to_string(),
             ));
@@ -4630,6 +4659,7 @@ fn update_agg_payload(
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
             // arg = key, maybe_arg2 = value
             let Some(value) = maybe_arg2 else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
                 ));
@@ -4637,6 +4667,7 @@ fn update_agg_payload(
             let mut key_vec = convert_dbtype_to_raw_jsonb(&arg)?;
             let mut val_vec = convert_dbtype_to_raw_jsonb(&value)?;
             let Value::Blob(vec) = &mut payload[0] else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "JsonGroupObject: payload[0] is not a blob".to_string(),
                 ));
@@ -4653,6 +4684,7 @@ fn update_agg_payload(
             // arg = value
             let mut data = convert_dbtype_to_raw_jsonb(&arg)?;
             let Value::Blob(vec) = &mut payload[0] else {
+                mark_unlikely();
                 return Err(LimboError::InternalError(
                     "JsonGroupArray: payload[0] is not a blob".to_string(),
                 ));
@@ -4730,6 +4762,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         AggFunc::Min | AggFunc::Max => payload[0].clone(),
         AggFunc::GroupConcat | AggFunc::StringAgg => payload[0].clone(),
         AggFunc::External(_) => {
+            mark_unlikely();
             // External aggregates are finalized via AggContext::compute_external()
             return Err(LimboError::InternalError(
                 "finalize_agg_payload called for External aggregate".to_string(),
@@ -5117,6 +5150,7 @@ pub fn op_sorter_compare(
 
     let previous_sorter_values = {
         let Register::Record(record) = &state.registers[*sorted_record_reg] else {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "Sorted record must be a record".to_string(),
             ));
@@ -5134,6 +5168,7 @@ pub fn op_sorter_compare(
 
     let cursor = cursor.as_sorter_mut();
     let Some(current_sorter_record) = cursor.record() else {
+        mark_unlikely();
         return Err(LimboError::InternalError(
             "Sorter must have a record".to_string(),
         ));
@@ -5179,6 +5214,7 @@ pub fn op_rowset_add(
     let rowid = match value {
         Value::Numeric(Numeric::Integer(i)) => *i,
         _ => {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "RowSetAdd: P2 must be an integer".to_string(),
             ));
@@ -5267,6 +5303,7 @@ pub fn op_rowset_test(
     let rowid = match value {
         Value::Numeric(Numeric::Integer(i)) => *i,
         _ => {
+            mark_unlikely();
             return Err(LimboError::InternalError(
                 "RowSetTest: P3 must be an integer".to_string(),
             ));
@@ -5628,6 +5665,7 @@ pub fn op_function(
             }
             ScalarFunc::Glob => {
                 if arg_count != 2 {
+                    mark_unlikely();
                     return Err(LimboError::ParseError(
                         "wrong number of arguments to function GLOB()".to_string(),
                     ));

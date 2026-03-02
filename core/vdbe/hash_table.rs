@@ -13,6 +13,7 @@ use crate::{
     vdbe::metrics::HashJoinMetrics,
     CompletionError, Numeric, Result,
 };
+use branches::{mark_unlikely, unlikely};
 use rapidhash::fast::RapidHasher;
 use std::cmp::Ordering;
 use std::hash::Hasher;
@@ -395,7 +396,7 @@ impl HashEntry {
 
     /// Deserialize an entry from bytes, returning (entry, bytes_consumed) or error.
     fn deserialize(buf: &[u8]) -> Result<(Self, usize)> {
-        if buf.len() < 16 {
+        if unlikely(buf.len() < 16) {
             return Err(LimboError::Corrupt(
                 "HashEntry: buffer too small for header".to_string(),
             ));
@@ -442,7 +443,7 @@ impl HashEntry {
     /// Helper to deserialize a single Value from bytes.
     /// Returns (Value, bytes_consumed).
     fn deserialize_value(buf: &[u8]) -> Result<(Value, usize)> {
-        if buf.is_empty() {
+        if unlikely(buf.is_empty()) {
             return Err(LimboError::Corrupt(
                 "HashEntry: unexpected end of buffer".to_string(),
             ));
@@ -453,7 +454,7 @@ impl HashEntry {
         let value = match value_type {
             NULL_HASH => Value::Null,
             INT_HASH => {
-                if offset + 8 > buf.len() {
+                if unlikely(offset + 8 > buf.len()) {
                     return Err(LimboError::Corrupt(
                         "HashEntry: buffer too small for integer".to_string(),
                     ));
@@ -464,7 +465,7 @@ impl HashEntry {
                 Value::from_i64(i)
             }
             FLOAT_HASH => {
-                if offset + 8 > buf.len() {
+                if unlikely(offset + 8 > buf.len()) {
                     return Err(LimboError::Corrupt(
                         "HashEntry: buffer too small for float".to_string(),
                     ));
@@ -477,7 +478,7 @@ impl HashEntry {
             TEXT_HASH => {
                 let (str_len, varint_len) = read_varint(&buf[offset..])?;
                 offset += varint_len;
-                if offset + str_len as usize > buf.len() {
+                if unlikely(offset + str_len as usize > buf.len()) {
                     return Err(LimboError::Corrupt(
                         "HashEntry: buffer too small for text".to_string(),
                     ));
@@ -494,7 +495,7 @@ impl HashEntry {
             BLOB_HASH => {
                 let (blob_len, varint_len) = read_varint(&buf[offset..])?;
                 offset += varint_len;
-                if offset + blob_len as usize > buf.len() {
+                if unlikely(offset + blob_len as usize > buf.len()) {
                     return Err(LimboError::Corrupt(
                         "HashEntry: buffer too small for blob".to_string(),
                     ));
@@ -504,6 +505,7 @@ impl HashEntry {
                 Value::Blob(b)
             }
             _ => {
+                mark_unlikely();
                 return Err(LimboError::Corrupt(format!(
                     "HashEntry: unknown value type {value_type}",
                 )));
@@ -1998,6 +2000,7 @@ impl HashTable {
                 let io_state = spilled.io_state.get();
 
                 if matches!(io_state, SpillIOState::Error) {
+                    mark_unlikely();
                     return Err(LimboError::InternalError(
                         "hash join spill I/O failure".into(),
                     ));
@@ -2223,7 +2226,7 @@ impl HashTable {
             if partition.has_more_chunks() {
                 (true, 0)
             } else {
-                if !partition.partial_entry.is_empty() {
+                if unlikely(!partition.partial_entry.is_empty()) {
                     return Err(LimboError::Corrupt("HashEntry: truncated entry".into()));
                 }
                 let total_num_entries = partition.total_num_entries();

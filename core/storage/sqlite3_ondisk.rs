@@ -44,7 +44,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use crate::{turso_assert, turso_assert_eq, turso_assert_greater_than};
-use branches::unlikely;
+use branches::{mark_unlikely, unlikely};
 use bytemuck::{Pod, Zeroable};
 use pack1::{I32BE, U16BE, U32BE};
 use tracing::{instrument, Level};
@@ -517,7 +517,10 @@ impl TryFrom<u8> for PageType {
             5 => Ok(Self::TableInterior),
             10 => Ok(Self::IndexLeaf),
             13 => Ok(Self::TableLeaf),
-            _ => Err(LimboError::Corrupt(format!("Invalid page type: {value}"))),
+            _ => {
+                mark_unlikely();
+                Err(LimboError::Corrupt(format!("Invalid page type: {value}")))
+            }
         }
     }
 }
@@ -955,26 +958,33 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
     match serial_type.kind() {
         SerialTypeKind::Null => Ok((ValueRef::Null, 0)),
         SerialTypeKind::I8 => {
-            let val = *buf
-                .first()
-                .ok_or_else(|| LimboError::Corrupt("Invalid UInt8 value".into()))?;
+            let val = *buf.first().ok_or_else(|| {
+                mark_unlikely();
+                LimboError::Corrupt("Invalid UInt8 value".into())
+            })?;
             Ok((ValueRef::Numeric(Numeric::Integer(val as i8 as i64)), 1))
         }
         SerialTypeKind::I16 => {
-            let bytes: &[u8; 2] = buf
-                .get(..2)
-                .and_then(|s| s.try_into().ok())
-                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt16 value".into()))?;
+            let bytes: &[u8; 2] =
+                buf.get(..2)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| {
+                        mark_unlikely();
+                        LimboError::Corrupt("Invalid BEInt16 value".into())
+                    })?;
             Ok((
                 ValueRef::Numeric(Numeric::Integer(i16::from_be_bytes(*bytes) as i64)),
                 2,
             ))
         }
         SerialTypeKind::I24 => {
-            let bytes: &[u8; 3] = buf
-                .get(..3)
-                .and_then(|s| s.try_into().ok())
-                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt24 value".into()))?;
+            let bytes: &[u8; 3] =
+                buf.get(..3)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| {
+                        mark_unlikely();
+                        LimboError::Corrupt("Invalid BEInt24 value".into())
+                    })?;
             let sign_extension = (bytes[0] as i8 >> 7) as u8;
             Ok((
                 ValueRef::Numeric(Numeric::Integer(i32::from_be_bytes([
@@ -987,20 +997,26 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
             ))
         }
         SerialTypeKind::I32 => {
-            let bytes: &[u8; 4] = buf
-                .get(..4)
-                .and_then(|s| s.try_into().ok())
-                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt32 value".into()))?;
+            let bytes: &[u8; 4] =
+                buf.get(..4)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| {
+                        mark_unlikely();
+                        LimboError::Corrupt("Invalid BEInt32 value".into())
+                    })?;
             Ok((
                 ValueRef::Numeric(Numeric::Integer(i32::from_be_bytes(*bytes) as i64)),
                 4,
             ))
         }
         SerialTypeKind::I48 => {
-            let bytes: &[u8; 6] = buf
-                .get(..6)
-                .and_then(|s| s.try_into().ok())
-                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt48 value".into()))?;
+            let bytes: &[u8; 6] =
+                buf.get(..6)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| {
+                        mark_unlikely();
+                        LimboError::Corrupt("Invalid BEInt48 value".into())
+                    })?;
             let sign_extension = (bytes[0] as i8 >> 7) as u8;
             Ok((
                 ValueRef::Numeric(Numeric::Integer(i64::from_be_bytes([
@@ -1017,10 +1033,13 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
             ))
         }
         SerialTypeKind::I64 => {
-            let bytes: &[u8; 8] = buf
-                .get(..8)
-                .and_then(|s| s.try_into().ok())
-                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt64 value".into()))?;
+            let bytes: &[u8; 8] =
+                buf.get(..8)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| {
+                        mark_unlikely();
+                        LimboError::Corrupt("Invalid BEInt64 value".into())
+                    })?;
             Ok((
                 ValueRef::Numeric(Numeric::Integer(i64::from_be_bytes(*bytes))),
                 8,
@@ -1037,14 +1056,16 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
         SerialTypeKind::ConstInt1 => Ok((ValueRef::Numeric(Numeric::Integer(1)), 0)),
         SerialTypeKind::Blob => {
             let content_size = serial_type.size();
-            let data = buf
-                .get(..content_size)
-                .ok_or_else(|| LimboError::Corrupt("Invalid Blob value".into()))?;
+            let data = buf.get(..content_size).ok_or_else(|| {
+                mark_unlikely();
+                LimboError::Corrupt("Invalid Blob value".into())
+            })?;
             Ok((ValueRef::Blob(data), content_size))
         }
         SerialTypeKind::Text => {
             let content_size = serial_type.size();
             let data = buf.get(..content_size).ok_or_else(|| {
+                mark_unlikely();
                 LimboError::Corrupt(format!(
                     "Invalid String value, length {} < expected length {}",
                     buf.len(),
@@ -1069,12 +1090,14 @@ pub fn read_value_serial_type<'a>(
         0 => Ok((ValueRef::Null, 0)),
         1 => {
             if buf.is_empty() {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 1-byte int");
             }
             Ok((ValueRef::Numeric(Numeric::Integer(buf[0] as i8 as i64)), 1))
         }
         2 => {
             if buf.len() < 2 {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 2-byte int");
             }
             Ok((
@@ -1084,6 +1107,7 @@ pub fn read_value_serial_type<'a>(
         }
         3 => {
             if buf.len() < 3 {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 3-byte int");
             }
             let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
@@ -1099,6 +1123,7 @@ pub fn read_value_serial_type<'a>(
         }
         4 => {
             if buf.len() < 4 {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 4-byte int");
             }
             Ok((
@@ -1110,6 +1135,7 @@ pub fn read_value_serial_type<'a>(
         }
         5 => {
             if buf.len() < 6 {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 6-byte int");
             }
             let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
@@ -1129,6 +1155,7 @@ pub fn read_value_serial_type<'a>(
         }
         6 => {
             if buf.len() < 8 {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 8-byte int");
             }
             Ok((
@@ -1140,6 +1167,7 @@ pub fn read_value_serial_type<'a>(
         }
         7 => {
             if buf.len() < 8 {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 8-byte float");
             }
             Ok((
@@ -1155,15 +1183,17 @@ pub fn read_value_serial_type<'a>(
             0 => {
                 // Blob
                 let content_size = ((n - 12) / 2) as usize;
-                let data = buf
-                    .get(..content_size)
-                    .ok_or_else(|| LimboError::Corrupt("Invalid Blob value".into()))?;
+                let data = buf.get(..content_size).ok_or_else(|| {
+                    mark_unlikely();
+                    LimboError::Corrupt("Invalid Blob value".into())
+                })?;
                 Ok((ValueRef::Blob(data), content_size))
             }
             1 => {
                 // Text
                 let content_size = ((n - 13) / 2) as usize;
                 let data = buf.get(..content_size).ok_or_else(|| {
+                    mark_unlikely();
                     LimboError::Corrupt(format!(
                         "Invalid String value, length {} < expected length {}",
                         buf.len(),
@@ -1179,7 +1209,10 @@ pub fn read_value_serial_type<'a>(
             }
             _ => unreachable!(),
         },
-        _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
+        _ => {
+            mark_unlikely();
+            crate::bail_corrupt_error!("Invalid serial type for integer")
+        }
     }
 }
 
@@ -1188,18 +1221,21 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     match serial_type {
         1 => {
             if buf.is_empty() {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 1-byte int");
             }
             Ok(buf[0] as i8 as i64)
         }
         2 => {
             if buf.len() < 2 {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 2-byte int");
             }
             Ok(i16::from_be_bytes([buf[0], buf[1]]) as i64)
         }
         3 => {
             if buf.len() < 3 {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 3-byte int");
             }
             let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
@@ -1207,12 +1243,14 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
         }
         4 => {
             if buf.len() < 4 {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 4-byte int");
             }
             Ok(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64)
         }
         5 => {
             if buf.len() < 6 {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 6-byte int");
             }
             let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
@@ -1237,7 +1275,10 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
         }
         8 => Ok(0),
         9 => Ok(1),
-        _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
+        _ => {
+            mark_unlikely();
+            crate::bail_corrupt_error!("Invalid serial type for integer")
+        }
     }
 }
 
@@ -1255,6 +1296,7 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
                 }
             }
             None => {
+                mark_unlikely();
                 crate::bail_corrupt_error!("Invalid varint");
             }
         }
@@ -1272,6 +1314,7 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
             Ok((v, 9))
         }
         None => {
+            mark_unlikely();
             bail_corrupt_error!("Invalid varint");
         }
     }
@@ -1797,6 +1840,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                     match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
                         Ok(_) => original_c(Ok((buf, bytes_read))),
                         Err(e) => {
+                            mark_unlikely();
                             tracing::error!(
                                 "Failed to verify checksum for page_id={page_idx}: {e}"
                             );

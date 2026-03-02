@@ -1,4 +1,4 @@
-use branches::mark_unlikely;
+use branches::{mark_unlikely, unlikely};
 use rustc_hash::FxHashMap as HashMap;
 #[cfg(debug_assertions)]
 use rustc_hash::FxHashSet as HashSet;
@@ -2493,6 +2493,7 @@ impl BTreeCursor {
                             let parent_contents = parent.get_contents();
                             let parent_rightmost =
                                 parent_contents.rightmost_pointer()?.ok_or_else(|| {
+                                    mark_unlikely();
                                     LimboError::Corrupt(format!(
                                         "parent page {} is a leaf page, expected interior page",
                                         parent.get().id
@@ -2780,6 +2781,7 @@ impl BTreeCursor {
                     for i in (0..=current_sibling).rev() {
                         match btree_read_page(&self.pager, pgno as i64) {
                             Err(e) => {
+                                mark_unlikely();
                                 tracing::error!("error reading page {}: {}", pgno, e);
                                 group.cancel();
                                 self.pager.io.drain()?;
@@ -2841,6 +2843,7 @@ impl BTreeCursor {
                                     ..
                                 }) => left_child_page,
                                 other => {
+                                    mark_unlikely();
                                     crate::bail_corrupt_error!(
                                         "expected interior cell, got {:?}",
                                         other
@@ -4471,16 +4474,17 @@ impl BTreeCursor {
                     };
 
                     if let Some(next_page) = first_overflow_page {
-                        if next_page < 2
-                            || next_page
-                                > self
-                                    .pager
-                                    .io
-                                    .block(|| {
-                                        self.pager.with_header(|header| header.database_size)
-                                    })?
-                                    .get()
-                        {
+                        if unlikely(
+                            next_page < 2
+                                || next_page
+                                    > self
+                                        .pager
+                                        .io
+                                        .block(|| {
+                                            self.pager.with_header(|header| header.database_size)
+                                        })?
+                                        .get(),
+                        ) {
                             self.overflow_state = OverflowState::Start;
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
@@ -4503,16 +4507,17 @@ impl BTreeCursor {
                     return_if_io!(self.pager.free_page(Some(page), next_page_id));
 
                     if next != 0 {
-                        if next < 2
-                            || next
-                                > self
-                                    .pager
-                                    .io
-                                    .block(|| {
-                                        self.pager.with_header(|header| header.database_size)
-                                    })?
-                                    .get()
-                        {
+                        if unlikely(
+                            next < 2
+                                || next
+                                    > self
+                                        .pager
+                                        .io
+                                        .block(|| {
+                                            self.pager.with_header(|header| header.database_size)
+                                        })?
+                                        .get(),
+                        ) {
                             self.overflow_state = OverflowState::Start;
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
@@ -5197,7 +5202,7 @@ impl CursorTrait for BTreeCursor {
                     let page = self.stack.top_ref();
                     let cell_idx = self.stack.current_cell_index() as usize;
                     let contents = page.get_contents();
-                    if cell_idx >= contents.cell_count() {
+                    if unlikely(cell_idx >= contents.cell_count()) {
                         return_corrupt!(
                             "Corrupted page: cell index {} is out of bounds for page with {} cells",
                             cell_idx,
@@ -6078,7 +6083,7 @@ pub fn integrity_check(
             let page_size = contents.as_ptr().len();
             let max_pointers =
                 page_size.saturating_sub(FREELIST_TRUNK_HEADER_SIZE) / FREELIST_LEAF_PTR_SIZE;
-            if page_pointers as usize > max_pointers {
+            if unlikely(page_pointers as usize > max_pointers) {
                 tracing::error!(
                     "integrity_check: freelist trunk page {} has invalid leaf count {} (max {}). header_bytes={:02x?}",
                     page.get().id,
@@ -6096,7 +6101,7 @@ pub fn integrity_check(
             for i in 0..page_pointers {
                 let offset =
                     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + FREELIST_LEAF_PTR_SIZE * i as usize;
-                if offset + FREELIST_LEAF_PTR_SIZE > page_size {
+                if unlikely(offset + FREELIST_LEAF_PTR_SIZE > page_size) {
                     tracing::error!(
                         "integrity_check: freelist trunk page {} has invalid leaf offset {}. header_bytes={:02x?}",
                         page.get().id,
@@ -6758,7 +6763,7 @@ fn find_free_slot(
     let max_start_offset = usable_space - amount;
 
     while let Some(cur) = cur_block {
-        if cur + CELL_SIZE_MIN > usable_space {
+        if unlikely(cur + CELL_SIZE_MIN > usable_space) {
             return_corrupt!("Free block header extends beyond page");
         }
 
@@ -6778,7 +6783,7 @@ fn find_free_slot(
             }
 
             prev_block = cur_block;
-            if next <= cur {
+            if unlikely(next <= cur) {
                 return_corrupt!("Free list not in ascending order");
             }
             cur_block = Some(next);
@@ -6818,7 +6823,7 @@ fn find_free_slot(
             let frag = page_ref.num_frag_free_bytes() + new_size_u8;
             page_ref.write_fragmented_bytes_count(frag);
             return Ok(cur_block);
-        } else if new_size + cur > max_start_offset {
+        } else if unlikely(new_size + cur > max_start_offset) {
             return_corrupt!("Free block extends beyond page end");
         } else {
             // Requested amount fits inside the current free slot so we reduce its size
@@ -7252,22 +7257,22 @@ fn free_cell_range(
     usable_space: usize,
 ) -> Result<()> {
     const CELL_SIZE_MIN: usize = 4;
-    if len < CELL_SIZE_MIN {
+    if unlikely(len < CELL_SIZE_MIN) {
         return_corrupt!("free_cell_range: minimum cell size is {CELL_SIZE_MIN}");
     }
-    if offset > usable_space.saturating_sub(CELL_SIZE_MIN) {
+    if unlikely(offset > usable_space.saturating_sub(CELL_SIZE_MIN)) {
         return_corrupt!("free_cell_range: start offset beyond usable space: offset={offset} usable_space={usable_space}");
     }
 
     let mut size = len;
     let mut end = offset + len;
-    if end > usable_space {
+    if unlikely(end > usable_space) {
         return_corrupt!("free_cell_range: freed range extends beyond usable space: offset={offset} len={len} end={end} usable_space={usable_space}");
     }
     let cur_content_area = page.cell_content_area() as usize;
     let first_block = page.first_freeblock() as usize;
     if first_block == 0 {
-        if offset < cur_content_area {
+        if unlikely(offset < cur_content_area) {
             return_corrupt!("free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
         }
         if offset == cur_content_area {
@@ -7294,7 +7299,7 @@ fn free_cell_range(
     let mut next_block = Some(first_block);
 
     while let Some(next) = next_block {
-        if prev_block.is_some_and(|prev| next <= prev) {
+        if unlikely(prev_block.is_some_and(|prev| next <= prev)) {
             return_corrupt!("free_cell_range: freeblocks not in ascending order: next_block={next} prev_block={prev_block:?}");
         }
         if next >= offset {
@@ -7309,7 +7314,7 @@ fn free_cell_range(
     }
 
     if let Some(next) = next_block {
-        if next + CELL_SIZE_MIN > usable_space {
+        if unlikely(next + CELL_SIZE_MIN > usable_space) {
             return_corrupt!("free_cell_range: free block beyond usable space: next_block={next} usable_space={usable_space}");
         }
     }
@@ -7324,7 +7329,7 @@ fn free_cell_range(
             removed_fragmentation = (next - end) as u8;
             let next_size = page.read_u16_no_offset(next + 2) as usize;
             end = next + next_size;
-            if end > usable_space {
+            if unlikely(end > usable_space) {
                 return_corrupt!("free_cell_range: coalesced block extends beyond page: offset={offset} len={len} end={end} usable_space={usable_space}");
             }
             size = end - offset;
@@ -7340,7 +7345,7 @@ fn free_cell_range(
     if let Some(prev) = prev_block {
         let prev_size = page.read_u16_no_offset(prev + 2) as usize;
         let prev_end = prev + prev_size;
-        if prev_end > offset {
+        if unlikely(prev_end > offset) {
             return_corrupt!(
                 "free_cell_range: previous block overlap: prev_end={prev_end} offset={offset}"
             );
@@ -7355,20 +7360,20 @@ fn free_cell_range(
     }
 
     let cur_frag_free_bytes = page.num_frag_free_bytes();
-    if removed_fragmentation > cur_frag_free_bytes {
+    if unlikely(removed_fragmentation > cur_frag_free_bytes) {
         return_corrupt!("free_cell_range: invalid fragmentation count: removed_fragmentation={removed_fragmentation} num_frag_free_bytes={cur_frag_free_bytes}");
     }
     let frag = cur_frag_free_bytes - removed_fragmentation;
     page.write_fragmented_bytes_count(frag);
 
-    if offset < cur_content_area {
+    if unlikely(offset < cur_content_area) {
         return_corrupt!("free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
     }
 
     // As above, if the freed range is exactly at the beginning of the content area, we are not creating a freeblock;
     // instead we are just extending the unallocated region.
     if offset == cur_content_area {
-        if prev_block.is_some_and(|prev| prev != first_block) {
+        if unlikely(prev_block.is_some_and(|prev| prev != first_block)) {
             return_corrupt!("free_cell_range: invalid content area merge - freed range should have been merged with previous freeblock: prev={prev_block:?} first_block={first_block}");
         }
         // If we get here, we are freeing data from the left end of the content area,
@@ -7377,7 +7382,7 @@ fn free_cell_range(
         // of the freed range.
         match next_block {
             Some(next) => {
-                if next <= end {
+                if unlikely(next <= end) {
                     return_corrupt!("free_cell_range: invalid content area merge - first freeblock should either be 0 or greater than the content area start: next_block={next} end={end}");
                 }
                 let next_u16: u16 = next
@@ -7427,21 +7432,21 @@ fn defragment_page_fast(
     freeblock_1st: usize,
     freeblock_2nd: usize,
 ) -> Result<()> {
-    if freeblock_1st == 0 {
+    if unlikely(freeblock_1st == 0) {
         return_corrupt!("defragment_page_fast: expected at least one freeblock");
     }
-    if freeblock_2nd > 0 && freeblock_1st >= freeblock_2nd {
+    if unlikely(freeblock_2nd > 0 && freeblock_1st >= freeblock_2nd) {
         return_corrupt!(
             "defragment_page_fast: first freeblock must be before second freeblock: freeblock_1st={freeblock_1st} freeblock_2nd={freeblock_2nd}"
         );
     }
     const FREEBLOCK_SIZE_MIN: usize = 4;
-    if freeblock_1st > usable_space - FREEBLOCK_SIZE_MIN {
+    if unlikely(freeblock_1st > usable_space - FREEBLOCK_SIZE_MIN) {
         return_corrupt!(
             "defragment_page_fast: first freeblock beyond usable space: freeblock_1st={freeblock_1st} usable_space={usable_space}"
         );
     }
-    if freeblock_2nd > usable_space - FREEBLOCK_SIZE_MIN {
+    if unlikely(freeblock_2nd > usable_space - FREEBLOCK_SIZE_MIN) {
         return_corrupt!(
             "defragment_page_fast: second freeblock beyond usable space: freeblock_2nd={freeblock_2nd} usable_space={usable_space}"
         );
@@ -7459,12 +7464,12 @@ fn defragment_page_fast(
 
     if freeblock_2nd > 0 {
         // If there's 2 freeblocks, merge them into one first.
-        if freeblock_1st + freeblock_1st_size > freeblock_2nd {
+        if unlikely(freeblock_1st + freeblock_1st_size > freeblock_2nd) {
             return_corrupt!(
                 "defragment_page_fast: overlapping freeblocks: freeblock_1st={freeblock_1st} freeblock_1st_size={freeblock_1st_size} freeblock_2nd={freeblock_2nd}"
             );
         }
-        if freeblock_2nd + freeblock_2nd_size > usable_space {
+        if unlikely(freeblock_2nd + freeblock_2nd_size > usable_space) {
             return_corrupt!(
                 "defragment_page_fast: second freeblock extends beyond usable space: freeblock_2nd={freeblock_2nd} freeblock_2nd_size={freeblock_2nd_size} usable_space={usable_space}"
             );
@@ -7483,7 +7488,7 @@ fn defragment_page_fast(
             after_first_freeblock..after_first_freeblock + copy_amount,
             freeblock_1st + freeblocks_total_size,
         );
-    } else if freeblock_1st + freeblock_1st_size > usable_space {
+    } else if unlikely(freeblock_1st + freeblock_1st_size > usable_space) {
         return_corrupt!(
             "defragment_page_fast: first freeblock extends beyond usable space: freeblock_1st={freeblock_1st} freeblock_1st_size={freeblock_1st_size} usable_space={usable_space}"
         );
@@ -7495,7 +7500,7 @@ fn defragment_page_fast(
     // meaning, it's no longer a freeblock, it's just plain old free space.
     // content area start | free space | ----------- cells ----------|
     let new_cell_content_area = cell_content_area + freeblocks_total_size;
-    if new_cell_content_area + (freeblock_1st - cell_content_area) > usable_space {
+    if unlikely(new_cell_content_area + (freeblock_1st - cell_content_area) > usable_space) {
         return_corrupt!(
             "defragment_page_fast: new cell content area extends beyond usable space: new_cell_content_area={new_cell_content_area} freeblock_1st={freeblock_1st} cell_content_area={cell_content_area} usable_space={usable_space}"
         );
@@ -7518,7 +7523,7 @@ fn defragment_page_fast(
             // If the cell pointer was located before the first freeblock, we need to shift it right by the size of the merged freeblock
             // since the space occupied by both the 1st and 2nd freeblocks was now moved to its left.
             let new_offset = cell_ptr + freeblocks_total_size;
-            if new_offset > usable_space {
+            if unlikely(new_offset > usable_space) {
                 return_corrupt!(
                     "defragment_page_fast: shifted cell pointer beyond usable space: new_offset={new_offset} usable_space={usable_space}"
                 );
@@ -7528,7 +7533,7 @@ fn defragment_page_fast(
             // If the cell pointer was located between the first and second freeblock, we need to shift it right by the size of only the second freeblock,
             // since the first one was already on its left.
             let new_offset = cell_ptr + freeblock_2nd_size;
-            if new_offset > usable_space {
+            if unlikely(new_offset > usable_space) {
                 return_corrupt!(
                     "defragment_page_fast: shifted cell pointer beyond usable space: new_offset={new_offset} usable_space={usable_space}"
                 );
@@ -7844,14 +7849,14 @@ fn compute_free_space(page: &PageContent, usable_space: usize) -> Result<usize> 
     // space that is not reserved for extensions by sqlite. Usually reserved_space is 0.
 
     let first_cell = page.offset() + page.header_size() + (2 * page.cell_count());
-    if first_cell > usable_space {
+    if unlikely(first_cell > usable_space) {
         return_corrupt!(
             "compute_free_space: first_cell beyond usable space: first_cell={first_cell} usable_space={usable_space}"
         );
     }
 
     let cell_content_area_start = page.cell_content_area() as usize;
-    if cell_content_area_start > usable_space {
+    if unlikely(cell_content_area_start > usable_space) {
         return_corrupt!(
             "compute_free_space: cell content area beyond usable space: cell_content_area_start={cell_content_area_start} usable_space={usable_space}"
         );
@@ -7862,7 +7867,7 @@ fn compute_free_space(page: &PageContent, usable_space: usize) -> Result<usize> 
     // #3 is computed by iterating over the freeblocks linked list
     let mut cur_freeblock_ptr = page.first_freeblock() as usize;
     if cur_freeblock_ptr > 0 {
-        if cur_freeblock_ptr < cell_content_area_start {
+        if unlikely(cur_freeblock_ptr < cell_content_area_start) {
             return_corrupt!(
                 "compute_free_space: first freeblock before content area: first_freeblock={cur_freeblock_ptr} cell_content_area_start={cell_content_area_start}"
             );
@@ -7871,19 +7876,19 @@ fn compute_free_space(page: &PageContent, usable_space: usize) -> Result<usize> 
         let mut next = 0usize;
         let mut size = 0usize;
         loop {
-            if cur_freeblock_ptr + 4 > usable_space {
+            if unlikely(cur_freeblock_ptr + 4 > usable_space) {
                 return_corrupt!(
                     "compute_free_space: freeblock header out of bounds: cur_freeblock_ptr={cur_freeblock_ptr} usable_space={usable_space}"
                 );
             }
             next = page.read_u16_no_offset(cur_freeblock_ptr) as usize; // first 2 bytes in freeblock = next freeblock pointer
             size = page.read_u16_no_offset(cur_freeblock_ptr + 2) as usize; // next 2 bytes in freeblock = size of current freeblock
-            if size < 4 {
+            if unlikely(size < 4) {
                 return_corrupt!(
                     "compute_free_space: freeblock too small: cur_freeblock_ptr={cur_freeblock_ptr} size={size}"
                 );
             }
-            if cur_freeblock_ptr + size > usable_space {
+            if unlikely(cur_freeblock_ptr + size > usable_space) {
                 return_corrupt!(
                     "compute_free_space: freeblock extends beyond page: cur_freeblock_ptr={cur_freeblock_ptr} size={size} usable_space={usable_space}"
                 );
@@ -7894,7 +7899,7 @@ fn compute_free_space(page: &PageContent, usable_space: usize) -> Result<usize> 
                 break;
             }
             // Freeblocks are in order from left to right on the page.
-            if next <= cur_freeblock_ptr + size + 3 {
+            if unlikely(next <= cur_freeblock_ptr + size + 3) {
                 return_corrupt!(
                     "compute_free_space: freeblocks list not in ascending order: cur_freeblock_ptr={cur_freeblock_ptr} size={size} next={next}"
                 );
@@ -7903,12 +7908,12 @@ fn compute_free_space(page: &PageContent, usable_space: usize) -> Result<usize> 
         }
     }
 
-    if free_space_bytes > usable_space {
+    if unlikely(free_space_bytes > usable_space) {
         return_corrupt!(
             "compute_free_space: free space greater than usable space: free_space_bytes={free_space_bytes} usable_space={usable_space}"
         );
     }
-    if free_space_bytes < first_cell {
+    if unlikely(free_space_bytes < first_cell) {
         return_corrupt!(
             "compute_free_space: free space underflow: free_space_bytes={free_space_bytes} first_cell={first_cell} usable_space={usable_space}"
         );
@@ -8117,6 +8122,7 @@ fn fill_cell_payload(
                             }
                             Ok(IOResult::IO(io_result)) => return Ok(IOResult::IO(io_result)),
                             Err(e) => {
+                                mark_unlikely();
                                 break Err(e);
                             }
                         };
