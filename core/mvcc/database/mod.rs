@@ -982,6 +982,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         tx: &Transaction,
         mvcc_store: &Arc<MvStore<Clock>>,
     ) -> Result<()> {
+        if mvcc_store.is_sqlite_sequence_table_id(rowid.table_id) {
+            // sqlite_sequence uses monotonic sequence metadata updates; concurrent
+            // AUTOINCREMENT writers must not fail due to row-level WW conflicts on this table.
+            return Ok(());
+        }
         let row_versions = mvcc_store.rows.get(rowid);
         if row_versions.is_none() {
             return Ok(());
@@ -2023,6 +2028,7 @@ pub struct MvStore<Clock: LogicalClock> {
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
+    sqlite_sequence_table_ids: RwLock<HashSet<MVTableId>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -2094,6 +2100,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
+            sqlite_sequence_table_ids: RwLock::new(HashSet::default()),
         }
     }
 
@@ -2162,7 +2169,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Err(err) => {
                 return Err(LimboError::Corrupt(format!(
                     "Failed to read MVCC metadata table: {err}"
-                )))
+                )));
             }
         };
         let mut value: Option<i64> = None;
@@ -2333,6 +2340,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         row: Row,
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
+        self.insert_to_table_or_index_with_allocator_update(tx_id, row, maybe_index_id, true)
+    }
+
+    /// Same as [`Self::insert_to_table_or_index`], but allows callers to
+    /// suppress rowid allocator updates for table inserts.
+    ///
+    /// This is used for UPDATE rowid rewrite paths (`DELETE` + `INSERT`) where
+    /// the inserted rowid should not be treated as advancing the allocator's
+    /// AUTOINCREMENT floor.
+    pub fn insert_to_table_or_index_with_allocator_update(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+        update_rowid_allocator: bool,
+    ) -> Result<()> {
         tracing::trace!("insert(tx_id={}, row.id={:?})", tx_id, row.id);
         let tx = self
             .txs
@@ -2375,8 +2398,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 };
                 tx.insert_to_write_set(id.clone());
                 tx.record_created_table_version(id.clone(), version_id);
-                let allocator = self.get_rowid_allocator(&id.table_id);
-                allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
+                if update_rowid_allocator {
+                    let allocator = self.get_rowid_allocator(&id.table_id);
+                    allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
+                }
                 self.insert_version(id, row_version);
             }
         }
@@ -2511,11 +2536,31 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         row: Row,
         maybe_index_id: Option<MVTableId>,
     ) -> Result<bool> {
+        self.update_to_table_or_index_with_allocator_update(tx_id, row, maybe_index_id, true)
+    }
+
+    /// Same as [`Self::update_to_table_or_index`], but allows callers to
+    /// control whether the inserted replacement row updates the rowid allocator.
+    ///
+    /// The update is implemented as delete-then-insert; the flag is forwarded
+    /// to the insert step.
+    pub fn update_to_table_or_index_with_allocator_update(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+        update_rowid_allocator: bool,
+    ) -> Result<bool> {
         tracing::trace!("update(tx_id={}, row.id={:?})", tx_id, row.id);
         if !self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id)? {
             return Ok(false);
         }
-        self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
+        self.insert_to_table_or_index_with_allocator_update(
+            tx_id,
+            row,
+            maybe_index_id,
+            update_rowid_allocator,
+        )?;
         Ok(true)
     }
 
@@ -2612,6 +2657,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             None => {
                 let row_versions_opt = self.rows.get(&id);
                 if let Some(ref row_versions) = row_versions_opt {
+                    let ignore_conflicts = self.is_sqlite_sequence_table_id(id.table_id);
                     let mut row_versions = row_versions.value().write();
                     for rv in row_versions.iter_mut().rev() {
                         let tx = self
@@ -2625,7 +2671,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
                             continue;
                         }
-                        if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv) {
+                        if !ignore_conflicts
+                            && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+                        {
                             turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
                             drop(row_versions_opt);
@@ -2707,11 +2755,45 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             None => {
                 if let Some(row_versions) = self.rows.get(id) {
                     let row_versions = row_versions.value().read();
-                    if let Some(rv) = row_versions
-                        .iter()
-                        .rev()
-                        .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-                    {
+                    let selected = if self.is_sqlite_sequence_table_id(id.table_id) {
+                        // sqlite_sequence is monotonic metadata, not regular user data.
+                        //
+                        // Under MVCC we can have multiple visible versions/rows for the same
+                        // logical sequence entry (same table name) from concurrent writers.
+                        // If we just returned the latest visible version by MVCC order, we can
+                        // pick a stale/lower sequence value and regress AUTOINCREMENT behavior.
+                        //
+                        // To preserve SQLite semantics ("never reuse a lower AUTOINCREMENT id"),
+                        // prefer the visible row with the highest seq value. If seq parsing fails
+                        // for all visible rows, fall back to latest_visible to preserve read
+                        // behavior instead of returning no row.
+                        let mut latest_visible: Option<&RowVersion> = None;
+                        let mut max_seq_visible: Option<(i64, &RowVersion)> = None;
+                        for rv in row_versions.iter().rev() {
+                            if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
+                                continue;
+                            }
+                            if latest_visible.is_none() {
+                                latest_visible = Some(rv);
+                            }
+                            if let Some(seq) = sqlite_sequence_seq_from_row(&rv.row) {
+                                let should_replace = match max_seq_visible {
+                                    Some((max_seq, _)) => seq > max_seq,
+                                    None => true,
+                                };
+                                if should_replace {
+                                    max_seq_visible = Some((seq, rv));
+                                }
+                            }
+                        }
+                        max_seq_visible.map(|(_, rv)| rv).or(latest_visible)
+                    } else {
+                        row_versions
+                            .iter()
+                            .rev()
+                            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
+                    };
+                    if let Some(rv) = selected {
                         tx.insert_to_read_set(id.clone());
                         return Ok(Some(rv.row.clone()));
                     }
@@ -4133,12 +4215,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             HeaderReadResult::NoLog => {
                 return Err(LimboError::Corrupt(
                     "WAL has committed frames but logical log header is missing".to_string(),
-                ))
+                ));
             }
             HeaderReadResult::Invalid => {
                 return Err(LimboError::Corrupt(
                     "WAL has committed frames but logical log header is invalid".to_string(),
-                ))
+                ));
             }
         };
         self.storage.logical_log.write().set_header(header);
@@ -4218,7 +4300,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             HeaderReadResult::Invalid => {
                 return Err(LimboError::Corrupt(
                     "Logical log header corrupt and no WAL recovery available".to_string(),
-                ))
+                ));
             }
         };
 
@@ -4233,7 +4315,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 None => {
                     return Err(LimboError::Corrupt(
                         "Missing MVCC metadata table".to_string(),
-                    ))
+                    ));
                 }
             }
         } else {
@@ -4303,7 +4385,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         _ => {
                             return Err(LimboError::Corrupt(
                                 "sqlite_schema type must be text".to_string(),
-                            ))
+                            ));
                         }
                     };
                     let name = match record.get_value_opt(1) {
@@ -4311,7 +4393,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         _ => {
                             return Err(LimboError::Corrupt(
                                 "sqlite_schema name must be text".to_string(),
-                            ))
+                            ));
                         }
                     };
                     let table_name = match record.get_value_opt(2) {
@@ -4319,7 +4401,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         _ => {
                             return Err(LimboError::Corrupt(
                                 "sqlite_schema tbl_name must be text".to_string(),
-                            ))
+                            ));
                         }
                     };
                     let root_page = match record.get_value_opt(3) {
@@ -4327,7 +4409,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         _ => {
                             return Err(LimboError::Corrupt(
                                 "sqlite_schema root_page must be integer".to_string(),
-                            ))
+                            ));
                         }
                     };
                     let sql = match record.get_value_opt(4) {
@@ -4471,17 +4553,23 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 let table_id = self.get_table_id_from_root_page(root_page);
                                 if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
                                     if let Some(value) = *entry.value() {
-                                        panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
+                                        panic!(
+                                            "Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}"
+                                        );
                                     }
                                 }
                                 self.insert_table_id_to_rootpage(table_id, None);
                             } else {
                                 let table_id = self.get_table_id_from_root_page(root_page);
                                 let Some(entry) = self.table_id_to_rootpage.get(&table_id) else {
-                                    panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
+                                    panic!(
+                                        "Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map"
+                                    );
                                 };
                                 let Some(value) = *entry.value() else {
-                                    panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
+                                    panic!(
+                                        "Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map"
+                                    );
                                 };
                                 turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
                             }
@@ -4744,6 +4832,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Records a table-id as `sqlite_sequence` so MVCC can apply its special
+    /// conflict/read rules for AUTOINCREMENT metadata rows.
+    pub fn register_sqlite_sequence_table_id(&self, table_id: MVTableId) {
+        self.sqlite_sequence_table_ids.write().insert(table_id);
+    }
+
+    /// Returns true if `table_id` is known to be the `sqlite_sequence` table.
+    pub fn is_sqlite_sequence_table_id(&self, table_id: MVTableId) -> bool {
+        self.sqlite_sequence_table_ids.read().contains(&table_id)
+    }
+
     pub fn is_btree_allocated(&self, table_id: &MVTableId) -> bool {
         let maybe_root_page = self.table_id_to_rootpage.get(table_id);
         maybe_root_page.is_some_and(|entry| entry.value().is_some())
@@ -4882,6 +4981,15 @@ fn is_write_write_conflict(
         Some(TxTimestampOrID::Timestamp(_)) => true,
         None => false,
     }
+}
+
+fn sqlite_sequence_seq_from_row(row: &Row) -> Option<i64> {
+    let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+    let val = record.get_value_opt(1)?;
+    let ValueRef::Numeric(Numeric::Integer(seq)) = val else {
+        return None;
+    };
+    Some(seq)
 }
 
 impl RowVersion {
