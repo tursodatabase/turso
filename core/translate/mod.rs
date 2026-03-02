@@ -33,6 +33,7 @@ pub(crate) mod pragma;
 pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
+pub(crate) mod scope;
 pub(crate) mod select;
 pub(crate) mod subquery;
 pub(crate) mod transaction;

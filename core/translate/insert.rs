@@ -11,8 +11,8 @@ use crate::{
         expr::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
             process_returning_clause, rewrite_between_expr, translate_expr,
-            translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior, NoConstantOptReason,
-            ReturningBufferCtx, WalkControl,
+            translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason, ReturningBufferCtx,
+            WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement, index_probe,
@@ -23,6 +23,7 @@ use crate::{
             TableReferences,
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
+        scope::{EmptyScope, FullTableScope},
         select::translate_select,
         subquery::{emit_non_from_clause_subquery, plan_subqueries_from_returning},
         trigger_exec::{
@@ -1513,13 +1514,7 @@ fn bind_insert(
                                     }
                                     _ => {}
                                 }
-                                bind_and_rewrite_expr(
-                                    expr,
-                                    None,
-                                    None,
-                                    resolver,
-                                    BindingBehavior::ResultColumnsNotAllowed,
-                                )?;
+                                bind_and_rewrite_expr(expr, &mut EmptyScope, resolver, false)?;
                             }
                             values = values_expr.pop().unwrap_or_else(Vec::new);
                         }
@@ -1549,22 +1544,10 @@ fn bind_insert(
         } = &mut upsert_opt.do_clause
         {
             for set in sets.iter_mut() {
-                bind_and_rewrite_expr(
-                    &mut set.expr,
-                    None,
-                    None,
-                    resolver,
-                    BindingBehavior::AllowUnboundIdentifiers,
-                )?;
+                bind_and_rewrite_expr(&mut set.expr, &mut EmptyScope, resolver, true)?;
             }
             if let Some(ref mut where_expr) = where_clause {
-                bind_and_rewrite_expr(
-                    where_expr,
-                    None,
-                    None,
-                    resolver,
-                    BindingBehavior::AllowUnboundIdentifiers,
-                )?;
+                bind_and_rewrite_expr(where_expr, &mut EmptyScope, resolver, true)?;
             }
         }
         let next = upsert_opt.next.take();
@@ -3165,13 +3148,8 @@ fn emit_replace_delete_conflicting_row(
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
             if let Some(expr) = &column_index.expr {
                 let mut expr = expr.as_ref().clone();
-                bind_and_rewrite_expr(
-                    &mut expr,
-                    Some(table_references),
-                    None,
-                    resolver,
-                    BindingBehavior::ResultColumnsNotAllowed,
-                )?;
+                let mut scope = FullTableScope::new(table_references);
+                bind_and_rewrite_expr(&mut expr, &mut scope, resolver, false)?;
                 translate_expr_no_constant_opt(
                     program,
                     Some(table_references),

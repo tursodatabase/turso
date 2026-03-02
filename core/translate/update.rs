@@ -3,10 +3,11 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
+use crate::translate::expr::bind_and_rewrite_expr;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{Operation, Scan};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
+use crate::translate::scope::FullTableScope;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
@@ -285,13 +286,8 @@ pub fn prepare_update_plan(
     // Process each SET assignment and map column names to expressions
     // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
     for set in &mut body.sets {
-        bind_and_rewrite_expr(
-            &mut set.expr,
-            Some(&mut table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
+        let mut scope = FullTableScope::new(&mut table_references);
+        bind_and_rewrite_expr(&mut set.expr, &mut scope, resolver, false)?;
 
         let values = match set.expr.as_ref() {
             Expr::Parenthesized(vals) => vals.clone(),
@@ -366,13 +362,8 @@ pub fn prepare_update_plan(
         .order_by
         .iter_mut()
         .map(|o| {
-            let _ = bind_and_rewrite_expr(
-                &mut o.expr,
-                Some(&mut table_references),
-                Some(&result_columns),
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            );
+            let mut scope = FullTableScope::new(&mut table_references);
+            let _ = bind_and_rewrite_expr(&mut o.expr, &mut scope, resolver, false);
             (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
         })
         .collect();

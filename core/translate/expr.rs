@@ -20,7 +20,7 @@ use crate::translate::expression_index::{
 };
 use crate::translate::optimizer::TakeOwnership;
 use crate::translate::plan::{Operation, ResultSetColumn, Search};
-use crate::translate::planner::parse_row_id;
+use crate::translate::scope::{FullTableScope, LookupResult, ResolvedColumn, Scope};
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::CursorKey;
@@ -4891,32 +4891,31 @@ where
     Ok(WalkControl::Continue)
 }
 
-/// The precedence of binding identifiers to columns.
-///
-/// TryResultColumnsFirst means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
-///
-/// TryCanonicalColumnsFirst means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
-///
-/// ResultColumnsNotAllowed means that referring to result columns is not allowed. This is used e.g. for DML statements.
-///
-/// AllowUnboundIdentifiers means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BindingBehavior {
-    TryResultColumnsFirst,
-    TryCanonicalColumnsFirst,
-    ResultColumnsNotAllowed,
-    AllowUnboundIdentifiers,
+fn rewrite_expr_from_resolved_column(expr: &mut ast::Expr, resolved: ResolvedColumn) {
+    *expr = match resolved {
+        ResolvedColumn::Column {
+            database,
+            table,
+            column,
+            is_rowid_alias,
+        } => ast::Expr::Column {
+            database,
+            table,
+            column,
+            is_rowid_alias,
+        },
+        ResolvedColumn::RowId { database, table } => ast::Expr::RowId { database, table },
+        ResolvedColumn::AliasExpansion { expr } => *expr,
+    };
 }
 
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
-/// using the provided TableReferences, and replacing anonymous parameters with internal named
-/// ones
-pub fn bind_and_rewrite_expr<'a>(
+/// using the provided Scope, and replacing anonymous parameters with internal named ones.
+pub fn bind_and_rewrite_expr(
     top_level_expr: &mut ast::Expr,
-    mut referenced_tables: Option<&'a mut TableReferences>,
-    result_columns: Option<&'a [ResultSetColumn]>,
+    scope: &mut impl Scope,
     resolver: &Resolver<'_>,
-    binding_behavior: BindingBehavior,
+    tolerate_unbound: bool,
 ) -> Result<()> {
     walk_expr_mut(
         top_level_expr,
@@ -4948,138 +4947,25 @@ pub fn bind_and_rewrite_expr<'a>(
                     };
                 }
                 Expr::Id(id) => {
-                    let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                    match scope.resolve_column(id.as_str())? {
+                        LookupResult::Found(resolved) => {
+                            rewrite_expr_from_resolved_column(expr, resolved);
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!("no such column: {}", id.as_str());
-                    };
-                    let normalized_id = normalize_ident(id.as_str());
-
-                    if binding_behavior == BindingBehavior::TryResultColumnsFirst {
-                        if let Some(result_columns) = result_columns {
-                            for result_column in result_columns.iter() {
-                                if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
-                                        *expr = result_column.expr.clone();
-                                        return Ok(WalkControl::Continue);
-                                    }
-                                }
-                            }
+                        LookupResult::Ambiguous(msg) => {
+                            crate::bail_parse_error!("{}", msg);
                         }
-                    }
-                    let mut match_result = None;
-
-                    // First check joined tables
-                    for joined_table in referenced_tables.joined_tables().iter() {
-                        let col_idx = joined_table.table.columns().iter().position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                        });
-                        if col_idx.is_some() {
-                            if match_result.is_some() {
-                                let mut ok = false;
-                                // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
-                                // and the left table is used.
-                                if let Some(join_info) = &joined_table.join_info {
-                                    if join_info.using.iter().any(|using_col| {
-                                        using_col.as_str().eq_ignore_ascii_case(&normalized_id)
-                                    }) {
-                                        ok = true;
-                                    }
-                                }
-                                if !ok {
-                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
-                                }
-                            } else {
-                                let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    joined_table.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
-                            }
-                        // only if we haven't found a match, check for explicit rowid reference
-                        } else if let Table::BTree(btree) = &joined_table.table {
-                            if let Some(row_id_expr) = parse_row_id(
-                                &normalized_id,
-                                referenced_tables.joined_tables()[0].internal_id,
-                                || referenced_tables.joined_tables().len() != 1,
-                            )? {
-                                if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", id.as_str());
-                                }
-                                *expr = row_id_expr;
-                                return Ok(WalkControl::Continue);
-                            }
-                        }
+                        LookupResult::NotFound => {}
                     }
 
-                    // Then check outer query references, if we still didn't find something.
-                    // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
-                    // but in the case of subqueries, the inner query takes precedence.
-                    // For example:
-                    // SELECT * FROM t WHERE x = (SELECT x FROM t2)
-                    // In this case, there is no ambiguity:
-                    // - x in the outer query refers to t.x,
-                    // - x in the inner query refers to t2.x.
-                    if match_result.is_none() {
-                        for outer_ref in referenced_tables.outer_query_refs().iter() {
-                            // CTEs (FromClauseSubquery) in outer_query_refs are only for table
-                            // lookup (e.g., FROM cte1), not for column resolution. Columns from
-                            // CTEs should only be accessible when the CTE is explicitly in the
-                            // FROM clause, not as implicit outer references.
-                            if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
-                                continue;
-                            }
-                            let col_idx = outer_ref.table.columns().iter().position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                            });
-                            if col_idx.is_some() {
-                                if match_result.is_some() {
-                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
-                                }
-                                let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    outer_ref.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
-                            }
-                        }
-                    }
-
-                    if let Some((table_id, col_idx, is_rowid_alias)) = match_result {
-                        *expr = Expr::Column {
-                            database: None, // TODO: support different databases
-                            table: table_id,
-                            column: col_idx,
-                            is_rowid_alias,
-                        };
-                        referenced_tables.mark_column_used(table_id, col_idx);
+                    if tolerate_unbound {
                         return Ok(WalkControl::Continue);
                     }
 
-                    if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
-                        if let Some(result_columns) = result_columns {
-                            for result_column in result_columns.iter() {
-                                if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
-                                        *expr = result_column.expr.clone();
-                                        return Ok(WalkControl::Continue);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
+                    let can_use_identifier_fallback = scope.table_references_mut().is_some();
                     // SQLite behavior: Only double-quoted identifiers get fallback to string literals
                     // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
-                    if id.quoted_with('"') {
+                    if can_use_identifier_fallback && id.quoted_with('"') {
                         // Convert failed double-quoted identifier to string literal
                         *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
                         return Ok(WalkControl::Continue);
@@ -5090,66 +4976,27 @@ pub fn bind_and_rewrite_expr<'a>(
                 }
                 Expr::Qualified(tbl, id) => {
                     tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
-                    let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                    match scope.resolve_qualified(tbl.as_str(), id.as_str())? {
+                        LookupResult::Found(resolved) => {
+                            rewrite_expr_from_resolved_column(expr, resolved);
+                            tracing::debug!("rewritten to column");
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!(
-                            "no such column: {}.{}",
-                            tbl.as_str(),
-                            id.as_str()
-                        );
-                    };
-                    let normalized_table_name = normalize_ident(tbl.as_str());
-                    let matching_tbl = referenced_tables
-                        .find_table_and_internal_id_by_identifier(&normalized_table_name);
-                    if matching_tbl.is_none() {
-                        crate::bail_parse_error!("no such table: {}", normalized_table_name);
-                    }
-                    let (tbl_id, tbl) = matching_tbl.unwrap();
-                    let normalized_id = normalize_ident(id.as_str());
-                    let col_idx = tbl.columns().iter().position(|c| {
-                        c.name
-                            .as_ref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                    });
-                    // User-defined columns take precedence over rowid aliases
-                    // (oid, rowid, _rowid_). Only fall back to parse_row_id()
-                    // when no matching user column exists.
-                    // Note: Only BTree tables have rowid; derived tables (FromClauseSubquery)
-                    // don't have a rowid.
-                    let Some(col_idx) = col_idx else {
-                        if let Table::BTree(btree) = tbl {
-                            if let Some(row_id_expr) =
-                                parse_row_id(&normalized_id, tbl_id, || false)?
-                            {
-                                if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", normalized_id);
-                                }
-                                *expr = row_id_expr;
-                                // Mark the table's rowid as referenced so correlated
-                                // subquery detection works correctly when a rowid
-                                // reference is the only link to the outer query.
-                                referenced_tables.mark_rowid_referenced(tbl_id);
-                                return Ok(WalkControl::Continue);
-                            }
+                        LookupResult::Ambiguous(msg) => {
+                            crate::bail_parse_error!("{}", msg);
                         }
-                        crate::bail_parse_error!("no such column: {}", normalized_id);
-                    };
-                    let col = tbl.columns().get(col_idx).unwrap();
-                    *expr = Expr::Column {
-                        database: None, // TODO: support different databases
-                        table: tbl_id,
-                        column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    };
-                    tracing::debug!("rewritten to column");
-                    referenced_tables.mark_column_used(tbl_id, col_idx);
-                    return Ok(WalkControl::Continue);
+                        LookupResult::NotFound => {}
+                    }
+
+                    if tolerate_unbound {
+                        return Ok(WalkControl::Continue);
+                    }
+
+                    crate::bail_parse_error!("no such column: {}.{}", tbl.as_str(), id.as_str());
                 }
                 Expr::DoublyQualified(db_name, tbl_name, col_name) => {
-                    let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                    let Some(referenced_tables) = scope.table_references_mut() else {
+                        if tolerate_unbound {
                             return Ok(WalkControl::Continue);
                         }
                         crate::bail_parse_error!(
@@ -5229,7 +5076,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     // For functions that need star expansion (json_object, jsonb_object),
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
-                    if let Some(referenced_tables) = &mut referenced_tables {
+                    if let Some(referenced_tables) = scope.table_references_mut() {
                         if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), 0)
                         {
                             if func.needs_star_expansion() {
@@ -5780,13 +5627,8 @@ pub fn process_returning_clause(
     for rc in returning.iter_mut() {
         match rc {
             ast::ResultColumn::Expr(expr, alias) => {
-                bind_and_rewrite_expr(
-                    expr,
-                    Some(table_references),
-                    None,
-                    resolver,
-                    BindingBehavior::TryResultColumnsFirst,
-                )?;
+                let mut scope = FullTableScope::new(table_references);
+                bind_and_rewrite_expr(expr, &mut scope, resolver, false)?;
 
                 let vec_size = expr_vector_size(expr)?;
                 if vec_size != 1 {
