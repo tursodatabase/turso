@@ -930,9 +930,13 @@ pub fn translate_create_table(
         }
     }
 
-    let schema_master_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let Some(schema_master_table) =
+        resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+    else {
+        bail_parse_error!("sqlite_schema table not found in schema");
+    };
     let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
+        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -1018,8 +1022,8 @@ pub fn translate_create_table(
         }
     }
 
-    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    let sqlite_schema_cursor_id =
+        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),

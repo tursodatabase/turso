@@ -414,4 +414,33 @@ mod tests {
             "expected 'no such function: regexp', got: {err}"
         );
     }
+
+    #[test]
+    fn test_create_autoincrement_requires_sqlite_schema() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+
+        let mut schema = db.schema.lock().as_ref().clone();
+        schema.tables.remove("sqlite_schema");
+        let pager = conn.pager.load().clone();
+        let syms = SymbolTable::new();
+
+        let mut parser = turso_parser::parser::Parser::new(
+            b"CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT)",
+        );
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
+            .expect_err("translation should fail without sqlite_schema")
+            .to_string();
+        assert!(
+            err.contains("sqlite_schema table not found in schema"),
+            "expected missing sqlite_schema error, got: {err}"
+        );
+    }
 }
