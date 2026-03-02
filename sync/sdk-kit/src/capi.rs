@@ -476,6 +476,79 @@ pub extern "C" fn turso_sync_changes_deinit(item: *const c::turso_sync_changes_t
     }
 }
 
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_sync_database_set_url(
+    db: *const c::turso_sync_database_t,
+    url: *const std::ffi::c_char,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> turso_status_code_t {
+    let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
+        Ok(db) => db,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let url = if url.is_null() {
+        None
+    } else {
+        match unsafe { turso_sdk_kit::rsapi::str_from_c_str(url) } {
+            Ok(s) => Some(s.to_string()),
+            Err(err) => return unsafe { err.to_capi(error_opt_out) },
+        }
+    };
+    match db.set_url(url) {
+        Ok(()) => capi::c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_sync_database_set_auth_token(
+    db: *const c::turso_sync_database_t,
+    auth_token: *const std::ffi::c_char,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> turso_status_code_t {
+    let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
+        Ok(db) => db,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let auth_token = if auth_token.is_null() {
+        None
+    } else {
+        match unsafe { turso_sdk_kit::rsapi::str_from_c_str(auth_token) } {
+            Ok(s) => Some(s.to_string()),
+            Err(err) => return unsafe { err.to_capi(error_opt_out) },
+        }
+    };
+    db.set_auth_token(auth_token);
+    capi::c::turso_status_code_t::TURSO_OK
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_sync_database_set_encryption_key(
+    db: *const c::turso_sync_database_t,
+    key: *const std::ffi::c_char,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> turso_status_code_t {
+    let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
+        Ok(db) => db,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let key = if key.is_null() {
+        None
+    } else {
+        match unsafe { turso_sdk_kit::rsapi::str_from_c_str(key) } {
+            Ok(s) => Some(s.to_string()),
+            Err(err) => return unsafe { err.to_capi(error_opt_out) },
+        }
+    };
+    match db.set_encryption_key(key) {
+        Ok(()) => capi::c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
@@ -646,6 +719,138 @@ mod tests {
 
             turso_statement_deinit(statement);
             turso_connection_deinit(connection);
+            turso_sync_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_lazy_params_set_url() {
+        use crate::capi::c::turso_sync_database_set_url;
+
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let client_name = CString::new("turso-sync-test").unwrap();
+            let mut db = std::ptr::null();
+            let status = turso_sync_database_new(
+                &turso_database_config_t {
+                    path: path.as_ptr(),
+                    ..Default::default()
+                },
+                &turso_sync_database_config_t {
+                    path: path.as_ptr(),
+                    client_name: client_name.as_ptr(),
+                    bootstrap_if_empty: true,
+                    ..Default::default()
+                },
+                &mut db,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            // Test setting URL from None to Some
+            let url = CString::new("https://example.com").unwrap();
+            let status = turso_sync_database_set_url(db, url.as_ptr(), std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            // Test setting same URL (should succeed)
+            let status = turso_sync_database_set_url(db, url.as_ptr(), std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            // Test setting different URL (should fail)
+            let url2 = CString::new("https://other.com").unwrap();
+            let status = turso_sync_database_set_url(db, url2.as_ptr(), std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_MISUSE);
+
+            turso_sync_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_lazy_params_set_auth_token() {
+        use crate::capi::c::turso_sync_database_set_auth_token;
+
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let client_name = CString::new("turso-sync-test").unwrap();
+            let mut db = std::ptr::null();
+            let status = turso_sync_database_new(
+                &turso_database_config_t {
+                    path: path.as_ptr(),
+                    ..Default::default()
+                },
+                &turso_sync_database_config_t {
+                    path: path.as_ptr(),
+                    client_name: client_name.as_ptr(),
+                    bootstrap_if_empty: true,
+                    ..Default::default()
+                },
+                &mut db,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            // Test setting auth token (can be changed at any time)
+            let token1 = CString::new("token1").unwrap();
+            let status =
+                turso_sync_database_set_auth_token(db, token1.as_ptr(), std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            // Test changing auth token to different value (should succeed)
+            let token2 = CString::new("token2").unwrap();
+            let status =
+                turso_sync_database_set_auth_token(db, token2.as_ptr(), std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            // Test unsetting auth token (should succeed)
+            let status =
+                turso_sync_database_set_auth_token(db, std::ptr::null(), std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            turso_sync_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_lazy_params_set_encryption_key() {
+        use crate::capi::c::turso_sync_database_set_encryption_key;
+
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let client_name = CString::new("turso-sync-test").unwrap();
+            let mut db = std::ptr::null();
+            let status = turso_sync_database_new(
+                &turso_database_config_t {
+                    path: path.as_ptr(),
+                    ..Default::default()
+                },
+                &turso_sync_database_config_t {
+                    path: path.as_ptr(),
+                    client_name: client_name.as_ptr(),
+                    bootstrap_if_empty: true,
+                    ..Default::default()
+                },
+                &mut db,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            // Test setting encryption key from None to Some
+            let key = CString::new("base64encodedkey").unwrap();
+            let status =
+                turso_sync_database_set_encryption_key(db, key.as_ptr(), std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            // Test setting same key (should succeed)
+            let status =
+                turso_sync_database_set_encryption_key(db, key.as_ptr(), std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            // Test setting different key (should fail)
+            let key2 = CString::new("differentkey").unwrap();
+            let status =
+                turso_sync_database_set_encryption_key(db, key2.as_ptr(), std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_MISUSE);
+
             turso_sync_database_deinit(db);
         }
     }
