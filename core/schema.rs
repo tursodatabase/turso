@@ -3965,6 +3965,25 @@ mod tests {
     }
 
     #[test]
+    fn test_special_table_names_are_quoted_in_to_sql() -> Result<()> {
+        let tests = [
+            (r#"CREATE TABLE "t t" (x TEXT)"#, r#"CREATE TABLE "t t" (x TEXT)"#),
+            (r#"CREATE TABLE "123table" (x TEXT)"#, r#"CREATE TABLE "123table" (x TEXT)"#),
+            (
+                r#"CREATE TABLE "t""t" (x TEXT)"#,
+                r#"CREATE TABLE "t""t" (x TEXT)"#,
+            ),
+        ];
+
+        for (input_sql, expected_sql) in tests {
+            let actual = BTreeTable::from_sql(input_sql, 0)?.to_sql();
+            assert_eq!(actual, expected_sql);
+        }
+
+        Ok(())
+    }
+
+    #[test]
     #[should_panic]
     fn test_automatic_index_single_column() {
         // Without composite primary keys, we should not have an automatic index on a primary key that is a rowid alias

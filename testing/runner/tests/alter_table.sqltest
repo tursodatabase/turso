@@ -857,3 +857,20 @@ expect {
     createtablez'or1=1--(x)
     ok
 }
+
+# Regression for quoted table names with spaces after ADD COLUMN.
+# If sqlite_schema.sql drops quotes around the table name, reopening the DB can fail to parse schema.
+@cross-check-integrity
+test alter_table_add_column_with_space_in_name_keeps_quoted_schema_sql {
+    CREATE TABLE "t t"("a a" TEXT, "b b" TEXT);
+    ALTER TABLE "t t" ADD COLUMN "c c" TEXT;
+
+    SELECT sql LIKE 'CREATE TABLE "t t"%' FROM sqlite_schema WHERE type = 'table' AND name = 't t';
+    SELECT instr(sql, 'c c') > 0 FROM sqlite_schema WHERE type = 'table' AND name = 't t';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    1
+    ok
+}
