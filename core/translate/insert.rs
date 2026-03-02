@@ -3210,6 +3210,7 @@ fn build_constraints_to_check(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_update_sqlite_sequence(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
