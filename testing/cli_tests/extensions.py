@@ -799,6 +799,32 @@ def test_decimal():
         lambda res: "-2.2" == res,
         "decimal_sub(X'3FE0000000000000', 2.2) function return correctly",
     )
+    turso.run_test_fn(
+        "SELECT decimal_mul(3.1, 2);",
+        lambda res: "6.2" == res,
+        "decimal_mul(3.1, 2) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_mul(X'3FE0000000000000', 2.2);",
+        lambda res: "0" == res,
+        "decimal_mul(X'3FE0000000000000', 2.2) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_mul('2222', 0.2);",
+        lambda res: "444.4" == res,
+        "decimal_mul('2222', 0.2) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_pow2(3.3);",
+        lambda res: "" == res,
+        "decimal_pow2(3.3) function return correctly",
+    )
+    turso.run_test_fn(
+        "SELECT decimal_pow2(2);",
+        lambda res: "+4.0e+00" == res,
+        "decimal_pow2(2) function return correctly",
+    )
+    
 
 def test_vfs():
     turso = TestTursoShell()

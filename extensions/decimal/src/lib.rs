@@ -11,7 +11,7 @@ struct Decimal {
 }
 
 register_extension! {
-    scalars: {decimal_func, decimal_func_exp, decimal_func_add, decimal_func_sub}
+    scalars: {decimal_func, decimal_func_exp, decimal_func_add, decimal_func_sub, decimal_func_mul, decimal_func_pow2}
 }
 
 #[scalar(name = "decimal")]
@@ -122,6 +122,61 @@ fn decimal_func_sub(args: &[Value]) -> Value {
             None => Value::null(),
         },
         _ => Value::null(),
+    }
+}
+
+#[scalar(name = "decimal_mul")]
+fn decimal_func_mul(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
+
+    let mut pa = match Decimal::decimal_new(&args[0], true) {
+        Some(a) => a,
+        None => return Value::null(),
+    };
+
+    let pb = match Decimal::decimal_new(&args[1], true) {
+        Some(b) => b,
+        None => return Value::null(),
+    };
+
+    if pa.is_null || pb.is_null {
+        return Value::null();
+    }
+
+    pa.mul(&pb);
+
+    match pa.decimal_result() {
+        Some(res) => Value::from_text(res),
+        None => Value::null(),
+    }
+}
+
+//Return the N-th power of 2.  N must be an integer.
+#[scalar(name = "decimal_pow2")]
+fn decimal_func_pow2(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
+
+    if args[0].value_type() != ValueType::Integer {
+        return Value::null();
+    }
+
+    let n = match args[0].to_integer() {
+        Some(n) => n as i32,
+        None => return Value::null(),
+    };
+
+    let pa = match Decimal::pow2(n) {
+        Some(d) => d,
+        None => return Value::null(),
+    };
+
+    match pa.decimal_result_sci(0) {
+        Some(res) => Value::from_text(res),
+        None => Value::null(),
     }
 }
 
