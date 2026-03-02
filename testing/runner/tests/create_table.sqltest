@@ -225,3 +225,19 @@ test create_table_trailing_named_column_constraint_primary_key_enforced {
 expect {
     1|x|x
 }
+
+# https://github.com/tursodatabase/turso/issues/5632
+@cross-check-integrity
+test create_table_quoted_name_does_not_inject_parse_schema_predicate {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES('test');
+    CREATE TABLE "x' and 0 union select 'table','t2','t2',2,'create table t2(z)' --"(a);
+    SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 't2';
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    test
+    ok
+}

@@ -2121,7 +2121,7 @@ impl BTreeTable {
     /// For example, if a user creates a table like: `CREATE TABLE t              (x)`, we store it as
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("CREATE TABLE {} (", self.name);
+        let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
         let needs_pk_inline = self.primary_key_columns.len() == 1;
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {

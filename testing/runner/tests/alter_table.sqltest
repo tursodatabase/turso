@@ -809,3 +809,28 @@ test alter-add-column-default-string-spaces {
 expect {
     1|hello world|text
 }
+
+# https://github.com/tursodatabase/turso/issues/5632
+@cross-check-integrity
+test alter_table_add_column_with_single_quote_in_name {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    CREATE INDEX i1 ON t1(a);
+    CREATE INDEX i2 ON t2(b);
+
+    CREATE TABLE "z' OR 1=1 -- "(x);
+    ALTER TABLE "z' OR 1=1 -- " ADD COLUMN y;
+
+    SELECT rtrim(name) FROM sqlite_schema WHERE type = 'table' ORDER BY name;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name LIKE 'z'' or 1=1 -- %';
+    PRAGMA integrity_check;
+}
+expect {
+    t1
+    t2
+    t3
+    z' or 1=1 --
+    CREATE TABLE "z' or 1=1 -- " (x, y)
+    ok
+}
