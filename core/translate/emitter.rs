@@ -3229,6 +3229,7 @@ fn emit_update_insns<'a>(
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
     let update_database_id = target_table.database_id;
+    let mut has_before_triggers = false;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
         target_table.table.btree()
     {
@@ -3245,18 +3246,46 @@ fn emit_update_insns<'a>(
                 )
                 .collect()
             });
-        // Read OLD row values for trigger context
-        let old_registers: Vec<usize> = (0..col_len)
-            .map(|i| {
-                let reg = program.alloc_register();
-                program.emit_column_or_rowid(target_table_cursor_id, i, reg);
-                reg
-            })
-            .chain(std::iter::once(beg))
-            .collect();
-        if relevant_before_update_triggers.is_empty() {
-            Some(old_registers)
+
+        let has_after_triggers = t_ctx.resolver.with_schema(update_database_id, |s| {
+            get_relevant_triggers_type_and_time(
+                s,
+                TriggerEvent::Update,
+                TriggerTime::After,
+                Some(updated_column_indices.clone()),
+                &btree_table,
+            )
+            .count()
+                > 0
+        });
+
+        let has_fk_cascade = connection.foreign_keys_enabled()
+            && t_ctx.resolver.with_schema(update_database_id, |s| {
+                s.any_resolved_fks_referencing(table_name)
+            });
+
+        has_before_triggers = !relevant_before_update_triggers.is_empty();
+        let needs_old_registers = has_before_triggers || has_after_triggers || has_fk_cascade;
+
+        // Only read OLD row values when triggers or FK cascades need them
+        let old_registers: Option<Vec<usize>> = if needs_old_registers {
+            Some(
+                (0..col_len)
+                    .map(|i| {
+                        let reg = program.alloc_register();
+                        program.emit_column_or_rowid(target_table_cursor_id, i, reg);
+                        reg
+                    })
+                    .chain(std::iter::once(beg))
+                    .collect(),
+            )
         } else {
+            None
+        };
+
+        if has_before_triggers {
+            let old_registers =
+                old_registers.expect("old_registers allocated when has_before_triggers");
             // NEW row values are already in 'start' registers
             let new_registers = (0..col_len)
                 .map(|i| start + i)
@@ -3266,14 +3295,14 @@ fn emit_update_insns<'a>(
             // If the program has a trigger_conflict_override, propagate it to the trigger context.
             let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
                 TriggerContext::new_with_override_conflict(
-                    btree_table.clone(),
+                    btree_table,
                     Some(new_registers),
                     Some(old_registers.clone()), // Clone for AFTER trigger
                     override_conflict,
                 )
             } else {
                 TriggerContext::new(
-                    btree_table.clone(),
+                    btree_table,
                     Some(new_registers),
                     Some(old_registers.clone()), // Clone for AFTER trigger
                 )
@@ -3300,18 +3329,7 @@ fn emit_update_insns<'a>(
                 ),
             });
 
-            let has_relevant_after_triggers = t_ctx.resolver.with_schema(update_database_id, |s| {
-                get_relevant_triggers_type_and_time(
-                    s,
-                    TriggerEvent::Update,
-                    TriggerTime::After,
-                    Some(updated_column_indices),
-                    &btree_table,
-                )
-                .count()
-                    > 0
-            });
-            if has_relevant_after_triggers {
+            if has_after_triggers {
                 // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
                 // (since registers might be overwritten during trigger execution)
                 let preserved: Vec<usize> = old_registers
@@ -3330,6 +3348,9 @@ fn emit_update_insns<'a>(
             } else {
                 Some(old_registers)
             }
+        } else {
+            // No BEFORE triggers — pass through whatever old_registers we have
+            old_registers
         }
     } else {
         None
@@ -3347,31 +3368,28 @@ fn emit_update_insns<'a>(
     // sqlite> update t set c0 = c1+1;
     // sqlite> select * from t;
     // 2|666|666
-    if target_table.table.btree().is_some() {
-        let before_update_triggers_fired = preserved_old_registers.is_some();
+    if target_table.table.btree().is_some() && has_before_triggers {
         let skip_set_clauses = true;
-        if before_update_triggers_fired {
-            emit_update_column_values(
-                program,
-                table_references,
-                set_clauses,
-                cdc_update_alter_statement,
-                &target_table,
-                target_table_cursor_id,
-                start,
-                col_len,
-                table_name,
-                has_direct_rowid_update,
-                has_user_provided_rowid,
-                rowid_set_clause_reg,
-                is_virtual,
-                &index,
-                cdc_updates_register,
-                t_ctx,
-                skip_set_clauses,
-                skip_row_label,
-            )?;
-        }
+        emit_update_column_values(
+            program,
+            table_references,
+            set_clauses,
+            cdc_update_alter_statement,
+            &target_table,
+            target_table_cursor_id,
+            start,
+            col_len,
+            table_name,
+            has_direct_rowid_update,
+            has_user_provided_rowid,
+            rowid_set_clause_reg,
+            is_virtual,
+            &index,
+            cdc_updates_register,
+            t_ctx,
+            skip_set_clauses,
+            skip_row_label,
+        )?;
     }
 
     if connection.foreign_keys_enabled() {
