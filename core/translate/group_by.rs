@@ -22,7 +22,7 @@ use crate::{
     translate::collate::{get_collseq_from_expr, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
-        builder::{CursorType, ProgramBuilder, QueryMode},
+        builder::{CursorType, ProgramBuilder},
         insn::Insn,
         BranchOffset,
     },

@@ -347,7 +347,7 @@ pub struct ProgramBuilderOpts {
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
-        if let QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
+        if let $crate::QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
             $builder.emit_explain($push, $detail);
         }
     };

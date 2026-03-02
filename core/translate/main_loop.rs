@@ -39,7 +39,7 @@ use crate::{
         affinity::{self, Affinity},
         builder::{
             CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
-            ProgramBuilder, QueryMode,
+            ProgramBuilder,
         },
         insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
