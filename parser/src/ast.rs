@@ -1654,6 +1654,10 @@ pub enum PragmaName {
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
+    /// Sets or queries the group commit delay in microseconds for MVCC.
+    /// When > 0, transactions batch their fsync calls within this window
+    /// to trade latency for throughput.
+    ExperimentalGroupCommitDelayUs,
     /// List all available types (built-in and custom)
     ListTypes,
 }

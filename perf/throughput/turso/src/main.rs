@@ -52,6 +52,13 @@ struct Args {
 
     #[arg(long = "io", help = "IO backend")]
     io: Option<IoOption>,
+
+    #[arg(
+        long = "group-commit-delay",
+        default_value = "0",
+        help = "Group commit delay in microseconds (0 = disabled)"
+    )]
+    group_commit_delay: u64,
 }
 
 fn main() -> Result<()> {
@@ -87,7 +94,7 @@ async fn async_main(args: Args) -> Result<()> {
         std::fs::remove_file(wal_path).expect("Failed to remove existing database");
     }
 
-    let db = setup_database(db_path, args.mode, args.io).await?;
+    let db = setup_database(db_path, args.mode, args.io, args.group_commit_delay).await?;
 
     let start_barrier = Arc::new(Barrier::new(args.threads));
     let mut handles = Vec::new();
@@ -144,6 +151,7 @@ async fn setup_database(
     db_path: &str,
     mode: TransactionMode,
     io: Option<IoOption>,
+    group_commit_delay: u64,
 ) -> Result<Database> {
     let builder = Builder::new_local(db_path);
 
@@ -163,6 +171,11 @@ async fn setup_database(
         TransactionMode::Mvcc | TransactionMode::Concurrent | TransactionMode::LogicalLog
     ) {
         conn.pragma_update("journal_mode", "'mvcc'").await?;
+    }
+
+    if group_commit_delay > 0 {
+        conn.pragma_update("experimental_group_commit_delay_us", group_commit_delay)
+            .await?;
     }
 
     conn.execute(

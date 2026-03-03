@@ -1,3 +1,4 @@
+use crate::io::clock::MonotonicInstant;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::persistent_storage::Storage;
@@ -43,6 +44,7 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
+use std::time::Duration;
 use tracing::instrument;
 use tracing::Level;
 
@@ -854,6 +856,14 @@ pub enum CommitState<Clock: LogicalClock> {
         end_ts: u64,
         log_record: LogRecord,
     },
+    /// Wait for a batched fsync in group commit mode. Multiple transactions
+    /// join a SyncGroup after writing their log records. The first transaction
+    /// to observe the group window expired becomes the leader and issues fsync.
+    WaitForGroupSync {
+        end_ts: u64,
+        /// True if this transaction is the leader that issued the fsync.
+        is_leader: bool,
+    },
     EndCommitLogicalLog {
         end_ts: u64,
     },
@@ -879,15 +889,98 @@ pub enum WriteRowState {
     Next,
 }
 
+/// A batch of transactions sharing a single fsync of the logical log.
+///
+/// Transactions write their log records sequentially under the commit lock,
+/// then join a SyncGroup to wait for a batched fsync. The first transaction
+/// to observe the group window has expired becomes the leader, seals the group,
+/// and issues the fsync. All members wait on the shared completion.
+struct SyncGroup {
+    /// Monotonic timestamp when this group was created.
+    created_at: MonotonicInstant,
+    /// True once sealed — no more members accepted.
+    sealed: AtomicBool,
+    /// True once a leader has been claimed via CAS.
+    leader_claimed: AtomicBool,
+    /// Set by leader after issuing fsync. Polled by followers.
+    sync_done: AtomicBool,
+    /// Set if fsync failed — all members propagate this error.
+    sync_error: Mutex<Option<String>>,
+}
+
+impl SyncGroup {
+    fn new() -> Self {
+        Self {
+            created_at: MonotonicInstant::now(),
+            sealed: AtomicBool::new(false),
+            leader_claimed: AtomicBool::new(false),
+            sync_done: AtomicBool::new(false),
+            sync_error: Mutex::new(None),
+        }
+    }
+}
+
+impl Debug for SyncGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncGroup")
+            .field("sealed", &self.sealed.load(Ordering::Relaxed))
+            .field("sync_done", &self.sync_done.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 struct CommitCoordinator {
+    /// Serializes logical log writes. In group commit mode, held only during
+    /// the write phase (not during fsync).
     pager_commit_lock: Arc<TursoRwLock>,
+    /// Active sync group that transactions join after writing their log record.
+    /// None when group commit is disabled or no group is currently active.
+    current_group: Mutex<Option<Arc<SyncGroup>>>,
+    /// Group commit window in microseconds. 0 = disabled (legacy per-tx fsync).
+    group_commit_delay_us: AtomicU64,
 }
 
 impl CommitCoordinator {
     fn new() -> Self {
         Self {
             pager_commit_lock: Arc::new(TursoRwLock::new()),
+            current_group: Mutex::new(None),
+            group_commit_delay_us: AtomicU64::new(0),
+        }
+    }
+
+    fn is_group_commit_enabled(&self) -> bool {
+        self.group_commit_delay_us.load(Ordering::Relaxed) > 0
+    }
+
+    fn group_commit_window(&self) -> Duration {
+        Duration::from_micros(self.group_commit_delay_us.load(Ordering::Relaxed))
+    }
+
+    /// Join an existing sync group or create a new one.
+    /// Returns the group arc.
+    fn join_or_create_group(&self) -> Arc<SyncGroup> {
+        let mut current = self.current_group.lock();
+        if let Some(ref group) = *current {
+            if !group.sealed.load(Ordering::Acquire) {
+                return group.clone();
+            }
+        }
+        let group = Arc::new(SyncGroup::new());
+        *current = Some(group.clone());
+        group
+    }
+
+    /// Seal the current group and clear it so the next joiner creates a new one.
+    fn seal_and_rotate(&self, group: &SyncGroup) {
+        group.sealed.store(true, Ordering::Release);
+        let mut current = self.current_group.lock();
+        // Only clear if this is still the current group (pointer comparison via sealed flag).
+        if let Some(ref g) = *current {
+            if g.sealed.load(Ordering::Acquire) {
+                *current = None;
+            }
         }
     }
 }
@@ -904,9 +997,13 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     header: Arc<RwLock<Option<DatabaseHeader>>>,
     pager: Arc<Pager>,
     /// Bytes appended to the logical log for this commit; applied to writer offset only after durability and before lock release.
+    /// Only used in legacy (non-group-commit) mode.
     pending_log_append_bytes: Option<u64>,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    /// Sync group this transaction joined. Set when group commit is enabled and
+    /// the transaction has written its log record. None in legacy mode.
+    sync_group: Option<Arc<SyncGroup>>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -967,6 +1064,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             header,
             pending_log_append_bytes: None,
             sync_mode,
+            sync_group: None,
             _phantom: PhantomData,
         }
     }
@@ -1551,7 +1649,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
-                if !mvcc_store.is_exclusive_tx(&self.tx_id) {
+                let is_exclusive = mvcc_store.is_exclusive_tx(&self.tx_id);
+                if !is_exclusive {
                     // logical log needs to be serialized
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
@@ -1567,18 +1666,118 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .pager_commit_lock_held
                         .store(true, Ordering::Release);
                 }
-                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record)?;
-                self.pending_log_append_bytes = Some(append_bytes);
-                self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
-                // if Completion Completed without errors we can continue
-                if c.succeeded() {
-                    Ok(TransitionResult::Continue)
+
+                let use_group_commit =
+                    !is_exclusive && self.commit_coordinator.is_group_commit_enabled();
+
+                if use_group_commit {
+                    // Group commit: write + immediately advance offset, then release lock.
+                    let c = mvcc_store.storage.log_tx_and_advance(log_record)?;
+                    // Release commit lock immediately — fsync will be batched.
+                    let tx = mvcc_store
+                        .txs
+                        .get(&self.tx_id)
+                        .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+                    mvcc_store.unlock_commit_lock_if_held(tx.value());
+                    self.state = CommitState::WaitForGroupSync {
+                        end_ts: *end_ts,
+                        is_leader: false,
+                    };
+                    if c.succeeded() {
+                        Ok(TransitionResult::Continue)
+                    } else {
+                        Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    }
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    // Legacy: deferred offset, lock held through fsync.
+                    let (c, append_bytes) = mvcc_store.storage.log_tx(log_record)?;
+                    self.pending_log_append_bytes = Some(append_bytes);
+                    self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
+                    if c.succeeded() {
+                        Ok(TransitionResult::Continue)
+                    } else {
+                        Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    }
                 }
             }
 
+            CommitState::WaitForGroupSync { end_ts, is_leader } => {
+                // Skip fsync when synchronous mode is not FULL — same as legacy path.
+                if self.sync_mode != SyncMode::Full {
+                    tracing::debug!("Skipping group fsync of logical log (synchronous!=full)");
+                    self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
+                    return Ok(TransitionResult::Continue);
+                }
+
+                // First entry: join or create a sync group.
+                if self.sync_group.is_none() {
+                    let group = self.commit_coordinator.join_or_create_group();
+                    self.sync_group = Some(group);
+                }
+                let group = self.sync_group.as_ref().unwrap();
+
+                // Leader re-entry: we issued the fsync on a previous step and the IO
+                // completion brought us back. The fsync succeeded (errors are handled
+                // at the point of issuance). Mark the group done for followers.
+                if *is_leader {
+                    group.sync_done.store(true, Ordering::Release);
+                    self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
+                    return Ok(TransitionResult::Continue);
+                }
+
+                // Check if fsync already completed (by the leader).
+                if group.sync_done.load(Ordering::Acquire) {
+                    if let Some(ref err_msg) = *group.sync_error.lock() {
+                        return Err(LimboError::InternalError(err_msg.clone()));
+                    }
+                    self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
+                    return Ok(TransitionResult::Continue);
+                }
+
+                // Try to become leader once the group window has expired.
+                let elapsed = group.created_at.elapsed();
+                let window = self.commit_coordinator.group_commit_window();
+
+                if elapsed >= window
+                    && group
+                        .leader_claimed
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    // Leader: seal group so new arrivals create a fresh group,
+                    // then issue fsync covering all writes up to this point.
+                    self.commit_coordinator.seal_and_rotate(group);
+                    match mvcc_store.storage.sync(self.pager.get_sync_type()) {
+                        Ok(c) => {
+                            if c.succeeded() {
+                                group.sync_done.store(true, Ordering::Release);
+                                self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
+                                return Ok(TransitionResult::Continue);
+                            }
+                            // Fsync in flight — mark ourselves as leader so on re-entry
+                            // we take the leader path above.
+                            self.state = CommitState::WaitForGroupSync {
+                                end_ts: *end_ts,
+                                is_leader: true,
+                            };
+                            return Ok(TransitionResult::Io(IOCompletions::Single(c)));
+                        }
+                        Err(e) => {
+                            // Fsync failed — propagate to all group members.
+                            *group.sync_error.lock() = Some(e.to_string());
+                            group.sync_done.store(true, Ordering::Release);
+                            return Err(e);
+                        }
+                    }
+                }
+
+                // Follower or window not yet expired — yield and re-check.
+                Ok(TransitionResult::Io(IOCompletions::Single(
+                    Completion::new_yield(),
+                )))
+            }
             CommitState::SyncLogicalLog { end_ts } => {
+                // Legacy (non-group-commit) fsync path.
                 // Skip fsync when synchronous mode is not FULL.
                 // NORMAL mode skips fsync on commit (but still fsyncs on checkpoint).
                 if self.sync_mode != SyncMode::Full {
@@ -1613,7 +1812,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
-                // Order of operations matters here:
+                // Order of operations matters here (legacy / non-group-commit path):
                 // 1. Advance logical log writer offset (makes the written bytes "owned")
                 // 2. Mark transaction Committed (publishes versions to readers)
                 // 3. Release commit lock (allows next committer)
@@ -1632,6 +1831,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // writes to disk. If the commit fails before reaching here (e.g. during
                 // sync), the bytes are never consumed and the in-memory writer offset
                 // stays behind — the next write overwrites the uncommitted bytes.
+                //
+                // In group commit mode, (1) and (3) are already done in
+                // BeginCommitLogicalLog: offset is advanced immediately under the lock,
+                // and the lock is released before joining the sync group.
+                // pending_log_append_bytes is None, and pager_commit_lock_held is
+                // false, so the corresponding code below is naturally skipped.
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
@@ -4720,6 +4925,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.storage.checkpoint_threshold()
     }
 
+    pub fn set_group_commit_delay_us(&self, delay_us: u64) {
+        self.commit_coordinator
+            .group_commit_delay_us
+            .store(delay_us, Ordering::Relaxed);
+    }
+
+    pub fn group_commit_delay_us(&self) -> u64 {
+        self.commit_coordinator
+            .group_commit_delay_us
+            .load(Ordering::Relaxed)
+    }
+
     pub fn get_real_table_id(&self, table_id: i64) -> i64 {
         let entry = self.table_id_to_rootpage.get(&MVTableId::from(table_id));
         if let Some(entry) = entry {
@@ -5205,6 +5422,11 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
             Self::EndCommitLogicalLog { end_ts } => f
                 .debug_struct("EndCommitLogicalLog")
                 .field("end_ts", end_ts)
+                .finish(),
+            Self::WaitForGroupSync { end_ts, is_leader } => f
+                .debug_struct("WaitForGroupSync")
+                .field("end_ts", end_ts)
+                .field("is_leader", is_leader)
                 .finish(),
             Self::SyncLogicalLog { end_ts } => f
                 .debug_struct("SyncLogicalLog")

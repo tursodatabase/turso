@@ -1,7 +1,7 @@
 #!/bin/bash
 
 RUNS=${1:-10}
-CMD="cargo run --release --bin write-throughput -- -t 6 --mode legacy -i 1000"
+CMD="cargo run --release --bin write-throughput -- -t 6 --mode concurrent -i 1000"
 
 echo "Running benchmark $RUNS times..."
 echo "Command: $CMD"

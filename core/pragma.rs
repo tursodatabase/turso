@@ -167,6 +167,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_checkpoint_threshold"],
         ),
+        PragmaName::ExperimentalGroupCommitDelayUs => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["experimental_group_commit_delay_us"],
+        ),
         ForeignKeys => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],

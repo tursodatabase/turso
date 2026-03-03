@@ -2162,6 +2162,23 @@ impl Connection {
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
     }
+
+    pub(crate) fn set_group_commit_delay_us(&self, delay_us: u64) -> Result<()> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => {
+                mv_store.set_group_commit_delay_us(delay_us);
+                Ok(())
+            }
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn group_commit_delay_us(&self) -> Result<u64> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => Ok(mv_store.group_commit_delay_us()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
 }
 
 pub type Row = vdbe::Row;
