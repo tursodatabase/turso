@@ -1,0 +1,14 @@
+{
+  "name": "concurrent-writes",
+  "version": "1.0.0",
+  "description": "Experimental MVCC: concurrent writes with BEGIN CONCURRENT",
+  "main": "index.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@tursodatabase/database": "0.5.0-pre.17"
+  }
+}
