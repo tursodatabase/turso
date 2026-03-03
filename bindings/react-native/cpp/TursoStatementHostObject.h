@@ -60,6 +60,7 @@ private:
     jsi::Value rowValueDouble(jsi::Runtime &rt, const jsi::Value *args, size_t count);
     jsi::Value namedPosition(jsi::Runtime &rt, const jsi::Value *args, size_t count);
     jsi::Value parametersCount(jsi::Runtime &rt);
+    jsi::Value getAllRows(jsi::Runtime &rt);
 };
 
 } // namespace turso

@@ -65,6 +65,9 @@ export interface NativeStatement {
   // Parameter methods
   namedPosition(name: string): number;
   parametersCount(): number;
+
+  // Bulk row reading (native-side step+read loop)
+  getAllRows(): { status: number; rows: Row[] };
 }
 
 // ============================================================================

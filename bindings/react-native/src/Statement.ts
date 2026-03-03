@@ -290,22 +290,33 @@ export class Statement {
         this.bind(...params);
       }
 
-      const rows: Row[] = [];
+      // Fast path: native bulk read (handles step+read loop in C++)
+      // Re-enters native after each IO resolution to stay on the fast path
+      let rows: Row[] = [];
+      const MAX_IO_RETRIES = 10000;
 
-      // Step through all rows with async IO handling
-      while (true) {
-        const status = await this.stepWithIo();
-
-        if (status === TursoStatus.ROW) {
-          rows.push(this.readRow());
-        } else if (status === TursoStatus.DONE) {
-          break;
-        } else {
-          throw new Error(`Statement step failed with status: ${status}`);
+      for (let ioRetries = 0; ioRetries < MAX_IO_RETRIES; ioRetries++) {
+        const bulk = this._statement.getAllRows();
+        if (bulk.rows && bulk.rows.length > 0) {
+          rows = rows.concat(bulk.rows);
         }
+
+        if (bulk.status === TursoStatus.DONE) {
+          return rows;
+        }
+
+        if (bulk.status === TursoStatus.IO) {
+          this._statement.runIo();
+          if (this._extraIo) {
+            await this._extraIo();
+          }
+          continue;
+        }
+
+        throw new Error(`getAllRows failed with status: ${bulk.status}`);
       }
 
-      return rows;
+      throw new Error(`getAllRows: exceeded ${MAX_IO_RETRIES} IO retries`);
     } finally {
       this._statement.reset();
       if (this._execLock) {
