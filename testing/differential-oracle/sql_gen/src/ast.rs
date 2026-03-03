@@ -5,7 +5,7 @@
 
 use crate::context::Context;
 use crate::functions::AGGREGATE_FUNCTIONS;
-use crate::schema::DataType;
+use crate::schema::{DataType, Schema};
 use std::fmt;
 
 // =============================================================================
@@ -104,6 +104,16 @@ impl Stmt {
             | Stmt::Release(_) => None,
         }
     }
+
+    /// Returns a reason code when this statement contains a `LIMIT` query whose
+    /// `ORDER BY` does not include a unique column (primary key or non-nullable unique),
+    /// meaning ties may be broken differently across engines.
+    pub fn non_unique_order_by_reason(&self, schema: &Schema) -> Option<&'static str> {
+        match self {
+            Stmt::Select(s) => s.non_unique_order_by_reason(schema),
+            _ => None,
+        }
+    }
 }
 
 impl SelectStmt {
@@ -190,6 +200,94 @@ impl SelectStmt {
         }
         None
     }
+
+    /// Returns a reason code when this SELECT (or any nested subquery) has `LIMIT`
+    /// with `ORDER BY` that doesn't include a unique column, meaning tie-breaking
+    /// is engine-dependent.
+    pub fn non_unique_order_by_reason(&self, schema: &Schema) -> Option<&'static str> {
+        // Check THIS select: LIMIT + ORDER BY without a unique tiebreaker
+        if self.limit.is_some()
+            && !self.order_by.is_empty()
+            && !self.order_by_includes_unique_column(schema)
+        {
+            return Some("limit_non_unique_order_by");
+        }
+
+        // Recursively check nested subqueries
+        if let Some(with) = &self.with_clause {
+            for cte in &with.ctes {
+                if let Some(r) = cte.query.non_unique_order_by_reason(schema) {
+                    return Some(r);
+                }
+            }
+        }
+        for col in &self.columns {
+            if let Some(r) = col.expr.non_unique_order_by_reason(schema) {
+                return Some(r);
+            }
+        }
+        for join in &self.joins {
+            if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                if let Some(r) = expr.non_unique_order_by_reason(schema) {
+                    return Some(r);
+                }
+            }
+        }
+        if let Some(w) = &self.where_clause {
+            if let Some(r) = w.non_unique_order_by_reason(schema) {
+                return Some(r);
+            }
+        }
+        if let Some(gb) = &self.group_by {
+            for expr in &gb.exprs {
+                if let Some(r) = expr.non_unique_order_by_reason(schema) {
+                    return Some(r);
+                }
+            }
+            if let Some(h) = &gb.having {
+                if let Some(r) = h.non_unique_order_by_reason(schema) {
+                    return Some(r);
+                }
+            }
+        }
+        for item in &self.order_by {
+            if let Some(r) = item.expr.non_unique_order_by_reason(schema) {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    /// Returns true if any ORDER BY expression is a bare column reference to
+    /// a primary key or non-nullable unique column of the FROM table.
+    fn order_by_includes_unique_column(&self, schema: &Schema) -> bool {
+        let Some(from) = &self.from else {
+            return false;
+        };
+        // For queries with JOINs, we'd need the ORDER BY to cover all tables'
+        // unique keys, which is complex. Be conservative and say not guaranteed.
+        if !self.joins.is_empty() {
+            return false;
+        }
+        let Some(table) = schema.get_table(&from.table) else {
+            return false;
+        };
+        self.order_by.iter().any(|item| {
+            if let Expr::ColumnRef(col_ref) = &item.expr {
+                // If table-qualified, verify it matches the FROM table
+                if let Some(ref tbl) = col_ref.table {
+                    if *tbl != from.table && from.alias.as_deref() != Some(tbl) {
+                        return false;
+                    }
+                }
+                table.columns.iter().any(|c| {
+                    c.name == col_ref.column && (c.primary_key || (c.unique && !c.nullable))
+                })
+            } else {
+                false
+            }
+        })
+    }
 }
 
 impl Expr {
@@ -243,6 +341,58 @@ impl Expr {
             Expr::Parenthesized(e) => e.unordered_limit_reason(),
             Expr::ColumnRef(_) | Expr::Literal(_) => None,
             // Stubs: never instantiated
+            Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => None,
+        }
+    }
+
+    /// Schema-aware check: returns a reason code when a nested subquery has
+    /// `LIMIT` with `ORDER BY` that doesn't include a unique column.
+    pub fn non_unique_order_by_reason(&self, schema: &Schema) -> Option<&'static str> {
+        match self {
+            Expr::Subquery(s) => s.non_unique_order_by_reason(schema),
+            Expr::InSubquery(i) => i
+                .expr
+                .non_unique_order_by_reason(schema)
+                .or_else(|| i.subquery.non_unique_order_by_reason(schema)),
+            Expr::Exists(e) => e.subquery.non_unique_order_by_reason(schema),
+            Expr::BinaryOp(b) => b
+                .left
+                .non_unique_order_by_reason(schema)
+                .or_else(|| b.right.non_unique_order_by_reason(schema)),
+            Expr::UnaryOp(u) => u.operand.non_unique_order_by_reason(schema),
+            Expr::FunctionCall(fc) => fc
+                .args
+                .iter()
+                .find_map(|a| a.non_unique_order_by_reason(schema)),
+            Expr::Case(c) => c
+                .operand
+                .as_ref()
+                .and_then(|o| o.non_unique_order_by_reason(schema))
+                .or_else(|| {
+                    c.when_clauses.iter().find_map(|(w, t)| {
+                        w.non_unique_order_by_reason(schema)
+                            .or_else(|| t.non_unique_order_by_reason(schema))
+                    })
+                })
+                .or_else(|| {
+                    c.else_clause
+                        .as_ref()
+                        .and_then(|e| e.non_unique_order_by_reason(schema))
+                }),
+            Expr::Cast(c) => c.expr.non_unique_order_by_reason(schema),
+            Expr::Between(b) => b
+                .expr
+                .non_unique_order_by_reason(schema)
+                .or_else(|| b.low.non_unique_order_by_reason(schema))
+                .or_else(|| b.high.non_unique_order_by_reason(schema)),
+            Expr::InList(i) => i.expr.non_unique_order_by_reason(schema).or_else(|| {
+                i.list
+                    .iter()
+                    .find_map(|e| e.non_unique_order_by_reason(schema))
+            }),
+            Expr::IsNull(i) => i.expr.non_unique_order_by_reason(schema),
+            Expr::Parenthesized(e) => e.non_unique_order_by_reason(schema),
+            Expr::ColumnRef(_) | Expr::Literal(_) => None,
             Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => None,
         }
     }
@@ -2191,6 +2341,168 @@ mod tests {
         assert_eq!(
             select.unordered_limit_reason(),
             Some("limit_without_order_by")
+        );
+    }
+
+    #[test]
+    fn test_non_unique_order_by_detected() {
+        use crate::schema::{ColumnDef, Schema, Table};
+
+        let schema = Schema {
+            tables: vec![Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("status", DataType::Integer),
+                ],
+            )],
+            indexes: vec![],
+            triggers: vec![],
+            attached_databases: vec![],
+        };
+
+        // ORDER BY non-unique column with LIMIT → should be detected
+        let select = SelectStmt {
+            with_clause: None,
+            distinct: false,
+            columns: vec![],
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            order_by: vec![OrderByItem {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "status".to_string(),
+                }),
+                direction: OrderDirection::Desc,
+                nulls: None,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        assert_eq!(
+            select.non_unique_order_by_reason(&schema),
+            Some("limit_non_unique_order_by")
+        );
+    }
+
+    #[test]
+    fn test_non_unique_order_by_not_detected_for_pk() {
+        use crate::schema::{ColumnDef, Schema, Table};
+
+        let schema = Schema {
+            tables: vec![Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            )],
+            indexes: vec![],
+            triggers: vec![],
+            attached_databases: vec![],
+        };
+
+        // ORDER BY primary key with LIMIT → deterministic, no detection
+        let select = SelectStmt {
+            with_clause: None,
+            distinct: false,
+            columns: vec![],
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            order_by: vec![OrderByItem {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "id".to_string(),
+                }),
+                direction: OrderDirection::Asc,
+                nulls: None,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        assert_eq!(select.non_unique_order_by_reason(&schema), None);
+    }
+
+    #[test]
+    fn test_non_unique_order_by_in_nested_subquery() {
+        use crate::schema::{ColumnDef, Schema, Table};
+
+        let schema = Schema {
+            tables: vec![Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("a", DataType::Integer).primary_key(),
+                    ColumnDef::new("b", DataType::Text),
+                ],
+            )],
+            indexes: vec![],
+            triggers: vec![],
+            attached_databases: vec![],
+        };
+
+        // Nested scalar subquery with non-unique ORDER BY + LIMIT
+        let inner = SelectStmt {
+            with_clause: None,
+            distinct: false,
+            columns: vec![SelectColumn {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "a".to_string(),
+                }),
+                alias: None,
+            }],
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            order_by: vec![OrderByItem {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "b".to_string(),
+                }),
+                direction: OrderDirection::Desc,
+                nulls: None,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        // Outer query with the subquery in WHERE - no LIMIT itself
+        let outer = SelectStmt {
+            with_clause: None,
+            distinct: false,
+            columns: vec![],
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: Some(Expr::Subquery(Box::new(inner))),
+            group_by: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        assert_eq!(
+            outer.non_unique_order_by_reason(&schema),
+            Some("limit_non_unique_order_by")
         );
     }
 }
