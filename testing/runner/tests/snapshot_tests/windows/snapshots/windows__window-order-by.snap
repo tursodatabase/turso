@@ -60,7 +60,7 @@ addr  opcode            p1  p2  p3  p4                     p5  comment
   33      NotNull       26  37   0                          0  r[26]!=NULL -> goto 37
   34      Copy          30  28   1                          0  r[28]=r[30]; initialize previous peer register for new partition
   35      Null           0  19  19                          0  r[19..19]=NULL; reset accumulator registers
-  36      Integer        0  19   0                          0  r[19]=0
+  36      Integer        0  20   0                          0  r[20]=0
   37      Compare       28  30   2  k(2, Binary, Binary)    0  r[28..29]==r[30..31]; compare ORDER BY columns to detect peer
   38      Jump          39  41  39                          0
   39      Gosub         27  46   0                          0  ; detected non-peer row
@@ -71,13 +71,13 @@ addr  opcode            p1  p2  p3  p4                     p5  comment
   44    Goto             0  30   0                          0
   45    Null             0  27   0                          0  r[27]=NULL; return remaining buffered rows
   46    Rewind           4  62   0                          0  Rewind  ephemeral(buffer_table_window_0)
-  47      Column         4   2  21                          0  r[21]=ephemeral(buffer_table_window_0).sale_id
-  48      Column         4   3  22                          0  r[22]=ephemeral(buffer_table_window_0).emp_id
-  49      Column         4   0  23                          0  r[23]=ephemeral(buffer_table_window_0).sale_date
-  50      Column         4   1  24                          0  r[24]=ephemeral(buffer_table_window_0).amount
-  51      Column         4   4  25                          0  r[25]=ephemeral(buffer_table_window_0).region
-  52      AddImm        19   1   0                          0  r[19]=r[19]+1
-  53      Copy          19  20   0                          0  r[20]=r[19]
+  47    Integer          1  33   0                          0  r[33]=1
+  48      Column         4   2  21                          0  r[21]=ephemeral(buffer_table_window_0).sale_id
+  49      Column         4   3  22                          0  r[22]=ephemeral(buffer_table_window_0).emp_id
+  50      Column         4   0  23                          0  r[23]=ephemeral(buffer_table_window_0).sale_date
+  51      Column         4   1  24                          0  r[24]=ephemeral(buffer_table_window_0).amount
+  52      Column         4   4  25                          0  r[25]=ephemeral(buffer_table_window_0).region
+  53      Add           20  33  20                          0  r[20]=r[20]+r[33]
   54      Copy          21  13   0                          0  r[13]=r[21]
   55      Copy          22  14   0                          0  r[14]=r[22]
   56      Copy          23  15   0                          0  r[15]=r[23]
@@ -85,7 +85,7 @@ addr  opcode            p1  p2  p3  p4                     p5  comment
   58      Copy          25  17   0                          0  r[17]=r[25]
   59      Copy          20  18   0                          0  r[18]=r[20]
   60      ResultRow     13   6   0                          0  output=r[13..18]
-  61    Next             4  47   0                          0
+  61    Next             4  48   0                          0
   62    ResetSorter      4   0   0                          0  cursor=4
   63  Return            27   0   1                          0
   64  Halt               0   0   0                          0
