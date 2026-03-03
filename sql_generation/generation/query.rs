@@ -200,6 +200,49 @@ impl Arbitrary for SelectFree {
 
 impl Arbitrary for Select {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+        // ~15% chance: generate a correlated subquery with COUNT(*) when 2+ tables exist
+        if env.tables().len() >= 2 && rng.random_bool(0.15) {
+            let tables = env.tables();
+            let outer_table = pick(tables, rng);
+            let inner_candidates: Vec<&Table> = tables
+                .iter()
+                .filter(|t| t.name != outer_table.name)
+                .collect();
+            let inner_table = *pick(&inner_candidates, rng);
+
+            // Try to find a shared column name for correlation
+            let outer_col_names: IndexSet<&str> = outer_table
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            let shared: Vec<&str> = inner_table
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .filter(|n| outer_col_names.contains(n))
+                .collect();
+
+            let (outer_corr_col, inner_corr_col) = if !shared.is_empty() {
+                let col = (*pick(&shared, rng)).to_owned();
+                (col.clone(), col)
+            } else {
+                let oc = pick(&outer_table.columns, rng).name.clone();
+                let ic = pick(&inner_table.columns, rng).name.clone();
+                (oc, ic)
+            };
+
+            let where_clause = Predicate::arbitrary_from(rng, env, outer_table);
+
+            return Select::count_with_correlated_subquery(
+                outer_table.name.clone(),
+                inner_table.name.clone(),
+                outer_corr_col,
+                inner_corr_col,
+                where_clause,
+            );
+        }
+
         // Generate a number of selects based on the query size
         let opts = &env.opts().query.select;
         let num_compound_selects = opts.compound_selects

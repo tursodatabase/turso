@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use turso_parser::ast::{
     self,
     fmt::{BlankContext, ToTokens},
+    FunctionTail,
 };
 
 use crate::model::table::{SimValue, Table, TableContext};
@@ -81,6 +82,30 @@ impl Predicate {
     /// Create a predicate from a SimValue literal
     pub fn value(val: SimValue) -> Self {
         Self(ast::Expr::Literal(val.into()))
+    }
+
+    /// Create a COUNT(*) aggregate expression
+    pub fn count_star() -> Self {
+        Self(ast::Expr::FunctionCallStar {
+            name: ast::Name::from_string("COUNT"),
+            filter_over: FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
+    }
+
+    /// Create a scalar subquery expression
+    pub fn subquery(select: super::select::Select) -> Self {
+        Self(ast::Expr::Subquery(select.to_sql_ast()))
+    }
+
+    /// Create a qualified column reference (e.g. "table.column")
+    pub fn qualified_column(table: &str, column: &str) -> Self {
+        Self(ast::Expr::Qualified(
+            ast::Name::from_string(table),
+            ast::Name::from_string(column),
+        ))
     }
 
     pub fn parens(self) -> Self {
