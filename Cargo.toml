@@ -1,4 +1,4 @@
-# Copyright 2023-2025 the Limbo authors. All rights reserved. MIT license.
+# Copyright 2023-2026 the Turso authors. All rights reserved. MIT license.
 
 [workspace]
 resolver = "2"
@@ -46,7 +46,7 @@ exclude = ["perf/latency/limbo"]
 
 [workspace.package]
 version = "0.5.0-pre.18"
-authors = ["the Limbo authors"]
+authors = ["the Turso authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
