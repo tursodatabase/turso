@@ -98,7 +98,6 @@ turso_parser = { workspace = true }
 twox-hash = "2.1.1"
 intrusive-collections = "0.9.7"
 roaring = "0.11.2"
-simsimd = "6.5.3"
 arc-swap = "1.7"
 rustc-hash = "2.0"
 either = { workspace = true }
@@ -112,6 +111,9 @@ crc32c = "0.6.8"
 bigdecimal = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
+
+[target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
+simsimd = "6.5.3"
 
 [target.'cfg(antithesis)'.dependencies]
 antithesis_sdk = { workspace = true, features = ["full"] }

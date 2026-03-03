@@ -2,6 +2,10 @@ use crate::{
     vector::vector_types::{Vector, VectorSparse, VectorType},
     LimboError, Result,
 };
+#[cfg(not(any(
+    target_family = "wasm",
+    all(target_os = "windows", target_arch = "aarch64")
+)))]
 use simsimd::SpatialSimilarity;
 
 pub fn vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
@@ -16,23 +20,11 @@ pub fn vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
         ));
     }
     match v1.vector_type {
-        #[cfg(not(target_family = "wasm"))]
         VectorType::Float32Dense => Ok(vector_f32_distance_cos_simsimd(
             v1.as_f32_slice(),
             v2.as_f32_slice(),
         )),
-        #[cfg(target_family = "wasm")]
-        VectorType::Float32Dense => Ok(vector_f32_distance_cos_rust(
-            v1.as_f32_slice(),
-            v2.as_f32_slice(),
-        )),
-        #[cfg(not(target_family = "wasm"))]
         VectorType::Float64Dense => Ok(vector_f64_distance_cos_simsimd(
-            v1.as_f64_slice(),
-            v2.as_f64_slice(),
-        )),
-        #[cfg(target_family = "wasm")]
-        VectorType::Float64Dense => Ok(vector_f64_distance_cos_rust(
             v1.as_f64_slice(),
             v2.as_f64_slice(),
         )),
@@ -86,11 +78,15 @@ fn vector_f8_distance_cos(v1: &Vector, v2: &Vector) -> f64 {
 }
 
 #[allow(dead_code)]
+#[cfg(not(any(
+    target_family = "wasm",
+    all(target_os = "windows", target_arch = "aarch64")
+)))]
 fn vector_f32_distance_cos_simsimd(v1: &[f32], v2: &[f32]) -> f64 {
     f32::cosine(v1, v2).unwrap_or(f64::NAN)
 }
 
-// SimSIMD do not support WASM for now, so we have alternative implementation: https://github.com/ashvardanian/SimSIMD/issues/189
+// SimSIMD does not support WASM, and Windows AArch64 has linker issues with simsimd.lib.
 #[allow(dead_code)]
 fn vector_f32_distance_cos_rust(v1: &[f32], v2: &[f32]) -> f64 {
     let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
@@ -106,11 +102,24 @@ fn vector_f32_distance_cos_rust(v1: &[f32], v2: &[f32]) -> f64 {
 }
 
 #[allow(dead_code)]
+#[cfg(any(
+    target_family = "wasm",
+    all(target_os = "windows", target_arch = "aarch64")
+))]
+fn vector_f32_distance_cos_simsimd(v1: &[f32], v2: &[f32]) -> f64 {
+    vector_f32_distance_cos_rust(v1, v2)
+}
+
+#[allow(dead_code)]
+#[cfg(not(any(
+    target_family = "wasm",
+    all(target_os = "windows", target_arch = "aarch64")
+)))]
 fn vector_f64_distance_cos_simsimd(v1: &[f64], v2: &[f64]) -> f64 {
     f64::cosine(v1, v2).unwrap_or(f64::NAN)
 }
 
-// SimSIMD do not support WASM for now, so we have alternative implementation: https://github.com/ashvardanian/SimSIMD/issues/189
+// SimSIMD does not support WASM, and Windows AArch64 has linker issues with simsimd.lib.
 #[allow(dead_code)]
 fn vector_f64_distance_cos_rust(v1: &[f64], v2: &[f64]) -> f64 {
     let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
@@ -123,6 +132,15 @@ fn vector_f64_distance_cos_rust(v1: &[f64], v2: &[f64]) -> f64 {
         return 0.0;
     }
     1.0 - dot / (norm1 * norm2).sqrt()
+}
+
+#[allow(dead_code)]
+#[cfg(any(
+    target_family = "wasm",
+    all(target_os = "windows", target_arch = "aarch64")
+))]
+fn vector_f64_distance_cos_simsimd(v1: &[f64], v2: &[f64]) -> f64 {
+    vector_f64_distance_cos_rust(v1, v2)
 }
 
 fn vector_f32_sparse_distance_cos(v1: VectorSparse<f32>, v2: VectorSparse<f32>) -> f64 {
