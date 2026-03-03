@@ -2646,7 +2646,15 @@ impl Optimizable for ast::Expr {
             // contain DoublyQualified nodes.
             Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
-            Expr::FunctionCall { args, name, .. } => {
+            Expr::FunctionCall {
+                args,
+                name,
+                filter_over,
+                ..
+            } => {
+                if filter_over.over_clause.is_some() {
+                    return false;
+                }
                 let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
                     return false;
                 };
