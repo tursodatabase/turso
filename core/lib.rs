@@ -1058,6 +1058,13 @@ impl Database {
 
         let header: HeaderRefMut = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
         let header_mut = header.borrow_mut();
+
+        if !header_mut.text_encoding.is_utf8() {
+            return Err(LimboError::UnsupportedEncoding(
+                header_mut.text_encoding.to_string(),
+            ));
+        }
+
         let (read_version, write_version) = { (header_mut.read_version, header_mut.write_version) };
 
         if encryption_key.is_none() && header_mut.magic != SQLITE_HEADER {
