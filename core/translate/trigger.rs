@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
@@ -8,6 +9,34 @@ use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, Connection, Result};
 use turso_parser::ast::{self, QualifiedName};
+
+/// Reject trigger WHEN expressions that contain subquery forms we do not support.
+/// This keeps invalid triggers out of schema so later DML does not get poisoned.
+pub(crate) fn validate_trigger_when_clause(when_clause: Option<&ast::Expr>) -> Result<()> {
+    let Some(when_clause) = when_clause else {
+        return Ok(());
+    };
+
+    let mut when_clause = when_clause.clone();
+    walk_expr_mut(
+        &mut when_clause,
+        &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+            match expr {
+                ast::Expr::Exists(_) => {
+                    crate::bail_parse_error!("EXISTS is not supported in this position")
+                }
+                ast::Expr::InSelect { .. } => {
+                    crate::bail_parse_error!("IN (...subquery) is not supported in this position")
+                }
+                ast::Expr::Subquery(_) => {
+                    crate::bail_parse_error!("Scalar subquery is not supported in this context")
+                }
+                _ => Ok(WalkControl::Continue),
+            }
+        },
+    )?;
+    Ok(())
+}
 
 /// Reconstruct SQL string from CREATE TRIGGER AST
 #[allow(clippy::too_many_arguments)]
@@ -88,6 +117,7 @@ pub fn translate_create_trigger(
     temporary: bool,
     if_not_exists: bool,
     time: Option<ast::TriggerTime>,
+    when_clause: Option<&ast::Expr>,
     tbl_name: QualifiedName,
     program: &mut ProgramBuilder,
     sql: String,
@@ -144,6 +174,8 @@ pub fn translate_create_trigger(
     if temporary {
         bail_parse_error!("TEMPORARY triggers are not supported yet");
     }
+
+    validate_trigger_when_clause(when_clause)?;
 
     let opts = ProgramBuilderOpts {
         num_cursors: 1,

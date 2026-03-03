@@ -5886,6 +5886,7 @@ pub(crate) fn emit_returning_scan_back(program: &mut ProgramBuilder, buf: &Retur
 /// When `returning_buffer` is `Some`, the results are buffered into an ephemeral table
 /// instead of being yielded immediately. A subsequent call to `emit_returning_scan_back`
 /// will drain the buffer and yield the rows to the caller.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn emit_returning_results<'a>(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
@@ -5894,6 +5895,7 @@ pub(crate) fn emit_returning_results<'a>(
     rowid_reg: usize,
     resolver: &mut Resolver<'a>,
     returning_buffer: Option<&ReturningBufferCtx>,
+    cache_len_override: Option<usize>,
 ) -> Result<()> {
     if result_columns.is_empty() {
         return Ok(());
@@ -5903,45 +5905,18 @@ pub(crate) fn emit_returning_results<'a>(
         table_references.joined_tables().len() == 1,
         "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table"
     );
-    let table = table_references.joined_tables().first().unwrap();
 
-    resolver.enable_expr_to_reg_cache();
-    let expr = Expr::RowId {
-        database: None,
-        table: table.internal_id,
-    };
-    let cache_len = resolver.expr_to_reg_cache.len();
-    resolver
-        .expr_to_reg_cache
-        .push((std::borrow::Cow::Owned(expr), rowid_reg, false));
-    for (i, column) in table.columns().iter().enumerate() {
-        let raw_reg = if column.is_rowid_alias() {
-            rowid_reg
-        } else {
-            reg_columns_start + i
-        };
-        // The write registers hold stored (encoded) values. Produce the
-        // user-facing value in a fresh register so RETURNING shows decoded
-        // results — this is a no-op for regular columns.
-        let decoded_reg = program.alloc_register();
-        emit_user_facing_column_value(
+    let cache_len = if let Some(cache_len) = cache_len_override {
+        cache_len
+    } else {
+        seed_returning_expr_cache(
             program,
-            raw_reg,
-            decoded_reg,
-            column,
-            table.table.is_strict(),
+            table_references,
+            reg_columns_start,
+            rowid_reg,
             resolver,
-        )?;
-        let expr = Expr::Column {
-            database: None,
-            table: table.internal_id,
-            column: i,
-            is_rowid_alias: column.is_rowid_alias(),
-        };
-        resolver
-            .expr_to_reg_cache
-            .push((std::borrow::Cow::Owned(expr), decoded_reg, false));
-    }
+        )?
+    };
 
     let result_start_reg = program.alloc_registers(result_columns.len());
 
@@ -5996,6 +5971,63 @@ pub(crate) fn emit_returning_results<'a>(
     }
 
     Ok(())
+}
+
+/// Seed resolver expression cache with the current DML row image used by RETURNING.
+/// Returns the cache length before seeding so callers can later restore it.
+pub(crate) fn seed_returning_expr_cache<'a>(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    reg_columns_start: usize,
+    rowid_reg: usize,
+    resolver: &mut Resolver<'a>,
+) -> Result<usize> {
+    turso_assert!(
+        table_references.joined_tables().len() == 1,
+        "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table"
+    );
+    let table = table_references.joined_tables().first().unwrap();
+
+    resolver.enable_expr_to_reg_cache();
+    let cache_len = resolver.expr_to_reg_cache.len();
+    let rowid_expr = Expr::RowId {
+        database: None,
+        table: table.internal_id,
+    };
+    resolver
+        .expr_to_reg_cache
+        .push((std::borrow::Cow::Owned(rowid_expr), rowid_reg, false));
+
+    for (i, column) in table.columns().iter().enumerate() {
+        let raw_reg = if column.is_rowid_alias() {
+            rowid_reg
+        } else {
+            reg_columns_start + i
+        };
+        // The write registers hold stored (encoded) values. Produce the
+        // user-facing value in a fresh register so RETURNING and correlated
+        // RETURNING subqueries observe decoded values.
+        let decoded_reg = program.alloc_register();
+        emit_user_facing_column_value(
+            program,
+            raw_reg,
+            decoded_reg,
+            column,
+            table.table.is_strict(),
+            resolver,
+        )?;
+        let expr = Expr::Column {
+            database: None,
+            table: table.internal_id,
+            column: i,
+            is_rowid_alias: column.is_rowid_alias(),
+        };
+        resolver
+            .expr_to_reg_cache
+            .push((std::borrow::Cow::Owned(expr), decoded_reg, false));
+    }
+
+    Ok(cache_len)
 }
 
 /// Get the number of values returned by an expression

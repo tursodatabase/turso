@@ -222,6 +222,7 @@ pub fn translate_inner(
                 temporary,
                 if_not_exists,
                 time,
+                when_clause.as_deref(),
                 tbl_name,
                 program,
                 sql,

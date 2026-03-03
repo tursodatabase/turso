@@ -1463,6 +1463,7 @@ impl Schema {
                         "invalid trigger sql: {sql}"
                     )));
                 };
+                crate::translate::trigger::validate_trigger_when_clause(when_clause.as_deref())?;
                 self.add_trigger(
                     Trigger::new(
                         trigger_name,
@@ -4267,5 +4268,41 @@ mod tests {
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_handle_schema_row_rejects_trigger_when_subquery() {
+        // Schema load must reject persisted trigger SQL that uses unsupported
+        // WHEN-subquery forms. Otherwise later DML can fail at runtime.
+        let mut schema = Schema::new();
+        let mut from_sql_indexes = Vec::new();
+        let mut automatic_indices = HashMap::default();
+        let mut dbsp_state_roots = HashMap::default();
+        let mut dbsp_state_index_roots = HashMap::default();
+        let mut materialized_view_info = HashMap::default();
+        let syms = SymbolTable::default();
+
+        let err = schema
+            .handle_schema_row(
+                "trigger",
+                "tr1",
+                "t1",
+                0,
+                Some(
+                    "CREATE TRIGGER tr1 AFTER INSERT ON t1 WHEN NOT EXISTS (SELECT 1) BEGIN SELECT 1; END",
+                ),
+                &syms,
+                &mut from_sql_indexes,
+                &mut automatic_indices,
+                &mut dbsp_state_roots,
+                &mut dbsp_state_index_roots,
+                &mut materialized_view_info,
+                true,
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, LimboError::ParseError(msg) if msg.contains("EXISTS is not supported in this position"))
+        );
     }
 }

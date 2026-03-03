@@ -10,7 +10,7 @@ use turso_macros::match_ignore_ascii_case;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{
-    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerEvent, TriggerTime,
+    self, Expr, Literal, ResolveType, TableInternalId, TriggerEvent, TriggerTime,
 };
 
 use super::aggregation::emit_ungrouped_aggregation;
@@ -28,7 +28,7 @@ use super::plan::{
     TableReferences, UpdatePlan,
 };
 use super::select::emit_simple_count;
-use super::subquery::emit_from_clause_subqueries;
+use super::subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_phase};
 use crate::error::{
     SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
 };
@@ -39,8 +39,8 @@ use crate::schema::{
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back, rewrite_between_expr,
-    translate_expr_no_constant_opt, walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason,
-    ReturningBufferCtx, WalkControl,
+    seed_returning_expr_cache, translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior,
+    NoConstantOptReason, ReturningBufferCtx, WalkControl,
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters, emit_fk_update_parent_actions,
@@ -48,12 +48,11 @@ use crate::translate::fkeys::{
     stabilize_new_row_for_fk, ForeignKeyActions,
 };
 use crate::translate::plan::{
-    DeletePlan, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinedTable, NonFromClauseSubquery,
-    Plan, QueryDestination, ResultSetColumn, Search,
+    DeletePlan, EphemeralRowidMode, IndexMethodQuery, JoinedTable, NonFromClauseSubquery, Plan,
+    QueryDestination, ResultSetColumn, Search, SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::planner::{table_mask_from_expr, TableMask};
-use crate::translate::subquery::emit_non_from_clause_subquery;
 use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
     TriggerContext,
@@ -74,41 +73,6 @@ use crate::{
     SymbolTable,
 };
 use crate::{CaptureDataChangesExt, Connection, QueryMode};
-
-/// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
-/// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).
-/// Non-correlated EXISTS subqueries are evaluated before the loop and their result_reg
-/// is already properly initialized and populated by emit_non_from_clause_subquery.
-fn init_exists_result_regs(
-    program: &mut ProgramBuilder,
-    expr: &ast::Expr,
-    non_from_clause_subqueries: &[NonFromClauseSubquery],
-) {
-    let _ = walk_expr(expr, &mut |e| {
-        if let ast::Expr::SubqueryResult {
-            subquery_id,
-            query_type: SubqueryType::Exists { result_reg },
-            ..
-        } = e
-        {
-            // Only initialize if the subquery hasn't been evaluated yet.
-            // Non-correlated EXISTS subqueries are evaluated before the loop and their
-            // result_reg is already set correctly. Initializing them here would overwrite
-            // the correct result with 0.
-            let already_evaluated = non_from_clause_subqueries
-                .iter()
-                .find(|s| s.internal_id == *subquery_id)
-                .is_some_and(|s| s.has_been_evaluated());
-            if !already_evaluated {
-                program.emit_insn(Insn::Integer {
-                    value: 0,
-                    dest: *result_reg,
-                });
-            }
-        }
-        Ok(WalkControl::Continue)
-    });
-}
 
 // Would make more sense to not have RwLock for the attached databases and get all the schemas on prepare,
 // because there could be some data race where at 1 point you check the attached db, it has a table,
@@ -163,9 +127,11 @@ impl<'a> Resolver<'a> {
             database_schemas: self.database_schemas,
             attached_databases: self.attached_databases,
             symbol_table: self.symbol_table,
-            expr_to_reg_cache_enabled: false,
-            expr_to_reg_cache: Vec::new(),
-            register_affinities: HashMap::default(),
+            // Keep the expression cache when entering nested contexts so correlated
+            // subqueries can resolve outer expressions mapped to registers.
+            expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
+            expr_to_reg_cache: self.expr_to_reg_cache.clone(),
+            register_affinities: self.register_affinities.clone(),
         }
     }
 
@@ -1263,28 +1229,18 @@ pub fn emit_query<'a>(
 ) -> Result<usize> {
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
+    let mut non_from_clause_subqueries = std::mem::take(&mut plan.non_from_clause_subqueries);
 
-    // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
-    // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
-    for subquery in plan
-        .non_from_clause_subqueries
-        .iter_mut()
-        .filter(|s| !s.has_been_evaluated())
-    {
-        let eval_at = subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?;
-        if eval_at != EvalAt::BeforeLoop {
-            continue;
-        }
-        let plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-        emit_non_from_clause_subquery(
-            program,
-            &t_ctx.resolver,
-            *plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
+    // Evaluate subqueries scheduled for before-loop emission first.
+    // This must happen before VALUES emission since VALUES expressions may depend on them.
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        &plan.join_order,
+        Some(&plan.table_references),
+        &mut non_from_clause_subqueries,
+        SubqueryEvalPhase::BeforeLoop,
+    )?;
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
@@ -1296,14 +1252,35 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
-    // For non-grouped aggregation queries that also have non-aggregate columns,
-    // we need to ensure non-aggregate columns are only emitted once.
-    // This flag helps track whether we've already emitted these columns.
-    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
-
-    if has_ungrouped_nonagg_cols {
+    // Ungrouped aggregate queries sometimes need a "loop ran" flag.
+    // It serves two purposes:
+    // 1) emit non-aggregate SELECT-list expressions only once in the loop body;
+    // 2) detect the empty-loop case so post-loop fallback logic can run.
+    //
+    // We only allocate it when needed to avoid unnecessary bytecode churn on
+    // aggregate-only queries that never need once-only emission or empty-loop replay.
+    let has_ungrouped_aggregation = !plan.aggregates.is_empty() && plan.group_by.is_none();
+    let has_ungrouped_nonagg_cols =
+        has_ungrouped_aggregation && plan.result_columns.iter().any(|c| !c.contains_aggregates);
+    let has_loop_phase_result_subqueries = if has_ungrouped_aggregation {
+        non_from_clause_subqueries
+            .iter()
+            .filter(|sq| {
+                matches!(
+                    sq.origin,
+                    SubqueryOrigin::Select(SubqueryPosition::ResultColumn)
+                )
+            })
+            .any(|sq| {
+                matches!(
+                    sq.get_eval_phase(&plan.join_order, Some(&plan.table_references)),
+                    Ok(SubqueryEvalPhase::Loop(_))
+                )
+            })
+    } else {
+        false
+    };
+    if has_ungrouped_nonagg_cols || has_loop_phase_result_subqueries {
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
@@ -1313,19 +1290,6 @@ pub fn emit_query<'a>(
     if t_ctx.reg_result_cols_start.is_none() {
         t_ctx.reg_result_cols_start = Some(program.alloc_registers(plan.result_columns.len()));
         program.reg_result_cols_start = t_ctx.reg_result_cols_start
-    }
-
-    // For ungrouped aggregates with non-aggregate columns, initialize EXISTS subquery
-    // result_regs to 0. EXISTS returns 0 (not NULL) when the subquery is never evaluated
-    // (correlated EXISTS in empty loop). Non-aggregate columns themselves are evaluated
-    // after the loop in emit_ungrouped_aggregation if the loop never ran.
-    // We only initialize EXISTS subqueries that haven't been evaluated yet (correlated ones).
-    if has_ungrouped_nonagg_cols {
-        for rc in plan.result_columns.iter() {
-            if !rc.contains_aggregates {
-                init_exists_result_regs(program, &rc.expr, &plan.non_from_clause_subqueries);
-            }
-        }
     }
 
     let has_group_by_exprs = plan
@@ -1354,6 +1318,7 @@ pub fn emit_query<'a>(
                 t_ctx,
                 group_by,
                 plan,
+                &non_from_clause_subqueries,
                 &plan.result_columns,
                 &plan.order_by,
             )?;
@@ -1409,7 +1374,7 @@ pub fn emit_query<'a>(
         OperationMode::SELECT,
         &plan.where_clause,
         &plan.join_order,
-        &mut plan.non_from_clause_subqueries,
+        &mut non_from_clause_subqueries,
     )?;
 
     if plan.is_simple_count() {
@@ -1431,7 +1396,7 @@ pub fn emit_query<'a>(
         &plan.where_clause,
         None,
         OperationMode::SELECT,
-        &mut plan.non_from_clause_subqueries,
+        &mut non_from_clause_subqueries,
     )?;
 
     // Process result columns and expressions in the inner loop
@@ -1462,12 +1427,12 @@ pub fn emit_query<'a>(
         if matches!(row_source, GroupByRowSource::Sorter { .. }) {
             group_by_agg_phase(program, t_ctx, plan)?;
         }
-        group_by_emit_row_phase(program, t_ctx, plan)?;
+        group_by_emit_row_phase(program, t_ctx, plan, &mut non_from_clause_subqueries)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
-        emit_ungrouped_aggregation(program, t_ctx, plan)?;
+        emit_ungrouped_aggregation(program, t_ctx, plan, &mut non_from_clause_subqueries)?;
     } else if plan.window.is_some() {
-        emit_window_results(program, t_ctx, plan)?;
+        emit_window_results(program, t_ctx, plan, &mut non_from_clause_subqueries)?;
     }
 
     // Process ORDER BY results if needed
@@ -1537,28 +1502,17 @@ fn emit_program_for_delete(
         })
         .collect::<Vec<_>>();
 
-    // Evaluate uncorrelated subqueries as early as possible (only for normal path without rowset)
-    // For the rowset path, subqueries are handled by emit_program_for_select on the rowset_plan.
+    // Evaluate subqueries scheduled for before-loop emission (only for normal path without rowset).
+    // For the rowset path, WHERE subqueries are handled by emit_program_for_select on the rowset plan.
     if plan.rowset_plan.is_none() {
-        for subquery in plan
-            .non_from_clause_subqueries
-            .iter_mut()
-            .filter(|s| !s.has_been_evaluated())
-        {
-            let eval_at = subquery.get_eval_at(&join_order, Some(&plan.table_references))?;
-            if eval_at != EvalAt::BeforeLoop {
-                continue;
-            }
-            let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-            emit_non_from_clause_subquery(
-                program,
-                &t_ctx.resolver,
-                *subquery_plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
-        }
+        emit_non_from_clause_subqueries_for_phase(
+            program,
+            &t_ctx.resolver,
+            &join_order,
+            Some(&plan.table_references),
+            &mut plan.non_from_clause_subqueries,
+            SubqueryEvalPhase::BeforeLoop,
+        )?;
     }
 
     // Initialize cursors and other resources needed for query execution
@@ -1652,6 +1606,7 @@ fn emit_program_for_delete(
             program,
             &mut t_ctx,
             &mut plan.table_references,
+            &mut plan.non_from_clause_subqueries,
             &plan.result_columns,
             rowid_reg,
             table_cursor_id,
@@ -1686,6 +1641,7 @@ fn emit_program_for_delete(
             program,
             &mut t_ctx,
             &mut plan.table_references,
+            &mut plan.non_from_clause_subqueries,
             &plan.result_columns,
             resolver,
             returning_buffer.as_ref(),
@@ -1858,11 +1814,13 @@ pub fn emit_fk_child_decrement_on_delete(
     Ok(())
 }
 
+#[expect(clippy::too_many_arguments)]
 fn emit_delete_insns<'a>(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
     table_references: &mut TableReferences,
+    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
     result_columns: &'a [super::plan::ResultSetColumn],
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
@@ -1988,6 +1946,7 @@ fn emit_delete_insns<'a>(
         program,
         t_ctx,
         table_references,
+        non_from_clause_subqueries,
         result_columns,
         table_reference,
         rowid_reg,
@@ -2032,6 +1991,7 @@ fn emit_delete_row_common(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &mut TableReferences,
+    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
     result_columns: &[super::plan::ResultSetColumn],
     table_reference: *const JoinedTable,
     rowid_reg: usize,
@@ -2202,27 +2162,52 @@ fn emit_delete_row_common(
             )?;
         }
 
-        // Emit RETURNING results if specified (must be before DELETE)
-        if !result_columns.is_empty() {
-            let columns_start_reg = columns_start_reg
-                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
-            // Emit RETURNING results using the values we just read
-            emit_returning_results(
-                program,
-                table_references,
-                result_columns,
-                columns_start_reg,
-                rowid_reg,
-                &mut t_ctx.resolver,
-                returning_buffer,
-            )?;
-        }
-
         program.emit_insn(Insn::Delete {
             cursor_id: main_table_cursor_id,
             table_name: table_name.to_string(),
             is_part_of_update: false,
         });
+    }
+
+    // Evaluate RETURNING subqueries and emit RETURNING rows after the DELETE side effects
+    // so subqueries that scan the target table observe post-delete state.
+    // Seed the cache first so correlated subqueries can still read the current row image
+    // without relying on the moved/deleted cursor position.
+    let returning_cache_len = if !result_columns.is_empty() {
+        let columns_start_reg = columns_start_reg
+            .expect("columns_start_reg must be provided when there are triggers or RETURNING");
+        Some(seed_returning_expr_cache(
+            program,
+            table_references,
+            columns_start_reg,
+            rowid_reg,
+            &mut t_ctx.resolver,
+        )?)
+    } else {
+        None
+    };
+
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        &[],
+        Some(table_references),
+        non_from_clause_subqueries,
+        SubqueryEvalPhase::DmlWritePost,
+    )?;
+    if !result_columns.is_empty() {
+        let columns_start_reg = columns_start_reg
+            .expect("columns_start_reg must be provided when there are triggers or RETURNING");
+        emit_returning_results(
+            program,
+            table_references,
+            result_columns,
+            columns_start_reg,
+            rowid_reg,
+            &mut t_ctx.resolver,
+            returning_buffer,
+            returning_cache_len,
+        )?;
     }
 
     // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
@@ -2249,6 +2234,7 @@ fn emit_delete_insns_when_triggers_present(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &mut TableReferences,
+    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
     result_columns: &[super::plan::ResultSetColumn],
     rowid_reg: usize,
     main_table_cursor_id: usize,
@@ -2357,6 +2343,7 @@ fn emit_delete_insns_when_triggers_present(
         program,
         t_ctx,
         table_references,
+        non_from_clause_subqueries,
         result_columns,
         table_reference,
         rowid_reg,
@@ -2528,55 +2515,18 @@ fn emit_program_for_update(
         })
         .collect::<Vec<_>>();
 
-    // Evaluate uncorrelated subqueries as early as possible (only for normal path without ephemeral table).
-    // For the ephemeral path, WHERE clause subqueries are handled by emit_program_for_select
-    // on the ephemeral_plan. SET clause subqueries remain in the main plan and are emitted
-    // inside the update loop (after open_loop) where the write cursor is correctly positioned.
+    // Evaluate subqueries scheduled for before-loop emission (only for normal path without
+    // ephemeral table). For the ephemeral path, WHERE subqueries are handled by
+    // emit_program_for_select on the ephemeral plan.
     if !has_ephemeral_table {
-        for subquery in plan
-            .non_from_clause_subqueries
-            .iter_mut()
-            .filter(|s| !s.has_been_evaluated())
-        {
-            let eval_at = subquery.get_eval_at(&join_order, Some(&plan.table_references))?;
-            if eval_at != EvalAt::BeforeLoop {
-                continue;
-            }
-            let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-            emit_non_from_clause_subquery(
-                program,
-                &t_ctx.resolver,
-                *subquery_plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
-        }
-    }
-
-    // For the ephemeral path, SET clause subqueries remain in plan.non_from_clause_subqueries
-    // (WHERE clause subqueries were moved to the ephemeral plan by the optimizer).
-    // These SET clause subqueries must be emitted inside the update loop, after NotExists
-    // positions the write cursor, so correlated references resolve to the correct cursor.
-    // Drain them into a separate Vec so init_loop/open_loop don't try to evaluate them.
-    let mut update_subqueries = if has_ephemeral_table {
-        plan.non_from_clause_subqueries.drain(..).collect()
-    } else {
-        Vec::new()
-    };
-
-    // Drain RETURNING subqueries so they aren't evaluated during the main loop scan.
-    // RETURNING subqueries must be emitted after Insert so that correlated column
-    // references read post-UPDATE values from the cursor.
-    {
-        let mut i = 0;
-        while i < plan.non_from_clause_subqueries.len() {
-            if plan.non_from_clause_subqueries[i].is_returning {
-                update_subqueries.push(plan.non_from_clause_subqueries.remove(i));
-            } else {
-                i += 1;
-            }
-        }
+        emit_non_from_clause_subqueries_for_phase(
+            program,
+            &t_ctx.resolver,
+            &join_order,
+            Some(&plan.table_references),
+            &mut plan.non_from_clause_subqueries,
+            SubqueryEvalPhase::BeforeLoop,
+        )?;
     }
 
     // Initialize the main loop
@@ -2721,7 +2671,7 @@ fn emit_program_for_update(
         target_table,
         resolver,
         returning_buffer.as_ref(),
-        &mut update_subqueries,
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     // Close the main loop
@@ -3133,25 +3083,15 @@ fn emit_update_insns<'a>(
         });
     }
 
-    // Emit remaining SET clause subqueries inside the loop, after the write cursor
-    // is positioned via NotExists. In the ephemeral path, these subqueries were kept
-    // in the main plan (not moved to the ephemeral plan) and need the write cursor
-    // to be positioned so correlated references resolve correctly.
-    // RETURNING subqueries are skipped here and emitted after Insert so that
-    // correlated column references read post-UPDATE values from the cursor.
-    for subquery in non_from_clause_subqueries
-        .iter_mut()
-        .filter(|s| !s.has_been_evaluated() && !s.is_returning)
-    {
-        let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
-        emit_non_from_clause_subquery(
-            program,
-            &t_ctx.resolver,
-            *subquery_plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
+    // Emit SET-clause subqueries after NotExists has positioned the write cursor.
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        &[],
+        Some(table_references),
+        non_from_clause_subqueries,
+        SubqueryEvalPhase::DmlWritePre,
+    )?;
 
     if is_virtual {
         program.emit_insn(Insn::Copy {
@@ -4471,21 +4411,15 @@ fn emit_update_insns<'a>(
             }
         }
 
-        // Emit RETURNING subqueries after Insert so that correlated column
-        // references read post-UPDATE values from the cursor.
-        for subquery in non_from_clause_subqueries
-            .iter_mut()
-            .filter(|s| !s.has_been_evaluated() && s.is_returning)
-        {
-            let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
-            emit_non_from_clause_subquery(
-                program,
-                &t_ctx.resolver,
-                *subquery_plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
-        }
+        // Emit RETURNING subqueries after the write.
+        emit_non_from_clause_subqueries_for_phase(
+            program,
+            &t_ctx.resolver,
+            &[],
+            Some(table_references),
+            non_from_clause_subqueries,
+            SubqueryEvalPhase::DmlWritePost,
+        )?;
 
         // Emit RETURNING results if specified
         if let Some(returning_columns) = &returning {
@@ -4498,6 +4432,7 @@ fn emit_update_insns<'a>(
                     rowid_set_clause_reg.unwrap_or(beg),
                     &mut t_ctx.resolver,
                     returning_buffer,
+                    None,
                 )?;
             }
         }

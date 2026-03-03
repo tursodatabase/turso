@@ -584,6 +584,36 @@ expect {
     1|hat
 }
 
+# Correlated subquery in ORDER BY clause (GROUP BY output phase)
+@cross-check-integrity
+test subquery-correlated-in-order-by-grouped {
+    create table t(a);
+    insert into t values (0), (1);
+    select a
+    from t
+    group by a
+    order by (select t.a) desc;
+}
+expect {
+    1
+    0
+}
+
+# Correlated ORDER BY subquery that references a GROUP BY key not present in SELECT list
+@cross-check-integrity
+test subquery-correlated-in-order-by-grouped-nonselected-key {
+    create table t(g, v);
+    insert into t values (1, 10), (2, 20), (2, 30);
+    select sum(v) as s
+    from t
+    group by g
+    order by (select t.g) desc;
+}
+expect {
+    50
+    10
+}
+
 # Uncorrelated subquery in HAVING clause
 @cross-check-integrity
 test subquery-uncorrelated-in-having {
@@ -617,6 +647,20 @@ expect {
     300|100
 }
 
+# Correlated subquery in HAVING clause (GROUP BY output phase)
+@cross-check-integrity
+test subquery-correlated-in-having-grouped {
+    create table t(g, v);
+    insert into t values (1, 10), (2, 20), (2, 30);
+    select sum(v) as s
+    from t
+    group by g
+    having (select t.g) = 2;
+}
+expect {
+    50
+}
+
 # Uncorrelated subquery in LIMIT clause
 @cross-check-integrity
 test subquery-in-limit {
@@ -643,6 +687,104 @@ test subquery-in-offset {
 expect {
     2|b
     3|c
+}
+
+# Correlated nested subquery in ORDER BY (GROUP BY output phase)
+@cross-check-integrity
+test subquery-correlated-in-order-by-grouped-nested {
+    create table t(g, v);
+    insert into t values (1, 5), (1, 1), (2, 3), (2, 7);
+    select g, sum(v) as s
+    from t o
+    group by g
+    order by (select max(i.v) from t i where i.g = o.g) desc, g;
+}
+expect {
+    2|10
+    1|6
+}
+
+# Correlated nested scalar subquery in GROUP BY
+@cross-check-integrity
+test subquery-correlated-in-group-by-nested {
+    create table t(g, v);
+    insert into t values (1, 10), (1, 20), (2, 30);
+    select (select (select o.g)) as grp, sum(v) as s
+    from t o
+    group by (select (select o.g))
+    order by grp;
+}
+expect {
+    1|30
+    2|30
+}
+
+# Correlated nested subquery in HAVING (GROUP BY output phase)
+@cross-check-integrity
+test subquery-correlated-in-having-grouped-nested {
+    create table t(g, v);
+    insert into t values (1, 10), (1, 20), (2, 30), (2, 40), (2, 50);
+    select g, sum(v)
+    from t o
+    group by g
+    having (select (select count(*) from t i where i.g = o.g) from (select 1)) = 2;
+}
+expect {
+    1|30
+}
+
+# Correlated subqueries in CASE WHEN/THEN branches
+@cross-check-integrity
+test subquery-correlated-in-case-branches {
+    create table t(id, grp, val);
+    insert into t values (1, 1, 10), (2, 1, 30), (3, 2, 5), (4, 2, 9);
+    select o.id,
+           case
+             when (select o.id % 2) = 0 then (select max(i.val) from t i where i.grp = o.grp)
+             else (select min(i.val) from t i where i.grp = o.grp)
+           end
+    from t o
+    order by o.id;
+}
+expect {
+    1|10
+    2|30
+    3|5
+    4|9
+}
+
+# Correlated scalar subquery wrapped by CAST and COLLATE
+@cross-check-integrity
+test subquery-correlated-in-cast-collate {
+    create table t(id, val);
+    insert into t values (1, 10), (2, 20);
+    select cast((select i.val from t i where i.id = o.id) as text) collate nocase
+    from t o
+    order by o.id;
+}
+expect {
+    10
+    20
+}
+
+# Correlated subquery in LIMIT is not legal in this scope.
+@cross-check-integrity
+test subquery-correlated-in-limit-error {
+    create table t(id);
+    insert into t values (1), (2), (3);
+    select id from t o order by id limit (select o.id);
+}
+expect error {
+}
+
+# Correlated subquery in OFFSET is not legal in this scope.
+@cross-check-integrity
+test subquery-correlated-in-offset-error {
+    create table t(id);
+    insert into t values (1), (2), (3);
+    select id from t o order by id limit 1 offset (select o.id);
+}
+expect error {
 }
 
 ### INCORRECT NUMBER OF RETURNED VALUES - ERROR TESTS ###
@@ -979,7 +1121,6 @@ expect {
 }
 
 # With actual ORDER BY effect (GROUP BY present, so ORDER BY is not cleared)
-# Uses uncorrelated subquery since correlated subqueries in ORDER BY are not yet supported
 @cross-check-integrity
 test subquery-exists-in-order-by-aggregate-with-group {
     create table t4(x, g);
@@ -1076,6 +1217,19 @@ expect {
 test subquery-correlated-exists-in-select-with-aggregate-empty-table {
     create table t6(id);
     select exists (select 1 where t6.id = 1), count(*) from t6;
+}
+expect {
+    0|0
+}
+
+# Correlated scalar COUNT subquery in SELECT list with aggregates on empty table.
+# The scalar subquery is loop-correlated, but with no input rows SQLite still emits
+# one aggregate row and the scalar COUNT result is 0 (not NULL).
+@cross-check-integrity
+test subquery-correlated-count-in-select-with-aggregate-empty-table {
+    create table t1(a integer, b integer);
+    create table t2(a integer, b integer);
+    select count(*), (select count(*) from t2 where t2.a = t1.a) from t1;
 }
 expect {
     0|0
