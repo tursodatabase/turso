@@ -100,12 +100,21 @@ impl Predicate {
         Self(ast::Expr::Subquery(select.to_sql_ast()))
     }
 
-    /// Create a qualified column reference (e.g. "table.column")
+    /// Create a qualified column reference (e.g. "table.column" or "db.table.column")
     pub fn qualified_column(table: &str, column: &str) -> Self {
-        Self(ast::Expr::Qualified(
-            ast::Name::from_string(table),
-            ast::Name::from_string(column),
-        ))
+        // Handle attached-database prefixed table names like "aux0.tablename"
+        if let Some((db, tbl)) = table.split_once('.') {
+            Self(ast::Expr::DoublyQualified(
+                ast::Name::from_string(db),
+                ast::Name::from_string(tbl),
+                ast::Name::from_string(column),
+            ))
+        } else {
+            Self(ast::Expr::Qualified(
+                ast::Name::from_string(table),
+                ast::Name::from_string(column),
+            ))
+        }
     }
 
     pub fn parens(self) -> Self {
