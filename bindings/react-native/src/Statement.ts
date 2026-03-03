@@ -293,7 +293,7 @@ export class Statement {
       // Fast path: native bulk read (handles step+read loop in C++)
       // Re-enters native after each IO resolution to stay on the fast path
       let rows: Row[] = [];
-      const MAX_IO_RETRIES = 10000;
+      const MAX_IO_RETRIES = 1000000;
 
       for (let ioRetries = 0; ioRetries < MAX_IO_RETRIES; ioRetries++) {
         const bulk = this._statement.getAllRows();
