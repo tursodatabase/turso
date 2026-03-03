@@ -26,7 +26,7 @@ def write_worker(db_path: str) -> int:
     val = random.randint(1, 100)
     conn = turso.connect(db_path)
     try:
-        conn.execute("PRAGMA journal_mode = 'mvcc'")
+        conn.execute("PRAGMA journal_mode = 'mvcc'").fetchone()
         while True:
             conn.execute("BEGIN CONCURRENT")
             try:
@@ -50,7 +50,7 @@ async def main() -> None:
 
     try:
         setup = turso.connect(db_path)
-        setup.execute("PRAGMA journal_mode = 'mvcc'")
+        setup.execute("PRAGMA journal_mode = 'mvcc'").fetchone()
         setup.execute("CREATE TABLE hits (val INTEGER)")
         setup.commit()
         setup.close()
@@ -62,7 +62,7 @@ async def main() -> None:
             print(f"inserted val={val}")
 
         final = turso.connect(db_path)
-        final.execute("PRAGMA journal_mode = 'mvcc'")
+        final.execute("PRAGMA journal_mode = 'mvcc'").fetchone()
         cur = final.execute("SELECT COUNT(*) FROM hits")
         row = cur.fetchone()
         print(f"total rows: {row[0]}")
