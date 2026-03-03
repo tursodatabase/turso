@@ -18,6 +18,14 @@ Basic example demonstrating local embedded database usage.
 python examples/basic.py
 ```
 
+## concurrent_writes.py
+
+MVCC mode: 16 concurrent writers using `BEGIN CONCURRENT` with conflict retry.
+
+```bash
+python examples/concurrent_writes.py
+```
+
 ## sync_example.py
 
 Demonstrates syncing with Turso Cloud, including optional remote encryption support.
