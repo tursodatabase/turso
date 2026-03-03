@@ -253,6 +253,22 @@ expect error {
 }
 
 @cross-check-integrity
+test upsert-unknown-qualified-column-do-update {
+    CREATE TABLE accounts(
+      id INTEGER PRIMARY KEY,
+      owner TEXT,
+      version INTEGER
+    );
+    INSERT INTO accounts(id, owner, version) VALUES (1, 'a', 1);
+    INSERT INTO accounts(id, owner) VALUES (1, 'b')
+      ON CONFLICT(id) DO UPDATE
+      SET version = accounts.versABS + 1;
+}
+expect error {
+    no such column: accounts\.versabs
+}
+
+@cross-check-integrity
 test upsert-values-returning-mixed {
     CREATE TABLE mix (k UNIQUE, v);
     INSERT INTO mix VALUES (1,'one');
