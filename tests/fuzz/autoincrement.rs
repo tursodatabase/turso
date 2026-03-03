@@ -1,10 +1,14 @@
 #[cfg(test)]
 mod autoincrement_fuzz_tests {
     use crate::helpers;
-    use core_tester::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
+    use core_tester::common::{
+        limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase,
+    };
     use rand::seq::IndexedRandom;
     use rand::Rng;
+    use rusqlite::params;
     use rusqlite::types::Value;
+    use std::sync::Arc;
 
     fn single_int(rows: &[Vec<Value>], label: &str) -> i64 {
         assert_eq!(rows.len(), 1, "{label}: expected 1 row, got {}", rows.len());
@@ -56,6 +60,44 @@ mod autoincrement_fuzz_tests {
     ) -> Option<i64> {
         let ids = fetch_limbo_ids(conn);
         ids.choose(rng).copied()
+    }
+
+    fn sequence_max(rows: &[Vec<Value>], label: &str) -> i64 {
+        let mut max_seq = 0;
+        for row in rows {
+            assert_eq!(
+                row.len(),
+                2,
+                "{label}: expected 2 columns (name, seq), got {}",
+                row.len()
+            );
+            let seq = match row[1] {
+                Value::Integer(v) => v,
+                ref v => panic!("{label}: expected integer seq, got {v:?}"),
+            };
+            max_seq = max_seq.max(seq);
+        }
+        max_seq
+    }
+
+    fn execute_outcome_parity(
+        db: &TempDatabase,
+        limbo_conn: &Arc<turso_core::Connection>,
+        sqlite_conn: &rusqlite::Connection,
+        stmt: &str,
+        ctx: &str,
+    ) -> bool {
+        let sqlite_res = sqlite_conn.execute(stmt, params![]);
+        let limbo_res = limbo_exec_rows_fallible(db, limbo_conn, stmt);
+        match (sqlite_res, limbo_res) {
+            (Ok(_), Ok(_)) => true,
+            (Err(_), Err(_)) => false,
+            (sqlite_outcome, limbo_outcome) => {
+                panic!(
+                    "statement outcome mismatch\n{ctx}\nstmt={stmt}\nsqlite={sqlite_outcome:?}\nlimbo={limbo_outcome:?}"
+                );
+            }
+        }
     }
 
     #[turso_macros::test(mvcc)]
@@ -158,6 +200,190 @@ mod autoincrement_fuzz_tests {
                 "SELECT id, payload FROM t ORDER BY id",
                 &ctx,
             );
+        }
+
+        helpers::assert_differential(
+            &limbo_conn,
+            &sqlite_conn,
+            "PRAGMA integrity_check",
+            &format!("seed={seed} final"),
+        );
+    }
+
+    #[turso_macros::test(mvcc)]
+    fn autoincrement_transactional_differential_fuzz(db: TempDatabase) {
+        let (mut rng, seed) =
+            helpers::init_fuzz_test("autoincrement_transactional_differential_fuzz");
+
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        helpers::execute_on_both(
+            &limbo_conn,
+            &sqlite_conn,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)",
+            "create table",
+        );
+
+        let iterations = std::env::var("FUZZ_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| helpers::fuzz_iterations(300));
+
+        let mut history: Vec<String> = Vec::with_capacity(iterations + 16);
+        let mut in_tx = false;
+        let mut tx_start_seq: Option<i64> = None;
+        let mut last_committed_seq: i64 = 0;
+
+        for step in 0..iterations {
+            helpers::log_progress(
+                "autoincrement_transactional_differential_fuzz",
+                step,
+                iterations,
+                8,
+            );
+
+            let action = rng.random_range(0..100);
+            let stmt = if in_tx {
+                if action < 18 {
+                    "COMMIT".to_string()
+                } else if action < 36 {
+                    "ROLLBACK".to_string()
+                } else if action < 60 {
+                    match maybe_random_existing_id(&mut rng, &limbo_conn) {
+                        Some(id) => format!("DELETE FROM t WHERE id = {id}"),
+                        None => continue,
+                    }
+                } else if action < 85 {
+                    match maybe_random_existing_id(&mut rng, &limbo_conn) {
+                        Some(id) => {
+                            let delta = rng.random_range(-5..=20);
+                            let new_id = id.saturating_add(delta);
+                            format!("UPDATE OR IGNORE t SET id = {new_id} WHERE id = {id}")
+                        }
+                        None => continue,
+                    }
+                } else {
+                    match maybe_random_existing_id(&mut rng, &limbo_conn) {
+                        Some(id) => {
+                            if rng.random_bool(0.5) {
+                                format!(
+                                    "INSERT OR ABORT INTO t(id, payload) VALUES ({id}, 'dup_{step}')"
+                                )
+                            } else {
+                                format!(
+                                    "INSERT OR ROLLBACK INTO t(id, payload) VALUES ({id}, 'dup_rb_{step}')"
+                                )
+                            }
+                        }
+                        None => continue,
+                    }
+                }
+            } else if action < 10 {
+                "BEGIN".to_string()
+            } else if action < 56 {
+                format!("INSERT INTO t(payload) VALUES ('tx_auto_{step}')")
+            } else if action < 74 {
+                let explicit_id = match rng.random_range(0..4) {
+                    0 => rng.random_range(1..=(last_committed_seq + 1).max(1)),
+                    1 => last_committed_seq + rng.random_range(1..=32),
+                    2 => rng.random_range(-50..=50),
+                    _ => rng.random_range(1..=200),
+                };
+                format!(
+                    "INSERT OR IGNORE INTO t(id, payload) VALUES ({explicit_id}, 'tx_explicit_{step}')"
+                )
+            } else if action < 86 {
+                match maybe_random_existing_id(&mut rng, &limbo_conn) {
+                    Some(id) => format!("DELETE FROM t WHERE id = {id}"),
+                    None => continue,
+                }
+            } else if action < 96 {
+                match maybe_random_existing_id(&mut rng, &limbo_conn) {
+                    Some(id) => {
+                        let delta = rng.random_range(-5..=20);
+                        let new_id = id.saturating_add(delta);
+                        format!("UPDATE OR IGNORE t SET id = {new_id} WHERE id = {id}")
+                    }
+                    None => continue,
+                }
+            } else {
+                match maybe_random_existing_id(&mut rng, &limbo_conn) {
+                    Some(id) => {
+                        format!("INSERT OR ABORT INTO t(id, payload) VALUES ({id}, 'dup_{step}')")
+                    }
+                    None => continue,
+                }
+            };
+
+            history.push(stmt.clone());
+            let ctx = format!(
+                "seed={seed} step={step} in_tx_before={in_tx}\nstmt={stmt}\nhistory:\n{}",
+                helpers::history_tail(&history, 40)
+            );
+
+            let success = execute_outcome_parity(&db, &limbo_conn, &sqlite_conn, &stmt, &ctx);
+
+            if success {
+                if stmt == "BEGIN" {
+                    in_tx = true;
+                } else if stmt == "COMMIT" || stmt == "ROLLBACK" {
+                    in_tx = false;
+                    tx_start_seq = None;
+                }
+            } else if in_tx && stmt.contains("OR ROLLBACK") {
+                in_tx = false;
+                tx_start_seq = None;
+            }
+
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                "SELECT id, payload FROM t ORDER BY id",
+                &ctx,
+            );
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                "SELECT name, seq FROM sqlite_sequence WHERE name='t' ORDER BY seq",
+                &ctx,
+            );
+
+            let seq_rows = limbo_exec_rows(
+                &limbo_conn,
+                "SELECT name, seq FROM sqlite_sequence WHERE name='t' ORDER BY seq",
+            );
+            let seq = sequence_max(&seq_rows, "sqlite_sequence rows");
+
+            if stmt == "BEGIN" && success {
+                tx_start_seq = Some(seq);
+            }
+            if stmt == "ROLLBACK" && success {
+                if let Some(start_seq) = tx_start_seq {
+                    assert_eq!(
+                        seq, start_seq,
+                        "ROLLBACK did not restore sqlite_sequence start value\nstart_seq={start_seq} end_seq={seq}\n{ctx}"
+                    );
+                }
+                tx_start_seq = None;
+            }
+            if !success && stmt.contains("OR ROLLBACK") {
+                if let Some(start_seq) = tx_start_seq {
+                    assert_eq!(
+                        seq, start_seq,
+                        "OR ROLLBACK conflict did not restore sqlite_sequence start value\nstart_seq={start_seq} end_seq={seq}\n{ctx}"
+                    );
+                }
+                tx_start_seq = None;
+            }
+
+            if !in_tx {
+                assert!(
+                    seq >= last_committed_seq,
+                    "committed sqlite_sequence decreased: prev={last_committed_seq} new={seq}\n{ctx}"
+                );
+                last_committed_seq = seq;
+            }
         }
 
         helpers::assert_differential(
