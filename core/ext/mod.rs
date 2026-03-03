@@ -75,12 +75,11 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 
         if kind == VTabKind::TableValuedFunction {
             if let Ok(vtab) = VirtualTable::function(&name_str, syms) {
-                // Use the schema handler to insert the table
                 let table = Arc::new(Table::Virtual(vtab));
                 let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
-                let guard = mutex.lock();
-                let schema_ptr = Arc::as_ptr(&*guard) as *mut Schema;
-                (*schema_ptr).tables.insert(name_str, table);
+                let mut guard = mutex.lock();
+                let schema = Arc::make_mut(&mut *guard);
+                schema.tables.insert(name_str, table);
             } else {
                 return ResultCode::Error;
             }
