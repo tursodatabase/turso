@@ -1,5 +1,5 @@
 /**
- * Concurrent writes with MVCC (experimental)
+ * Concurrent writes with MVCC
  *
  * BEGIN CONCURRENT lets multiple connections write at the same time without
  * holding an exclusive lock.  Conflicts are detected at commit time: if two

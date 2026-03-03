@@ -13,5 +13,5 @@ cargo run --package turso --example sync_example --features sync  # requires Tur
 |---------|-------------|
 | `example` | Basic queries, prepared statements, and pragma usage |
 | `example_struct` | Mapping rows to structs using transactions |
-| `concurrent_writes` | Experimental MVCC mode: 16 concurrent writers using `BEGIN CONCURRENT` |
+| `concurrent_writes` | MVCC mode: 16 concurrent writers using `BEGIN CONCURRENT` |
 | `sync_example` | Syncing with Turso Cloud (set `TURSO_REMOTE_URL` / `TURSO_AUTH_TOKEN`) |

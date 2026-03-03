@@ -1,7 +1,7 @@
 {
   "name": "concurrent-writes",
   "version": "1.0.0",
-  "description": "Experimental MVCC: concurrent writes with BEGIN CONCURRENT",
+  "description": "Concurrent writes with MVCC using BEGIN CONCURRENT",
   "main": "index.mjs",
   "type": "module",
   "scripts": {

@@ -20,8 +20,7 @@ python examples/basic.py
 
 ## concurrent_writes.py
 
-Experimental MVCC mode: 16 concurrent writers using `BEGIN CONCURRENT` with
-conflict retry.
+MVCC mode: 16 concurrent writers using `BEGIN CONCURRENT` with conflict retry.
 
 ```bash
 python examples/concurrent_writes.py
