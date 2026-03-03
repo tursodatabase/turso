@@ -2227,3 +2227,132 @@ expect {
     42
 }
 
+# Correlated scalar subquery in INSERT ... RETURNING
+@cross-check-integrity
+test insert-returning-correlated-subquery {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2)
+    RETURNING a, (SELECT t.a);
+}
+expect {
+    1|1
+    2|2
+}
+
+# Correlated scalar subquery in DELETE ... RETURNING
+@cross-check-integrity
+test delete-returning-correlated-subquery {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    DELETE FROM t WHERE a >= 2
+    RETURNING a, (SELECT t.a);
+}
+expect {
+    2|2
+    3|3
+}
+
+# Uncorrelated RETURNING subquery that reads the target table must be re-evaluated per row.
+@cross-check-integrity
+test delete-returning-subquery-reads-mutating-table {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    DELETE FROM t WHERE a <= 2
+    RETURNING a, (SELECT count(*) FROM t);
+}
+expect {
+    1|2
+    2|1
+}
+
+# UPDATE RETURNING subquery that reads the target table must be re-evaluated per row.
+@cross-check-integrity
+test update-returning-subquery-reads-mutating-table {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    UPDATE t SET a = a + 10 WHERE a <= 2
+    RETURNING a, (SELECT sum(a) FROM t);
+}
+expect {
+    11|16
+    12|26
+}
+
+# INSERT RETURNING subquery reading target table should observe statement writes.
+@cross-check-integrity
+test insert-returning-subquery-reads-mutating-table {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    INSERT INTO t VALUES (3), (4)
+    RETURNING a, (SELECT count(*) FROM t);
+}
+expect {
+    3|3
+    4|4
+}
+
+# Multiple uncorrelated target-table subqueries in RETURNING should track post-delete state.
+@cross-check-integrity
+test delete-returning-subquery-multiple-target-table-reads {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    DELETE FROM t WHERE a <= 2
+    RETURNING a, (SELECT count(*) FROM t), (SELECT sum(a) FROM t);
+}
+expect {
+    1|2|5
+    2|1|3
+}
+
+# DELETE alias should be visible in WHERE clause.
+@cross-check-integrity
+test delete-returning-delete-alias-qualified-where {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    DELETE FROM t AS o WHERE o.a = 1
+    RETURNING a;
+}
+expect {
+    1
+}
+
+# Correlated subquery in DELETE WHERE should resolve outer DELETE alias.
+@cross-check-integrity
+test delete-returning-delete-alias-correlated-subquery-in-where {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    DELETE FROM t AS o
+    WHERE EXISTS (SELECT 1 FROM t i WHERE i.a = o.a + 1)
+    RETURNING a;
+}
+expect {
+    1
+    2
+}
+
+# Subquery in DELETE WHERE (scalar) should work with RETURNING.
+@cross-check-integrity
+test delete-returning-where-scalar-subquery {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    DELETE FROM t
+    WHERE x = (SELECT MAX(x) FROM t)
+    RETURNING *;
+}
+expect {
+    3|30
+}
+
+# Subquery in DELETE WHERE (IN) should work with RETURNING.
+@cross-check-integrity
+test delete-returning-where-in-subquery {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (3), (5), (7);
+    DELETE FROM t
+    WHERE a IN (SELECT a FROM t WHERE a > 3)
+    RETURNING *;
+}
+expect {
+    5
+    7
+}

@@ -140,3 +140,17 @@ expect {
     1
 }
 
+# https://github.com/tursodatabase/turso/issues/3889
+@cross-check-integrity
+test orderby-subquery-correlated-outer-alias {
+    CREATE TABLE t1(x);
+    CREATE TABLE t2(y);
+    SELECT name AS s
+    FROM sqlite_schema
+    WHERE type = 'table' AND name IN ('t1', 't2')
+    ORDER BY (SELECT s) DESC;
+}
+expect {
+    t2
+    t1
+}
