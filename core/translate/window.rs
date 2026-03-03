@@ -7,10 +7,11 @@ use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::order_by::order_by_sorter_insert;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    SelectPlan, TableReferences, Window,
+    SelectPlan, SubqueryEvalPhase, TableReferences, Window,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
+use crate::translate::subquery::emit_non_from_clause_subqueries_for_phase;
 use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder, TableRefIdCounter};
@@ -978,6 +979,7 @@ pub fn emit_window_results(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
+    non_from_clause_subqueries: &mut [super::plan::NonFromClauseSubquery],
 ) -> crate::Result<()> {
     let WindowMetadata {
         labels,
@@ -1011,7 +1013,7 @@ pub fn emit_window_results(
         pc_if_empty: label_empty,
     });
 
-    emit_return_buffered_rows(program, window, t_ctx, plan)?;
+    emit_return_buffered_rows(program, window, t_ctx, plan, non_from_clause_subqueries)?;
 
     program.resolve_label(label_empty, program.offset());
 
@@ -1033,6 +1035,7 @@ fn emit_return_buffered_rows(
     window: &Window,
     t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
+    non_from_clause_subqueries: &mut [super::plan::NonFromClauseSubquery],
 ) -> crate::Result<()> {
     let WindowMetadata {
         labels,
@@ -1062,6 +1065,15 @@ fn emit_return_buffered_rows(
         program.emit_column_or_rowid(cursors.buffer_read, *col_idx, reg_result);
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
+
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        &plan.join_order,
+        Some(&plan.table_references),
+        non_from_clause_subqueries,
+        SubqueryEvalPhase::WindowOutput,
+    )?;
 
     match plan.order_by.is_empty() {
         true => {

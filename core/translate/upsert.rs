@@ -1263,6 +1263,7 @@ pub fn emit_upsert(
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
             resolver,
             ctx.returning_buffer.as_ref(),
+            None,
         )?;
     }
 

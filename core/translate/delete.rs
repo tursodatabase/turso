@@ -32,14 +32,18 @@ pub fn translate_delete(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(tbl_name)?;
-    let tbl_name = normalize_ident(tbl_name.name.as_str());
+    let table_name = normalize_ident(tbl_name.name.as_str());
+    let table_identifier = tbl_name
+        .alias
+        .as_ref()
+        .map_or_else(|| table_name.clone(), |alias| alias.as_str().to_string());
 
     // Check if this is a system table that should be protected from direct writes
     if !connection.is_nested_stmt()
         && !connection.is_mvcc_bootstrap_connection()
-        && crate::schema::is_system_table(&tbl_name)
+        && crate::schema::is_system_table(&table_name)
     {
-        crate::bail_parse_error!("table {} may not be modified", tbl_name);
+        crate::bail_parse_error!("table {} may not be modified", table_name);
     }
 
     if crate::is_attached_db(database_id) {
@@ -50,7 +54,8 @@ pub fn translate_delete(
     let mut delete_plan = prepare_delete_plan(
         program,
         resolver,
-        tbl_name,
+        table_name,
+        table_identifier,
         where_clause,
         limit,
         returning,
@@ -128,7 +133,8 @@ pub fn translate_delete(
 pub fn prepare_delete_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    tbl_name: String,
+    table_name: String,
+    table_identifier: String,
     where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
     mut returning: Vec<ResultColumn>,
@@ -137,28 +143,28 @@ pub fn prepare_delete_plan(
     database_id: usize,
 ) -> Result<Plan> {
     let schema = resolver.schema();
-    let table = match resolver.with_schema(database_id, |s| s.get_table(&tbl_name)) {
+    let table = match resolver.with_schema(database_id, |s| s.get_table(&table_name)) {
         Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", tbl_name),
+        None => crate::bail_parse_error!("no such table: {}", table_name),
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
-        crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
+        crate::bail_parse_error!("unsafe use of virtual table \"{}\"", table_name);
     }
 
     // Check if this is a materialized view
-    if schema.is_materialized_view(&tbl_name) {
-        crate::bail_parse_error!("cannot modify materialized view {}", tbl_name);
+    if schema.is_materialized_view(&table_name) {
+        crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
     // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(&tbl_name);
+    let incompatible_views = schema.has_incompatible_dependent_views(&table_name);
     if !incompatible_views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
             "Cannot DELETE from table '{}' because it has incompatible dependent materialized view(s): {}. \n\
              These views were created with a different DBSP version than the current version ({}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
-            tbl_name,
+            table_name,
             incompatible_views.join(", "),
             DBSP_CIRCUIT_VERSION
         );
@@ -177,7 +183,7 @@ pub fn prepare_delete_plan(
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         table,
-        identifier: tbl_name,
+        identifier: table_identifier,
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),

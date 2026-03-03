@@ -4,8 +4,12 @@ use super::{
     emitter::TranslateCtx,
     expr::{translate_condition_expr, translate_expr, ConditionMetadata},
     order_by::order_by_sorter_insert,
-    plan::{Distinctness, GroupBy, SelectPlan},
+    plan::{
+        Distinctness, GroupBy, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
+        SubqueryEvalPhaseFloor,
+    },
     result_row::emit_select_result,
+    subquery::emit_non_from_clause_subqueries_for_phase,
 };
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
@@ -90,6 +94,7 @@ pub fn init_group_by<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     group_by: &'a GroupBy,
     plan: &SelectPlan,
+    non_from_clause_subqueries: &[NonFromClauseSubquery],
     result_columns: &'a [ResultSetColumn],
     order_by: &'a [(Box<ast::Expr>, ast::SortOrder)],
 ) -> Result<()> {
@@ -97,6 +102,7 @@ pub fn init_group_by<'a>(
         &mut t_ctx.non_aggregate_expressions,
         group_by,
         plan,
+        non_from_clause_subqueries,
         result_columns,
         order_by,
     )?;
@@ -296,6 +302,7 @@ fn collect_non_aggregate_expressions<'a>(
     non_aggregate_expressions: &mut Vec<(&'a ast::Expr, bool)>,
     group_by: &'a GroupBy,
     plan: &SelectPlan,
+    non_from_clause_subqueries: &[NonFromClauseSubquery],
     root_result_columns: &'a [ResultSetColumn],
     order_by: &'a [(Box<ast::Expr>, ast::SortOrder)],
 ) -> Result<()> {
@@ -306,8 +313,15 @@ fn collect_non_aggregate_expressions<'a>(
         .chain(order_by.iter().map(|(e, _)| e.as_ref()))
         .chain(group_by.having.iter().flatten())
     {
-        collect_result_columns(expr, plan, &mut result_columns)?;
+        collect_result_columns(expr, plan, non_from_clause_subqueries, &mut result_columns)?;
     }
+
+    let has_deferred_subqueries = non_from_clause_subqueries.iter().any(|sq| {
+        !matches!(
+            sq.eval_phase_floor,
+            SubqueryEvalPhaseFloor::BeforeLoopOrLoop
+        )
+    });
 
     for group_expr in &group_by.exprs {
         let expr_appears_in_result_columns = result_columns
@@ -315,7 +329,12 @@ fn collect_non_aggregate_expressions<'a>(
             .any(|expr| exprs_are_equivalent(expr, group_expr))
             || root_result_columns
                 .iter()
-                .any(|rc| exprs_are_equivalent(&rc.expr, group_expr));
+                .any(|rc| exprs_are_equivalent(&rc.expr, group_expr))
+            // Post-loop subqueries (HAVING/ORDER BY/SELECT-list) may reference
+            // GROUP BY keys through outer-column bindings. Keep group keys
+            // materialized in accumulator registers so deferred translation can
+            // resolve those bindings without reading exhausted cursors.
+            || has_deferred_subqueries;
         non_aggregate_expressions.push((group_expr, expr_appears_in_result_columns));
     }
     for expr in result_columns {
@@ -335,6 +354,7 @@ fn collect_non_aggregate_expressions<'a>(
 fn collect_result_columns<'a>(
     root_expr: &'a ast::Expr,
     plan: &SelectPlan,
+    non_from_clause_subqueries: &[NonFromClauseSubquery],
     result_columns: &mut Vec<&'a ast::Expr>,
 ) -> Result<()> {
     walk_expr(root_expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
@@ -349,13 +369,26 @@ fn collect_result_columns<'a>(
                 }
             }
             // SubqueryResult is an exception because we can't "extract" columns from it
-            // unlike other expressions like function calls or direct column references,
-            // so we must add it so that the subquery result gets collected to the GROUP BY
-            // columns.
-            //
-            // However, if the subquery is of the form: 'aggregate_result IN (SELECT...)', we need to skip it because the aggregation
-            // is done later.
-            ast::Expr::SubqueryResult { lhs, .. } => {
+            // unlike other expressions like function calls or direct column references.
+            // We intentionally avoid collecting SubqueryResult itself here: a deferred
+            // subquery must be evaluated in its EvalPhase, not pre-materialized from an
+            // uninitialized/stale result register during the main loop.
+            ast::Expr::SubqueryResult {
+                subquery_id, lhs, ..
+            } => {
+                let should_materialize = non_from_clause_subqueries
+                    .iter()
+                    .find(|sq| sq.internal_id == *subquery_id)
+                    .is_none_or(|sq| {
+                        matches!(
+                            sq.eval_phase_floor,
+                            SubqueryEvalPhaseFloor::BeforeLoopOrLoop
+                        )
+                    });
+                if !should_materialize {
+                    return Ok(WalkControl::Continue);
+                }
+
                 if let Some(ref lhs) = lhs {
                     let mut lhs_contains_agg = false;
                     walk_expr(lhs, &mut |expr: &ast::Expr| -> Result<WalkControl> {
@@ -755,8 +788,8 @@ pub fn group_by_emit_row_phase<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
+    non_from_clause_subqueries: &mut [super::plan::NonFromClauseSubquery],
 ) -> Result<()> {
-    let group_by = plan.group_by.as_ref().expect("group by not found");
     let GroupByMetadata {
         labels, registers, ..
     } = t_ctx
@@ -828,7 +861,16 @@ pub fn group_by_emit_row_phase<'a>(
 
     t_ctx.resolver.enable_expr_to_reg_cache();
 
-    if let Some(having) = &group_by.having {
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        &plan.join_order,
+        Some(&plan.table_references),
+        non_from_clause_subqueries,
+        SubqueryEvalPhase::GroupByOutput,
+    )?;
+
+    if let Some(having) = &plan.group_by.as_ref().expect("group by not found").having {
         for expr in having.iter() {
             let if_true_target = program.allocate_label();
             translate_condition_expr(

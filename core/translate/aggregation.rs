@@ -1,4 +1,6 @@
+use rustc_hash::FxHashSet as HashSet;
 use turso_parser::ast;
+use turso_parser::ast::TableInternalId;
 
 use crate::{
     function::AggFunc,
@@ -14,12 +16,54 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     expr::{
-        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        translate_condition_expr, translate_expr, translate_expr_no_constant_opt, walk_expr,
+        ConditionMetadata, NoConstantOptReason, WalkControl,
     },
-    plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
+    plan::{Aggregate, Distinctness, SelectPlan, SubqueryEvalPhase, TableReferences},
     result_row::emit_select_result,
+    subquery::{emit_non_from_clause_subqueries_for_phase, emit_non_from_clause_subquery},
 };
+
+/// In ungrouped aggregation, expressions are evaluated once after the loop if no input
+/// row was seen. In that branch, run referenced loop-phase subqueries now so their
+/// result registers are populated from a NULL outer row context.
+fn emit_empty_loop_result_subqueries<'a>(
+    program: &mut ProgramBuilder,
+    t_ctx: &TranslateCtx<'a>,
+    plan: &'a SelectPlan,
+    non_from_clause_subqueries: &mut [super::plan::NonFromClauseSubquery],
+) -> Result<()> {
+    let mut needed = HashSet::<TableInternalId>::default();
+    for rc in &plan.result_columns {
+        walk_expr(&rc.expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+            if let ast::Expr::SubqueryResult { subquery_id, .. } = expr {
+                needed.insert(*subquery_id);
+                return Ok(WalkControl::SkipChildren);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    if needed.is_empty() {
+        return Ok(());
+    }
+
+    for subquery in non_from_clause_subqueries
+        .iter_mut()
+        .filter(|sq| needed.contains(&sq.internal_id))
+    {
+        let Some(replay_plan) = subquery.take_loop_replay_plan() else {
+            continue;
+        };
+        emit_non_from_clause_subquery(
+            program,
+            &t_ctx.resolver,
+            *replay_plan,
+            &subquery.query_type,
+            true,
+        )?;
+    }
+    Ok(())
+}
 
 /// Emits the bytecode for processing an aggregate without a GROUP BY clause.
 /// This is called when the main query execution loop has finished processing,
@@ -28,6 +72,7 @@ pub fn emit_ungrouped_aggregation<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
+    non_from_clause_subqueries: &mut [super::plan::NonFromClauseSubquery],
 ) -> Result<()> {
     let agg_start_reg = t_ctx.reg_agg_start.unwrap();
 
@@ -49,6 +94,15 @@ pub fn emit_ungrouped_aggregation<'a>(
         ));
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
+
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        &plan.join_order,
+        Some(&plan.table_references),
+        non_from_clause_subqueries,
+        SubqueryEvalPhase::UngroupedAggregationOutput,
+    )?;
 
     // Allocate a label for the end (used by both HAVING and OFFSET to skip row emission)
     let end_label = program.allocate_label();
@@ -125,6 +179,7 @@ pub fn emit_ungrouped_aggregation<'a>(
                 }
             }
         }
+        emit_empty_loop_result_subqueries(program, t_ctx, plan, non_from_clause_subqueries)?;
         // Evaluate non-aggregate columns now (with cursor in invalid state, columns return NULL)
         // Must use no_constant_opt to prevent constant hoisting which would place the label
         // after the hoisted constants, causing infinite loops in compound selects.

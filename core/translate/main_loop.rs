@@ -14,10 +14,10 @@ use super::{
     optimizer::{constraints::BinaryExprSide, Optimizable},
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
-        Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, IterationDirection,
+        Aggregate, DistinctCtx, Distinctness, HashJoinOp, HashJoinType, IterationDirection,
         JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery, Operation,
         QueryDestination, Scan, Search, SeekDef, SeekKey, SeekKeyComponent, SelectPlan,
-        SetOperation, TableReferences, WhereTerm,
+        SetOperation, SubqueryEvalPhase, TableReferences, WhereTerm,
     },
 };
 use crate::{
@@ -29,7 +29,7 @@ use crate::{
         expr::comparison_affinity,
         planner::{table_mask_from_expr, TableMask},
         result_row::emit_select_result,
-        subquery::emit_non_from_clause_subquery,
+        subquery::emit_non_from_clause_subqueries_for_phase_with_filter,
         window::emit_window_loop_source,
     },
     turso_assert, turso_assert_eq,
@@ -1965,13 +1965,19 @@ pub fn open_loop(
         }
     }
 
-    if subqueries.iter().any(|s| !s.has_been_evaluated()) {
+    let mut unevaluated_before_or_loop = 0usize;
+    for subquery in subqueries.iter().filter(|s| !s.has_been_evaluated()) {
+        if subquery
+            .get_eval_phase(join_order, Some(table_references))?
+            .is_before_or_loop()
+        {
+            unevaluated_before_or_loop += 1;
+        }
+    }
+    if unevaluated_before_or_loop > 0 {
         crate::bail_parse_error!(
-            "all subqueries should have already been emitted, but found {} unevaluated subqueries",
-            subqueries
-                .iter()
-                .filter(|s| !s.has_been_evaluated())
-                .count()
+            "all before-loop/loop subqueries should have already been emitted, but found {} unevaluated subqueries",
+            unevaluated_before_or_loop
         );
     }
 
@@ -2025,28 +2031,23 @@ fn emit_correlated_subqueries(
     subqueries: &mut [NonFromClauseSubquery],
     on_only: bool,
 ) -> Result<()> {
-    for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
-        if !subquery.correlated {
-            continue;
-        }
-        if on_only && !subquery_referenced_in_predicates(predicates, true, subquery.internal_id) {
-            continue;
-        }
-        let eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
-        if eval_at != EvalAt::Loop(join_index) {
-            continue;
-        }
-
-        let plan = subquery.consume_plan(eval_at);
-        emit_non_from_clause_subquery(
-            program,
-            resolver,
-            *plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
-    Ok(())
+    emit_non_from_clause_subqueries_for_phase_with_filter(
+        program,
+        resolver,
+        join_order,
+        Some(table_references),
+        subqueries,
+        SubqueryEvalPhase::Loop(join_index),
+        |subquery| {
+            if !subquery.correlated {
+                return false;
+            }
+            if on_only {
+                return subquery_referenced_in_predicates(predicates, true, subquery.internal_id);
+            }
+            true
+        },
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

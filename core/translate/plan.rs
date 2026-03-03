@@ -239,6 +239,43 @@ impl Ord for EvalAt {
     }
 }
 
+/// Concrete emission phase for a non-FROM subquery.
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+pub enum SubqueryEvalPhase {
+    /// Run once before any join loops start.
+    BeforeLoop,
+    /// Run while a specific join-loop is active.
+    Loop(usize),
+    /// Run while producing GROUP BY output rows.
+    GroupByOutput,
+    /// Run while producing the single output row of an ungrouped aggregate query.
+    UngroupedAggregationOutput,
+    /// Run while producing rows from a window query output buffer.
+    WindowOutput,
+    /// Run before DML write opcode(s) execute.
+    DmlWritePre,
+    /// Run after DML write opcode(s) execute.
+    DmlWritePost,
+}
+
+impl SubqueryEvalPhase {
+    /// True when the phase is tied to pre-loop or in-loop execution.
+    pub fn is_before_or_loop(self) -> bool {
+        matches!(
+            self,
+            SubqueryEvalPhase::BeforeLoop | SubqueryEvalPhase::Loop(_)
+        )
+    }
+
+    /// Convert old loop-based scheduling to a concrete emission phase.
+    fn from_eval_at(eval_at: EvalAt) -> Self {
+        match eval_at {
+            EvalAt::BeforeLoop => SubqueryEvalPhase::BeforeLoop,
+            EvalAt::Loop(i) => SubqueryEvalPhase::Loop(i),
+        }
+    }
+}
+
 /// A query plan is either a SELECT or a DELETE (for now)
 #[derive(Debug, Clone)]
 pub enum Plan {
@@ -2240,17 +2277,21 @@ pub enum SubqueryState {
     /// is translated into bytecode.
     Unevaluated { plan: Option<Box<SelectPlan>> },
     /// The subquery has been evaluated.
-    /// The [evaluated_at] field contains the loop index where the subquery was evaluated.
     /// The query plan struct no longer exists because translating the plan currently
     /// requires an ownership transfer. We retain the outer table references so
     /// later masking/evaluation logic can still reason about dependencies.
     Evaluated {
-        /// Join-loop position where the subquery was emitted into bytecode.
-        evaluated_at: EvalAt,
+        /// Emission phase where the subquery was translated into bytecode.
+        evaluated_phase: SubqueryEvalPhase,
         /// Outer table ids referenced by the subquery when it was planned.
         /// We keep these so later analysis can still understand dependencies
         /// even after the plan is consumed.
         outer_ref_ids: Vec<TableInternalId>,
+        /// Optional replay plan for loop-phase subqueries.
+        /// This is used for ungrouped aggregate queries when the main loop
+        /// reads zero rows and loop-phase subqueries must still run once with
+        /// a NULL outer-row context.
+        loop_replay_plan: Option<Box<SelectPlan>>,
     },
 }
 
@@ -2266,14 +2307,8 @@ pub enum SubqueryPosition {
 
 impl SubqueryPosition {
     /// Returns true if a subquery in this position of the SELECT can be correlated, i.e. if it can reference columns from the outer query.
-    /// FIXME: HAVING and ORDER BY should allow correlated subqueries, but our translation system currently does not support this well.
-    /// Subqueries in these positions should be evaluated after the main loop, AND they should also have access to aggregations computed
-    /// in the main query.
     pub fn allow_correlated(&self) -> bool {
-        matches!(
-            self,
-            SubqueryPosition::ResultColumn | SubqueryPosition::Where | SubqueryPosition::GroupBy
-        )
+        !matches!(self, SubqueryPosition::LimitOffset)
     }
 
     pub fn name(&self) -> &'static str {
@@ -2288,19 +2323,70 @@ impl SubqueryPosition {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryOrigin {
+    /// Subquery found inside a SELECT statement.
+    Select(SubqueryPosition),
+    /// Subquery found inside DELETE/UPDATE WHERE.
+    DmlWhere,
+    /// Subquery found inside VALUES expressions.
+    Values,
+    /// Subquery found inside UPDATE SET expressions.
+    SetClause,
+    /// Subquery found inside RETURNING expressions.
+    Returning,
+}
+
+impl SubqueryOrigin {
+    /// Returns true if this origin allows correlated subqueries.
+    pub fn allow_correlated(&self) -> bool {
+        match self {
+            SubqueryOrigin::Select(position) => position.allow_correlated(),
+            SubqueryOrigin::DmlWhere
+            | SubqueryOrigin::Values
+            | SubqueryOrigin::SetClause
+            | SubqueryOrigin::Returning => true,
+        }
+    }
+
+    /// Human-readable name used in parse error messages.
+    pub fn name(&self) -> &'static str {
+        match self {
+            SubqueryOrigin::Select(position) => position.name(),
+            SubqueryOrigin::DmlWhere => "WHERE",
+            SubqueryOrigin::Values => "VALUES",
+            SubqueryOrigin::SetClause => "SET",
+            SubqueryOrigin::Returning => "RETURNING",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryEvalPhaseFloor {
+    /// Subquery may run before-loop or in-loop, based on outer references.
+    BeforeLoopOrLoop,
+    /// Subquery cannot run before grouped rows are available.
+    GroupByOutput,
+    /// Subquery cannot run before ungrouped aggregate output is available.
+    UngroupedAggregationOutput,
+    /// Subquery cannot run before window output rows are available.
+    WindowOutput,
+    /// Subquery must run before statement write effects.
+    DmlWritePre,
+    /// Subquery must run after statement write effects.
+    DmlWritePost,
+}
+
 #[derive(Debug, Clone)]
 /// A subquery that is not part of the `FROM` clause.
 /// This is used for subqueries in the WHERE clause, HAVING clause, ORDER BY clause, LIMIT clause, OFFSET clause, etc.
-/// Currently only subqueries in the WHERE clause are supported.
 pub struct NonFromClauseSubquery {
     pub internal_id: TableInternalId,
     pub query_type: SubqueryType,
     pub state: SubqueryState,
     pub correlated: bool,
-    /// Whether this subquery originates from a RETURNING clause.
-    /// RETURNING subqueries must be evaluated after the Insert instruction
-    /// so that correlated column references read post-UPDATE values.
-    pub is_returning: bool,
+    pub origin: SubqueryOrigin,
+    pub eval_phase_floor: SubqueryEvalPhaseFloor,
 }
 
 impl NonFromClauseSubquery {
@@ -2321,20 +2407,53 @@ impl NonFromClauseSubquery {
     ) -> Result<EvalAt> {
         let plan = match &self.state {
             SubqueryState::Unevaluated { plan } => plan.as_ref().unwrap(),
-            SubqueryState::Evaluated { evaluated_at, .. } => {
-                return Ok(*evaluated_at);
+            SubqueryState::Evaluated { .. } => {
+                panic!("get_eval_at called for an already evaluated subquery");
             }
         };
         eval_at_for_select_plan(plan, join_order, table_references)
+    }
+
+    pub fn get_eval_phase(
+        &self,
+        join_order: &[JoinOrderMember],
+        table_references: Option<&TableReferences>,
+    ) -> Result<SubqueryEvalPhase> {
+        // If already emitted, reuse the concrete phase that was used.
+        if let SubqueryState::Evaluated {
+            evaluated_phase, ..
+        } = &self.state
+        {
+            return Ok(*evaluated_phase);
+        }
+
+        // Otherwise compute loop timing first, then raise it to the minimum phase
+        // required by the expression position (HAVING/ORDER BY/RETURNING/etc).
+        let eval_at = self.get_eval_at(join_order, table_references)?;
+        Ok(match self.eval_phase_floor {
+            SubqueryEvalPhaseFloor::BeforeLoopOrLoop => SubqueryEvalPhase::from_eval_at(eval_at),
+            SubqueryEvalPhaseFloor::GroupByOutput => SubqueryEvalPhase::GroupByOutput,
+            SubqueryEvalPhaseFloor::UngroupedAggregationOutput => {
+                SubqueryEvalPhase::UngroupedAggregationOutput
+            }
+            SubqueryEvalPhaseFloor::WindowOutput => SubqueryEvalPhase::WindowOutput,
+            SubqueryEvalPhaseFloor::DmlWritePre => SubqueryEvalPhase::DmlWritePre,
+            SubqueryEvalPhaseFloor::DmlWritePost => SubqueryEvalPhase::DmlWritePost,
+        })
     }
 
     /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
     ///
     /// This captures any outer references before the plan is moved so later
     /// phases can still reason about dependencies.
-    pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<SelectPlan> {
+    pub fn consume_plan(&mut self, evaluated_phase: SubqueryEvalPhase) -> Box<SelectPlan> {
         match &mut self.state {
             SubqueryState::Unevaluated { plan } => {
+                let loop_replay_plan = if matches!(evaluated_phase, SubqueryEvalPhase::Loop(_)) {
+                    plan.as_ref().map(|p| Box::new((**p).clone()))
+                } else {
+                    None
+                };
                 let outer_ref_ids = plan
                     .as_ref()
                     .map(|plan| {
@@ -2348,8 +2467,9 @@ impl NonFromClauseSubquery {
                     .unwrap_or_default();
                 let plan = plan.take().unwrap();
                 self.state = SubqueryState::Evaluated {
-                    evaluated_at,
+                    evaluated_phase,
                     outer_ref_ids,
+                    loop_replay_plan,
                 };
                 plan
             }
@@ -2357,6 +2477,23 @@ impl NonFromClauseSubquery {
                 panic!("subquery has already been evaluated");
             }
         }
+    }
+
+    /// Take a replay plan for a loop-evaluated subquery, if available.
+    /// The replay plan is consumed so fallback emission happens at most once.
+    pub fn take_loop_replay_plan(&mut self) -> Option<Box<SelectPlan>> {
+        let SubqueryState::Evaluated {
+            evaluated_phase,
+            loop_replay_plan,
+            ..
+        } = &mut self.state
+        else {
+            return None;
+        };
+        if !matches!(evaluated_phase, SubqueryEvalPhase::Loop(_)) {
+            return None;
+        }
+        loop_replay_plan.take()
     }
 }
 

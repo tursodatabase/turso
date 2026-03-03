@@ -7,7 +7,8 @@ use super::{
     plan::{
         Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        Plan, QueryDestination, ResultSetColumn, Scan, SubqueryEvalPhase, TableReferences,
+        WhereTerm,
     },
     select::prepare_select_plan,
 };
@@ -1617,9 +1618,23 @@ pub fn determine_where_to_eval_expr(
                     crate::bail_parse_error!("subquery not found");
                 };
                 match &subquery.state {
-                    SubqueryState::Evaluated { evaluated_at, .. } => {
-                        eval_at = eval_at.max(*evaluated_at);
-                    }
+                    SubqueryState::Evaluated {
+                        evaluated_phase, ..
+                    } => match evaluated_phase {
+                        SubqueryEvalPhase::BeforeLoop => {}
+                        SubqueryEvalPhase::Loop(loop_idx) => {
+                            eval_at = eval_at.max(EvalAt::Loop(*loop_idx));
+                        }
+                        SubqueryEvalPhase::GroupByOutput
+                        | SubqueryEvalPhase::UngroupedAggregationOutput
+                        | SubqueryEvalPhase::WindowOutput
+                        | SubqueryEvalPhase::DmlWritePre
+                        | SubqueryEvalPhase::DmlWritePost => {
+                            panic!(
+                                    "where-term dependency analysis encountered subquery evaluated at non-loop phase"
+                                );
+                        }
+                    },
                     SubqueryState::Unevaluated { plan } => {
                         let used_outer_refs = plan
                             .as_ref()

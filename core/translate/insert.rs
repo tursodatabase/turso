@@ -19,12 +19,12 @@ use crate::{
             open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
+            ColumnUsedMask, JoinedTable, Operation, QueryDestination, ResultSetColumn,
+            SubqueryEvalPhase, TableReferences,
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
-        subquery::{emit_non_from_clause_subquery, plan_subqueries_from_returning},
+        subquery::{emit_non_from_clause_subqueries_for_phase, plan_subqueries_from_returning},
         trigger_exec::{
             fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
             TriggerContext,
@@ -415,26 +415,6 @@ pub fn translate_insert(
         &values,
         inserting_multiple_rows,
     )?;
-
-    // Emit subqueries for RETURNING clause (uncorrelated subqueries are evaluated once)
-    for subquery in returning_subqueries
-        .iter_mut()
-        .filter(|s| !s.has_been_evaluated())
-    {
-        let eval_at = subquery.get_eval_at(&[], Some(&table_references))?;
-        if eval_at != EvalAt::BeforeLoop {
-            continue;
-        }
-        let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-        emit_non_from_clause_subquery(
-            program,
-            resolver,
-            *subquery_plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
 
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 
@@ -873,6 +853,14 @@ pub fn translate_insert(
 
     // Emit RETURNING results if specified
     if !result_columns.is_empty() {
+        emit_non_from_clause_subqueries_for_phase(
+            program,
+            resolver,
+            &[],
+            Some(&table_references),
+            &mut returning_subqueries,
+            SubqueryEvalPhase::DmlWritePost,
+        )?;
         emit_returning_results(
             program,
             &table_references,
@@ -881,6 +869,7 @@ pub fn translate_insert(
             insertion.key_register(),
             resolver,
             ctx.returning_buffer.as_ref(),
+            None,
         )?;
     }
     program.emit_insn(Insn::Goto {
