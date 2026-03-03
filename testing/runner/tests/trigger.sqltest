@@ -1674,3 +1674,37 @@ test trigger-raise-fail-delete {
 expect error {
     delete fail
 }
+
+# https://github.com/tursodatabase/turso/issues/5174
+@backend rust
+test trigger-when-rejects-exists-subquery-at-create {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER tr1 AFTER INSERT ON t1 WHEN NOT EXISTS (SELECT 1) BEGIN
+      INSERT INTO t1 VALUES(NEW.id + 100, 'auto');
+    END;
+}
+expect error {
+    EXISTS is not supported in this position
+}
+
+@backend rust
+test trigger-when-rejects-in-subquery-at-create {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER tr2 AFTER INSERT ON t1 WHEN NEW.id IN (SELECT 1) BEGIN
+      INSERT INTO t1 VALUES(NEW.id + 100, 'auto');
+    END;
+}
+expect error {
+    IN
+}
+
+@backend rust
+test trigger-when-rejects-scalar-subquery-at-create {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER tr3 AFTER INSERT ON t1 WHEN NEW.id = (SELECT 1) BEGIN
+      INSERT INTO t1 VALUES(NEW.id + 100, 'auto');
+    END;
+}
+expect error {
+    Scalar subquery is not supported in this context
+}
