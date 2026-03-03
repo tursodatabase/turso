@@ -722,7 +722,7 @@ def test_fuzzy():
 
 def test_decimal():
     turso = TestTursoShell(init_commands="")
-    ext_path = "./target/debug/liblimbo_decimal"
+    ext_path = "./target/debug/libturso_decimal"
     turso.run_test_fn(
         "SELECT decimal('0.1');",
         lambda res: "error: no such function: " in res,
