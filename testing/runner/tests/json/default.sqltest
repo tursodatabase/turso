@@ -2602,6 +2602,35 @@ expect {
     c|3|integer
 }
 
+test json_each_nested_subquery_table_call_keeps_arguments {
+    SELECT EXISTS (
+        SELECT 1
+        FROM json_each('["delete"]')
+        WHERE value IN (SELECT value FROM json_each('["delete"]'))
+    );
+}
+expect {
+    1
+}
+
+test json_each_nested_subquery_correlated_delete {
+    CREATE TABLE important_data(id INTEGER PRIMARY KEY, value TEXT);
+    INSERT INTO important_data VALUES (1, 'keep'), (2, 'delete'), (3, 'keep');
+
+    DELETE FROM important_data
+    WHERE EXISTS (
+        SELECT 1
+        FROM json_each('["delete"]')
+        WHERE value IN (SELECT value FROM json_each('["delete"]'))
+        AND important_data.value = json_each.value
+    );
+
+    SELECT COUNT(*) FROM important_data;
+}
+expect {
+    2
+}
+
 test json-each-no-arguments {
     SELECT * FROM json_each();
 }
