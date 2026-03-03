@@ -302,3 +302,12 @@ test autoinc-fail-on-non-integer-pk-mixed-case-string-name {
 }
 expect error {
 }
+
+# regression test for https://github.com/tursodatabase/turso/issues/5703
+test autoinc-expicit-negative-rowid-initializes-seq-table {
+	CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT);
+	INSERT OR IGNORE INTO t(id,payload) VALUES (-42, 'tx_explicit_0');
+	SELECT name, seq FROM sqlite_sequence WHERE name='t';
+} expect {
+	t|0
+}
