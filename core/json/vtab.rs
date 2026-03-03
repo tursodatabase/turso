@@ -228,6 +228,9 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         _idx_str: Option<String>,
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
+        self.traversal_states.clear();
+        self.rowid = 0;
+
         if args.is_empty() {
             return Ok(false);
         }
