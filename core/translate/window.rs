@@ -453,8 +453,9 @@ pub struct WindowRegisters {
     /// Start of the register array storing per-function state for window functions.
     /// Aggregates use `AggStep` to populate their state.
     pub acc_start: usize,
-    /// Start of the register array storing current accumulator results for each window function
-    /// (populated by `AggValue` when computing results without clearing accumulators).
+    /// Start of the register array storing per-function outputs. Aggregate windows
+    /// populate these via `AggValue`; window-only functions like ROW_NUMBER()
+    /// keep their running state here.
     pub acc_result_start: usize,
     /// Stores the address to which control returns after all buffered rows are flushed.
     pub flush_buffer_return_offset: usize,
@@ -817,7 +818,7 @@ fn emit_reset_state_if_new_partition(
     });
     for (i, func) in window.functions.iter().enumerate() {
         if matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)) {
-            program.emit_int(0, registers.acc_start + i);
+            program.emit_int(0, registers.acc_result_start + i);
         }
     }
 
@@ -1062,6 +1063,8 @@ fn emit_return_buffered_rows(
 
     let label_skip_returning_row = program.allocate_label();
     let label_loop_start = program.allocate_label();
+    let reg_one = program.alloc_register();
+    program.emit_int(1, reg_one);
     program.preassign_label_to_next_insn(label_loop_start);
 
     // Propagate subquery result column values to the outer query (if any) or directly to
@@ -1073,15 +1076,11 @@ fn emit_return_buffered_rows(
     }
     for (i, func) in window.functions.iter().enumerate() {
         if let WindowFunctionKind::Window(WindowFunc::RowNumber) = &func.func {
-            let reg_row_number = registers.acc_start + i;
-            program.emit_insn(Insn::AddImm {
-                register: reg_row_number,
-                value: 1,
-            });
-            program.emit_insn(Insn::Copy {
-                src_reg: reg_row_number,
-                dst_reg: registers.acc_result_start + i,
-                extra_amount: 0,
+            let reg_row_number = registers.acc_result_start + i;
+            program.emit_insn(Insn::Add {
+                lhs: reg_row_number,
+                rhs: reg_one,
+                dest: reg_row_number,
             });
         }
     }

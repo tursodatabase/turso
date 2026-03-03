@@ -83,7 +83,7 @@ addr  opcode                    p1  p2  p3  p4                     p5  comment
   57      NotNull               30  61   0                          0  r[30]!=NULL -> goto 61
   58      Copy                  33  32   0                          0  r[32]=r[33]; initialize previous peer register for new partition
   59      Null                   0  25  25                          0  r[25..25]=NULL; reset accumulator registers
-  60      Integer                0  25   0                          0  r[25]=0
+  60      Integer                0  26   0                          0  r[26]=0
   61      Compare               32  33   1  k(1, Binary)            0  r[32..32]==r[33..33]; compare ORDER BY columns to detect peer
   62      Jump                  63  65  63                          0
   63      Gosub                 31  70   0                          0  ; detected non-peer row
@@ -94,17 +94,17 @@ addr  opcode                    p1  p2  p3  p4                     p5  comment
   68    Goto                     0  55   0                          0
   69    Null                     0  31   0                          0  r[31]=NULL; return remaining buffered rows
   70    Rewind                   4  82   0                          0  Rewind  ephemeral(buffer_table_window_0)
-  71      Column                 4   1  27                          0  r[27]=ephemeral(buffer_table_window_0).department
-  72      Column                 4   2  28                          0  r[28]=ephemeral(buffer_table_window_0).column 2
-  73      Column                 4   0  29                          0  r[29]=ephemeral(buffer_table_window_0).column 0
-  74      AddImm                25   1   0                          0  r[25]=r[25]+1
-  75      Copy                  25  26   0                          0  r[26]=r[25]
+  71    Integer                  1  35   0                          0  r[35]=1
+  72      Column                 4   1  27                          0  r[27]=ephemeral(buffer_table_window_0).department
+  73      Column                 4   2  28                          0  r[28]=ephemeral(buffer_table_window_0).column 2
+  74      Column                 4   0  29                          0  r[29]=ephemeral(buffer_table_window_0).column 0
+  75      Add                   26  35  26                          0  r[26]=r[26]+r[35]
   76      Copy                  27  21   0                          0  r[21]=r[27]
   77      Copy                  28  22   0                          0  r[22]=r[28]
   78      Copy                  29  23   0                          0  r[23]=r[29]
   79      Copy                  26  24   0                          0  r[24]=r[26]
   80      ResultRow             21   4   0                          0  output=r[21..24]
-  81    Next                     4  71   0                          0
+  81    Next                     4  72   0                          0
   82    ResetSorter              4   0   0                          0  cursor=4
   83  Return                    31   0   1                          0
   84  Halt                       0   0   0                          0

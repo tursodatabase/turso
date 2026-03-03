@@ -319,23 +319,19 @@ impl WindowFunc {
             Self::RowNumber => &[0],
         }
     }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::RowNumber => "row_number",
-        }
-    }
 }
 
 impl Deterministic for WindowFunc {
     fn is_deterministic(&self) -> bool {
-        false
+        true
     }
 }
 
 impl std::fmt::Display for WindowFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        match self {
+            Self::RowNumber => write!(f, "row_number"),
+        }
     }
 }
 
