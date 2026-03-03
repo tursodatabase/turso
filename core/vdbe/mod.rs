@@ -35,7 +35,7 @@ pub use crate::translate::collate::CollationSeq;
 use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
-    mvcc::{database::CommitStateMachine, LocalClock},
+    mvcc::{database::CommitStateMachine, MvccClock},
     numeric::Numeric,
     return_if_io,
     schema::Trigger,
@@ -215,11 +215,11 @@ enum CommitState {
     /// Committing attached database pagers after main pager commit is done.
     CommittingAttached,
     CommittingMvcc {
-        state_machine: StateMachine<CommitStateMachine<LocalClock>>,
+        state_machine: StateMachine<CommitStateMachine<MvccClock>>,
     },
     /// Committing MVCC transactions on attached databases after main MVCC commit is done.
     CommittingAttachedMvcc {
-        state_machine: StateMachine<CommitStateMachine<LocalClock>>,
+        state_machine: StateMachine<CommitStateMachine<MvccClock>>,
         db_id: usize,
         mv_store: Arc<MvStore>,
     },
@@ -1758,7 +1758,7 @@ impl Program {
     #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
     fn step_end_mvcc_txn(
         &self,
-        commit_state: &mut StateMachine<CommitStateMachine<LocalClock>>,
+        commit_state: &mut StateMachine<CommitStateMachine<MvccClock>>,
         mv_store: &Arc<MvStore>,
     ) -> Result<IOResult<()>> {
         commit_state.step(mv_store)
