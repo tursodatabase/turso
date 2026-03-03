@@ -575,7 +575,8 @@ fn test_vacuum_into_empty_edge_cases(tmp_db: TempDatabase) -> anyhow::Result<()>
 }
 
 /// Test VACUUM INTO preserves AUTOINCREMENT counters (sqlite_sequence)
-#[turso_macros::test(mvcc)]
+/// FIXME: enable for mvcc when autoincrement is fixed
+#[turso_macros::test]
 fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 

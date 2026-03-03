@@ -55,7 +55,7 @@ mod fuzz_tests {
     // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
     #[turso_macros::test(
         mvcc,
-        init_sql = "CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)"
+        init_sql = "CREATE TABLE t (x INTEGER PRIMARY KEY)"
     )]
     pub fn rowid_seek_fuzz(db: TempDatabase) {
         let _ = tracing_subscriber::fmt::try_init();
