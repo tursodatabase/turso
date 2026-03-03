@@ -126,6 +126,17 @@ expect {
     1235|2
 }
 
+# First explicit insert with a non-positive rowid still initializes sqlite_sequence.
+@cross-check-integrity
+test autoinc-explicit-negative-initializes-sequence-zero {
+    CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
+    INSERT OR IGNORE INTO t1(x, y) VALUES(-43, 'neg');
+    SELECT name, seq FROM sqlite_sequence WHERE name='t1';
+}
+expect {
+    t1|0
+}
+
 # Test: AUTOINCREMENT works for multiple tables independently.
 @cross-check-integrity
 test autoinc-multiple-tables {
