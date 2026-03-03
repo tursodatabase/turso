@@ -1,4 +1,5 @@
 @database :memory:
+@skip-file-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 
 setup schema {
     CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id < 5), val TEXT);

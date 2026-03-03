@@ -905,6 +905,7 @@ expect {
 # Autoincrement with ON CONFLICT
 # =============================================================================
 
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 @cross-check-integrity
 test insert-or-ignore-autoincrement {
     CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT UNIQUE);
@@ -918,6 +919,7 @@ expect {
     3|three
 }
 
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 @cross-check-integrity
 test insert-or-replace-autoincrement {
     CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT UNIQUE);
