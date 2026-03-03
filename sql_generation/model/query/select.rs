@@ -256,7 +256,13 @@ fn collect_subquery_tables(select: &ast::Select, tables: &mut IndexSet<String>) 
 fn collect_select_table_names(select_table: &ast::SelectTable, tables: &mut IndexSet<String>) {
     match select_table {
         ast::SelectTable::Table(qname, _, _) => {
-            tables.insert(qname.name.as_str().to_owned());
+            // Reconstruct the full name including db prefix (e.g. "aux0.tablename")
+            // to match how the simulator tracks attached-database tables.
+            let name = match &qname.db_name {
+                Some(db) => format!("{}.{}", db.as_str(), qname.name.as_str()),
+                None => qname.name.as_str().to_owned(),
+            };
+            tables.insert(name);
         }
         ast::SelectTable::Select(sub, _) => {
             collect_subquery_tables(sub, tables);
