@@ -94,6 +94,48 @@ impl Select {
         }
     }
 
+    /// Build a query like:
+    /// SELECT COUNT(*), (SELECT COUNT(*) FROM inner_table WHERE inner_table.col = outer_table.col)
+    /// FROM outer_table WHERE where_clause
+    pub fn count_with_correlated_subquery(
+        outer_table: String,
+        inner_table: String,
+        outer_corr_col: String,
+        inner_corr_col: String,
+        where_clause: Predicate,
+    ) -> Self {
+        let inner_select = Select::single(
+            inner_table.clone(),
+            vec![ResultColumn::Expr(Predicate::count_star())],
+            Predicate::eq(
+                Predicate::qualified_column(&inner_table, &inner_corr_col),
+                Predicate::qualified_column(&outer_table, &outer_corr_col),
+            ),
+            None,
+            Distinctness::All,
+        );
+
+        Select {
+            body: SelectBody {
+                select: Box::new(SelectInner {
+                    distinctness: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr(Predicate::count_star()),
+                        ResultColumn::Expr(Predicate::subquery(inner_select)),
+                    ],
+                    from: Some(FromClause {
+                        table: SelectTable::Table(outer_table),
+                        joins: Vec::new(),
+                    }),
+                    where_clause,
+                    order_by: None,
+                }),
+                compounds: Vec::new(),
+            },
+            limit: None,
+        }
+    }
+
     pub fn compound(left: Select, right: Select, operator: CompoundOperator) -> Self {
         let mut body = left.body;
         body.compounds.push(CompoundSelect {
@@ -107,13 +149,20 @@ impl Select {
     }
 
     pub fn dependencies(&self) -> IndexSet<String> {
-        if self.body.select.from.is_none() {
-            return IndexSet::new();
-        }
-        let from = self.body.select.from.as_ref().unwrap();
         let mut tables = IndexSet::new();
 
-        tables.extend(from.dependencies());
+        if let Some(from) = &self.body.select.from {
+            tables.extend(from.dependencies());
+        }
+
+        // Collect tables referenced by subquery expressions in result columns
+        for col in &self.body.select.columns {
+            if let ResultColumn::Expr(pred) = col {
+                if let ast::Expr::Subquery(sub_select) = &pred.0 {
+                    collect_subquery_tables(sub_select, &mut tables);
+                }
+            }
+        }
 
         for compound in &self.body.compounds {
             tables.extend(
@@ -186,6 +235,40 @@ pub struct FromClause {
 pub enum SelectTable {
     Table(String),
     Select(Select),
+}
+
+/// Extract table names from an ast::Select (used for subquery dependency tracking).
+fn collect_subquery_tables(select: &ast::Select, tables: &mut IndexSet<String>) {
+    if let ast::SelectBody {
+        select:
+            ast::OneSelect::Select {
+                from: Some(from_clause),
+                ..
+            },
+        ..
+    } = &select.body
+    {
+        collect_select_table_names(&from_clause.select, tables);
+    }
+}
+
+/// Extract table names from an ast::SelectTable.
+fn collect_select_table_names(select_table: &ast::SelectTable, tables: &mut IndexSet<String>) {
+    match select_table {
+        ast::SelectTable::Table(qname, _, _) => {
+            // Reconstruct the full name including db prefix (e.g. "aux0.tablename")
+            // to match how the simulator tracks attached-database tables.
+            let name = match &qname.db_name {
+                Some(db) => format!("{}.{}", db.as_str(), qname.name.as_str()),
+                None => qname.name.as_str().to_owned(),
+            };
+            tables.insert(name);
+        }
+        ast::SelectTable::Select(sub, _) => {
+            collect_subquery_tables(sub, tables);
+        }
+        _ => {}
+    }
 }
 
 /// Convert a table name string to a QualifiedName, handling attached DB prefixes.

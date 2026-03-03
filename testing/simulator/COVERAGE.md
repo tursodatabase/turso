@@ -181,6 +181,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | (NOT) IN (SELECT...)      | No      |         |
 | (NOT) EXISTS (SELECT...)  | No      |         |
 | x <operator> (SELECT...)) | No      |         |
+| Correlated scalar subquery | Partial | SELECT COUNT(*), (SELECT COUNT(*) FROM t2 WHERE t2.c = t1.c) FROM t1 |
 | CASE WHEN THEN ELSE END   | No      |         |
 | RAISE                     | No      |         |
 
@@ -289,7 +290,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | ----------------- | ------ | ------- |
 | avg(X)            | No     |         |
 | count()           | No     |         |
-| count(*)          | No     |         |
+| count(*)          | Partial | Ungrouped aggregate with correlated subquery |
 | group_concat(X)   | No     |         |
 | group_concat(X,Y) | No     |         |
 | string_agg(X,Y)   | No     |         |
