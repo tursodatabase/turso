@@ -651,8 +651,6 @@ pub fn translate_insert(
                 seq_cursor_id,
                 r_seq_rowid,
                 table_name_reg,
-                fallback_rowid_reg,
-                use_fixed_rowid_for_sequence,
                 seq_to_write_reg,
             )?;
             program.preassign_label_to_next_insn(explicit_done_label);
