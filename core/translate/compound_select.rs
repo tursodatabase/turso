@@ -1,13 +1,13 @@
 use crate::schema::{Index, IndexColumn};
 use crate::sync::Arc;
 use crate::translate::collate::get_collseq_from_expr;
-use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
+use crate::translate::emitter::{select::emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
-use crate::{emit_explain, LimboError, QueryMode};
+use crate::{emit_explain, LimboError};
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
 

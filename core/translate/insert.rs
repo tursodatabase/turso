@@ -4,8 +4,8 @@ use crate::{
     sync::Arc,
     translate::{
         emitter::{
-            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_cdc_patch_record, emit_check_constraints, emit_fk_child_decrement_on_delete,
+            delete::emit_fk_child_decrement_on_delete, emit_cdc_autocommit_commit,
+            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
             prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{

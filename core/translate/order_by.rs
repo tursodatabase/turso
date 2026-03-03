@@ -15,7 +15,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u16, IdxInsertFlags, Insn},
     },
-    QueryMode, Result,
+    Result,
 };
 
 use super::{

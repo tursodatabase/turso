@@ -9,7 +9,7 @@ use crate::{
     translate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
-        emitter::emit_program_for_select,
+        emitter::select::{emit_program_for_select, emit_query},
         expr::{
             compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
         },
@@ -26,11 +26,11 @@ use crate::{
         insn::Insn,
         CursorID,
     },
-    Connection, QueryMode, Result,
+    Connection, Result,
 };
 
 use super::{
-    emitter::{emit_query, Resolver, TranslateCtx},
+    emitter::{Resolver, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
     planner::resolve_window_and_aggregate_functions,
