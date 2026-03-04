@@ -396,6 +396,17 @@ pub struct ProgramState {
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
+    /// Whether this statement opened a savepoint on the main database.
+    ///
+    /// Nested helper statements run with subtransactions disabled and must not
+    /// release/rollback the parent statement's savepoint.
+    main_stmt_savepoint_active: bool,
+    /// Attached MVCC databases where this statement opened a statement savepoint.
+    ///
+    /// We must only release/rollback savepoints that were opened by this
+    /// statement. Nested helper statements run with subtransactions disabled
+    /// and must not touch parent statement savepoints.
+    attached_mvcc_savepoint_dbs: Vec<usize>,
     uses_subjournal: bool,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
@@ -485,6 +496,8 @@ impl ProgramState {
             rowsets: HashMap::default(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
+            main_stmt_savepoint_active: false,
+            attached_mvcc_savepoint_dbs: Vec::new(),
             uses_subjournal: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
@@ -597,6 +610,8 @@ impl ProgramState {
         self.hash_tables.clear();
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
+        self.main_stmt_savepoint_active = false;
+        self.attached_mvcc_savepoint_dbs.clear();
         self.uses_subjournal = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
@@ -625,11 +640,13 @@ impl ProgramState {
         pager: &Arc<Pager>,
         write: bool,
     ) -> Result<IOResult<()>> {
+        self.main_stmt_savepoint_active = false;
         if write {
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
             if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
                     mv_store.begin_savepoint(tx_id);
+                    self.main_stmt_savepoint_active = true;
                 }
             } else {
                 // Non-MVCC mode: use pager savepoints
@@ -642,6 +659,7 @@ impl ProgramState {
                 }
                 result?;
                 self.uses_subjournal = true;
+                self.main_stmt_savepoint_active = true;
             }
         }
 
@@ -667,22 +685,31 @@ impl ProgramState {
     ) -> Result<()> {
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
+        let attached_mvcc_dbs: Vec<usize> = self.attached_mvcc_savepoint_dbs.drain(..).collect();
         let result = 'outer: {
             match end_statement {
                 EndStatement::ReleaseSavepoint => {
                     if let Some(mv_store) = connection.mv_store().as_ref() {
-                        if let Some(tx_id) = connection.get_mv_tx_id() {
-                            mv_store.release_savepoint(tx_id);
+                        if self.main_stmt_savepoint_active {
+                            if let Some(tx_id) = connection.get_mv_tx_id() {
+                                mv_store.release_savepoint(tx_id);
+                            }
                         }
-                        // Release savepoints on attached MVCC databases.
-                        connection.for_each_attached_mv_tx(|db_id, tx_id| {
-                            if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
+                        // Release savepoints only for attached MVCC DBs where this
+                        // statement actually opened one.
+                        for db_id in &attached_mvcc_dbs {
+                            if let (Some(attached_mv), Some(tx_id)) = (
+                                connection.mv_store_for_db(*db_id),
+                                connection.get_mv_tx_id_for_db(*db_id),
+                            ) {
                                 attached_mv.release_savepoint(tx_id);
                             }
-                        });
+                        }
                         Ok(()) // MVCC mode: no pager savepoint to release
                     } else {
-                        pager.release_savepoint()?;
+                        if self.main_stmt_savepoint_active {
+                            pager.release_savepoint()?;
+                        }
                         for p in &attached_pagers {
                             p.release_savepoint()?;
                         }
@@ -690,36 +717,59 @@ impl ProgramState {
                     }
                 }
                 EndStatement::RollbackSavepoint => {
+                    // If no statement savepoint was opened, there's nothing to undo.
+                    // This is common for nested helper statements where subtransactions
+                    // are intentionally disabled.
+                    if !self.main_stmt_savepoint_active
+                        && attached_mvcc_dbs.is_empty()
+                        && attached_pagers.is_empty()
+                        && connection.mv_store().is_none()
+                    {
+                        break 'outer Ok(());
+                    }
+
+                    let mut rolled_back_any_savepoint = false;
                     if let Some(mv_store) = connection.mv_store().as_ref() {
-                        if let Some(tx_id) = connection.get_mv_tx_id() {
-                            // Returns false if no savepoint was active - don't reset FK counters
-                            if !mv_store.rollback_first_savepoint(tx_id)? {
-                                break 'outer Ok(());
-                            }
-                        }
-                        // Rollback savepoints on attached MVCC databases.
-                        let mut attached_err = None;
-                        connection.for_each_attached_mv_tx(|db_id, tx_id| {
-                            if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
-                                if let Err(e) = attached_mv.rollback_first_savepoint(tx_id) {
-                                    attached_err = Some(e);
+                        if self.main_stmt_savepoint_active {
+                            if let Some(tx_id) = connection.get_mv_tx_id() {
+                                // Returns false if no savepoint was active - don't reset FK counters
+                                if mv_store.rollback_first_savepoint(tx_id)? {
+                                    rolled_back_any_savepoint = true;
                                 }
                             }
-                        });
-                        if let Some(e) = attached_err {
-                            break 'outer Err(e);
+                        }
+                        // Rollback savepoints only for attached MVCC DBs where this
+                        // statement actually opened one.
+                        for db_id in &attached_mvcc_dbs {
+                            if let (Some(attached_mv), Some(tx_id)) = (
+                                connection.mv_store_for_db(*db_id),
+                                connection.get_mv_tx_id_for_db(*db_id),
+                            ) {
+                                if attached_mv.rollback_first_savepoint(tx_id)? {
+                                    rolled_back_any_savepoint = true;
+                                }
+                            }
                         }
                     } else {
-                        match pager.rollback_to_newest_savepoint() {
-                            // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
-                            // caused the error or not. If it didn't, don't reset any FK violation counters.
-                            Ok(false) => break 'outer Ok(()),
-                            Err(err) => break 'outer Err(err),
-                            _ => {}
+                        if self.main_stmt_savepoint_active {
+                            match pager.rollback_to_newest_savepoint() {
+                                // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
+                                // caused the error or not. If it didn't, don't reset any FK violation counters.
+                                Ok(false) => {}
+                                Ok(true) => {
+                                    rolled_back_any_savepoint = true;
+                                }
+                                Err(err) => break 'outer Err(err),
+                            }
                         }
                         for p in &attached_pagers {
-                            p.rollback_to_newest_savepoint()?;
+                            if p.rollback_to_newest_savepoint()? {
+                                rolled_back_any_savepoint = true;
+                            }
                         }
+                    }
+                    if !rolled_back_any_savepoint {
+                        break 'outer Ok(());
                     }
                     // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
                     // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
@@ -739,6 +789,8 @@ impl ProgramState {
         for p in &attached_pagers {
             p.stop_use_subjournal();
         }
+        self.main_stmt_savepoint_active = false;
+        self.attached_mvcc_savepoint_dbs.clear();
         result
     }
 
@@ -1785,6 +1837,21 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        let mut index_methods_rolled_back = false;
+        let mut rollback_index_methods =
+            |state: &mut ProgramState, abort_error: &mut Option<LimboError>| {
+                if index_methods_rolled_back {
+                    return;
+                }
+                if let Err(rollback_err) = execute::index_method_rollback_all(state) {
+                    capture_abort_error(
+                        abort_error,
+                        rollback_err,
+                        "Failed to rollback index method state during abort",
+                    );
+                }
+                index_methods_rolled_back = true;
+            };
 
         if self.is_trigger_subprogram() {
             self.connection.end_trigger_execution();
@@ -1810,6 +1877,7 @@ impl Program {
                             "Failed to rollback statement savepoint during abort",
                         );
                     }
+                    rollback_index_methods(state, &mut abort_error);
                 }
             }
             match err {
@@ -1832,6 +1900,7 @@ impl Program {
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
                     if self.connection.get_auto_commit() {
+                        rollback_index_methods(state, &mut abort_error);
                         self.rollback_current_txn(pager);
                     }
                 }
@@ -1848,6 +1917,7 @@ impl Program {
                     };
                     match effective_resolve {
                         ResolveType::Rollback => {
+                            rollback_index_methods(state, &mut abort_error);
                             self.rollback_current_txn(pager);
                         }
                         ResolveType::Fail => {
@@ -1914,6 +1984,7 @@ impl Program {
                         }
                         _ => {
                             if self.connection.get_auto_commit() {
+                                rollback_index_methods(state, &mut abort_error);
                                 self.rollback_current_txn(pager);
                             }
                         }
@@ -1930,6 +2001,7 @@ impl Program {
                 }
                 _ => {
                     if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
+                        rollback_index_methods(state, &mut abort_error);
                         self.rollback_current_txn(pager);
                     }
                 }

@@ -1,5 +1,4 @@
 use crate::sync::Arc;
-use crate::turso_assert;
 use crate::turso_debug_assert;
 use crate::{
     index_method::{
@@ -2437,7 +2436,12 @@ impl Drop for FtsCursor {
         );
 
         if is_flushing {
-            turso_assert!(conn.is_in_write_tx(), "FTS Drop: in-progress flush abandoned (transaction already committed). pre_commit should have completed the flush.");
+            if !conn.is_in_write_tx() {
+                tracing::debug!(
+                    "FTS Drop: abandoning in-progress flush (no active write transaction)"
+                );
+                return;
+            }
 
             tracing::debug!("FTS Drop: completing in-progress flush");
             loop {
@@ -2463,14 +2467,17 @@ impl Drop for FtsCursor {
             return;
         }
 
-        // If the transaction has already committed (auto-commit), flushing to BTree
-        // would create dirty pages outside of any transaction, causing the
-        // "dirty pages must be empty for read txn" panic on the next read.
-        turso_assert!(
-            conn.is_in_write_tx(),
-            "FTS Drop: transaction already committed, cannot flush",
-            { "pending_docs_count": self.pending_docs_count }
-        );
+        if !conn.is_in_write_tx() {
+            tracing::debug!(
+                "FTS Drop: discarding {} pending documents (no active write transaction)",
+                self.pending_docs_count
+            );
+            self.pending_docs_count = 0;
+            if let Some(ref dir) = self.hybrid_directory {
+                let _ = dir.take_pending_writes();
+            }
+            return;
+        }
 
         // Commit any pending writes to Tantivy
         if let Some(ref mut writer) = self.writer {
@@ -3257,6 +3264,36 @@ impl IndexMethodCursor for FtsCursor {
             return self.commit_and_flush();
         }
         Ok(IOResult::Done(()))
+    }
+
+    /// Discards statement-local pending writes on rollback.
+    fn rollback(&mut self) -> Result<()> {
+        if self.pending_docs_count > 0 {
+            tracing::debug!(
+                "FTS rollback: discarding {} pending documents",
+                self.pending_docs_count
+            );
+        }
+        self.pending_docs_count = 0;
+
+        if let Some(ref mut writer) = self.writer {
+            writer
+                .rollback()
+                .map_err(|e| LimboError::InternalError(format!("FTS rollback error: {e}")))?;
+        }
+
+        if let Some(ref dir) = self.hybrid_directory {
+            let writes = dir.take_pending_writes();
+            if !writes.is_empty() {
+                tracing::debug!(
+                    "FTS rollback: discarding {} pending directory writes",
+                    writes.len()
+                );
+            }
+        }
+
+        self.state = FtsState::Ready;
+        Ok(())
     }
 
     /// Optimizes the FTS index by merging all segments into one.
