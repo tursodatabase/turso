@@ -113,6 +113,7 @@ The MVCC implementation is experimental and has the following limitations:
 * Indexes cannot be created and databases with indexes cannot be used.
 * All the data is eagerly loaded from disk to memory on first access so using big databases may take a long time to start, and will consume a lot of memory
 * Only `PRAGMA wal_checkpoint(TRUNCATE)` is supported and it blocks both readers and writers
+* `AUTOINCREMENT` is not supported. Tables with `AUTOINCREMENT` cannot be created or inserted into while MVCC is enabled.
 * Many features may not work, work incorrectly, and/or cause a panic.
 * Queries may return incorrect results
 * If a database is written to using MVCC and then opened again without MVCC, the changes are not visible unless first checkpointed

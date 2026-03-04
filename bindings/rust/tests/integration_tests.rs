@@ -1754,3 +1754,38 @@ async fn test_ghost_commits() {
         );
     }
 }
+
+/// AUTOINCREMENT is not supported in MVCC mode. Verify that CREATE TABLE
+/// with AUTOINCREMENT fails with a clear error message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_autoincrement_blocked_in_mvcc() {
+    let (db, _dir) = setup_mvcc_db("").await;
+    let conn = db.connect().unwrap();
+
+    // CREATE TABLE with AUTOINCREMENT should fail
+    let result = conn
+        .execute(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)",
+            (),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "CREATE TABLE with AUTOINCREMENT should fail in MVCC mode"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("AUTOINCREMENT is not supported in MVCC mode"),
+        "unexpected error: {err}"
+    );
+
+    // Regular tables without AUTOINCREMENT should still work
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')", ())
+        .await
+        .unwrap();
+    let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
+    assert_eq!(count, 1);
+}

@@ -197,6 +197,7 @@ expect {
 }
 
 # Auto-increment
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 @cross-check-integrity
 test insert-returning-autoincrement {
     CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
@@ -1154,6 +1155,7 @@ expect {
 }
 
 # AUTOINCREMENT with RETURNING
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 @cross-check-integrity
 test delete-returning-autoincrement {
     CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
@@ -2124,6 +2126,7 @@ expect {
 }
 
 # RETURNING with expressions using last_insert_rowid (if supported)
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 @cross-check-integrity
 test insert-returning-last-insert-rowid {
     CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
