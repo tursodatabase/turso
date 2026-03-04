@@ -1379,14 +1379,14 @@ impl Wal for WalFile {
         let shared_file = self.shared.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
-                tracing::error!(err = ?res.unwrap_err());
+                tracing::debug!(err = ?res.unwrap_err());
                 page.clear_locked();
                 page.clear_wal_tag();
                 return None; // IO error already captured in completion
             };
             let buf_len = buf.len();
             if bytes_read != buf_len as i32 {
-                tracing::error!(
+                tracing::debug!(
                     "WAL short read at offset {offset}, page {page_idx}, frame_id={frame_id}: expected {buf_len} bytes, got {bytes_read}"
                 );
                 page.clear_locked();
@@ -1452,7 +1452,7 @@ impl Wal for WalFile {
             };
             let buf_len = buf.len();
             if bytes_read != buf_len as i32 {
-                tracing::error!(
+                tracing::debug!(
                     "short read on WAL frame {frame_id} at offset {offset}: expected {buf_len} bytes, got {bytes_read}"
                 );
                 return Some(CompletionError::ShortReadWalFrame {
@@ -1485,7 +1485,7 @@ impl Wal for WalFile {
                         frame_ref[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&decrypted_data);
                     }
                     Err(_) => {
-                        tracing::error!("Failed to decrypt page data for frame_id={frame_id}");
+                        tracing::debug!("Failed to decrypt page data for frame_id={frame_id}");
                     }
                 }
             }
@@ -1552,7 +1552,7 @@ impl Wal for WalFile {
                     };
                     let buf_len = buf.len();
                     if bytes_read != buf_len as i32 {
-                        tracing::error!(
+                        tracing::debug!(
                             "short read on WAL frame validation at offset {offset}, page_id={page_id}: expected {buf_len} bytes, got {bytes_read}"
                         );
                         return Some(CompletionError::ShortReadWalFrame {
@@ -1641,7 +1641,7 @@ impl Wal for WalFile {
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(pager, mode).inspect_err(|e| {
-            tracing::error!("Wal Checkpoint failed: {e}");
+            tracing::debug!("Wal Checkpoint failed: {e}");
             let _ = self.checkpoint_guard.write().take();
             self.ongoing_checkpoint.write().state = CheckpointState::Start;
         })
@@ -2772,7 +2772,7 @@ impl WalFile {
         }
         if let Some(e) = e {
             mark_unlikely();
-            tracing::error!(
+            tracing::debug!(
                 "Failed to restart WAL header: {:?}, releasing read locks",
                 e
             );
