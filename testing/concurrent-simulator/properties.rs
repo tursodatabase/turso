@@ -418,7 +418,7 @@ impl Property for ElleHistoryRecorder {
             Operation::Begin { mode } => {
                 // For BEGIN and BEGIN DEFERRED, defer index reservation until first operation
                 // For BEGIN IMMEDIATE/EXCLUSIVE, reserve index now since they acquire locks immediately
-                let is_deferred = mode == "BEGIN" || mode.to_uppercase().contains("DEFERRED");
+                let is_deferred = mode.is_deferred();
                 let (invoke_index, invoke_time) = if is_deferred {
                     (None, None)
                 } else {
