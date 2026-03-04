@@ -206,6 +206,7 @@ expect {
     1|new
 }
 
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 test attach-write-insert-autoincrement {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
@@ -220,6 +221,7 @@ expect {
     3|c
 }
 
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 test attach-write-insert-autoincrement-gap {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
