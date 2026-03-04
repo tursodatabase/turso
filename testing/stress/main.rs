@@ -584,11 +584,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build()?;
 
     let opts = Opts::parse();
-    if opts.seed.is_some() {
-        eprintln!("seed is only supporte when building with --cfg shuttle");
-        std::process::exit(1);
-    }
-
     rt.block_on(Box::pin(async_main(opts)))
 }
 
