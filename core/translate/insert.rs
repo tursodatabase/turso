@@ -44,6 +44,7 @@ use crate::{
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
 };
 use std::num::NonZeroUsize;
+use turso_macros::turso_assert;
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo, With,
@@ -603,6 +604,15 @@ pub fn translate_insert(
             table_name_reg,
         }) = ctx.autoincrement_meta
         {
+            turso_assert!(ctx.table.has_autoincrement);
+            // Existing sqlite_sequence row: update only when explicit key advances seq.
+            let missing_row_label = program.allocate_label();
+            let explicit_done_label = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: r_seq_rowid,
+                target_pc: missing_row_label,
+            });
+
             let skip_seq_update_label = program.allocate_label();
             program.emit_insn(Insn::Le {
                 lhs: insertion.key_register(),
@@ -621,8 +631,34 @@ pub fn translate_insert(
                 table_name_reg,
                 insertion.key_register(),
             )?;
-
+            program.emit_insn(Insn::Goto {
+                target_pc: explicit_done_label,
+            });
             program.preassign_label_to_next_insn(skip_seq_update_label);
+
+            // Missing sqlite_sequence row: materialize it once with max(existing_seq, explicit_key).
+            // For first explicit negative insert this yields seq=0, matching SQLite.
+            program.preassign_label_to_next_insn(missing_row_label);
+            let seq_to_write_reg = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: r_seq,
+                dst_reg: seq_to_write_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::MemMax {
+                dest_reg: seq_to_write_reg,
+                src_reg: insertion.key_register(),
+            });
+            emit_update_sqlite_sequence(
+                program,
+                resolver,
+                ctx.database_id,
+                seq_cursor_id,
+                r_seq_rowid,
+                table_name_reg,
+                seq_to_write_reg,
+            )?;
+            program.preassign_label_to_next_insn(explicit_done_label);
         }
     }
 
