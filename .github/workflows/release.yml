@@ -61,13 +61,10 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
+        # we specify bash to get pipefail; it guards against the `curl` command
+        # failing. otherwise `sh` won't catch that `curl` returned non-0
         shell: bash
-        run: |
-          for i in 1 2 3; do
-            curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.2/cargo-dist-installer.sh | sh && break
-            echo "Attempt $i failed, retrying in 15s..."
-            sleep 15
-          done
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.2/cargo-dist-installer.sh | sh"
       - name: Cache dist
         uses: actions/upload-artifact@v4
         with:
@@ -129,25 +126,13 @@ jobs:
           submodules: recursive
       - name: Install Rust non-interactively if not already installed
         if: ${{ matrix.container }}
-        shell: bash
         run: |
-          for i in 1 2 3; do
-            if command -v cargo > /dev/null 2>&1; then
-              break
-            fi
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && break
-            echo "Attempt $i failed, retrying in 15s..."
-            sleep 15
-          done
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          if ! command -v cargo > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
       - name: Install dist
-        shell: bash
-        run: |
-          for i in 1 2 3; do
-            ${{ matrix.install_dist.run }} && break
-            echo "Attempt $i failed, retrying in 15s..."
-            sleep 15
-          done
+        run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v4

@@ -21,5 +21,3 @@ install-updater = true
 dist = false
 # Whether to enable GitHub Attestations
 github-attestations = true
-# Allow manual edits to CI scripts (e.g. retry logic for network resilience)
-allow-dirty = ["ci"]
