@@ -29,7 +29,7 @@ use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::elle::{ELLE_LIST_APPEND_KEY_COUNT, ELLE_RW_REGISTER_KEY_COUNT, elle_key_name};
-use crate::operations::{OpResult, Operation};
+use crate::operations::{OpResult, Operation, TxMode};
 
 /// A chaotic workload instance (one per fiber, drives a single transaction).
 ///
@@ -90,9 +90,9 @@ impl ChaoticElleWorkload {
         match planned {
             PlannedOp::Begin => Operation::Begin {
                 mode: if self.enable_mvcc {
-                    "BEGIN CONCURRENT".into()
+                    TxMode::Concurrent
                 } else {
-                    "BEGIN".into()
+                    TxMode::Default
                 },
             },
             PlannedOp::Read { key } => match self.model {

@@ -14,7 +14,7 @@ use sql_generation::{
 };
 
 use crate::elle::{ELLE_LIST_APPEND_KEY_COUNT, ELLE_RW_REGISTER_KEY_COUNT, elle_key_name};
-use crate::operations::Operation;
+use crate::operations::{Operation, TxMode};
 use crate::{FiberState, SimulatorState};
 
 /// Context passed to workloads for generating operations.
@@ -59,15 +59,13 @@ impl Workload for BeginWorkload {
             return None;
         }
         let mode = if ctx.enable_mvcc {
-            ["BEGIN DEFERRED", "BEGIN IMMEDIATE", "BEGIN CONCURRENT"]
+            *[TxMode::Deferred, TxMode::Immediate, TxMode::Concurrent]
                 .choose(rng)
                 .expect("array is not empty")
         } else {
-            "BEGIN"
+            TxMode::Default
         };
-        Some(Operation::Begin {
-            mode: mode.to_string(),
-        })
+        Some(Operation::Begin { mode })
     }
 }
 
@@ -197,6 +195,10 @@ pub struct CreateIndexWorkload;
 
 impl Workload for CreateIndexWorkload {
     fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        // DDL is not allowed inside concurrent transactions
+        if *ctx.fiber_state == FiberState::InConcurrentTx {
+            return None;
+        }
         let create_index = CreateIndex::arbitrary(rng, ctx);
         let sql = create_index.to_string();
         Some(Operation::CreateIndex {
@@ -212,6 +214,10 @@ pub struct DropIndexWorkload;
 
 impl Workload for DropIndexWorkload {
     fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        // DDL is not allowed inside concurrent transactions
+        if *ctx.fiber_state == FiberState::InConcurrentTx {
+            return None;
+        }
         if ctx.sim_state.indexes.is_empty() {
             return None;
         }
@@ -251,7 +257,7 @@ pub struct CommitWorkload;
 
 impl Workload for CommitWorkload {
     fn generate(&self, ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
-        if *ctx.fiber_state != FiberState::InTx {
+        if !ctx.fiber_state.is_in_tx() {
             return None;
         }
         Some(Operation::Commit)
@@ -263,7 +269,7 @@ pub struct RollbackWorkload;
 
 impl Workload for RollbackWorkload {
     fn generate(&self, ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
-        if *ctx.fiber_state != FiberState::InTx {
+        if !ctx.fiber_state.is_in_tx() {
             return None;
         }
         Some(Operation::Rollback)
