@@ -1,6 +1,9 @@
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
-    schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table},
+    schema::{
+        self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table,
+        SQLITE_SEQUENCE_TABLE_NAME,
+    },
     sync::Arc,
     translate::{
         emitter::{
@@ -1274,16 +1277,44 @@ fn resolve_upserts(
     Ok(())
 }
 
+fn get_valid_sqlite_sequence_table(
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<Arc<BTreeTable>> {
+    let Some(seq_table) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+    }) else {
+        crate::bail_corrupt_error!("missing sqlite_sequence table");
+    };
+
+    if !seq_table.has_rowid {
+        crate::bail_corrupt_error!("malformed sqlite_sequence: table must have rowid");
+    }
+
+    if seq_table.columns.len() != 2 {
+        crate::bail_corrupt_error!(
+            "malformed sqlite_sequence: expected 2 columns, got {}",
+            seq_table.columns.len()
+        );
+    }
+
+    let col0_name = seq_table.columns[0].name.as_deref();
+    let col1_name = seq_table.columns[1].name.as_deref();
+    if !matches!(col0_name, Some(name) if name.eq_ignore_ascii_case("name"))
+        || !matches!(col1_name, Some(name) if name.eq_ignore_ascii_case("seq"))
+    {
+        crate::bail_corrupt_error!("malformed sqlite_sequence: expected columns (name, seq)");
+    }
+
+    Ok(seq_table)
+}
+
 fn init_autoincrement(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
     resolver: &Resolver,
 ) -> Result<()> {
-    let seq_table = resolver
-        .with_schema(ctx.database_id, |s| s.get_btree_table("sqlite_sequence"))
-        .ok_or_else(|| {
-            crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
-        })?;
+    let seq_table = get_valid_sqlite_sequence_table(resolver, ctx.database_id)?;
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: seq_cursor_id,
@@ -2709,11 +2740,7 @@ fn ensure_sequence_initialized(
     table: &schema::BTreeTable,
     database_id: usize,
 ) -> Result<()> {
-    let seq_table = resolver
-        .with_schema(database_id, |s| s.get_btree_table("sqlite_sequence"))
-        .ok_or_else(|| {
-            crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
-        })?;
+    let seq_table = get_valid_sqlite_sequence_table(resolver, database_id)?;
 
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
 
@@ -2801,7 +2828,7 @@ fn ensure_sequence_initialized(
         key_reg: new_rowid_reg,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: "sqlite_sequence".to_string(),
+        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 
     program.preassign_label_to_next_insn(entry_exists_label);
@@ -3074,9 +3101,7 @@ fn emit_update_sqlite_sequence(
         extra_amount: 0,
     });
 
-    let seq_table = resolver
-        .with_schema(database_id, |s| s.get_btree_table("sqlite_sequence"))
-        .unwrap();
+    let seq_table = get_valid_sqlite_sequence_table(resolver, database_id)?;
     let affinity_str = seq_table
         .columns
         .iter()
@@ -3107,7 +3132,7 @@ fn emit_update_sqlite_sequence(
         key_reg: r_seq_rowid,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: "sqlite_sequence".to_string(),
+        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Goto {
         target_pc: end_update_label,
@@ -3119,7 +3144,7 @@ fn emit_update_sqlite_sequence(
         key_reg: r_seq_rowid,
         record_reg,
         flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
-        table_name: "sqlite_sequence".to_string(),
+        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 
     program.preassign_label_to_next_insn(end_update_label);
