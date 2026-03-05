@@ -112,6 +112,7 @@ impl Profile {
                         update: UpdateOpts {
                             padding_size: Some(20_000),
                             force_late_failure: true,
+                            ..Default::default()
                         },
                         ..Default::default()
                     },
