@@ -991,7 +991,7 @@ impl Program {
     pub fn step(
         &self,
         state: &mut ProgramState,
-        pager: Arc<Pager>,
+        pager: &Arc<Pager>,
         query_mode: QueryMode,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
@@ -1016,7 +1016,7 @@ impl Program {
         result
     }
 
-    fn explain_step(&self, state: &mut ProgramState, pager: Arc<Pager>) -> Result<StepResult> {
+    fn explain_step(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Result<StepResult> {
         turso_debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.is_closed() {
             let tx_state = self.connection.get_tx_state();
@@ -1114,7 +1114,7 @@ impl Program {
     fn explain_query_plan_step(
         &self,
         state: &mut ProgramState,
-        pager: Arc<Pager>,
+        pager: &Arc<Pager>,
     ) -> Result<StepResult> {
         turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
@@ -1161,7 +1161,7 @@ impl Program {
     fn normal_step(
         &self,
         state: &mut ProgramState,
-        pager: Arc<Pager>,
+        pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
@@ -1175,7 +1175,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
-                self.abort(&pager, None, state)?;
+                self.abort(pager, None, state)?;
                 return Ok(StepResult::Interrupt);
             }
 
@@ -1193,7 +1193,7 @@ impl Program {
                         // the write itself succeeded.
                         let checkpoint_err = LimboError::CheckpointFailed(err.to_string());
                         tracing::error!("Checkpoint failed: {checkpoint_err}");
-                        if let Err(abort_err) = self.abort(&pager, Some(&checkpoint_err), state) {
+                        if let Err(abort_err) = self.abort(pager, Some(&checkpoint_err), state) {
                             tracing::error!(
                                 "Abort also failed during checkpoint error handling: {abort_err}"
                             );
@@ -1201,7 +1201,7 @@ impl Program {
                         return Err(checkpoint_err);
                     }
                     let err = err.into();
-                    if let Err(abort_err) = self.abort(&pager, Some(&err), state) {
+                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
                         tracing::error!("Abort failed during error handling: {abort_err}");
                     }
                     return Err(err);
@@ -1218,7 +1218,7 @@ impl Program {
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-            match insn_function(self, state, insn, &pager) {
+            match insn_function(self, state, insn, pager) {
                 Ok(InsnFunctionStepResult::Step) => {
                     // Instruction completed, moving to next
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
@@ -1267,7 +1267,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    if let Err(abort_err) = self.abort(&pager, Some(&err), state) {
+                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
                         tracing::error!("Abort failed during error handling: {abort_err}");
                     }
                     return Err(err);
