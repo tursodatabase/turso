@@ -2022,13 +2022,16 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
         if !has_custom {
             return Arc::clone(table);
         }
         let mut modified = (**table).clone();
         for col in &mut modified.columns {
-            if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+            if col.is_array() {
+                // Arrays are stored as record-format blobs.
+                col.ty_str = "BLOB".to_string();
+            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
                 col.ty_str = type_def.base.to_uppercase();
             }
         }
@@ -2047,7 +2050,7 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
         if !has_custom {
             return Arc::clone(table);
         }
@@ -2060,7 +2063,11 @@ impl BTreeTable {
                     continue;
                 }
             }
-            if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+            if col.is_array() {
+                // Pre-encode: user input can be text ('[1,2]') or blob (ARRAY[]),
+                // so accept ANY here; the encoder handles conversion.
+                col.ty_str = "ANY".to_string();
+            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
                 col.ty_str = type_def.value_input_type().to_uppercase();
             }
         }
@@ -2076,6 +2083,12 @@ impl BTreeTable {
             return;
         }
         for col in &mut self.columns {
+            if col.is_array() {
+                // Arrays are stored as record-format blobs regardless of element type.
+                col.set_ty(Type::Blob);
+                col.set_base_affinity(Affinity::Blob);
+                continue;
+            }
             if let Some(type_def) = schema.get_type_def_unchecked(&col.ty_str) {
                 let (base_ty, _) = type_from_name(&type_def.base);
                 col.set_ty(base_ty);
@@ -2142,6 +2155,9 @@ impl BTreeTable {
             if !column.ty_str.is_empty() {
                 sql.push(' ');
                 sql.push_str(&column.ty_str);
+                if column.is_array() {
+                    sql.push_str("[]");
+                }
             }
             if column.notnull() {
                 sql.push_str(" NOT NULL");
@@ -2729,6 +2745,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     },
                 );
                 col.ty_params = ty_params;
+                if let Some(t) = col_type.as_ref() {
+                    if t.is_array() {
+                        col.set_array_dimensions(t.array_dimensions);
+                    }
+                }
                 cols.push(col);
             }
 
@@ -2996,6 +3017,10 @@ const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
 const BASE_AFF_SHIFT: u16 = COLL_SHIFT + 2;
 const BASE_AFF_MASK: u16 = 0b111 << BASE_AFF_SHIFT;
 
+// Bits 13-15: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+const ARRAY_DIM_SHIFT: u16 = 13;
+const ARRAY_DIM_MASK: u16 = 0b111 << ARRAY_DIM_SHIFT;
+
 impl Column {
     pub fn affinity(&self) -> Affinity {
         let v = ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) as u8;
@@ -3184,6 +3209,23 @@ impl Column {
     }
 
     #[inline]
+    pub const fn is_array(&self) -> bool {
+        (self.raw & ARRAY_DIM_MASK) != 0
+    }
+
+    /// Number of array dimensions (0 = scalar, 1 = `[]`, 2 = `[][]`, etc.)
+    #[inline]
+    pub const fn array_dimensions(&self) -> u32 {
+        ((self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT) as u32
+    }
+
+    #[inline]
+    pub fn set_array_dimensions(&mut self, dims: u32) {
+        assert!(dims <= 7, "array dimensions must be <= 7");
+        self.raw = (self.raw & !ARRAY_DIM_MASK) | ((dims as u16) << ARRAY_DIM_SHIFT);
+    }
+
+    #[inline]
     const fn set_flag(&mut self, mask: u16, val: bool) {
         if val {
             self.raw |= mask
@@ -3268,6 +3310,11 @@ impl TryFrom<&ColumnDefinition> for Column {
             },
         );
         col.ty_params = ty_params;
+        if let Some(t) = value.col_type.as_ref() {
+            if t.is_array() {
+                col.set_array_dimensions(t.array_dimensions);
+            }
+        }
         Ok(col)
     }
 }

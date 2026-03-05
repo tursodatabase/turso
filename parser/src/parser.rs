@@ -645,8 +645,37 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_nm(&mut self) -> Result<Name> {
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_LBRACKET {
+                // Bracket-quoted identifier: [name] or [multi word name]
+                return self.parse_bracket_quoted_name();
+            }
+        }
         let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
         Ok(Name::from_bytes(tok.as_bytes()))
+    }
+
+    /// Parse a bracket-quoted identifier like `[name]` or `[ multi word name]`.
+    /// Captures the raw bytes between `[` and `]` so whitespace is preserved
+    /// verbatim (the lexer discards inter-token whitespace, so we can't
+    /// reassemble from tokens without losing e.g. leading spaces).
+    fn parse_bracket_quoted_name(&mut self) -> Result<Name> {
+        eat_assert!(self, TK_LBRACKET);
+        // Byte offset right after the `[` token
+        let start = self.lexer.offset;
+        loop {
+            let tok = match self.eat()? {
+                Some(t) => t,
+                None => return Err(Error::ParseUnexpectedEOF),
+            };
+            if tok.token_type == TK_RBRACKET {
+                // tok.value points to `]`; its start is the end of our content
+                let end = tok.value.as_ptr() as usize - self.lexer.input.as_ptr() as usize;
+                let raw = &self.lexer.input[start..end];
+                let name = String::from_utf8_lossy(raw).into_owned();
+                return Ok(Name::exact(name));
+            }
+        }
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
@@ -1050,9 +1079,18 @@ impl<'a> Parser<'a> {
             None
         };
 
+        // Check for array suffix(es) [], [][], etc.
+        let mut array_dimensions = 0u32;
+        while self.peek()?.is_some_and(|t| t.token_type == TK_LBRACKET) {
+            eat_assert!(self, TK_LBRACKET);
+            eat_expect!(self, TK_RBRACKET);
+            array_dimensions += 1;
+        }
+
         Ok(Some(Type {
             name: type_name,
             size,
+            array_dimensions,
         }))
     }
 
@@ -1091,7 +1129,7 @@ impl<'a> Parser<'a> {
             TK_NOT => Ok(Some(3)), // NOT is 3 because of binary operator
             TK_EQ | TK_NE | TK_IS | TK_BETWEEN | TK_IN | TK_MATCH | TK_LIKE_KW | TK_ISNULL
             | TK_NOTNULL => Ok(Some(3)),
-            TK_LT | TK_GT | TK_LE | TK_GE => Ok(Some(4)),
+            TK_LT | TK_GT | TK_LE | TK_GE | TK_ARRAY_CONTAINS | TK_ARRAY_OVERLAP => Ok(Some(4)),
             TK_ESCAPE => Ok(None), // ESCAPE will be consumed after parsing MATCH|LIKE_KW
             TK_BITAND | TK_BITOR | TK_LSHIFT | TK_RSHIFT => Ok(Some(6)),
             TK_PLUS | TK_MINUS => Ok(Some(7)),
@@ -1099,6 +1137,7 @@ impl<'a> Parser<'a> {
             TK_CONCAT | TK_PTR => Ok(Some(9)),
             TK_COLLATE => Ok(Some(10)),
             // no need 11 because its for unary operators
+            TK_LBRACKET => Ok(Some(12)), // subscript: expr[n]
             _ => Ok(None),
         }
     }
@@ -1344,6 +1383,7 @@ impl<'a> Parser<'a> {
             TK_MINUS,
             TK_EXISTS,
             TK_CASE,
+            TK_LBRACKET,
         );
 
         match tok.token_type {
@@ -1505,12 +1545,39 @@ impl<'a> Parser<'a> {
                 eat_expect!(self, TK_RP);
                 Ok(Box::new(Expr::Raise(resolve, expr)))
             }
+            TK_LBRACKET => {
+                // Bracket-quoted identifier: [name] or [multi word name]
+                let name = self.parse_bracket_quoted_name()?;
+                Ok(Box::new(Expr::Id(name)))
+            }
             _ => {
                 let can_be_lit_str = tok.token_type == TK_STRING;
 
                 // can be either Literal::String or Name - so we parse raw value early and decide later
                 let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
                 let name = tok.value;
+
+                // Check for ARRAY[...] literal
+                if name.eq_ignore_ascii_case(b"array") {
+                    if let Some(tok) = self.peek()? {
+                        if tok.token_type == TK_LBRACKET {
+                            eat_assert!(self, TK_LBRACKET);
+                            let elements = self.parse_expr_list()?;
+                            eat_expect!(self, TK_RBRACKET);
+                            // Desugar ARRAY[...] into array(...) function call
+                            return Ok(Box::new(Expr::FunctionCall {
+                                name: Name::from_bytes(b"array"),
+                                distinctness: None,
+                                args: elements,
+                                order_by: vec![],
+                                filter_over: FunctionTail {
+                                    filter_clause: None,
+                                    over_clause: None,
+                                },
+                            }));
+                        }
+                    }
+                }
 
                 let second_name = if let Some(tok) = self.peek()? {
                     if tok.token_type == TK_DOT {
@@ -1615,7 +1682,7 @@ impl<'a> Parser<'a> {
             match tok.token_type.fallback_id_if_ok() {
                 TK_LP | TK_CAST | TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_NULL
                 | TK_BLOB | TK_FLOAT | TK_INTEGER | TK_VARIABLE | TK_CTIME_KW | TK_NOT
-                | TK_BITNOT | TK_PLUS | TK_MINUS | TK_EXISTS | TK_CASE => {}
+                | TK_BITNOT | TK_PLUS | TK_MINUS | TK_EXISTS | TK_CASE | TK_LBRACKET => {}
                 _ => break,
             }
 
@@ -1944,6 +2011,22 @@ impl<'a> Parser<'a> {
                         self.parse_expr(pre + 1)?,
                     ))
                 }
+                TK_ARRAY_CONTAINS => {
+                    eat_assert!(self, TK_ARRAY_CONTAINS);
+                    Box::new(Expr::Binary(
+                        result,
+                        Operator::ArrayContains,
+                        self.parse_expr(pre + 1)?,
+                    ))
+                }
+                TK_ARRAY_OVERLAP => {
+                    eat_assert!(self, TK_ARRAY_OVERLAP);
+                    Box::new(Expr::Binary(
+                        result,
+                        Operator::ArrayOverlap,
+                        self.parse_expr(pre + 1)?,
+                    ))
+                }
                 TK_CONCAT => {
                     eat_assert!(self, TK_CONCAT);
                     Box::new(Expr::Binary(
@@ -1963,6 +2046,40 @@ impl<'a> Parser<'a> {
                     Box::new(Expr::Binary(result, op, self.parse_expr(pre + 1)?))
                 }
                 TK_COLLATE => Box::new(Expr::Collate(result, self.parse_collate()?.unwrap())),
+                TK_LBRACKET => {
+                    eat_assert!(self, TK_LBRACKET);
+                    let first = self.parse_expr(0)?;
+                    // Slice syntax: expr[start:end]
+                    if self.peek()?.is_some_and(|t| t.token_type == TK_COLON) {
+                        eat_assert!(self, TK_COLON);
+                        let second = self.parse_expr(0)?;
+                        eat_expect!(self, TK_RBRACKET);
+                        // Desugar to array_slice(expr, start, end)
+                        Box::new(Expr::FunctionCall {
+                            name: Name::from_bytes(b"array_slice"),
+                            distinctness: None,
+                            args: vec![result, first, second],
+                            order_by: vec![],
+                            filter_over: FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        })
+                    } else {
+                        // Desugar expr[index] into array_element(expr, index)
+                        eat_expect!(self, TK_RBRACKET);
+                        Box::new(Expr::FunctionCall {
+                            name: Name::from_bytes(b"array_element"),
+                            distinctness: None,
+                            args: vec![result, first],
+                            order_by: vec![],
+                            filter_over: FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        })
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -2129,7 +2246,7 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_AS);
                     Ok(Some(As::As(self.parse_nm()?)))
                 }
-                TK_STRING | TK_ID => Ok(Some(As::Elided(self.parse_nm()?))),
+                TK_STRING | TK_ID | TK_LBRACKET => Ok(Some(As::Elided(self.parse_nm()?))),
                 _ => Ok(None),
             },
         }
@@ -2337,10 +2454,18 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
 
-            let tok = peek_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW, TK_LP);
+            let tok = peek_expect!(
+                self,
+                TK_ID,
+                TK_STRING,
+                TK_INDEXED,
+                TK_JOIN_KW,
+                TK_LP,
+                TK_LBRACKET
+            );
 
             match tok.token_type.fallback_id_if_ok() {
-                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => {
+                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                     let name = self.parse_fullname(false)?;
                     match self.peek()? {
                         None => {
@@ -2411,10 +2536,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_from_clause(&mut self) -> Result<FromClause> {
-        let tok = peek_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW, TK_LP);
+        let tok = peek_expect!(
+            self,
+            TK_ID,
+            TK_STRING,
+            TK_INDEXED,
+            TK_JOIN_KW,
+            TK_LP,
+            TK_LBRACKET
+        );
 
         match tok.token_type.fallback_id_if_ok() {
-            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => {
+            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                 let name = self.parse_fullname(false)?;
                 match self.peek()? {
                     None => Ok(FromClause {
@@ -2490,7 +2623,12 @@ impl<'a> Parser<'a> {
             }
             tt => {
                 // dot STAR case
-                if tt == TK_ID || tt == TK_STRING || tt == TK_INDEXED || tt == TK_JOIN_KW {
+                if tt == TK_ID
+                    || tt == TK_STRING
+                    || tt == TK_INDEXED
+                    || tt == TK_JOIN_KW
+                    || tt == TK_LBRACKET
+                {
                     if let Ok(res) = self.mark(|p| -> Result<ResultColumn> {
                         let name = p.parse_nm()?;
                         eat_expect!(p, TK_DOT);
@@ -3749,11 +3887,35 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let name = self.parse_nm()?;
-                eat_expect!(self, TK_EQ);
-                Ok(Set {
-                    col_names: vec![name],
-                    expr: self.parse_expr(0)?,
-                })
+                // Check for array subscript: col[n] = value
+                // Desugar SET col[n] = val → SET col = array_set_element(col, n, val)
+                if self.peek()?.is_some_and(|t| t.token_type == TK_LBRACKET) {
+                    eat_assert!(self, TK_LBRACKET);
+                    let idx_expr = self.parse_expr(0)?;
+                    eat_expect!(self, TK_RBRACKET);
+                    eat_expect!(self, TK_EQ);
+                    let val_expr = self.parse_expr(0)?;
+                    let col_ref = Box::new(Expr::Id(name.clone()));
+                    Ok(Set {
+                        col_names: vec![name],
+                        expr: Box::new(Expr::FunctionCall {
+                            name: Name::from_bytes(b"array_set_element"),
+                            distinctness: None,
+                            args: vec![col_ref, idx_expr, val_expr],
+                            order_by: vec![],
+                            filter_over: FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        }),
+                    })
+                } else {
+                    eat_expect!(self, TK_EQ);
+                    Ok(Set {
+                        col_names: vec![name],
+                        expr: self.parse_expr(0)?,
+                    })
+                }
             }
         }
     }
@@ -4844,6 +5006,7 @@ mod tests {
                                     type_name: Some(Type {
                                         name: "INTEGER".to_owned(),
                                         size: None,
+                                        array_dimensions: 0,
                                     }),
                                 }),
                                 None,
@@ -4874,6 +5037,7 @@ mod tests {
                                         size: Some(TypeSize::MaxSize(Box::new(Expr::Literal(
                                             Literal::Numeric("255".to_owned()),
                                         )))),
+                                        array_dimensions: 0,
                                     }),
                                 }),
                                 None,
@@ -4909,6 +5073,7 @@ mod tests {
                                                 "5".to_owned(),
                                             ))),
                                         )),
+                                        array_dimensions: 0,
                                     }),
                                 }),
                                 None,
@@ -9600,6 +9765,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![],
                     }),
@@ -9614,6 +9780,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9635,6 +9802,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9658,6 +9826,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9682,6 +9851,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9706,6 +9876,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9727,6 +9898,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9749,6 +9921,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9771,6 +9944,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9793,6 +9967,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9815,6 +9990,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9837,6 +10013,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9858,6 +10035,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9879,6 +10057,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9905,6 +10084,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9945,6 +10125,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -9985,6 +10166,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10025,6 +10207,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10065,6 +10248,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10105,6 +10289,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10145,6 +10330,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10185,6 +10371,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10214,6 +10401,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10243,6 +10431,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10272,6 +10461,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10301,6 +10491,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10322,6 +10513,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10344,6 +10536,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10366,6 +10559,7 @@ mod tests {
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
+                            array_dimensions: 0,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10390,6 +10584,7 @@ mod tests {
                             col_type: Some(Type {
                                 name: "INTEGER".to_owned(),
                                 size: None,
+                                array_dimensions: 0,
                             }),
                             constraints: vec![],
                         },
@@ -10555,6 +10750,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![],
                             },
@@ -10596,6 +10792,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {
@@ -10613,6 +10810,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![],
                             },
@@ -10658,6 +10856,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![],
                             },
@@ -10696,6 +10895,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![],
                             },
@@ -11170,6 +11370,7 @@ mod tests {
                                                 Name::exact("bar".to_owned()),
                                                 Name::exact("baz".to_owned()),
                                             ],
+
                                             expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                         }
                                     ],
@@ -11283,6 +11484,7 @@ mod tests {
                             sets: vec![
                                 Set {
                                     col_names: vec![Name::exact("bar".to_owned())],
+
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                 },
                             ],
@@ -11881,6 +12083,7 @@ mod tests {
                             col_names: vec![
                                 Name::exact("bar".to_owned()),
                             ],
+
                             expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                         }
                     ],
@@ -11935,6 +12138,7 @@ mod tests {
                             col_names: vec![
                                 Name::exact("bar".to_owned()),
                             ],
+
                             expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                         }
                     ],
@@ -12005,6 +12209,7 @@ mod tests {
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
+                                    array_dimensions: 0,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {

@@ -339,6 +339,11 @@ impl Expr {
                 .or_else(|| i.list.iter().find_map(|e| e.unordered_limit_reason())),
             Expr::IsNull(i) => i.expr.unordered_limit_reason(),
             Expr::Parenthesized(e) => e.unordered_limit_reason(),
+            Expr::ArrayLiteral(a) => a.elements.iter().find_map(|e| e.unordered_limit_reason()),
+            Expr::ArraySubscript(a) => a
+                .array
+                .unordered_limit_reason()
+                .or_else(|| a.index.unordered_limit_reason()),
             Expr::ColumnRef(_) | Expr::Literal(_) => None,
             // Stubs: never instantiated
             Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => None,
@@ -392,6 +397,14 @@ impl Expr {
             }),
             Expr::IsNull(i) => i.expr.non_unique_order_by_reason(schema),
             Expr::Parenthesized(e) => e.non_unique_order_by_reason(schema),
+            Expr::ArrayLiteral(a) => a
+                .elements
+                .iter()
+                .find_map(|e| e.non_unique_order_by_reason(schema)),
+            Expr::ArraySubscript(a) => a
+                .array
+                .non_unique_order_by_reason(schema)
+                .or_else(|| a.index.non_unique_order_by_reason(schema)),
             Expr::ColumnRef(_) | Expr::Literal(_) => None,
             Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => None,
         }
@@ -439,6 +452,10 @@ impl Expr {
             // Subqueries have their own scope — aggregates inside them don't
             // affect the outer query's aggregate/non-aggregate classification.
             Expr::Subquery(_) | Expr::InSubquery(_) | Expr::Exists(_) => false,
+            Expr::ArrayLiteral(a) => a.elements.iter().any(|e| e.contains_aggregate()),
+            Expr::ArraySubscript(a) => {
+                a.array.contains_aggregate() || a.index.contains_aggregate()
+            }
             Expr::ColumnRef(_) | Expr::Literal(_) => false,
             // Stubs: never instantiated
             Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => false,
@@ -474,6 +491,10 @@ impl Expr {
                         .is_some_and(|e| e.contains_column_ref())
             }
             Expr::Subquery(_) | Expr::InSubquery(_) | Expr::Exists(_) => false,
+            Expr::ArrayLiteral(a) => a.elements.iter().any(|e| e.contains_column_ref()),
+            Expr::ArraySubscript(a) => {
+                a.array.contains_column_ref() || a.index.contains_column_ref()
+            }
             Expr::Literal(_) => false,
             // Stubs: never instantiated
             Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => false,
@@ -513,6 +534,10 @@ impl Expr {
                     || c.else_clause
                         .as_ref()
                         .is_some_and(|e| e.contains_scalar_subquery())
+            }
+            Expr::ArrayLiteral(a) => a.elements.iter().any(|e| e.contains_scalar_subquery()),
+            Expr::ArraySubscript(a) => {
+                a.array.contains_scalar_subquery() || a.index.contains_scalar_subquery()
             }
             Expr::ColumnRef(_) | Expr::Literal(_) | Expr::InSubquery(_) | Expr::Exists(_) => false,
             // Stubs: never instantiated
@@ -1277,6 +1302,10 @@ pub enum Expr {
     IsNull(Box<IsNullExpr>),
     Exists(Box<ExistsExpr>),
     Parenthesized(Box<Expr>),
+    /// ARRAY[expr, expr, ...] — array literal constructor
+    ArrayLiteral(ArrayLiteralExpr),
+    /// expr[n] — array subscript
+    ArraySubscript(Box<ArraySubscriptExpr>),
     // Stubs: not yet generated (weight 0), shown in coverage report
     /// expr OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)
     WindowFunction(Box<WindowFunctionExpr>),
@@ -1303,6 +1332,8 @@ impl fmt::Display for Expr {
             Expr::IsNull(i) => write!(f, "{i}"),
             Expr::Exists(e) => write!(f, "{e}"),
             Expr::Parenthesized(e) => write!(f, "({e})"),
+            Expr::ArrayLiteral(a) => write!(f, "{a}"),
+            Expr::ArraySubscript(a) => write!(f, "{a}"),
             // Stubs
             Expr::WindowFunction(_) => todo!("window function generation"),
             Expr::Collate(_) => todo!("COLLATE expression generation"),
@@ -1435,6 +1466,18 @@ impl Expr {
         ctx.record(ExprKind::Raise);
         todo!("RAISE expression generation")
     }
+
+    /// Create an array literal expression (records to context).
+    pub fn array_literal(ctx: &mut Context, elements: Vec<Expr>) -> Self {
+        ctx.record(ExprKind::ArrayLiteral);
+        Expr::ArrayLiteral(ArrayLiteralExpr { elements })
+    }
+
+    /// Create an array subscript expression (records to context).
+    pub fn array_subscript(ctx: &mut Context, array: Expr, index: Expr) -> Self {
+        ctx.record(ExprKind::ArraySubscript);
+        Expr::ArraySubscript(Box::new(ArraySubscriptExpr { array, index }))
+    }
 }
 
 /// A column reference.
@@ -1538,6 +1581,10 @@ pub enum BinOp {
     IsNot,
     // Pattern matching (stub — weight 0)
     Regexp,
+    // Array operators
+    ArrayContains,
+    ContainedBy,
+    ArrayOverlap,
 }
 
 impl fmt::Display for BinOp {
@@ -1567,6 +1614,9 @@ impl fmt::Display for BinOp {
             BinOp::Is => write!(f, "IS"),
             BinOp::IsNot => write!(f, "IS NOT"),
             BinOp::Regexp => write!(f, "REGEXP"),
+            BinOp::ArrayContains => write!(f, "@>"),
+            BinOp::ContainedBy => write!(f, "<@"),
+            BinOp::ArrayOverlap => write!(f, "&&"),
         }
     }
 }
@@ -1607,6 +1657,11 @@ impl BinOp {
             BinOp::LeftShift,
             BinOp::RightShift,
         ]
+    }
+
+    /// Returns array operators (excludes ContainedBy — no parser support for `<@`).
+    pub fn array() -> &'static [BinOp] {
+        &[BinOp::ArrayContains, BinOp::ArrayOverlap]
     }
 
     /// Returns true if this is a comparison operator.
@@ -1813,6 +1868,38 @@ pub struct CollateExpr;
 /// A RAISE expression for triggers (stub).
 #[derive(Debug, Clone)]
 pub struct RaiseExpr;
+
+/// An array literal expression: ARRAY[expr, expr, ...]
+#[derive(Debug, Clone)]
+pub struct ArrayLiteralExpr {
+    pub elements: Vec<Expr>,
+}
+
+impl fmt::Display for ArrayLiteralExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ARRAY[")?;
+        for (i, elem) in self.elements.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{elem}")?;
+        }
+        write!(f, "]")
+    }
+}
+
+/// An array subscript expression: expr[index]
+#[derive(Debug, Clone)]
+pub struct ArraySubscriptExpr {
+    pub array: Expr,
+    pub index: Expr,
+}
+
+impl fmt::Display for ArraySubscriptExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}[{}]", self.array, self.index)
+    }
+}
 
 impl fmt::Display for InSubqueryExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

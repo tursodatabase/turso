@@ -1,4 +1,4 @@
-use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
+use crate::error::{SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 
@@ -12,9 +12,10 @@ use super::plan::TableReferences;
 use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
-use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
+use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{ColDef, Column, Table, Type, TypeDef};
+use crate::sync::Arc;
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
 };
@@ -29,7 +30,6 @@ use crate::vdbe::{
     insn::{CmpInsFlags, InsertFlags, Insn},
     BranchOffset,
 };
-use crate::sync::Arc;
 use crate::{LimboError, Numeric, Result, Value};
 use std::collections::HashSet;
 
@@ -770,6 +770,9 @@ pub fn translate_condition_expr(
             let expr_reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
             emit_cond_jump(program, condition_metadata, expr_reg);
+        }
+        ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
     }
     Ok(())
@@ -1651,6 +1654,83 @@ pub fn translate_expr(
                         ScalarFunc::Cast => {
                             unreachable!("this is always ast::Expr::Cast")
                         }
+                        ScalarFunc::Array => {
+                            let start_reg = program.alloc_registers(args.len());
+                            for (i, arg) in args.iter().enumerate() {
+                                translate_expr(
+                                    program,
+                                    referenced_tables,
+                                    arg,
+                                    start_reg + i,
+                                    resolver,
+                                )?;
+                            }
+                            program.emit_insn(Insn::MakeArray {
+                                start_reg,
+                                count: args.len(),
+                                dest: target_register,
+                            });
+                            Ok(target_register)
+                        }
+                        ScalarFunc::ArrayElement => {
+                            let args = expect_arguments_exact!(args, 2, srf);
+                            let base_reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[0],
+                                base_reg,
+                                resolver,
+                            )?;
+                            let index_reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[1],
+                                index_reg,
+                                resolver,
+                            )?;
+                            program.emit_insn(Insn::ArrayElement {
+                                array_reg: base_reg,
+                                index_reg,
+                                dest: target_register,
+                            });
+                            Ok(target_register)
+                        }
+                        ScalarFunc::ArraySetElement => {
+                            let args = expect_arguments_exact!(args, 3, srf);
+                            let array_reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[0],
+                                array_reg,
+                                resolver,
+                            )?;
+                            let index_reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[1],
+                                index_reg,
+                                resolver,
+                            )?;
+                            let value_reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[2],
+                                value_reg,
+                                resolver,
+                            )?;
+                            program.emit_insn(Insn::ArraySetElement {
+                                array_reg,
+                                index_reg,
+                                value_reg,
+                                dest: target_register,
+                            });
+                            Ok(target_register)
+                        }
                         ScalarFunc::Changes => {
                             if !args.is_empty() {
                                 crate::bail_parse_error!(
@@ -2481,7 +2561,19 @@ pub fn translate_expr(
                         | ScalarFunc::NumericMul
                         | ScalarFunc::NumericDiv
                         | ScalarFunc::NumericLt
-                        | ScalarFunc::NumericEq => translate_function(
+                        | ScalarFunc::NumericEq
+                        | ScalarFunc::ArrayLength
+                        | ScalarFunc::ArrayAppend
+                        | ScalarFunc::ArrayPrepend
+                        | ScalarFunc::ArrayCat
+                        | ScalarFunc::ArrayRemove
+                        | ScalarFunc::ArrayContains
+                        | ScalarFunc::ArrayPosition
+                        | ScalarFunc::ArraySlice
+                        | ScalarFunc::StringToArray
+                        | ScalarFunc::ArrayToString
+                        | ScalarFunc::ArrayOverlap
+                        | ScalarFunc::ArrayContainsAll => translate_function(
                             program,
                             args,
                             referenced_tables,
@@ -3423,6 +3515,9 @@ pub fn translate_expr(
             });
             Ok(target_register)
         }
+        ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
     }?;
 
     if let Some(span) = constant_span {
@@ -3918,6 +4013,16 @@ fn emit_binary_insn(
     if op.is_comparison() {
         affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, resolver);
     }
+    let is_array_cmp =
+        expr_is_array(lhs_expr, referenced_tables) && expr_is_array(rhs_expr, referenced_tables);
+    let cmp_flags = || {
+        let f = CmpInsFlags::default().with_affinity(affinity);
+        if is_array_cmp {
+            f.array_cmp()
+        } else {
+            f
+        }
+    };
 
     match op {
         ast::Operator::NotEquals => {
@@ -3928,7 +4033,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default().with_affinity(affinity),
+                    flags: cmp_flags(),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -3945,7 +4050,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default().with_affinity(affinity),
+                    flags: cmp_flags(),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -3962,7 +4067,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default().with_affinity(affinity),
+                    flags: cmp_flags(),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -3979,7 +4084,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default().with_affinity(affinity),
+                    flags: cmp_flags(),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -3996,7 +4101,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default().with_affinity(affinity),
+                    flags: cmp_flags(),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -4013,7 +4118,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default().with_affinity(affinity),
+                    flags: cmp_flags(),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -4148,16 +4253,159 @@ fn emit_binary_insn(
             })
         }
         ast::Operator::Concat => {
-            program.emit_insn(Insn::Concat {
-                lhs,
-                rhs,
+            if expr_is_array(lhs_expr, referenced_tables)
+                || expr_is_array(rhs_expr, referenced_tables)
+            {
+                program.emit_insn(Insn::ArrayConcat {
+                    lhs,
+                    rhs,
+                    dest: target_register,
+                });
+            } else {
+                program.emit_insn(Insn::Concat {
+                    lhs,
+                    rhs,
+                    dest: target_register,
+                });
+            }
+        }
+        ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
+            // Function instructions read contiguous registers start_reg..start_reg+arg_count.
+            // When both operands are equivalent the compiler reuses a single shared register,
+            // so we must copy it into a contiguous pair.
+            let start = if lhs == rhs {
+                let regs = program.alloc_registers(2);
+                program.emit_insn(Insn::Copy {
+                    src_reg: lhs,
+                    dst_reg: regs,
+                    extra_amount: 0,
+                });
+                program.emit_insn(Insn::Copy {
+                    src_reg: lhs,
+                    dst_reg: regs + 1,
+                    extra_amount: 0,
+                });
+                regs
+            } else {
+                lhs
+            };
+            let func = match op {
+                ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
+                ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
+                _ => unreachable!(),
+            };
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg: start,
                 dest: target_register,
+                func: FuncCtx {
+                    func: Func::Scalar(func),
+                    arg_count: 2,
+                },
             });
         }
         other_unimplemented => todo!("{:?}", other_unimplemented),
     }
 
     Ok(())
+}
+
+/// Check if an expression is known to produce an array value.
+pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferences>) -> bool {
+    match expr {
+        Expr::Column { table, column, .. } => {
+            if let Some(tables) = referenced_tables {
+                tables
+                    .find_table_by_internal_id(*table)
+                    .map(|(_, t)| t)
+                    .and_then(|t| t.get_column_at(*column))
+                    .is_some_and(|col| col.is_array())
+            } else {
+                false
+            }
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            if let Ok(f) = Func::resolve_function(name.as_str(), args.len()) {
+                match &f {
+                    Func::Scalar(sf) if sf.returns_array_blob() => return true,
+                    Func::Agg(AggFunc::ArrayAgg) => return true,
+                    _ => {}
+                }
+            }
+            // Wrapper functions that pass through an array value
+            match name.as_str().to_lowercase().as_str() {
+                "coalesce" | "ifnull" | "min" | "max" => {
+                    args.iter().any(|a| expr_is_array(a, referenced_tables))
+                }
+                "iif" => {
+                    // args: condition, then_val, else_val
+                    args.get(1)
+                        .is_some_and(|a| expr_is_array(a, referenced_tables))
+                        || args
+                            .get(2)
+                            .is_some_and(|a| expr_is_array(a, referenced_tables))
+                }
+                "nullif" => args
+                    .first()
+                    .is_some_and(|a| expr_is_array(a, referenced_tables)),
+                "array_element" => {
+                    // Subscripting a multi-dim array yields a lower-dim array
+                    if let Some(tables) = referenced_tables {
+                        args.first()
+                            .is_some_and(|a| expr_array_dimensions(a, tables) > 1)
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        }
+        Expr::Array { .. } | Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+        Expr::Binary(lhs, ast::Operator::Concat, rhs) => {
+            expr_is_array(lhs, referenced_tables) || expr_is_array(rhs, referenced_tables)
+        }
+        Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => {
+            when_then_pairs
+                .iter()
+                .any(|(_, then_expr)| expr_is_array(then_expr, referenced_tables))
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|e| expr_is_array(e, referenced_tables))
+        }
+        _ => false,
+    }
+}
+
+/// Return the number of array dimensions for an expression, or 0 for non-array.
+fn expr_array_dimensions(expr: &Expr, tables: &TableReferences) -> u32 {
+    match expr {
+        Expr::Column { table, column, .. } => tables
+            .find_table_by_internal_id(*table)
+            .map(|(_, t)| t)
+            .and_then(|t| t.get_column_at(*column))
+            .map(|col| col.array_dimensions())
+            .unwrap_or(0),
+        Expr::FunctionCall { name, args, .. }
+            if name.as_str().eq_ignore_ascii_case("array_element") =>
+        {
+            let d = args
+                .first()
+                .map(|a| expr_array_dimensions(a, tables))
+                .unwrap_or(0);
+            d.saturating_sub(1)
+        }
+        Expr::FunctionCall { name, .. } if name.as_str().eq_ignore_ascii_case("array") => 1,
+        Expr::Subscript { .. } | Expr::Array { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+        _ => 0,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4209,6 +4457,9 @@ fn emit_binary_condition_insn(
     // When jump_if_condition_is_true: we jump on true, so set jump_if_null when NULL should also jump (e.g. CHECK constraints in integrity_check).
     // When !jump_if_condition_is_true: we jump on false, so set jump_if_null when NULL should also jump (standard SQL 3-valued logic).
     let mut flags = CmpInsFlags::default().with_affinity(affinity);
+    if expr_is_array(lhs_expr, referenced_tables) && expr_is_array(rhs_expr, referenced_tables) {
+        flags = flags.array_cmp();
+    }
     if condition_metadata.jump_if_condition_is_true {
         if condition_metadata.jump_target_when_null == condition_metadata.jump_target_when_true {
             flags = flags.jump_if_null()
@@ -4423,10 +4674,53 @@ fn emit_binary_condition_insn(
             eval_result(program, target_register);
         }
         ast::Operator::Concat => {
-            program.emit_insn(Insn::Concat {
-                lhs,
-                rhs,
+            if expr_is_array(lhs_expr, referenced_tables)
+                || expr_is_array(rhs_expr, referenced_tables)
+            {
+                program.emit_insn(Insn::ArrayConcat {
+                    lhs,
+                    rhs,
+                    dest: target_register,
+                });
+            } else {
+                program.emit_insn(Insn::Concat {
+                    lhs,
+                    rhs,
+                    dest: target_register,
+                });
+            }
+            eval_result(program, target_register);
+        }
+        ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
+            let start = if lhs == rhs {
+                let regs = program.alloc_registers(2);
+                program.emit_insn(Insn::Copy {
+                    src_reg: lhs,
+                    dst_reg: regs,
+                    extra_amount: 0,
+                });
+                program.emit_insn(Insn::Copy {
+                    src_reg: lhs,
+                    dst_reg: regs + 1,
+                    extra_amount: 0,
+                });
+                regs
+            } else {
+                lhs
+            };
+            let func = match op {
+                ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
+                ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
+                _ => unreachable!(),
+            };
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg: start,
                 dest: target_register,
+                func: FuncCtx {
+                    func: Func::Scalar(func),
+                    arg_count: 2,
+                },
             });
             eval_result(program, target_register);
         }
@@ -4859,6 +5153,11 @@ where
                 ast::Expr::Unary(_, expr) => {
                     walk_expr(expr, func)?;
                 }
+                ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
+                    unreachable!(
+                        "Array and Subscript are desugared into function calls by the parser"
+                    )
+                }
                 ast::Expr::Id(_)
                 | ast::Expr::Column { .. }
                 | ast::Expr::RowId { .. }
@@ -5232,8 +5531,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
                     if let Some(referenced_tables) = &mut referenced_tables {
-                        if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), 0)
-                        {
+                        if let Ok(func) = Func::resolve_function(name.as_str(), 0) {
                             if func.needs_star_expansion() {
                                 // Only expand if there are actual tables - otherwise leave as
                                 // FunctionCallStar so translate_expr can generate the error
@@ -5477,6 +5775,11 @@ where
                 }
                 ast::Expr::Unary(_, expr) => {
                     walk_expr_mut(expr, func)?;
+                }
+                ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
+                    unreachable!(
+                        "Array and Subscript are desugared into function calls by the parser"
+                    )
                 }
                 ast::Expr::Id(_)
                 | ast::Expr::Column { .. }
@@ -5959,6 +6262,15 @@ pub(crate) fn emit_returning_results<'a>(
         )?;
     }
 
+    // Decode array columns in RETURNING results (record blob → JSON text).
+    super::result_row::emit_array_decode_for_results(
+        program,
+        result_columns,
+        table_references,
+        result_start_reg,
+        resolver,
+    )?;
+
     // Bit of a hack: this is required in case of e.g. INSERT ... ON CONFLICT DO UPDATE ... RETURNING
     // where the result column values may either be the ones that were inserted, or the ones that were updated,
     // depending on the row in question.
@@ -6176,6 +6488,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             SubqueryType::In { .. } => 1,
             SubqueryType::RowValue { num_regs, .. } => *num_regs,
         },
+        Expr::Array { .. } | Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
     })
 }
 
@@ -6285,7 +6600,7 @@ fn emit_custom_type_operator(
         constant_mask: 0,
         start_reg: func_start,
         dest: result_reg,
-        func: crate::function::FuncCtx { func, arg_count: 2 },
+        func: FuncCtx { func, arg_count: 2 },
     });
     if resolved.negate {
         program.emit_insn(Insn::Not {
@@ -6521,6 +6836,11 @@ pub(crate) fn emit_user_facing_column_value(
             extra_amount: 0,
         });
     }
+    // Array columns: pass through raw record blob. ArrayDecode is emitted
+    // at display time (ResultRow) so that functions/subscripts see raw blobs.
+    if column.is_array() {
+        return Ok(());
+    }
     if let Some(type_def) = resolver.schema().get_type_def(&column.ty_str, is_strict) {
         if let Some(ref decode_expr) = type_def.decode {
             let skip_label = program.allocate_label();
@@ -6706,6 +7026,199 @@ pub(crate) fn emit_trigger_decode_registers(
         .collect::<Result<Vec<usize>>>()
 }
 
+/// Maximum number of array elements supported in the per-element transform loop.
+/// Limited by the fixed register block allocated at compile time.
+const MAX_ARRAY_LOOP_ELEMENTS: usize = 1024;
+
+/// Emit a per-element transform loop on an array blob in `reg`.
+/// Extracts each element, applies `transform_expr` via emit_type_expr,
+/// stores results into contiguous registers, then rebuilds the blob with
+/// MakeArrayDynamic. O(N) instead of O(N²) ArraySetElement per iteration.
+fn emit_array_element_loop(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    transform_expr: &ast::Expr,
+    col: &Column,
+    type_def: &TypeDef,
+    resolver: &Resolver,
+) -> Result<()> {
+    let reg_len = program.alloc_register();
+    let reg_idx = program.alloc_register();
+    let reg_elem = program.alloc_register();
+    // Reserve a contiguous block for transformed elements.
+    // At runtime, we only use registers[elem_base..elem_base+len].
+    let elem_base = program.alloc_registers(MAX_ARRAY_LOOP_ELEMENTS);
+
+    program.emit_insn(Insn::ArrayLength { reg, dest: reg_len });
+
+    // Guard: halt if the array exceeds the register block size.
+    let max_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: MAX_ARRAY_LOOP_ELEMENTS as i64,
+        dest: max_reg,
+    });
+    let ok_label = program.allocate_label();
+    program.emit_insn(Insn::Le {
+        lhs: reg_len,
+        rhs: max_reg,
+        target_pc: ok_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Halt {
+        err_code: SQLITE_CONSTRAINT,
+        description: format!(
+            "array exceeds maximum element count for custom type transform ({MAX_ARRAY_LOOP_ELEMENTS})"
+        ),
+        on_error: None,
+    });
+    program.preassign_label_to_next_insn(ok_label);
+    // reg_idx is the 1-based array index for ArrayElement (PG convention)
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: reg_idx,
+    });
+    // reg_offset is the 0-based offset for RegCopyOffset into the register block
+    let reg_offset = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: reg_offset,
+    });
+
+    let loop_start = program.offset();
+    let loop_end_label = program.allocate_label();
+
+    program.emit_insn(Insn::Gt {
+        lhs: reg_idx,
+        rhs: reg_len,
+        target_pc: loop_end_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+
+    // Extract element from record blob (1-based index)
+    program.emit_insn(Insn::ArrayElement {
+        array_reg: reg,
+        index_reg: reg_idx,
+        dest: reg_elem,
+    });
+
+    // Apply per-element transform expression
+    emit_type_expr(
+        program,
+        transform_expr,
+        reg_elem,
+        reg_elem,
+        col,
+        type_def,
+        resolver,
+    )?;
+
+    // Store transformed element into contiguous register block at 0-based offset
+    program.emit_insn(Insn::RegCopyOffset {
+        src: reg_elem,
+        base: elem_base,
+        offset_reg: reg_offset,
+    });
+
+    program.emit_insn(Insn::AddImm {
+        register: reg_idx,
+        value: 1,
+    });
+    program.emit_insn(Insn::AddImm {
+        register: reg_offset,
+        value: 1,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: loop_start,
+    });
+
+    program.preassign_label_to_next_insn(loop_end_label);
+
+    // Rebuild the array blob from the contiguous register block in one pass
+    program.emit_insn(Insn::MakeArrayDynamic {
+        start_reg: elem_base,
+        count_reg: reg_len,
+        dest: reg,
+    });
+
+    Ok(())
+}
+
+/// Emit bytecode to encode an array value: parse JSON text input, validate/coerce
+/// elements, and serialize to a native record-format BLOB.
+/// For custom element types with encode expressions, a per-element bytecode loop
+/// normalizes input to blob, applies encode per element, then rebuilds the blob.
+fn emit_array_encode(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    col: &Column,
+    resolver: &Resolver,
+    table_name: &str,
+) -> Result<()> {
+    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
+        if let Some(encode_expr) = type_def.encode.as_ref() {
+            // Normalize input (text or blob) to blob with ANY affinity first
+            program.emit_insn(Insn::ArrayEncode {
+                reg,
+                element_affinity: Affinity::Blob,
+                element_type: "ANY".into(),
+                table_name: table_name.into(),
+                col_name: col.name.as_deref().unwrap_or("").into(),
+            });
+
+            emit_array_element_loop(program, reg, encode_expr, col, type_def, resolver)?;
+        }
+    }
+
+    // ArrayEncode: parse JSON text → validate/coerce → serialize to record blob.
+    // For multi-dimensional arrays (e.g. INTEGER[][]), the outer array's elements
+    // are themselves arrays (blobs), so we use ANY/Blob for validation.
+    // Only 1-dimensional arrays validate elements against the declared base type.
+    let is_any = col.ty_str.eq_ignore_ascii_case("ANY");
+    let is_multidim = col.array_dimensions() > 1;
+    let col_name = col.name.as_deref().unwrap_or("");
+    let element_affinity = if is_any || is_multidim {
+        Affinity::Blob
+    } else {
+        Affinity::affinity(&col.ty_str)
+    };
+    let element_type = if is_any || is_multidim {
+        "ANY".into()
+    } else {
+        col.ty_str.to_uppercase().into()
+    };
+    program.emit_insn(Insn::ArrayEncode {
+        reg,
+        element_affinity,
+        element_type,
+        table_name: table_name.into(),
+        col_name: col_name.into(),
+    });
+    Ok(())
+}
+
+/// Emit bytecode to decode an array value: convert record-format BLOB to JSON text.
+/// For base element types, this is a single ArrayDecode instruction.
+/// For custom element types with decode expressions, a per-element loop
+/// extracts elements via ArrayElement, applies decode, then rebuilds the blob.
+pub(crate) fn emit_array_decode(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    col: &Column,
+    resolver: &Resolver,
+) -> Result<()> {
+    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
+        if let Some(decode_expr) = type_def.decode.as_ref() {
+            emit_array_element_loop(program, reg, decode_expr, col, type_def, resolver)?;
+        }
+    }
+
+    // Convert record blob to JSON text for display
+    program.emit_insn(Insn::ArrayDecode { reg });
+    Ok(())
+}
+
 /// Emit encode expressions for columns with custom types in a contiguous register range.
 /// Used by INSERT, UPDATE, and UPSERT paths to encode values before TypeCheck.
 ///
@@ -6718,6 +7231,7 @@ pub(crate) fn emit_custom_type_encode_columns(
     columns: &[Column],
     start_reg: usize,
     only_columns: Option<&HashSet<usize>>,
+    table_name: &str,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {
         if let Some(filter) = only_columns {
@@ -6725,6 +7239,21 @@ pub(crate) fn emit_custom_type_encode_columns(
                 continue;
             }
         }
+
+        let reg = start_reg + i;
+
+        // Handle array columns: encode input (text or blob) -> record blob for storage
+        if col.is_array() {
+            let skip_label = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: skip_label,
+            });
+            emit_array_encode(program, reg, col, resolver, table_name)?;
+            program.preassign_label_to_next_insn(skip_label);
+            continue;
+        }
+
         let type_name = &col.ty_str;
         if type_name.is_empty() {
             continue;
@@ -6735,8 +7264,6 @@ pub(crate) fn emit_custom_type_encode_columns(
         let Some(ref encode_expr) = type_def.encode else {
             continue;
         };
-
-        let reg = start_reg + i;
 
         // Skip NULL values: jump over encode if NULL
         let skip_label = program.allocate_label();
@@ -6770,6 +7297,21 @@ pub(crate) fn emit_custom_type_decode_columns(
                 continue;
             }
         }
+
+        let reg = start_reg + i;
+
+        // Handle array columns: decode record blob -> JSON text for display
+        if col.is_array() {
+            let skip_label = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: skip_label,
+            });
+            emit_array_decode(program, reg, col, resolver)?;
+            program.preassign_label_to_next_insn(skip_label);
+            continue;
+        }
+
         let type_name = &col.ty_str;
         if type_name.is_empty() {
             continue;
@@ -6780,8 +7322,6 @@ pub(crate) fn emit_custom_type_decode_columns(
         let Some(ref decode_expr) = type_def.decode else {
             continue;
         };
-
-        let reg = start_reg + i;
 
         // Skip NULL values: jump over decode if NULL
         let skip_label = program.allocate_label();

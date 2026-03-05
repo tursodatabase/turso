@@ -304,6 +304,7 @@ pub enum AggFunc {
     JsonbGroupObject,
     #[cfg(feature = "json")]
     JsonGroupObject,
+    ArrayAgg,
     #[strum(disabled)]
     External(Arc<ExtFunc>),
 }
@@ -318,7 +319,8 @@ impl PartialEq for AggFunc {
             | (Self::Min, Self::Min)
             | (Self::StringAgg, Self::StringAgg)
             | (Self::Sum, Self::Sum)
-            | (Self::Total, Self::Total) => true,
+            | (Self::Total, Self::Total)
+            | (Self::ArrayAgg, Self::ArrayAgg) => true,
             (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
@@ -348,6 +350,7 @@ impl AggFunc {
             Self::StringAgg => 2,
             Self::Sum => 1,
             Self::Total => 1,
+            Self::ArrayAgg => 1,
             #[cfg(feature = "json")]
             Self::JsonGroupArray | Self::JsonbGroupArray => 1,
             #[cfg(feature = "json")]
@@ -369,6 +372,7 @@ impl AggFunc {
             Self::StringAgg => &[2],
             Self::Sum => &[1],
             Self::Total => &[1],
+            Self::ArrayAgg => &[1],
             #[cfg(feature = "json")]
             Self::JsonGroupArray | Self::JsonbGroupArray => &[1],
             #[cfg(feature = "json")]
@@ -388,6 +392,7 @@ impl AggFunc {
             Self::StringAgg => "string_agg",
             Self::Sum => "sum",
             Self::Total => "total",
+            Self::ArrayAgg => "array_agg",
             #[cfg(feature = "json")]
             Self::JsonbGroupArray => "jsonb_group_array",
             #[cfg(feature = "json")]
@@ -490,6 +495,23 @@ pub enum ScalarFunc {
     NumericDiv,
     NumericLt,
     NumericEq,
+    // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
+    Array,
+    ArrayElement,
+    ArraySetElement,
+    // Array utility functions
+    ArrayLength,
+    ArrayAppend,
+    ArrayPrepend,
+    ArrayCat,
+    ArrayRemove,
+    ArrayContains,
+    ArrayPosition,
+    ArraySlice,
+    StringToArray,
+    ArrayToString,
+    ArrayOverlap,
+    ArrayContainsAll,
 }
 
 impl Deterministic for ScalarFunc {
@@ -579,7 +601,45 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericLt
             | ScalarFunc::NumericEq => true,
+            ScalarFunc::Array
+            | ScalarFunc::ArrayElement
+            | ScalarFunc::ArraySetElement
+            | ScalarFunc::ArrayLength
+            | ScalarFunc::ArrayAppend
+            | ScalarFunc::ArrayPrepend
+            | ScalarFunc::ArrayCat
+            | ScalarFunc::ArrayRemove
+            | ScalarFunc::ArrayContains
+            | ScalarFunc::ArrayPosition
+            | ScalarFunc::ArraySlice
+            | ScalarFunc::StringToArray
+            | ScalarFunc::ArrayToString
+            | ScalarFunc::ArrayOverlap
+            | ScalarFunc::ArrayContainsAll => true,
         }
+    }
+}
+
+impl ScalarFunc {
+    /// Returns true if this function returns a record-format array blob
+    /// that needs ArrayDecode for display.
+    ///
+    /// FIXME: ideally every function would declare its return type via a
+    /// `return_type()` method, and this whitelist would be replaced by a
+    /// generic check. Postponed for now — the set of array-returning
+    /// functions is small and controlled by us.
+    pub fn returns_array_blob(&self) -> bool {
+        matches!(
+            self,
+            Self::Array
+                | Self::ArraySetElement
+                | Self::ArrayAppend
+                | Self::ArrayPrepend
+                | Self::ArrayCat
+                | Self::ArrayRemove
+                | Self::ArraySlice
+                | Self::StringToArray
+        )
     }
 }
 
@@ -670,6 +730,21 @@ impl Display for ScalarFunc {
             Self::NumericDiv => "numeric_div",
             Self::NumericLt => "numeric_lt",
             Self::NumericEq => "numeric_eq",
+            Self::Array => "array",
+            Self::ArrayElement => "array_element",
+            Self::ArraySetElement => "array_set_element",
+            Self::ArrayLength => "array_length",
+            Self::ArrayAppend => "array_append",
+            Self::ArrayPrepend => "array_prepend",
+            Self::ArrayCat => "array_cat",
+            Self::ArrayRemove => "array_remove",
+            Self::ArrayContains => "array_contains",
+            Self::ArrayPosition => "array_position",
+            Self::ArraySlice => "array_slice",
+            Self::StringToArray => "string_to_array",
+            Self::ArrayToString => "array_to_string",
+            Self::ArrayOverlap => "array_overlap",
+            Self::ArrayContainsAll => "array_contains_all",
         };
         write!(f, "{str}")
     }
@@ -681,6 +756,9 @@ impl ScalarFunc {
         matches!(
             self,
             Self::Cast
+                | Self::Array
+                | Self::ArrayElement
+                | Self::ArraySetElement
                 | Self::StatInit
                 | Self::StatPush
                 | Self::StatGet
@@ -783,6 +861,23 @@ impl ScalarFunc {
             | Self::NumericLt
             | Self::NumericEq => &[2],
             Self::NumericEncode => &[3],
+            // Array construction / element access
+            Self::Array => &[-1],         // variable arity
+            Self::ArrayElement => &[2],
+            Self::ArraySetElement => &[3],
+            // Array functions
+            Self::ArrayLength => &[1, 2],
+            Self::ArrayAppend
+            | Self::ArrayPrepend
+            | Self::ArrayCat
+            | Self::ArrayRemove
+            | Self::ArrayContains
+            | Self::ArrayPosition
+            | Self::ArrayOverlap
+            | Self::ArrayContainsAll => &[2],
+            Self::ArraySlice => &[3],
+            Self::StringToArray => &[2, 3],
+            Self::ArrayToString => &[2, 3],
         }
     }
 
@@ -1112,6 +1207,7 @@ impl Func {
                 }
                 Ok(Self::Scalar(ScalarFunc::TimeDiff))
             }
+            "array_agg" => Ok(Self::Agg(AggFunc::ArrayAgg)),
             #[cfg(feature = "json")]
             "jsonb_group_array" => Ok(Self::Agg(AggFunc::JsonbGroupArray)),
             #[cfg(feature = "json")]
@@ -1291,6 +1387,23 @@ impl Func {
             "numeric_div" => Ok(Self::Scalar(ScalarFunc::NumericDiv)),
             "numeric_lt" => Ok(Self::Scalar(ScalarFunc::NumericLt)),
             "numeric_eq" => Ok(Self::Scalar(ScalarFunc::NumericEq)),
+            // Array construction / element access (desugared from syntax)
+            "array" => Ok(Self::Scalar(ScalarFunc::Array)),
+            "array_element" => Ok(Self::Scalar(ScalarFunc::ArrayElement)),
+            "array_set_element" => Ok(Self::Scalar(ScalarFunc::ArraySetElement)),
+            // Array functions
+            "array_length" => Ok(Self::Scalar(ScalarFunc::ArrayLength)),
+            "array_append" => Ok(Self::Scalar(ScalarFunc::ArrayAppend)),
+            "array_prepend" => Ok(Self::Scalar(ScalarFunc::ArrayPrepend)),
+            "array_cat" => Ok(Self::Scalar(ScalarFunc::ArrayCat)),
+            "array_remove" => Ok(Self::Scalar(ScalarFunc::ArrayRemove)),
+            "array_contains" => Ok(Self::Scalar(ScalarFunc::ArrayContains)),
+            "array_position" => Ok(Self::Scalar(ScalarFunc::ArrayPosition)),
+            "array_slice" => Ok(Self::Scalar(ScalarFunc::ArraySlice)),
+            "string_to_array" => Ok(Self::Scalar(ScalarFunc::StringToArray)),
+            "array_to_string" => Ok(Self::Scalar(ScalarFunc::ArrayToString)),
+            "array_overlap" | "array_overlaps" => Ok(Self::Scalar(ScalarFunc::ArrayOverlap)),
+            "array_contains_all" => Ok(Self::Scalar(ScalarFunc::ArrayContainsAll)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }
