@@ -2437,9 +2437,17 @@ impl Drop for FtsCursor {
 
         if is_flushing {
             if !conn.is_in_write_tx() {
+                // This can happen when pre_commit started flushing, then the
+                // statement/transaction aborted and closed the write transaction
+                // before cursor drop cleanup runs.
                 tracing::debug!(
                     "FTS Drop: abandoning in-progress flush (no active write transaction)"
                 );
+                if let Some(ref dir) = self.hybrid_directory {
+                    let _ = dir.take_pending_writes();
+                }
+                self.pending_docs_count = 0;
+                self.state = FtsState::Ready;
                 return;
             }
 
@@ -3268,13 +3276,13 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Discards statement-local pending writes on rollback.
     fn rollback(&mut self) -> Result<()> {
-        if self.pending_docs_count > 0 {
+        let pending_docs_count = self.pending_docs_count;
+        if pending_docs_count > 0 {
             tracing::debug!(
                 "FTS rollback: discarding {} pending documents",
-                self.pending_docs_count
+                pending_docs_count
             );
         }
-        self.pending_docs_count = 0;
 
         if let Some(ref mut writer) = self.writer {
             writer
@@ -3292,6 +3300,7 @@ impl IndexMethodCursor for FtsCursor {
             }
         }
 
+        self.pending_docs_count = 0;
         self.state = FtsState::Ready;
         Ok(())
     }

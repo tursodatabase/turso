@@ -141,9 +141,7 @@ pub trait IndexMethodCursor {
 
     /// Called when the current statement rolls back.
     /// Implementations should discard any statement-local pending state.
-    fn rollback(&mut self) -> Result<()> {
-        Ok(())
-    }
+    fn rollback(&mut self) -> Result<()>;
 
     /// Optimize the index by merging segments or performing other maintenance.
     fn optimize(&mut self, _connection: &Arc<Connection>) -> Result<IOResult<()>> {

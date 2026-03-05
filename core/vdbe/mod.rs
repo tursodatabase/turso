@@ -640,6 +640,10 @@ impl ProgramState {
         pager: &Arc<Pager>,
         write: bool,
     ) -> Result<IOResult<()>> {
+        turso_assert!(
+            !self.main_stmt_savepoint_active,
+            "begin_statement called with active main statement savepoint"
+        );
         self.main_stmt_savepoint_active = false;
         if write {
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
