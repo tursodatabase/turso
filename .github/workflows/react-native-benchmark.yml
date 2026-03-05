@@ -68,7 +68,7 @@ jobs:
         run: |
           npx react-native bundle \
             --platform ios \
-            --dev false \
+            --dev true \
             --entry-file index.js \
             --bundle-output ios/main.jsbundle \
             --assets-dest ios
