@@ -709,7 +709,6 @@ fn expr_index_column_names(table: &Table) -> HashSet<String> {
         .collect()
 }
 
-
 fn build_expr_index_update_predicate<R: Rng + ?Sized>(
     rng: &mut R,
     table: &Table,
