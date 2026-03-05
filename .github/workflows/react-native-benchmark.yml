@@ -59,7 +59,9 @@ jobs:
 
       - name: Install CocoaPods
         working-directory: examples/react-native/ios
-        run: pod install
+        run: |
+          rm -f Podfile.lock
+          pod install
 
       - name: Bundle JS
         working-directory: examples/react-native
@@ -83,6 +85,7 @@ jobs:
             -destination "generic/platform=iOS Simulator" \
             CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=YES \
+            ARCHS=arm64 \
             -quiet
 
       - name: Boot iOS Simulator
