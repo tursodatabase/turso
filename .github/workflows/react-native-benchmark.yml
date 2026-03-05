@@ -1,0 +1,159 @@
+name: React Native Benchmark (iOS)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'bindings/react-native/**'
+      - 'examples/react-native/**'
+      - 'core/**'
+      - 'sdk-kit/**'
+      - 'sync/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+
+jobs:
+  benchmark-ios:
+    name: Build & run iOS benchmark
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-ios-bench"
+          cache-on-failure: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Rust iOS libraries (device + simulator)
+        working-directory: bindings/react-native
+        run: |
+          make ios-build
+          make package-dylibs
+
+      - name: Install example app dependencies
+        working-directory: examples/react-native
+        run: npm install
+
+      - name: Install binding dependencies
+        working-directory: bindings/react-native
+        run: npm install
+
+      - name: Install CocoaPods
+        working-directory: examples/react-native/ios
+        run: pod install
+
+      - name: Bundle JS
+        working-directory: examples/react-native
+        run: |
+          npx react-native bundle \
+            --platform ios \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output ios/main.jsbundle \
+            --assets-dest ios
+
+      - name: Build for iOS Simulator
+        working-directory: examples/react-native
+        run: |
+          xcodebuild \
+            -workspace ios/TursoExample.xcworkspace \
+            -scheme TursoExample \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -derivedDataPath ios/build \
+            -destination "generic/platform=iOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=YES \
+            -quiet
+
+      - name: Boot iOS Simulator
+        run: |
+          # Find an available iPhone simulator
+          DEVICE_UDID=$(xcrun simctl list devices available -j \
+            | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for runtime, devices in data.get('devices', {}).items():
+              if 'iOS' not in runtime: continue
+              for d in devices:
+                  if 'iPhone' in d['name'] and d['isAvailable']:
+                      print(d['udid']); sys.exit(0)
+          ")
+          echo "DEVICE_UDID=$DEVICE_UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$DEVICE_UDID" || true
+          sleep 3
+
+      - name: Run benchmark
+        timeout-minutes: 5
+        working-directory: examples/react-native
+        run: |
+          APP_PATH=$(find ios/build -name "TursoExample.app" -type d | head -1)
+          BUNDLE_ID="org.reactjs.native.example.TursoExample"
+
+          xcrun simctl install "$DEVICE_UDID" "$APP_PATH"
+          xcrun simctl launch "$DEVICE_UDID" "$BUNDLE_ID"
+
+          LOG_FILE="ci-simulator.log"
+          xcrun simctl spawn "$DEVICE_UDID" log stream \
+            --predicate "process == 'TursoExample'" \
+            --style compact > "$LOG_FILE" 2>/dev/null &
+          LOG_PID=$!
+
+          # Wait for results (up to 3 minutes)
+          for i in $(seq 1 90); do
+            sleep 2
+            if grep -q "TURSO_BENCH_RESULTS_END" "$LOG_FILE" 2>/dev/null; then
+              break
+            fi
+          done
+
+          kill $LOG_PID 2>/dev/null || true
+          wait $LOG_PID 2>/dev/null || true
+
+          echo ""
+          echo "============================================"
+          echo "  BENCHMARK RESULTS"
+          echo "============================================"
+          sed -n '/TURSO_BENCH_RESULTS_START/,/TURSO_BENCH_RESULTS_END/p' "$LOG_FILE" \
+            | grep -v "TURSO_BENCH_RESULTS_" || true
+          echo "============================================"
+
+          if grep -q "TURSO_BENCH_EXIT_CODE=1" "$LOG_FILE" 2>/dev/null; then
+            echo "::error::Some benchmark tests failed"
+            exit 1
+          elif ! grep -q "TURSO_BENCH_RESULTS_END" "$LOG_FILE" 2>/dev/null; then
+            echo "::error::Timed out waiting for benchmark results"
+            tail -100 "$LOG_FILE" || true
+            exit 1
+          fi
+
+      - name: Shutdown simulator
+        if: always()
+        run: xcrun simctl shutdown "$DEVICE_UDID" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-logs
+          path: examples/react-native/ci-simulator.log
+          if-no-files-found: ignore

@@ -527,6 +527,24 @@ export default function App() {
     }
 
     setResults(testResults);
+
+    // Structured output for CI capture
+    const passed = testResults.filter(r => r.passed).length;
+    const failed = testResults.filter(r => !r.passed).length;
+    console.log('=== TURSO_BENCH_RESULTS_START ===');
+    for (const r of testResults) {
+      const status = r.passed ? 'PASS' : 'FAIL';
+      const extra = r.metric ? ` [${r.metric}]` : '';
+      const err = r.error ? ` ERROR: ${r.error}` : '';
+      console.log(`[${status}] ${r.name}${extra}${err}`);
+    }
+    console.log(`SUMMARY: ${passed} passed, ${failed} failed`);
+    console.log('=== TURSO_BENCH_RESULTS_END ===');
+    if (failed > 0) {
+      console.log('TURSO_BENCH_EXIT_CODE=1');
+    } else {
+      console.log('TURSO_BENCH_EXIT_CODE=0');
+    }
   }
 
   const passedCount = results.filter(r => r.passed).length;
