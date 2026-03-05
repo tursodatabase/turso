@@ -458,10 +458,8 @@ impl Statement {
                 .column_name(i)
                 .expect("column index must be within valid range")
                 .into_owned();
-            cols.push(Column {
-                name,
-                decl_type: None, // TODO
-            });
+            let decl_type = stmt.column_decltype(i);
+            cols.push(Column { name, decl_type });
         }
 
         cols
