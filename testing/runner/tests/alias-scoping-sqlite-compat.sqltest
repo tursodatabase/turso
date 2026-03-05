@@ -1,0 +1,86 @@
+@database :memory:
+
+setup base {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 15);
+}
+
+@setup base
+test where-allows-unambiguous-select-alias {
+    SELECT a, -a AS x FROM t WHERE x < 0 ORDER BY a;
+}
+expect {
+    1|-1
+    2|-2
+    3|-3
+}
+
+@setup base
+test where-prefers-source-column-over-alias {
+    SELECT -a AS b, a, t.b FROM t WHERE b > 15 ORDER BY a;
+}
+expect {
+    -2|2|20
+}
+
+@setup base
+test order-by-prefers-select-alias-over-source-column {
+    SELECT -a AS b, a, t.b FROM t ORDER BY b;
+}
+expect {
+    -3|3|15
+    -2|2|20
+    -1|1|10
+}
+
+@setup base
+test group-by-prefers-source-column-over-alias {
+    SELECT -a AS b, COUNT(*) FROM t GROUP BY b ORDER BY 1;
+}
+expect {
+    -3|1
+    -2|1
+    -1|1
+}
+
+@setup base
+test order-by-subquery-can-see-select-alias {
+    SELECT a, -a AS x FROM t ORDER BY (SELECT x);
+}
+expect {
+    3|-3
+    2|-2
+    1|-1
+}
+
+@setup base
+test order-by-subquery-prefers-outer-source-column-over-select-alias {
+    SELECT -a AS b, a, t.b FROM t ORDER BY (SELECT b);
+}
+expect {
+    -1|1|10
+    -3|3|15
+    -2|2|20
+}
+
+@setup base
+test having-subquery-can-see-aggregate-alias {
+    SELECT a % 2 AS g, SUM(b) AS s FROM t GROUP BY g HAVING (SELECT s) > 15 ORDER BY g;
+}
+expect {
+    0|20
+    1|25
+}
+
+@setup base
+test nested-where-subquery-can-see-select-alias {
+    SELECT -a AS x, a
+    FROM t
+    WHERE EXISTS (SELECT 1 WHERE EXISTS (SELECT x WHERE x < 0))
+    ORDER BY a;
+}
+expect {
+    -1|1
+    -2|2
+    -3|3
+}

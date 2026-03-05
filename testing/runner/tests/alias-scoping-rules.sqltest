@@ -1,0 +1,263 @@
+@database :memory:
+
+test col-alias-visible-order-by {
+    CREATE TABLE t_order(x INT);
+    INSERT INTO t_order VALUES (2), (1);
+    SELECT x + 1 AS y FROM t_order ORDER BY y;
+}
+expect {
+    2
+    3
+}
+
+test col-alias-visible-group-by {
+    CREATE TABLE t_group(category TEXT);
+    INSERT INTO t_group VALUES ('a'), ('a'), ('b');
+    SELECT category AS cat, COUNT(*) FROM t_group GROUP BY cat ORDER BY cat;
+}
+expect {
+    a|2
+    b|1
+}
+
+test col-alias-visible-having {
+    CREATE TABLE t_having(x INT);
+    INSERT INTO t_having VALUES (1), (1), (1), (2), (2), (2);
+    SELECT COUNT(*) AS cnt FROM t_having GROUP BY x HAVING cnt > 2 ORDER BY cnt;
+}
+expect {
+    3
+    3
+}
+
+test col-alias-visible-where {
+    CREATE TABLE t_where(x INT);
+    INSERT INTO t_where VALUES (10), (20);
+    SELECT x + 1 AS y FROM t_where WHERE y > 10;
+}
+expect {
+    11
+    21
+}
+
+test col-alias-not-visible-same-select-item {
+    CREATE TABLE t_same_select(x INT, y INT);
+    INSERT INTO t_same_select VALUES (1, 10);
+    SELECT x AS y, y + 1 AS z FROM t_same_select;
+}
+expect {
+    1|11
+}
+
+test alias-wins-over-column-order-by {
+    CREATE TABLE t_amb_order(a INT, b INT);
+    INSERT INTO t_amb_order VALUES (1, 100), (2, 0);
+    SELECT b AS a FROM t_amb_order ORDER BY a;
+}
+expect {
+    0
+    100
+}
+
+test alias-wins-over-column-group-by {
+    CREATE TABLE t_amb_group(a INT, b INT);
+    INSERT INTO t_amb_group VALUES (1, 10), (1, 20), (2, 30);
+    SELECT COUNT(*) FROM (SELECT b AS a FROM t_amb_group GROUP BY a);
+}
+expect {
+    3
+}
+
+test table-alias-shadows-base-name {
+    CREATE TABLE t_shadow(x INT);
+    INSERT INTO t_shadow VALUES (1);
+    SELECT t_shadow.x FROM t_shadow AS u;
+}
+expect error {
+}
+
+test table-alias-works-across-clauses {
+    CREATE TABLE t_scope(x INT);
+    INSERT INTO t_scope VALUES (6), (2), (7);
+    SELECT u.x FROM t_scope AS u WHERE u.x > 5 GROUP BY u.x HAVING u.x > 5 ORDER BY u.x;
+}
+expect {
+    6
+    7
+}
+
+test table-alias-in-join-on {
+    CREATE TABLE t1_join(id INT);
+    CREATE TABLE t2_join(id INT);
+    INSERT INTO t1_join VALUES (1), (2);
+    INSERT INTO t2_join VALUES (2), (3);
+    SELECT a.id, b.id FROM t1_join AS a JOIN t2_join AS b ON a.id = b.id;
+}
+expect {
+    2|2
+}
+
+test from-subquery-correlation-not-supported {
+    CREATE TABLE t1_from(id INT);
+    CREATE TABLE t2_from(id INT);
+    INSERT INTO t1_from VALUES (1);
+    INSERT INTO t2_from VALUES (1);
+    SELECT * FROM t1_from AS a, (SELECT * FROM t2_from WHERE t2_from.id = a.id);
+}
+expect error {
+}
+
+test subquery-alias-basic {
+    SELECT sub.x FROM (SELECT 1 AS x) AS sub;
+}
+expect {
+    1
+}
+
+test subquery-without-alias-allowed {
+    SELECT x FROM (SELECT 1 AS x);
+}
+expect {
+    1
+}
+
+test subquery-alias-table-scope {
+    SELECT sub.x FROM (SELECT 1 AS x) AS sub WHERE sub.x = 1;
+}
+expect {
+    1
+}
+
+test subquery-output-column-alias-visible {
+    CREATE TABLE t_subcol(x INT);
+    INSERT INTO t_subcol VALUES (1);
+    SELECT sub.y FROM (SELECT x + 1 AS y FROM t_subcol) AS sub;
+}
+expect {
+    2
+}
+
+test subquery-output-base-column-not-visible {
+    CREATE TABLE t_subcol2(x INT);
+    INSERT INTO t_subcol2 VALUES (1);
+    SELECT sub.x FROM (SELECT x + 1 AS y FROM t_subcol2) AS sub;
+}
+expect error {
+}
+
+test cte-basic-scope {
+    WITH cte AS (SELECT 1 AS val)
+    SELECT cte.val FROM cte;
+}
+expect {
+    1
+}
+
+test cte-visible-in-subsequent-cte {
+    WITH
+      a AS (SELECT 1 AS x),
+      b AS (SELECT x + 1 AS y FROM a)
+    SELECT y FROM b;
+}
+expect {
+    2
+}
+
+test cte-not-visible-before-definition {
+    WITH
+      a AS (SELECT y FROM b),
+      b AS (SELECT 1 AS y)
+    SELECT * FROM a;
+}
+expect error {
+}
+
+test cte-shadows-table {
+    CREATE TABLE t_cte_shadow(x INT);
+    INSERT INTO t_cte_shadow VALUES (10);
+    WITH t_cte_shadow AS (SELECT 1 AS x)
+    SELECT x FROM t_cte_shadow;
+}
+expect {
+    1
+}
+
+test cte-not-visible-outside-statement {
+    SELECT * FROM cte_missing;
+}
+expect error {
+}
+
+test self-join-aliases {
+    CREATE TABLE t_self(id INT, parent_id INT, x INT);
+    INSERT INTO t_self VALUES (1, NULL, 10), (2, 1, 20);
+    SELECT a.x, b.x FROM t_self AS a JOIN t_self AS b ON a.id = b.parent_id ORDER BY a.x, b.x;
+}
+expect {
+    10|20
+}
+
+test join-using-with-alias {
+    CREATE TABLE t1_using(id INT, x INT);
+    CREATE TABLE t2_using(id INT, y INT);
+    INSERT INTO t1_using VALUES (1, 10), (2, 20);
+    INSERT INTO t2_using VALUES (2, 200), (3, 300);
+    SELECT id, a.id FROM t1_using AS a JOIN t2_using AS b USING(id);
+}
+expect {
+    2|2
+}
+
+@skip "compound SELECT ORDER BY is not supported yet in turso"
+test compound-first-select-alias-used-in-order-by {
+    CREATE TABLE t1_cmp(x INT, y INT);
+    CREATE TABLE t2_cmp(p INT, q INT);
+    INSERT INTO t1_cmp VALUES (2, 20), (1, 10);
+    INSERT INTO t2_cmp VALUES (3, 30);
+    SELECT x AS a, y AS b FROM t1_cmp
+    UNION ALL
+    SELECT p, q FROM t2_cmp
+    ORDER BY a;
+}
+expect {
+    1|10
+    2|20
+    3|30
+}
+
+test compound-later-select-alias-ignored {
+    CREATE TABLE t1_cmp2(x INT);
+    CREATE TABLE t2_cmp2(p INT);
+    INSERT INTO t1_cmp2 VALUES (1);
+    INSERT INTO t2_cmp2 VALUES (2);
+    SELECT x AS a FROM t1_cmp2
+    UNION ALL
+    SELECT p AS z FROM t2_cmp2
+    ORDER BY z;
+}
+expect error {
+}
+
+test col-alias-not-visible-in-window-order-by {
+    CREATE TABLE t_win(x INT);
+    INSERT INTO t_win VALUES (1), (2);
+    SELECT x + 1 AS y, SUM(x) OVER (ORDER BY y) FROM t_win;
+}
+expect error {
+}
+
+test update-table-alias-not-supported {
+    CREATE TABLE t_up_alias(x INT);
+    INSERT INTO t_up_alias VALUES (3);
+    UPDATE t_up_alias AS u SET u.x = 5 WHERE u.x = 3;
+}
+expect error {
+}
+
+test delete-table-alias-not-supported {
+    CREATE TABLE t_del_alias(x INT);
+    INSERT INTO t_del_alias VALUES (3);
+    DELETE FROM t_del_alias AS u WHERE u.x = 3;
+}
+expect error {
+}
