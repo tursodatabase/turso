@@ -173,12 +173,13 @@ fn emit_collseq_if_needed(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
     expr: &ast::Expr,
+    reg_minmax_not_updated: Option<usize>,
 ) {
     // Check if this is a column expression with explicit COLLATE clause
     if let ast::Expr::Collate(_, collation_name) = expr {
         if let Ok(collation) = CollationSeq::new(collation_name.as_str()) {
             program.emit_insn(Insn::CollSeq {
-                reg: None,
+                reg: reg_minmax_not_updated,
                 collation,
             });
         }
@@ -191,7 +192,7 @@ fn emit_collseq_if_needed(
             if let Some(table_column) = table_ref.get_column_at(*column) {
                 if let Some(c) = table_column.collation_opt() {
                     program.emit_insn(Insn::CollSeq {
-                        reg: None,
+                        reg: reg_minmax_not_updated,
                         collation: c,
                     });
                     return;
@@ -203,7 +204,7 @@ fn emit_collseq_if_needed(
     // Always emit a CollSeq to reset to BINARY default, preventing collation
     // from a previous aggregate leaking into this one.
     program.emit_insn(Insn::CollSeq {
-        reg: None,
+        reg: reg_minmax_not_updated,
         collation: CollationSeq::Binary,
     });
 }
@@ -391,6 +392,7 @@ pub fn translate_aggregation_step(
     agg_arg_source: AggArgumentSource,
     target_register: usize,
     resolver: &Resolver,
+    reg_minmax_not_updated: Option<usize>,
 ) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
@@ -471,7 +473,7 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            emit_collseq_if_needed(program, referenced_tables, expr);
+            emit_collseq_if_needed(program, referenced_tables, expr, reg_minmax_not_updated);
             let comparator_func_name =
                 super::order_by::custom_type_lt_func(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
@@ -490,7 +492,7 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            emit_collseq_if_needed(program, referenced_tables, expr);
+            emit_collseq_if_needed(program, referenced_tables, expr, reg_minmax_not_updated);
             let comparator_func_name =
                 super::order_by::custom_type_lt_func(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
