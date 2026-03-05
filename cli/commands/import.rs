@@ -273,5 +273,5 @@ pub fn normalize_ident(identifier: &str) -> String {
     } else {
         identifier
     }
-    .to_lowercase()
+    .to_ascii_lowercase()
 }
