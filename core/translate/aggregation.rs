@@ -585,6 +585,21 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
+        AggFunc::ArrayAgg => {
+            if num_args != 1 {
+                crate::bail_parse_error!("array_agg bad number of arguments");
+            }
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: expr_reg,
+                delimiter: 0,
+                func: AggFunc::ArrayAgg,
+                comparator_func_name: None,
+            });
+            target_register
+        }
         AggFunc::External(ref func) => {
             let argc = func.agg_args().map_err(|_| {
                 LimboError::ExtensionError(

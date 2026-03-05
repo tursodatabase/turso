@@ -518,6 +518,18 @@ pub enum Expr {
         /// The type of subquery.
         query_type: SubqueryType,
     },
+    /// `ARRAY[expr, ...]` array literal
+    Array {
+        /// elements of the array
+        elements: Vec<Box<Expr>>,
+    },
+    /// `expr[index]` subscript/element access
+    Subscript {
+        /// base expression (the array)
+        base: Box<Expr>,
+        /// index expression
+        index: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -714,6 +726,10 @@ pub enum Operator {
     RightShift,
     /// `-`
     Subtract,
+    /// `@>` array contains
+    ArrayContains,
+    /// `&&` array overlap
+    ArrayOverlap,
 }
 
 impl Operator {
@@ -1810,6 +1826,15 @@ pub struct Type {
     pub name: String, // TODO Validate: Ids+
     /// type size
     pub size: Option<TypeSize>,
+    /// Number of array dimensions: 0 = scalar, 1 = `type[]`, 2 = `type[][]`, etc.
+    pub array_dimensions: u32,
+}
+
+impl Type {
+    /// Returns true when this type has at least one array dimension.
+    pub fn is_array(&self) -> bool {
+        self.array_dimensions > 0
+    }
 }
 
 /// Column type size limit(s)

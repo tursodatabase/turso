@@ -4,7 +4,7 @@ use crate::ast::{BinOp, Expr, Literal, UnaryOp};
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
-use crate::functions::FunctionDef;
+use crate::functions::{FunctionCategory, FunctionDef};
 use crate::generate::literal::generate_literal;
 use crate::generate::select::{generate_select, generate_simple_select};
 use crate::schema::DataType;
@@ -87,6 +87,10 @@ fn collect_capability_allowed_exprs<C: Capabilities>() -> Vec<ExprKind> {
         candidates.push(ExprKind::WindowFunction);
     }
 
+    // Array expressions (default weight 0)
+    candidates.push(ExprKind::ArrayLiteral);
+    candidates.push(ExprKind::ArraySubscript);
+
     // Always available (but weight 0)
     candidates.push(ExprKind::Collate);
     candidates.push(ExprKind::Raise);
@@ -168,6 +172,9 @@ fn is_expr_valid_for_depth(
         // Window functions require depth budget and subquery budget (they contain nested SELECTs conceptually)
         ExprKind::WindowFunction => depth < max_expr_depth,
 
+        // Array expressions require depth budget
+        ExprKind::ArrayLiteral | ExprKind::ArraySubscript => depth < max_expr_depth,
+
         // Collate and Raise require depth budget
         ExprKind::Collate | ExprKind::Raise => depth < max_expr_depth,
     }
@@ -196,6 +203,8 @@ fn dispatch_expr_generation<C: Capabilities>(
         ExprKind::Exists => generate_exists(generator, ctx),
         // Parenthesized is not generated directly - it's just for grouping
         ExprKind::Parenthesized => unreachable!("parenthesized is not generated directly"),
+        ExprKind::ArrayLiteral => generate_array_literal_expr(generator, ctx, depth),
+        ExprKind::ArraySubscript => generate_array_subscript_expr(generator, ctx, depth),
         // Stubs
         ExprKind::WindowFunction => todo!("window function generation"),
         ExprKind::Collate => todo!("COLLATE expression generation"),
@@ -293,6 +302,7 @@ fn generate_binary_op<C: Capabilities>(
         (OpType::Comparison, category_weights.comparison),
         (OpType::Logical, category_weights.logical),
         (OpType::Arithmetic, category_weights.arithmetic),
+        (OpType::Array, category_weights.array),
     ];
 
     let op_type = generator.policy().select_weighted(ctx, &candidates)?;
@@ -301,11 +311,19 @@ fn generate_binary_op<C: Capabilities>(
         OpType::Comparison => BinOp::comparison(),
         OpType::Logical => BinOp::logical(),
         OpType::Arithmetic => BinOp::arithmetic(),
+        OpType::Array => BinOp::array(),
     };
 
     let op = *ctx
         .choose(ops)
         .ok_or_else(|| GenError::exhausted("binary_op", "no operators available"))?;
+
+    // For array operators, generate array operands
+    if matches!(op_type, OpType::Array) {
+        let left = generate_array_operand(generator, ctx, depth)?;
+        let right = generate_array_operand(generator, ctx, depth)?;
+        return Ok(Expr::binary_op(ctx, left, op, right));
+    }
 
     let left = generate_binop_left(generator, ctx, depth)?;
     let right = generate_binop_right(generator, ctx, depth)?;
@@ -318,6 +336,45 @@ fn generate_binary_op<C: Capabilities>(
     }
 
     Ok(Expr::binary_op(ctx, left, op, right))
+}
+
+/// Generate an array operand for array binary operators.
+/// 60% probability of using an array column from scope, 40% falls back to array literal.
+fn generate_array_operand<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    _depth: usize,
+) -> Result<Expr, GenError> {
+    // Try to pick an array column from scope
+    if ctx.gen_bool_with_prob(0.6) {
+        let array_col_names: Vec<(Option<String>, String)> = ctx
+            .tables_in_scope()
+            .iter()
+            .flat_map(|st| {
+                let qualifier = st.qualifier.clone();
+                st.table
+                    .array_columns()
+                    .map(move |c| (Some(qualifier.clone()), c.name.clone()))
+            })
+            .collect();
+
+        if !array_col_names.is_empty() {
+            let (qualifier, col_name) = ctx.choose(&array_col_names).unwrap().clone();
+            return Ok(Expr::column_ref(ctx, qualifier, col_name));
+        }
+    }
+
+    // Fall back to a simple array literal (don't recurse into generate_array_literal_expr
+    // which calls generate_expr — that can pick ArrayLiteral or BinaryOp(Array) again,
+    // causing exponential stack growth).
+    let config = &generator.policy().literal_config;
+    let size = ctx.gen_range_inclusive(config.array_min_size, config.array_max_size);
+    let mut elements = Vec::with_capacity(size);
+    for _ in 0..size {
+        let lit = generate_literal(ctx, DataType::Integer, generator.policy());
+        elements.push(Expr::literal(ctx, lit));
+    }
+    Ok(Expr::array_literal(ctx, elements))
 }
 
 /// Generate the left operand of a binary operation.
@@ -345,6 +402,7 @@ enum OpType {
     Comparison,
     Logical,
     Arithmetic,
+    Array,
 }
 
 /// Generate a unary operation.
@@ -414,6 +472,28 @@ fn generate_function_arg<C: Capabilities>(
         if func.arg_types.is_empty() {
             let val = ctx.gen_range_inclusive(0, max_val as usize) as i64;
             return Ok(Expr::literal(ctx, Literal::Integer(val)));
+        }
+    }
+
+    // For Array-category functions with ANY arg type, sometimes use an array column ref
+    if func.category == FunctionCategory::Array
+        && func.arg_type_at(arg_index).is_none()
+        && ctx.gen_bool_with_prob(0.5)
+    {
+        let array_col_names: Vec<(Option<String>, String)> = ctx
+            .tables_in_scope()
+            .iter()
+            .flat_map(|st| {
+                let qualifier = st.qualifier.clone();
+                st.table
+                    .array_columns()
+                    .map(move |c| (Some(qualifier.clone()), c.name.clone()))
+            })
+            .collect();
+
+        if !array_col_names.is_empty() {
+            let (qualifier, col_name) = ctx.choose(&array_col_names).unwrap().clone();
+            return Ok(Expr::column_ref(ctx, qualifier, col_name));
         }
     }
 
@@ -619,6 +699,40 @@ fn generate_like_escape<C: Capabilities>(
     todo!("LIKE ... ESCAPE expression generation")
 }
 
+/// Generate an ARRAY[...] literal expression.
+fn generate_array_literal_expr<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    let config = &generator.policy().literal_config;
+    let size = ctx.gen_range_inclusive(config.array_min_size, config.array_max_size);
+
+    let mut elements = Vec::with_capacity(size);
+    for _ in 0..size {
+        let elem = generate_expr(generator, ctx, depth + 1)?;
+        elements.push(elem);
+    }
+
+    Ok(Expr::array_literal(ctx, elements))
+}
+
+/// Generate an array subscript expression: expr[index].
+fn generate_array_subscript_expr<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    // The array part: either a column ref or an array literal
+    let array_expr = generate_expr(generator, ctx, depth + 1)?;
+
+    // The index: generate a small positive integer
+    let idx_val = ctx.gen_range_inclusive(1, 10) as i64;
+    let index_expr = Expr::literal(ctx, crate::ast::Literal::Integer(idx_val));
+
+    Ok(Expr::array_subscript(ctx, array_expr, index_expr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +816,8 @@ mod tests {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            array_literal: 0,
+            array_subscript: 0,
             window_function: 0,
             collate: 0,
             raise: 0,
@@ -750,6 +866,8 @@ mod tests {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            array_literal: 0,
+            array_subscript: 0,
             window_function: 0,
             collate: 0,
             raise: 0,
@@ -809,6 +927,8 @@ mod tests {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            array_literal: 0,
+            array_subscript: 0,
             window_function: 0,
             collate: 0,
             raise: 0,
@@ -866,6 +986,8 @@ mod tests {
                 in_subquery: 30,
                 is_null: 0,
                 exists: 30,
+                array_literal: 0,
+                array_subscript: 0,
                 window_function: 0,
                 collate: 0,
                 raise: 0,
@@ -940,6 +1062,8 @@ mod tests {
             in_subquery: 40,
             is_null: 0,
             exists: 40,
+            array_literal: 0,
+            array_subscript: 0,
             window_function: 0,
             collate: 0,
             raise: 0,

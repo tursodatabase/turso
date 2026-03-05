@@ -30,7 +30,10 @@ use super::{
 /// produce wrong ORDER BY results, so they should be treated as if the
 /// type has no `<` operator (sort on encoded blobs instead).
 fn has_known_sort_comparator(func_name: &str) -> bool {
-    matches!(func_name, "numeric_lt" | "test_uint_lt" | "string_reverse")
+    matches!(
+        func_name,
+        "numeric_lt" | "test_uint_lt" | "string_reverse" | "array_lt"
+    )
 }
 
 /// For an ORDER BY expression that is a column reference to a custom type,
@@ -50,6 +53,10 @@ pub(crate) fn custom_type_lt_func(
     {
         let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
         let col = table.get_column_at(*column)?;
+        // Array columns use element-wise comparison
+        if col.is_array() {
+            return Some("array_lt".to_string());
+        }
         let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
         type_def
             .operators
@@ -58,6 +65,8 @@ pub(crate) fn custom_type_lt_func(
             .and_then(|op| op.func_name.as_ref())
             .filter(|func_name| has_known_sort_comparator(func_name))
             .cloned()
+    } else if super::expr::expr_is_array(expr, Some(referenced_tables)) {
+        Some("array_lt".to_string())
     } else {
         None
     }
@@ -396,6 +405,15 @@ impl EmitOrderBy {
                 }
             }
         }
+
+        // Decode array blobs to JSON text for display, after extracting from sorter
+        super::result_row::emit_array_decode_for_results(
+            program,
+            result_columns,
+            &plan.table_references,
+            start_reg,
+            &t_ctx.resolver,
+        )?;
 
         emit_result_row_and_limit(
             program,

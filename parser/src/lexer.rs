@@ -236,13 +236,30 @@ impl<'a> Iterator for Lexer<'a> {
                 b'!' => Some(self.mark(|l| l.eat_ne())),
                 b'|' => Some(Ok(self.eat_concat_or_bitor())),
                 b',' => Some(Ok(self.eat_one_token(TokenType::TK_COMMA))),
-                b'&' => Some(Ok(self.eat_one_token(TokenType::TK_BITAND))),
+                b'&' => Some(Ok(self.eat_overlap_or_bitand())),
                 b'~' => Some(Ok(self.eat_one_token(TokenType::TK_BITNOT))),
                 b'\'' | b'"' | b'`' => Some(self.mark(|l| l.eat_lit_or_id())),
                 b'.' => Some(self.mark(|l| l.eat_dot_or_frac(false))),
                 b'0'..=b'9' => Some(self.mark(|l| l.eat_number())),
-                b'[' => Some(self.mark(|l| l.eat_bracket())),
-                b'?' | b'$' | b'@' | b'#' | b':' => Some(self.mark(|l| l.eat_var())),
+                b'[' => Some(Ok(self.eat_one_token(TokenType::TK_LBRACKET))),
+                b']' => Some(Ok(self.eat_one_token(TokenType::TK_RBRACKET))),
+                b'@' => {
+                    // @> is array contains operator; bare @ starts a variable
+                    if self.input.get(self.offset + 1) == Some(&b'>') {
+                        Some(Ok(self.eat_array_contains()))
+                    } else {
+                        Some(self.mark(|l| l.eat_var()))
+                    }
+                }
+                b'?' | b'$' | b'#' => Some(self.mark(|l| l.eat_var())),
+                b':' => {
+                    // `:name` is a named parameter, but `:` followed by a digit
+                    // or non-identifier char is a standalone colon (used in slice syntax).
+                    match self.input.get(self.offset + 1) {
+                        Some(&b) if is_identifier_start(b) => Some(self.mark(|l| l.eat_var())),
+                        _ => Some(Ok(self.eat_one_token(TokenType::TK_COLON))),
+                    }
+                }
                 b if is_identifier_start(b) => Some(self.mark(|l| l.eat_blob_or_id())),
                 _ => Some(self.eat_unrecognized()),
             },
@@ -596,6 +613,28 @@ impl<'a> Lexer<'a> {
         Token::new(&self.input[start..self.offset], TokenType::TK_BITOR)
     }
 
+    /// Tokenize `&&` (array overlap) or single `&` (bitwise AND).
+    fn eat_overlap_or_bitand(&mut self) -> Token<'a> {
+        let start = self.offset;
+        self.eat_and_assert(|b| b == b'&');
+        if self.peek() == Some(b'&') {
+            self.eat_and_assert(|b| b == b'&');
+            return Token::new(&self.input[start..self.offset], TokenType::TK_ARRAY_OVERLAP);
+        }
+        Token::new(&self.input[start..self.offset], TokenType::TK_BITAND)
+    }
+
+    /// Tokenize `@>` (array contains).
+    fn eat_array_contains(&mut self) -> Token<'a> {
+        let start = self.offset;
+        self.eat_and_assert(|b| b == b'@');
+        self.eat_and_assert(|b| b == b'>');
+        Token::new(
+            &self.input[start..self.offset],
+            TokenType::TK_ARRAY_CONTAINS,
+        )
+    }
+
     fn eat_lit_or_id(&mut self) -> Result<Token<'a>> {
         let start = self.offset;
         let quote = self.eat().unwrap();
@@ -777,25 +816,6 @@ impl<'a> Lexer<'a> {
                 &self.input[start..self.offset],
                 TokenType::TK_INTEGER,
             )),
-        }
-    }
-
-    fn eat_bracket(&mut self) -> Result<Token<'a>> {
-        let start = self.offset;
-        self.eat_and_assert(|b| b == b'[');
-        if self.eat_past(b']') {
-            Ok(Token::new(
-                &self.input[start..self.offset],
-                TokenType::TK_ID,
-            ))
-        } else {
-            cold();
-            let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-            Err(Error::UnterminatedBracket {
-                span: (start, self.offset - start).into(),
-                token_text,
-                offset: start,
-            })
         }
     }
 
@@ -1015,10 +1035,8 @@ mod tests {
                 b"0x1A3F_5678e9".as_slice(),
                 Token::new(b"0x1A3F_5678e9", TokenType::TK_INTEGER),
             ),
-            (
-                b"[identifier]".as_slice(),
-                Token::new(b"[identifier]", TokenType::TK_ID),
-            ),
+            (b"[".as_slice(), Token::new(b"[", TokenType::TK_LBRACKET)),
+            (b"]".as_slice(), Token::new(b"]", TokenType::TK_RBRACKET)),
             (
                 b"?123".as_slice(),
                 Token::new(b"123", TokenType::TK_VARIABLE), // '?' omitted from value
