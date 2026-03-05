@@ -112,39 +112,50 @@ jobs:
           APP_PATH=$(find ios/build -name "TursoExample.app" -type d | head -1)
           BUNDLE_ID="org.reactjs.native.example.TursoExample"
 
-          xcrun simctl install "$DEVICE_UDID" "$APP_PATH"
-          xcrun simctl launch "$DEVICE_UDID" "$BUNDLE_ID"
-
           LOG_FILE="ci-simulator.log"
           xcrun simctl spawn "$DEVICE_UDID" log stream \
+            --level debug \
             --style compact > "$LOG_FILE" 2>/dev/null &
           LOG_PID=$!
+          sleep 2
+
+          xcrun simctl install "$DEVICE_UDID" "$APP_PATH"
+          xcrun simctl launch --console-pty "$DEVICE_UDID" "$BUNDLE_ID" 2>&1 | tee ci-app-console.log &
+          APP_LOG_PID=$!
 
           # Wait for results (up to 3 minutes)
           for i in $(seq 1 90); do
             sleep 2
-            if grep -q "TURSO_BENCH_RESULTS_END" "$LOG_FILE" 2>/dev/null; then
+            if grep -q "TURSO_BENCH_RESULTS_END" "$LOG_FILE" ci-app-console.log 2>/dev/null; then
               break
             fi
           done
 
           kill $LOG_PID 2>/dev/null || true
+          kill $APP_LOG_PID 2>/dev/null || true
           wait $LOG_PID 2>/dev/null || true
+          wait $APP_LOG_PID 2>/dev/null || true
 
           echo ""
           echo "============================================"
           echo "  BENCHMARK RESULTS"
           echo "============================================"
-          sed -n '/TURSO_BENCH_RESULTS_START/,/TURSO_BENCH_RESULTS_END/p' "$LOG_FILE" \
-            | grep -v "TURSO_BENCH_RESULTS_" || true
+          # Check both log sources for results
+          for f in ci-app-console.log "$LOG_FILE"; do
+            sed -n '/TURSO_BENCH_RESULTS_START/,/TURSO_BENCH_RESULTS_END/p' "$f" \
+              | grep -v "TURSO_BENCH_RESULTS_" || true
+          done
           echo "============================================"
 
-          if grep -q "TURSO_BENCH_EXIT_CODE=1" "$LOG_FILE" 2>/dev/null; then
+          if grep -q "TURSO_BENCH_EXIT_CODE=1" "$LOG_FILE" ci-app-console.log 2>/dev/null; then
             echo "::error::Some benchmark tests failed"
             exit 1
-          elif ! grep -q "TURSO_BENCH_RESULTS_END" "$LOG_FILE" 2>/dev/null; then
+          elif ! grep -q "TURSO_BENCH_RESULTS_END" "$LOG_FILE" ci-app-console.log 2>/dev/null; then
             echo "::error::Timed out waiting for benchmark results"
-            tail -100 "$LOG_FILE" || true
+            echo "=== Last 50 lines of system log ==="
+            tail -50 "$LOG_FILE" || true
+            echo "=== App console log ==="
+            cat ci-app-console.log || true
             exit 1
           fi
 
@@ -157,5 +168,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-logs
-          path: examples/react-native/ci-simulator.log
+          path: |
+            examples/react-native/ci-simulator.log
+            examples/react-native/ci-app-console.log
           if-no-files-found: ignore
