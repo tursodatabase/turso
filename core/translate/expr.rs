@@ -14,7 +14,7 @@ use crate::function::FtsFunc;
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::schema::{Table, Type};
+use crate::schema::{ColDef, Column, Table, Type, TypeDef};
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
 };
@@ -29,7 +29,9 @@ use crate::vdbe::{
     insn::{CmpInsFlags, InsertFlags, Insn},
     BranchOffset,
 };
-use crate::{Numeric, Result, Value};
+use crate::sync::Arc;
+use crate::{LimboError, Numeric, Result, Value};
+use std::collections::HashSet;
 
 use super::collate::{get_collseq_from_expr, CollationSeq};
 
@@ -1297,14 +1299,14 @@ pub fn translate_expr(
                     // CAST(x AS numeric(10,2))), fall through to regular CAST.
                     let user_param_count = type_def.user_params().count();
                     if user_param_count == 0 || ty_params.len() == user_param_count {
-                        let mut cast_col = crate::schema::Column::new(
+                        let mut cast_col = Column::new(
                             None,
                             tn.name.clone(),
                             None,
                             None,
-                            crate::schema::Type::Null,
+                            Type::Null,
                             None,
-                            crate::schema::ColDef::default(),
+                            ColDef::default(),
                         );
                         cast_col.ty_params = ty_params;
 
@@ -2605,7 +2607,7 @@ pub fn translate_expr(
                 // expand the * to all columns from the referenced tables as key-value pairs
                 _ if func.needs_star_expansion() => {
                     let tables = referenced_tables.ok_or_else(|| {
-                        crate::LimboError::ParseError(format!(
+                        LimboError::ParseError(format!(
                             "{}(*) requires a FROM clause",
                             name.as_str()
                         ))
@@ -2613,7 +2615,7 @@ pub fn translate_expr(
 
                     // Verify there's at least one table to expand
                     if tables.joined_tables().is_empty() {
-                        return Err(crate::LimboError::ParseError(format!(
+                        return Err(LimboError::ParseError(format!(
                             "{}(*) requires a FROM clause",
                             name.as_str()
                         )));
@@ -5173,7 +5175,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     let table = resolver
                         .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
+                            LimboError::ParseError(format!(
                                 "no such table: {}.{}",
                                 db_name.as_str(),
                                 tbl_name.as_str()
@@ -5190,7 +5192,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_col_name))
                         })
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
+                            LimboError::ParseError(format!(
                                 "Column: {}.{}.{} not found",
                                 db_name.as_str(),
                                 tbl_name.as_str(),
@@ -5220,7 +5222,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         };
                         referenced_tables.mark_column_used(tbl_id, col_idx);
                     } else {
-                        return Err(crate::LimboError::ParseError(format!(
+                        return Err(LimboError::ParseError(format!(
                             "table {normalized_tbl_name} is not in FROM clause - cross-database column references require the table to be explicitly joined"
                         )));
                     }
@@ -6208,7 +6210,7 @@ fn emit_custom_type_operator(
     let func = resolver
         .resolve_function(&resolved.func_name, 2)
         .ok_or_else(|| {
-            crate::LimboError::InternalError(format!("function not found: {}", resolved.func_name))
+            LimboError::InternalError(format!("function not found: {}", resolved.func_name))
         })?;
     let (first, second) = if resolved.swap_args {
         (e2, e1)
@@ -6297,8 +6299,8 @@ fn emit_custom_type_operator(
 /// Info about a column with a custom type, extracted from an expression.
 struct ExprCustomTypeInfo {
     type_name: String,
-    column: crate::schema::Column,
-    type_def: crate::sync::Arc<crate::schema::TypeDef>,
+    column: Column,
+    type_def: Arc<TypeDef>,
 }
 
 /// If the expression is a column reference to a custom type, return the type info.
@@ -6323,7 +6325,7 @@ fn expr_custom_type_info(
         return Some(ExprCustomTypeInfo {
             type_name: type_name.to_lowercase(),
             column: col.clone(),
-            type_def: crate::sync::Arc::clone(type_def),
+            type_def: Arc::clone(type_def),
         });
     }
     None
@@ -6366,8 +6368,8 @@ enum EncodeArg {
 
 /// Info needed to encode a literal argument for an operator call.
 struct OperatorEncodeInfo {
-    column: crate::schema::Column,
-    type_def: crate::sync::Arc<crate::schema::TypeDef>,
+    column: Column,
+    type_def: Arc<TypeDef>,
     which: EncodeArg,
 }
 
@@ -6402,7 +6404,7 @@ fn find_custom_type_operator(
     let rhs_info = expr_custom_type_info(e2, referenced_tables, resolver);
 
     // Try to find a direct or derived operator match on a type definition.
-    let find_in_type_def = |type_def: &crate::schema::TypeDef| -> Option<(String, bool, bool)> {
+    let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
         // Direct match: just check op symbol (no right_type constraint)
         for op_def in &type_def.operators {
             if op_def.op == op_str {
@@ -6508,7 +6510,7 @@ pub(crate) fn emit_user_facing_column_value(
     program: &mut ProgramBuilder,
     source_reg: usize,
     dest_reg: usize,
-    column: &crate::schema::Column,
+    column: &Column,
     is_strict: bool,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -6552,7 +6554,7 @@ pub(crate) fn decode_custom_type_registers_in_expr(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     expr: &mut turso_parser::ast::Expr,
-    columns: &[crate::schema::Column],
+    columns: &[Column],
     start_reg: usize,
     key_reg: Option<usize>,
     is_strict: bool,
@@ -6601,8 +6603,8 @@ pub(crate) fn emit_type_expr(
     expr: &turso_parser::ast::Expr,
     value_reg: usize,
     dest_reg: usize,
-    column: &crate::schema::Column,
-    type_def: &crate::schema::TypeDef,
+    column: &Column,
+    type_def: &TypeDef,
     resolver: &Resolver,
 ) -> Result<usize> {
     // Set up value override
@@ -6661,7 +6663,7 @@ pub(crate) fn emit_type_expr(
 pub(crate) fn emit_trigger_decode_registers(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    columns: &[crate::schema::Column],
+    columns: &[Column],
     source_regs: &dyn Fn(usize) -> usize,
     rowid_reg: usize,
     is_strict: bool,
@@ -6713,9 +6715,9 @@ pub(crate) fn emit_trigger_decode_registers(
 pub(crate) fn emit_custom_type_encode_columns(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    columns: &[crate::schema::Column],
+    columns: &[Column],
     start_reg: usize,
-    only_columns: Option<&std::collections::HashSet<usize>>,
+    only_columns: Option<&HashSet<usize>>,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {
         if let Some(filter) = only_columns {
@@ -6738,7 +6740,7 @@ pub(crate) fn emit_custom_type_encode_columns(
 
         // Skip NULL values: jump over encode if NULL
         let skip_label = program.allocate_label();
-        program.emit_insn(crate::vdbe::insn::Insn::IsNull {
+        program.emit_insn(Insn::IsNull {
             reg,
             target_pc: skip_label,
         });
@@ -6758,9 +6760,9 @@ pub(crate) fn emit_custom_type_encode_columns(
 pub(crate) fn emit_custom_type_decode_columns(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    columns: &[crate::schema::Column],
+    columns: &[Column],
     start_reg: usize,
-    only_columns: Option<&std::collections::HashSet<usize>>,
+    only_columns: Option<&HashSet<usize>>,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {
         if let Some(filter) = only_columns {
@@ -6783,7 +6785,7 @@ pub(crate) fn emit_custom_type_decode_columns(
 
         // Skip NULL values: jump over decode if NULL
         let skip_label = program.allocate_label();
-        program.emit_insn(crate::vdbe::insn::Insn::IsNull {
+        program.emit_insn(Insn::IsNull {
             reg,
             target_pc: skip_label,
         });
