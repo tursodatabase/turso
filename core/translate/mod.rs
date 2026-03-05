@@ -25,6 +25,7 @@ pub(crate) mod insert;
 pub(crate) mod integrity_check;
 pub(crate) mod logical;
 pub(crate) mod main_loop;
+pub(crate) mod name_context;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
 pub(crate) mod plan;

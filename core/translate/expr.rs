@@ -6,6 +6,7 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, UnaryOperator};
 
 use super::emitter::Resolver;
+use super::name_context::NameResolutionPolicy;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -4900,7 +4901,7 @@ where
 /// ResultColumnsNotAllowed means that referring to result columns is not allowed. This is used e.g. for DML statements.
 ///
 /// AllowUnboundIdentifiers means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingBehavior {
     TryResultColumnsFirst,
     TryCanonicalColumnsFirst,
@@ -4918,6 +4919,7 @@ pub fn bind_and_rewrite_expr<'a>(
     resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
+    let name_resolution_policy = NameResolutionPolicy::for_legacy_behavior(binding_behavior);
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
@@ -4956,7 +4958,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     };
                     let normalized_id = normalize_ident(id.as_str());
 
-                    if binding_behavior == BindingBehavior::TryResultColumnsFirst {
+                    if name_resolution_policy.prefers_local_result_aliases() {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
                                 if let Some(alias) = &result_column.alias {
@@ -5064,7 +5066,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         return Ok(WalkControl::Continue);
                     }
 
-                    if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
+                    if name_resolution_policy.allows_local_result_alias_fallback() {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
                                 if let Some(alias) = &result_column.alias {
