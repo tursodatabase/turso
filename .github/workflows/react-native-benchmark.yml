@@ -117,7 +117,6 @@ jobs:
 
           LOG_FILE="ci-simulator.log"
           xcrun simctl spawn "$DEVICE_UDID" log stream \
-            --predicate "process == 'TursoExample'" \
             --style compact > "$LOG_FILE" 2>/dev/null &
           LOG_PID=$!
 
