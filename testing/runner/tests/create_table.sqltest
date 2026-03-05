@@ -15,6 +15,14 @@ expect {
 }
 
 @cross-check-integrity
+test create_table_non_ascii_case {
+    CREATE TABLE é(a);
+    CREATE TABLE É(a);
+}
+expect {
+}
+
+@cross-check-integrity
 test create_table_unique_contained_in_primary_keys {
     CREATE TABLE t4 (a,b, primary key(a,b), unique(a));
 }
