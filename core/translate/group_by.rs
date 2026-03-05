@@ -6,6 +6,7 @@ use super::{
     order_by::order_by_sorter_insert,
     plan::{Distinctness, GroupBy, SelectPlan},
     result_row::emit_select_result,
+    subquery::emit_aggregate_having_subqueries,
 };
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
@@ -124,7 +125,15 @@ pub fn init_group_by<'a>(
     if !plan.aggregates.is_empty() {
         // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
         // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
-        t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
+        let agg_start_reg = program.alloc_registers_and_init_w_null(plan.aggregates.len());
+        for (i, agg) in plan.aggregates.iter().enumerate() {
+            t_ctx.resolver.bound_result_alias_expr_cache.push((
+                std::borrow::Cow::Owned(agg.original_expr.clone()),
+                agg_start_reg + i,
+                false,
+            ));
+        }
+        t_ctx.reg_agg_start = Some(agg_start_reg);
     }
     // END BLOCK
 
@@ -829,6 +838,11 @@ pub fn group_by_emit_row_phase<'a>(
     t_ctx.resolver.enable_expr_to_reg_cache();
 
     if let Some(having) = &group_by.having {
+        emit_aggregate_having_subqueries(
+            program,
+            &t_ctx.resolver,
+            &plan.non_from_clause_subqueries,
+        )?;
         for expr in having.iter() {
             let if_true_target = program.allocate_label();
             translate_condition_expr(

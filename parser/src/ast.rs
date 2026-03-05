@@ -420,6 +420,13 @@ pub enum Expr {
     },
     /// Identifier
     Id(Name),
+    /// Internal-only reference to a bound result alias expression.
+    /// Not part of SQL syntax; used by the translator to preserve alias identity
+    /// across nested scopes.
+    BoundResultAlias {
+        expr: Box<Expr>,
+        contains_aggregates: bool,
+    },
     /// Column
     Column {
         /// the x in `x.y.z`. index of the db in catalog.

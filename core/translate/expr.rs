@@ -504,6 +504,9 @@ pub fn translate_condition_expr(
                 "Variable as a direct predicate in WHERE clause is not supported"
             );
         }
+        ast::Expr::BoundResultAlias { expr, .. } => {
+            translate_condition_expr(program, referenced_tables, expr, condition_metadata, resolver)?;
+        }
         ast::Expr::Name(_) => {
             crate::bail_parse_error!("Name as a direct predicate in WHERE clause is not supported");
         }
@@ -3226,6 +3229,25 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Literal(lit) => emit_literal(program, lit, target_register),
+        ast::Expr::BoundResultAlias { expr, .. } => {
+            if let Some((src_reg, needs_decode)) = resolver
+                .resolve_bound_result_alias_expr_reg(expr)
+                .or_else(|| resolver.resolve_cached_expr_reg(expr))
+            {
+                if needs_decode {
+                    translate_expr(program, referenced_tables, expr, target_register, resolver)
+                } else {
+                    program.emit_insn(Insn::Copy {
+                        src_reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                    Ok(target_register)
+                }
+            } else {
+                translate_expr(program, referenced_tables, expr, target_register, resolver)
+            }
+        }
         ast::Expr::Name(_) => {
             crate::bail_parse_error!("ast::Expr::Name is not supported in this position")
         }
@@ -4754,6 +4776,9 @@ where
                 ast::Expr::Cast { expr, .. } => {
                     walk_expr(expr, func)?;
                 }
+                ast::Expr::BoundResultAlias { expr, .. } => {
+                    walk_expr(expr, func)?;
+                }
                 ast::Expr::Collate(expr, _) => {
                     walk_expr(expr, func)?;
                 }
@@ -5030,7 +5055,10 @@ pub fn bind_and_rewrite_expr_with_context<'a>(
                     }
 
                     if let Some(result_column) = name_context.find_outer_result_alias(id.as_str()) {
-                        let rewritten = result_column.expr.clone();
+                        let rewritten = Expr::BoundResultAlias {
+                            expr: Box::new(result_column.expr.clone()),
+                            contains_aggregates: result_column.contains_aggregates,
+                        };
                         mark_bound_expr_usage(&rewritten, referenced_tables)?;
                         *expr = rewritten;
                         return Ok(WalkControl::Continue);
@@ -5448,6 +5476,9 @@ where
                         walk_expr_mut(raise_expr, func)?;
                     }
                 }
+                ast::Expr::BoundResultAlias { expr, .. } => {
+                    walk_expr_mut(expr, func)?;
+                }
                 ast::Expr::Unary(_, expr) => {
                     walk_expr_mut(expr, func)?;
                 }
@@ -5540,6 +5571,9 @@ pub(crate) fn get_expr_affinity_info(
             get_expr_affinity_info(exprs.first().unwrap(), referenced_tables, resolver)
         }
         ast::Expr::Collate(expr, _) => get_expr_affinity_info(expr, referenced_tables, resolver),
+        ast::Expr::BoundResultAlias { expr, .. } => {
+            get_expr_affinity_info(expr, referenced_tables, resolver)
+        }
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => ExprAffinityInfo::no_affinity(),
         ast::Expr::Register(reg) => {
@@ -6118,6 +6152,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             1
         }
         Expr::Literal(_) => 1,
+        Expr::BoundResultAlias { expr, .. } => expr_vector_size(expr)?,
         Expr::Name(_) => 1,
         Expr::NotNull(expr) => {
             let evs_expr = expr_vector_size(expr)?;

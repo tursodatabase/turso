@@ -19,6 +19,7 @@ use super::{
     },
     plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
     result_row::emit_select_result,
+    subquery::emit_aggregate_having_subqueries,
 };
 
 /// Emits the bytecode for processing an aggregate without a GROUP BY clause.
@@ -57,6 +58,11 @@ pub fn emit_ungrouped_aggregation<'a>(
     if let Some(group_by) = &plan.group_by {
         if group_by.exprs.is_empty() {
             if let Some(having) = &group_by.having {
+                emit_aggregate_having_subqueries(
+                    program,
+                    &t_ctx.resolver,
+                    &plan.non_from_clause_subqueries,
+                )?;
                 for expr in having.iter() {
                     let if_true_target = program.allocate_label();
                     translate_condition_expr(

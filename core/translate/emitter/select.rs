@@ -83,7 +83,7 @@ pub fn emit_query<'a>(
     for subquery in plan
         .non_from_clause_subqueries
         .iter_mut()
-        .filter(|s| !s.has_been_evaluated())
+        .filter(|s| !s.has_been_evaluated() && !s.emit_in_aggregate_having)
     {
         let eval_at = subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?;
         if eval_at != EvalAt::BeforeLoop {
@@ -176,7 +176,15 @@ pub fn emit_query<'a>(
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
         // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
-        t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
+        let agg_start_reg = program.alloc_registers_and_init_w_null(plan.aggregates.len());
+        for (i, agg) in plan.aggregates.iter().enumerate() {
+            t_ctx.resolver.bound_result_alias_expr_cache.push((
+                std::borrow::Cow::Owned(agg.original_expr.clone()),
+                agg_start_reg + i,
+                false,
+            ));
+        }
+        t_ctx.reg_agg_start = Some(agg_start_reg);
     } else if let Some(window) = &plan.window {
         init_window(
             program,
@@ -264,8 +272,6 @@ pub fn emit_query<'a>(
     program.preassign_label_to_next_insn(after_main_loop_label);
 
     let order_by_necessary = !plan.order_by.is_empty() && !plan.contains_constant_false_condition;
-    let order_by = &plan.order_by;
-
     // Handle GROUP BY and aggregation processing
     if has_group_by_exprs {
         let row_source = &t_ctx
@@ -285,7 +291,7 @@ pub fn emit_query<'a>(
     }
 
     // Process ORDER BY results if needed
-    if !order_by.is_empty() && order_by_necessary {
+    if !plan.order_by.is_empty() && order_by_necessary {
         emit_order_by(program, t_ctx, plan)?;
     }
 

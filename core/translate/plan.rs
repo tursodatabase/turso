@@ -2298,6 +2298,9 @@ pub struct NonFromClauseSubquery {
     pub query_type: SubqueryType,
     pub state: SubqueryState,
     pub correlated: bool,
+    /// Some HAVING subqueries depend on outer finalized aggregate aliases and cannot be
+    /// emitted in the normal pre-loop/main-loop subquery phases.
+    pub emit_in_aggregate_having: bool,
     /// Whether this subquery originates from a RETURNING clause.
     /// RETURNING subqueries must be evaluated after the Insert instruction
     /// so that correlated column references read post-UPDATE values.

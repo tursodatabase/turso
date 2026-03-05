@@ -1965,12 +1965,15 @@ pub fn open_loop(
         }
     }
 
-    if subqueries.iter().any(|s| !s.has_been_evaluated()) {
+    if subqueries
+        .iter()
+        .any(|s| !s.has_been_evaluated() && !s.emit_in_aggregate_having)
+    {
         crate::bail_parse_error!(
             "all subqueries should have already been emitted, but found {} unevaluated subqueries",
             subqueries
                 .iter()
-                .filter(|s| !s.has_been_evaluated())
+                .filter(|s| !s.has_been_evaluated() && !s.emit_in_aggregate_having)
                 .count()
         );
     }
@@ -2025,7 +2028,10 @@ fn emit_correlated_subqueries(
     subqueries: &mut [NonFromClauseSubquery],
     on_only: bool,
 ) -> Result<()> {
-    for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+    for subquery in subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated() && !s.emit_in_aggregate_having)
+    {
         if !subquery.correlated {
             continue;
         }

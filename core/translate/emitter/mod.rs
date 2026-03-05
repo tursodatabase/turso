@@ -87,12 +87,17 @@ pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
+    parent: Option<&'a Resolver<'a>>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
     /// Cache entries: (expression, register, needs_custom_type_decode).
     /// The `needs_custom_type_decode` flag is true for hash-join payload registers
     /// that contain raw encoded values and need DECODE applied when read.
     pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize, bool)>,
+    /// Bound result aliases may need to resolve against outer query registers before the
+    /// outer query enables general expression caching, e.g. correlated HAVING subqueries
+    /// that reference finalized aggregate aliases.
+    pub bound_result_alias_expr_cache: Vec<(Cow<'a, ast::Expr>, usize, bool)>,
     /// Maps register indices to column affinities for expression index evaluation.
     /// Populated temporarily during UPDATE new-image expression index key computation,
     /// where column references have been rewritten to Expr::Register and comparison
@@ -116,9 +121,11 @@ impl<'a> Resolver<'a> {
             schema,
             database_schemas,
             attached_databases,
+            parent: None,
             symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
+            bound_result_alias_expr_cache: Vec::new(),
             register_affinities: HashMap::default(),
         }
     }
@@ -127,14 +134,16 @@ impl<'a> Resolver<'a> {
         self.schema
     }
 
-    pub fn fork(&self) -> Resolver<'a> {
+    pub fn fork(&'a self) -> Resolver<'a> {
         Resolver {
             schema: self.schema,
             database_schemas: self.database_schemas,
             attached_databases: self.attached_databases,
+            parent: Some(self),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
+            bound_result_alias_expr_cache: Vec::new(),
             register_affinities: HashMap::default(),
         }
     }
@@ -165,9 +174,26 @@ impl<'a> Resolver<'a> {
                 .rev()
                 .find(|(e, _, _)| exprs_are_equivalent(expr, e))
                 .map(|(_, reg, needs_decode)| (*reg, *needs_decode))
+                .or_else(|| {
+                    self.parent
+                        .and_then(|parent| parent.resolve_cached_expr_reg(expr))
+                })
         } else {
-            None
+            self.parent
+                .and_then(|parent| parent.resolve_cached_expr_reg(expr))
         }
+    }
+
+    pub fn resolve_bound_result_alias_expr_reg(&self, expr: &ast::Expr) -> Option<(usize, bool)> {
+        self.bound_result_alias_expr_cache
+            .iter()
+            .rev()
+            .find(|(e, _, _)| exprs_are_equivalent(expr, e))
+            .map(|(_, reg, needs_decode)| (*reg, *needs_decode))
+            .or_else(|| {
+                self.parent
+                    .and_then(|parent| parent.resolve_bound_result_alias_expr_reg(expr))
+            })
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning

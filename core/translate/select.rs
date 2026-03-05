@@ -1029,6 +1029,7 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
                 }
             }
             Expr::Cast { expr, .. }
+            | Expr::BoundResultAlias { expr, .. }
             | Expr::Collate(expr, _)
             | Expr::IsNull(expr)
             | Expr::NotNull(expr)

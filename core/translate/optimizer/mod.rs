@@ -2257,6 +2257,7 @@ impl Optimizable for ast::Expr {
             }
             Expr::Cast { expr, .. } => expr.is_nonnull(tables),
             Expr::Collate(expr, _) => expr.is_nonnull(tables),
+            Expr::BoundResultAlias { expr, .. } => expr.is_nonnull(tables),
             Expr::DoublyQualified(..) => {
                 panic!("Do not call is_nonnull before DoublyQualified has been rewritten as Column")
             }
@@ -2346,6 +2347,7 @@ impl Optimizable for ast::Expr {
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
             Expr::Collate(expr, _) => expr.is_constant(resolver),
+            Expr::BoundResultAlias { expr, .. } => expr.is_constant(resolver),
             // Not constant. Normally rewritten to Expr::Column by the optimizer,
             // but CHECK constraints bypass the rewrite pass and legitimately
             // contain DoublyQualified nodes.

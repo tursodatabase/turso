@@ -528,6 +528,13 @@ pub fn resolve_window_and_aggregate_functions(
     let mut contains_aggregates = false;
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
+            Expr::BoundResultAlias {
+                contains_aggregates: alias_contains_aggregates,
+                ..
+            } => {
+                contains_aggregates |= *alias_contains_aggregates;
+                return Ok(WalkControl::SkipChildren);
+            }
             Expr::FunctionCall {
                 name,
                 args,

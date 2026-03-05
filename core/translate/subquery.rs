@@ -11,7 +11,8 @@ use crate::{
         compound_select::emit_program_for_compound_select,
         emitter::select::{emit_program_for_select, emit_query},
         expr::{
-            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
+            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
         },
         name_context::NameContext,
         optimizer::optimize_select_plan,
@@ -38,6 +39,76 @@ use super::{
 };
 use crate::vdbe::builder::CursorKey;
 use turso_parser::ast::TableInternalId;
+
+fn select_plan_contains_outer_aggregate_alias(plan: &SelectPlan) -> bool {
+    fn expr_has_outer_aggregate_alias(expr: &ast::Expr) -> bool {
+        let mut found = false;
+        let _ = walk_expr(expr, &mut |node: &ast::Expr| -> Result<WalkControl> {
+            if let ast::Expr::BoundResultAlias {
+                contains_aggregates: true,
+                ..
+            } = node
+            {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            Ok(WalkControl::Continue)
+        });
+        found
+    }
+
+    plan.result_columns
+        .iter()
+        .any(|column| expr_has_outer_aggregate_alias(&column.expr))
+        || plan
+            .where_clause
+            .iter()
+            .any(|term| expr_has_outer_aggregate_alias(&term.expr))
+        || plan
+            .group_by
+            .as_ref()
+            .is_some_and(|group_by| {
+                group_by.exprs.iter().any(expr_has_outer_aggregate_alias)
+                    || group_by
+                        .having
+                        .as_ref()
+                        .is_some_and(|having| having.iter().any(expr_has_outer_aggregate_alias))
+            })
+        || plan
+            .order_by
+            .iter()
+            .any(|(expr, _)| expr_has_outer_aggregate_alias(expr))
+        || plan
+            .limit
+            .as_deref()
+            .is_some_and(expr_has_outer_aggregate_alias)
+        || plan
+            .offset
+            .as_deref()
+            .is_some_and(expr_has_outer_aggregate_alias)
+}
+
+pub fn emit_aggregate_having_subqueries(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<()> {
+    for subquery in subqueries.iter().filter(|subquery| {
+        subquery.emit_in_aggregate_having && matches!(subquery.state, SubqueryState::Unevaluated { .. })
+    }) {
+        let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
+            continue;
+        };
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            (**plan).clone(),
+            &subquery.query_type,
+            true,
+        )?;
+    }
+    Ok(())
+}
 
 // Compute query plans for subqueries occurring in any position other than the FROM clause.
 // This includes the WHERE clause, HAVING clause, GROUP BY clause, ORDER BY clause, LIMIT clause, and OFFSET clause.
@@ -429,6 +500,8 @@ fn get_subquery_parser<'a>(
                 };
                 optimize_select_plan(&mut plan, resolver.schema())?;
                 let correlated = plan.is_correlated();
+                let emit_in_aggregate_having = position == SubqueryPosition::Having
+                    && select_plan_contains_outer_aggregate_alias(&plan);
                 handle_unsupported_correlation(correlated, position)?;
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
@@ -437,6 +510,7 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
+                    emit_in_aggregate_having,
                     is_returning: false,
                 });
                 Ok(WalkControl::Continue)
@@ -504,6 +578,8 @@ fn get_subquery_parser<'a>(
                 *num_regs = reg_count;
 
                 let correlated = plan.is_correlated();
+                let emit_in_aggregate_having = position == SubqueryPosition::Having
+                    && select_plan_contains_outer_aggregate_alias(&plan);
                 handle_unsupported_correlation(correlated, position)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
@@ -516,6 +592,7 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
+                    emit_in_aggregate_having,
                     is_returning: false,
                 });
                 Ok(WalkControl::Continue)
@@ -630,6 +707,8 @@ fn get_subquery_parser<'a>(
                 };
 
                 let correlated = plan.is_correlated();
+                let emit_in_aggregate_having = position == SubqueryPosition::Having
+                    && select_plan_contains_outer_aggregate_alias(&plan);
                 handle_unsupported_correlation(correlated, position)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
@@ -642,6 +721,7 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(plan)),
                     },
                     correlated,
+                    emit_in_aggregate_having,
                     is_returning: false,
                 });
                 Ok(WalkControl::Continue)

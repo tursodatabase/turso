@@ -894,6 +894,7 @@ impl ToTokens for Expr {
                 Ok(())
             }
             Self::Id(id) => id.to_tokens(s, context),
+            Self::BoundResultAlias { expr, .. } => expr.to_tokens(s, context),
             Self::Column { table, column, .. } => {
                 let (tbl_name, col_name) = context.get_table_and_column_names(*table, *column);
                 s.append(TK_ID, Some(tbl_name.as_ref()))?;
