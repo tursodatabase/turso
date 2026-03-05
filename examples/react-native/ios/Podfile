@@ -38,7 +38,7 @@ target 'TursoExample' do
 
     # Fix framework search paths for vendored xcframework in development pod.
     # CocoaPods doesn't always propagate these correctly for local :path pods.
-    turso_xcfw = File.expand_path('../../bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework', installer.sandbox.root)
+    turso_xcfw = File.expand_path('../../../../bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework', installer.sandbox.root)
     extra_paths = %w[ios-arm64 ios-arm64-simulator].map { |s| "\"#{turso_xcfw}/#{s}\"" }.join(' ')
     installer.generated_aggregate_targets.each do |aggregate_target|
       aggregate_target.xcconfigs.each do |config_name, xcconfig|
