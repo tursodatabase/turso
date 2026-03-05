@@ -1,6 +1,8 @@
 use garde::Validate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
+
 use sql_generation::generation::Opts;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
@@ -35,14 +37,25 @@ pub struct QueryProfile {
 
 impl Default for QueryProfile {
     fn default() -> Self {
+        // bias defaults toward UPDATE + expression-index interactions.
+        let mut gen_opts = Opts::default();
+        gen_opts.table.large_table.enable = false;
+        gen_opts.table.rowid_alias_prob = 0.5;
+
+        gen_opts.query.insert.min_rows = NonZeroU32::new(10).unwrap();
+        gen_opts.query.insert.max_rows = NonZeroU32::new(60).unwrap();
+        gen_opts.query.update.expr_index_update_prob = 0.95;
+        gen_opts.query.create_index.expr_term_prob = 0.8;
+        gen_opts.query.create_index.max_expr_terms = 2;
+
         Self {
-            gen_opts: Opts::default(),
+            gen_opts,
             check_after_dml: true,
             select_weight: 60,
             create_table_weight: 15,
-            create_index_weight: 5,
+            create_index_weight: 15,
             insert_weight: 30,
-            update_weight: 20,
+            update_weight: 40,
             delete_weight: 20,
             drop_table_weight: 2,
             alter_table_weight: 2,

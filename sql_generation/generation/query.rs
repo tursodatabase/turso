@@ -3,7 +3,7 @@ use crate::generation::{
     ArbitrarySized, GenerationContext, InsertOpts,
 };
 use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
-use crate::model::query::predicate::Predicate;
+use crate::model::query::predicate::{expr_to_value, Predicate};
 use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
     SelectInner, SelectTable,
@@ -17,8 +17,9 @@ use crate::model::table::{
     Table, TableContext,
 };
 use indexmap::IndexSet;
-use rand::seq::IndexedRandom;
+use rand::seq::{IndexedRandom, IteratorRandom};
 use rand::{Rng, SeedableRng};
+use std::collections::HashSet;
 use turso_parser::ast::{
     ColumnConstraint, Expr, FunctionTail, Literal, Name as AstName, Operator, SortOrder,
 };
@@ -628,13 +629,23 @@ impl Arbitrary for CreateIndex {
                 expr_budget -= 1;
                 let col_ref = || Expr::Id(AstName::exact(column.name.clone()));
                 let num = |n: i64| Expr::Literal(Literal::Numeric(n.to_string()));
-                let k: i64 = expr_rng.random_range(0..=4);
-
-                let expr = match expr_rng.random_range(0u8..=3) {
-                    0 => Expr::Binary(Box::new(col_ref()), Operator::Multiply, Box::new(num(k))),
-                    1 => simple_fn_call("abs", vec![col_ref()]),
-                    2 => Expr::Binary(Box::new(col_ref()), Operator::Add, Box::new(num(k))),
-                    _ => simple_fn_call("substr", vec![col_ref(), num(1), num(k.max(1))]),
+                // Bias toward modulus (low-cardinality); remaining split across add/mul/abs/substr.
+                const MODULUS_PROB: f64 = 0.6;
+                let expr = if expr_rng.random_bool(MODULUS_PROB) {
+                    let m: i64 = expr_rng.random_range(2..=10);
+                    Expr::Binary(Box::new(col_ref()), Operator::Modulus, Box::new(num(m)))
+                } else {
+                    let k: i64 = expr_rng.random_range(1..=4);
+                    match expr_rng.random_range(0u8..=3) {
+                        0 => Expr::Binary(Box::new(col_ref()), Operator::Add, Box::new(num(k))),
+                        1 => Expr::Binary(
+                            Box::new(col_ref()),
+                            Operator::Multiply,
+                            Box::new(num(k.max(2))),
+                        ),
+                        2 => simple_fn_call("abs", vec![col_ref()]),
+                        _ => simple_fn_call("substr", vec![col_ref(), num(1), num(k)]),
+                    }
                 };
                 IndexColumnKind::Expr {
                     expr: Box::new(expr),
@@ -672,10 +683,101 @@ impl Arbitrary for CreateIndex {
     }
 }
 
+/// Returns expression-index expressions from a table's indexes.
+fn expr_index_exprs(table: &Table) -> impl Iterator<Item = &Expr> {
+    table
+        .indexes
+        .iter()
+        .flat_map(|idx| idx.columns.iter())
+        .filter_map(|ic| match &ic.kind {
+            IndexColumnKind::Expr { expr } => Some(expr.as_ref()),
+            IndexColumnKind::Column { .. } => None,
+        })
+}
+
+/// Returns column names referenced by expression indexes.
+fn expr_index_column_names(table: &Table) -> HashSet<String> {
+    table
+        .indexes
+        .iter()
+        .flat_map(|idx| idx.columns.iter())
+        .filter_map(|ic| match &ic.kind {
+            IndexColumnKind::Expr { .. } => Some(ic),
+            IndexColumnKind::Column { .. } => None,
+        })
+        .flat_map(|ic| ic.referenced_columns(&table.columns))
+        .collect()
+}
+
+
+fn build_expr_index_update_predicate<R: Rng + ?Sized>(
+    rng: &mut R,
+    table: &Table,
+) -> Option<Predicate> {
+    if table.rows.is_empty() {
+        return None;
+    }
+
+    let idx_exprs: Vec<&Expr> = expr_index_exprs(table).collect();
+    let idx_expr = idx_exprs
+        .iter()
+        .copied()
+        .filter(|e| matches!(e, Expr::Binary(_, Operator::Modulus, _)))
+        .choose(rng)
+        .or_else(|| idx_exprs.iter().copied().choose(rng))?;
+
+    let (value, sample_row_idx) = (0..8).find_map(|_| {
+        let row_idx = rng.random_range(0..table.rows.len());
+        let row = &table.rows[row_idx];
+        let v = expr_to_value(idx_expr, row, table)?;
+        (!matches!(v.0, turso_core::Value::Null)).then_some((v, row_idx))
+    })?;
+
+    let expr_pred = Predicate(Expr::Binary(
+        Box::new(idx_expr.clone()),
+        Operator::Equals,
+        Box::new(Expr::Literal((&value).into())),
+    ));
+
+    // Optionally add a PK upper-bound using the sampled matching row.
+    let pk_pred = table
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.is_primary_key() && matches!(c.column_type, ColumnType::Integer))
+        .and_then(|(pk_idx, pk_col)| {
+            let turso_core::Value::Numeric(turso_core::Numeric::Integer(threshold)) =
+                &table.rows[sample_row_idx][pk_idx].0
+            else {
+                return None;
+            };
+            Some(Predicate(Expr::Binary(
+                Box::new(Expr::Id(AstName::exact(pk_col.name.clone()))),
+                Operator::LessEquals,
+                Box::new(Expr::Literal(Literal::Numeric(threshold.to_string()))),
+            )))
+        });
+
+    Some(Predicate::and(
+        std::iter::once(expr_pred).chain(pk_pred).collect(),
+    ))
+}
+
 impl Arbitrary for Update {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
-        let table = pick(env.tables(), rng);
         let update_opts = &env.opts().query.update;
+
+        let expr_index_tables: Vec<&Table> = env
+            .tables()
+            .iter()
+            .filter(|t| expr_index_exprs(t).next().is_some())
+            .collect();
+        let expr_index_table = rng
+            .random_bool(update_opts.expr_index_update_prob)
+            .then(|| expr_index_tables.choose(rng).copied())
+            .flatten();
+        let forced_expr_idx = expr_index_table.is_some();
+        let table = expr_index_table.unwrap_or_else(|| pick(env.tables(), rng));
 
         let unique_columns: Vec<(usize, &Column)> = table
             .columns
@@ -762,22 +864,47 @@ impl Arbitrary for Update {
             (set_values, predicate)
         } else {
             // Normal case: pick from non-UNIQUE columns
-            let num_cols = rng.random_range(1..=non_unique_columns.len());
-            let set_values: Vec<(String, SetValue)> =
-                pick_unique(&non_unique_columns, num_cols, rng)
-                    .map(|column| {
-                        (
-                            column.name.clone(),
-                            SetValue::Simple(SimValue::arbitrary_from(
-                                rng,
-                                env,
-                                &column.column_type,
-                            )),
-                        )
-                    })
-                    .collect();
 
-            let predicate = Predicate::arbitrary_from(rng, env, table);
+            let must_include = if forced_expr_idx {
+                let expr_index_columns = expr_index_column_names(table);
+                non_unique_columns
+                    .iter()
+                    .copied()
+                    .filter(|c| expr_index_columns.contains(c.name.as_str()))
+                    .choose(rng)
+            } else {
+                None
+            };
+
+            let num_cols = rng.random_range(1..=non_unique_columns.len());
+            let excluded_name = must_include.map(|c| c.name.as_str());
+            let mut set_cols: Vec<&Column> = must_include.into_iter().collect();
+            let remaining_cols: Vec<&Column> = non_unique_columns
+                .iter()
+                .copied()
+                .filter(|c| Some(c.name.as_str()) != excluded_name)
+                .collect();
+            let remaining_needed = num_cols - set_cols.len();
+            set_cols.extend(pick_unique(&remaining_cols, remaining_needed, rng).copied());
+
+            let set_values: Vec<(String, SetValue)> = set_cols
+                .iter()
+                .map(|column| {
+                    (
+                        column.name.clone(),
+                        SetValue::Simple(SimValue::arbitrary_from(rng, env, &column.column_type)),
+                    )
+                })
+                .collect();
+
+            let predicate =
+                if forced_expr_idx && rng.random_bool(update_opts.expr_index_predicate_prob) {
+                    build_expr_index_update_predicate(rng, table)
+                        .unwrap_or_else(|| Predicate::arbitrary_from(rng, env, table))
+                } else {
+                    Predicate::arbitrary_from(rng, env, table)
+                };
+
             (set_values, predicate)
         };
 
