@@ -417,6 +417,24 @@ expect {
     3
 }
 
+test subquery-scalar-limit-zero {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT 'row', (SELECT * FROM t LIMIT 0);
+}
+expect {
+    row|
+}
+
+test subquery-scalar-limit-negative {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT 'row', (SELECT * FROM t LIMIT -1);
+}
+expect {
+    row|1
+}
+
 # =============================================================================
 # Joins between subqueries
 # =============================================================================
