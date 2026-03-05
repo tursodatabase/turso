@@ -68,7 +68,7 @@ jobs:
         run: |
           npx react-native bundle \
             --platform ios \
-            --dev true \
+            --dev false \
             --entry-file index.js \
             --bundle-output ios/main.jsbundle \
             --assets-dest ios
@@ -115,39 +115,62 @@ jobs:
           xcrun simctl install "$DEVICE_UDID" "$APP_PATH"
           xcrun simctl launch "$DEVICE_UDID" "$BUNDLE_ID"
 
-          echo "Waiting 60s for benchmarks to complete..."
-          sleep 60
+          # Poll for the results database file (written by the app when benchmarks finish).
+          DATA_DIR=$(xcrun simctl get_app_container "$DEVICE_UDID" "$BUNDLE_ID" data)
+          RESULTS_DB="$DATA_DIR/Documents/ci_bench_results.db"
+          echo "Waiting for results at: $RESULTS_DB"
 
-          echo "=== Checking if app process is still running ==="
-          xcrun simctl spawn "$DEVICE_UDID" launchctl list | grep -i turso || echo "App process not found in launchctl"
-
-          echo "=== App logs (log show) ==="
-          xcrun simctl spawn "$DEVICE_UDID" log show \
-            --predicate "process == 'TursoExample'" \
-            --last 2m \
-            --style compact 2>&1 | head -200
-
-          echo "=== Crash reports ==="
-          find ~/Library/Logs/DiagnosticReports -name "*TursoExample*" -newer "$APP_PATH" 2>/dev/null | head -5
-          for f in $(find ~/Library/Logs/DiagnosticReports -name "*TursoExample*" -newer "$APP_PATH" 2>/dev/null | head -1); do
-            head -50 "$f"
+          for i in $(seq 1 120); do
+            if [ -f "$RESULTS_DB" ]; then
+              # Give the app a moment to finish writing
+              sleep 2
+              echo "Results database found after ~${i}s"
+              break
+            fi
+            sleep 1
           done
 
-          echo "=== All logs mentioning turso (log show, no predicate filter) ==="
-          xcrun simctl spawn "$DEVICE_UDID" log show \
-            --last 2m \
-            --style compact 2>&1 | grep -i -E "turso|TursoExample|BENCH" | head -100
+          if [ ! -f "$RESULTS_DB" ]; then
+            echo "ERROR: Results database not found after 120s"
 
-          echo "=== Done ==="
+            echo "=== Crash reports ==="
+            find ~/Library/Logs/DiagnosticReports -name "*TursoExample*" -newer "$APP_PATH" 2>/dev/null | head -5
+            for f in $(find ~/Library/Logs/DiagnosticReports -name "*TursoExample*" -newer "$APP_PATH" 2>/dev/null | head -1); do
+              head -50 "$f"
+            done
+
+            echo "=== App process check ==="
+            xcrun simctl spawn "$DEVICE_UDID" launchctl list | grep -i turso || echo "App not found"
+
+            echo "=== Files in Documents ==="
+            ls -la "$DATA_DIR/Documents/" 2>/dev/null || echo "Documents dir not found"
+
+            exit 1
+          fi
+
+          echo "=== Benchmark Results ==="
+          sqlite3 "$RESULTS_DB" "SELECT status, name, COALESCE(metric,''), COALESCE(error,'') FROM results;" | while IFS='|' read -r status name metric error; do
+            extra=""
+            [ -n "$metric" ] && extra=" [$metric]"
+            [ -n "$error" ] && extra="$extra ERROR: $error"
+            echo "[$status] $name$extra"
+          done
+
+          echo ""
+          sqlite3 "$RESULTS_DB" "SELECT 'SUMMARY: ' || passed || ' passed, ' || failed || ' failed' FROM summary;"
+
+          EXIT_CODE=$(sqlite3 "$RESULTS_DB" "SELECT exit_code FROM summary LIMIT 1;")
+          exit "${EXIT_CODE:-1}"
 
       - name: Shutdown simulator
         if: always()
         run: xcrun simctl shutdown "$DEVICE_UDID" 2>/dev/null || true
 
-      - name: Upload logs
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-logs
-          path: examples/react-native/ci-simulator.log
+          name: benchmark-results
+          path: |
+            ~/Library/Developer/CoreSimulator/Devices/*/data/Containers/Data/Application/*/Documents/ci_bench_results.db
           if-no-files-found: ignore

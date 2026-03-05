@@ -545,6 +545,38 @@ export default function App() {
     } else {
       console.log('TURSO_BENCH_EXIT_CODE=0');
     }
+
+    // Write results to a SQLite database for CI to read (console.log is not
+    // captured reliably in Release builds on iOS simulators).
+    try {
+      const resultsDb = await connect({ path: 'ci_bench_results.db' });
+      await resultsDb.exec(
+        'CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY, status TEXT, name TEXT, metric TEXT, error TEXT)',
+      );
+      await resultsDb.exec(
+        `CREATE TABLE IF NOT EXISTS summary (passed INTEGER, failed INTEGER, exit_code INTEGER)`,
+      );
+      await resultsDb.exec('BEGIN');
+      for (const r of testResults) {
+        await resultsDb.run(
+          'INSERT INTO results (status, name, metric, error) VALUES (?, ?, ?, ?)',
+          r.passed ? 'PASS' : 'FAIL',
+          r.name,
+          r.metric ?? null,
+          r.error ?? null,
+        );
+      }
+      await resultsDb.run(
+        'INSERT INTO summary (passed, failed, exit_code) VALUES (?, ?, ?)',
+        passed,
+        failed,
+        failed > 0 ? 1 : 0,
+      );
+      await resultsDb.exec('COMMIT');
+      resultsDb.close();
+    } catch (e) {
+      console.log('Failed to write CI results db: ' + String(e));
+    }
   }
 
   const passedCount = results.filter(r => r.passed).length;
