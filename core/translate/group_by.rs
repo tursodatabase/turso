@@ -365,6 +365,18 @@ fn collect_result_columns<'a>(
             // However, if the subquery is of the form: 'aggregate_result IN (SELECT...)', we need to skip it because the aggregation
             // is done later.
             ast::Expr::SubqueryResult { lhs, .. } => {
+                if let ast::Expr::SubqueryResult { subquery_id, .. } = expr {
+                    if plan
+                        .non_from_clause_subqueries
+                        .iter()
+                        .any(|subquery| {
+                            subquery.internal_id == *subquery_id
+                                && subquery.emit_in_aggregate_having
+                        })
+                    {
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                }
                 if let Some(ref lhs) = lhs {
                     let mut lhs_contains_agg = false;
                     walk_expr(lhs, &mut |expr: &ast::Expr| -> Result<WalkControl> {

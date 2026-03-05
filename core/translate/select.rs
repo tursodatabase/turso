@@ -7,7 +7,8 @@ use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, bind_and_rewrite_expr_with_context, expr_vector_size, BindingBehavior,
+    bind_and_rewrite_expr, bind_and_rewrite_expr_with_context, expr_vector_size, walk_expr,
+    BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::name_context::NameContext;
@@ -484,6 +485,7 @@ fn prepare_one_select_plan(
                 if !group_by.exprs.is_empty() {
                     // Normal GROUP BY with expressions
                     for expr in group_by.exprs.iter_mut() {
+                        let original_expr = expr.as_ref().clone();
                         replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
                         bind_and_rewrite_expr_with_context(
                             expr,
@@ -492,6 +494,11 @@ fn prepare_one_select_plan(
                             resolver,
                             BindingBehavior::TryResultColumnsFirst,
                             parent_name_context,
+                        )?;
+                        reject_outer_query_refs_in_group_by(
+                            expr,
+                            &plan.table_references,
+                            &original_expr,
                         )?;
                     }
 
@@ -1101,6 +1108,44 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
         }
     }
     false
+}
+
+fn reject_outer_query_refs_in_group_by(
+    expr: &Expr,
+    table_references: &TableReferences,
+    original_expr: &Expr,
+) -> Result<()> {
+    let mut references_outer_query = false;
+    walk_expr(expr, &mut |node| {
+        match node {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                if table_references
+                    .find_outer_query_ref_by_internal_id(*table)
+                    .is_some()
+                {
+                    references_outer_query = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            Expr::BoundResultAlias { .. } => {
+                references_outer_query = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+
+    if references_outer_query {
+        match original_expr {
+            Expr::Id(name) | Expr::Name(name) => {
+                crate::bail_parse_error!("no such column: {}", name.as_str());
+            }
+            _ => crate::bail_parse_error!("GROUP BY may not reference outer query columns"),
+        }
+    }
+
+    Ok(())
 }
 
 fn select_has_non_from_subqueries(
