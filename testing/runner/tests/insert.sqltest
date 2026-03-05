@@ -2111,3 +2111,43 @@ test insert-ipk-index-explicit-value {
 expect {
     ok
 }
+
+@cross-check-integrity
+test serial-pk-omit-column {
+    CREATE TABLE t_serial (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
+    INSERT INTO t_serial (name) VALUES ('alice');
+    SELECT typeof(id), id, name FROM t_serial;
+}
+expect {
+    null||alice
+}
+
+@cross-check-integrity
+test serial-pk-explicit-null {
+    CREATE TABLE t_serial (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
+    INSERT INTO t_serial (id, name) VALUES (NULL, 'bob');
+    SELECT typeof(id), id, name FROM t_serial;
+}
+expect {
+    null||bob
+}
+
+@cross-check-integrity
+test text-pk-omit-column {
+    CREATE TABLE t_text (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+    INSERT INTO t_text (name) VALUES ('alice');
+    SELECT typeof(id), id, name FROM t_text;
+}
+expect {
+    null||alice
+}
+
+@cross-check-integrity
+test integer-pk-omit-column {
+    CREATE TABLE t_int (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+    INSERT INTO t_int (name) VALUES ('alice');
+    SELECT typeof(id), id, name FROM t_int;
+}
+expect {
+    integer|1|alice
+}

@@ -2240,7 +2240,7 @@ fn translate_column(
             });
         }
     } else {
-        let nullable = !column.notnull() && !column.primary_key();
+        let nullable = !column.notnull() && !column.is_rowid_alias();
         if !nullable {
             crate::bail_parse_error!(
                 "column {} is not nullable",
