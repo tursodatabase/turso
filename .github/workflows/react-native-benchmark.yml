@@ -49,13 +49,13 @@ jobs:
           make ios-build
           make package-dylibs
 
-      - name: Install example app dependencies
-        working-directory: examples/react-native
-        run: npm install
-
       - name: Install binding dependencies
         working-directory: bindings/react-native
-        run: npm install
+        run: npm install --ignore-scripts
+
+      - name: Install example app dependencies
+        working-directory: examples/react-native
+        run: npm install --ignore-scripts
 
       - name: Install CocoaPods
         working-directory: examples/react-native/ios
