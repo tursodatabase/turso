@@ -563,7 +563,7 @@ pub fn translate_insert(
         });
 
         // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion)?;
+        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
 
         // Post-encode TypeCheck: validate that encode produced the correct
         // storage type (BASE).
@@ -3711,6 +3711,7 @@ fn emit_custom_type_encode(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     insertion: &Insertion,
+    table_name: &str,
 ) -> Result<()> {
     let columns: Vec<_> = insertion
         .col_mappings
@@ -3723,5 +3724,6 @@ fn emit_custom_type_encode(
         &columns,
         insertion.first_col_register(),
         None, // INSERT: encode all columns
+        table_name,
     )
 }

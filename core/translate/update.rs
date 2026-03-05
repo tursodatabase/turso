@@ -281,6 +281,7 @@ pub fn prepare_update_plan(
         .collect();
 
     let mut set_clauses: Vec<(usize, Box<Expr>)> = Vec::with_capacity(body.sets.len());
+    let mut subscript_assignments: Vec<(usize, Box<Expr>, Box<Expr>)> = Vec::new();
 
     // Process each SET assignment and map column names to expressions
     // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
@@ -292,6 +293,17 @@ pub fn prepare_update_plan(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
+
+        // Also bind the subscript expression if present
+        if let Some(ref mut subscript_expr) = set.subscript {
+            bind_and_rewrite_expr(
+                subscript_expr,
+                Some(&mut table_references),
+                None,
+                resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+        }
 
         let values = match set.expr.as_ref() {
             Expr::Parenthesized(vals) => vals.clone(),
@@ -305,6 +317,8 @@ pub fn prepare_update_plan(
                 values.len()
             );
         }
+
+        let subscript = set.subscript.clone();
 
         for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
             let ident = normalize_ident(col_name.as_str());
@@ -340,9 +354,20 @@ pub fn prepare_update_plan(
                     }
                 }
             };
-            match set_clauses.iter_mut().find(|(idx, _)| *idx == col_index) {
-                Some((_, existing_expr)) => existing_expr.clone_from(expr),
-                None => set_clauses.push((col_index, expr.clone())),
+            if let Some(ref sub) = subscript {
+                // For subscript assignments, store the full triple
+                // and ensure a placeholder set_clause exists for the column
+                subscript_assignments.push((col_index, sub.clone(), expr.clone()));
+                // Add a placeholder set_clause so the emitter knows this column is modified.
+                // Use the value expr as placeholder; it won't be used for subscript columns.
+                if !set_clauses.iter().any(|(idx, _)| *idx == col_index) {
+                    set_clauses.push((col_index, expr.clone()));
+                }
+            } else {
+                match set_clauses.iter_mut().find(|(idx, _)| *idx == col_index) {
+                    Some((_, existing_expr)) => existing_expr.clone_from(expr),
+                    None => set_clauses.push((col_index, expr.clone())),
+                }
             }
         }
     }
@@ -457,6 +482,7 @@ pub fn prepare_update_plan(
         table_references,
         or_conflict,
         set_clauses,
+        subscript_assignments,
         where_clause,
         returning: if result_columns.is_empty() {
             None

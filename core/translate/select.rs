@@ -1065,6 +1065,15 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
                     stack.push(expr);
                 }
             }
+            Expr::Array { elements } => {
+                for elem in elements.iter().rev() {
+                    stack.push(elem.as_ref());
+                }
+            }
+            Expr::Subscript { base, index } => {
+                stack.push(index.as_ref());
+                stack.push(base.as_ref());
+            }
             Expr::Column { .. }
             | Expr::DoublyQualified(_, _, _)
             | Expr::Id(_)

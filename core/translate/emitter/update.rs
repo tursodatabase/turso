@@ -329,6 +329,7 @@ pub fn emit_program_for_update(
         connection,
         &mut plan.table_references,
         &plan.set_clauses,
+        &plan.subscript_assignments,
         plan.cdc_update_alter_statement.as_deref(),
         &plan.indexes_to_update,
         plan.returning.as_ref(),
@@ -383,6 +384,7 @@ fn emit_update_column_values<'a>(
     program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
     set_clauses: &[(usize, Box<ast::Expr>)],
+    subscript_assignments: &[(usize, Box<ast::Expr>, Box<ast::Expr>)],
     cdc_update_alter_statement: Option<&str>,
     target_table: &Arc<JoinedTable>,
     target_table_cursor_id: usize,
@@ -443,6 +445,43 @@ fn emit_update_column_values<'a>(
                     });
 
                     program.emit_null(target_reg, None);
+                } else if subscript_assignments.iter().any(|(ci, _, _)| ci == col_idx) {
+                    // Array element assignment: SET col[n] = value
+                    // 1. Read current array value from table
+                    program.emit_insn(Insn::Column {
+                        cursor_id: target_table_cursor_id,
+                        column: idx,
+                        dest: target_reg,
+                        default: None,
+                    });
+                    // 2. Apply all subscript assignments for this column in order
+                    for (_, subscript_expr, value_expr) in subscript_assignments
+                        .iter()
+                        .filter(|(ci, _, _)| ci == col_idx)
+                    {
+                        let index_reg = program.alloc_register();
+                        translate_expr(
+                            program,
+                            Some(table_references),
+                            subscript_expr,
+                            index_reg,
+                            &t_ctx.resolver,
+                        )?;
+                        let value_reg = program.alloc_register();
+                        translate_expr(
+                            program,
+                            Some(table_references),
+                            value_expr,
+                            value_reg,
+                            &t_ctx.resolver,
+                        )?;
+                        program.emit_insn(Insn::ArraySetElement {
+                            array_reg: target_reg,
+                            index_reg,
+                            value_reg,
+                            dest: target_reg,
+                        });
+                    }
                 } else {
                     // Columns with custom type encode must not have their
                     // SET expressions hoisted as constants. See the doc
@@ -630,6 +669,7 @@ fn emit_update_insns<'a>(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
     set_clauses: &[(usize, Box<ast::Expr>)],
+    subscript_assignments: &[(usize, Box<ast::Expr>, Box<ast::Expr>)],
     cdc_update_alter_statement: Option<&str>,
     indexes_to_update: &[Arc<Index>],
     returning: Option<&'a Vec<ResultSetColumn>>,
@@ -811,6 +851,7 @@ fn emit_update_insns<'a>(
         program,
         table_references,
         set_clauses,
+        subscript_assignments,
         cdc_update_alter_statement,
         &target_table,
         target_table_cursor_id,
@@ -995,6 +1036,7 @@ fn emit_update_insns<'a>(
             program,
             table_references,
             set_clauses,
+            subscript_assignments,
             cdc_update_alter_statement,
             &target_table,
             target_table_cursor_id,
@@ -1285,6 +1327,7 @@ fn emit_update_insns<'a>(
                 &btree_table.columns,
                 start,
                 Some(&set_col_indices),
+                table_name,
             )?;
 
             // Post-encode TypeCheck: validate encoded values match storage type.

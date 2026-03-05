@@ -18,7 +18,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
-    ImmutableRecord, IndexInfo, SeekResult, Text,
+    ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
     normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
@@ -93,6 +93,13 @@ use crate::{
 use crate::{connection::Row, info, turso_assert, OpenFlags, TransactionState, ValueRef};
 
 use super::{
+    array::{
+        array_values_from_blob, compare_arrays, compute_array_length, exec_array_append,
+        exec_array_cat, exec_array_contains, exec_array_contains_all, exec_array_overlap,
+        exec_array_position, exec_array_prepend, exec_array_remove, exec_array_slice,
+        exec_array_to_string, exec_string_to_array, make_array_from_registers,
+        parse_json_text_array, serialize_array_from_blob, values_to_record_blob,
+    },
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
@@ -886,6 +893,28 @@ pub fn op_comparison(
             state.pc += 1;
         }
         return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // Element-wise array comparison when ARRAY_CMP flag is set
+    if flags.has_array_cmp() {
+        if let (Value::Blob(lb), Value::Blob(rb)) = (lhs_value, rhs_value) {
+            if let Ok(ord) = compare_arrays(lb, rb) {
+                let should_jump = match op {
+                    ComparisonOp::Eq => ord.is_eq(),
+                    ComparisonOp::Ne => !ord.is_eq(),
+                    ComparisonOp::Lt => ord.is_lt(),
+                    ComparisonOp::Le => ord.is_le(),
+                    ComparisonOp::Gt => ord.is_gt(),
+                    ComparisonOp::Ge => ord.is_ge(),
+                };
+                if should_jump {
+                    state.pc = target_pc.as_offset_int();
+                } else {
+                    state.pc += 1;
+                }
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
     }
 
     let (new_lhs, new_rhs) = (affinity.convert(lhs_value), affinity.convert(rhs_value));
@@ -1854,6 +1883,480 @@ pub fn op_type_check(
             // Custom types: skip type check — encode function validates
             Ok(())
         })?;
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Parse an array input (JSON text or record blob), validate/coerce each element
+/// against the declared element type using STRICT type-checking logic, then
+/// serialize to a native record-format BLOB for storage.
+pub fn op_array_encode(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ArrayEncode {
+            reg,
+            element_affinity,
+            element_type,
+            table_name,
+            col_name,
+        },
+        insn
+    );
+
+    let val = state.registers[*reg].get_value();
+    if matches!(val, Value::Null) {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // Fast path: blob input with ANY type — validate it is a well-formed record
+    // before accepting. This avoids the redundant extract→reserialize when MakeArray
+    // output feeds directly into ArrayEncode with ANY affinity, but rejects raw blobs
+    // (e.g. zeroblob, X'DEADBEEF') that would crash on read.
+    if let Value::Blob(b) = val {
+        if element_type.eq_ignore_ascii_case("ANY") {
+            // Validate blob is a well-formed record using streaming iterator
+            // (no Vec<Value> allocation). Rejects empty blobs and invalid records.
+            let valid = !b.is_empty()
+                && ValueIterator::new(b)
+                    .map(|iter| iter.into_iter().all(|r| r.is_ok()))
+                    .unwrap_or(false);
+            if !valid {
+                bail_constraint_error!(
+                    "cannot store non-array value in {} column {}.{} ({})",
+                    element_type,
+                    table_name,
+                    col_name,
+                    SQLITE_CONSTRAINT
+                );
+            }
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
+
+    // Extract elements from either blob (MakeArray) or text (JSON literal)
+    let raw_elements = match val {
+        Value::Blob(b) => array_values_from_blob(b).ok(),
+        Value::Text(text) => parse_json_text_array(text.as_str()),
+        _ => None,
+    };
+    let Some(raw_elements) = raw_elements else {
+        bail_constraint_error!(
+            "cannot store non-array value in {} column {}.{} ({})",
+            element_type,
+            table_name,
+            col_name,
+            SQLITE_CONSTRAINT
+        );
+    };
+
+    const MAX_ARRAY_ELEMENTS: usize = 100_000;
+    if raw_elements.len() > MAX_ARRAY_ELEMENTS {
+        bail_constraint_error!(
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
+        );
+    }
+
+    let mut coerced_elements: Vec<Value> = Vec::with_capacity(raw_elements.len());
+    for elem in raw_elements {
+        // NULL elements are allowed — same as STRICT allows NULL in columns
+        if matches!(elem, Value::Null) {
+            coerced_elements.push(elem);
+            continue;
+        }
+
+        // Apply affinity coercion — same as STRICT's TypeCheck
+        let mut reg_tmp = Register::Value(elem);
+        apply_affinity_char(&mut reg_tmp, *element_affinity);
+        let coerced = reg_tmp.get_value().clone();
+
+        // Check value type matches the declared element type — same as STRICT's TypeCheck
+        let value_type = coerced.value_type();
+        let ty_bytes = element_type.as_bytes();
+        let type_ok = turso_macros::match_ignore_ascii_case!(match ty_bytes {
+            b"ANY" => true,
+            b"INTEGER" | b"INT" => value_type == ValueType::Integer,
+            b"REAL" => value_type == ValueType::Float,
+            b"TEXT" => value_type == ValueType::Text,
+            b"BLOB" => value_type == ValueType::Blob,
+            _ => true, // custom types validated by their own encode
+        });
+
+        if !type_ok {
+            bail_constraint_error!(
+                "cannot store {} value in {} ({})",
+                value_type,
+                element_type,
+                SQLITE_CONSTRAINT
+            );
+        }
+
+        coerced_elements.push(coerced);
+    }
+
+    // Serialize coerced elements as a native record-format BLOB
+    let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len());
+    state.registers[*reg] = Register::Value(Value::Blob(record.into_payload()));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Convert a native record-format array BLOB back to JSON text for display.
+pub fn op_array_decode(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ArrayDecode { reg }, insn);
+
+    let val = state.registers[*reg].get_value();
+    if matches!(val, Value::Null) {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let text = match val {
+        Value::Blob(b) if b.is_empty() => "[]".to_string(),
+        Value::Blob(b) => serialize_array_from_blob(b)?,
+        _ => {
+            // Not a blob — leave as-is (might be text from a function result)
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    };
+    state.registers[*reg] = Register::Value(Value::build_text(text));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Access element at index from a record-format array BLOB.
+pub fn op_array_element(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ArrayElement {
+            array_reg,
+            index_reg,
+            dest,
+        },
+        insn
+    );
+
+    let arr_val = state.registers[*array_reg].get_value();
+    if matches!(arr_val, Value::Null) {
+        state.registers[*dest] = Register::Value(Value::Null);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let idx = match state.registers[*index_reg].get_value() {
+        Value::Numeric(Numeric::Integer(i)) if *i >= 0 => *i as usize,
+        _ => {
+            // Negative, non-integer, or NULL index → NULL result
+            state.registers[*dest] = Register::Value(Value::Null);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    };
+
+    let result = match arr_val {
+        Value::Blob(blob) => match ValueIterator::new(blob) {
+            Ok(mut iter) => iter
+                .nth(idx)
+                .and_then(|r| r.ok())
+                .map(|vref| vref.to_owned())
+                .unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        },
+        _ => Value::Null,
+    };
+
+    state.registers[*dest] = Register::Value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Get the number of elements in a record-format array BLOB.
+pub fn op_array_length(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ArrayLength { reg, dest }, insn);
+
+    let val = state.registers[*reg].get_value();
+    let result = match compute_array_length(val) {
+        Some(count) => Value::from_i64(count),
+        None => Value::Null,
+    };
+    state.registers[*dest] = Register::Value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Create an array from contiguous registers as a record-format BLOB.
+pub fn op_make_array(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        MakeArray {
+            start_reg,
+            count,
+            dest
+        },
+        insn
+    );
+
+    let end = start_reg
+        .checked_add(*count)
+        .ok_or_else(|| LimboError::InternalError("MakeArray: register range overflow".into()))?;
+    if end > state.registers.len() {
+        return Err(LimboError::InternalError(format!(
+            "MakeArray: register range {}..{} exceeds register file size {}",
+            start_reg,
+            end,
+            state.registers.len()
+        )));
+    }
+    state.registers[*dest] = Register::Value(make_array_from_registers(
+        &state.registers,
+        *start_reg,
+        *count,
+    ));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Create an array from contiguous registers with dynamic count.
+pub fn op_make_array_dynamic(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        MakeArrayDynamic {
+            start_reg,
+            count_reg,
+            dest
+        },
+        insn
+    );
+
+    let count = match state.registers[*count_reg].get_value() {
+        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
+        _ => 0,
+    };
+
+    let end = start_reg.checked_add(count).ok_or_else(|| {
+        LimboError::InternalError("MakeArrayDynamic: register range overflow".into())
+    })?;
+    if end > state.registers.len() {
+        return Err(LimboError::InternalError(format!(
+            "MakeArrayDynamic: register range {}..{} exceeds register file size {}",
+            start_reg,
+            end,
+            state.registers.len()
+        )));
+    }
+
+    state.registers[*dest] = Register::Value(make_array_from_registers(
+        &state.registers,
+        *start_reg,
+        count,
+    ));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Copy a register value to a dynamically-computed destination register.
+pub fn op_reg_copy_offset(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        RegCopyOffset {
+            src,
+            base,
+            offset_reg
+        },
+        insn
+    );
+
+    let offset = match state.registers[*offset_reg].get_value() {
+        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
+        _ => 0,
+    };
+    let dest = *base + offset;
+    if dest >= state.registers.len() {
+        return Err(LimboError::InternalError(format!(
+            "RegCopyOffset: destination register {} out of bounds (max {})",
+            dest,
+            state.registers.len()
+        )));
+    }
+    state.registers[dest] = state.registers[*src].clone();
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Concatenate/append/prepend arrays. Runtime dispatch based on operand types.
+pub fn op_array_concat(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ArrayConcat { lhs, rhs, dest }, insn);
+
+    // Check NULL before cloning to avoid unnecessary allocation
+    let lhs_ref = state.registers[*lhs].get_value();
+    let rhs_ref = state.registers[*rhs].get_value();
+
+    // PG-compatible NULL handling for arrays:
+    // array || NULL = array, NULL || array = array, NULL || NULL = NULL
+    if matches!(lhs_ref, Value::Null) && matches!(rhs_ref, Value::Null) {
+        state.registers[*dest] = Register::Value(Value::Null);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    if matches!(lhs_ref, Value::Null) {
+        state.registers[*dest] = Register::Value(rhs_ref.clone());
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    if matches!(rhs_ref, Value::Null) {
+        state.registers[*dest] = Register::Value(lhs_ref.clone());
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let result = match (lhs_ref, rhs_ref) {
+        (Value::Blob(lb), Value::Blob(rb)) => {
+            let mut elems_a = array_values_from_blob(lb)?;
+            let elems_b = array_values_from_blob(rb)?;
+            elems_a.extend(elems_b);
+            values_to_record_blob(&elems_a)
+        }
+        (Value::Blob(lb), _) => {
+            let mut elems = array_values_from_blob(lb)?;
+            elems.push(rhs_ref.clone());
+            values_to_record_blob(&elems)
+        }
+        (_, Value::Blob(rb)) => {
+            let mut elems = array_values_from_blob(rb)?;
+            elems.insert(0, lhs_ref.clone());
+            values_to_record_blob(&elems)
+        }
+        _ => {
+            // Neither is an array blob — fall back to string concat
+            Value::build_text(format!("{lhs_ref}{rhs_ref}"))
+        }
+    };
+
+    state.registers[*dest] = Register::Value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Set element at index in a record-format array BLOB.
+pub fn op_array_set_element(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ArraySetElement {
+            array_reg,
+            index_reg,
+            value_reg,
+            dest,
+        },
+        insn
+    );
+
+    let arr_val = state.registers[*array_reg].get_value();
+    if matches!(arr_val, Value::Null) {
+        state.registers[*dest] = Register::Value(Value::Null);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let idx = match state.registers[*index_reg].get_value() {
+        Value::Numeric(Numeric::Integer(i)) if *i >= 0 => *i as usize,
+        _ => {
+            // Invalid index (negative, non-integer): preserve original array
+            state.registers[*dest] = Register::Value(arr_val.clone());
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    };
+
+    let new_val = state.registers[*value_reg].get_value().clone();
+
+    let Value::Blob(blob) = arr_val else {
+        return Err(LimboError::InternalError(
+            "ArraySetElement: expected blob array".into(),
+        ));
+    };
+    let mut elements = array_values_from_blob(blob)?;
+    if idx >= elements.len() {
+        // Out-of-bounds: preserve original array unchanged
+        state.registers[*dest] = Register::Value(Value::Blob(blob.clone()));
+    } else {
+        elements[idx] = new_val;
+        state.registers[*dest] = Register::Value(values_to_record_blob(&elements));
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Extract a subslice of elements from a record-format array BLOB.
+pub fn op_array_slice(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ArraySlice {
+            array_reg,
+            start_reg,
+            end_reg,
+            dest,
+        },
+        insn
+    );
+
+    let arr_val = state.registers[*array_reg].get_value().clone();
+    let start_val = state.registers[*start_reg].get_value().clone();
+    let end_val = state.registers[*end_reg].get_value().clone();
+
+    let result = exec_array_slice(&arr_val, &start_val, &end_val);
+    state.registers[*dest] = Register::Value(result);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4411,6 +4914,11 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
                 "External aggregate not supported in init_agg_payload".to_string(),
             ));
         }
+        AggFunc::ArrayAgg => {
+            // payload[0] = element count (Integer), remaining slots = accumulated values.
+            // We serialize to a record blob only in finalize, avoiding O(n²) re-serialization.
+            payload.push(Value::from_i64(0));
+        }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
             payload.push(Value::Blob(vec![]));
@@ -4679,6 +5187,13 @@ fn update_agg_payload(
             vec.append(&mut key_vec);
             vec.append(&mut val_vec);
         }
+        AggFunc::ArrayAgg => {
+            // ArrayAgg accumulation is handled directly in the AggStep caller
+            // via payload_vec_mut() to grow the Vec (O(1) per row).
+            return Err(LimboError::InternalError(
+                "ArrayAgg should be handled directly in op_agg_step, not update_agg_payload".into(),
+            ));
+        }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
@@ -4761,6 +5276,22 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         }
         AggFunc::Min | AggFunc::Max => payload[0].clone(),
         AggFunc::GroupConcat | AggFunc::StringAgg => payload[0].clone(),
+        AggFunc::ArrayAgg => {
+            // payload[0] = count, payload[1..] = accumulated values.
+            // Serialize to a record blob only once at finalization.
+            let count = payload[0].as_int().unwrap_or(0) as usize;
+            if count == 0 {
+                Value::Null
+            } else if 1 + count > payload.len() {
+                return Err(LimboError::InternalError(format!(
+                    "ArrayAgg: count ({count}) exceeds payload length ({})",
+                    payload.len() - 1
+                )));
+            } else {
+                let elements = &payload[1..1 + count];
+                Value::Blob(ImmutableRecord::from_values(elements, count).into_payload())
+            }
+        }
         AggFunc::External(_) => {
             mark_unlikely();
             // External aggregates are finalized via AggContext::compute_external()
@@ -4871,28 +5402,46 @@ pub fn op_agg_step(
         }
         _ => {
             let arg = state.registers[*col].get_value().clone();
-            // Only a subset of aggregate functions take two arguments
-            let maybe_arg2 = match func {
-                AggFunc::GroupConcat | AggFunc::StringAgg => {
-                    Some(state.registers[*delimiter].get_value().clone())
-                }
-                #[cfg(feature = "json")]
-                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                    Some(state.registers[*delimiter].get_value().clone())
-                }
-                _ => None,
-            };
-            let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
 
-            // Now get mutable borrow on payload
-            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let payload = agg.payload_mut();
-            update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
+            if matches!(func, AggFunc::ArrayAgg) {
+                // ArrayAgg grows the payload Vec directly (O(1) per row).
+                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                    panic!(
+                        "Unexpected value {:?} in AggStep at register {}",
+                        state.registers[*acc_reg], *acc_reg
+                    );
+                };
+                let payload = agg.payload_vec_mut();
+                let count = payload[0]
+                    .as_int()
+                    .expect("array_agg count must be an integer")
+                    as usize;
+                payload[0] = Value::from_i64((count + 1) as i64);
+                payload.push(arg);
+            } else {
+                // Only a subset of aggregate functions take two arguments
+                let maybe_arg2 = match func {
+                    AggFunc::GroupConcat | AggFunc::StringAgg => {
+                        Some(state.registers[*delimiter].get_value().clone())
+                    }
+                    #[cfg(feature = "json")]
+                    AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+                        Some(state.registers[*delimiter].get_value().clone())
+                    }
+                    _ => None,
+                };
+                let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
+
+                // Now get mutable borrow on payload
+                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                    panic!(
+                        "Unexpected value {:?} in AggStep at register {}",
+                        state.registers[*acc_reg], *acc_reg
+                    );
+                };
+                let payload = agg.payload_mut();
+                update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
+            }
         }
     };
 
@@ -6569,6 +7118,96 @@ pub fn op_function(
                     }
                 };
                 state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::ArrayAppend => {
+                check_arg_count!(arg_count, 2);
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let elem_val = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_append(&arr_val, &elem_val));
+            }
+            ScalarFunc::ArrayPrepend => {
+                check_arg_count!(arg_count, 2);
+                let elem_val = state.registers[*start_reg].get_value().clone();
+                let arr_val = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_prepend(&arr_val, &elem_val));
+            }
+            ScalarFunc::ArrayCat => {
+                check_arg_count!(arg_count, 2);
+                let a_val = state.registers[*start_reg].get_value().clone();
+                let b_val = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_cat(&a_val, &b_val));
+            }
+            ScalarFunc::ArrayRemove => {
+                check_arg_count!(arg_count, 2);
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let target = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_remove(&arr_val, &target));
+            }
+            ScalarFunc::ArrayContains => {
+                check_arg_count!(arg_count, 2);
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let target = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_contains(&arr_val, &target));
+            }
+            ScalarFunc::ArrayPosition => {
+                check_arg_count!(arg_count, 2);
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let target = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_position(&arr_val, &target));
+            }
+            ScalarFunc::ArrayLength => {
+                // Accept 1 or 2 args; dimension arg (PG compat) ignored for 1D arrays
+                let arr_val = state.registers[*start_reg].get_value();
+                let result = match compute_array_length(arr_val) {
+                    Some(count) => Value::from_i64(count),
+                    None => Value::Null,
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::ArraySlice => {
+                check_arg_count!(arg_count, 3);
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let start_idx = state.registers[*start_reg + 1].get_value().clone();
+                let end_idx = state.registers[*start_reg + 2].get_value().clone();
+                let result = exec_array_slice(&arr_val, &start_idx, &end_idx);
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::StringToArray => {
+                let text = state.registers[*start_reg].get_value().clone();
+                let delimiter = state.registers[*start_reg + 1].get_value().clone();
+                let null_str = if arg_count >= 3 {
+                    Some(state.registers[*start_reg + 2].get_value().clone())
+                } else {
+                    None
+                };
+                state.registers[*dest] =
+                    Register::Value(exec_string_to_array(&text, &delimiter, null_str.as_ref()));
+            }
+            ScalarFunc::ArrayToString => {
+                let arr_val = state.registers[*start_reg].get_value().clone();
+                let delimiter = state.registers[*start_reg + 1].get_value().clone();
+                let null_str = if arg_count >= 3 {
+                    Some(state.registers[*start_reg + 2].get_value().clone())
+                } else {
+                    None
+                };
+                state.registers[*dest] = Register::Value(exec_array_to_string(
+                    &arr_val,
+                    &delimiter,
+                    null_str.as_ref(),
+                ));
+            }
+            ScalarFunc::ArrayOverlap => {
+                check_arg_count!(arg_count, 2);
+                let a_val = state.registers[*start_reg].get_value().clone();
+                let b_val = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_overlap(&a_val, &b_val));
+            }
+            ScalarFunc::ArrayContainsAll => {
+                check_arg_count!(arg_count, 2);
+                let a_val = state.registers[*start_reg].get_value().clone();
+                let b_val = state.registers[*start_reg + 1].get_value().clone();
+                state.registers[*dest] = Register::Value(exec_array_contains_all(&a_val, &b_val));
             }
         },
         crate::function::Func::Vector(vector_func) => {
@@ -13467,5 +14106,54 @@ mod tests {
         ];
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_array_agg_accumulates_correctly() {
+        // Verify that array_agg produces correct results when accumulating
+        // multiple values. Uses the direct payload approach (O(1) per row).
+        let mut payload = Vec::new();
+        init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
+
+        // Simulate how AggStep accumulates values directly into the payload Vec.
+        for i in 0..100 {
+            let count = payload[0].as_int().unwrap_or(0) as usize;
+            payload[0] = Value::from_i64((count + 1) as i64);
+            payload.push(Value::from_i64(i));
+        }
+
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();
+        let blob = match &result {
+            Value::Blob(b) => b,
+            _ => panic!("Expected Blob, got {result:?}"),
+        };
+        let elements = array_values_from_blob(blob).unwrap();
+        assert_eq!(elements.len(), 100);
+        for (i, elem) in elements.iter().enumerate() {
+            assert_eq!(*elem, Value::from_i64(i as i64));
+        }
+    }
+
+    #[test]
+    fn test_array_agg_zero_rows_produces_valid_result() {
+        // array_agg with zero rows should return NULL, matching PostgreSQL.
+        // The result must not be an invalid empty blob that crashes on decode.
+        let mut payload = Vec::new();
+        init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
+        // No values accumulated — count stays 0.
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_array_agg_finalize_bounds_check() {
+        // If payload[0] count is larger than the actual payload length,
+        // finalize should return an error rather than panicking.
+        let payload = vec![Value::from_i64(999)]; // claims 999 elements but has none
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload);
+        assert!(
+            result.is_err(),
+            "Should error on count exceeding payload length"
+        );
     }
 }

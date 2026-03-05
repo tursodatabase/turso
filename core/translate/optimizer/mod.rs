@@ -2315,6 +2315,8 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
             Expr::Register(..) => false, // Register values can be null
+            Expr::Array { elements } => elements.iter().all(|e| e.is_nonnull(tables)),
+            Expr::Subscript { .. } => false, // out-of-bounds access returns NULL
         }
     }
     /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
@@ -2392,6 +2394,10 @@ impl Optimizable for ast::Expr {
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
             Expr::Register(_) => false,
+            Expr::Array { elements } => elements.iter().all(|e| e.is_constant(resolver)),
+            Expr::Subscript { base, index } => {
+                base.is_constant(resolver) && index.is_constant(resolver)
+            }
         }
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false

@@ -644,8 +644,11 @@ pub struct UpdatePlan {
     pub table_references: TableReferences,
     /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
     pub or_conflict: Option<ResolveType>,
-    // (colum index, new value) pairs
+    // (column index, new value) pairs
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
+    // For array element assignment: (column_index, subscript_index_expr, value_expr)
+    // Supports multiple subscript assignments per column (e.g. SET col[0]='a', col[1]='b')
+    pub subscript_assignments: Vec<(usize, Box<ast::Expr>, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
     pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
     pub limit: Option<Box<Expr>>,

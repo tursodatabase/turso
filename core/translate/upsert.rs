@@ -589,6 +589,7 @@ pub fn emit_upsert(
                 &bt.columns,
                 new_start,
                 None,
+                &bt.name,
             )?;
 
             // Post-encode TypeCheck: validate encoded values match storage type.

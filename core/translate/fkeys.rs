@@ -1380,6 +1380,7 @@ fn generate_set_null_stmt(
         .iter()
         .map(|col| ast::Set {
             col_names: vec![Name::from_string(col)],
+            subscript: None,
             expr: Box::new(Expr::Literal(Literal::Null)),
         })
         .collect();
@@ -1416,6 +1417,7 @@ fn generate_set_default_stmt(
                 .unwrap_or(Expr::Literal(Literal::Null));
             ast::Set {
                 col_names: vec![Name::from_string(col)],
+                subscript: None,
                 expr: Box::new(default_expr),
             }
         })
@@ -1453,6 +1455,7 @@ fn generate_cascade_update_stmt(
                 .expect("new params required for cascade update");
             ast::Set {
                 col_names: vec![Name::from_string(col)],
+                subscript: None,
                 expr: Box::new(Expr::Variable(format!("{}", param_idx.get()))),
             }
         })

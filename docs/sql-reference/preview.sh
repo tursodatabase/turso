@@ -87,6 +87,7 @@ cat > src/SUMMARY.md << 'EOF'
 - [Math](functions/math.md)
 - [JSON](functions/json.md)
 - [Window](functions/window.md)
+- [Array](functions/array.md)
 - [Vector](functions/vector.md)
 - [Full-Text Search](functions/fts.md)
 
