@@ -412,6 +412,14 @@ impl Value {
         }
     }
 
+    pub fn to_float_or_zero(&self) -> f64 {
+        match self {
+            Value::Numeric(Numeric::Float(f)) => f64::from(*f),
+            Value::Numeric(Numeric::Integer(i)) => *i as f64,
+            _ => 0.0,
+        }
+    }
+
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Value::Numeric(Numeric::Integer(i)) => Some(*i),
