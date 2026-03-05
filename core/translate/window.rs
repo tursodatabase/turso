@@ -1075,8 +1075,15 @@ fn emit_return_buffered_rows(
 
     let label_skip_returning_row = program.allocate_label();
     let label_loop_start = program.allocate_label();
-    let reg_one = program.alloc_register();
-    program.emit_int(1, reg_one);
+    let reg_one = window
+        .functions
+        .iter()
+        .any(|func| matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)))
+        .then(|| {
+            let reg = program.alloc_register();
+            program.emit_int(1, reg);
+            reg
+        });
     program.preassign_label_to_next_insn(label_loop_start);
 
     // Propagate subquery result column values to the outer query (if any) or directly to
@@ -1088,6 +1095,7 @@ fn emit_return_buffered_rows(
     }
     for (i, func) in window.functions.iter().enumerate() {
         if let WindowFunctionKind::Window(WindowFunc::RowNumber) = &func.func {
+            let reg_one = reg_one.expect("row_number must allocate reg_one");
             let reg_row_number = registers.acc_result_start + i;
             program.emit_insn(Insn::Add {
                 lhs: reg_row_number,
