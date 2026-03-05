@@ -79,7 +79,7 @@ jobs:
           xcodebuild \
             -workspace ios/TursoExample.xcworkspace \
             -scheme TursoExample \
-            -configuration Release \
+            -configuration Debug \
             -sdk iphonesimulator \
             -derivedDataPath ios/build \
             -destination "generic/platform=iOS Simulator" \
