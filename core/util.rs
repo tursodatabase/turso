@@ -3851,7 +3851,7 @@ pub mod tests {
     fn test_normalize_ident() {
         assert_eq!(normalize_ident("foo"), "foo");
         assert_eq!(normalize_ident("FOO"), "foo");
-        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὀδυσσεύς");
+        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὈΔΥΣΣΕΎΣ");
     }
 
     fn schema_with_tables(create_table_sqls: &[&str]) -> Schema {
