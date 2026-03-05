@@ -6,12 +6,15 @@ use super::plan::{
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::emitter::{OperationMode, Resolver};
-use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, bind_and_rewrite_expr_with_context, expr_vector_size, BindingBehavior,
+};
 use crate::translate::group_by::compute_group_by_sort_order;
+use crate::translate::name_context::NameContext;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
-    break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
+    break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where_with_context,
     plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
@@ -41,6 +44,7 @@ pub fn translate_select(
         &[],
         query_destination,
         connection,
+        None,
     )?;
     if program.trigger.is_some() {
         if let Some(virtual_table) = plan_first_virtual_table_name(&select_plan) {
@@ -132,6 +136,7 @@ pub fn prepare_select_plan(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    parent_name_context: Option<&NameContext<'_>>,
 ) -> Result<Plan> {
     let compounds = select.body.compounds;
     match compounds.is_empty() {
@@ -145,6 +150,7 @@ pub fn prepare_select_plan(
             outer_query_refs,
             query_destination,
             connection,
+            parent_name_context,
         )?)),
         false => {
             // For compound SELECTs, the WITH clause applies to all parts.
@@ -162,6 +168,7 @@ pub fn prepare_select_plan(
                 outer_query_refs,
                 query_destination.clone(),
                 connection,
+                parent_name_context,
             )?;
 
             let mut left = Vec::with_capacity(compounds.len());
@@ -181,6 +188,7 @@ pub fn prepare_select_plan(
                     outer_query_refs,
                     query_destination.clone(),
                     connection,
+                    parent_name_context,
                 )?;
             }
 
@@ -224,6 +232,7 @@ fn prepare_one_select_plan(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    parent_name_context: Option<&NameContext<'_>>,
 ) -> Result<SelectPlan> {
     if order_by
         .iter()
@@ -338,21 +347,23 @@ fn prepare_one_select_plan(
                 let mut window = Window::new(Some(name), &window_def.window)?;
 
                 for expr in window.partition_by.iter_mut() {
-                    bind_and_rewrite_expr(
+                    bind_and_rewrite_expr_with_context(
                         expr,
                         Some(&mut plan.table_references),
                         None,
                         resolver,
                         BindingBehavior::ResultColumnsNotAllowed,
+                        parent_name_context,
                     )?;
                 }
                 for (expr, _) in window.order_by.iter_mut() {
-                    bind_and_rewrite_expr(
+                    bind_and_rewrite_expr_with_context(
                         expr,
                         Some(&mut plan.table_references),
                         None,
                         resolver,
                         BindingBehavior::ResultColumnsNotAllowed,
+                        parent_name_context,
                     )?;
                 }
 
@@ -410,12 +421,13 @@ fn prepare_one_select_plan(
                         }
                     }
                     ResultColumn::Expr(mut expr, maybe_alias) => {
-                        bind_and_rewrite_expr(
+                        bind_and_rewrite_expr_with_context(
                             &mut expr,
                             Some(&mut plan.table_references),
                             None,
                             resolver,
                             BindingBehavior::ResultColumnsNotAllowed,
+                            parent_name_context,
                         )?;
                         let contains_aggregates = resolve_window_and_aggregate_functions(
                             &expr,
@@ -445,12 +457,13 @@ fn prepare_one_select_plan(
             add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
-            parse_where(
+            parse_where_with_context(
                 where_clause.as_deref(),
                 &mut plan.table_references,
                 Some(&plan.result_columns),
                 &mut plan.where_clause,
                 resolver,
+                parent_name_context,
             )?;
 
             if let Some(mut group_by) = group_by {
@@ -462,6 +475,7 @@ fn prepare_one_select_plan(
                         &plan.result_columns,
                         resolver,
                         &mut aggregate_expressions,
+                        parent_name_context,
                     )?)
                 } else {
                     None
@@ -471,12 +485,13 @@ fn prepare_one_select_plan(
                     // Normal GROUP BY with expressions
                     for expr in group_by.exprs.iter_mut() {
                         replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
-                        bind_and_rewrite_expr(
+                        bind_and_rewrite_expr_with_context(
                             expr,
                             Some(&mut plan.table_references),
                             Some(&plan.result_columns),
                             resolver,
                             BindingBehavior::TryResultColumnsFirst,
+                            parent_name_context,
                         )?;
                     }
 
@@ -513,12 +528,13 @@ fn prepare_one_select_plan(
             for mut o in order_by {
                 replace_column_number_with_copy_of_column_expr(&mut o.expr, &plan.result_columns)?;
 
-                bind_and_rewrite_expr(
+                bind_and_rewrite_expr_with_context(
                     &mut o.expr,
                     Some(&mut plan.table_references),
                     Some(&plan.result_columns),
                     resolver,
                     BindingBehavior::TryResultColumnsFirst,
+                    parent_name_context,
                 )?;
                 resolve_window_and_aggregate_functions(
                     &o.expr,
@@ -603,7 +619,13 @@ fn prepare_one_select_plan(
                 )?;
             }
 
-            plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(
+                program,
+                &mut plan,
+                resolver,
+                connection,
+                parent_name_context,
+            )?;
 
             validate_expr_correct_column_counts(&plan)?;
 
@@ -639,13 +661,14 @@ fn prepare_one_select_plan(
             for value_row in values.iter_mut() {
                 for value in value_row.iter_mut() {
                     // Before binding, we check for unquoted literals. Sqlite throws an error in this case
-                    bind_and_rewrite_expr(
+                    bind_and_rewrite_expr_with_context(
                         value,
                         Some(&mut table_references),
                         None,
                         resolver,
                         // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
                         BindingBehavior::TryResultColumnsFirst,
+                        parent_name_context,
                     )?;
                 }
             }
@@ -1227,6 +1250,7 @@ fn process_having_clause(
     result_columns: &[ResultSetColumn],
     resolver: &Resolver,
     aggregate_expressions: &mut Vec<super::plan::Aggregate>,
+    parent_name_context: Option<&NameContext<'_>>,
 ) -> Result<Vec<ast::Expr>> {
     let mut predicates = vec![];
     break_predicate_at_and_boundaries(&having, &mut predicates);
@@ -1241,12 +1265,13 @@ fn process_having_clause(
     }
 
     for expr in predicates.iter_mut() {
-        bind_and_rewrite_expr(
+        bind_and_rewrite_expr_with_context(
             expr,
             Some(table_references),
             Some(result_columns),
             resolver,
             BindingBehavior::TryResultColumnsFirst,
+            parent_name_context,
         )?;
         resolve_window_and_aggregate_functions(expr, resolver, aggregate_expressions, None)?;
     }

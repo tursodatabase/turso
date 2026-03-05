@@ -2266,13 +2266,14 @@ pub enum SubqueryPosition {
 
 impl SubqueryPosition {
     /// Returns true if a subquery in this position of the SELECT can be correlated, i.e. if it can reference columns from the outer query.
-    /// FIXME: HAVING and ORDER BY should allow correlated subqueries, but our translation system currently does not support this well.
-    /// Subqueries in these positions should be evaluated after the main loop, AND they should also have access to aggregations computed
-    /// in the main query.
     pub fn allow_correlated(&self) -> bool {
         matches!(
             self,
-            SubqueryPosition::ResultColumn | SubqueryPosition::Where | SubqueryPosition::GroupBy
+            SubqueryPosition::ResultColumn
+                | SubqueryPosition::Where
+                | SubqueryPosition::GroupBy
+                | SubqueryPosition::Having
+                | SubqueryPosition::OrderBy
         )
     }
 

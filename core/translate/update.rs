@@ -68,7 +68,7 @@ pub fn translate_update(
     if let Plan::Update(ref mut update_plan) = plan {
         if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
             // When using ephemeral plan (key columns are being updated), subqueries are in the ephemeral_plan's WHERE
-            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection, None)?;
         } else {
             // Normal path: subqueries are in the UPDATE plan's WHERE
             plan_subqueries_from_where_clause(
@@ -119,7 +119,7 @@ pub fn translate_update_for_schema_change(
 
         // Plan subqueries in the WHERE clause
         if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
-            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection, None)?;
         } else {
             plan_subqueries_from_where_clause(
                 program,

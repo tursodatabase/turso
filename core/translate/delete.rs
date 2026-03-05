@@ -63,7 +63,7 @@ pub fn translate_delete(
     if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
         if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
             // When using rowset (triggers or subqueries present), subqueries are in the rowset_plan's WHERE
-            plan_subqueries_from_select_plan(program, rowset_plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(program, rowset_plan, resolver, connection, None)?;
         } else {
             // Normal path: subqueries are in the DELETE plan's WHERE
             plan_subqueries_from_where_clause(

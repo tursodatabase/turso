@@ -13,6 +13,7 @@ use crate::{
         expr::{
             compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
         },
+        name_context::NameContext,
         optimizer::optimize_select_plan,
         plan::{
             ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
@@ -51,16 +52,19 @@ pub fn plan_subqueries_from_select_plan(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     connection: &Arc<Connection>,
+    parent_name_context: Option<&NameContext<'_>>,
 ) -> Result<()> {
     // WHERE
     plan_subqueries_with_outer_query_access(
         program,
         &mut plan.non_from_clause_subqueries,
         &mut plan.table_references,
+        Some(&plan.result_columns),
         resolver,
         plan.where_clause.iter_mut().map(|t| &mut t.expr),
         connection,
         SubqueryPosition::Where,
+        parent_name_context,
     )?;
 
     // GROUP BY
@@ -69,20 +73,24 @@ pub fn plan_subqueries_from_select_plan(
             program,
             &mut plan.non_from_clause_subqueries,
             &mut plan.table_references,
+            Some(&plan.result_columns),
             resolver,
             group_by.exprs.iter_mut(),
             connection,
             SubqueryPosition::GroupBy,
+            parent_name_context,
         )?;
         if let Some(having) = group_by.having.as_mut() {
             plan_subqueries_with_outer_query_access(
                 program,
                 &mut plan.non_from_clause_subqueries,
                 &mut plan.table_references,
+                Some(&plan.result_columns),
                 resolver,
                 having.iter_mut(),
                 connection,
                 SubqueryPosition::Having,
+                parent_name_context,
             )?;
         }
     }
@@ -92,10 +100,12 @@ pub fn plan_subqueries_from_select_plan(
         program,
         &mut plan.non_from_clause_subqueries,
         &mut plan.table_references,
+        None,
         resolver,
         plan.result_columns.iter_mut().map(|c| &mut c.expr),
         connection,
         SubqueryPosition::ResultColumn,
+        parent_name_context,
     )?;
 
     // ORDER BY
@@ -103,10 +113,12 @@ pub fn plan_subqueries_from_select_plan(
         program,
         &mut plan.non_from_clause_subqueries,
         &mut plan.table_references,
+        Some(&plan.result_columns),
         resolver,
         plan.order_by.iter_mut().map(|(expr, _)| &mut **expr),
         connection,
         SubqueryPosition::OrderBy,
+        parent_name_context,
     )?;
 
     // LIMIT and OFFSET cannot reference columns from the outer query
@@ -116,10 +128,12 @@ pub fn plan_subqueries_from_select_plan(
             program,
             &mut plan.non_from_clause_subqueries,
             &mut plan.table_references,
+            None,
             resolver,
             connection,
             get_outer_query_refs,
             SubqueryPosition::LimitOffset,
+            parent_name_context,
         );
         // Limit
         if let Some(limit) = &mut plan.limit {
@@ -166,10 +180,12 @@ pub fn plan_subqueries_from_where_clause(
         program,
         non_from_clause_subqueries,
         table_references,
+        None,
         resolver,
         where_clause.iter_mut().map(|t| &mut t.expr),
         connection,
         SubqueryPosition::Where,
+        None,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -192,10 +208,12 @@ pub fn plan_subqueries_from_values(
         program,
         non_from_clause_subqueries,
         table_references,
+        None,
         resolver,
         values.iter_mut().flatten().map(|e| e.as_mut()),
         connection,
         SubqueryPosition::ResultColumn, // VALUES are similar to result columns in terms of subquery handling
+        None,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -217,10 +235,12 @@ pub fn plan_subqueries_from_set_clauses(
         program,
         non_from_clause_subqueries,
         table_references,
+        None,
         resolver,
         set_clauses.iter_mut().map(|(_, expr)| expr.as_mut()),
         connection,
         SubqueryPosition::ResultColumn, // SET clause subqueries are similar to result columns
+        None,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -250,10 +270,12 @@ pub fn plan_subqueries_from_returning(
         program,
         non_from_clause_subqueries,
         table_references,
+        None,
         resolver,
         exprs,
         connection,
         SubqueryPosition::ResultColumn,
+        None,
     )?;
 
     // Mark newly added subqueries as RETURNING so the UPDATE emitter can
@@ -271,10 +293,12 @@ fn plan_subqueries_with_outer_query_access<'a>(
     program: &mut ProgramBuilder,
     out_subqueries: &mut Vec<NonFromClauseSubquery>,
     referenced_tables: &mut TableReferences,
+    result_columns: Option<&[super::plan::ResultSetColumn]>,
     resolver: &Resolver,
     exprs: impl Iterator<Item = &'a mut ast::Expr>,
     connection: &Arc<Connection>,
     position: SubqueryPosition,
+    parent_name_context: Option<&NameContext<'_>>,
 ) -> Result<()> {
     // Most subqueries can reference columns from the outer query,
     // including nested cases where a subquery inside a subquery references columns from its parent's parent
@@ -324,10 +348,12 @@ fn plan_subqueries_with_outer_query_access<'a>(
         program,
         out_subqueries,
         referenced_tables,
+        result_columns,
         resolver,
         connection,
         get_outer_query_refs,
         position,
+        parent_name_context,
     );
     for expr in exprs {
         walk_expr_mut(expr, &mut subquery_parser)?;
@@ -341,10 +367,12 @@ fn get_subquery_parser<'a>(
     program: &'a mut ProgramBuilder,
     out_subqueries: &'a mut Vec<NonFromClauseSubquery>,
     referenced_tables: &'a mut TableReferences,
+    result_columns: Option<&'a [super::plan::ResultSetColumn]>,
     resolver: &'a Resolver,
     connection: &'a Arc<Connection>,
     get_outer_query_refs: fn(&TableReferences) -> Vec<OuterQueryReference>,
     position: SubqueryPosition,
+    parent_name_context: Option<&'a NameContext<'a>>,
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
     fn handle_unsupported_correlation(correlated: bool, position: SubqueryPosition) -> Result<()> {
         if correlated && !position.allow_correlated() {
@@ -357,6 +385,17 @@ fn get_subquery_parser<'a>(
     }
 
     move |expr: &mut ast::Expr| -> Result<WalkControl> {
+        let parent_binding_behavior = match position {
+            SubqueryPosition::OrderBy => super::expr::BindingBehavior::TryResultColumnsFirst,
+            SubqueryPosition::LimitOffset => super::expr::BindingBehavior::ResultColumnsNotAllowed,
+            _ => super::expr::BindingBehavior::TryCanonicalColumnsFirst,
+        };
+        let current_name_context = NameContext::new(
+            parent_name_context,
+            Some(super::name_context::SourceScope::new(&*referenced_tables)),
+            result_columns.map(super::name_context::ResultAliasScope::new),
+            super::name_context::NameResolutionPolicy::for_legacy_behavior(parent_binding_behavior),
+        );
         match expr {
             ast::Expr::Exists(_) => {
                 let subquery_id = program.table_reference_counter.next();
@@ -381,6 +420,7 @@ fn get_subquery_parser<'a>(
                     &outer_query_refs,
                     QueryDestination::ExistsSubqueryResult { result_reg },
                     connection,
+                    Some(&current_name_context),
                 )?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
@@ -426,6 +466,7 @@ fn get_subquery_parser<'a>(
                     &outer_query_refs,
                     QueryDestination::Unset,
                     connection,
+                    Some(&current_name_context),
                 )?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
@@ -495,6 +536,7 @@ fn get_subquery_parser<'a>(
                     &outer_query_refs,
                     QueryDestination::Unset,
                     connection,
+                    Some(&current_name_context),
                 )?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(

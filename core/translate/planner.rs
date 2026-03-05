@@ -11,9 +11,14 @@ use super::{
     },
     select::prepare_select_plan,
 };
+use crate::function::{AggFunc, ExtFunc};
 use crate::translate::{
     emitter::Resolver,
-    expr::{unwrap_parens, BindingBehavior, WalkControl},
+    expr::{
+        bind_and_rewrite_expr, bind_and_rewrite_expr_with_context, unwrap_parens, BindingBehavior,
+        WalkControl,
+    },
+    name_context::NameContext,
     plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
@@ -22,10 +27,6 @@ use crate::{
     schema::Table,
     util::{exprs_are_equivalent, normalize_ident, validate_aggregate_function_tail},
     Result,
-};
-use crate::{
-    function::{AggFunc, ExtFunc},
-    translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
     translate::plan::{Window, WindowFunction},
@@ -237,6 +238,7 @@ impl CteScope {
             &outer_query_refs,
             QueryDestination::placeholder_for_subquery(),
             connection,
+            None,
         );
         program.pop_cte_being_defined();
         let cte_plan = cte_plan?;
@@ -797,6 +799,7 @@ fn parse_from_clause_table(
                 &outer_query_refs_for_subquery,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
+                None,
             )?;
             match &subplan {
                 Plan::Select(_) | Plan::CompoundSelect { .. } => {}
@@ -936,6 +939,7 @@ fn parse_table(
                 table_references.outer_query_refs(),
                 QueryDestination::placeholder_for_subquery(),
                 connection,
+                None,
             )?;
             let explicit_cols = if cte_explicit_columns.is_empty() {
                 None
@@ -1296,16 +1300,35 @@ pub fn parse_where(
     out_where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
 ) -> Result<()> {
+    parse_where_with_context(
+        where_clause,
+        table_references,
+        result_columns,
+        out_where_clause,
+        resolver,
+        None,
+    )
+}
+
+pub fn parse_where_with_context(
+    where_clause: Option<&Expr>,
+    table_references: &mut TableReferences,
+    result_columns: Option<&[ResultSetColumn]>,
+    out_where_clause: &mut Vec<WhereTerm>,
+    resolver: &Resolver,
+    parent_name_context: Option<&NameContext<'_>>,
+) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
-            bind_and_rewrite_expr(
+            bind_and_rewrite_expr_with_context(
                 &mut expr.expr,
                 Some(table_references),
                 result_columns,
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
+                parent_name_context,
             )?;
         }
         // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.

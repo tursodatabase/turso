@@ -6,7 +6,9 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, UnaryOperator};
 
 use super::emitter::Resolver;
-use super::name_context::NameResolutionPolicy;
+use super::name_context::{
+    NameContext, NameResolutionPolicy, ResolvedSourceName, ResultAliasScope, SourceScope,
+};
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -4914,12 +4916,35 @@ pub enum BindingBehavior {
 /// ones
 pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
-    mut referenced_tables: Option<&'a mut TableReferences>,
+    referenced_tables: Option<&'a mut TableReferences>,
     result_columns: Option<&'a [ResultSetColumn]>,
     resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
-    let name_resolution_policy = NameResolutionPolicy::for_legacy_behavior(binding_behavior);
+    bind_and_rewrite_expr_with_context(
+        top_level_expr,
+        referenced_tables,
+        result_columns,
+        resolver,
+        binding_behavior,
+        None,
+    )
+}
+
+pub fn bind_and_rewrite_expr_with_context<'a>(
+    top_level_expr: &mut ast::Expr,
+    mut referenced_tables: Option<&'a mut TableReferences>,
+    result_columns: Option<&'a [ResultSetColumn]>,
+    resolver: &Resolver<'_>,
+    binding_behavior: BindingBehavior,
+    parent_name_context: Option<&NameContext<'a>>,
+) -> Result<()> {
+    let mut name_resolution_policy = NameResolutionPolicy::for_legacy_behavior(binding_behavior);
+    if parent_name_context.is_some() && binding_behavior == BindingBehavior::ResultColumnsNotAllowed
+    {
+        name_resolution_policy.outer_result_aliases =
+            super::name_context::AliasVisibility::Fallback;
+    }
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
@@ -4956,127 +4981,59 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         crate::bail_parse_error!("no such column: {}", id.as_str());
                     };
-                    let normalized_id = normalize_ident(id.as_str());
+                    let name_context = NameContext::new(
+                        parent_name_context,
+                        Some(SourceScope::new(&*referenced_tables)),
+                        result_columns.map(ResultAliasScope::new),
+                        name_resolution_policy,
+                    );
 
                     if name_resolution_policy.prefers_local_result_aliases() {
-                        if let Some(result_columns) = result_columns {
-                            for result_column in result_columns.iter() {
-                                if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
-                                        *expr = result_column.expr.clone();
-                                        return Ok(WalkControl::Continue);
-                                    }
-                                }
-                            }
+                        if let Some(result_column) =
+                            name_context.find_local_result_alias(id.as_str())
+                        {
+                            *expr = result_column.expr.clone();
+                            return Ok(WalkControl::Continue);
                         }
                     }
-                    let mut match_result = None;
-
-                    // First check joined tables
-                    for joined_table in referenced_tables.joined_tables().iter() {
-                        let col_idx = joined_table.table.columns().iter().position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                        });
-                        if col_idx.is_some() {
-                            if match_result.is_some() {
-                                let mut ok = false;
-                                // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
-                                // and the left table is used.
-                                if let Some(join_info) = &joined_table.join_info {
-                                    if join_info.using.iter().any(|using_col| {
-                                        using_col.as_str().eq_ignore_ascii_case(&normalized_id)
-                                    }) {
-                                        ok = true;
-                                    }
-                                }
-                                if !ok {
-                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
-                                }
-                            } else {
-                                let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    joined_table.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
+                    if let Some(resolved) =
+                        name_context.resolve_unqualified_source_column(id.as_str())?
+                    {
+                        match resolved {
+                            ResolvedSourceName::Column(resolved) => {
+                                *expr = Expr::Column {
+                                    database: None, // TODO: support different databases
+                                    table: resolved.table_id,
+                                    column: resolved.column_index,
+                                    is_rowid_alias: resolved.is_rowid_alias,
+                                };
+                                referenced_tables
+                                    .mark_column_used(resolved.table_id, resolved.column_index);
                             }
-                        // only if we haven't found a match, check for explicit rowid reference
-                        } else if let Table::BTree(btree) = &joined_table.table {
-                            if let Some(row_id_expr) = parse_row_id(
-                                &normalized_id,
-                                referenced_tables.joined_tables()[0].internal_id,
-                                || referenced_tables.joined_tables().len() != 1,
-                            )? {
-                                if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", id.as_str());
-                                }
-                                *expr = row_id_expr;
-                                return Ok(WalkControl::Continue);
+                            ResolvedSourceName::RowId { table_id } => {
+                                *expr = Expr::RowId {
+                                    database: None, // TODO: support different databases
+                                    table: table_id,
+                                };
                             }
                         }
-                    }
-
-                    // Then check outer query references, if we still didn't find something.
-                    // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
-                    // but in the case of subqueries, the inner query takes precedence.
-                    // For example:
-                    // SELECT * FROM t WHERE x = (SELECT x FROM t2)
-                    // In this case, there is no ambiguity:
-                    // - x in the outer query refers to t.x,
-                    // - x in the inner query refers to t2.x.
-                    if match_result.is_none() {
-                        for outer_ref in referenced_tables.outer_query_refs().iter() {
-                            // CTEs (FromClauseSubquery) in outer_query_refs are only for table
-                            // lookup (e.g., FROM cte1), not for column resolution. Columns from
-                            // CTEs should only be accessible when the CTE is explicitly in the
-                            // FROM clause, not as implicit outer references.
-                            if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
-                                continue;
-                            }
-                            let col_idx = outer_ref.table.columns().iter().position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                            });
-                            if col_idx.is_some() {
-                                if match_result.is_some() {
-                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
-                                }
-                                let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    outer_ref.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
-                            }
-                        }
-                    }
-
-                    if let Some((table_id, col_idx, is_rowid_alias)) = match_result {
-                        *expr = Expr::Column {
-                            database: None, // TODO: support different databases
-                            table: table_id,
-                            column: col_idx,
-                            is_rowid_alias,
-                        };
-                        referenced_tables.mark_column_used(table_id, col_idx);
                         return Ok(WalkControl::Continue);
                     }
 
                     if name_resolution_policy.allows_local_result_alias_fallback() {
-                        if let Some(result_columns) = result_columns {
-                            for result_column in result_columns.iter() {
-                                if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
-                                        *expr = result_column.expr.clone();
-                                        return Ok(WalkControl::Continue);
-                                    }
-                                }
-                            }
+                        if let Some(result_column) =
+                            name_context.find_local_result_alias(id.as_str())
+                        {
+                            *expr = result_column.expr.clone();
+                            return Ok(WalkControl::Continue);
                         }
+                    }
+
+                    if let Some(result_column) = name_context.find_outer_result_alias(id.as_str()) {
+                        let rewritten = result_column.expr.clone();
+                        mark_bound_expr_usage(&rewritten, referenced_tables)?;
+                        *expr = rewritten;
+                        return Ok(WalkControl::Continue);
                     }
 
                     // SQLite behavior: Only double-quoted identifiers get fallback to string literals
@@ -5293,6 +5250,22 @@ pub fn bind_and_rewrite_expr<'a>(
             Ok(WalkControl::Continue)
         },
     )?;
+    Ok(())
+}
+
+fn mark_bound_expr_usage(expr: &ast::Expr, referenced_tables: &mut TableReferences) -> Result<()> {
+    walk_expr(expr, &mut |node| {
+        match node {
+            Expr::Column { table, column, .. } => {
+                referenced_tables.mark_column_used(*table, *column);
+            }
+            Expr::RowId { table, .. } => {
+                referenced_tables.mark_rowid_referenced(*table);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 

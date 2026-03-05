@@ -1,8 +1,11 @@
 #![allow(dead_code)]
 
 use super::expr::BindingBehavior;
-use super::plan::{OuterQueryReference, ResultSetColumn, TableReferences};
+use super::plan::{JoinInfo, OuterQueryReference, ResultSetColumn, TableReferences};
 use crate::schema::Table;
+use crate::translate::planner::parse_row_id;
+use crate::util::normalize_ident;
+use crate::Result;
 use turso_parser::ast::TableInternalId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +98,19 @@ pub struct ResultAliasBinding<'a> {
     pub contains_aggregates: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedColumn {
+    pub table_id: TableInternalId,
+    pub column_index: usize,
+    pub is_rowid_alias: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedSourceName {
+    Column(ResolvedColumn),
+    RowId { table_id: TableInternalId },
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SourceScope<'a> {
     table_references: &'a TableReferences,
@@ -106,11 +122,14 @@ impl<'a> SourceScope<'a> {
     }
 
     pub fn local_tables(&self) -> impl Iterator<Item = SourceTableRef<'a>> {
-        self.table_references.joined_tables().iter().map(|table_ref| SourceTableRef {
-            identifier: table_ref.identifier.as_str(),
-            internal_id: table_ref.internal_id,
-            table: &table_ref.table,
-        })
+        self.table_references
+            .joined_tables()
+            .iter()
+            .map(|table_ref| SourceTableRef {
+                identifier: table_ref.identifier.as_str(),
+                internal_id: table_ref.internal_id,
+                table: &table_ref.table,
+            })
     }
 
     pub fn outer_refs(&self) -> impl Iterator<Item = OuterSourceRef<'a>> {
@@ -156,11 +175,14 @@ impl<'a> ResultAliasScope<'a> {
             .iter()
             .enumerate()
             .filter_map(|(result_column_index, result_column)| {
-                result_column.alias.as_deref().map(|alias| ResultAliasBinding {
-                    alias,
-                    result_column_index,
-                    contains_aggregates: result_column.contains_aggregates,
-                })
+                result_column
+                    .alias
+                    .as_deref()
+                    .map(|alias| ResultAliasBinding {
+                        alias,
+                        result_column_index,
+                        contains_aggregates: result_column.contains_aggregates,
+                    })
             })
     }
 
@@ -209,5 +231,125 @@ impl<'a> NameContext<'a> {
         self.source_scope
             .map(|scope| scope.table_references().outer_query_refs())
             .unwrap_or(&[])
+    }
+
+    pub fn find_local_result_alias(&self, identifier: &str) -> Option<&'a ResultSetColumn> {
+        let normalized_id = normalize_ident(identifier);
+        self.result_scope.and_then(|scope| {
+            scope.result_columns().iter().find(|result_column| {
+                result_column
+                    .alias
+                    .as_ref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(&normalized_id))
+            })
+        })
+    }
+
+    pub fn find_outer_result_alias(&self, identifier: &str) -> Option<&'a ResultSetColumn> {
+        if self.policy.outer_result_aliases == AliasVisibility::Hidden {
+            return None;
+        }
+        self.parent.and_then(|parent| {
+            parent
+                .find_local_result_alias(identifier)
+                .or_else(|| parent.find_outer_result_alias(identifier))
+        })
+    }
+
+    pub fn resolve_unqualified_source_column(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<ResolvedSourceName>> {
+        let Some(source_scope) = self.source_scope else {
+            return Ok(None);
+        };
+        let normalized_id = normalize_ident(identifier);
+        let table_references = source_scope.table_references();
+
+        let mut match_result = None;
+        for joined_table in table_references.joined_tables().iter() {
+            let col_idx = joined_table.table.columns().iter().position(|c| {
+                c.name
+                    .as_ref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+            });
+            if let Some(col_idx) = col_idx {
+                if let Some(existing) = match_result {
+                    if !Self::column_ambiguity_allowed(&joined_table.join_info, &normalized_id) {
+                        crate::bail_parse_error!("Column {} is ambiguous", identifier);
+                    }
+                    match_result = Some(existing);
+                } else {
+                    let col = joined_table.table.columns().get(col_idx).unwrap();
+                    match_result = Some(ResolvedColumn {
+                        table_id: joined_table.internal_id,
+                        column_index: col_idx,
+                        is_rowid_alias: col.is_rowid_alias(),
+                    });
+                }
+            }
+        }
+
+        if match_result.is_some() {
+            return Ok(match_result.map(ResolvedSourceName::Column));
+        }
+
+        if table_references.joined_tables().len() == 1 {
+            let joined_table = &table_references.joined_tables()[0];
+            if let Table::BTree(btree) = &joined_table.table {
+                if let Some(row_id_expr) =
+                    parse_row_id(&normalized_id, joined_table.internal_id, || false)?
+                {
+                    if !btree.has_rowid {
+                        crate::bail_parse_error!("no such column: {}", identifier);
+                    }
+                    return Ok(Some(Self::resolved_source_name_from_rowid_expr(
+                        &row_id_expr,
+                    )));
+                }
+            }
+        }
+
+        for outer_ref in table_references.outer_query_refs().iter() {
+            if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
+                continue;
+            }
+            let col_idx = outer_ref.table.columns().iter().position(|c| {
+                c.name
+                    .as_ref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+            });
+            if let Some(col_idx) = col_idx {
+                if match_result.is_some() {
+                    crate::bail_parse_error!("Column {} is ambiguous", identifier);
+                }
+                let col = outer_ref.table.columns().get(col_idx).unwrap();
+                match_result = Some(ResolvedColumn {
+                    table_id: outer_ref.internal_id,
+                    column_index: col_idx,
+                    is_rowid_alias: col.is_rowid_alias(),
+                });
+            }
+        }
+
+        Ok(match_result.map(ResolvedSourceName::Column))
+    }
+
+    fn column_ambiguity_allowed(join_info: &Option<JoinInfo>, identifier: &str) -> bool {
+        join_info.as_ref().is_some_and(|join_info| {
+            join_info
+                .using
+                .iter()
+                .any(|using_col| using_col.as_str().eq_ignore_ascii_case(identifier))
+        })
+    }
+
+    fn resolved_source_name_from_rowid_expr(expr: &turso_parser::ast::Expr) -> ResolvedSourceName {
+        match expr {
+            turso_parser::ast::Expr::RowId { table, .. } => {
+                ResolvedSourceName::RowId { table_id: *table }
+            }
+            _ => unreachable!("expected rowid expression"),
+        }
     }
 }
