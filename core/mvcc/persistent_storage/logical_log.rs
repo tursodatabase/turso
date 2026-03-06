@@ -339,15 +339,8 @@ impl LogicalLog {
         let tx_header_start = self.write_buf.len();
         self.write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
 
-        // 3. Serialize ops (both table and index rows)
-        let payload_start = self.write_buf.len();
-        for row_version in &tx.row_versions {
-            serialize_op_entry(&mut self.write_buf, row_version)?;
-        }
-        if let Some(header) = tx.header {
-            serialize_header_entry(&mut self.write_buf, &header);
-        }
-        let payload_size = (self.write_buf.len() - payload_start) as u64;
+        // 3. Serialize ops into write_buf.
+        let payload_size = self.serialize_ops_into_write_buf(tx)?;
         let payload_end = self.write_buf.len();
 
         // 4. Backfill TX HEADER: FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
@@ -360,8 +353,9 @@ impl LogicalLog {
         self.write_buf[tx_header_start + 16..tx_header_start + 24]
             .copy_from_slice(&commit_ts.to_le_bytes());
 
-        // 5. Serialize trailer: chained CRC over TX_HEADER (24 B) + payload, then END_MAGIC.
-        // Seed from running_crc (derived from salt, or previous frame's CRC).
+        // 5. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
+        // CRC is chained: seeded from running_crc (salt-derived, or previous frame's CRC),
+        // covers TX_HEADER (24 B) + payload (encrypted or plaintext).
         let crc = crc32c::crc32c_append(
             self.running_crc,
             &self.write_buf[tx_header_start..payload_end],
@@ -393,6 +387,19 @@ impl LogicalLog {
             self.pending_running_crc = Some(crc);
         }
         Ok((c, buffer_len as u64))
+    }
+
+    /// Serializes ops into `write_buf`.
+    /// Returns the plaintext payload size (used in the TX header's `payload_size` field).
+    fn serialize_ops_into_write_buf(&mut self, tx: &LogRecord) -> Result<u64> {
+        let payload_start = self.write_buf.len();
+        for row_version in &tx.row_versions {
+            serialize_op_entry(&mut self.write_buf, row_version)?;
+        }
+        if let Some(header) = tx.header {
+            serialize_header_entry(&mut self.write_buf, &header);
+        }
+        Ok((self.write_buf.len() - payload_start) as u64)
     }
 
     /// Writes a transaction to the log and immediately advances the writer offset.
@@ -494,6 +501,8 @@ impl LogicalLog {
     }
 }
 
+/// Serialize one op into `buffer`.
+/// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
 fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
     let is_delete = row_version.end.is_some();
     let tag = match (&row_version.row.id.row_id, is_delete) {
@@ -767,64 +776,23 @@ impl StreamingLogicalLogReader {
         self.remaining_bytes() == 0
     }
 
-    fn parse_next_transaction(&mut self, io: &Arc<dyn crate::IO>) -> Result<ParseResult> {
-        if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
-            return Ok(ParseResult::Eof);
-        }
-        let frame_start = self.offset.saturating_sub(self.bytes_can_read());
-
-        let header_bytes = match self.try_consume_fixed::<TX_HEADER_SIZE>(io)? {
-            Some(bytes) => bytes,
-            None => return Ok(ParseResult::Eof),
-        };
-
-        // TX HEADER layout (24 bytes): FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
-        let frame_magic = u32::from_le_bytes([
-            header_bytes[0],
-            header_bytes[1],
-            header_bytes[2],
-            header_bytes[3],
-        ]);
-        if frame_magic != FRAME_MAGIC {
-            self.last_valid_offset = frame_start;
-            return Ok(ParseResult::InvalidFrame);
-        }
-        let payload_size = u64::from_le_bytes([
-            header_bytes[4],
-            header_bytes[5],
-            header_bytes[6],
-            header_bytes[7],
-            header_bytes[8],
-            header_bytes[9],
-            header_bytes[10],
-            header_bytes[11],
-        ]);
-        let op_count = u32::from_le_bytes([
-            header_bytes[12],
-            header_bytes[13],
-            header_bytes[14],
-            header_bytes[15],
-        ]);
-        let commit_ts = u64::from_le_bytes([
-            header_bytes[16],
-            header_bytes[17],
-            header_bytes[18],
-            header_bytes[19],
-            header_bytes[20],
-            header_bytes[21],
-            header_bytes[22],
-            header_bytes[23],
-        ]);
-
-        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
-        let mut running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
-        let mut payload_bytes_read: u64 = 0;
+    /// Parse an unencrypted payload via field-by-field streaming IO reads.
+    fn parse_streaming_payload(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+        op_count: u32,
+        payload_size: usize,
+        commit_ts: u64,
+        mut running_crc: u32,
+    ) -> Result<PayloadParseResult> {
         let mut parsed_ops = Vec::with_capacity((op_count as usize).min(1024));
+        let mut payload_bytes_read: u64 = 0;
 
         for _ in 0..op_count {
+            // Op header (6 bytes): tag(1) | flags(1) | table_id(4, little-endian i32)
             let op_bytes = match self.try_consume_fixed::<6>(io)? {
                 Some(bytes) => bytes,
-                None => return Ok(ParseResult::Eof),
+                None => return Ok(PayloadParseResult::Eof),
             };
             running_crc = crc32c::crc32c_append(running_crc, &op_bytes);
             let tag = op_bytes[0];
@@ -834,49 +802,37 @@ impl StreamingLogicalLogReader {
             let table_id = match tag {
                 OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
                     if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     Some(MVTableId::from(table_id_i32 as i64))
                 }
                 OP_UPDATE_HEADER => {
-                    // Header op must not carry row-level bits or table addressing.
                     if flags != 0 || table_id_i32 != 0 {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     None
                 }
-                _ => {
-                    self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::InvalidFrame);
-                }
+                _ => return Ok(PayloadParseResult::InvalidFrame),
             };
             let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
 
             let (payload_len, payload_len_bytes, payload_len_bytes_len) =
                 match self.consume_varint_bytes(io) {
                     Ok(Some((value, bytes, len))) => (value, bytes, len),
-                    Ok(None) => return Ok(ParseResult::Eof),
-                    Err(LimboError::Corrupt(_)) => {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
-                    }
+                    Ok(None) => return Ok(PayloadParseResult::Eof),
+                    Err(LimboError::Corrupt(_)) => return Ok(PayloadParseResult::InvalidFrame),
                     Err(err) => return Err(err),
                 };
             running_crc =
                 crc32c::crc32c_append(running_crc, &payload_len_bytes[..payload_len_bytes_len]);
             let payload_len = match usize::try_from(payload_len) {
                 Ok(v) => v,
-                Err(_) => {
-                    self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::InvalidFrame);
-                }
+                Err(_) => return Ok(PayloadParseResult::InvalidFrame),
             };
 
             let payload = match self.try_consume_bytes(io, payload_len)? {
                 Some(bytes) => bytes,
-                None => return Ok(ParseResult::Eof),
+                None => return Ok(PayloadParseResult::Eof),
             };
             running_crc = crc32c::crc32c_append(running_crc, &payload);
 
@@ -886,10 +842,7 @@ impl StreamingLogicalLogReader {
                 .and_then(|op_size| payload_bytes_read.checked_add(op_size))
             {
                 Some(v) => v,
-                None => {
-                    self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::InvalidFrame);
-                }
+                None => return Ok(PayloadParseResult::InvalidFrame),
             };
 
             let parsed_op = match tag {
@@ -897,15 +850,11 @@ impl StreamingLogicalLogReader {
                     let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = match read_varint(&payload) {
                         Ok(v) => v,
-                        Err(_) => {
-                            self.last_valid_offset = frame_start;
-                            return Ok(ParseResult::InvalidFrame);
-                        }
+                        Err(_) => return Ok(PayloadParseResult::InvalidFrame),
                     };
                     let rowid_i64 = rowid_u64 as i64;
                     if rowid_len > payload.len() {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     let mut payload = payload;
                     let record_bytes = payload.split_off(rowid_len);
@@ -922,14 +871,10 @@ impl StreamingLogicalLogReader {
                     let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = match read_varint(&payload) {
                         Ok(v) => v,
-                        Err(_) => {
-                            self.last_valid_offset = frame_start;
-                            return Ok(ParseResult::InvalidFrame);
-                        }
+                        Err(_) => return Ok(PayloadParseResult::InvalidFrame),
                     };
                     if rowid_len != payload.len() {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     let rowid_i64 = rowid_u64 as i64;
                     let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
@@ -959,34 +904,107 @@ impl StreamingLogicalLogReader {
                 }
                 OP_UPDATE_HEADER => {
                     if payload.len() != DatabaseHeader::SIZE {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     let mut bytes = [0u8; DatabaseHeader::SIZE];
                     bytes.copy_from_slice(&payload);
                     let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
-                    // Fail closed on clearly invalid header payloads before handing it to recovery.
                     if header.magic != *b"SQLite format 3\0" {
-                        self.last_valid_offset = frame_start;
-                        return Ok(ParseResult::InvalidFrame);
+                        return Ok(PayloadParseResult::InvalidFrame);
                     }
                     ParsedOp::UpdateHeader { header, commit_ts }
                 }
-                _ => {
-                    self.last_valid_offset = frame_start;
-                    return Ok(ParseResult::InvalidFrame);
-                }
+                _ => return Ok(PayloadParseResult::InvalidFrame),
             };
 
             parsed_ops.push(parsed_op);
         }
 
+        if payload_size as u64 != payload_bytes_read {
+            return Ok(PayloadParseResult::InvalidFrame);
+        }
+
+        Ok(PayloadParseResult::Ok(parsed_ops, running_crc))
+    }
+
+    fn parse_next_transaction(&mut self, io: &Arc<dyn crate::IO>) -> Result<ParseResult> {
+        if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
+            return Ok(ParseResult::Eof);
+        }
+        let frame_start = self.offset.saturating_sub(self.bytes_can_read());
+
+        let header_bytes = match self.try_consume_fixed::<TX_HEADER_SIZE>(io)? {
+            Some(bytes) => bytes,
+            None => return Ok(ParseResult::Eof),
+        };
+
+        // TX HEADER layout (24 bytes): FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        let frame_magic = u32::from_le_bytes([
+            header_bytes[0],
+            header_bytes[1],
+            header_bytes[2],
+            header_bytes[3],
+        ]);
+        if frame_magic != FRAME_MAGIC {
+            self.last_valid_offset = frame_start;
+            return Ok(ParseResult::InvalidFrame);
+        }
+        let payload_size_u64 = u64::from_le_bytes([
+            header_bytes[4],
+            header_bytes[5],
+            header_bytes[6],
+            header_bytes[7],
+            header_bytes[8],
+            header_bytes[9],
+            header_bytes[10],
+            header_bytes[11],
+        ]);
+        let op_count = u32::from_le_bytes([
+            header_bytes[12],
+            header_bytes[13],
+            header_bytes[14],
+            header_bytes[15],
+        ]);
+        let commit_ts = u64::from_le_bytes([
+            header_bytes[16],
+            header_bytes[17],
+            header_bytes[18],
+            header_bytes[19],
+            header_bytes[20],
+            header_bytes[21],
+            header_bytes[22],
+            header_bytes[23],
+        ]);
+
+        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
+        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+
+        let payload_size = match usize::try_from(payload_size_u64) {
+            Ok(v) => v,
+            Err(_) => {
+                self.last_valid_offset = frame_start;
+                return Ok(ParseResult::InvalidFrame);
+            }
+        };
+
+        // 2. Parse payload.
+        let (parsed_ops, running_crc) = match self.parse_streaming_payload(
+            io, op_count, payload_size, commit_ts, running_crc,
+        )? {
+            PayloadParseResult::Ok(ops, crc) => (ops, crc),
+            PayloadParseResult::Eof => return Ok(ParseResult::Eof),
+            PayloadParseResult::InvalidFrame => {
+                self.last_valid_offset = frame_start;
+                return Ok(ParseResult::InvalidFrame);
+            }
+        };
+
+        // 3. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
         let trailer_bytes = match self.try_consume_fixed::<TX_TRAILER_SIZE>(io)? {
             Some(bytes) => bytes,
             None => return Ok(ParseResult::Eof),
         };
 
-        // TX TRAILER layout (8 bytes): crc32c(4) | END_MAGIC(4)
         let crc32c_expected = u32::from_le_bytes([
             trailer_bytes[0],
             trailer_bytes[1],
@@ -1000,11 +1018,6 @@ impl StreamingLogicalLogReader {
             trailer_bytes[7],
         ]);
 
-        // Validate payload_size from frame header against bytes actually consumed
-        if payload_size != payload_bytes_read {
-            self.last_valid_offset = frame_start;
-            return Ok(ParseResult::InvalidFrame);
-        }
         if crc32c_expected != running_crc {
             self.last_valid_offset = frame_start;
             return Ok(ParseResult::InvalidFrame);
@@ -1305,6 +1318,18 @@ impl StreamingLogicalLogReader {
     fn bytes_can_read(&self) -> usize {
         self.buffer.read().len().saturating_sub(self.buffer_offset)
     }
+}
+
+/// Result of parsing just the payload portion of a transaction frame.
+/// Used by `parse_streaming_payload` to communicate back to `parse_next_transaction`
+/// without duplicating control flow.
+enum PayloadParseResult {
+    /// Successfully parsed ops and updated running CRC.
+    Ok(Vec<ParsedOp>, u32),
+    /// Not enough bytes to complete the payload.
+    Eof,
+    /// Payload data is structurally invalid.
+    InvalidFrame,
 }
 
 #[cfg_attr(test, derive(Debug))]
