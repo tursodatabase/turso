@@ -2999,7 +2999,7 @@ pub fn rewrite_inline_col_fk_target_if_needed(
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::schema::Type as SchemaValueType;
+    use crate::schema::{BTreeTable, Type as SchemaValueType};
     use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type};
 
     #[test]
@@ -3011,30 +3011,11 @@ pub mod tests {
 
     fn schema_with_table(create_table_sql: &str) -> Schema {
         let mut schema = Schema::new();
-        let syms = SymbolTable::new();
-        let mut from_sql_indexes = Vec::new();
-        let mut automatic_indices = HashMap::default();
-        let mut dbsp_state_roots = HashMap::default();
-        let mut dbsp_state_index_roots = HashMap::default();
-        let mut materialized_view_info = HashMap::default();
-
+        let table =
+            BTreeTable::from_sql(create_table_sql, 2).expect("test CREATE TABLE should parse");
         schema
-            .handle_schema_row(
-                "table",
-                "t",
-                "t",
-                2,
-                Some(create_table_sql),
-                &syms,
-                &mut from_sql_indexes,
-                &mut automatic_indices,
-                &mut dbsp_state_roots,
-                &mut dbsp_state_index_roots,
-                &mut materialized_view_info,
-                None,
-                false,
-            )
-            .expect("test schema row should parse");
+            .add_btree_table(std::sync::Arc::new(table))
+            .expect("test table should be added to schema");
 
         schema
     }
