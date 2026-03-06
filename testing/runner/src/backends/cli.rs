@@ -193,7 +193,6 @@ impl CliDatabaseInstance {
             cmd.arg("-m").arg("list"); // List mode for pipe-separated output
             cmd.arg("--experimental-views");
             cmd.arg("--experimental-custom-types");
-            cmd.arg("--experimental-triggers");
             cmd.arg("--experimental-attach");
             cmd.arg("--experimental-index-method");
         }

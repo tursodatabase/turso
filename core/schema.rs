@@ -903,9 +903,8 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
-        enable_triggers: bool,
     ) -> Result<IOResult<()>> {
-        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, enable_triggers);
+        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms);
         if result.is_err() {
             state.cleanup(pager);
         } else if let Ok(IOResult::Done(..)) = result {
@@ -923,7 +922,6 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
-        enable_triggers: bool,
     ) -> Result<IOResult<()>> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
@@ -1034,7 +1032,6 @@ impl Schema {
                         &mut acc.dbsp_state_roots,
                         &mut acc.dbsp_state_index_roots,
                         &mut acc.materialized_view_info,
-                        enable_triggers,
                     )?;
 
                     state.phase = MakeFromBtreePhase::Advancing;
@@ -1270,7 +1267,6 @@ impl Schema {
         dbsp_state_roots: &mut HashMap<String, i64>,
         dbsp_state_index_roots: &mut HashMap<String, i64>,
         materialized_view_info: &mut HashMap<String, (String, i64)>,
-        enable_triggers: bool,
     ) -> Result<()> {
         match ty {
             "table" => {
@@ -1433,13 +1429,6 @@ impl Schema {
                 }
             }
             "trigger" => {
-                // Check if experimental triggers are enabled
-                if !enable_triggers {
-                    return Err(crate::LimboError::ParseError(
-                        "Database contains triggers but --experimental-triggers flag is not set. Enable with --experimental-triggers flag to use this database.".to_string(),
-                    ));
-                }
-
                 use turso_parser::ast::{Cmd, Stmt};
                 use turso_parser::parser::Parser;
 

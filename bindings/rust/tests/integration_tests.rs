@@ -1506,20 +1506,14 @@ async fn test_lost_updates() {
 
 /// Helper: create MVCC-enabled file-backed database with given schema
 async fn setup_mvcc_db(schema: &str) -> (turso::Database, tempfile::TempDir) {
-    setup_mvcc_db_with_options(schema, false).await
+    setup_mvcc_db_with_options(schema).await
 }
 
 /// Helper: create MVCC-enabled file-backed database with options
-async fn setup_mvcc_db_with_options(
-    schema: &str,
-    triggers: bool,
-) -> (turso::Database, tempfile::TempDir) {
+async fn setup_mvcc_db_with_options(schema: &str) -> (turso::Database, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let mut builder = Builder::new_local(db_path.to_str().unwrap());
-    if triggers {
-        builder = builder.experimental_triggers(true);
-    }
+    let builder = Builder::new_local(db_path.to_str().unwrap());
     let db = builder.build().await.unwrap();
     let conn = db.connect().unwrap();
     // PRAGMA journal_mode returns a row, so use query() to consume it

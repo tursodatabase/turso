@@ -225,7 +225,6 @@ pub fn translate_inner(
                 tbl_name,
                 program,
                 sql,
-                connection.clone(),
             )?
         }
         ast::Stmt::CreateView {
@@ -286,13 +285,7 @@ pub fn translate_inner(
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(
-            connection,
-            resolver,
-            &trigger_name,
-            if_exists,
-            program,
-        )?,
+        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
         ast::Stmt::DropView {
             if_exists,
             view_name,

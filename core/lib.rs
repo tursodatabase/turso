@@ -170,7 +170,6 @@ pub struct DatabaseOpts {
     pub enable_encryption: bool,
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
-    pub enable_triggers: bool,
     pub enable_attach: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
@@ -209,11 +208,6 @@ impl DatabaseOpts {
 
     pub fn with_autovacuum(mut self, enable: bool) -> Self {
         self.enable_autovacuum = enable;
-        self
-    }
-
-    pub fn with_triggers(mut self, enable: bool) -> Self {
-        self.enable_triggers = enable;
         self
     }
 
@@ -867,10 +861,6 @@ impl Database {
                 }
 
                 OpenDbAsyncPhase::LoadingSchema => {
-                    let db = state
-                        .db
-                        .as_ref()
-                        .expect("db must be initialized in Init phase");
                     let pager = state
                         .pager
                         .as_ref()
@@ -880,7 +870,6 @@ impl Database {
                         .as_ref()
                         .expect("conn must be initialized in Init phase");
                     let syms = conn.syms.read();
-                    let enable_triggers = db.opts.enable_triggers;
 
                     let guard = state
                         .schema_guard
@@ -898,7 +887,6 @@ impl Database {
                         None,
                         pager,
                         &syms,
-                        enable_triggers,
                     );
 
                     match result {
@@ -1566,10 +1554,6 @@ impl Database {
 
     pub fn experimental_custom_types_enabled(&self) -> bool {
         self.opts.enable_custom_types
-    }
-
-    pub fn experimental_triggers_enabled(&self) -> bool {
-        self.opts.enable_triggers
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {

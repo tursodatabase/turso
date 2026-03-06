@@ -356,7 +356,7 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
     conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
         .unwrap();
 
-    let dest_opts = turso_core::DatabaseOpts::new().with_triggers(true);
+    let dest_opts = turso_core::DatabaseOpts::new();
     let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, dest_opts);
     let dest_conn = dest_db.connect_limbo();
 
