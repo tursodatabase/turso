@@ -10,4 +10,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH events USING INDEX idx_events_severity
+`--SEARCH events USING INDEX idx_events_severity (severity>?)

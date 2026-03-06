@@ -31,7 +31,7 @@ QUERY PLAN
 |--SCALAR SUBQUERY 2
 |  `--SCAN order_totals
 |--SCAN customers AS c
-`--SEARCH ot USING INDEX ephemeral_subquery_t5
+`--SEARCH ot USING INDEX ephemeral_subquery_t5 (customer_id=?)
 
 BYTECODE
 addr  opcode                      p1   p2  p3  p4            p5  comment

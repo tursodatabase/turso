@@ -200,6 +200,7 @@ pub fn emit_query<'a>(
         program.emit_insn(Insn::HashClear {
             hash_table_id: ctx.hash_table_id,
         });
+        emit_explain!(program, false, "USE HASH TABLE FOR DISTINCT".to_owned());
     }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;

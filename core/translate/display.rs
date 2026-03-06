@@ -9,12 +9,61 @@ use turso_parser::{
     token::TokenType,
 };
 
-use crate::{schema::Table, translate::plan::TableReferences};
+use crate::{
+    schema::Table,
+    translate::plan::{SeekKeyComponent, TableReferences},
+    types::SeekOp,
+};
 
 use super::plan::{
-    Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Scan, Search, SelectPlan,
-    SetOperation, UpdatePlan,
+    Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Scan, Search, SeekDef,
+    SelectPlan, SetOperation, UpdatePlan,
 };
+
+/// Build SQLite-style constraint annotation string for an index seek.
+/// e.g. "(label=? AND fromId>?)"
+pub(crate) fn seek_constraint_annotation(
+    index: &crate::schema::Index,
+    seek_def: &SeekDef,
+) -> String {
+    let mut parts = Vec::new();
+    // Equality prefix constraints
+    for (i, _constraint) in seek_def.prefix.iter().enumerate() {
+        if let Some(col) = index.columns.get(i) {
+            parts.push(format!("{}=?", col.name));
+        }
+    }
+    // Range constraint from start key
+    let range_col_idx = seek_def.prefix.len();
+    if let SeekKeyComponent::Expr(_) = &seek_def.start.last_component {
+        if let Some(col) = index.columns.get(range_col_idx) {
+            let op_str = match seek_def.start.op {
+                SeekOp::GE { .. } => ">=",
+                SeekOp::GT => ">",
+                SeekOp::LE { .. } => "<=",
+                SeekOp::LT => "<",
+            };
+            parts.push(format!("{}{op_str}?", col.name));
+        }
+    }
+    // Range constraint from end key
+    if let SeekKeyComponent::Expr(_) = &seek_def.end.last_component {
+        if let Some(col) = index.columns.get(range_col_idx) {
+            let op_str = match seek_def.end.op {
+                SeekOp::LE { .. } => "<=",
+                SeekOp::LT => "<",
+                SeekOp::GE { .. } => ">=",
+                SeekOp::GT => ">",
+            };
+            parts.push(format!("{}{op_str}?", col.name));
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(" AND "))
+    }
+}
 
 impl Display for Aggregate {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -125,24 +174,29 @@ impl Display for SelectPlan {
                         }
                     }
                 }
-                Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
-                        writeln!(
-                            f,
-                            "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                            indent, reference.identifier
-                        )?;
+                Operation::Search(search) => {
+                    let left_join_suffix = if member.is_outer { " LEFT-JOIN" } else { "" };
+                    match search {
+                        Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                            writeln!(
+                                f,
+                                "{indent}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
+                                reference.identifier
+                            )?;
+                        }
+                        Search::Seek {
+                            index: Some(index),
+                            seek_def,
+                        } => {
+                            let constraints = seek_constraint_annotation(index, seek_def);
+                            writeln!(
+                                f,
+                                "{indent}SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
+                                reference.identifier, index.name
+                            )?;
+                        }
                     }
-                    Search::Seek {
-                        index: Some(index), ..
-                    } => {
-                        writeln!(
-                            f,
-                            "{}SEARCH {} USING INDEX {}",
-                            indent, reference.identifier, index.name
-                        )?;
-                    }
-                },
+                }
                 Operation::IndexMethodQuery(query) => {
                     let index_method = query.index.index_method.as_ref().unwrap();
                     writeln!(
@@ -178,6 +232,9 @@ impl Display for SelectPlan {
                     )?;
                 }
             }
+        }
+        if self.distinctness.is_distinct() {
+            writeln!(f, "USE HASH TABLE FOR DISTINCT")?;
         }
         Ok(())
     }

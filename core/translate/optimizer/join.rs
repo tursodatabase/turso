@@ -47,7 +47,7 @@ pub struct JoinN {
     /// Tuple: (table_number, access_method_index)
     pub data: Vec<(usize, usize)>,
     /// The estimated number of rows returned by joining these n tables together.
-    pub output_cardinality: usize,
+    pub output_cardinality: f64,
     /// Estimated execution cost of this N-ary join.
     pub cost: Cost,
 }
@@ -99,7 +99,7 @@ pub fn join_lhs_and_rhs<'a>(
     // The input cardinality for this join is the output cardinality of the previous join.
     // For example, in a 2-way join, if the left table has 1000 rows, and the right table will return 2 rows for each of the left table's rows,
     // then the output cardinality of the join will be 2000.
-    let input_cardinality = lhs.map_or(1, |l| l.output_cardinality);
+    let input_cardinality = lhs.map_or(1.0, |l| l.output_cardinality);
 
     let rhs_table_number = join_order.last().unwrap().original_idx;
     let rhs_base_rows = base_table_rows
@@ -112,7 +112,7 @@ pub fn join_lhs_and_rhs<'a>(
         rhs_constraints,
         join_order,
         maybe_order_target,
-        input_cardinality as f64,
+        input_cardinality,
         rhs_base_rows,
         params,
     )?
@@ -167,7 +167,7 @@ pub fn join_lhs_and_rhs<'a>(
             table_references,
             subqueries,
             schema,
-            input_cardinality as f64,
+            input_cardinality,
             rhs_base_rows,
             params,
             best_access_method.cost,
@@ -184,7 +184,7 @@ pub fn join_lhs_and_rhs<'a>(
             table_references,
             subqueries,
             schema,
-            input_cardinality as f64,
+            input_cardinality,
             rhs_base_rows,
             params,
             best_access_method.cost,
@@ -297,7 +297,7 @@ pub fn join_lhs_and_rhs<'a>(
             build_self_constraint_selectivity(rhs_constraints, rhs_table_number);
         // Penalize cross products so we don't introduce a table before it can join.
         let effective_rhs_rows = (*rhs_base_rows) * rhs_self_constraint_selectivity;
-        let cross_cost = (input_cardinality as f64) * effective_rhs_rows;
+        let cross_cost = (input_cardinality) * effective_rhs_rows;
         best_access_method.cost = best_access_method.cost + Cost(cross_cost);
     }
 
@@ -388,7 +388,7 @@ pub fn join_lhs_and_rhs<'a>(
             } else {
                 let join_selectivity = prior_constraint_selectivity.clamp(0.0, 1.0);
                 let denom = (build_cardinality * join_selectivity).max(1.0);
-                (input_cardinality as f64 / denom).max(1.0)
+                (input_cardinality / denom).max(1.0)
             };
 
             // The build table must NOT have any constraints from prior tables that won't be
@@ -723,7 +723,7 @@ pub fn join_lhs_and_rhs<'a>(
                 Cost(cost_estimate.estimated_cost)
             } else {
                 // Inner table: FTS cost is multiplied by input cardinality
-                Cost(cost_estimate.estimated_cost * input_cardinality as f64)
+                Cost(cost_estimate.estimated_cost * input_cardinality)
             };
 
             if fts_cost < best_access_method.cost {
@@ -795,7 +795,7 @@ pub fn join_lhs_and_rhs<'a>(
     //
     let output_cardinality = if let Some(estimated_rows) = index_method_estimated_rows {
         // Special index methods (e.g., FTS) provide their own row estimate
-        (input_cardinality as f64 * estimated_rows as f64).ceil() as usize
+        input_cardinality * estimated_rows as f64
     } else if let AccessMethodParams::BTreeTable {
         index,
         constraint_refs,
@@ -804,13 +804,11 @@ pub fn join_lhs_and_rhs<'a>(
     {
         if constraint_refs.is_empty() {
             // FULL SCAN: cartesian product filtered by all constraints
-            (input_cardinality as f64 * *rhs_base_rows * output_cardinality_multiplier).ceil()
-                as usize
+            input_cardinality * *rhs_base_rows * output_cardinality_multiplier
         } else if index.is_none() {
             // ROWID SEEK: exactly 1 row per lookup (primary key is unique)
             // Only apply local filters, not equi-join selectivity (that's the seek)
-            (input_cardinality as f64 * local_filter_multiplier * params.fanout_index_seek_unique)
-                .ceil() as usize
+            input_cardinality * local_filter_multiplier * params.fanout_index_seek_unique
         } else {
             // INDEX SEEK: fanout depends on matched columns
             let index = index.as_ref().unwrap();
@@ -853,18 +851,17 @@ pub fn join_lhs_and_rhs<'a>(
             };
 
             // Final: input_rows × fanout × local_filters
-            (input_cardinality as f64 * fanout * local_filter_multiplier).ceil() as usize
+            input_cardinality * fanout * local_filter_multiplier
         }
     } else if let AccessMethodParams::MultiIndexScan {
         estimated_rows_per_outer_row,
         ..
     } = &best_access_method.params
     {
-        (input_cardinality as f64 * estimated_rows_per_outer_row * local_filter_multiplier).ceil()
-            as usize
+        input_cardinality * estimated_rows_per_outer_row * local_filter_multiplier
     } else {
         // HashJoin, VirtualTable, Subquery: use full selectivity formula
-        (input_cardinality as f64 * *rhs_base_rows * output_cardinality_multiplier).ceil() as usize
+        input_cardinality * *rhs_base_rows * output_cardinality_multiplier
     };
 
     access_methods_arena.push(best_access_method);

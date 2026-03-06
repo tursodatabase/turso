@@ -23,4 +23,4 @@ info:
 ---
 QUERY PLAN
 |--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
-`--SEARCH o USING INDEX idx_orders_customer_id
+`--SEARCH o USING INDEX idx_orders_customer_id (customer_id=?)

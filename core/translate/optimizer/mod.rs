@@ -536,7 +536,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 
     if let Some((best_join_order, output_rows)) = best_join_order {
         plan.join_order = best_join_order;
-        let mut est = output_rows as f64;
+        let mut est = output_rows;
         // Clamp to LIMIT when it's a literal non-negative number.
         // Negative LIMIT means "no limit" in SQLite, so we skip those.
         if let Some(limit_expr) = &plan.limit {
@@ -1284,7 +1284,7 @@ fn optimize_table_access(
     subqueries: &[NonFromClauseSubquery],
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
-) -> Result<Option<(Vec<JoinOrderMember>, usize)>> {
+) -> Result<Option<(Vec<JoinOrderMember>, f64)>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
     #[cfg(feature = "optimizer_params")]
@@ -1474,8 +1474,7 @@ fn optimize_table_access(
         let best_unordered_plan_cost = best_plan.cost;
         let best_ordered_plan_cost = best_ordered_plan.cost;
         const SORT_COST_PER_ROW_MULTIPLIER: f64 = 0.001;
-        let sorting_penalty =
-            Cost(best_plan.output_cardinality as f64 * SORT_COST_PER_ROW_MULTIPLIER);
+        let sorting_penalty = Cost(best_plan.output_cardinality * SORT_COST_PER_ROW_MULTIPLIER);
         if best_unordered_plan_cost + sorting_penalty > best_ordered_plan_cost {
             best_ordered_plan
         } else {

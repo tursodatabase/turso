@@ -17,7 +17,7 @@ info:
 QUERY PLAN
 |--SCAN customers AS c
 `--CORRELATED SCALAR SUBQUERY 1
-   `--SEARCH orders USING INDEX idx_orders_customer
+   `--SEARCH orders USING INDEX idx_orders_customer (customer_id=?)
 
 BYTECODE
 addr  opcode           p1  p2  p3  p4            p5  comment
