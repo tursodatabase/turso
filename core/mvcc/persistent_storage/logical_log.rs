@@ -282,6 +282,7 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     pending_running_crc: Option<u32>,
     encryption_ctx: Option<EncryptionContext>,
+    /// Reusable scratch buffer for ops serialization on the encrypted write path.
     encryption_scratch_buffer: Vec<u8>,
 }
 
@@ -350,7 +351,7 @@ impl LogicalLog {
         let tx_header_start = self.write_buf.len();
         self.write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
 
-        // 3. Serialize ops into write_buf.
+        // 3. Serialize ops into write_buf (encrypted or plaintext).
         let payload_size = self.serialize_ops_into_write_buf(tx)?;
         let payload_end = self.write_buf.len();
 
@@ -544,6 +545,85 @@ impl LogicalLog {
     }
 }
 
+/// Serialize one op into `buffer`.
+/// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
+fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
+    let is_delete = row_version.end.is_some();
+    let tag = match (&row_version.row.id.row_id, is_delete) {
+        (RowKey::Int(_), false) => OP_UPSERT_TABLE,
+        (RowKey::Int(_), true) => OP_DELETE_TABLE,
+        (RowKey::Record(_), false) => OP_UPSERT_INDEX,
+        (RowKey::Record(_), true) => OP_DELETE_INDEX,
+    };
+
+    let mut flags = 0u8;
+    if row_version.btree_resident {
+        flags |= OP_FLAG_BTREE_RESIDENT;
+    }
+
+    let table_id_i64: i64 = row_version.row.id.table_id.into();
+    turso_assert!(
+        table_id_i64 < 0,
+        "table_id_i64 should be negative, but got {table_id_i64}"
+    );
+    turso_assert!(
+        (i32::MIN as i64..=i32::MAX as i64).contains(&table_id_i64),
+        "table_id_i64 out of i32 range: {table_id_i64}"
+    );
+    let table_id_i32 = table_id_i64 as i32;
+
+    buffer.push(tag);
+    buffer.push(flags);
+    buffer.extend_from_slice(&table_id_i32.to_le_bytes());
+
+    match tag {
+        OP_UPSERT_TABLE => {
+            let RowKey::Int(rowid) = row_version.row.id.row_id else {
+                unreachable!("table ops must have RowKey::Int")
+            };
+            let record_bytes = row_version.row.payload();
+            let rowid_u64 = rowid as u64;
+            let rowid_len = varint_len(rowid_u64);
+            let payload_len = rowid_len + record_bytes.len();
+            write_varint_to_vec(payload_len as u64, buffer);
+            write_varint_to_vec(rowid_u64, buffer);
+            buffer.extend_from_slice(record_bytes);
+        }
+        OP_DELETE_TABLE => {
+            let RowKey::Int(rowid) = row_version.row.id.row_id else {
+                unreachable!("table ops must have RowKey::Int")
+            };
+            let rowid_u64 = rowid as u64;
+            let rowid_len = varint_len(rowid_u64);
+            write_varint_to_vec(rowid_len as u64, buffer);
+            write_varint_to_vec(rowid_u64, buffer);
+        }
+        OP_UPSERT_INDEX | OP_DELETE_INDEX => {
+            let key_bytes = row_version.row.payload();
+            write_varint_to_vec(key_bytes.len() as u64, buffer);
+            buffer.extend_from_slice(key_bytes);
+        }
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "invalid logical log op tag: {tag}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
+    // Header op uses tag-only addressing (table_id=0, flags=0) and fixed payload length.
+    buffer.push(OP_UPDATE_HEADER);
+    buffer.push(0);
+    buffer.extend_from_slice(&0i32.to_le_bytes());
+    write_varint_to_vec(DatabaseHeader::SIZE as u64, buffer);
+    buffer.extend_from_slice(bytemuck::bytes_of(header));
+}
+
+/// Parse all ops from a decrypted plaintext buffer.
+/// Validates that `plaintext.len() == payload_size` and that every byte is consumed.
 fn parse_ops_from_plaintext(
     plaintext: &[u8],
     payload_size: usize,
@@ -696,83 +776,6 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
     };
 
     Ok(Some((parsed_op, total)))
-}
-
-/// Serialize one op into `buffer`.
-/// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
-fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
-    let is_delete = row_version.end.is_some();
-    let tag = match (&row_version.row.id.row_id, is_delete) {
-        (RowKey::Int(_), false) => OP_UPSERT_TABLE,
-        (RowKey::Int(_), true) => OP_DELETE_TABLE,
-        (RowKey::Record(_), false) => OP_UPSERT_INDEX,
-        (RowKey::Record(_), true) => OP_DELETE_INDEX,
-    };
-
-    let mut flags = 0u8;
-    if row_version.btree_resident {
-        flags |= OP_FLAG_BTREE_RESIDENT;
-    }
-
-    let table_id_i64: i64 = row_version.row.id.table_id.into();
-    turso_assert!(
-        table_id_i64 < 0,
-        "table_id_i64 should be negative, but got {table_id_i64}"
-    );
-    turso_assert!(
-        (i32::MIN as i64..=i32::MAX as i64).contains(&table_id_i64),
-        "table_id_i64 out of i32 range: {table_id_i64}"
-    );
-    let table_id_i32 = table_id_i64 as i32;
-
-    buffer.push(tag);
-    buffer.push(flags);
-    buffer.extend_from_slice(&table_id_i32.to_le_bytes());
-
-    match tag {
-        OP_UPSERT_TABLE => {
-            let RowKey::Int(rowid) = row_version.row.id.row_id else {
-                unreachable!("table ops must have RowKey::Int")
-            };
-            let record_bytes = row_version.row.payload();
-            let rowid_u64 = rowid as u64;
-            let rowid_len = varint_len(rowid_u64);
-            let payload_len = rowid_len + record_bytes.len();
-            write_varint_to_vec(payload_len as u64, buffer);
-            write_varint_to_vec(rowid_u64, buffer);
-            buffer.extend_from_slice(record_bytes);
-        }
-        OP_DELETE_TABLE => {
-            let RowKey::Int(rowid) = row_version.row.id.row_id else {
-                unreachable!("table ops must have RowKey::Int")
-            };
-            let rowid_u64 = rowid as u64;
-            let rowid_len = varint_len(rowid_u64);
-            write_varint_to_vec(rowid_len as u64, buffer);
-            write_varint_to_vec(rowid_u64, buffer);
-        }
-        OP_UPSERT_INDEX | OP_DELETE_INDEX => {
-            let key_bytes = row_version.row.payload();
-            write_varint_to_vec(key_bytes.len() as u64, buffer);
-            buffer.extend_from_slice(key_bytes);
-        }
-        _ => {
-            return Err(LimboError::InternalError(format!(
-                "invalid logical log op tag: {tag}"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
-    // Header op uses tag-only addressing (table_id=0, flags=0) and fixed payload length.
-    buffer.push(OP_UPDATE_HEADER);
-    buffer.push(0);
-    buffer.extend_from_slice(&0i32.to_le_bytes());
-    write_varint_to_vec(DatabaseHeader::SIZE as u64, buffer);
-    buffer.extend_from_slice(bytemuck::bytes_of(header));
 }
 
 #[derive(Debug)]
@@ -1223,9 +1226,6 @@ impl StreamingLogicalLogReader {
             header_bytes[23],
         ]);
 
-        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
-        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
-
         let payload_size = match usize::try_from(payload_size_u64) {
             Ok(v) => v,
             Err(_) => {
@@ -1234,12 +1234,16 @@ impl StreamingLogicalLogReader {
             }
         };
 
+        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
+        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+
         // 2. Parse payload — branches for encrypted vs unencrypted.
-        let (parsed_ops, running_crc) = match if self.encryption_ctx.is_some() {
+        let payload_result = if self.encryption_ctx.is_some() {
             self.parse_encrypted_payload(io, op_count, payload_size, commit_ts, running_crc)?
         } else {
             self.parse_streaming_payload(io, op_count, payload_size, commit_ts, running_crc)?
-        } {
+        };
+        let (parsed_ops, running_crc) = match payload_result {
             PayloadParseResult::Ok(ops, crc) => (ops, crc),
             PayloadParseResult::Eof => return Ok(ParseResult::Eof),
             PayloadParseResult::InvalidFrame => {
@@ -1570,8 +1574,8 @@ impl StreamingLogicalLogReader {
 }
 
 /// Result of parsing just the payload portion of a transaction frame.
-/// Used by `parse_streaming_payload` to communicate back to `parse_next_transaction`
-/// without duplicating control flow.
+/// Used by `parse_encrypted_payload` and `parse_streaming_payload` to communicate
+/// back to `parse_next_transaction` without duplicating control flow.
 enum PayloadParseResult {
     /// Successfully parsed ops and updated running CRC.
     Ok(Vec<ParsedOp>, u32),
@@ -3567,6 +3571,8 @@ mod tests {
         }
     }
 
+    // ── Encryption tests (Phase 3) ──────────────────────────────────────────
+
     fn test_enc_ctx() -> crate::storage::encryption::EncryptionContext {
         use crate::storage::encryption::{CipherMode, EncryptionKey};
         let key = EncryptionKey::Key128([0x42u8; 16]);
@@ -3597,34 +3603,36 @@ mod tests {
         }
     }
 
-    /// Verify the on-disk layout invariant: encrypt_chunk returns
-    /// ciphertext whose length is exactly plaintext_len + tag_size,
-    /// and the nonce is nonce_size bytes.  The read path slices the
-    /// blob as `[..payload_size+tag_size]` (ciphertext) and
-    /// `[payload_size+tag_size..]` (nonce), so any violation would
-    /// cause a mis-split and AEAD failure.
+    /// Write an encrypted frame, verify the on-disk layout invariant
+    /// (blob = plaintext + tag_size + nonce_size), then read back and
+    /// verify roundtrip correctness with multiple ops.
     #[test]
-    fn test_encrypted_log_on_disk_layout_invariant() {
+    fn test_encrypted_log_roundtrip_and_layout() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file("enc-layout.db-log", OpenFlags::Create, false)
+            .open_file("enc-roundtrip.db-log", OpenFlags::Create, false)
             .unwrap();
         let table_id: MVTableId = (-2).into();
         let enc_ctx = test_enc_ctx();
         let tag_size = enc_ctx.tag_size();
         let nonce_size = enc_ctx.nonce_size();
 
+        // Write one encrypted frame with 2 ops.
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
         let tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 100,
-            row_versions: vec![make_test_row_version(table_id, 1, "layout_check", 100)],
+            row_versions: vec![
+                make_test_row_version(table_id, 1, "hello", 100),
+                make_test_row_version(table_id, 2, "world", 100),
+            ],
             header: None,
         };
         let c = log.log_tx(&tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        // Read the raw on-disk frame to verify sizes.
+        // ── Layout invariant check ──
+        // Read the raw TX header to extract payload_size.
         let frame_hdr_buf = Arc::new(Buffer::new_temporary(TX_HEADER_SIZE));
         let frame_hdr_out = Arc::new(crate::sync::RwLock::new(Vec::new()));
         let out = frame_hdr_out.clone();
@@ -3645,12 +3653,8 @@ mod tests {
         assert_eq!(frame_hdr.len(), TX_HEADER_SIZE);
         let payload_size = u64::from_le_bytes(frame_hdr[4..12].try_into().unwrap()) as usize;
 
-        // Total file: LOG_HDR + TX_HEADER + encrypted_blob + TX_TRAILER
         let file_size = file.size().unwrap() as usize;
         let encrypted_blob_size = file_size - LOG_HDR_SIZE - TX_HEADER_SIZE - TX_TRAILER_SIZE;
-
-        // encrypted_blob = ciphertext_with_tag + nonce
-        //                = (payload_size + tag_size) + nonce_size
         assert_eq!(
             encrypted_blob_size,
             payload_size + tag_size + nonce_size,
@@ -3658,39 +3662,7 @@ mod tests {
              payload_size({payload_size}) + tag_size({tag_size}) + nonce_size({nonce_size})"
         );
 
-        // Verify that the frame still decrypts and parses correctly.
-        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
-        reader.read_header(&io).unwrap();
-        match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::Ops(ops) => assert_eq!(ops.len(), 1),
-            other => panic!("expected Ops, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_encrypted_log_basic_roundtrip() {
-        init_tracing();
-        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let file = io
-            .open_file("enc-roundtrip.db-log", OpenFlags::Create, false)
-            .unwrap();
-        let table_id: MVTableId = (-2).into();
-        let enc_ctx = test_enc_ctx();
-
-        // Write one encrypted frame with 2 ops.
-        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 100,
-            row_versions: vec![
-                make_test_row_version(table_id, 1, "hello", 100),
-                make_test_row_version(table_id, 2, "world", 100),
-            ],
-            header: None,
-        };
-        let c = log.log_tx(&tx).unwrap();
-        io.wait_for_completion(c).unwrap();
-
-        // Read it back.
+        // ── Roundtrip read ──
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
         reader.read_header(&io).unwrap();
 
@@ -3700,7 +3672,6 @@ mod tests {
         };
         assert_eq!(ops.len(), 2);
 
-        // Verify values.
         match &ops[0] {
             super::ParsedOp::UpsertTable { rowid, .. } => {
                 assert_eq!(rowid.row_id, RowKey::Int(1));
@@ -3714,7 +3685,6 @@ mod tests {
             other => panic!("expected UpsertTable, got {other:?}"),
         }
 
-        // Should be EOF after.
         assert!(matches!(
             reader.parse_next_transaction(&io).unwrap(),
             ParseResult::Eof
@@ -3801,67 +3771,68 @@ mod tests {
         assert_eq!(ops.len(), 0);
     }
 
+    /// AEAD integrity: wrong key and tampered ciphertext must both be rejected.
     #[test]
-    fn test_encrypted_log_wrong_key_rejected() {
+    fn test_encrypted_log_integrity_rejection() {
         init_tracing();
-        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let file = io
-            .open_file("enc-wrongkey.db-log", OpenFlags::Create, false)
-            .unwrap();
-        let table_id: MVTableId = (-2).into();
-
-        // Write with correct key.
-        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(test_enc_ctx()));
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 100,
-            row_versions: vec![make_test_row_version(table_id, 1, "secret", 100)],
-            header: None,
-        };
-        let c = log.log_tx(&tx).unwrap();
-        io.wait_for_completion(c).unwrap();
-
-        // Read with wrong key.
-        let mut reader = StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx()));
-        reader.read_header(&io).unwrap();
-
-        match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::InvalidFrame => {} // expected
-            other => panic!("expected InvalidFrame with wrong key, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_encrypted_log_tampered_ciphertext_rejected() {
-        init_tracing();
-        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let file = io
-            .open_file("enc-tamper-ct.db-log", OpenFlags::Create, false)
-            .unwrap();
         let table_id: MVTableId = (-2).into();
         let enc_ctx = test_enc_ctx();
 
-        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 100,
-            row_versions: vec![make_test_row_version(table_id, 1, "tamper_me", 100)],
-            header: None,
-        };
-        let c = log.log_tx(&tx).unwrap();
-        io.wait_for_completion(c).unwrap();
+        // ── Wrong key ──
+        {
+            let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+            let file = io
+                .open_file("enc-wrongkey.db-log", OpenFlags::Create, false)
+                .unwrap();
 
-        // Flip a bit in the ciphertext (after log header + TX header).
-        let corrupt_offset = (LOG_HDR_SIZE + TX_HEADER_SIZE + 1) as u64;
-        let byte_buf = Arc::new(Buffer::new(vec![0xFF]));
-        let c = Completion::new_write(move |_| {});
-        io.wait_for_completion(file.pwrite(corrupt_offset, byte_buf, c).unwrap())
-            .unwrap();
+            let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100,
+                row_versions: vec![make_test_row_version(table_id, 1, "secret", 100)],
+                header: None,
+            };
+            let c = log.log_tx(&tx).unwrap();
+            io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
-        reader.read_header(&io).unwrap();
+            let mut reader = StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx()));
+            reader.read_header(&io).unwrap();
 
-        match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::InvalidFrame => {}
-            other => panic!("expected InvalidFrame after ciphertext tamper, got {other:?}"),
+            match reader.parse_next_transaction(&io).unwrap() {
+                ParseResult::InvalidFrame => {}
+                other => panic!("expected InvalidFrame with wrong key, got {other:?}"),
+            }
+        }
+
+        // ── Tampered ciphertext ──
+        {
+            let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+            let file = io
+                .open_file("enc-tamper.db-log", OpenFlags::Create, false)
+                .unwrap();
+
+            let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100,
+                row_versions: vec![make_test_row_version(table_id, 1, "tamper_me", 100)],
+                header: None,
+            };
+            let c = log.log_tx(&tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+
+            // Flip a byte in the ciphertext (after log header + TX header).
+            let corrupt_offset = (LOG_HDR_SIZE + TX_HEADER_SIZE + 1) as u64;
+            let byte_buf = Arc::new(Buffer::new(vec![0xFF]));
+            let c = Completion::new_write(move |_| {});
+            io.wait_for_completion(file.pwrite(corrupt_offset, byte_buf, c).unwrap())
+                .unwrap();
+
+            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+            reader.read_header(&io).unwrap();
+
+            match reader.parse_next_transaction(&io).unwrap() {
+                ParseResult::InvalidFrame => {}
+                other => panic!("expected InvalidFrame after ciphertext tamper, got {other:?}"),
+            }
         }
     }
 
