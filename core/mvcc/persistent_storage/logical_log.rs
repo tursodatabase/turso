@@ -3566,4 +3566,347 @@ mod tests {
             }
         }
     }
+
+    fn test_enc_ctx() -> crate::storage::encryption::EncryptionContext {
+        use crate::storage::encryption::{CipherMode, EncryptionKey};
+        let key = EncryptionKey::Key128([0x42u8; 16]);
+        crate::storage::encryption::EncryptionContext::new(CipherMode::Aes128Gcm, &key, 4096)
+            .unwrap()
+    }
+
+    fn wrong_key_enc_ctx() -> crate::storage::encryption::EncryptionContext {
+        use crate::storage::encryption::{CipherMode, EncryptionKey};
+        let key = EncryptionKey::Key128([0xFFu8; 16]);
+        crate::storage::encryption::EncryptionContext::new(CipherMode::Aes128Gcm, &key, 4096)
+            .unwrap()
+    }
+
+    fn make_test_row_version(
+        table_id: MVTableId,
+        rowid: i64,
+        value: &str,
+        commit_ts: u64,
+    ) -> crate::mvcc::database::RowVersion {
+        let row = generate_simple_string_row(table_id, rowid, value);
+        crate::mvcc::database::RowVersion {
+            id: rowid as u64,
+            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
+            end: None,
+            row,
+            btree_resident: false,
+        }
+    }
+
+    /// Verify the on-disk layout invariant: encrypt_chunk returns
+    /// ciphertext whose length is exactly plaintext_len + tag_size,
+    /// and the nonce is nonce_size bytes.  The read path slices the
+    /// blob as `[..payload_size+tag_size]` (ciphertext) and
+    /// `[payload_size+tag_size..]` (nonce), so any violation would
+    /// cause a mis-split and AEAD failure.
+    #[test]
+    fn test_encrypted_log_on_disk_layout_invariant() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-layout.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+        let tag_size = enc_ctx.tag_size();
+        let nonce_size = enc_ctx.nonce_size();
+
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![make_test_row_version(table_id, 1, "layout_check", 100)],
+            header: None,
+        };
+        let c = log.log_tx(&tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        // Read the raw on-disk frame to verify sizes.
+        let frame_hdr_buf = Arc::new(Buffer::new_temporary(TX_HEADER_SIZE));
+        let frame_hdr_out = Arc::new(crate::sync::RwLock::new(Vec::new()));
+        let out = frame_hdr_out.clone();
+        let c = Completion::new_read(
+            frame_hdr_buf,
+            Box::new(
+                move |res: std::result::Result<(Arc<Buffer>, i32), crate::CompletionError>| {
+                    let Ok((buf, n)) = res else { return None };
+                    out.write().extend_from_slice(&buf.as_slice()[..n as usize]);
+                    None
+                },
+            ),
+        );
+        let c = file.pread(LOG_HDR_SIZE as u64, c).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let frame_hdr = frame_hdr_out.read();
+        assert_eq!(frame_hdr.len(), TX_HEADER_SIZE);
+        let payload_size = u64::from_le_bytes(frame_hdr[4..12].try_into().unwrap()) as usize;
+
+        // Total file: LOG_HDR + TX_HEADER + encrypted_blob + TX_TRAILER
+        let file_size = file.size().unwrap() as usize;
+        let encrypted_blob_size = file_size - LOG_HDR_SIZE - TX_HEADER_SIZE - TX_TRAILER_SIZE;
+
+        // encrypted_blob = ciphertext_with_tag + nonce
+        //                = (payload_size + tag_size) + nonce_size
+        assert_eq!(
+            encrypted_blob_size,
+            payload_size + tag_size + nonce_size,
+            "on-disk blob size ({encrypted_blob_size}) != \
+             payload_size({payload_size}) + tag_size({tag_size}) + nonce_size({nonce_size})"
+        );
+
+        // Verify that the frame still decrypts and parses correctly.
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(&io).unwrap();
+        match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::Ops(ops) => assert_eq!(ops.len(), 1),
+            other => panic!("expected Ops, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encrypted_log_basic_roundtrip() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-roundtrip.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+
+        // Write one encrypted frame with 2 ops.
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![
+                make_test_row_version(table_id, 1, "hello", 100),
+                make_test_row_version(table_id, 2, "world", 100),
+            ],
+            header: None,
+        };
+        let c = log.log_tx(&tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        // Read it back.
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(&io).unwrap();
+
+        let ops = match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::Ops(ops) => ops,
+            other => panic!("expected Ops, got {other:?}"),
+        };
+        assert_eq!(ops.len(), 2);
+
+        // Verify values.
+        match &ops[0] {
+            super::ParsedOp::UpsertTable { rowid, .. } => {
+                assert_eq!(rowid.row_id, RowKey::Int(1));
+            }
+            other => panic!("expected UpsertTable, got {other:?}"),
+        }
+        match &ops[1] {
+            super::ParsedOp::UpsertTable { rowid, .. } => {
+                assert_eq!(rowid.row_id, RowKey::Int(2));
+            }
+            other => panic!("expected UpsertTable, got {other:?}"),
+        }
+
+        // Should be EOF after.
+        assert!(matches!(
+            reader.parse_next_transaction(&io).unwrap(),
+            ParseResult::Eof
+        ));
+    }
+
+    #[test]
+    fn test_encrypted_log_multiple_frames_crc_chain() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-multi.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        for i in 0..5u64 {
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100 + i,
+                row_versions: vec![make_test_row_version(
+                    table_id,
+                    i as i64,
+                    &format!("val_{i}"),
+                    100 + i,
+                )],
+                header: None,
+            };
+            let c = log.log_tx(&tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+        }
+
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(&io).unwrap();
+
+        for i in 0..5u64 {
+            let ops = match reader.parse_next_transaction(&io).unwrap() {
+                ParseResult::Ops(ops) => ops,
+                other => panic!("frame {i}: expected Ops, got {other:?}"),
+            };
+            assert_eq!(ops.len(), 1, "frame {i}");
+            match &ops[0] {
+                super::ParsedOp::UpsertTable {
+                    rowid, commit_ts, ..
+                } => {
+                    assert_eq!(rowid.row_id, RowKey::Int(i as i64));
+                    assert_eq!(*commit_ts, 100 + i);
+                }
+                other => panic!("frame {i}: expected UpsertTable, got {other:?}"),
+            }
+        }
+
+        assert!(matches!(
+            reader.parse_next_transaction(&io).unwrap(),
+            ParseResult::Eof
+        ));
+    }
+
+    #[test]
+    fn test_encrypted_log_empty_transaction() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-empty.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let enc_ctx = test_enc_ctx();
+
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 42,
+            row_versions: vec![],
+            header: None,
+        };
+        let c = log.log_tx(&tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(&io).unwrap();
+
+        let ops = match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::Ops(ops) => ops,
+            other => panic!("expected Ops, got {other:?}"),
+        };
+        assert_eq!(ops.len(), 0);
+    }
+
+    #[test]
+    fn test_encrypted_log_wrong_key_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-wrongkey.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let table_id: MVTableId = (-2).into();
+
+        // Write with correct key.
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(test_enc_ctx()));
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![make_test_row_version(table_id, 1, "secret", 100)],
+            header: None,
+        };
+        let c = log.log_tx(&tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        // Read with wrong key.
+        let mut reader = StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx()));
+        reader.read_header(&io).unwrap();
+
+        match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::InvalidFrame => {} // expected
+            other => panic!("expected InvalidFrame with wrong key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encrypted_log_tampered_ciphertext_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-tamper-ct.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        let tx = crate::mvcc::database::LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![make_test_row_version(table_id, 1, "tamper_me", 100)],
+            header: None,
+        };
+        let c = log.log_tx(&tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        // Flip a bit in the ciphertext (after log header + TX header).
+        let corrupt_offset = (LOG_HDR_SIZE + TX_HEADER_SIZE + 1) as u64;
+        let byte_buf = Arc::new(Buffer::new(vec![0xFF]));
+        let c = Completion::new_write(move |_| {});
+        io.wait_for_completion(file.pwrite(corrupt_offset, byte_buf, c).unwrap())
+            .unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(&io).unwrap();
+
+        match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::InvalidFrame => {}
+            other => panic!("expected InvalidFrame after ciphertext tamper, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encrypted_log_torn_tail_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("enc-torn.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+
+        // Write 2 frames.
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        for i in 0..2u64 {
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100 + i,
+                row_versions: vec![make_test_row_version(table_id, i as i64, "data", 100 + i)],
+                header: None,
+            };
+            let c = log.log_tx(&tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+        }
+
+        // Truncate mid-way through the second frame.
+        let file_size = file.size().unwrap();
+        let truncate_at = file_size - 5; // remove last 5 bytes
+        let c = Completion::new_trunc(|_| {});
+        io.wait_for_completion(file.truncate(truncate_at, c).unwrap())
+            .unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        reader.read_header(&io).unwrap();
+
+        // First frame should parse fine.
+        match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::Ops(ops) => assert_eq!(ops.len(), 1),
+            other => panic!("expected Ops for frame 1, got {other:?}"),
+        }
+
+        // Second frame is torn — should be EOF.
+        match reader.parse_next_transaction(&io).unwrap() {
+            ParseResult::Eof => {}
+            other => panic!("expected Eof for torn frame 2, got {other:?}"),
+        }
+    }
 }
