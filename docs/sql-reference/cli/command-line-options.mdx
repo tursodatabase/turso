@@ -1,0 +1,163 @@
+---
+title: Command-Line Options
+description: CLI flags, arguments, and server modes for the tursodb command
+sidebarTitle: Command-Line Options
+---
+
+# Command-Line Options
+
+```bash
+tursodb [OPTIONS] [DATABASE] [SQL]
+```
+
+## Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `DATABASE` | `:memory:` | Path to a SQLite database file. If omitted, an in-memory database is created |
+| `SQL` | — | SQL statement to execute. If provided, the shell runs the query and exits |
+
+### Examples
+
+```bash
+# In-memory database
+tursodb
+
+# Open an existing file
+tursodb customers.db
+
+# Run a query and exit
+tursodb customers.db "SELECT count(*) FROM orders;"
+
+# Pipe SQL from stdin
+echo "SELECT 1 + 1;" | tursodb -q
+```
+
+## Options
+
+### `-m, --output-mode <MODE>`
+
+Set the output display format.
+
+| Mode | Description |
+|------|-------------|
+| `pretty` | Table with borders (default) |
+| `list` | Pipe-delimited values |
+| `line` | One column per line with column names |
+
+```bash
+tursodb -m list mydata.db "SELECT * FROM users;"
+```
+
+### `-o, --output <PATH>`
+
+Redirect query output to a file instead of stdout.
+
+```bash
+tursodb -o results.txt mydata.db "SELECT * FROM users;"
+```
+
+### `-q, --quiet`
+
+Suppress the startup banner and version information.
+
+```bash
+tursodb -q mydata.db
+```
+
+### `-e, --echo`
+
+Print each SQL statement before executing it. Useful for debugging scripts.
+
+```bash
+echo "SELECT 42;" | tursodb -q -e
+```
+
+```
+SELECT 42;
+42
+```
+
+### `-v, --vfs <VFS>`
+
+Select the Virtual File System backend.
+
+| VFS | Description |
+|-----|-------------|
+| `syscall` | Standard OS file I/O (default) |
+| `memory` | In-memory storage |
+| `io_uring` | Linux io_uring (requires feature flag) |
+
+```bash
+tursodb -v memory
+```
+
+### `-t, --tracing-output <PATH>`
+
+Write internal log traces to a file. Useful for debugging and performance analysis.
+
+```bash
+tursodb -t trace.log mydata.db
+```
+
+### `--readonly`
+
+Open the database in read-only mode. Write operations will return an error.
+
+```bash
+tursodb --readonly production.db "SELECT count(*) FROM users;"
+```
+
+Attempting to write in read-only mode:
+
+```bash
+tursodb --readonly production.db "INSERT INTO users VALUES (1, 'test');"
+# Error: Resource is read-only
+```
+
+### `--mcp`
+
+Start a Model Context Protocol server instead of the interactive shell. This allows AI assistants and other MCP clients to interact with the database via JSON-RPC.
+
+```bash
+tursodb --mcp mydata.db
+```
+
+### `--sync-server <ADDRESS>`
+
+Start a sync server for database replication, listening at the given address.
+
+```bash
+tursodb --sync-server 0.0.0.0:8080 mydata.db
+```
+
+## Experimental Feature Flags
+
+These flags enable features that are still under development. They may change or be removed in future releases.
+
+<Warning>
+Experimental features may have incomplete implementations or known limitations. Use them for testing and development only.
+</Warning>
+
+| Flag | Description |
+|------|-------------|
+| `--experimental-views` | Enable views (`CREATE VIEW` / `DROP VIEW`) |
+| `--experimental-custom-types` | Enable custom types (`CREATE TYPE` / `DROP TYPE`) |
+| `--experimental-encryption` | Enable at-rest database encryption |
+| `--experimental-index-method` | Enable custom index methods. Necessary for FTS and Sparse Vector indexes |
+| `--experimental-autovacuum` | Enable automatic database vacuuming |
+| `--experimental-triggers` | Enable triggers (`CREATE TRIGGER` / `DROP TRIGGER`) |
+| `--experimental-attach` | Enable `ATTACH DATABASE` / `DETACH DATABASE` |
+
+```bash
+# Enable views and triggers
+tursodb --experimental-views --experimental-triggers mydata.db
+```
+
+## Other Flags
+
+| Flag | Description |
+|------|-------------|
+| `--unsafe-testing` | Enable unsafe testing features (e.g., `sqlite_dbpage` writes) |
+| `-h, --help` | Print usage help |
+| `-V, --version` | Print version information |

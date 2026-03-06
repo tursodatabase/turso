@@ -1,6 +1,6 @@
-# SQL Language Reference
+# Turso Reference
 
-This directory contains the Turso SQL language reference documentation. The files are `.mdx` (Markdown + JSX components) and render as readable markdown on GitHub.
+This directory contains the Turso reference documentation — both the SQL language reference and the CLI reference. The files are `.mdx` (Markdown + JSX components) and render as readable markdown on GitHub.
 
 ## Structure
 
@@ -25,7 +25,11 @@ sql-reference/
 │   └── ...
 ├── pragmas.mdx                 # All supported PRAGMAs (includes CDC, encryption)
 ├── extensions.mdx              # UUID, regexp, vector, time, CSV, percentile
-└── compatibility.mdx           # SQLite compatibility notes and known differences
+├── compatibility.mdx           # SQLite compatibility notes and known differences
+└── cli/                        # CLI reference
+    ├── getting-started.mdx     # Installation, usage patterns, output modes
+    ├── command-line-options.mdx # CLI flags and arguments
+    └── shell-commands.mdx      # Dot commands (.tables, .schema, etc.)
 ```
 
 ## Editing guidelines
