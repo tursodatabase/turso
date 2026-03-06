@@ -37,25 +37,14 @@ pub struct QueryProfile {
 
 impl Default for QueryProfile {
     fn default() -> Self {
-        // bias defaults toward UPDATE + expression-index interactions.
-        let mut gen_opts = Opts::default();
-        gen_opts.table.large_table.enable = false;
-        gen_opts.table.rowid_alias_prob = 0.5;
-
-        gen_opts.query.insert.min_rows = NonZeroU32::new(10).unwrap();
-        gen_opts.query.insert.max_rows = NonZeroU32::new(60).unwrap();
-        gen_opts.query.update.expr_index_update_prob = 0.95;
-        gen_opts.query.create_index.expr_term_prob = 0.8;
-        gen_opts.query.create_index.max_expr_terms = 2;
-
         Self {
-            gen_opts,
+            gen_opts: Opts::default(),
             check_after_dml: true,
             select_weight: 60,
             create_table_weight: 15,
-            create_index_weight: 15,
+            create_index_weight: 5,
             insert_weight: 30,
-            update_weight: 40,
+            update_weight: 20,
             delete_weight: 20,
             drop_table_weight: 2,
             alter_table_weight: 2,
@@ -66,6 +55,19 @@ impl Default for QueryProfile {
 }
 
 impl QueryProfile {
+    pub fn expr_index_stress() -> Self {
+        let mut profile = Self::default();
+        profile.gen_opts.table.large_table.enable = false;
+        profile.gen_opts.table.rowid_alias_prob = 0.5;
+        profile.gen_opts.query.insert.min_rows = NonZeroU32::new(10).unwrap();
+        profile.gen_opts.query.insert.max_rows = NonZeroU32::new(60).unwrap();
+        profile.gen_opts.query.update.expr_index_update_prob = 0.95;
+        profile.gen_opts.query.create_index.expr_term_prob = 0.8;
+        profile.create_index_weight = 15;
+        profile.update_weight = 40;
+        profile
+    }
+
     /// Attention: edit this function when another weight is added
     pub fn total_weight(&self) -> u32 {
         self.select_weight
