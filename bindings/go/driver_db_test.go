@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path"
+	"runtime"
 	"slices"
 	"sync"
 	"testing"
@@ -1651,60 +1652,84 @@ func TestParallelSelectColumnsConcurrency(t *testing.T) {
 	db, err := sql.Open("turso", dbPath)
 	require.NoError(t, err)
 	defer db.Close()
-	db.SetMaxOpenConns(10)
+
+	maxConns := runtime.GOMAXPROCS(0)
+	if maxConns < 16 {
+		maxConns = 16
+	}
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
 
 	_, err = db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
 	require.NoError(t, err)
-	for i := range 5000 {
-		_, err = db.Exec(
-			"INSERT INTO users (name, email) VALUES (?, ?)",
-			fmt.Sprintf("user%d", i),
-			fmt.Sprintf("user%d@example.com", i),
-		)
-		require.NoError(t, err)
+	_, err = db.Exec("INSERT INTO users (id, name, email) VALUES (1, 'alice', 'alice@example.com')")
+	require.NoError(t, err)
+
+	workers := runtime.GOMAXPROCS(0) * 4
+	if workers < 32 {
+		workers = 32
 	}
+	const roundsPerWorker = 12
+	const selectsPerRound = 300
 
-	const goroutines = 40
-	const selectsPerGoroutine = 2000
-
+	start := make(chan struct{})
 	var wg sync.WaitGroup
-	errCh := make(chan error, goroutines)
-	for g := range goroutines {
+	errCh := make(chan error, workers)
+	for g := range workers {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for i := range selectsPerGoroutine {
-				rows, qerr := db.Query(
-					"SELECT id, name, email FROM users WHERE id = ?",
-					(i%5000)+1,
-				)
-				if qerr != nil {
-					errCh <- fmt.Errorf("worker %d query: %w", workerID, qerr)
-					return
-				}
-				for rows.Next() {
-					var rid int
-					var name string
-					var email string
-					if serr := rows.Scan(&rid, &name, &email); serr != nil {
-						_ = rows.Close()
-						errCh <- fmt.Errorf("worker %d scan: %w", workerID, serr)
+			<-start
+			for round := 0; round < roundsPerWorker; round++ {
+				for i := 0; i < selectsPerRound; i++ {
+					rows, qerr := db.Query("SELECT name, email, name FROM users WHERE id = 1")
+					if qerr != nil {
+						errCh <- fmt.Errorf("worker %d query: %w", workerID, qerr)
 						return
 					}
-				}
-				if rerr := rows.Err(); rerr != nil {
-					_ = rows.Close()
-					errCh <- fmt.Errorf("worker %d rows err: %w", workerID, rerr)
-					return
-				}
-				if cerr := rows.Close(); cerr != nil {
-					errCh <- fmt.Errorf("worker %d close: %w", workerID, cerr)
-					return
+
+					// Force column metadata fetch path on every query.
+					cols, cerr := rows.Columns()
+					if cerr != nil {
+						_ = rows.Close()
+						errCh <- fmt.Errorf("worker %d columns: %w", workerID, cerr)
+						return
+					}
+					if len(cols) != 3 {
+						_ = rows.Close()
+						errCh <- fmt.Errorf("worker %d unexpected columns len=%d", workerID, len(cols))
+						return
+					}
+
+					for rows.Next() {
+						var a, b, c string
+						if serr := rows.Scan(&a, &b, &c); serr != nil {
+							_ = rows.Close()
+							errCh <- fmt.Errorf("worker %d scan: %w", workerID, serr)
+							return
+						}
+					}
+					if rerr := rows.Err(); rerr != nil {
+						_ = rows.Close()
+						errCh <- fmt.Errorf("worker %d rows err: %w", workerID, rerr)
+						return
+					}
+					if closeErr := rows.Close(); closeErr != nil {
+						errCh <- fmt.Errorf("worker %d close: %w", workerID, closeErr)
+						return
+					}
+
+					// Perturb scheduling/memory often to surface pointer lifetime bugs faster.
+					if i%128 == 0 {
+						runtime.GC()
+						runtime.Gosched()
+					}
 				}
 			}
 		}(g)
 	}
 
+	close(start)
 	wg.Wait()
 	close(errCh)
 	for runErr := range errCh {
