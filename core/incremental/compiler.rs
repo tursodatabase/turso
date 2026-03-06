@@ -1542,6 +1542,12 @@ impl DbspCompiler {
         // Extract source identifiers from each input (for UNION ALL)
         let left_source = Self::extract_source_identifier(&union.inputs[0]);
         let right_source = Self::extract_source_identifier(&union.inputs[1]);
+        // Compiler currently lowers UNION as a binary tree. We attach an explicit branch key
+        // per input arm so same-source UNION ALL branches preserve duplicates.
+        // If compilation ever moves to n-ary merge nodes, each input arm must provide its own
+        // unique branch key.
+        let left_source_key = format!("{left_source}#branch:0");
+        let right_source_key = format!("{right_source}#branch:1");
 
         // Compile left and right inputs
         let left_id = self.compile_plan(&union.inputs[0])?;
@@ -1552,10 +1558,10 @@ impl DbspCompiler {
         // Create a merge operator that handles the rowid transformation
         let operator_id = self.circuit.next_id;
         let mode = if union.all {
-            // For UNION ALL, pass the source identifiers
+            // For UNION ALL, pass source+branch keys.
             UnionMode::All {
-                left_table: left_source,
-                right_table: right_source,
+                left_source_key,
+                right_source_key,
             }
         } else {
             UnionMode::Distinct

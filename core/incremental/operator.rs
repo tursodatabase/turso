@@ -3716,8 +3716,8 @@ mod tests {
         let mut merge_op = MergeOperator::new(
             1,
             UnionMode::All {
-                left_table: "table1".to_string(),
-                right_table: "table2".to_string(),
+                left_source_key: "table1#branch:0".to_string(),
+                right_source_key: "table2#branch:1".to_string(),
             },
         );
 
@@ -3760,6 +3760,68 @@ mod tests {
             assert!(values.contains(&2));
             assert!(values.contains(&3));
             assert!(values.contains(&4));
+        } else {
+            panic!("Expected Done result");
+        }
+    }
+
+    #[test]
+    fn test_merge_operator_union_all_same_source_keeps_branch_duplicates() {
+        let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor = BTreeCursor::new_index(_pager, index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        // Reproducer: UNION ALL where both branches read the same table and rowid.
+        let mut merge_op = MergeOperator::new(
+            11,
+            UnionMode::All {
+                left_source_key: "t#branch:0".to_string(),
+                right_source_key: "t#branch:1".to_string(),
+            },
+        );
+
+        let mut left_delta = Delta::new();
+        left_delta.insert(1, vec![Value::from_i64(42)]);
+        let mut right_delta = Delta::new();
+        right_delta.insert(1, vec![Value::from_i64(42)]);
+
+        let result1 = merge_op
+            .commit(DeltaPair::new(left_delta, right_delta), &mut cursors)
+            .unwrap();
+
+        let first_rowids = if let IOResult::Done(merged) = result1 {
+            assert_eq!(
+                merged.len(),
+                2,
+                "UNION ALL should preserve both branch rows"
+            );
+            let rowids: Vec<i64> = merged.changes.iter().map(|(row, _)| row.rowid).collect();
+            assert_ne!(
+                rowids[0], rowids[1],
+                "same-source UNION ALL branches must map to distinct storage rowids"
+            );
+            rowids
+        } else {
+            panic!("Expected Done result");
+        };
+
+        // Rowid mapping should remain stable per branch across commits.
+        let mut left_delta2 = Delta::new();
+        left_delta2.insert(1, vec![Value::from_i64(100)]);
+        let mut right_delta2 = Delta::new();
+        right_delta2.insert(1, vec![Value::from_i64(200)]);
+        let result2 = merge_op
+            .commit(DeltaPair::new(left_delta2, right_delta2), &mut cursors)
+            .unwrap();
+
+        if let IOResult::Done(merged) = result2 {
+            let rowids: Vec<i64> = merged.changes.iter().map(|(row, _)| row.rowid).collect();
+            assert_eq!(
+                rowids, first_rowids,
+                "same branch/source rowid should keep stable mapped rowid"
+            );
         } else {
             panic!("Expected Done result");
         }
@@ -3850,8 +3912,8 @@ mod tests {
         let mut merge_op = MergeOperator::new(
             10,
             UnionMode::All {
-                left_table: "orders".to_string(),
-                right_table: "archived_orders".to_string(),
+                left_source_key: "orders#branch:0".to_string(),
+                right_source_key: "archived_orders#branch:1".to_string(),
             },
         );
 
@@ -3969,8 +4031,8 @@ mod tests {
         let mut merge_op = MergeOperator::new(
             12,
             UnionMode::All {
-                left_table: "t1".to_string(),
-                right_table: "t2".to_string(),
+                left_source_key: "t1#branch:0".to_string(),
+                right_source_key: "t2#branch:1".to_string(),
             },
         );
 
