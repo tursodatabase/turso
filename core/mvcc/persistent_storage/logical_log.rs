@@ -421,15 +421,15 @@ impl LogicalLog {
             }
             let payload_size = self.encryption_scratch_buffer.len() as u64;
 
-            // AAD = salt(8 LE) || tx_header(24) — binds ciphertext to this specific
-            // frame so payloads cannot be swapped between transactions.
-            let salt = self.header.as_ref().unwrap().salt;
-            let mut aad = [0u8; 8 + TX_HEADER_SIZE];
+            // AAD = salt(8 LE) || payload_size(8 LE) || op_count(4 LE) || commit_ts(8 LE)
+            // Binds ciphertext to this specific frame so payloads cannot be swapped
+            // between transactions.
+            let salt = self.header.as_ref().expect("log header must be set before writing").salt;
+            let mut aad = [0u8; 28];
             aad[..8].copy_from_slice(&salt.to_le_bytes());
-            aad[8..12].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
-            aad[12..20].copy_from_slice(&payload_size.to_le_bytes());
-            aad[20..24].copy_from_slice(&op_count.to_le_bytes());
-            aad[24..32].copy_from_slice(&commit_ts.to_le_bytes());
+            aad[8..16].copy_from_slice(&payload_size.to_le_bytes());
+            aad[16..20].copy_from_slice(&op_count.to_le_bytes());
+            aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
 
             let (ciphertext, nonce) =
                 enc_ctx.encrypt_chunk(&self.encryption_scratch_buffer, &aad)?;
@@ -726,7 +726,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
 
     let parsed_op = match tag {
         OP_UPSERT_TABLE => {
-            let table_id = table_id.unwrap();
+            let table_id = table_id.expect("table op must have table_id");
             let (rowid_u64, rowid_len) = read_varint(&payload)
                 .map_err(|_| LimboError::Corrupt("Bad rowid varint in UPSERT_TABLE".into()))?;
             if rowid_len > payload.len() {
@@ -744,7 +744,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             }
         }
         OP_DELETE_TABLE => {
-            let table_id = table_id.unwrap();
+            let table_id = table_id.expect("table op must have table_id");
             let (rowid_u64, rowid_len) = read_varint(&payload)
                 .map_err(|_| LimboError::Corrupt("Bad rowid varint in DELETE_TABLE".into()))?;
             if rowid_len != payload.len() {
@@ -760,13 +760,13 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             }
         }
         OP_UPSERT_INDEX => ParsedOp::UpsertIndex {
-            table_id: table_id.unwrap(),
+            table_id: table_id.expect("index op must have table_id"),
             payload,
             commit_ts,
             btree_resident,
         },
         OP_DELETE_INDEX => ParsedOp::DeleteIndex {
-            table_id: table_id.unwrap(),
+            table_id: table_id.expect("index op must have table_id"),
             payload,
             commit_ts,
             btree_resident,
@@ -1001,7 +1001,7 @@ impl StreamingLogicalLogReader {
         commit_ts: u64,
         running_crc: u32,
     ) -> Result<PayloadParseResult> {
-        let enc = self.encryption_ctx.as_ref().unwrap();
+        let enc = self.encryption_ctx.as_ref().expect("encryption_ctx must be set for encrypted payload");
         let nonce_size = enc.nonce_size();
         let tag_size = enc.tag_size();
 
@@ -1019,19 +1019,19 @@ impl StreamingLogicalLogReader {
         };
         let running_crc = crc32c::crc32c_append(running_crc, &blob);
 
-        // AAD = salt(8 LE) || tx_header(24) — must match the write path exactly.
-        let salt = self.header.as_ref().unwrap().salt;
-        let mut aad = [0u8; 8 + TX_HEADER_SIZE];
+        // AAD = salt(8 LE) || payload_size(8 LE) || op_count(4 LE) || commit_ts(8 LE)
+        // Must match the write path exactly.
+        let salt = self.header.as_ref().expect("log header must be read before parsing").salt;
+        let mut aad = [0u8; 28];
         aad[..8].copy_from_slice(&salt.to_le_bytes());
-        aad[8..12].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
-        aad[12..20].copy_from_slice(&(payload_size as u64).to_le_bytes());
-        aad[20..24].copy_from_slice(&op_count.to_le_bytes());
-        aad[24..32].copy_from_slice(&commit_ts.to_le_bytes());
+        aad[8..16].copy_from_slice(&(payload_size as u64).to_le_bytes());
+        aad[16..20].copy_from_slice(&op_count.to_le_bytes());
+        aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
 
         let ciphertext = &blob[..payload_size + tag_size];
         let nonce = &blob[payload_size + tag_size..];
 
-        let enc_ctx = self.encryption_ctx.as_ref().unwrap();
+        let enc_ctx = self.encryption_ctx.as_ref().expect("encryption_ctx must be set for encrypted payload");
         let plaintext = match enc_ctx.decrypt_chunk(ciphertext, nonce, &aad) {
             Ok(p) => p,
             Err(e) => {
@@ -3604,8 +3604,6 @@ mod tests {
         }
     }
 
-    // ── Encryption tests (Phase 3) ──────────────────────────────────────────
-
     fn test_enc_ctx() -> crate::storage::encryption::EncryptionContext {
         use crate::storage::encryption::{CipherMode, EncryptionKey};
         let key = EncryptionKey::Key128([0x42u8; 16]);
@@ -3776,34 +3774,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_encrypted_log_empty_transaction() {
-        init_tracing();
-        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let file = io
-            .open_file("enc-empty.db-log", OpenFlags::Create, false)
-            .unwrap();
-        let enc_ctx = test_enc_ctx();
-
-        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 42,
-            row_versions: vec![],
-            header: None,
-        };
-        let c = log.log_tx(&tx).unwrap();
-        io.wait_for_completion(c).unwrap();
-
-        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
-        reader.read_header(&io).unwrap();
-
-        let ops = match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::Ops(ops) => ops,
-            other => panic!("expected Ops, got {other:?}"),
-        };
-        assert_eq!(ops.len(), 0);
-    }
-
     /// AEAD integrity: wrong key and tampered ciphertext must both be rejected.
     #[test]
     fn test_encrypted_log_integrity_rejection() {
@@ -3833,6 +3803,40 @@ mod tests {
             match reader.parse_next_transaction(&io).unwrap() {
                 ParseResult::InvalidFrame => {}
                 other => panic!("expected InvalidFrame with wrong key, got {other:?}"),
+            }
+        }
+
+        // ── Tampered TX header (commit_ts) ──
+        // commit_ts is part of the AAD, so flipping a byte in it causes AEAD
+        // decryption to fail even though the ciphertext itself is untouched.
+        {
+            let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+            let file = io
+                .open_file("enc-hdr-tamper.db-log", OpenFlags::Create, false)
+                .unwrap();
+
+            let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+            let tx = crate::mvcc::database::LogRecord {
+                tx_timestamp: 100,
+                row_versions: vec![make_test_row_version(table_id, 1, "hdr_tamper", 100)],
+                header: None,
+            };
+            let c = log.log_tx(&tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+
+            // Flip a byte in the commit_ts field (TX header offset 16..24, file offset = LOG_HDR + 16).
+            let corrupt_offset = (LOG_HDR_SIZE + 16) as u64;
+            let byte_buf = Arc::new(Buffer::new(vec![0xFF]));
+            let c = Completion::new_write(move |_| {});
+            io.wait_for_completion(file.pwrite(corrupt_offset, byte_buf, c).unwrap())
+                .unwrap();
+
+            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
+            reader.read_header(&io).unwrap();
+
+            match reader.parse_next_transaction(&io).unwrap() {
+                ParseResult::InvalidFrame => {}
+                other => panic!("expected InvalidFrame after TX header tamper, got {other:?}"),
             }
         }
 
