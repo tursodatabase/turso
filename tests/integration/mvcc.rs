@@ -96,6 +96,10 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
     fn set_header(&self, header: turso_core::mvcc::persistent_storage::logical_log::LogHeader) {
         self.inner.set_header(header)
     }
+
+    fn encryption_ctx(&self) -> Option<turso_core::EncryptionContext> {
+        self.inner.encryption_ctx()
+    }
 }
 
 /// CREATE TABLE on an attached MVCC database must not deadlock.

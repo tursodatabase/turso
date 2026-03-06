@@ -7586,10 +7586,8 @@ fn assert_log_payloads_decrypt(
         }
         let payload_size =
             u64::from_le_bytes(log_bytes[offset + 4..offset + 12].try_into().unwrap()) as usize;
-        let op_count =
-            u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
-        let commit_ts =
-            u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
+        let op_count = u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
+        let commit_ts = u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
 
         let payload_offset = offset + 24;
         let on_disk_size = payload_size + tag_size + nonce_size;
@@ -7642,7 +7640,11 @@ fn test_encrypted_recovery_checkpoint_then_more_writes() {
 
     let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
     assert!(log_path.exists(), "db-log file should exist before restart");
-    assert_log_payloads_decrypt(&log_path, hex_key, crate::storage::encryption::CipherMode::Aes256Gcm);
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
 
     db.restart();
     let conn = db.connect();
@@ -7672,7 +7674,11 @@ fn test_encrypted_recovery_multiple_restart_cycles() {
     }
 
     assert!(log_path.exists(), "db-log file should exist after cycle 1");
-    assert_log_payloads_decrypt(&log_path, hex_key, crate::storage::encryption::CipherMode::Aes256Gcm);
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
     db.restart();
 
     // Cycle 2: insert more rows
@@ -7717,7 +7723,11 @@ fn test_encrypted_recovery_corrupted_ciphertext() {
         log_path.exists(),
         "db-log file should exist before corruption"
     );
-    assert_log_payloads_decrypt(&log_path, hex_key, crate::storage::encryption::CipherMode::Aes256Gcm);
+    assert_log_payloads_decrypt(
+        &log_path,
+        hex_key,
+        crate::storage::encryption::CipherMode::Aes256Gcm,
+    );
 
     // Corrupt the payload of the second (non-checkpointed) frame in the log file.
     // The log header is 56 bytes, then the TX header is 24 bytes. Flip a byte
