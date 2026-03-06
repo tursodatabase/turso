@@ -111,6 +111,7 @@ use crate::{
     Buffer, Completion, CompletionError, LimboError, Result,
 };
 
+use crate::storage::encryption::EncryptionContext;
 use crate::File;
 
 /// Logical log size in bytes at which a committing transaction will trigger a checkpoint.
@@ -278,10 +279,16 @@ pub struct LogicalLog {
     /// `advance_offset_after_success` so that an abandoned write
     /// doesn't corrupt the chain.
     pending_running_crc: Option<u32>,
+    encryption_ctx: Option<EncryptionContext>,
+    encryption_scratch_buffer: Vec<u8>,
 }
 
 impl LogicalLog {
-    pub fn new(file: Arc<dyn File>, io: Arc<dyn crate::IO>) -> Self {
+    pub fn new(
+        file: Arc<dyn File>,
+        io: Arc<dyn crate::IO>,
+        encryption_ctx: Option<EncryptionContext>,
+    ) -> Self {
         Self {
             file,
             io,
@@ -290,6 +297,8 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
+            encryption_ctx,
+            encryption_scratch_buffer: Vec::new(),
         }
     }
 
@@ -389,17 +398,23 @@ impl LogicalLog {
         Ok((c, buffer_len as u64))
     }
 
-    /// Serializes ops into `write_buf`.
+    /// Serializes ops into `write_buf`, encrypting if an encryption context is set.
     /// Returns the plaintext payload size (used in the TX header's `payload_size` field).
+    ///
+    /// Encrypted on-disk blob layout: ciphertext(plaintext_len + tag_size) | nonce(nonce_size)
     fn serialize_ops_into_write_buf(&mut self, tx: &LogRecord) -> Result<u64> {
-        let payload_start = self.write_buf.len();
-        for row_version in &tx.row_versions {
-            serialize_op_entry(&mut self.write_buf, row_version)?;
+        if self.encryption_ctx.is_some() {
+            unimplemented!("encrypted write path")
+        } else {
+            let payload_start = self.write_buf.len();
+            for row_version in &tx.row_versions {
+                serialize_op_entry(&mut self.write_buf, row_version)?;
+            }
+            if let Some(header) = tx.header {
+                serialize_header_entry(&mut self.write_buf, &header);
+            }
+            Ok((self.write_buf.len() - payload_start) as u64)
         }
-        if let Some(header) = tx.header {
-            serialize_header_entry(&mut self.write_buf, &header);
-        }
-        Ok((self.write_buf.len() - payload_start) as u64)
     }
 
     /// Writes a transaction to the log and immediately advances the writer offset.
@@ -499,6 +514,27 @@ impl LogicalLog {
         self.offset = 0;
         Ok(c)
     }
+}
+
+fn parse_ops_from_plaintext(
+    _plaintext: &[u8],
+    _payload_size: usize,
+    _op_count: u32,
+    _commit_ts: u64,
+) -> Result<Vec<ParsedOp>> {
+    unimplemented!("parse_ops_from_plaintext")
+}
+
+/// Parse one op entry from a contiguous byte slice (no IO).
+/// Returns `Ok(Some((parsed_op, bytes_consumed)))` on success,
+/// `Ok(None)` when not enough bytes, or `Err` on structural corruption.
+///
+/// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
+fn try_parse_one_op_from_buf(
+    _buf: &[u8],
+    _commit_ts: u64,
+) -> Result<Option<(ParsedOp, usize)>> {
+    unimplemented!("try_parse_one_op_from_buf")
 }
 
 /// Serialize one op into `buffer`.
@@ -647,10 +683,11 @@ pub struct StreamingLogicalLogReader {
     /// Running CRC state for chained checksum validation. Seeded from the header salt;
     /// updated after each successfully validated frame.
     running_crc: u32,
+    encryption_ctx: Option<EncryptionContext>,
 }
 
 impl StreamingLogicalLogReader {
-    pub fn new(file: Arc<dyn File>) -> Self {
+    pub fn new(file: Arc<dyn File>, encryption_ctx: Option<EncryptionContext>) -> Self {
         let file_size = file.size().expect("failed to get file size") as usize;
         Self {
             file,
@@ -663,6 +700,7 @@ impl StreamingLogicalLogReader {
             pending_ops: std::collections::VecDeque::new(),
             last_valid_offset: 0,
             running_crc: 0,
+            encryption_ctx,
         }
     }
 
@@ -774,6 +812,19 @@ impl StreamingLogicalLogReader {
 
     pub fn is_eof(&self) -> bool {
         self.remaining_bytes() == 0
+    }
+
+    /// Parse an encrypted payload: read the single AEAD blob, decrypt, then parse ops from plaintext.
+    /// Encrypted on-disk blob layout: ciphertext(plaintext_len + tag_size) | nonce(nonce_size)
+    fn parse_encrypted_payload(
+        &mut self,
+        _io: &Arc<dyn crate::IO>,
+        _op_count: u32,
+        _payload_size: usize,
+        _commit_ts: u64,
+        _running_crc: u32,
+    ) -> Result<PayloadParseResult> {
+        unimplemented!("encrypted read path")
     }
 
     /// Parse an unencrypted payload via field-by-field streaming IO reads.
@@ -987,10 +1038,12 @@ impl StreamingLogicalLogReader {
             }
         };
 
-        // 2. Parse payload.
-        let (parsed_ops, running_crc) = match self.parse_streaming_payload(
-            io, op_count, payload_size, commit_ts, running_crc,
-        )? {
+        // 2. Parse payload — branches for encrypted vs unencrypted.
+        let (parsed_ops, running_crc) = match if self.encryption_ctx.is_some() {
+            self.parse_encrypted_payload(io, op_count, payload_size, commit_ts, running_crc)?
+        } else {
+            self.parse_streaming_payload(io, op_count, payload_size, commit_ts, running_crc)?
+        } {
             PayloadParseResult::Ok(ops, crc) => (ops, crc),
             PayloadParseResult::Eof => return Ok(ParseResult::Eof),
             PayloadParseResult::InvalidFrame => {
@@ -1425,7 +1478,7 @@ mod tests {
         commit_ts: u64,
     ) -> (Arc<dyn crate::File>, usize) {
         let file = io.open_file(file_name, OpenFlags::Create, false).unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: commit_ts,
@@ -1467,7 +1520,7 @@ mod tests {
     }
 
     fn read_table_ops(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> Vec<ExpectedTableOp> {
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(io).unwrap();
         let mut ops = Vec::new();
         loop {
@@ -1545,7 +1598,7 @@ mod tests {
         let file = io
             .open_file("logical_log_varint_decode_tmp", OpenFlags::Create, false)
             .unwrap();
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.buffer.write().extend_from_slice(bytes);
         reader.consume_varint_bytes(&io)
     }
@@ -1951,7 +2004,7 @@ mod tests {
         let file = io
             .open_file("test.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let rowid_len = varint_len(1);
@@ -2000,7 +2053,7 @@ mod tests {
                 .unwrap();
             io.wait_for_completion(c).unwrap();
 
-            let mut reader = StreamingLogicalLogReader::new(file.clone());
+            let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
             reader.read_header(&io).unwrap();
             let mut seen = 0;
             loop {
@@ -2030,7 +2083,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 1, false, false, "a");
         append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 2, false, false, "b");
@@ -2080,12 +2133,12 @@ mod tests {
         let file = io
             .open_file("logical_log_i32_min_table_id", OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
         let table_id = crate::mvcc::database::MVTableId::from(i32::MIN as i64);
 
         append_single_table_op_tx(&mut log, &io, table_id, 7, 11, false, false, "min");
 
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(&io).unwrap();
         match reader
             .next_record(&io, |_id| {
@@ -2119,7 +2172,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), -1, 1, false, false, "neg");
         append_single_table_op_tx(&mut log, &io, (-2).into(), -1, 2, true, false, "neg");
@@ -2177,7 +2230,7 @@ mod tests {
         let file = io
             .open_file("corrupt.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 123,
@@ -2197,7 +2250,7 @@ mod tests {
         io.wait_for_completion(c).unwrap();
 
         // Flip one byte in the op data (varint payload_len).
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         // After read_header, reader.offset = LOG_HDR_SIZE.
         // Skip frame header (TX_HEADER_SIZE) + fixed op prefix (tag+flags+table_id = 6 bytes).
@@ -2208,7 +2261,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2229,7 +2282,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 1, false, false, "first");
         let frame2_start = log.offset;
@@ -2282,7 +2335,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2310,7 +2363,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2334,7 +2387,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2357,7 +2410,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2378,7 +2431,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
         let after_first = log.offset as usize;
@@ -2420,7 +2473,7 @@ mod tests {
         let file = io
             .open_file("header-corrupt.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
         let tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 77,
             row_versions: vec![],
@@ -2434,7 +2487,7 @@ mod tests {
         let c = file.pwrite(0, bad, Completion::new_write(|_| {})).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }
@@ -2457,7 +2510,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }
@@ -2494,7 +2547,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         let res = reader.read_header(&io);
         assert!(res.is_err());
 
@@ -2514,7 +2567,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         let result = reader.try_read_header(&io).unwrap();
         assert!(
             matches!(result, HeaderReadResult::Invalid),
@@ -2556,7 +2609,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }
@@ -2579,7 +2632,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2605,7 +2658,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let res = reader.next_record(&io, |_id| {
             Err(LimboError::InternalError("no index".to_string()))
@@ -2625,7 +2678,7 @@ mod tests {
         let file = io
             .open_file("empty-tx.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         // Frame 1: empty tx (no ops). The reader must skip it silently (ops.is_empty() → continue).
         let tx = crate::mvcc::database::LogRecord {
@@ -2648,7 +2701,7 @@ mod tests {
         let c = log.log_tx(&header_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
 
         // The reader skips the empty frame and returns the UpdateHeader from frame 2.
@@ -2686,7 +2739,7 @@ mod tests {
         let file = io
             .open_file("bitflip.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 300,
             row_versions: Vec::new(),
@@ -2723,7 +2776,7 @@ mod tests {
                     .unwrap();
                 io.wait_for_completion(c).unwrap();
 
-                let mut reader = StreamingLogicalLogReader::new(file.clone());
+                let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
                 reader.read_header(&io).unwrap();
                 let res = reader.next_record(&io, |_id| {
                     Err(LimboError::InternalError("no index".to_string()))
@@ -2758,7 +2811,7 @@ mod tests {
         let file = io
             .open_file("roundtrip-rand.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let mut expected = Vec::new();
         for tx_i in 0..128u64 {
@@ -2865,7 +2918,7 @@ mod tests {
             Ok(f) => f,
             Err(_) => return false,
         };
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
         let mut expected = Vec::new();
 
         for (idx, (is_delete, rowid, btree_resident)) in events.into_iter().take(64).enumerate() {
@@ -2978,7 +3031,7 @@ mod tests {
         let file = io
             .open_file("btree.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 55,
@@ -3018,7 +3071,7 @@ mod tests {
             "payload_size at bytes [4..12] must be non-zero for a non-empty op"
         );
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let rec = reader
             .next_record(&io, |_id| {
@@ -3042,7 +3095,7 @@ mod tests {
         let file = io
             .open_file("header.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         let mut tx = crate::mvcc::database::LogRecord {
             tx_timestamp: 10,
@@ -3066,7 +3119,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let header = reader.header().unwrap();
         // Verify the on-disk CRC matches a fresh computation over the header bytes
@@ -3110,7 +3163,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 11, false, false, "foo");
         let c = file
@@ -3122,7 +3175,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         let result = reader.try_read_header(&io).unwrap();
         assert!(matches!(result, HeaderReadResult::Invalid));
     }
@@ -3137,7 +3190,7 @@ mod tests {
         let file = io
             .open_file("salt-regen.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         // Write a frame and capture the salt
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
@@ -3156,7 +3209,7 @@ mod tests {
         append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
 
         // Reader should see only the new frame (old data was truncated)
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -3189,7 +3242,7 @@ mod tests {
         let file = io
             .open_file("crc-chain.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         // Write 3 frames
         append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "aaa");
@@ -3198,7 +3251,7 @@ mod tests {
         append_single_table_op_tx(&mut log, &io, (-2).into(), 3, 30, false, false, "ccc");
 
         // Without corruption, all 3 frames should read back
-        let mut reader = StreamingLogicalLogReader::new(file.clone());
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -3222,7 +3275,7 @@ mod tests {
 
         // Now frame 1 should fail CRC, and frames 2+3 should NOT be returned
         // (chained CRC means the reader stops at the first invalid frame)
-        let mut reader = StreamingLogicalLogReader::new(file);
+        let mut reader = StreamingLogicalLogReader::new(file, None);
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -3254,7 +3307,7 @@ mod tests {
         let file_a = io
             .open_file("splice-a.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log_a = LogicalLog::new(file_a.clone(), io.clone());
+        let mut log_a = LogicalLog::new(file_a.clone(), io.clone(), None);
         append_single_table_op_tx(&mut log_a, &io, (-2).into(), 1, 10, false, false, "aaa");
         let log_a_end = log_a.offset as usize;
 
@@ -3262,7 +3315,7 @@ mod tests {
         let file_b = io
             .open_file("splice-b.db-log", crate::OpenFlags::Create, false)
             .unwrap();
-        let mut log_b = LogicalLog::new(file_b.clone(), io.clone());
+        let mut log_b = LogicalLog::new(file_b.clone(), io.clone(), None);
         append_single_table_op_tx(&mut log_b, &io, (-2).into(), 2, 20, false, false, "bbb");
         let log_b_end = log_b.offset as usize;
 
@@ -3297,7 +3350,7 @@ mod tests {
         io.wait_for_completion(c).unwrap();
 
         // Read log A — should get 1 valid frame (A's own), then reject the spliced frame
-        let mut reader = StreamingLogicalLogReader::new(file_a);
+        let mut reader = StreamingLogicalLogReader::new(file_a, None);
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)

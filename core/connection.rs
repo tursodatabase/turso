@@ -1569,7 +1569,8 @@ impl Connection {
         // A fresh :memory: DB defaults to WAL, so when main is MVCC we need to
         // create an MvStore for the attached DB so it runs in the same mode.
         if is_memory_db && self.mvcc_enabled() && !db.mvcc_enabled() {
-            let mv_store = journal_mode::open_mv_store(db.io.clone(), &db.path, db.open_flags)?;
+            let mv_store =
+                journal_mode::open_mv_store(db.io.clone(), &db.path, db.open_flags, None)?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
             mv_store.bootstrap(bootstrap_conn)?;
