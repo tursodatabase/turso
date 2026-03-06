@@ -273,11 +273,9 @@ pub fn plan_satisfies_order_target(
                             }
                         }
 
-                        // If ORDER BY collation doesn't match index collation, this index can't satisfy the ordering
-                        if idx_col
-                            .collation
-                            .is_some_and(|idx_collation| target_col.collation != idx_collation)
-                        {
+                        // Index columns without explicit COLLATE use BINARY.
+                        // Treat them as BINARY for ordering compatibility checks.
+                        if target_col.collation != idx_col.collation.unwrap_or_default() {
                             break;
                         }
 
