@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -1641,4 +1642,72 @@ func TestBusyTimeoutConcurrentWrites(t *testing.T) {
 	require.Equal(t, numGoroutines*numUpdates, finalValue,
 		"expected %d updates, got %d", numGoroutines*numUpdates, finalValue)
 	fmt.Println("Busy timeout concurrent writes test passed")
+}
+
+func TestParallelSelectColumnsConcurrency(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := path.Join(tmp, "parallel_select_columns.db")
+
+	db, err := sql.Open("turso", dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+	db.SetMaxOpenConns(10)
+
+	_, err = db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
+	require.NoError(t, err)
+	for i := range 5000 {
+		_, err = db.Exec(
+			"INSERT INTO users (name, email) VALUES (?, ?)",
+			fmt.Sprintf("user%d", i),
+			fmt.Sprintf("user%d@example.com", i),
+		)
+		require.NoError(t, err)
+	}
+
+	const goroutines = 40
+	const selectsPerGoroutine = 2000
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines)
+	for g := range goroutines {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := range selectsPerGoroutine {
+				rows, qerr := db.Query(
+					"SELECT id, name, email FROM users WHERE id = ?",
+					(i%5000)+1,
+				)
+				if qerr != nil {
+					errCh <- fmt.Errorf("worker %d query: %w", workerID, qerr)
+					return
+				}
+				for rows.Next() {
+					var rid int
+					var name string
+					var email string
+					if serr := rows.Scan(&rid, &name, &email); serr != nil {
+						_ = rows.Close()
+						errCh <- fmt.Errorf("worker %d scan: %w", workerID, serr)
+						return
+					}
+				}
+				if rerr := rows.Err(); rerr != nil {
+					_ = rows.Close()
+					errCh <- fmt.Errorf("worker %d rows err: %w", workerID, rerr)
+					return
+				}
+				if cerr := rows.Close(); cerr != nil {
+					errCh <- fmt.Errorf("worker %d close: %w", workerID, cerr)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for runErr := range errCh {
+		require.NoError(t, runErr)
+	}
 }
