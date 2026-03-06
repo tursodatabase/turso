@@ -1014,7 +1014,10 @@ impl StreamingLogicalLogReader {
         let enc_ctx = self.encryption_ctx.as_ref().unwrap();
         let plaintext = match enc_ctx.decrypt_chunk(ciphertext, nonce, &aad) {
             Ok(p) => p,
-            Err(_) => return Ok(PayloadParseResult::InvalidFrame),
+            Err(e) => {
+                tracing::warn!("decrypt_chunk failed: {e}");
+                return Ok(PayloadParseResult::InvalidFrame);
+            }
         };
 
         match parse_ops_from_plaintext(&plaintext, payload_size, op_count, commit_ts) {
@@ -1077,7 +1080,10 @@ impl StreamingLogicalLogReader {
                 crc32c::crc32c_append(running_crc, &payload_len_bytes[..payload_len_bytes_len]);
             let payload_len = match usize::try_from(payload_len) {
                 Ok(v) => v,
-                Err(_) => return Ok(PayloadParseResult::InvalidFrame),
+                Err(e) => {
+                    tracing::warn!("payload_len overflows usize: {e}");
+                    return Ok(PayloadParseResult::InvalidFrame);
+                }
             };
 
             let payload = match self.try_consume_bytes(io, payload_len)? {
@@ -1100,7 +1106,10 @@ impl StreamingLogicalLogReader {
                     let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = match read_varint(&payload) {
                         Ok(v) => v,
-                        Err(_) => return Ok(PayloadParseResult::InvalidFrame),
+                        Err(e) => {
+                            tracing::warn!("failed to read rowid varint in upsert op: {e}");
+                            return Ok(PayloadParseResult::InvalidFrame);
+                        }
                     };
                     let rowid_i64 = rowid_u64 as i64;
                     if rowid_len > payload.len() {
@@ -1121,7 +1130,10 @@ impl StreamingLogicalLogReader {
                     let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = match read_varint(&payload) {
                         Ok(v) => v,
-                        Err(_) => return Ok(PayloadParseResult::InvalidFrame),
+                        Err(e) => {
+                            tracing::warn!("failed to read rowid varint in delete op: {e}");
+                            return Ok(PayloadParseResult::InvalidFrame);
+                        }
                     };
                     if rowid_len != payload.len() {
                         return Ok(PayloadParseResult::InvalidFrame);
@@ -1228,7 +1240,8 @@ impl StreamingLogicalLogReader {
 
         let payload_size = match usize::try_from(payload_size_u64) {
             Ok(v) => v,
-            Err(_) => {
+            Err(e) => {
+                tracing::warn!("payload_size overflows usize: {e}");
                 self.last_valid_offset = frame_start;
                 return Ok(ParseResult::InvalidFrame);
             }
