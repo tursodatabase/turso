@@ -1561,6 +1561,7 @@ impl Connection {
                 &db.path,
                 db.open_flags,
                 db.durable_storage.clone(),
+                None,
             )?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;

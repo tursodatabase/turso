@@ -1260,6 +1260,7 @@ impl Database {
                 &self.path,
                 self.open_flags,
                 self.durable_storage.clone(),
+                None,
             )?;
             self.mv_store.store(Some(mv_store));
         }
