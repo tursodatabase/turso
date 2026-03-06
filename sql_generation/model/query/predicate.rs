@@ -34,33 +34,27 @@ impl Predicate {
     }
 
     pub fn and(predicates: Vec<Predicate>) -> Self {
-        if predicates.is_empty() {
-            Self::true_()
-        } else if predicates.len() == 1 {
-            predicates.into_iter().next().unwrap().parens()
-        } else {
-            let expr = ast::Expr::Binary(
-                Box::new(predicates[0].0.clone()),
-                ast::Operator::And,
-                Box::new(Self::and(predicates[1..].to_vec()).0),
-            );
+        let mut predicates = predicates.into_iter();
+        let Some(first) = predicates.next() else {
+            return Self::true_();
+        };
+
+        predicates.fold(first.parens(), |lhs, rhs| {
+            let expr = ast::Expr::Binary(Box::new(lhs.0), ast::Operator::And, Box::new(rhs.0));
             Self(expr).parens()
-        }
+        })
     }
 
     pub fn or(predicates: Vec<Predicate>) -> Self {
-        if predicates.is_empty() {
-            Self::false_()
-        } else if predicates.len() == 1 {
-            predicates.into_iter().next().unwrap().parens()
-        } else {
-            let expr = ast::Expr::Binary(
-                Box::new(predicates[0].0.clone()),
-                ast::Operator::Or,
-                Box::new(Self::or(predicates[1..].to_vec()).0),
-            );
+        let mut predicates = predicates.into_iter();
+        let Some(first) = predicates.next() else {
+            return Self::false_();
+        };
+
+        predicates.fold(first.parens(), |lhs, rhs| {
+            let expr = ast::Expr::Binary(Box::new(lhs.0), ast::Operator::Or, Box::new(rhs.0));
             Self(expr).parens()
-        }
+        })
     }
 
     pub fn eq(lhs: Predicate, rhs: Predicate) -> Self {
@@ -147,23 +141,11 @@ pub fn expr_to_value<T: TableContext>(
         }
         ast::Expr::FunctionCall {
             name,
-            distinctness,
+            distinctness: _,
             args,
-            order_by,
-            filter_over,
+            order_by: _,
+            filter_over: _,
         } => {
-            let has_unsupported_fn_features = distinctness.is_some()
-                || !order_by.is_empty()
-                || filter_over.filter_clause.is_some()
-                || filter_over.over_clause.is_some();
-            debug_assert!(
-                !has_unsupported_fn_features,
-                "expr_to_value only supports plain function calls (no DISTINCT/ORDER BY/FILTER/OVER)"
-            );
-            if has_unsupported_fn_features {
-                return None;
-            }
-
             let name = name.as_str();
             if name.eq_ignore_ascii_case("abs") && args.len() == 1 {
                 let val = expr_to_value(args[0].as_ref(), row, table)?;

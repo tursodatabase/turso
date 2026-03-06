@@ -18,7 +18,7 @@ use crate::model::table::{
 };
 use indexmap::IndexSet;
 use rand::seq::{IndexedRandom, IteratorRandom};
-use rand::{Rng, SeedableRng};
+use rand::Rng;
 use std::collections::HashSet;
 use turso_parser::ast::{
     ColumnConstraint, Expr, FunctionTail, Literal, Name as AstName, Operator, SortOrder,
@@ -612,8 +612,6 @@ impl Arbitrary for CreateIndex {
         let create_index_opts = &env.opts().query.create_index;
         let mut expr_budget = create_index_opts.max_expr_terms;
 
-        let mut expr_rng = rand::rngs::StdRng::seed_from_u64(rng.random());
-
         let mut columns = Vec::with_capacity(num_columns_to_pick);
         for i in picked_column_indices {
             let column = &table.columns[i];
@@ -623,20 +621,19 @@ impl Arbitrary for CreateIndex {
                 SortOrder::Desc
             };
 
-            let use_expr =
-                expr_budget > 0 && expr_rng.random_bool(create_index_opts.expr_term_prob);
+            let use_expr = expr_budget > 0 && rng.random_bool(create_index_opts.expr_term_prob);
             let kind = if use_expr {
                 expr_budget -= 1;
                 let col_ref = || Expr::Id(AstName::exact(column.name.clone()));
                 let num = |n: i64| Expr::Literal(Literal::Numeric(n.to_string()));
                 // Bias toward modulus (low-cardinality); remaining split across add/mul/abs/substr.
                 const MODULUS_PROB: f64 = 0.6;
-                let expr = if expr_rng.random_bool(MODULUS_PROB) {
-                    let m: i64 = expr_rng.random_range(2..=10);
+                let expr = if rng.random_bool(MODULUS_PROB) {
+                    let m: i64 = rng.random_range(2..=10);
                     Expr::Binary(Box::new(col_ref()), Operator::Modulus, Box::new(num(m)))
                 } else {
-                    let k: i64 = expr_rng.random_range(1..=4);
-                    match expr_rng.random_range(0u8..=3) {
+                    let k: i64 = rng.random_range(1..=4);
+                    match rng.random_range(0u8..=3) {
                         0 => Expr::Binary(Box::new(col_ref()), Operator::Add, Box::new(num(k))),
                         1 => Expr::Binary(
                             Box::new(col_ref()),
@@ -684,7 +681,7 @@ impl Arbitrary for CreateIndex {
 }
 
 /// Returns expression-index expressions from a table's indexes.
-fn expr_index_exprs(table: &Table) -> impl Iterator<Item = &Expr> {
+fn iter_expr_index_expressions(table: &Table) -> impl Iterator<Item = &Expr> {
     table
         .indexes
         .iter()
@@ -696,17 +693,61 @@ fn expr_index_exprs(table: &Table) -> impl Iterator<Item = &Expr> {
 }
 
 /// Returns column names referenced by expression indexes.
-fn expr_index_column_names(table: &Table) -> HashSet<String> {
+fn collect_expr_index_referenced_columns(table: &Table) -> HashSet<String> {
     table
         .indexes
         .iter()
         .flat_map(|idx| idx.columns.iter())
-        .filter_map(|ic| match &ic.kind {
-            IndexColumnKind::Expr { .. } => Some(ic),
-            IndexColumnKind::Column { .. } => None,
-        })
+        .filter(|ic| matches!(ic.kind, IndexColumnKind::Expr { .. }))
         .flat_map(|ic| ic.referenced_columns(&table.columns))
         .collect()
+}
+
+const MAX_EXPR_INDEX_ROW_SAMPLES: usize = 8;
+
+fn pick_expr_index_expression<'a, R: Rng + ?Sized>(
+    rng: &mut R,
+    table: &'a Table,
+) -> Option<&'a Expr> {
+    let idx_exprs: Vec<&Expr> = iter_expr_index_expressions(table).collect();
+    idx_exprs
+        .iter()
+        .copied()
+        .filter(|e| matches!(e, Expr::Binary(_, Operator::Modulus, _)))
+        .choose(rng)
+        .or_else(|| idx_exprs.into_iter().choose(rng))
+}
+
+fn sample_non_null_expr_value<R: Rng + ?Sized>(
+    rng: &mut R,
+    table: &Table,
+    idx_expr: &Expr,
+) -> Option<(SimValue, usize)> {
+    // Bound retries so predicate generation remains deterministic and fast.
+    (0..MAX_EXPR_INDEX_ROW_SAMPLES).find_map(|_| {
+        let row_idx = rng.random_range(0..table.rows.len());
+        let row = &table.rows[row_idx];
+        let v = expr_to_value(idx_expr, row, table)?;
+        (!matches!(v.0, turso_core::Value::Null)).then_some((v, row_idx))
+    })
+}
+
+fn build_integer_pk_upper_bound(table: &Table, sample_row_idx: usize) -> Option<Predicate> {
+    let (pk_idx, pk_col) = table
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.is_primary_key() && matches!(c.column_type, ColumnType::Integer))?;
+    let turso_core::Value::Numeric(turso_core::Numeric::Integer(threshold)) =
+        &table.rows[sample_row_idx][pk_idx].0
+    else {
+        return None;
+    };
+    Some(Predicate(Expr::Binary(
+        Box::new(Expr::Id(AstName::exact(pk_col.name.clone()))),
+        Operator::LessEquals,
+        Box::new(Expr::Literal(Literal::Numeric(threshold.to_string()))),
+    )))
 }
 
 fn build_expr_index_update_predicate<R: Rng + ?Sized>(
@@ -717,20 +758,8 @@ fn build_expr_index_update_predicate<R: Rng + ?Sized>(
         return None;
     }
 
-    let idx_exprs: Vec<&Expr> = expr_index_exprs(table).collect();
-    let idx_expr = idx_exprs
-        .iter()
-        .copied()
-        .filter(|e| matches!(e, Expr::Binary(_, Operator::Modulus, _)))
-        .choose(rng)
-        .or_else(|| idx_exprs.iter().copied().choose(rng))?;
-
-    let (value, sample_row_idx) = (0..8).find_map(|_| {
-        let row_idx = rng.random_range(0..table.rows.len());
-        let row = &table.rows[row_idx];
-        let v = expr_to_value(idx_expr, row, table)?;
-        (!matches!(v.0, turso_core::Value::Null)).then_some((v, row_idx))
-    })?;
+    let idx_expr = pick_expr_index_expression(rng, table)?;
+    let (value, sample_row_idx) = sample_non_null_expr_value(rng, table, idx_expr)?;
 
     let expr_pred = Predicate(Expr::Binary(
         Box::new(idx_expr.clone()),
@@ -738,24 +767,7 @@ fn build_expr_index_update_predicate<R: Rng + ?Sized>(
         Box::new(Expr::Literal((&value).into())),
     ));
 
-    // Optionally add a PK upper-bound using the sampled matching row.
-    let pk_pred = table
-        .columns
-        .iter()
-        .enumerate()
-        .find(|(_, c)| c.is_primary_key() && matches!(c.column_type, ColumnType::Integer))
-        .and_then(|(pk_idx, pk_col)| {
-            let turso_core::Value::Numeric(turso_core::Numeric::Integer(threshold)) =
-                &table.rows[sample_row_idx][pk_idx].0
-            else {
-                return None;
-            };
-            Some(Predicate(Expr::Binary(
-                Box::new(Expr::Id(AstName::exact(pk_col.name.clone()))),
-                Operator::LessEquals,
-                Box::new(Expr::Literal(Literal::Numeric(threshold.to_string()))),
-            )))
-        });
+    let pk_pred = build_integer_pk_upper_bound(table, sample_row_idx);
 
     Some(Predicate::and(
         std::iter::once(expr_pred).chain(pk_pred).collect(),
@@ -769,7 +781,7 @@ impl Arbitrary for Update {
         let expr_index_tables: Vec<&Table> = env
             .tables()
             .iter()
-            .filter(|t| expr_index_exprs(t).next().is_some())
+            .filter(|t| iter_expr_index_expressions(t).next().is_some())
             .collect();
         let expr_index_table = rng
             .random_bool(update_opts.expr_index_update_prob)
@@ -865,7 +877,7 @@ impl Arbitrary for Update {
             // Normal case: pick from non-UNIQUE columns
 
             let must_include = if forced_expr_idx {
-                let expr_index_columns = expr_index_column_names(table);
+                let expr_index_columns = collect_expr_index_referenced_columns(table);
                 non_unique_columns
                     .iter()
                     .copied()
