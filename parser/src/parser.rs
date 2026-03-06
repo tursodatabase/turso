@@ -3068,7 +3068,10 @@ impl<'a> Parser<'a> {
             TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => {
                 Ok(Box::new(Expr::Name(self.parse_nm()?)))
             }
-            tt if tt.as_str().is_some_and(|s| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())) => {
+            tt if tt
+                .as_str()
+                .is_some_and(|s| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())) =>
+            {
                 // Accept any SQL keyword as a pragma value (e.g. PRAGMA journal_mode=OFF)
                 let keyword = tt.as_str().unwrap().to_owned();
                 self.eat()?; // consume the peeked token
