@@ -352,7 +352,7 @@ impl LogicalLog {
         self.write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
 
         // 3. Serialize ops into write_buf (encrypted or plaintext).
-        let payload_size = self.serialize_ops_into_write_buf(tx)?;
+        let payload_size = self.serialize_ops_into_write_buf(tx, op_count, commit_ts)?;
         let payload_end = self.write_buf.len();
 
         // 4. Backfill TX HEADER: FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
@@ -405,7 +405,12 @@ impl LogicalLog {
     /// Returns the plaintext payload size (used in the TX header's `payload_size` field).
     ///
     /// Encrypted on-disk blob layout: ciphertext(plaintext_len + tag_size) | nonce(nonce_size)
-    fn serialize_ops_into_write_buf(&mut self, tx: &LogRecord) -> Result<u64> {
+    fn serialize_ops_into_write_buf(
+        &mut self,
+        tx: &LogRecord,
+        op_count: u32,
+        commit_ts: u64,
+    ) -> Result<u64> {
         if let Some(enc_ctx) = &self.encryption_ctx {
             self.encryption_scratch_buffer.clear();
             for row_version in &tx.row_versions {
@@ -416,8 +421,16 @@ impl LogicalLog {
             }
             let payload_size = self.encryption_scratch_buffer.len() as u64;
 
+            // AAD = salt(8 LE) || tx_header(24) — binds ciphertext to this specific
+            // frame so payloads cannot be swapped between transactions.
             let salt = self.header.as_ref().unwrap().salt;
-            let aad = salt.to_le_bytes();
+            let mut aad = [0u8; 8 + TX_HEADER_SIZE];
+            aad[..8].copy_from_slice(&salt.to_le_bytes());
+            aad[8..12].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+            aad[12..20].copy_from_slice(&payload_size.to_le_bytes());
+            aad[20..24].copy_from_slice(&op_count.to_le_bytes());
+            aad[24..32].copy_from_slice(&commit_ts.to_le_bytes());
+
             let (ciphertext, nonce) =
                 enc_ctx.encrypt_chunk(&self.encryption_scratch_buffer, &aad)?;
             // encrypt_chunk returns ciphertext with the auth tag appended, so its
@@ -1006,8 +1019,15 @@ impl StreamingLogicalLogReader {
         };
         let running_crc = crc32c::crc32c_append(running_crc, &blob);
 
+        // AAD = salt(8 LE) || tx_header(24) — must match the write path exactly.
         let salt = self.header.as_ref().unwrap().salt;
-        let aad = salt.to_le_bytes();
+        let mut aad = [0u8; 8 + TX_HEADER_SIZE];
+        aad[..8].copy_from_slice(&salt.to_le_bytes());
+        aad[8..12].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        aad[12..20].copy_from_slice(&(payload_size as u64).to_le_bytes());
+        aad[20..24].copy_from_slice(&op_count.to_le_bytes());
+        aad[24..32].copy_from_slice(&commit_ts.to_le_bytes());
+
         let ciphertext = &blob[..payload_size + tag_size];
         let nonce = &blob[payload_size + tag_size..];
 
