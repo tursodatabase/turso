@@ -104,6 +104,42 @@ expect {
     CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE c = 1)
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-correlated-outer-shadow-nested {
+    CREATE TABLE t (a, b);
+    CREATE TABLE u (b);
+    CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE EXISTS (SELECT 1 WHERE b = 1));
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE EXISTS (SELECT 1 WHERE c = 1))
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-select-branch {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 2);
+    CREATE VIEW v AS SELECT s.x FROM (SELECT b AS x FROM t) AS s;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT * FROM v;
+}
+expect {
+    2
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-tablecall-branch {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 't');
+    CREATE VIEW v AS SELECT p.name FROM t JOIN pragma_table_info(t.b) AS p;
+    ALTER TABLE t RENAME COLUMN b TO c;
+    SELECT COUNT(*) FROM v;
+}
+expect {
+    2
+}
+
 @skip-if mvcc "ATTACH is not supported in MVCC mode"
 @skip-if sqlite "sqlite views cannot reference attached databases"
 test alter-table-rename-column-view-attached-db-qualified {

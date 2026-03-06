@@ -1233,9 +1233,6 @@ pub fn translate_alter_table(
                         }
                     }
                 }
-            }
-
-            if rename {
                 let target_db_name = resolver
                     .get_database_name_by_index(database_id)
                     .ok_or_else(|| {
