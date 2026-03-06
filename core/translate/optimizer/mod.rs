@@ -2156,8 +2156,8 @@ fn eliminate_constant_conditions(
     Ok(ConstantConditionEliminationResult::Continue)
 }
 
-/// Check if the order by collation matches the index columns collations.
-/// Only remove the index if sort was eliminated.
+/// Check if the order target collation matches index column collations.
+/// Only remove the index when sort elimination selected this plan.
 fn maybe_remove_index_candidate(
     index: &mut Option<Arc<Index>>,
     table_reference: &JoinedTable,
@@ -2188,12 +2188,9 @@ fn maybe_remove_index_candidate(
             };
 
             if let Some(idx_col) = matching_idx_col {
-                let idx_collation = idx_col.collation;
-
-                // If ORDER BY collation doesn't match index collation, this index can't satisfy the ordering
-                if idx_collation.is_some_and(|idx_collation| col_order.collation != idx_collation)
-                    && sort_eliminated
-                {
+                // Index columns without explicit COLLATE use BINARY.
+                // Treat them as BINARY for ordering compatibility checks.
+                if col_order.collation != idx_col.collation.unwrap_or_default() {
                     *index = None;
                     return;
                 }
