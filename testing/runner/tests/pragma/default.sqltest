@@ -277,6 +277,7 @@ expect {
     avg|w|1
 }
 
+@skip-if sqlite "sqlite will default to 'delete'"
 test test-pragma-journal-mode-unsupported {
 	PRAGMA journal_mode=NONEXISTANT;
 }
