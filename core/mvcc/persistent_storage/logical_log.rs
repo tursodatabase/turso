@@ -106,7 +106,9 @@ use crate::turso_assert;
 use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
-    storage::sqlite3_ondisk::{read_varint, varint_len, write_varint_to_vec, DatabaseHeader},
+    storage::sqlite3_ondisk::{
+        read_varint, read_varint_partial, varint_len, write_varint_to_vec, DatabaseHeader,
+    },
     types::IndexInfo,
     Buffer, Completion, CompletionError, LimboError, Result,
 };
@@ -403,8 +405,34 @@ impl LogicalLog {
     ///
     /// Encrypted on-disk blob layout: ciphertext(plaintext_len + tag_size) | nonce(nonce_size)
     fn serialize_ops_into_write_buf(&mut self, tx: &LogRecord) -> Result<u64> {
-        if self.encryption_ctx.is_some() {
-            unimplemented!("encrypted write path")
+        if let Some(enc_ctx) = &self.encryption_ctx {
+            self.encryption_scratch_buffer.clear();
+            for row_version in &tx.row_versions {
+                serialize_op_entry(&mut self.encryption_scratch_buffer, row_version)?;
+            }
+            if let Some(hdr) = tx.header {
+                serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
+            }
+            let payload_size = self.encryption_scratch_buffer.len() as u64;
+
+            let salt = self.header.as_ref().unwrap().salt;
+            let aad = salt.to_le_bytes();
+            let (ciphertext, nonce) =
+                enc_ctx.encrypt_chunk(&self.encryption_scratch_buffer, &aad)?;
+            // encrypt_chunk returns ciphertext with the auth tag appended, so its
+            // length must be exactly plaintext_len + tag_size.  The read path
+            // relies on this to split the on-disk blob back into (ciphertext+tag, nonce).
+            debug_assert_eq!(
+                ciphertext.len(),
+                self.encryption_scratch_buffer.len() + enc_ctx.tag_size(),
+                "encrypt_chunk output size mismatch: expected plaintext({}) + tag({}), got {}",
+                self.encryption_scratch_buffer.len(),
+                enc_ctx.tag_size(),
+                ciphertext.len(),
+            );
+            self.write_buf.extend_from_slice(&ciphertext);
+            self.write_buf.extend_from_slice(&nonce);
+            Ok(payload_size)
         } else {
             let payload_start = self.write_buf.len();
             for row_version in &tx.row_versions {
@@ -517,12 +545,39 @@ impl LogicalLog {
 }
 
 fn parse_ops_from_plaintext(
-    _plaintext: &[u8],
-    _payload_size: usize,
-    _op_count: u32,
-    _commit_ts: u64,
+    plaintext: &[u8],
+    payload_size: usize,
+    op_count: u32,
+    commit_ts: u64,
 ) -> Result<Vec<ParsedOp>> {
-    unimplemented!("parse_ops_from_plaintext")
+    if plaintext.len() != payload_size {
+        return Err(LimboError::Corrupt(format!(
+            "decrypted size ({}) != payload_size ({payload_size})",
+            plaintext.len()
+        )));
+    }
+    let mut ops = Vec::with_capacity((op_count as usize).min(1024));
+    let mut cursor = 0usize;
+    for _ in 0..op_count {
+        match try_parse_one_op_from_buf(&plaintext[cursor..], commit_ts)? {
+            Some((op, consumed)) => {
+                cursor += consumed;
+                ops.push(op);
+            }
+            None => {
+                return Err(LimboError::Corrupt(
+                    "incomplete op in decrypted payload".into(),
+                ));
+            }
+        }
+    }
+    if cursor != plaintext.len() {
+        return Err(LimboError::Corrupt(format!(
+            "trailing bytes after ops: consumed {cursor}, total {}",
+            plaintext.len()
+        )));
+    }
+    Ok(ops)
 }
 
 /// Parse one op entry from a contiguous byte slice (no IO).
@@ -530,11 +585,117 @@ fn parse_ops_from_plaintext(
 /// `Ok(None)` when not enough bytes, or `Err` on structural corruption.
 ///
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
-fn try_parse_one_op_from_buf(
-    _buf: &[u8],
-    _commit_ts: u64,
-) -> Result<Option<(ParsedOp, usize)>> {
-    unimplemented!("try_parse_one_op_from_buf")
+fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(ParsedOp, usize)>> {
+    if buf.len() < 6 {
+        return Ok(None);
+    }
+
+    let tag = buf[0];
+    let flags = buf[1];
+    let table_id_i32 = i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
+
+    let table_id: Option<MVTableId> = match tag {
+        OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
+            if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
+                return Err(LimboError::Corrupt(
+                    "Invalid op flags or non-negative table_id".into(),
+                ));
+            }
+            Some(MVTableId::from(table_id_i32 as i64))
+        }
+        OP_UPDATE_HEADER => {
+            if flags != 0 || table_id_i32 != 0 {
+                return Err(LimboError::Corrupt(
+                    "Invalid UPDATE_HEADER flags/table_id".into(),
+                ));
+            }
+            None
+        }
+        _ => return Err(LimboError::Corrupt(format!("Unknown op tag: {tag}"))),
+    };
+    let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
+
+    let Some((payload_len_u64, varint_bytes)) = read_varint_partial(&buf[6..])? else {
+        return Ok(None);
+    };
+    let payload_len = match usize::try_from(payload_len_u64) {
+        Ok(v) => v,
+        Err(_) => return Err(LimboError::Corrupt("payload_len overflows usize".into())),
+    };
+
+    let fixed = 6 + varint_bytes;
+    let total = fixed + payload_len;
+    if buf.len() < total {
+        return Ok(None);
+    }
+
+    let payload = buf[fixed..total].to_vec();
+
+    let parsed_op = match tag {
+        OP_UPSERT_TABLE => {
+            let table_id = table_id.unwrap();
+            let (rowid_u64, rowid_len) = read_varint(&payload)
+                .map_err(|_| LimboError::Corrupt("Bad rowid varint in UPSERT_TABLE".into()))?;
+            if rowid_len > payload.len() {
+                return Err(LimboError::Corrupt("rowid_len > payload".into()));
+            }
+            let mut p = payload;
+            let record_bytes = p.split_off(rowid_len);
+            let rowid = RowID::new(table_id, RowKey::Int(rowid_u64 as i64));
+            ParsedOp::UpsertTable {
+                table_id,
+                rowid,
+                record_bytes,
+                commit_ts,
+                btree_resident,
+            }
+        }
+        OP_DELETE_TABLE => {
+            let table_id = table_id.unwrap();
+            let (rowid_u64, rowid_len) = read_varint(&payload)
+                .map_err(|_| LimboError::Corrupt("Bad rowid varint in DELETE_TABLE".into()))?;
+            if rowid_len != payload.len() {
+                return Err(LimboError::Corrupt(
+                    "DELETE_TABLE payload size mismatch".into(),
+                ));
+            }
+            let rowid = RowID::new(table_id, RowKey::Int(rowid_u64 as i64));
+            ParsedOp::DeleteTable {
+                rowid,
+                commit_ts,
+                btree_resident,
+            }
+        }
+        OP_UPSERT_INDEX => ParsedOp::UpsertIndex {
+            table_id: table_id.unwrap(),
+            payload,
+            commit_ts,
+            btree_resident,
+        },
+        OP_DELETE_INDEX => ParsedOp::DeleteIndex {
+            table_id: table_id.unwrap(),
+            payload,
+            commit_ts,
+            btree_resident,
+        },
+        OP_UPDATE_HEADER => {
+            if payload.len() != DatabaseHeader::SIZE {
+                return Err(LimboError::Corrupt(
+                    "UPDATE_HEADER wrong payload size".into(),
+                ));
+            }
+            let mut bytes = [0u8; DatabaseHeader::SIZE];
+            bytes.copy_from_slice(&payload);
+            let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
+            if header.magic != *b"SQLite format 3\0" {
+                return Err(LimboError::Corrupt("UPDATE_HEADER bad SQLite magic".into()));
+            }
+            ParsedOp::UpdateHeader { header, commit_ts }
+        }
+        _ => unreachable!("tag validated above"),
+    };
+
+    Ok(Some((parsed_op, total)))
 }
 
 /// Serialize one op into `buffer`.
@@ -818,13 +979,48 @@ impl StreamingLogicalLogReader {
     /// Encrypted on-disk blob layout: ciphertext(plaintext_len + tag_size) | nonce(nonce_size)
     fn parse_encrypted_payload(
         &mut self,
-        _io: &Arc<dyn crate::IO>,
-        _op_count: u32,
-        _payload_size: usize,
-        _commit_ts: u64,
-        _running_crc: u32,
+        io: &Arc<dyn crate::IO>,
+        op_count: u32,
+        payload_size: usize,
+        commit_ts: u64,
+        running_crc: u32,
     ) -> Result<PayloadParseResult> {
-        unimplemented!("encrypted read path")
+        let enc = self.encryption_ctx.as_ref().unwrap();
+        let nonce_size = enc.nonce_size();
+        let tag_size = enc.tag_size();
+
+        let on_disk_size = match payload_size
+            .checked_add(tag_size)
+            .and_then(|s| s.checked_add(nonce_size))
+        {
+            Some(s) => s,
+            None => return Ok(PayloadParseResult::InvalidFrame),
+        };
+
+        let blob = match self.try_consume_bytes(io, on_disk_size)? {
+            Some(b) => b,
+            None => return Ok(PayloadParseResult::Eof),
+        };
+        let running_crc = crc32c::crc32c_append(running_crc, &blob);
+
+        let salt = self.header.as_ref().unwrap().salt;
+        let aad = salt.to_le_bytes();
+        let ciphertext = &blob[..payload_size + tag_size];
+        let nonce = &blob[payload_size + tag_size..];
+
+        let enc_ctx = self.encryption_ctx.as_ref().unwrap();
+        let plaintext = match enc_ctx.decrypt_chunk(ciphertext, nonce, &aad) {
+            Ok(p) => p,
+            Err(_) => return Ok(PayloadParseResult::InvalidFrame),
+        };
+
+        match parse_ops_from_plaintext(&plaintext, payload_size, op_count, commit_ts) {
+            Ok(ops) => Ok(PayloadParseResult::Ok(ops, running_crc)),
+            Err(e) => {
+                tracing::warn!("encrypted frame parse error: {e}");
+                Ok(PayloadParseResult::InvalidFrame)
+            }
+        }
     }
 
     /// Parse an unencrypted payload via field-by-field streaming IO reads.
