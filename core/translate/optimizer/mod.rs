@@ -688,21 +688,27 @@ fn first_update_safety_reason(
             break 'requires Some(DmlSafetyReason::ReplaceMode);
         }
 
-        let Some(index) = table_ref.op.index() else {
-            let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
-                accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
+        // Changing the rowid (or its INTEGER PRIMARY KEY alias) mutates the
+        // B-tree key of the table itself. This can reposition the scan cursor
+        // and cause duplicate-key violations to be missed, so materialization
+        // is required regardless of whether a secondary index is in use.
+        let updates_rowid_key = btree_table.has_rowid
+            && plan.set_clauses.iter().any(|(idx, _)| {
+                *idx == ROWID_SENTINEL
+                    || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
             });
-            if rowid_alias_used {
-                break 'requires Some(DmlSafetyReason::KeyMutation);
-            }
-            let direct_rowid_update = plan
-                .set_clauses
-                .iter()
-                .any(|(idx, _)| *idx == ROWID_SENTINEL);
-            if direct_rowid_update {
-                break 'requires Some(DmlSafetyReason::KeyMutation);
-            }
-            break 'requires None;
+        if updates_rowid_key {
+            break 'requires Some(DmlSafetyReason::KeyMutation);
+        }
+
+        let index = match &table_ref.op {
+            Operation::Scan(Scan::BTreeTable {
+                index: Some(index), ..
+            })
+            | Operation::Search(Search::Seek {
+                index: Some(index), ..
+            }) => index,
+            _ => break 'requires None,
         };
 
         for (set_clause_col_idx, _) in plan.set_clauses.iter() {
