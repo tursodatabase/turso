@@ -137,7 +137,7 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
         .io
         .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)?;
     let default_storage: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage> = Arc::new(
-        turso_core::mvcc::persistent_storage::Storage::new(file, tmp_db.io.clone()),
+        turso_core::mvcc::persistent_storage::Storage::new(file, tmp_db.io.clone(), None),
     );
     let recording = Arc::new(RecordingDurableStorage::new(default_storage));
 
