@@ -12068,18 +12068,17 @@ fn op_journal_mode_inner(
                     return Ok(InsnFunctionStepResult::Step);
                 };
 
-                // Parse the new mode
-                let new_mode =
-                    journal_mode::JournalMode::from_str(mode_str.as_str()).map_err(|_| {
-                        LimboError::ParseError(format!("Unknown journal mode: {mode_str}"))
-                    })?;
-
-                // Validate the new mode
-                if !new_mode.supported() {
-                    return Err(LimboError::ParseError(format!(
-                        "Journal Mode `{new_mode}` is not supported"
-                    )));
-                }
+                // Parse the new mode. If unknown or unsupported, silently return
+                // current mode (matches SQLite behavior).
+                let new_mode = match journal_mode::JournalMode::from_str(mode_str.as_str()) {
+                    Ok(mode) if mode.supported() => mode,
+                    _ => {
+                        let ret: &'static str = prev_mode.into();
+                        state.registers[*dest] = Register::Value(Value::build_text(ret));
+                        state.pc += 1;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                };
 
                 // If same mode, just return
                 if prev_mode == new_mode {

@@ -276,3 +276,10 @@ test pragma-function-list-aggregate {
 expect {
     avg|w|1
 }
+
+test test-pragma-journal-mode-unsupported {
+	PRAGMA journal_mode=NONEXISTANT;
+}
+expect {
+    wal
+}
