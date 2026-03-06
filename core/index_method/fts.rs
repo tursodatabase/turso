@@ -3284,11 +3284,16 @@ impl IndexMethodCursor for FtsCursor {
             );
         }
 
-        if let Some(ref mut writer) = self.writer {
+        // Keep rollback error, but always reset in-memory cursor state so we don't
+        // remain in a flushing state after statement rollback.
+        let writer_rollback_result = if let Some(ref mut writer) = self.writer {
             writer
                 .rollback()
-                .map_err(|e| LimboError::InternalError(format!("FTS rollback error: {e}")))?;
-        }
+                .map(|_| ())
+                .map_err(|e| LimboError::InternalError(format!("FTS rollback error: {e}")))
+        } else {
+            Ok(())
+        };
 
         if let Some(ref dir) = self.hybrid_directory {
             let writes = dir.take_pending_writes();
@@ -3302,7 +3307,7 @@ impl IndexMethodCursor for FtsCursor {
 
         self.pending_docs_count = 0;
         self.state = FtsState::Ready;
-        Ok(())
+        writer_rollback_result
     }
 
     /// Optimizes the FTS index by merging all segments into one.
