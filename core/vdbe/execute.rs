@@ -12961,6 +12961,7 @@ fn op_journal_mode_inner(
                         ));
                     }
                     let db_path = program.connection.get_database_canonical_path();
+                    // todo(v): pass required encryption ctx to enable encryption with mvcc
                     let mv_store = journal_mode::open_mv_store(
                         pager.io.clone(),
                         &db_path,
