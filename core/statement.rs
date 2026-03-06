@@ -160,9 +160,9 @@ impl Statement {
         }
 
         const MAX_SCHEMA_RETRY: usize = 50;
-        let mut res =
-            self.program
-                .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+        let mut res = self
+            .program
+            .step(&mut self.state, &self.pager, self.query_mode, waker);
         for attempt in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
             if !matches!(res, Err(LimboError::SchemaUpdated)) {
@@ -172,7 +172,7 @@ impl Statement {
             self.reprepare()?;
             res = self
                 .program
-                .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+                .step(&mut self.state, &self.pager, self.query_mode, waker);
         }
 
         // Aggregate metrics when statement completes
