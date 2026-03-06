@@ -1,0 +1,13 @@
+name: Antithesis nightly
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  test:
+    uses: ./.github/workflows/antithesis.yml
+    with:
+      duration: 240
+      test_name: "scheduled run"
+    secrets: inherit
