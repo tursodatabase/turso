@@ -16,9 +16,11 @@ info:
 QUERY PLAN
 `--COMPOUND QUERY
    |--LEFT-MOST SUBQUERY
-   |  `--SCAN current_employees USING COVERING INDEX idx_current_dept
+   |  |--SCAN current_employees USING COVERING INDEX idx_current_dept
+   |  `--USE HASH TABLE FOR DISTINCT
    `--UNION USING TEMP B-TREE
-      `--SCAN former_employees USING COVERING INDEX idx_former_dept
+      |--SCAN former_employees USING COVERING INDEX idx_former_dept
+      `--USE HASH TABLE FOR DISTINCT
 
 BYTECODE
 addr  opcode                  p1  p2  p3  p4      p5  comment

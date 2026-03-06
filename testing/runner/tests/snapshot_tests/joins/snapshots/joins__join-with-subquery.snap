@@ -34,6 +34,6 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
-|--SEARCH recent_orders USING INDEX ephemeral_subquery_t3
+|--SEARCH recent_orders USING INDEX ephemeral_subquery_t3 (customer_id=?)
 |  `--SCAN orders USING INDEX idx_orders_customer_id
 `--USE SORTER FOR ORDER BY

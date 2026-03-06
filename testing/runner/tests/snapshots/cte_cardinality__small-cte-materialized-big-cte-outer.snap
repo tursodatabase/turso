@@ -24,5 +24,5 @@ info:
 QUERY PLAN
 |--SCAN big AS b
 |  `--SCAN items
-`--SEARCH s USING INDEX ephemeral_subquery_t2
+`--SEARCH s USING INDEX ephemeral_subquery_t2 (id=?)
    `--SCAN items

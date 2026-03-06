@@ -13,4 +13,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH inventory USING INDEX idx_inventory_covering
+`--SEARCH inventory USING INDEX idx_inventory_covering (warehouse_id=?)

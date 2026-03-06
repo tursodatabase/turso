@@ -888,8 +888,20 @@ pub fn emit_from_clause_subqueries(
         }
     }
 
+    // Build lookup from table index to is_outer for LEFT-JOIN annotations
+    let outer_table_set: HashSet<usize> = join_order
+        .iter()
+        .filter(|m| m.is_outer)
+        .map(|m| m.original_idx)
+        .collect();
+
     for table_index in visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];
+        let left_join_suffix = if outer_table_set.contains(&table_index) {
+            " LEFT-JOIN"
+        } else {
+            ""
+        };
         emit_explain!(
             program,
             true,
@@ -926,15 +938,18 @@ pub fn emit_from_clause_subqueries(
                 Operation::Search(search) => match search {
                     Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
                         format!(
-                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?){left_join_suffix}",
                             table_reference.identifier
                         )
                     }
                     Search::Seek {
-                        index: Some(index), ..
+                        index: Some(index),
+                        seek_def,
                     } => {
+                        let constraints =
+                            super::display::seek_constraint_annotation(index, seek_def);
                         format!(
-                            "SEARCH {} USING INDEX {}",
+                            "SEARCH {} USING INDEX {}{constraints}{left_join_suffix}",
                             table_reference.identifier, index.name
                         )
                     }

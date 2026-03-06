@@ -14,4 +14,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH products USING INDEX idx_products_price
+`--SEARCH products USING INDEX idx_products_price (price>=? AND price>?)

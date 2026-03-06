@@ -10,4 +10,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH products USING INDEX idx_products_sku
+`--SEARCH products USING INDEX idx_products_sku (sku=?)
