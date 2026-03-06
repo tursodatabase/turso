@@ -220,11 +220,16 @@ pub struct TableConstraints {
 
 /// Estimate selectivity for IN expressions given the number of values and table row count.
 fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
-    let selectivity = (in_list_len / row_count).min(1.0);
     if not {
-        1.0 - selectivity
+        // NOT IN: each value in the list excludes roughly 1/ndv of the rows.
+        // Without ANALYZE stats we don't know ndv, so we use the equality
+        // selectivity heuristic (sel_eq_unindexed = 0.1) per excluded value.
+        // This gives NOT IN (v1,v2,v3) ≈ (1 - 0.1)^3 ≈ 0.729, which is a
+        // reasonable estimate that the filter does meaningful work.
+        let per_value_sel = 0.1_f64; // matches sel_eq_unindexed default
+        (1.0 - per_value_sel).powf(in_list_len).max(0.01)
     } else {
-        selectivity
+        (in_list_len / row_count).min(1.0)
     }
 }
 
