@@ -3068,7 +3068,8 @@ pub mod tests {
     #[test]
     fn test_rewrite_view_sql_table_call_branch() {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
-        let view_sql = "CREATE VIEW v AS SELECT p.name FROM t JOIN pragma_table_info(t.b) AS p";
+        let view_sql =
+            "CREATE VIEW v AS SELECT j.value FROM t JOIN json_each(json_array(t.b)) AS j";
 
         let rewritten =
             rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")

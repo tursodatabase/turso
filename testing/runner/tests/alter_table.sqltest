@@ -132,12 +132,12 @@ expect {
 test alter-table-rename-column-view-tablecall-branch {
     CREATE TABLE t (a, b);
     INSERT INTO t VALUES (1, 't');
-    CREATE VIEW v AS SELECT p.name FROM t JOIN pragma_table_info(t.b) AS p;
+    CREATE VIEW v AS SELECT j.value FROM t JOIN json_each(json_array(t.b)) AS j;
     ALTER TABLE t RENAME COLUMN b TO c;
     SELECT COUNT(*) FROM v;
 }
 expect {
-    2
+    1
 }
 
 @skip-if mvcc "views not supported in MVCC mode"
