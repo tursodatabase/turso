@@ -278,6 +278,7 @@ expect {
 }
 
 @skip-if sqlite "sqlite will default to 'delete'"
+@skip-if mvcc "will return mvcc as journal mode"
 test test-pragma-journal-mode-unsupported {
 	PRAGMA journal_mode=NONEXISTANT;
 }
