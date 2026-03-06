@@ -763,3 +763,18 @@ expect {
     102|3
     103|1
 }
+
+# When two unique indexes have equal cost but different prerequisites,
+# prefer the constant-bound index (fewer prereqs). This mirrors SQLite's
+# whereLoopFindLesser() where plans with fewer dependencies dominate.
+setup prereq_schema {
+    CREATE TABLE t1 (id TEXT PRIMARY KEY NOT NULL);
+    CREATE TABLE t2 (a TEXT NOT NULL, b TEXT NOT NULL);
+    CREATE UNIQUE INDEX idx_t2_a ON t2 (a);
+    CREATE UNIQUE INDEX idx_t2_b ON t2 (b);
+}
+
+@setup prereq_schema
+snapshot-eqp prefer-constant-bound-index-over-join-dependent {
+    SELECT t1.id FROM t1 LEFT JOIN t2 ON t1.id = t2.a AND t2.b = 'x' WHERE t2.a IS NULL;
+}
