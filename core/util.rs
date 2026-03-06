@@ -1932,6 +1932,13 @@ mod rename_column_view {
             return Ok(None);
         };
 
+        let current_view_name = normalize_ident(view_name.name.as_str());
+        if !visiting_views.insert(current_view_name.clone()) {
+            return Err(LimboError::ParseError(format!(
+                "view {current_view_name} is circularly defined"
+            )));
+        }
+
         let rewrite_result = (|| -> Result<Option<RewrittenView>> {
             let original_select = select.clone();
             let original_columns =
@@ -1976,6 +1983,7 @@ mod rename_column_view {
                 columns: final_columns,
             }))
         })();
+        visiting_views.remove(&current_view_name);
         rewrite_result
     }
 

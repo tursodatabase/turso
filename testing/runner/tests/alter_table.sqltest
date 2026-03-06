@@ -140,6 +140,27 @@ expect {
     2
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-self-cycle {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v AS SELECT * FROM v;
+    ALTER TABLE t RENAME COLUMN b TO c;
+}
+expect error {
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-view-mutual-cycle {
+    CREATE TABLE t (a, b);
+    CREATE VIEW v1 AS SELECT * FROM t;
+    CREATE VIEW v2 AS SELECT * FROM v1;
+    DROP VIEW v1;
+    CREATE VIEW v1 AS SELECT * FROM v2;
+    ALTER TABLE t RENAME COLUMN b TO c;
+}
+expect error {
+}
+
 @skip-if mvcc "ATTACH is not supported in MVCC mode"
 @skip-if sqlite "sqlite views cannot reference attached databases"
 test alter-table-rename-column-view-attached-db-qualified {
