@@ -13,4 +13,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH orders USING INDEX idx_orders_customer_date
+`--SEARCH orders USING INDEX idx_orders_customer_date (customer_id=?)

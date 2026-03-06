@@ -56,12 +56,12 @@ info:
 ---
 QUERY PLAN
 |--SCAN part
-|--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1
+|--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
 |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
 |--CORRELATED SCALAR SUBQUERY 1
-|  |--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1
+|  |--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
 |  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 |  `--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)

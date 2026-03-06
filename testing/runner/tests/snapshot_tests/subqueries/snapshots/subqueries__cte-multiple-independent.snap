@@ -36,7 +36,7 @@ info:
 QUERY PLAN
 |--SCAN orders
 |--SCAN large_orders AS l
-`--SEARCH v USING INDEX ephemeral_subquery_t6
+`--SEARCH v USING INDEX ephemeral_subquery_t6 (id=?)
    |--LIST SUBQUERY 1
    |  `--SCAN large_orders
    `--SCAN customers

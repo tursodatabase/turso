@@ -27,9 +27,9 @@ info:
 ---
 QUERY PLAN
 |--SCAN customers AS c
-|--SEARCH o USING INDEX idx_orders_customer_id
-|--SEARCH oi USING INDEX idx_order_items_order_id
-`--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH o USING INDEX idx_orders_customer_id (customer_id=?) LEFT-JOIN
+|--SEARCH oi USING INDEX idx_order_items_order_id (order_id=?) LEFT-JOIN
+`--SEARCH p USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN
 
 BYTECODE
 addr  opcode              p1  p2  p3  p4              p5  comment

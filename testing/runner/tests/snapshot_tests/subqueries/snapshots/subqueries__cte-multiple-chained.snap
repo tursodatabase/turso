@@ -31,5 +31,5 @@ info:
 QUERY PLAN
 |--SCAN customer_orders AS co
 |  `--SCAN orders USING INDEX idx_orders_customer
-`--SEARCH ac USING INDEX ephemeral_subquery_t2
+`--SEARCH ac USING INDEX ephemeral_subquery_t2 (id=?)
    `--SCAN customers

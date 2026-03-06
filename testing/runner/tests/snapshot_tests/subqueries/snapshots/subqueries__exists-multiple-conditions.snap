@@ -23,7 +23,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN products AS p
-|--SEARCH oi USING INDEX idx_order_items_product
+|--SEARCH oi USING INDEX idx_order_items_product (product_id=?)
 `--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)
 
 BYTECODE

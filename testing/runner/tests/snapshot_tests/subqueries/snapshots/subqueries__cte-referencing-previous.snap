@@ -41,9 +41,9 @@ info:
 ---
 QUERY PLAN
 |--SCAN categories AS c
-|--SEARCH tpd USING INDEX ephemeral_subquery_t7
+|--SEARCH tpd USING INDEX ephemeral_subquery_t7 (category_id=?)
 |  |--SCAN products AS p
-|  `--SEARCH tp USING INDEX ephemeral_subquery_t5
+|  `--SEARCH tp USING INDEX ephemeral_subquery_t5 (product_id=?)
 |     `--SCAN product_sales
 |        `--SCAN order_items AS oi USING INDEX idx_order_items_product
 `--USE SORTER FOR ORDER BY

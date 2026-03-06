@@ -28,4 +28,4 @@ info:
 QUERY PLAN
 |--SCAN employees
 |--SCAN employee_salaries AS e1
-`--SEARCH e2 USING INDEX ephemeral_subquery_t4
+`--SEARCH e2 USING INDEX ephemeral_subquery_t4 (department=?)
