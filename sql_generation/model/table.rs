@@ -1,10 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
-    hash::Hash,
-    ops::Deref,
-};
+use std::{collections::HashMap, fmt::Display, hash::Hash, ops::Deref};
 
+use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use turso_core::{numeric::Numeric, types, LimboError};
@@ -208,12 +204,11 @@ impl Index {
 
 /// Extract column name references from an expression, returning only those that match known table columns.
 fn extract_column_refs(expr: &ast::Expr, columns: &[Column]) -> Vec<String> {
-    let known: HashMap<String, String> = columns
+    let known: HashMap<String, &str> = columns
         .iter()
-        .map(|c| (c.name.to_ascii_lowercase(), c.name.clone()))
+        .map(|c| (c.name.to_ascii_lowercase(), c.name.as_str()))
         .collect();
-    let mut refs = Vec::new();
-    let mut seen = HashSet::new();
+    let mut refs = IndexSet::new();
     turso_core::walk_expr(expr, &mut |e| {
         let name_str = match e {
             ast::Expr::Id(name) | ast::Expr::Name(name) => Some(name.as_str()),
@@ -223,17 +218,14 @@ fn extract_column_refs(expr: &ast::Expr, columns: &[Column]) -> Vec<String> {
             _ => None,
         };
         if let Some(n) = name_str {
-            let norm = n.to_ascii_lowercase();
-            if let Some(canonical) = known.get(&norm) {
-                if seen.insert(norm) {
-                    refs.push(canonical.clone());
-                }
+            if let Some(canonical) = known.get(&n.to_ascii_lowercase()) {
+                refs.insert((*canonical).to_owned());
             }
         }
         Ok(turso_core::WalkControl::Continue)
     })
     .unwrap();
-    refs
+    refs.into_iter().collect()
 }
 
 fn rename_column_in_expr(expr: &mut ast::Expr, from: &str, to: &str) {
@@ -540,10 +532,7 @@ impl From<&SimValue> for ast::Literal {
 impl From<Option<bool>> for SimValue {
     #[inline]
     fn from(value: Option<bool>) -> Self {
-        if value.is_none() {
-            return SimValue::NULL;
-        }
-        SimValue::from(value.unwrap())
+        value.map_or(SimValue::NULL, SimValue::from)
     }
 }
 

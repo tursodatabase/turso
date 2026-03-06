@@ -170,9 +170,19 @@ impl Profile {
         profile
     }
 
+    pub fn expr_index_stress() -> Self {
+        let profile = Profile {
+            query: QueryProfile::expr_index_stress(),
+            ..Default::default()
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
     pub fn parse_from_type(profile_type: ProfileType) -> anyhow::Result<Self> {
         let profile = match profile_type {
             ProfileType::Default => Self::default(),
+            ProfileType::ExprIndexStress => Self::expr_index_stress(),
             ProfileType::WriteHeavy => Self::write_heavy(),
             ProfileType::WriteHeavySpill => Self::write_heavy_spill(),
             ProfileType::Faultless => Self::faultless(),
@@ -214,6 +224,7 @@ impl Profile {
 pub enum ProfileType {
     #[default]
     Default,
+    ExprIndexStress,
     WriteHeavy,
     WriteHeavySpill,
     Faultless,
