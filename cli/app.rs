@@ -88,8 +88,6 @@ pub struct Opts {
     pub experimental_index_method: bool,
     #[clap(long, help = "Enable experimental autovacuum feature")]
     pub experimental_autovacuum: bool,
-    #[clap(long, help = "Enable experimental triggers feature")]
-    pub experimental_triggers: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
     #[clap(
@@ -219,7 +217,6 @@ impl Limbo {
             .with_encryption(opts.experimental_encryption)
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
-            .with_triggers(opts.experimental_triggers)
             .with_attach(opts.experimental_attach)
             .with_unsafe_testing(opts.unsafe_testing);
 

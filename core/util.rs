@@ -144,7 +144,6 @@ pub fn parse_schema_rows(
     syms: &SymbolTable,
     mv_tx: Option<(u64, TransactionMode)>,
     _existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
-    enable_triggers: bool,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
     let mv_store = rows.mv_store().clone();
@@ -180,7 +179,6 @@ pub fn parse_schema_rows(
             &mut dbsp_state_roots,
             &mut dbsp_state_index_roots,
             &mut materialized_view_info,
-            enable_triggers,
         )
     })?;
 

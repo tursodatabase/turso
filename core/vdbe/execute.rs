@@ -9323,7 +9323,6 @@ pub fn op_parse_schema(
     let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
     conn.auto_commit.store(false, Ordering::SeqCst);
 
-    let enable_triggers = conn.experimental_triggers_enabled();
     // For attached databases, qualify the sqlite_schema table with the database name
     let schema_table = if crate::is_attached_db(*db) {
         let db_name = conn
@@ -9389,7 +9388,6 @@ pub fn op_parse_schema(
         // correctly without setting mv_tx.
         program.connection.get_mv_tx(),
         existing_views,
-        enable_triggers,
     );
 
     // Store the modified schema back
@@ -12470,7 +12468,6 @@ fn op_vacuum_into_inner(
                 let source_db = &program.connection.db;
                 let dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
-                    .with_triggers(source_db.experimental_triggers_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled());
 
                 program.connection.execute("BEGIN")?;

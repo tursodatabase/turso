@@ -92,7 +92,6 @@ impl SqlBackend for RustBackend {
 
         // Create the database using the Turso builder
         let db = Builder::new_local(&db_path)
-            .experimental_triggers(true)
             .experimental_attach(true)
             .experimental_index_method(true)
             .experimental_materialized_views(true)

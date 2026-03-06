@@ -467,14 +467,7 @@ impl Connection {
             self.get_mv_tx()
         };
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(
-            stmt,
-            &mut fresh,
-            &self.syms.read(),
-            mv_tx,
-            existing_views,
-            self.experimental_triggers_enabled(),
-        )?;
+        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), mv_tx, existing_views)?;
 
         // Load custom types from __turso_internal_types if the table exists
         // and custom types are enabled. Type loading errors are non-fatal: we log
@@ -1282,7 +1275,6 @@ impl Connection {
         } // Statement dropped here, before schema write lock
 
         let syms = self.syms.read();
-        let enable_triggers = self.experimental_triggers_enabled();
         self.with_schema_mut(|schema| -> Result<()> {
             // Incremental re-parse after extension loading. The schema already has
             // tables/indices/views from initial parse. We only need to pick up
@@ -1307,7 +1299,6 @@ impl Connection {
                     &mut dbsp_state_roots,
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
-                    enable_triggers,
                 ) {
                     Ok(()) => {}
                     Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
@@ -1375,10 +1366,6 @@ impl Connection {
 
     pub fn experimental_custom_types_enabled(&self) -> bool {
         self.db.experimental_custom_types_enabled()
-    }
-
-    pub fn experimental_triggers_enabled(&self) -> bool {
-        self.db.experimental_triggers_enabled()
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {

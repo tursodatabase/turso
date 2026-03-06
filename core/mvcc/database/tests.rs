@@ -756,8 +756,7 @@ fn test_recovery_checkpoint_then_more_writes() {
 /// Why this matters: Trigger definitions are stored without btrees and should not break recovery.
 #[test]
 fn test_restart_with_trigger_rootpage_zero() {
-    let mut db =
-        MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_triggers(true));
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT)")
