@@ -192,9 +192,6 @@ pub struct ConnectionMetrics {
     /// Aggregate metrics from all statements
     pub aggregate: StatementMetrics,
 
-    /// Metrics from the last executed statement
-    pub last_statement: Option<StatementMetrics>,
-
     /// High-water marks for monitoring
     pub max_vm_steps_per_statement: u64,
     pub max_rows_read_per_statement: u64,
@@ -205,8 +202,8 @@ impl ConnectionMetrics {
         Self::default()
     }
 
-    /// Record a completed statement's metrics
-    pub fn record_statement(&mut self, metrics: StatementMetrics) {
+    /// Record a completed statement's metrics (borrows, no clone).
+    pub fn record_statement(&mut self, metrics: &StatementMetrics) {
         self.total_statements = self.total_statements.saturating_add(1);
 
         // Update high-water marks
@@ -214,10 +211,7 @@ impl ConnectionMetrics {
         self.max_rows_read_per_statement = self.max_rows_read_per_statement.max(metrics.rows_read);
 
         // Aggregate into total
-        self.aggregate.merge(&metrics);
-
-        // Keep last statement for debugging
-        self.last_statement = Some(metrics);
+        self.aggregate.merge(metrics);
     }
 
     /// Reset connection metrics
@@ -244,13 +238,6 @@ impl fmt::Display for ConnectionMetrics {
         writeln!(f)?;
         writeln!(f, "Aggregate Statistics:")?;
         write!(f, "{}", self.aggregate)?;
-
-        if let Some(ref last) = self.last_statement {
-            writeln!(f)?;
-            writeln!(f, "Last Statement:")?;
-            write!(f, "{last}")?;
-        }
-
         Ok(())
     }
 }
@@ -286,12 +273,12 @@ mod tests {
         let mut stmt1 = StatementMetrics::new();
         stmt1.vm_steps = 100;
         stmt1.rows_read = 50;
-        conn_metrics.record_statement(stmt1);
+        conn_metrics.record_statement(&stmt1);
 
         let mut stmt2 = StatementMetrics::new();
         stmt2.vm_steps = 75;
         stmt2.rows_read = 100;
-        conn_metrics.record_statement(stmt2);
+        conn_metrics.record_statement(&stmt2);
 
         assert_eq!(conn_metrics.max_vm_steps_per_statement, 100);
         assert_eq!(conn_metrics.max_rows_read_per_statement, 100);
