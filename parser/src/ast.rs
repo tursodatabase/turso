@@ -1623,6 +1623,10 @@ pub enum PragmaName {
     QueryOnly,
     /// Returns schema version of the database file.
     SchemaVersion,
+    /// Alias for `require_where` pragma, as an homage to MySQL (https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates)
+    IAmADummy,
+    /// Reject DELETE/UPDATE without WHERE clause
+    RequireWhere,
     /// Control database synchronization mode (OFF | FULL | NORMAL | EXTRA)
     Synchronous,
     /// Control where temporary tables and indices are stored (DEFAULT=0, FILE=1, MEMORY=2)

@@ -1,0 +1,46 @@
+@database :memory:
+
+test pragma-require-where-alias {
+    PRAGMA require_where = ON;
+    PRAGMA i_am_a_dummy
+}
+expect {
+    1
+}
+
+test pragma-require-where-delete-with-where-ok {
+    CREATE TABLE t_strict3(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t_strict3 VALUES (1, 'a');
+    PRAGMA i_am_a_dummy = ON;
+    DELETE FROM t_strict3 WHERE id = 1;
+    SELECT * FROM t_strict3
+}
+expect {
+}
+
+test pragma-require-where-update-with-where-ok {
+    CREATE TABLE t_strict4(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t_strict4 VALUES (1, 'a');
+    PRAGMA i_am_a_dummy = ON;
+    UPDATE t_strict4 SET val = 'b' WHERE id = 1;
+    SELECT * FROM t_strict4
+}
+expect {
+    1|b
+}
+
+test pragma-require-where-delete-without-where {
+    PRAGMA i_am_a_dummy = ON;
+    DELETE FROM nonexistent_table
+}
+expect error {
+    DELETE without a WHERE clause is not allowed when require_where is enabled
+}
+
+test pragma-require-where-update-without-where {
+    PRAGMA i_am_a_dummy = ON;
+    UPDATE nonexistent_table SET val = 'x'
+}
+expect error {
+    UPDATE without a WHERE clause is not allowed when require_where is enabled
+}
