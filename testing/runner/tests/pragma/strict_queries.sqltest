@@ -1,0 +1,83 @@
+@database :memory:
+
+test pragma-strict-queries-default-off {
+    PRAGMA strict_queries
+}
+expect {
+    0
+}
+
+test pragma-strict-queries-enable {
+    PRAGMA strict_queries = ON;
+    PRAGMA strict_queries
+}
+expect {
+    1
+}
+
+test pragma-strict-queries-disable {
+    PRAGMA strict_queries = ON;
+    PRAGMA strict_queries = OFF;
+    PRAGMA strict_queries
+}
+expect {
+    0
+}
+
+test pragma-strict-queries-off-allows-delete-without-where {
+    CREATE TABLE t_strict5(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t_strict5 VALUES (1, 'a');
+    PRAGMA strict_queries = OFF;
+    DELETE FROM t_strict5;
+    SELECT * FROM t_strict5
+}
+expect {
+}
+
+test pragma-strict-queries-off-allows-update-without-where {
+    CREATE TABLE t_strict6(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t_strict6 VALUES (1, 'a');
+    PRAGMA strict_queries = OFF;
+    UPDATE t_strict6 SET val = 'b';
+    SELECT * FROM t_strict6
+}
+expect {
+    1|b
+}
+
+test pragma-strict-queries-delete-with-where-ok {
+    CREATE TABLE t_strict3(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t_strict3 VALUES (1, 'a');
+    PRAGMA strict_queries = ON;
+    DELETE FROM t_strict3 WHERE id = 1;
+    SELECT * FROM t_strict3
+}
+expect {
+}
+
+test pragma-strict-queries-update-with-where-ok {
+    CREATE TABLE t_strict4(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t_strict4 VALUES (1, 'a');
+    PRAGMA strict_queries = ON;
+    UPDATE t_strict4 SET val = 'b' WHERE id = 1;
+    SELECT * FROM t_strict4
+}
+expect {
+    1|b
+}
+
+test pragma-strict-queries-delete-without-where {
+    PRAGMA strict_queries = ON;
+    DELETE FROM nonexistent_table
+}
+expect error {
+    DELETE without a WHERE clause is not allowed when strict_queries is enabled
+}
+
+test pragma-strict-queries-update-without-where {
+    PRAGMA strict_queries = ON;
+    UPDATE nonexistent_table SET val = 'x'
+}
+expect error {
+    UPDATE without a WHERE clause is not allowed when strict_queries is enabled
+}
