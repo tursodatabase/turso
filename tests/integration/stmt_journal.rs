@@ -16,6 +16,19 @@ fn needs_stmt_journal(conn: &Arc<turso_core::Connection>, sql: &str) -> bool {
         .load(Ordering::Relaxed)
 }
 
+/// Collect all rows from a query as pipe-delimited strings (like SQLite CLI output).
+fn query_rows(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        let vals: Vec<String> = row.get_values().map(|v| format!("{v}")).collect();
+        rows.push(vals.join("|"));
+        Ok(())
+    })
+    .unwrap();
+    rows
+}
+
 // ──────────────────────────────────────────────────────────
 // INSERT
 // ──────────────────────────────────────────────────────────
@@ -325,5 +338,180 @@ fn update_fk_child_key_mutation_ephemeral(tmp_db: TempDatabase) -> anyhow::Resul
         &conn,
         "UPDATE c SET id = 99 WHERE id = 1"
     ));
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────
+// Regression: UPDATE ABORT with multiple unique indexes
+// ──────────────────────────────────────────────────────────
+
+/// UPDATE with ABORT (default) on a table with two unique indexes.
+/// If the first index's constraint check passes and its entries are mutated,
+/// but the second index's check fails, the first index's mutations must be
+/// rolled back. Without proper preflight checks or a statement journal,
+/// the first index is left inconsistent with the table.
+#[turso_macros::test]
+fn update_abort_multi_unique_no_orphan_index_entries(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INT, c INT)")?;
+    conn.execute("CREATE UNIQUE INDEX idx_b ON t(b)")?;
+    conn.execute("CREATE UNIQUE INDEX idx_c ON t(c)")?;
+    conn.execute("INSERT INTO t VALUES(1, 10, 100)")?;
+    conn.execute("INSERT INTO t VALUES(2, 20, 200)")?;
+    conn.execute("BEGIN")?;
+    // b=40 is fine (no conflict on idx_b), but c=200 conflicts with row 2 on idx_c.
+    let result = conn.execute("UPDATE t SET b=40, c=200 WHERE a=1");
+    assert!(result.is_err(), "UPDATE should fail with UNIQUE constraint");
+
+    // The failed UPDATE must not have mutated idx_b. Verify by querying via idx_b:
+    // row 1 should still be findable at b=10.
+    let rows = query_rows(&conn, "SELECT a, b, c FROM t WHERE b = 10");
+    assert_eq!(
+        rows,
+        vec!["1|10|100"],
+        "row 1 should still be at b=10 in idx_b"
+    );
+
+    // b=40 should not exist in the index.
+    let rows = query_rows(&conn, "SELECT a, b, c FROM t WHERE b = 40");
+    assert!(rows.is_empty(), "b=40 should not exist in idx_b");
+
+    // Full table scan should show original data.
+    let rows = query_rows(&conn, "SELECT a, b, c FROM t ORDER BY a");
+    assert_eq!(rows, vec!["1|10|100", "2|20|200"]);
+
+    // Integrity check should pass.
+    let ic = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(ic, vec!["ok"], "integrity_check failed after UPDATE ABORT");
+    conn.execute("ROLLBACK")?;
+    Ok(())
+}
+
+/// UPDATE that changes the rowid to conflict with an existing row, with indexes.
+/// The rowid conflict check happens AFTER the per-index loop, so index mutations
+/// from the loop must be rolled back when the rowid check fails.
+#[turso_macros::test]
+fn update_abort_rowid_conflict_after_index_mutation(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INT UNIQUE)")?;
+    conn.execute("INSERT INTO t VALUES(1, 10)")?;
+    conn.execute("INSERT INTO t VALUES(2, 20)")?;
+    conn.execute("BEGIN")?;
+    // b=30 is fine (no conflict on idx_b), but a=2 conflicts on the PK.
+    let result = conn.execute("UPDATE t SET a=2, b=30 WHERE a=1");
+    assert!(result.is_err(), "UPDATE should fail with PK conflict");
+
+    // idx_b should still have the old entry.
+    let rows = query_rows(&conn, "SELECT a, b FROM t WHERE b = 10");
+    assert_eq!(rows, vec!["1|10"], "row 1 should still be at b=10");
+
+    let rows = query_rows(&conn, "SELECT a, b FROM t WHERE b = 30");
+    assert!(rows.is_empty(), "b=30 should not exist");
+
+    let ic = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(
+        ic,
+        vec!["ok"],
+        "integrity_check failed after UPDATE rowid conflict"
+    );
+    conn.execute("ROLLBACK")?;
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────
+// Regression: partial index skipped in preflight
+// ──────────────────────────────────────────────────────────
+
+/// Non-partial idx_b is preflighted (checked before mutations), but partial
+/// idx_c is skipped in preflight and only checked in the per-index loop.
+/// If idx_b mutates first and then idx_c's check fails, idx_b is orphaned.
+#[turso_macros::test]
+fn update_abort_partial_index_not_preflighted(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INT, c INT)")?;
+    // Creation order matters: it determines per-index loop processing order.
+    // idx_c (partial) must be created first so idx_b (non-partial) is processed
+    // first in the loop — its mutations then orphan when idx_c's check fails.
+    conn.execute("CREATE UNIQUE INDEX idx_c ON t(c) WHERE c IS NOT NULL")?;
+    conn.execute("CREATE UNIQUE INDEX idx_b ON t(b)")?;
+    conn.execute("INSERT INTO t VALUES(1, 10, 100)")?;
+    conn.execute("INSERT INTO t VALUES(2, 20, 200)")?;
+    // Partial unique indexes can't be preflighted, so the stmt journal must be kept
+    // to protect against orphan index entries when the partial index check fails
+    // after a non-partial index has been mutated.
+    assert!(
+        needs_stmt_journal(&conn, "UPDATE t SET b=40, c=200 WHERE a=1"),
+        "stmt journal required: partial unique index can't be preflighted"
+    );
+
+    conn.execute("BEGIN")?;
+    // b=40 passes preflight (non-partial idx_b). c=200 conflicts on partial idx_c.
+    let result = conn.execute("UPDATE t SET b=40, c=200 WHERE a=1");
+    assert!(
+        result.is_err(),
+        "UPDATE should fail with UNIQUE constraint on idx_c"
+    );
+
+    // idx_b must not be mutated — row 1 should still be at b=10.
+    let rows = query_rows(&conn, "SELECT a, b, c FROM t WHERE b = 10");
+    assert_eq!(
+        rows,
+        vec!["1|10|100"],
+        "row 1 should still be at b=10 in idx_b"
+    );
+
+    let rows = query_rows(&conn, "SELECT a, b, c FROM t WHERE b = 40");
+    assert!(rows.is_empty(), "b=40 should not exist in idx_b");
+
+    let ic = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(
+        ic,
+        vec!["ok"],
+        "integrity_check failed: partial index skip left orphan entries"
+    );
+    conn.execute("ROLLBACK")?;
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────
+// Regression: INSERT OR REPLACE + NOT NULL abort fallback
+// ──────────────────────────────────────────────────────────
+
+/// INSERT OR REPLACE where the REPLACE preflight deletes a conflicting row,
+/// but then a NOT NULL constraint (without default) fires HaltIfNull.
+/// The deleted row must be restored.
+#[turso_macros::test]
+fn insert_replace_notnull_no_default_preserves_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE, b TEXT NOT NULL)")?;
+    conn.execute("INSERT INTO t VALUES(1, 'x', 'ok')")?;
+    conn.execute("BEGIN")?;
+    // 'x' conflicts on the UNIQUE(a) → REPLACE deletes row 1.
+    // But b=NULL violates NOT NULL (no default) → falls back to ABORT.
+    let result = conn.execute("INSERT OR REPLACE INTO t VALUES(2, 'x', NULL)");
+    assert!(
+        result.is_err(),
+        "INSERT should fail with NOT NULL constraint"
+    );
+
+    // The original row must still exist.
+    let rows = query_rows(&conn, "SELECT id, a, b FROM t ORDER BY id");
+    assert_eq!(rows, vec!["1|x|ok"], "original row should be preserved");
+
+    // Querying via the UNIQUE index should also find the original row.
+    let rows = query_rows(&conn, "SELECT id, a, b FROM t WHERE a = 'x'");
+    assert_eq!(
+        rows,
+        vec!["1|x|ok"],
+        "row should be findable via UNIQUE index"
+    );
+
+    let ic = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(
+        ic,
+        vec!["ok"],
+        "integrity_check failed after INSERT OR REPLACE abort"
+    );
+    conn.execute("ROLLBACK")?;
     Ok(())
 }
