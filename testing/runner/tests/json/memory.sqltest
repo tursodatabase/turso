@@ -122,3 +122,21 @@ test json101-8-1 {
 expect {
 		["abc\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f !\"#xyz"]
 }
+
+test json_each_nested_subquery_correlated_delete {
+    CREATE TABLE important_data(id INTEGER PRIMARY KEY, value TEXT);
+    INSERT INTO important_data VALUES (1, 'keep'), (2, 'delete'), (3, 'keep');
+
+    DELETE FROM important_data
+    WHERE EXISTS (
+        SELECT 1
+        FROM json_each('["delete"]')
+        WHERE value IN (SELECT value FROM json_each('["delete"]'))
+        AND important_data.value = json_each.value
+    );
+
+    SELECT COUNT(*) FROM important_data;
+}
+expect {
+    2
+}
