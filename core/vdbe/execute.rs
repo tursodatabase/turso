@@ -13468,4 +13468,32 @@ mod tests {
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
         assert_eq!(result, Value::Null);
     }
+
+    #[test]
+    fn test_avg_huge_scientific_notation_no_panic() {
+        // Text containing 'E' can be parsed as scientific notation with a huge
+        // exponent, causing DoubleDouble overflow to NaN (inf - inf in error
+        // correction). AVG must not panic on such values.
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, '3334363931382E383333333735353439')")
+            .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            conn.execute("SELECT AVG(b) FROM t1")
+        }));
+        assert!(
+            result.is_ok(),
+            "AVG on text that overflows DoubleDouble should not panic"
+        );
+    }
 }

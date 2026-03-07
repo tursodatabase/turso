@@ -498,6 +498,12 @@ fn create_result_from_significand(
     }
 
     let mut final_result: f64 = result.into();
+    // DoubleDouble arithmetic can produce NaN when intermediate values overflow
+    // to infinity (inf - inf = NaN in the Dekker error correction term). The
+    // mathematically correct result for these extreme exponents is ±infinity.
+    if final_result.is_nan() {
+        final_result = f64::INFINITY;
+    }
     if sign < 0 {
         final_result = -final_result;
     }
