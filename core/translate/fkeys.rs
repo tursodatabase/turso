@@ -1453,7 +1453,12 @@ fn generate_cascade_update_stmt(
                 .expect("new params required for cascade update");
             ast::Set {
                 col_names: vec![Name::from_string(col)],
-                expr: Box::new(Expr::Variable(format!("{}", param_idx.get()))),
+                expr: Box::new(Expr::Variable(ast::Variable::indexed(
+                    u32::try_from(param_idx.get())
+                        .ok()
+                        .and_then(std::num::NonZeroU32::new)
+                        .expect("fk parameter index must fit into NonZeroU32"),
+                ))),
             }
         })
         .collect();
@@ -1483,7 +1488,12 @@ fn build_fk_match_where_clause(child_cols: &[String], ctx: &FkSubprogramContext)
         let cond = Expr::Binary(
             Box::new(Expr::Id(Name::from_string(col))),
             ast::Operator::Equals,
-            Box::new(Expr::Variable(format!("{}", param_idx.get()))),
+            Box::new(Expr::Variable(ast::Variable::indexed(
+                u32::try_from(param_idx.get())
+                    .ok()
+                    .and_then(std::num::NonZeroU32::new)
+                    .expect("fk parameter index must fit into NonZeroU32"),
+            ))),
         );
         conditions.push(cond);
     }

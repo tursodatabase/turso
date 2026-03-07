@@ -324,7 +324,7 @@ impl IndexInfo {
             return Err(ffi.code);
         }
         let constraint_usages = unsafe {
-            Box::from_raw(std::slice::from_raw_parts_mut(
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                 ffi.constraint_usages_ptr,
                 ffi.constraint_usage_len,
             ))

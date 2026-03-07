@@ -2,7 +2,7 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::{self, CStr, CString};
-use std::num::{NonZero, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
 use turso_core::{CheckpointMode, LimboError, Value};
@@ -1148,13 +1148,26 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_count(stmt: *mut sqlite3_stmt) -
     stmt.stmt.parameters_count() as ffi::c_int
 }
 
+#[inline]
+fn sqlite3_bind_index_in_range(stmt: &sqlite3_stmt, idx: ffi::c_int) -> Option<NonZeroUsize> {
+    let idx = NonZeroUsize::new(idx as usize)?;
+    let max = stmt.stmt.parameters_count();
+    if idx.get() > max {
+        None
+    } else {
+        Some(idx)
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_parameter_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
     let stmt = &*stmt;
-    let index = NonZero::new_unchecked(idx as usize);
+    let Some(index) = sqlite3_bind_index_in_range(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     if let Some(val) = stmt.stmt.parameters().name(index) {
         let c_string = CString::new(val).expect("CString::new failed");
@@ -1192,13 +1205,12 @@ pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: ffi::c_
         return SQLITE_MISUSE;
     }
 
-    if idx <= 0 {
-        return SQLITE_RANGE;
-    }
     let stmt = &mut *stmt;
+    let Some(index) = sqlite3_bind_index_in_range(stmt, idx) else {
+        return SQLITE_RANGE;
+    };
 
-    stmt.stmt
-        .bind_at(NonZero::new_unchecked(idx as usize), Value::Null);
+    stmt.stmt.bind_at(index, Value::Null);
     SQLITE_OK
 }
 
@@ -1220,13 +1232,12 @@ pub unsafe extern "C" fn sqlite3_bind_int64(
     if stmt.is_null() {
         return SQLITE_MISUSE;
     }
-    if idx <= 0 {
-        return SQLITE_RANGE;
-    }
     let stmt = &mut *stmt;
+    let Some(index) = sqlite3_bind_index_in_range(stmt, idx) else {
+        return SQLITE_RANGE;
+    };
 
-    stmt.stmt
-        .bind_at(NonZero::new_unchecked(idx as usize), Value::from_i64(val));
+    stmt.stmt.bind_at(index, Value::from_i64(val));
 
     SQLITE_OK
 }
@@ -1240,13 +1251,12 @@ pub unsafe extern "C" fn sqlite3_bind_double(
     if stmt.is_null() {
         return SQLITE_MISUSE;
     }
-    if idx <= 0 {
-        return SQLITE_RANGE;
-    }
     let stmt = &mut *stmt;
+    let Some(index) = sqlite3_bind_index_in_range(stmt, idx) else {
+        return SQLITE_RANGE;
+    };
 
-    stmt.stmt
-        .bind_at(NonZero::new_unchecked(idx as usize), Value::from_f64(val));
+    stmt.stmt.bind_at(index, Value::from_f64(val));
 
     SQLITE_OK
 }
@@ -1262,14 +1272,14 @@ pub unsafe extern "C" fn sqlite3_bind_text(
     if stmt.is_null() {
         return SQLITE_MISUSE;
     }
-    if idx <= 0 {
-        return SQLITE_RANGE;
-    }
-    if text.is_null() {
-        return sqlite3_bind_null(stmt, idx);
-    }
-
     let stmt_ref = &mut *stmt;
+    let Some(index) = sqlite3_bind_index_in_range(stmt_ref, idx) else {
+        return SQLITE_RANGE;
+    };
+    if text.is_null() {
+        stmt_ref.stmt.bind_at(index, Value::Null);
+        return SQLITE_OK;
+    }
 
     let static_ptr = std::ptr::null();
     let transient_ptr = -1isize as usize as *const ffi::c_void;
@@ -1292,21 +1302,15 @@ pub unsafe extern "C" fn sqlite3_bind_text(
 
     if ptr_val == transient_ptr {
         let val = Value::from_text(str_value);
-        stmt_ref
-            .stmt
-            .bind_at(NonZero::new_unchecked(idx as usize), val);
+        stmt_ref.stmt.bind_at(index, val);
     } else if ptr_val == static_ptr {
         let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
-        stmt_ref
-            .stmt
-            .bind_at(NonZero::new_unchecked(idx as usize), val);
+        stmt_ref.stmt.bind_at(index, val);
     } else {
         let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
-        stmt_ref
-            .stmt
-            .bind_at(NonZero::new_unchecked(idx as usize), val);
+        stmt_ref.stmt.bind_at(index, val);
 
         stmt_ref
             .destructors
@@ -1327,23 +1331,20 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
     if stmt.is_null() {
         return SQLITE_MISUSE;
     }
-    if idx <= 0 {
+    let stmt_ref = &mut *stmt;
+    let Some(index) = sqlite3_bind_index_in_range(stmt_ref, idx) else {
         return SQLITE_RANGE;
-    }
+    };
     if blob.is_null() {
-        return sqlite3_bind_null(stmt, idx);
+        stmt_ref.stmt.bind_at(index, Value::Null);
+        return SQLITE_OK;
     }
 
     let slice_blob = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
 
-    let stmt_ref = &mut *stmt;
     let val_blob = Value::from_blob(slice_blob);
 
-    if let Some(nz_idx) = NonZeroUsize::new(idx as usize) {
-        stmt_ref.stmt.bind_at(nz_idx, val_blob);
-    } else {
-        return SQLITE_RANGE;
-    }
+    stmt_ref.stmt.bind_at(index, val_blob);
 
     if let Some(destructor_fn) = destructor {
         let ptr_val = destructor_fn as *const ffi::c_void;

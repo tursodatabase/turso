@@ -855,7 +855,7 @@ impl<'a> Lexer<'a> {
                         debug_assert!(end_hex >= start_hex);
                         self.eat_and_assert(|b| b == b'\'');
 
-                        if (end_hex - start_hex) % 2 != 0 {
+                        if ((end_hex - start_hex) & 1) != 0 {
                             let token_text =
                                 String::from_utf8_lossy(&self.input[start..self.offset])
                                     .to_string();
