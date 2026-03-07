@@ -1,6 +1,7 @@
 use super::*;
 
 #[derive(Debug, Clone)]
+/// Payload layout metadata recorded during hash-build planning or reuse.
 pub(super) struct HashBuildPayloadInfo {
     pub payload_columns: Vec<MaterializedColumnRef>,
     pub key_affinities: String,
@@ -28,6 +29,7 @@ fn expr_references_outer_query(expr: &Expr, table_references: &TableReferences) 
     has_outer_ref
 }
 
+/// Static configuration for a fresh hash-table build.
 struct HashBuildConfig {
     payload_columns: Vec<MaterializedColumnRef>,
     payload_signature_columns: Vec<usize>,
@@ -41,38 +43,46 @@ struct HashBuildConfig {
     signature: HashBuildSignature,
 }
 
-struct HashBuildPlanner<'program, 'ctx, 'plan, 'tables, 'predicates> {
-    program: &'program mut ProgramBuilder,
+/// Typestate entry point for hash-build planning.
+///
+/// Planning decides whether an existing hash build can be reused and, if not,
+/// captures all configuration needed to emit a fresh build deterministically.
+pub(crate) struct HashBuildPlanner<'prog, 'ctx, 'plan, 'tab, 'pred> {
+    program: &'prog mut ProgramBuilder,
     t_ctx: &'ctx mut TranslateCtx<'plan>,
-    table_references: &'tables TableReferences,
-    non_from_clause_subqueries: &'predicates [NonFromClauseSubquery],
-    predicates: &'predicates [WhereTerm],
-    hash_join_op: &'predicates HashJoinOp,
+    table_references: &'tab TableReferences,
+    non_from_clause_subqueries: &'pred [NonFromClauseSubquery],
+    predicates: &'pred [WhereTerm],
+    hash_join_op: &'pred HashJoinOp,
     hash_build_cursor_id: CursorID,
     hash_table_id: usize,
 }
 
-struct PreparedHashBuild<'program, 'ctx, 'plan, 'tables, 'predicates> {
-    planner: HashBuildPlanner<'program, 'ctx, 'plan, 'tables, 'predicates>,
+/// A planned hash build whose signature check has already completed.
+pub(super) struct PreparedHashBuild<'prog, 'ctx, 'plan, 'tab, 'pred> {
+    planner: HashBuildPlanner<'prog, 'ctx, 'plan, 'tab, 'pred>,
     config: HashBuildConfig,
 }
 
-enum HashBuildPlan<'program, 'ctx, 'plan, 'tables, 'predicates> {
+/// Result of hash-build planning.
+///
+/// Reuse means the caller can immediately probe an existing compatible hash
+/// table. Build means the caller must execute the prepared build before probing.
+pub(super) enum HashBuildPlan<'prog, 'ctx, 'plan, 'tab, 'pred> {
     Reuse(HashBuildPayloadInfo),
-    Build(PreparedHashBuild<'program, 'ctx, 'plan, 'tables, 'predicates>),
+    Build(Box<PreparedHashBuild<'prog, 'ctx, 'plan, 'tab, 'pred>>),
 }
 
-impl<'program, 'ctx, 'plan, 'tables, 'predicates>
-    HashBuildPlanner<'program, 'ctx, 'plan, 'tables, 'predicates>
-{
+impl<'prog, 'ctx, 'plan, 'tab, 'pred> HashBuildPlanner<'prog, 'ctx, 'plan, 'tab, 'pred> {
     #[allow(clippy::too_many_arguments)]
-    fn new(
-        program: &'program mut ProgramBuilder,
+    /// Capture the immutable inputs needed to decide whether to reuse or build.
+    pub(super) const fn new(
+        program: &'prog mut ProgramBuilder,
         t_ctx: &'ctx mut TranslateCtx<'plan>,
-        table_references: &'tables TableReferences,
-        non_from_clause_subqueries: &'predicates [NonFromClauseSubquery],
-        predicates: &'predicates [WhereTerm],
-        hash_join_op: &'predicates HashJoinOp,
+        table_references: &'tab TableReferences,
+        non_from_clause_subqueries: &'pred [NonFromClauseSubquery],
+        predicates: &'pred [WhereTerm],
+        hash_join_op: &'pred HashJoinOp,
         hash_build_cursor_id: CursorID,
         hash_table_id: usize,
     ) -> Self {
@@ -88,7 +98,8 @@ impl<'program, 'ctx, 'plan, 'tables, 'predicates>
         }
     }
 
-    fn prepare(self) -> Result<HashBuildPlan<'program, 'ctx, 'plan, 'tables, 'predicates>> {
+    /// Decide whether the hash table can be reused or must be rebuilt.
+    pub(super) fn prepare(self) -> Result<HashBuildPlan<'prog, 'ctx, 'plan, 'tab, 'pred>> {
         let materialized_input = self
             .t_ctx
             .materialized_build_inputs
@@ -217,7 +228,7 @@ impl<'program, 'ctx, 'plan, 'tables, 'predicates>
             self.program.clear_hash_build_signature(self.hash_table_id);
         }
 
-        Ok(HashBuildPlan::Build(PreparedHashBuild {
+        Ok(HashBuildPlan::Build(Box::new(PreparedHashBuild {
             planner: self,
             config: HashBuildConfig {
                 payload_columns,
@@ -231,14 +242,13 @@ impl<'program, 'ctx, 'plan, 'tables, 'predicates>
                 allow_seek,
                 signature,
             },
-        }))
+        })))
     }
 }
 
-impl<'program, 'ctx, 'plan, 'tables, 'predicates>
-    PreparedHashBuild<'program, 'ctx, 'plan, 'tables, 'predicates>
-{
-    fn emit(self) -> Result<HashBuildPayloadInfo> {
+impl<'prog, 'ctx, 'plan, 'tab, 'pred> PreparedHashBuild<'prog, 'ctx, 'plan, 'tab, 'pred> {
+    /// Emit the fresh hash build after planning has fixed its configuration.
+    pub(super) fn emit(self) -> Result<HashBuildPayloadInfo> {
         let Self { planner, config } = self;
         let build_table =
             &planner.table_references.joined_tables()[planner.hash_join_op.build_table_idx];
@@ -477,30 +487,587 @@ impl<'program, 'ctx, 'plan, 'tables, 'predicates>
     }
 }
 
+struct PreparedProbeBuild {
+    build_cursor_id: CursorID,
+    payload_info: HashBuildPayloadInfo,
+}
+
+struct ProbeSetupState {
+    build_cursor_id: CursorID,
+    payload_info: HashBuildPayloadInfo,
+    payload_dest_reg: Option<usize>,
+    match_reg: usize,
+    hash_probe_miss_label: BranchOffset,
+    match_found_label: BranchOffset,
+    hash_next_label: BranchOffset,
+}
+
+/// Hash-join probe setup in `open_loop`.
+///
+/// Setup still runs in three ordered phases, but plain helper methods are enough:
+/// build or reuse the hash table, emit probe instructions, then install `HashCtx`.
+pub(super) struct HashProbeSetupEmitter<'prog, 'ctx, 'plan, 'tab, 'pred> {
+    program: &'prog mut ProgramBuilder,
+    t_ctx: &'ctx mut TranslateCtx<'plan>,
+    table_references: &'tab TableReferences,
+    subqueries: &'pred [NonFromClauseSubquery],
+    predicates: &'pred [WhereTerm],
+    hash_join_op: &'pred HashJoinOp,
+    mode: &'ctx OperationMode,
+    probe_cursor_id: CursorID,
+    loop_start: BranchOffset,
+    loop_end: BranchOffset,
+    next: BranchOffset,
+    live_table_ids: &'pred HashSet<TableInternalId>,
+}
+
+impl<'prog, 'ctx, 'plan, 'tab, 'pred> HashProbeSetupEmitter<'prog, 'ctx, 'plan, 'tab, 'pred> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) const fn new(
+        program: &'prog mut ProgramBuilder,
+        t_ctx: &'ctx mut TranslateCtx<'plan>,
+        table_references: &'tab TableReferences,
+        subqueries: &'pred [NonFromClauseSubquery],
+        predicates: &'pred [WhereTerm],
+        hash_join_op: &'pred HashJoinOp,
+        mode: &'ctx OperationMode,
+        probe_cursor_id: CursorID,
+        loop_start: BranchOffset,
+        loop_end: BranchOffset,
+        next: BranchOffset,
+        live_table_ids: &'pred HashSet<TableInternalId>,
+    ) -> Self {
+        Self {
+            program,
+            t_ctx,
+            table_references,
+            subqueries,
+            predicates,
+            hash_join_op,
+            mode,
+            probe_cursor_id,
+            loop_start,
+            loop_end,
+            next,
+            live_table_ids,
+        }
+    }
+
+    /// Ensure the build cursor exists and the hash table is ready for probing.
+    fn prepare_build(&mut self) -> Result<PreparedProbeBuild> {
+        let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
+        let (build_cursor_id, _) = build_table.resolve_cursors(self.program, self.mode.clone())?;
+        let build_cursor_id = if let Some(cursor_id) = build_cursor_id {
+            cursor_id
+        } else {
+            let btree = build_table
+                .btree()
+                .expect("Hash join build table must be a BTree table");
+            let cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
+                CursorKey::table(build_table.internal_id),
+                CursorType::BTreeTable(btree.clone()),
+            );
+            self.program.emit_insn(Insn::OpenRead {
+                cursor_id,
+                root_page: btree.root_page,
+                db: build_table.database_id,
+            });
+            cursor_id
+        };
+
+        let hash_table_id: usize = build_table.internal_id.into();
+        let btree = build_table
+            .btree()
+            .expect("Hash join build table must be a BTree table");
+        let hash_build_cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
+            CursorKey::hash_build(build_table.internal_id),
+            CursorType::BTreeTable(btree.clone()),
+        );
+        let payload_info = match HashBuildPlanner::new(
+            self.program,
+            self.t_ctx,
+            self.table_references,
+            self.subqueries,
+            self.predicates,
+            self.hash_join_op,
+            hash_build_cursor_id,
+            hash_table_id,
+        )
+        .prepare()?
+        {
+            HashBuildPlan::Reuse(info) => Ok(info),
+            HashBuildPlan::Build(prepared) => prepared.emit(),
+        }?;
+
+        Ok(PreparedProbeBuild {
+            build_cursor_id,
+            payload_info,
+        })
+    }
+
+    /// Emit the probe-side cursor positioning, key loading, and `HashProbe`. Advance
+    /// to the state needed to install the resulting `HashCtx`.
+    fn emit_probe(&mut self, prepared: PreparedProbeBuild) -> Result<ProbeSetupState> {
+        let PreparedProbeBuild {
+            build_cursor_id,
+            payload_info,
+        } = prepared;
+        let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
+        let hash_table_id: usize = build_table.internal_id.into();
+        let num_keys = self.hash_join_op.join_keys.len();
+
+        self.program.emit_insn(Insn::Rewind {
+            cursor_id: self.probe_cursor_id,
+            pc_if_empty: self.loop_end,
+        });
+        self.program.preassign_label_to_next_insn(self.loop_start);
+
+        let probe_key_start_reg = self.program.alloc_registers(num_keys);
+        for (idx, join_key) in self.hash_join_op.join_keys.iter().enumerate() {
+            let probe_expr = join_key.get_probe_expr(self.predicates);
+            translate_expr(
+                self.program,
+                Some(self.table_references),
+                probe_expr,
+                probe_key_start_reg + idx,
+                &self.t_ctx.resolver,
+            )?;
+        }
+
+        if let Some(count) = std::num::NonZeroUsize::new(num_keys) {
+            self.program.emit_insn(Insn::Affinity {
+                start_reg: probe_key_start_reg,
+                count,
+                affinities: payload_info.key_affinities.clone(),
+            });
+        }
+
+        if payload_info.use_bloom_filter && self.hash_join_op.join_type != HashJoinType::FullOuter {
+            self.program.emit_insn(Insn::Filter {
+                cursor_id: payload_info.bloom_filter_cursor_id,
+                target_pc: self.next,
+                key_reg: probe_key_start_reg,
+                num_keys,
+            });
+        }
+
+        let num_payload = payload_info.payload_columns.len();
+        let payload_dest_reg = if num_payload > 0 {
+            Some(self.program.alloc_registers(num_payload))
+        } else {
+            None
+        };
+
+        if matches!(self.hash_join_op.join_type, HashJoinType::FullOuter) {
+            let probe_table_idx = self.hash_join_op.probe_table_idx;
+            if let Some(lj_meta) = self.t_ctx.meta_left_joins[probe_table_idx].as_ref() {
+                self.program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: lj_meta.reg_match_flag,
+                });
+            }
+        }
+
+        let hash_probe_miss_label = if self.hash_join_op.join_type == HashJoinType::FullOuter {
+            self.program.allocate_label()
+        } else {
+            self.next
+        };
+
+        let match_reg = self.program.alloc_register();
+        self.program.emit_insn(Insn::HashProbe {
+            hash_table_id: to_u16(hash_table_id),
+            key_start_reg: to_u16(probe_key_start_reg),
+            num_keys: to_u16(num_keys),
+            dest_reg: to_u16(match_reg),
+            target_pc: hash_probe_miss_label,
+            payload_dest_reg: payload_dest_reg.map(to_u16),
+            num_payload: to_u16(num_payload),
+        });
+
+        let match_found_label = self.program.allocate_label();
+        self.program.preassign_label_to_next_insn(match_found_label);
+        let hash_next_label = self.program.allocate_label();
+
+        Ok(ProbeSetupState {
+            build_cursor_id,
+            payload_info,
+            payload_dest_reg,
+            match_reg,
+            hash_probe_miss_label,
+            match_found_label,
+            hash_next_label,
+        })
+    }
+
+    /// Install `HashCtx` and cache any payload-backed expressions for later reads.
+    fn install_context(&mut self, state: ProbeSetupState) -> Result<()> {
+        let ProbeSetupState {
+            build_cursor_id,
+            payload_info,
+            payload_dest_reg,
+            match_reg,
+            hash_probe_miss_label,
+            match_found_label,
+            hash_next_label,
+        } = state;
+        let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
+        let hash_table_id: usize = build_table.internal_id.into();
+        let payload_columns = payload_info.payload_columns.clone();
+
+        self.t_ctx.hash_table_contexts.insert(
+            self.hash_join_op.build_table_idx,
+            HashCtx {
+                hash_table_reg: hash_table_id,
+                match_reg,
+                match_found_label,
+                hash_next_label,
+                payload_start_reg: payload_dest_reg,
+                payload_columns: payload_info.payload_columns,
+                check_outer_label: if self.hash_join_op.join_type == HashJoinType::FullOuter {
+                    Some(hash_probe_miss_label)
+                } else {
+                    None
+                },
+                build_cursor_id: if payload_info.allow_seek {
+                    Some(build_cursor_id)
+                } else {
+                    None
+                },
+                join_type: self.hash_join_op.join_type,
+                inner_loop_gosub_reg: None,
+                inner_loop_gosub_label: None,
+                inner_loop_skip_label: None,
+            },
+        );
+
+        self.t_ctx.resolver.enable_expr_to_reg_cache();
+        let rowid_expr = Expr::RowId {
+            database: None,
+            table: build_table.internal_id,
+        };
+        let payload_has_build_rowid = payload_columns.iter().any(|payload| {
+            matches!(
+                payload,
+                MaterializedColumnRef::RowId { table_id } if *table_id == build_table.internal_id
+            )
+        });
+        let build_table_is_live = self.live_table_ids.contains(&build_table.internal_id);
+        if payload_info.allow_seek && !payload_has_build_rowid && !build_table_is_live {
+            self.t_ctx
+                .resolver
+                .expr_to_reg_cache
+                .push((Cow::Owned(rowid_expr), match_reg, false));
+        }
+        if let Some(payload_reg) = payload_dest_reg {
+            for (i, payload) in payload_columns.iter().enumerate() {
+                let (payload_table_id, expr, is_column) = match payload {
+                    MaterializedColumnRef::Column {
+                        table_id,
+                        column_idx,
+                        is_rowid_alias,
+                    } => (
+                        *table_id,
+                        Expr::Column {
+                            database: None,
+                            table: *table_id,
+                            column: *column_idx,
+                            is_rowid_alias: *is_rowid_alias,
+                        },
+                        true,
+                    ),
+                    MaterializedColumnRef::RowId { table_id } => (
+                        *table_id,
+                        Expr::RowId {
+                            database: None,
+                            table: *table_id,
+                        },
+                        false,
+                    ),
+                };
+                if self.live_table_ids.contains(&payload_table_id) {
+                    continue;
+                }
+                self.t_ctx.resolver.expr_to_reg_cache.push((
+                    Cow::Owned(expr),
+                    payload_reg + i,
+                    is_column,
+                ));
+            }
+        } else if payload_info.allow_seek && !build_table_is_live {
+            self.program.emit_insn(Insn::SeekRowid {
+                cursor_id: build_cursor_id,
+                src_reg: match_reg,
+                target_pc: hash_next_label,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn emit(mut self) -> Result<()> {
+        let prepared = self.prepare_build()?;
+        let state = self.emit_probe(prepared)?;
+        self.install_context(state)
+    }
+}
+
+struct ProbeCloseState {
+    label_next_probe_row: BranchOffset,
+    semi_anti_next_pc: Option<BranchOffset>,
+}
+
+/// Result of emitting hash-join probe teardown.
+pub(super) struct HashProbeCloseOutcome {
+    pub semi_anti_next_pc: Option<BranchOffset>,
+}
+
+/// Close-loop path of a hash-join probe.
+///
+/// The teardown remains ordered: emit `HashNext`, optionally emit FULL OUTER
+/// unmatched probe rows, then return the probe-row advance state.
+pub(super) struct HashProbeCloseEmitter<'prog, 'ctx, 'plan, 'hash> {
+    program: &'prog mut ProgramBuilder,
+    t_ctx: &'ctx mut TranslateCtx<'plan>,
+    hash_join_op: &'hash HashJoinOp,
+    hash_ctx: HashCtx,
+    select_plan: Option<&'plan SelectPlan>,
+    table_index: usize,
+}
+
+impl<'prog, 'ctx, 'plan, 'hash> HashProbeCloseEmitter<'prog, 'ctx, 'plan, 'hash> {
+    #[allow(clippy::too_many_arguments)]
+    /// Capture the mutable close-loop inputs for a single hash probe table.
+    pub(super) fn new(
+        program: &'prog mut ProgramBuilder,
+        t_ctx: &'ctx mut TranslateCtx<'plan>,
+        hash_join_op: &'hash HashJoinOp,
+        hash_ctx: HashCtx,
+        select_plan: Option<&'plan SelectPlan>,
+        table_index: usize,
+    ) -> Self {
+        Self {
+            program,
+            t_ctx,
+            hash_join_op,
+            hash_ctx,
+            select_plan,
+            table_index,
+        }
+    }
+
+    /// Emit `HashNext` and loop back into the existing match-processing path.
+    fn emit_matched_iteration(&mut self) -> Result<ProbeCloseState> {
+        let hash_table_reg = self.hash_ctx.hash_table_reg;
+        let match_reg = self.hash_ctx.match_reg;
+        let match_found_label = self.hash_ctx.match_found_label;
+        let hash_next_label = self.hash_ctx.hash_next_label;
+        let payload_dest_reg = self.hash_ctx.payload_start_reg;
+        let num_payload = self.hash_ctx.payload_columns.len();
+        let check_outer_label = self.hash_ctx.check_outer_label;
+        let join_type = self.hash_ctx.join_type;
+        let inner_loop_gosub_reg = self.hash_ctx.inner_loop_gosub_reg;
+        let inner_loop_skip_label = self.hash_ctx.inner_loop_skip_label;
+        let label_next_probe_row = self.program.allocate_label();
+        let mut semi_anti_next_pc = None;
+
+        if let Some(gosub_reg) = inner_loop_gosub_reg {
+            semi_anti_next_pc = Some(self.program.offset());
+            self.program.emit_insn(Insn::Return {
+                return_reg: gosub_reg,
+                can_fallthrough: false,
+            });
+            if let Some(skip_label) = inner_loop_skip_label {
+                self.program.preassign_label_to_next_insn(skip_label);
+            }
+        }
+
+        let hash_next_target = if join_type == HashJoinType::FullOuter {
+            check_outer_label.unwrap_or(label_next_probe_row)
+        } else {
+            label_next_probe_row
+        };
+
+        if semi_anti_next_pc.is_none() {
+            semi_anti_next_pc = Some(self.program.offset());
+        }
+        self.program
+            .resolve_label(hash_next_label, self.program.offset());
+
+        self.program.emit_insn(Insn::HashNext {
+            hash_table_id: hash_table_reg,
+            dest_reg: match_reg,
+            target_pc: hash_next_target,
+            payload_dest_reg,
+            num_payload,
+        });
+        self.program.emit_insn(Insn::Goto {
+            target_pc: match_found_label,
+        });
+
+        Ok(ProbeCloseState {
+            label_next_probe_row,
+            semi_anti_next_pc,
+        })
+    }
+
+    /// Emit FULL OUTER unmatched probe rows before advancing to the next probe row.
+    fn emit_probe_miss_rows(&mut self, state: ProbeCloseState) -> Result<ProbeCloseState> {
+        let ProbeCloseState {
+            label_next_probe_row,
+            semi_anti_next_pc,
+        } = state;
+
+        if matches!(self.hash_ctx.join_type, HashJoinType::FullOuter) {
+            let probe_table_idx = self.hash_join_op.probe_table_idx;
+            let lj_meta = self.t_ctx.meta_left_joins[probe_table_idx]
+                .as_ref()
+                .expect("FULL OUTER probe table must have left join metadata");
+            let reg_match_flag = lj_meta.reg_match_flag;
+
+            if let Some(check_outer_label) = self.hash_ctx.check_outer_label {
+                self.program
+                    .resolve_label(check_outer_label, self.program.offset());
+            }
+            self.program
+                .resolve_label(lj_meta.label_match_flag_check_value, self.program.offset());
+
+            self.program.emit_insn(Insn::IfPos {
+                reg: reg_match_flag,
+                target_pc: label_next_probe_row,
+                decrement_by: 0,
+            });
+
+            if let Some(cursor_id) = self.hash_ctx.build_cursor_id {
+                self.program.emit_insn(Insn::NullRow { cursor_id });
+            }
+
+            if let Some(payload_reg) = self.hash_ctx.payload_start_reg {
+                let num_payload = self.hash_ctx.payload_columns.len();
+                if num_payload > 0 {
+                    self.program.emit_insn(Insn::Null {
+                        dest: payload_reg,
+                        dest_end: Some(payload_reg + num_payload - 1),
+                    });
+                }
+            }
+
+            if let Some(plan) = self.select_plan {
+                emit_unmatched_row_conditions_and_loop(
+                    self.program,
+                    self.t_ctx,
+                    plan,
+                    self.hash_join_op.build_table_idx,
+                    self.table_index,
+                    label_next_probe_row,
+                    self.hash_ctx
+                        .inner_loop_gosub_reg
+                        .zip(self.hash_ctx.inner_loop_gosub_label),
+                )?;
+            }
+        }
+
+        Ok(ProbeCloseState {
+            label_next_probe_row,
+            semi_anti_next_pc,
+        })
+    }
+
+    /// Anchor the next probe-row label and return the close-loop control-flow state.
+    fn finish(&mut self, state: ProbeCloseState) -> HashProbeCloseOutcome {
+        let ProbeCloseState {
+            label_next_probe_row,
+            semi_anti_next_pc,
+        } = state;
+
+        self.program
+            .preassign_label_to_next_insn(label_next_probe_row);
+
+        HashProbeCloseOutcome { semi_anti_next_pc }
+    }
+
+    pub(super) fn emit(mut self) -> Result<HashProbeCloseOutcome> {
+        let state = self.emit_matched_iteration()?;
+        let state = self.emit_probe_miss_rows(state)?;
+        Ok(self.finish(state))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_hash_build_phase(
+/// Emit unmatched build rows after the probe cursor has been exhausted.
+pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'_>,
-    table_references: &TableReferences,
-    non_from_clause_subqueries: &[NonFromClauseSubquery],
-    predicates: &[WhereTerm],
+    t_ctx: &mut TranslateCtx<'a>,
     hash_join_op: &HashJoinOp,
-    hash_build_cursor_id: CursorID,
-    hash_table_id: usize,
-) -> Result<HashBuildPayloadInfo> {
-    match HashBuildPlanner::new(
+    hash_ctx: &HashCtx,
+    select_plan: Option<&'a SelectPlan>,
+    table_index: usize,
+    probe_cursor_id: CursorID,
+) -> Result<()> {
+    if !matches!(
+        hash_join_op.join_type,
+        HashJoinType::LeftOuter | HashJoinType::FullOuter
+    ) {
+        return Ok(());
+    }
+    let Some(plan) = select_plan else {
+        return Ok(());
+    };
+
+    let hash_table_reg = hash_ctx.hash_table_reg;
+    let match_reg = hash_ctx.match_reg;
+    let payload_dest_reg = hash_ctx.payload_start_reg;
+    let num_payload = hash_ctx.payload_columns.len();
+    let build_cursor_id = hash_ctx.build_cursor_id;
+    let done_unmatched = program.allocate_label();
+
+    program.emit_insn(Insn::NullRow {
+        cursor_id: probe_cursor_id,
+    });
+
+    program.emit_insn(Insn::HashScanUnmatched {
+        hash_table_id: hash_table_reg,
+        dest_reg: match_reg,
+        target_pc: done_unmatched,
+        payload_dest_reg,
+        num_payload,
+    });
+
+    let unmatched_loop = program.allocate_label();
+    let label_next_unmatched = program.allocate_label();
+    program.preassign_label_to_next_insn(unmatched_loop);
+
+    if let Some(cursor_id) = build_cursor_id {
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id,
+            src_reg: match_reg,
+            target_pc: done_unmatched,
+        });
+    }
+
+    emit_unmatched_row_conditions_and_loop(
         program,
         t_ctx,
-        table_references,
-        non_from_clause_subqueries,
-        predicates,
-        hash_join_op,
-        hash_build_cursor_id,
-        hash_table_id,
-    )
-    .prepare()?
-    {
-        HashBuildPlan::Reuse(info) => Ok(info),
-        HashBuildPlan::Build(prepared) => prepared.emit(),
-    }
+        plan,
+        hash_join_op.build_table_idx,
+        table_index,
+        label_next_unmatched,
+        hash_ctx
+            .inner_loop_gosub_reg
+            .zip(hash_ctx.inner_loop_gosub_label),
+    )?;
+
+    program.resolve_label(label_next_unmatched, program.offset());
+    program.emit_insn(Insn::HashNextUnmatched {
+        hash_table_id: hash_table_reg,
+        dest_reg: match_reg,
+        target_pc: done_unmatched,
+        payload_dest_reg,
+        num_payload,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: unmatched_loop,
+    });
+    program.preassign_label_to_next_insn(done_unmatched);
+    Ok(())
 }

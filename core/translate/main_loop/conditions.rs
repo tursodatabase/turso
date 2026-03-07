@@ -1,5 +1,4 @@
 use super::*;
-use std::marker::PhantomData;
 
 fn expr_references_subquery_id(expr: &Expr, subquery_id: TableInternalId) -> bool {
     let mut found = false;
@@ -124,12 +123,12 @@ fn emit_conditions(
     Ok(())
 }
 
-struct PendingEarlyConditions;
-struct PendingCorrelatedSubqueries;
-struct PendingLateConditions;
-
-struct LoopConditionEmitter<'program, 'ctx, 'subqueries, State> {
-    program: &'program mut ProgramBuilder,
+/// Per-loop predicate emission.
+///
+/// Conditions that reference subquery results cannot be emitted until their
+/// correlated subqueries have run, so emission proceeds in three ordered steps.
+pub(super) struct LoopConditionEmitter<'prog, 'ctx, 'sub> {
+    program: &'prog mut ProgramBuilder,
     t_ctx: &'ctx TranslateCtx<'ctx>,
     table_references: &'ctx TableReferences,
     join_order: &'ctx [JoinOrderMember],
@@ -137,14 +136,13 @@ struct LoopConditionEmitter<'program, 'ctx, 'subqueries, State> {
     join_index: usize,
     condition_fail_target: BranchOffset,
     from_outer_join: bool,
-    subqueries: &'subqueries mut [NonFromClauseSubquery],
-    _state: PhantomData<State>,
+    subqueries: &'sub mut [NonFromClauseSubquery],
 }
 
-impl<'program, 'ctx, 'subqueries, State> LoopConditionEmitter<'program, 'ctx, 'subqueries, State> {
+impl<'prog, 'ctx, 'sub> LoopConditionEmitter<'prog, 'ctx, 'sub> {
     #[allow(clippy::too_many_arguments)]
-    fn new(
-        program: &'program mut ProgramBuilder,
+    pub(super) const fn new(
+        program: &'prog mut ProgramBuilder,
         t_ctx: &'ctx TranslateCtx<'ctx>,
         table_references: &'ctx TableReferences,
         join_order: &'ctx [JoinOrderMember],
@@ -152,7 +150,7 @@ impl<'program, 'ctx, 'subqueries, State> LoopConditionEmitter<'program, 'ctx, 's
         join_index: usize,
         condition_fail_target: BranchOffset,
         from_outer_join: bool,
-        subqueries: &'subqueries mut [NonFromClauseSubquery],
+        subqueries: &'sub mut [NonFromClauseSubquery],
     ) -> Self {
         Self {
             program,
@@ -164,18 +162,11 @@ impl<'program, 'ctx, 'subqueries, State> LoopConditionEmitter<'program, 'ctx, 's
             condition_fail_target,
             from_outer_join,
             subqueries,
-            _state: PhantomData,
         }
     }
-}
 
-impl<'program, 'ctx, 'subqueries>
-    LoopConditionEmitter<'program, 'ctx, 'subqueries, PendingEarlyConditions>
-{
-    fn emit_early_conditions(
-        self,
-    ) -> Result<LoopConditionEmitter<'program, 'ctx, 'subqueries, PendingCorrelatedSubqueries>>
-    {
+    /// Emit predicates that do not depend on subquery result registers.
+    fn emit_early_conditions(&mut self) -> Result<()> {
         emit_conditions(
             self.program,
             self.t_ctx,
@@ -187,27 +178,11 @@ impl<'program, 'ctx, 'subqueries>
             self.from_outer_join,
             self.subqueries,
             SubqueryRefFilter::WithoutSubqueryRefs,
-        )?;
-        Ok(LoopConditionEmitter::new(
-            self.program,
-            self.t_ctx,
-            self.table_references,
-            self.join_order,
-            self.predicates,
-            self.join_index,
-            self.condition_fail_target,
-            self.from_outer_join,
-            self.subqueries,
-        ))
+        )
     }
-}
 
-impl<'program, 'ctx, 'subqueries>
-    LoopConditionEmitter<'program, 'ctx, 'subqueries, PendingCorrelatedSubqueries>
-{
-    fn emit_correlated_subqueries(
-        self,
-    ) -> Result<LoopConditionEmitter<'program, 'ctx, 'subqueries, PendingLateConditions>> {
+    /// Materialize correlated subqueries that become valid at this loop depth.
+    fn emit_correlated_subqueries(&mut self) -> Result<()> {
         emit_correlated_subqueries(
             self.program,
             &self.t_ctx.resolver,
@@ -217,25 +192,11 @@ impl<'program, 'ctx, 'subqueries>
             self.predicates,
             self.subqueries,
             self.from_outer_join,
-        )?;
-        Ok(LoopConditionEmitter::new(
-            self.program,
-            self.t_ctx,
-            self.table_references,
-            self.join_order,
-            self.predicates,
-            self.join_index,
-            self.condition_fail_target,
-            self.from_outer_join,
-            self.subqueries,
-        ))
+        )
     }
-}
 
-impl<'program, 'ctx, 'subqueries>
-    LoopConditionEmitter<'program, 'ctx, 'subqueries, PendingLateConditions>
-{
-    fn emit_late_conditions(self) -> Result<()> {
+    /// Emit predicates that read registers populated by correlated subqueries.
+    fn emit_late_conditions(&mut self) -> Result<()> {
         emit_conditions(
             self.program,
             self.t_ctx,
@@ -249,32 +210,10 @@ impl<'program, 'ctx, 'subqueries>
             SubqueryRefFilter::WithSubqueryRefs,
         )
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_conditions_with_subqueries(
-    program: &mut ProgramBuilder,
-    t_ctx: &TranslateCtx<'_>,
-    table_references: &TableReferences,
-    join_order: &[JoinOrderMember],
-    predicates: &[WhereTerm],
-    join_index: usize,
-    condition_fail_target: BranchOffset,
-    from_outer_join: bool,
-    subqueries: &mut [NonFromClauseSubquery],
-) -> Result<()> {
-    LoopConditionEmitter::<PendingEarlyConditions>::new(
-        program,
-        t_ctx,
-        table_references,
-        join_order,
-        predicates,
-        join_index,
-        condition_fail_target,
-        from_outer_join,
-        subqueries,
-    )
-    .emit_early_conditions()?
-    .emit_correlated_subqueries()?
-    .emit_late_conditions()
+    pub(super) fn emit(mut self) -> Result<()> {
+        self.emit_early_conditions()?;
+        self.emit_correlated_subqueries()?;
+        self.emit_late_conditions()
+    }
 }

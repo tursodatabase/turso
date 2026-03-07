@@ -9,7 +9,6 @@ pub(super) fn emit_multi_index_scan_loop(
     multi_idx_op: &MultiIndexScanOp,
     loop_start: BranchOffset,
     loop_end: BranchOffset,
-    _next: BranchOffset,
 ) -> Result<()> {
     let table_cursor_id = program.resolve_cursor_id(&CursorKey::table(table.internal_id));
     let rowid_reg = program.alloc_register();
@@ -62,7 +61,7 @@ pub(super) fn emit_multi_index_scan_loop(
             .max(seek_def.size(&seek_def.end))
             .max(1);
         let key_start_reg = program.alloc_registers(max_key_regs);
-        emit_seek(
+        SeekEmitter::new(
             program,
             table_references,
             seek_def,
@@ -71,19 +70,8 @@ pub(super) fn emit_multi_index_scan_loop(
             key_start_reg,
             branch_loop_end,
             branch.index.as_ref(),
-            false,
-        )?;
-        emit_seek_termination(
-            program,
-            table_references,
-            seek_def,
-            t_ctx,
-            branch_cursor_id,
-            key_start_reg,
-            branch_loop_start,
-            branch_loop_end,
-            branch.index.as_ref(),
-        )?;
+        )
+        .emit(branch_loop_start, false)?;
 
         if is_index {
             program.emit_insn(Insn::IdxRowId {

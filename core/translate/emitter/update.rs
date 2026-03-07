@@ -20,7 +20,7 @@ use crate::{
             emit_fk_child_update_counters, emit_fk_update_parent_actions, fire_fk_update_actions,
             stabilize_new_row_for_fk, ForeignKeyActions,
         },
-        main_loop::{close_loop, init_loop, open_loop},
+        main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             EvalAt, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Operation,
             QueryDestination, ResultSetColumn, Scan, Search, SelectPlan, TableReferences,
@@ -201,12 +201,12 @@ pub fn emit_program_for_update(
     }
 
     // Initialize the main loop
-    init_loop(
+    InitLoop::emit(
         program,
         &mut t_ctx,
         &plan.table_references,
         &mut [],
-        mode.clone(),
+        &mode,
         &plan.where_clause,
         &join_order,
         &mut plan.non_from_clause_subqueries,
@@ -242,7 +242,7 @@ pub fn emit_program_for_update(
     }
 
     // Open the main loop
-    open_loop(
+    OpenLoop::emit(
         program,
         &mut t_ctx,
         &plan.table_references,
@@ -346,7 +346,7 @@ pub fn emit_program_for_update(
     )?;
 
     // Close the main loop
-    close_loop(
+    CloseLoop::emit(
         program,
         &mut t_ctx,
         &plan.table_references,

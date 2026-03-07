@@ -9,9 +9,9 @@ use crate::{
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
             OperationMode, ResultSetColumn, TableMask, TranslateCtx,
         },
-        group_by::{group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByRowSource},
-        main_loop::{close_loop, emit_loop, init_distinct, init_loop, open_loop},
-        order_by::{emit_order_by, init_order_by},
+        group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
+        main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
+        order_by::EmitOrderBy,
         plan::{
             Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember, Operation,
             QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
@@ -20,7 +20,7 @@ use crate::{
         select::emit_simple_count,
         subquery::{emit_from_clause_subqueries, emit_non_from_clause_subquery},
         values::emit_values,
-        window::{emit_window_results, init_window},
+        window::{emit_window_results, EmitWindow},
         ProgramBuilder, Resolver,
     },
     vdbe::insn::Insn,
@@ -149,7 +149,7 @@ pub fn emit_query<'a>(
 
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
-        init_order_by(
+        EmitOrderBy::init(
             program,
             t_ctx,
             &plan.result_columns,
@@ -163,7 +163,7 @@ pub fn emit_query<'a>(
 
     if has_group_by_exprs {
         if let Some(ref group_by) = plan.group_by {
-            init_group_by(
+            EmitGroupBy::init(
                 program,
                 t_ctx,
                 group_by,
@@ -178,7 +178,7 @@ pub fn emit_query<'a>(
         // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
         t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
     } else if let Some(window) = &plan.window {
-        init_window(
+        EmitWindow::init(
             program,
             t_ctx,
             window,
@@ -215,13 +215,12 @@ pub fn emit_query<'a>(
             target_pc: after_main_loop_label,
         });
     }
-
-    init_loop(
+    InitLoop::emit(
         program,
         t_ctx,
         &plan.table_references,
         &mut plan.aggregates,
-        OperationMode::SELECT,
+        &OperationMode::SELECT,
         &plan.where_clause,
         &plan.join_order,
         &mut plan.non_from_clause_subqueries,
@@ -238,7 +237,7 @@ pub fn emit_query<'a>(
     }
 
     // Set up main query execution loop
-    open_loop(
+    OpenLoop::emit(
         program,
         t_ctx,
         &plan.table_references,
@@ -250,10 +249,10 @@ pub fn emit_query<'a>(
     )?;
 
     // Process result columns and expressions in the inner loop
-    emit_loop(program, t_ctx, plan)?;
+    LoopBodyEmitter::emit(program, t_ctx, plan)?;
 
     // Clean up and close the main execution loop
-    close_loop(
+    CloseLoop::emit(
         program,
         t_ctx,
         &plan.table_references,
@@ -287,7 +286,7 @@ pub fn emit_query<'a>(
 
     // Process ORDER BY results if needed
     if !order_by.is_empty() && order_by_necessary {
-        emit_order_by(program, t_ctx, plan)?;
+        EmitOrderBy::emit(program, t_ctx, plan)?;
     }
 
     Ok(t_ctx.reg_result_cols_start.unwrap())

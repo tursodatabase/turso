@@ -12,7 +12,7 @@ use super::{
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::{constraints::BinaryExprSide, Optimizable},
-    order_by::{order_by_sorter_insert, sorter_insert},
+    order_by::sorter_insert,
     plan::{
         Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, IterationDirection,
         JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery, Operation,
@@ -30,7 +30,6 @@ use crate::{
         planner::{table_mask_from_expr, TableMask},
         result_row::emit_select_result,
         subquery::emit_non_from_clause_subquery,
-        window::emit_window_loop_source,
     },
     turso_assert, turso_assert_eq,
     types::SeekOp,
@@ -56,16 +55,16 @@ mod hash;
 mod init;
 mod multi_index;
 mod open;
+mod seek;
 
-pub(crate) use body::emit_loop;
 use body::emit_unmatched_row_conditions_and_loop;
-pub(crate) use close::close_loop;
-use close::{emit_autoindex, emit_seek, emit_seek_termination, AutoIndexResult};
-use conditions::emit_conditions_with_subqueries;
-use hash::emit_hash_build_phase;
-pub(crate) use init::{init_distinct, init_loop};
+pub(crate) use body::LoopBodyEmitter;
+pub(crate) use close::CloseLoop;
+use close::{emit_autoindex, AutoIndexResult};
+pub(crate) use init::{init_distinct, InitLoop};
 use multi_index::emit_multi_index_scan_loop;
-pub(crate) use open::open_loop;
+pub(crate) use open::OpenLoop;
+use seek::SeekEmitter;
 
 #[derive(Debug)]
 pub struct LeftJoinMetadata {

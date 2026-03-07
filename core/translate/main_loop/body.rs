@@ -1,5 +1,6 @@
+use crate::translate::{order_by::EmitOrderBy, window::EmitWindow};
+
 use super::*;
-use std::marker::PhantomData;
 
 /// SQLite (and so Turso) processes joins as a nested loop.
 /// The loop may emit rows to various destinations depending on the query:
@@ -24,24 +25,36 @@ pub fn emit_loop<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
 ) -> Result<()> {
-    LoopBodyEmitter::<PendingAntiJoinResolution>::new(program, t_ctx, plan)
-        .resolve_anti_join_entry()
-        .emit()
+    LoopBodyEmitter::emit(program, t_ctx, plan)
 }
 
-struct PendingAntiJoinResolution;
-struct ReadyToEmit;
+/// Emits the select-loop body.
+pub struct LoopBodyEmitter;
 
-struct LoopBodyEmitter<'program, 'ctx, 'plan, State> {
-    program: &'program mut ProgramBuilder,
+/// Internal state for loop-body emission.
+///
+/// The body has one non-obvious ordering rule: anti-join body entry must be
+/// resolved before any body instructions are emitted, otherwise relocated
+/// constants can make the backward jump land incorrectly.
+struct LoopBody<'prog, 'ctx, 'plan> {
+    program: &'prog mut ProgramBuilder,
     t_ctx: &'ctx mut TranslateCtx<'plan>,
     plan: &'plan SelectPlan,
-    _state: PhantomData<State>,
 }
 
-impl<'program, 'ctx, 'plan, State> LoopBodyEmitter<'program, 'ctx, 'plan, State> {
-    fn new(
-        program: &'program mut ProgramBuilder,
+impl LoopBodyEmitter {
+    pub fn emit<'a>(
+        program: &mut ProgramBuilder,
+        t_ctx: &mut TranslateCtx<'a>,
+        plan: &'a SelectPlan,
+    ) -> Result<()> {
+        LoopBody::new(program, t_ctx, plan).emit()
+    }
+}
+
+impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
+    const fn new(
+        program: &'prog mut ProgramBuilder,
         t_ctx: &'ctx mut TranslateCtx<'plan>,
         plan: &'plan SelectPlan,
     ) -> Self {
@@ -49,13 +62,11 @@ impl<'program, 'ctx, 'plan, State> LoopBodyEmitter<'program, 'ctx, 'plan, State>
             program,
             t_ctx,
             plan,
-            _state: PhantomData,
         }
     }
-}
 
-impl<'program, 'ctx, 'plan> LoopBodyEmitter<'program, 'ctx, 'plan, PendingAntiJoinResolution> {
-    fn resolve_anti_join_entry(self) -> LoopBodyEmitter<'program, 'ctx, 'plan, ReadyToEmit> {
+    /// Resolve the final anti-join body target before any row-emission logic runs.
+    fn resolve_anti_join_entry(&mut self) {
         // The innermost anti-join body entry must be resolved before any row
         // emission target is chosen, otherwise the late jump back into the body
         // can land on the wrong relocated instruction.
@@ -72,21 +83,9 @@ impl<'program, 'ctx, 'plan> LoopBodyEmitter<'program, 'ctx, 'plan, PendingAntiJo
                 }
             }
         }
-
-        LoopBodyEmitter::new(self.program, self.t_ctx, self.plan)
-    }
-}
-
-impl<'program, 'ctx, 'plan> LoopBodyEmitter<'program, 'ctx, 'plan, ReadyToEmit> {
-    fn emit(self) -> Result<()> {
-        emit_loop_source(
-            self.program,
-            self.t_ctx,
-            self.plan,
-            self.select_emit_target(),
-        )
     }
 
+    /// Choose the row-consumption target for the already-open main loop.
     fn select_emit_target(&self) -> LoopEmitTarget {
         if self
             .plan
@@ -106,6 +105,17 @@ impl<'program, 'ctx, 'plan> LoopBodyEmitter<'program, 'ctx, 'plan, ReadyToEmit> 
             return LoopEmitTarget::OrderBySorter;
         }
         LoopEmitTarget::QueryResult
+    }
+
+    /// Emit the loop body once all required entry labels are fixed.
+    fn emit(mut self) -> Result<()> {
+        self.resolve_anti_join_entry();
+        emit_loop_source(
+            self.program,
+            self.t_ctx,
+            self.plan,
+            self.select_emit_target(),
+        )
     }
 }
 
@@ -198,7 +208,7 @@ fn emit_loop_source<'a>(
             Ok(())
         }
         LoopEmitTarget::OrderBySorter => {
-            order_by_sorter_insert(program, t_ctx, plan)?;
+            EmitOrderBy::sorter_insert(program, t_ctx, plan)?;
 
             if let Distinctness::Distinct { ctx } = &plan.distinctness {
                 let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
@@ -347,7 +357,7 @@ fn emit_loop_source<'a>(
             Ok(())
         }
         LoopEmitTarget::Window => {
-            emit_window_loop_source(program, t_ctx, plan)?;
+            EmitWindow::emit_window_loop_source(program, t_ctx, plan)?;
 
             Ok(())
         }
