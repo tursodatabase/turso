@@ -126,6 +126,11 @@ pub fn normalize_ident(identifier: &str) -> String {
     identifier.to_lowercase()
 }
 
+/// Escape a SQL string literal payload for safe interpolation inside single quotes.
+pub fn escape_sql_string_literal(literal: &str) -> String {
+    literal.replace('\'', "''")
+}
+
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 
 /// Unparsed index that comes from a sql query, i.e not an automatic index

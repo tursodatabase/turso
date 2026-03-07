@@ -21,7 +21,7 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
-    normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
+    escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
     trim_ascii_whitespace,
@@ -9421,6 +9421,7 @@ pub fn op_init_cdc_version(
     );
 
     let conn = program.connection.clone();
+    let escaped_cdc_table_name = escape_sql_string_literal(cdc_table_name);
 
     // "off" — disable CDC (table and version entry are preserved)
     if CaptureDataChangesInfo::parse(cdc_mode, None)?.is_none() {
@@ -9447,7 +9448,7 @@ pub fn op_init_cdc_version(
     let cdc_table_exists = {
         conn.start_nested();
         let mut stmt = conn.prepare(format!(
-            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{cdc_table_name}'",
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
         ))?;
         stmt.program
             .prepared
@@ -9504,7 +9505,7 @@ pub fn op_init_cdc_version(
     {
         conn.start_nested();
         let mut stmt = conn.prepare(format!(
-            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{cdc_table_name}', '{version_to_insert}')",
+            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
         ))?;
         stmt.program
             .prepared
@@ -9520,7 +9521,7 @@ pub fn op_init_cdc_version(
     let actual_version = {
         conn.start_nested();
         let mut stmt = conn.prepare(format!(
-            "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{cdc_table_name}'",
+            "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
         ))?;
         stmt.program
             .prepared
@@ -10815,11 +10816,12 @@ pub fn op_add_column(
     );
 
     let conn = program.connection.clone();
+    let normalized_table_name = normalize_ident(table.as_str());
 
     conn.with_database_schema_mut(*db, |schema| {
         let table_ref = schema
             .tables
-            .get_mut(table)
+            .get_mut(&normalized_table_name)
             .expect("table being altered should be in schema");
 
         let table_ref = Arc::make_mut(table_ref);
