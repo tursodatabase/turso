@@ -1,5 +1,6 @@
 use std::fmt::Write;
 use std::iter::{repeat_n, Peekable};
+use std::num::NonZeroUsize;
 use std::str;
 use std::str::Chars;
 
@@ -547,6 +548,33 @@ fn format_fixed_from_digits(abs_f: f64, precision: usize, max_sig: usize) -> Str
     }
 
     result
+}
+
+/// SQLite's round(X,Y) for Y>0 formats with `%!.*f` and parses back to float.
+/// Reuse the same `%f` decimal path here so round() matches SQLite tie-breaking.
+pub(crate) fn round_half_away_from_zero(value: f64, precision: NonZeroUsize) -> f64 {
+    let precision = precision.get();
+    assert!(
+        precision <= 30,
+        "ROUND precision should be clamped to <= 30"
+    );
+
+    let mut formatted =
+        ensure_decimal_strip_zeros(&format_fixed_from_digits(value.abs(), precision, 26));
+
+    if value.is_sign_negative() {
+        formatted.insert(0, '-');
+    }
+
+    let rounded: f64 = crate::numeric::str_to_f64(formatted)
+        .expect("formatted float should always parse successfully")
+        .into();
+
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
 }
 
 /// Limit a formatted numeric string to `max_sig` significant digits, rounding
