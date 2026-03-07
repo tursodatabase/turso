@@ -14,6 +14,7 @@ All standard aggregate functions ignore NULL values (except `count(*)`). If ever
 
 | Function | Return Type | Description |
 |----------|-------------|-------------|
+| `array_agg(X)` | BLOB (array) | Collects all values of X into an array (Turso extension) |
 | `avg(X)` | REAL | Average of all non-NULL values of X |
 | `count(X)` | INTEGER | Count of rows where X is not NULL |
 | `count(*)` | INTEGER | Count of all rows in the group |
@@ -350,6 +351,47 @@ ORDER BY region, id;
 | 3 | South | 150.0 | 150.0 | 3 |
 | 4 | South | NULL | 150.0 | 3 |
 | 6 | South | 175.0 | 325.0 | 3 |
+
+## Turso Extension: array_agg(X)
+
+<Info>
+`array_agg(X)` is a Turso extension and is not part of standard SQLite. It is available by default in Turso without loading any additional extensions.
+</Info>
+
+```sql
+array_agg(X)
+```
+
+Collects all values of X (including NULLs) into an array. Returns NULL if the group is empty.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| X | any | The expression whose values to collect into an array |
+
+**Return type:** BLOB (array)
+
+```sql
+SELECT array_agg(name) FROM users;
+-- ["Alice","Bob","Charlie"]
+
+SELECT department, array_agg(name) FROM employees GROUP BY department;
+```
+
+| department | array_agg(name) |
+|------------|-----------------|
+| Engineering | ["Alice","Bob"] |
+| Sales | ["Charlie","Diana","Eve"] |
+
+```sql
+-- Control ordering with a subquery
+SELECT array_agg(name) FROM (SELECT name FROM users ORDER BY name);
+
+-- Combine with array_length
+SELECT array_length(array_agg(name)) FROM users;
+-- 3
+```
+
+For more array functions, see [Array Functions](/docs/sql-reference/functions/array).
 
 ## Turso Extension: stddev(X)
 

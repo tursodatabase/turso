@@ -281,6 +281,7 @@ impl SimValue {
             ast::Operator::Or => self.0.exec_or(&other.0).into(),
             ast::Operator::RightShift => self.0.exec_shift_right(&other.0).into(),
             ast::Operator::Subtract => self.0.exec_subtract(&other.0).into(),
+            ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => todo!(),
         }
     }
 

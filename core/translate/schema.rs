@@ -773,6 +773,16 @@ fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) 
                     _ => false,
                 });
 
+                // Array columns require STRICT tables because the encode/decode
+                // pipeline is only emitted for STRICT tables.
+                if col_type.is_array() && !is_strict {
+                    bail_parse_error!(
+                        "array type columns require STRICT tables: {}.{}",
+                        table_name,
+                        c.col_name
+                    );
+                }
+
                 if !is_builtin && is_strict {
                     // On non-STRICT tables any type name is allowed and is
                     // treated as a plain affinity hint (no encode/decode).

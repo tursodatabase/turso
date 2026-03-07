@@ -1,0 +1,661 @@
+---
+title: Array Functions
+description: Create, manipulate, and query array values
+sidebarTitle: Array
+---
+
+# Array Functions
+
+<Info>
+**Turso Extension**: Array types and functions are a Turso-specific feature for working with ordered collections directly in SQL. These functions are not part of the SQLite standard. Array columns require [STRICT tables](/docs/sql-reference/statements/create-table#strict-tables).
+</Info>
+
+Turso provides built-in support for array columns and a set of functions for constructing, querying, and transforming arrays. Arrays are stored internally as compact record-format BLOBs and displayed as JSON arrays on output.
+
+---
+
+## Array Construction
+
+### ARRAY[] Literal
+
+Constructs an array from a list of expressions.
+
+```sql
+ARRAY[expr1, expr2, ...]
+```
+
+```sql
+SELECT ARRAY[1, 2, 3];
+-- [1,2,3]
+
+SELECT ARRAY['hello', 'world'];
+-- ["hello","world"]
+
+SELECT ARRAY[];
+-- []
+```
+
+Arrays can also be inserted as JSON text:
+
+```sql
+CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
+
+INSERT INTO t VALUES (1, ARRAY['a', 'b', 'c']);
+INSERT INTO t VALUES (2, '["x", "y", "z"]');
+
+SELECT tags FROM t ORDER BY id;
+-- ["a","b","c"]
+-- ["x","y","z"]
+```
+
+### string_to_array
+
+Splits a string into an array using a delimiter.
+
+```sql
+string_to_array(text, delimiter)
+string_to_array(text, delimiter, null_string)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `text` | TEXT | The string to split |
+| `delimiter` | TEXT | The delimiter to split on. If NULL, splits into individual characters |
+| `null_string` | TEXT | Optional. Elements matching this string are replaced with NULL |
+
+**Returns:** BLOB -- an array value.
+
+```sql
+SELECT string_to_array('one,two,three', ',');
+-- ["one","two","three"]
+
+SELECT string_to_array('hello', NULL);
+-- ["h","e","l","l","o"]
+
+SELECT string_to_array('a,NULL,b', ',', 'NULL');
+-- ["a",null,"b"]
+```
+
+---
+
+## Element Access
+
+### Subscript Operator []
+
+Access individual elements using zero-based indexing. Returns NULL for out-of-bounds or negative indices.
+
+```sql
+array_expr[index]
+```
+
+```sql
+CREATE TABLE t (id INTEGER PRIMARY KEY, items TEXT[]) STRICT;
+INSERT INTO t VALUES (1, '["first", "second", "third"]');
+
+SELECT items[0], items[1], items[2] FROM t;
+-- first|second|third
+
+SELECT items[100] FROM t;
+-- NULL
+
+SELECT items[-1] FROM t;
+-- NULL
+```
+
+Subscripts can be chained for multi-dimensional arrays:
+
+```sql
+CREATE TABLE m (id INTEGER PRIMARY KEY, matrix INTEGER[][]) STRICT;
+INSERT INTO m VALUES (1, ARRAY[ARRAY[1,2], ARRAY[3,4]]);
+
+SELECT matrix[0][1] FROM m;
+-- 2
+
+SELECT matrix[1][0] FROM m;
+-- 3
+```
+
+### Slice Operator [start:end]
+
+Extract a sub-array using half-open range `[start, end)`.
+
+```sql
+array_expr[start:end]
+```
+
+```sql
+CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
+INSERT INTO t VALUES (1, ARRAY['a','b','c','d']);
+
+SELECT tags[1:3] FROM t;
+-- ["b","c"]
+```
+
+---
+
+## Scalar Functions
+
+### array_length
+
+Returns the number of elements in an array.
+
+```sql
+array_length(array)
+array_length(array, dimension)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array` | BLOB/TEXT | The array to measure |
+| `dimension` | INTEGER | Optional. Currently only dimension 1 is supported |
+
+**Returns:** INTEGER -- the number of elements. NULL if the input is NULL.
+
+```sql
+SELECT array_length(ARRAY[10, 20, 30]);
+-- 3
+
+SELECT array_length('[]');
+-- 0
+
+SELECT array_length(NULL);
+-- NULL
+```
+
+### array_append
+
+Appends an element to the end of an array.
+
+```sql
+array_append(array, element)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array` | BLOB/TEXT | The array to append to. If NULL, a new single-element array is created |
+| `element` | any | The element to append |
+
+**Returns:** BLOB -- a new array with the element appended.
+
+```sql
+SELECT array_append('[1, 2]', 3);
+-- [1,2,3]
+
+SELECT array_append('[]', 'x');
+-- ["x"]
+
+SELECT array_append(NULL, 'x');
+-- ["x"]
+```
+
+### array_prepend
+
+Prepends an element to the beginning of an array.
+
+```sql
+array_prepend(element, array)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `element` | any | The element to prepend |
+| `array` | BLOB/TEXT | The array to prepend to |
+
+**Returns:** BLOB -- a new array with the element prepended.
+
+```sql
+SELECT array_prepend('z', '["a", "b"]');
+-- ["z","a","b"]
+```
+
+### array_cat
+
+Concatenates two arrays.
+
+```sql
+array_cat(array1, array2)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array1` | BLOB/TEXT | The first array |
+| `array2` | BLOB/TEXT | The second array |
+
+**Returns:** BLOB -- a new array containing all elements from both arrays.
+
+```sql
+SELECT array_cat('[1, 2]', '[3, 4]');
+-- [1,2,3,4]
+
+SELECT array_cat('[]', '[1, 2]');
+-- [1,2]
+```
+
+The `||` operator also works for array concatenation:
+
+```sql
+CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
+INSERT INTO t VALUES (1, ARRAY['a', 'b']);
+
+-- Append element
+SELECT tags || 'c' FROM t;
+-- ["a","b","c"]
+
+-- Prepend element
+SELECT 'z' || tags FROM t;
+-- ["z","a","b"]
+
+-- Concatenate arrays
+SELECT tags || ARRAY['x', 'y'] FROM t;
+-- ["a","b","x","y"]
+```
+
+### array_remove
+
+Removes all occurrences of an element from an array.
+
+```sql
+array_remove(array, element)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array` | BLOB/TEXT | The array to remove from |
+| `element` | any | The element to remove |
+
+**Returns:** BLOB -- a new array with all occurrences of the element removed.
+
+```sql
+SELECT array_remove('[1, 2, 3, 2, 1]', 2);
+-- [1,3,1]
+
+SELECT array_remove('[1, 2, 3]', 99);
+-- [1,2,3]
+```
+
+### array_contains
+
+Tests whether an array contains a specific element.
+
+```sql
+array_contains(array, element)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array` | BLOB/TEXT | The array to search |
+| `element` | any | The element to search for |
+
+**Returns:** INTEGER -- 1 if found, 0 if not found.
+
+```sql
+SELECT array_contains('[1, 2, 3]', 2);
+-- 1
+
+SELECT array_contains('[1, 2, 3]', 5);
+-- 0
+```
+
+### array_position
+
+Returns the zero-based index of the first occurrence of an element.
+
+```sql
+array_position(array, element)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array` | BLOB/TEXT | The array to search |
+| `element` | any | The element to find |
+
+**Returns:** INTEGER -- the zero-based index, or NULL if not found.
+
+```sql
+SELECT array_position('[10, 20, 30]', 20);
+-- 1
+
+SELECT array_position('[10, 20, 30]', 10);
+-- 0
+
+SELECT array_position('[10, 20, 30]', 99);
+-- NULL
+```
+
+### array_slice
+
+Extracts a sub-array by index range.
+
+```sql
+array_slice(array, start, end)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array` | BLOB/TEXT | The source array |
+| `start` | INTEGER | Start index (zero-based, inclusive). NULL means 0 |
+| `end` | INTEGER | End index (exclusive) |
+
+**Returns:** BLOB -- a new array containing elements from `start` to `end - 1`.
+
+```sql
+SELECT array_slice('[1, 2, 3, 4]', 1, 3);
+-- [2,3]
+
+SELECT array_slice('[1, 2, 3, 4]', NULL, 2);
+-- [1,2]
+```
+
+### array_to_string
+
+Joins array elements into a string with a delimiter.
+
+```sql
+array_to_string(array, delimiter)
+array_to_string(array, delimiter, null_string)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array` | BLOB/TEXT | The array to join |
+| `delimiter` | TEXT | The separator between elements |
+| `null_string` | TEXT | Optional. Replacement text for NULL elements. If omitted, NULLs are skipped |
+
+**Returns:** TEXT -- the joined string.
+
+```sql
+SELECT array_to_string('[1, 2, 3]', ',');
+-- 1,2,3
+
+SELECT array_to_string('["hello", "world"]', ' ');
+-- hello world
+
+SELECT array_to_string('[1, null, 3]', ',');
+-- 1,3
+
+SELECT array_to_string('[1, null, 3]', ',', 'N/A');
+-- 1,N/A,3
+```
+
+### array_contains_all
+
+Tests whether one array contains all elements of another.
+
+```sql
+array_contains_all(haystack, needles)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `haystack` | BLOB/TEXT | The array to search in |
+| `needles` | BLOB/TEXT | The array of elements to search for |
+
+**Returns:** INTEGER -- 1 if all elements of `needles` are found in `haystack`, 0 otherwise.
+
+```sql
+SELECT array_contains_all('[1, 2, 3, 4, 5]', '[2, 4]');
+-- 1
+
+SELECT array_contains_all('[1, 2, 3]', '[2, 4]');
+-- 0
+
+SELECT array_contains_all('[1, 2, 3]', '[]');
+-- 1
+```
+
+The `@>` operator is an alias for this function. See [Array Operators](/docs/sql-reference/expressions#array-operators).
+
+### array_overlap
+
+Tests whether two arrays share any common elements.
+
+```sql
+array_overlap(array1, array2)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array1` | BLOB/TEXT | The first array |
+| `array2` | BLOB/TEXT | The second array |
+
+**Returns:** INTEGER -- 1 if any element appears in both arrays, 0 otherwise.
+
+```sql
+SELECT array_overlap('[1, 2, 3]', '[3, 4, 5]');
+-- 1
+
+SELECT array_overlap('[1, 2, 3]', '[4, 5, 6]');
+-- 0
+
+SELECT array_overlap('[]', '[1, 2]');
+-- 0
+```
+
+`array_overlaps` is accepted as an alias. The `&&` operator is also an alias. See [Array Operators](/docs/sql-reference/expressions#array-operators).
+
+---
+
+## Aggregate Function
+
+### array_agg
+
+Collects values from a group of rows into an array.
+
+```sql
+array_agg(expression)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `expression` | any | The value to collect. NULL values are included |
+
+**Returns:** BLOB -- an array containing one element per row in the group. Returns NULL for empty groups.
+
+```sql
+CREATE TABLE t (grp TEXT, val TEXT);
+INSERT INTO t VALUES ('x', 'a'), ('x', 'b'), ('y', 'c'), ('y', 'd'), ('y', 'e');
+
+SELECT grp, array_agg(val) FROM t GROUP BY grp ORDER BY grp;
+```
+
+| grp | array_agg(val) |
+|-----|----------------|
+| x | ["a","b"] |
+| y | ["c","d","e"] |
+
+```sql
+-- Control order with a subquery
+SELECT array_agg(val) FROM (SELECT val FROM t ORDER BY val);
+-- ["a","b","c","d","e"]
+
+-- Combine with array_length
+SELECT array_length(array_agg(val)) FROM t;
+-- 5
+```
+
+---
+
+## Array Operators
+
+### Containment: @>
+
+Tests whether the left array contains all elements of the right array. Equivalent to `array_contains_all(left, right)`.
+
+```sql
+array1 @> array2
+```
+
+```sql
+SELECT ARRAY[1,2,3] @> ARRAY[1,2];
+-- 1
+
+SELECT ARRAY[1,2,3] @> ARRAY[1,4];
+-- 0
+```
+
+### Overlap: &&
+
+Tests whether two arrays share any common elements. Equivalent to `array_overlap(left, right)`.
+
+```sql
+array1 && array2
+```
+
+```sql
+SELECT ARRAY[1,2,3] && ARRAY[3,4,5];
+-- 1
+
+SELECT ARRAY[1,2] && ARRAY[3,4];
+-- 0
+```
+
+### Comparison: =, !=, <, >, <=, >=
+
+Arrays support element-wise comparison. Elements are compared pairwise from left to right; if all compared elements are equal, the shorter array is considered less than the longer one.
+
+```sql
+SELECT ARRAY[1,2,3] = ARRAY[1,2,3];   -- 1
+SELECT ARRAY[1,2] < ARRAY[1,3];       -- 1
+SELECT ARRAY[1,2] < ARRAY[1,2,3];     -- 1 (shorter is less)
+```
+
+### Concatenation: ||
+
+When either operand is an array, `||` performs array concatenation or element append/prepend instead of string concatenation.
+
+```sql
+SELECT ARRAY[1,2] || ARRAY[3,4];  -- [1,2,3,4]  (array + array)
+SELECT ARRAY[1,2] || 3;           -- [1,2,3]    (append element)
+SELECT 0 || ARRAY[1,2];           -- [0,1,2]    (prepend element)
+```
+
+### Using operators in WHERE clauses
+
+```sql
+CREATE TABLE docs (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
+INSERT INTO docs VALUES (1, ARRAY['sql','database','tutorial']);
+INSERT INTO docs VALUES (2, ARRAY['rust','systems']);
+INSERT INTO docs VALUES (3, ARRAY['sql','rust']);
+
+-- Find docs tagged with both 'sql' and 'rust'
+SELECT id FROM docs WHERE tags @> ARRAY['sql','rust'];
+-- 3
+
+-- Find docs with any overlap with a set of tags
+SELECT id FROM docs WHERE tags && ARRAY['database','systems'] ORDER BY id;
+-- 1
+-- 2
+```
+
+---
+
+## Subscript Assignment
+
+Array elements can be updated individually using subscript syntax in UPDATE statements.
+
+```sql
+UPDATE table SET column[index] = value WHERE ...;
+```
+
+```sql
+CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
+INSERT INTO t VALUES (1, ARRAY['a','b','c']);
+
+UPDATE t SET tags[0] = 'X' WHERE id = 1;
+SELECT tags FROM t;
+-- ["X","b","c"]
+
+-- Multiple subscripts in one UPDATE
+UPDATE t SET tags[0] = 'A', tags[2] = 'C' WHERE id = 1;
+SELECT tags FROM t;
+-- ["A","b","C"]
+```
+
+Out-of-bounds assignments are silently ignored (the array is unchanged).
+
+---
+
+## Examples
+
+### Tagging system
+
+```sql
+CREATE TABLE articles (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    tags TEXT[]
+) STRICT;
+
+INSERT INTO articles VALUES (1, 'Getting Started with SQL', ARRAY['sql','beginner','tutorial']);
+INSERT INTO articles VALUES (2, 'Advanced Indexing', ARRAY['sql','performance','advanced']);
+INSERT INTO articles VALUES (3, 'Rust for Systems', ARRAY['rust','systems']);
+
+-- Find articles tagged 'sql'
+SELECT title FROM articles WHERE array_contains(tags, 'sql');
+
+-- Find articles with both 'sql' and 'advanced'
+SELECT title FROM articles WHERE tags @> ARRAY['sql','advanced'];
+-- Advanced Indexing
+
+-- Count tags per article
+SELECT title, array_length(tags) AS tag_count FROM articles;
+
+-- Collect all unique tags
+SELECT array_agg(DISTINCT tag) FROM (
+    SELECT array_to_string(tags, ',') AS tag FROM articles
+);
+```
+
+### Multi-dimensional arrays
+
+```sql
+CREATE TABLE matrices (
+    id INTEGER PRIMARY KEY,
+    data INTEGER[][]
+) STRICT;
+
+INSERT INTO matrices VALUES (1, ARRAY[ARRAY[1,2,3], ARRAY[4,5,6]]);
+
+-- Access a row
+SELECT data[0] FROM matrices WHERE id = 1;
+-- [1,2,3]
+
+-- Access a single element
+SELECT data[1][2] FROM matrices WHERE id = 1;
+-- 6
+
+-- Get number of rows
+SELECT array_length(data) FROM matrices WHERE id = 1;
+-- 2
+```
+
+### Type checking
+
+Array columns in STRICT tables validate element types on insert and update:
+
+```sql
+CREATE TABLE scores (id INTEGER PRIMARY KEY, vals INTEGER[]) STRICT;
+
+-- OK: exact integers
+INSERT INTO scores VALUES (1, '[1, 2, 3]');
+
+-- OK: floats that are exact integers are coerced
+INSERT INTO scores VALUES (2, '[1.0, 2.0]');
+
+-- OK: numeric strings are coerced
+INSERT INTO scores VALUES (3, '["42", "100"]');
+
+-- Error: non-numeric string in INTEGER array
+INSERT INTO scores VALUES (4, '["hello"]');
+-- Error: cannot store TEXT value in INTEGER
+
+-- NULL elements are always allowed
+INSERT INTO scores VALUES (5, '[1, null, 3]');
+```
+
+## See Also
+
+- [Data Types](/docs/sql-reference/data-types#array-types) for array column type declarations
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for STRICT table requirements
+- [Expressions](/docs/sql-reference/expressions#array-operators) for array operator syntax
+- [Aggregate Functions](/docs/sql-reference/functions/aggregate) for `array_agg`

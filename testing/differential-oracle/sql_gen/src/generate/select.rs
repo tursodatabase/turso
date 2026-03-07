@@ -9,7 +9,7 @@ use crate::ast::{
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
-use crate::functions::AGGREGATE_FUNCTIONS;
+use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory};
 use crate::generate::expr::generate_condition;
 use crate::generate::expr::generate_expr;
 use crate::generate::literal::generate_literal;
@@ -378,9 +378,18 @@ fn generate_group_by_clause<C: Capabilities>(
 }
 
 /// Generate an aggregate function call on a random column.
+///
+/// Array aggregate functions (e.g. ARRAY_AGG) are excluded by default since
+/// they are Turso-only and not supported by SQLite. They are only included
+/// when array support is explicitly enabled.
 fn generate_aggregate_call(ctx: &mut Context) -> Result<Expr, GenError> {
+    // Filter out array aggregate functions — they are Turso-only
+    let allowed: Vec<_> = AGGREGATE_FUNCTIONS
+        .iter()
+        .filter(|f| f.category != FunctionCategory::Array)
+        .collect();
     let func = ctx
-        .choose(AGGREGATE_FUNCTIONS)
+        .choose(&allowed)
         .ok_or_else(|| GenError::schema_empty("aggregate_functions"))?;
 
     // Pick a column from scoped tables, with qualifier when multi-table

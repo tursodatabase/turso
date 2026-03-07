@@ -69,7 +69,7 @@ impl<T: Write> TokenStream for WriteTokenStream<'_, T> {
     fn append(&mut self, ty: TokenType, value: Option<&str>) -> fmt::Result {
         if !self.spaced {
             match ty {
-                TK_COMMA | TK_SEMI | TK_RP | TK_DOT => {}
+                TK_COMMA | TK_SEMI | TK_RP | TK_DOT | TK_LBRACKET | TK_RBRACKET => {}
                 _ => {
                     self.write.write_char(' ')?;
                     self.spaced = true;
@@ -90,7 +90,8 @@ impl<T: Write> TokenStream for WriteTokenStream<'_, T> {
             (_, ty_str, value) => {
                 if let Some(str) = ty_str {
                     self.write.write_str(str)?;
-                    self.spaced = ty == TK_LP || ty == TK_DOT; // str should not be whitespace
+                    self.spaced = ty == TK_LP || ty == TK_DOT || ty == TK_LBRACKET;
+                    // str should not be whitespace
                 }
 
                 if let Some(str) = value {
@@ -1007,6 +1008,18 @@ impl ToTokens for Expr {
                 Some(_) => s.append(TK_VARIABLE, Some(&("?".to_owned() + var))),
                 None => s.append(TK_VARIABLE, Some("?")),
             },
+            Self::Array { elements } => {
+                s.append(TK_ID, Some("ARRAY"))?;
+                s.append(TK_LBRACKET, None)?;
+                comma(elements, s, context)?;
+                s.append(TK_RBRACKET, None)
+            }
+            Self::Subscript { base, index } => {
+                base.to_tokens(s, context)?;
+                s.append(TK_LBRACKET, None)?;
+                index.to_tokens(s, context)?;
+                s.append(TK_RBRACKET, None)
+            }
         }
     }
 }
@@ -1086,6 +1099,8 @@ impl ToTokens for Operator {
             Self::Or => s.append(TK_OR, None),
             Self::RightShift => s.append(TK_RSHIFT, None),
             Self::Subtract => s.append(TK_MINUS, None),
+            Self::ArrayContains => s.append(TK_ARRAY_CONTAINS, None),
+            Self::ArrayOverlap => s.append(TK_ARRAY_OVERLAP, None),
         }
     }
 }
@@ -2273,14 +2288,19 @@ impl ToTokens for Type {
         context: &C,
     ) -> Result<(), S::Error> {
         match self.size {
-            None => s.append(TK_ID, Some(&self.name)),
+            None => s.append(TK_ID, Some(&self.name))?,
             Some(ref size) => {
                 s.append(TK_ID, Some(&self.name))?; // TODO check there is no forbidden chars
                 s.append(TK_LP, None)?;
                 size.to_tokens(s, context)?;
-                s.append(TK_RP, None)
+                s.append(TK_RP, None)?;
             }
         }
+        for _ in 0..self.array_dimensions {
+            s.append(TK_LBRACKET, None)?;
+            s.append(TK_RBRACKET, None)?;
+        }
+        Ok(())
     }
 }
 

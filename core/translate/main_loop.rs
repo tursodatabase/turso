@@ -3143,7 +3143,7 @@ fn encode_seek_keys_for_custom_types(
         };
         let reg = start_reg + i;
         let skip_label = program.allocate_label();
-        program.emit_insn(crate::vdbe::insn::Insn::IsNull {
+        program.emit_insn(Insn::IsNull {
             reg,
             target_pc: skip_label,
         });

@@ -1963,6 +1963,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             b"GROUP_CONCAT" => Some(AggFunc::GroupConcat),
             b"STRING_AGG" => Some(AggFunc::StringAgg),
             b"TOTAL" => Some(AggFunc::Total),
+            b"ARRAY_AGG" => Some(AggFunc::ArrayAgg),
             _ => None,
         })
     }
@@ -2386,6 +2387,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 AggFunc::Sum | AggFunc::Avg | AggFunc::Total => Ok(Type::Real),
                 AggFunc::Min | AggFunc::Max => Ok(Type::Text),
                 AggFunc::GroupConcat | AggFunc::StringAgg => Ok(Type::Text),
+                AggFunc::ArrayAgg => Ok(Type::Blob),
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray
                 | AggFunc::JsonGroupArray

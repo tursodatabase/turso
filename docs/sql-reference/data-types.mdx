@@ -165,6 +165,42 @@ INSERT INTO events VALUES (
 
 For the full custom types reference including ENCODE/DECODE, operators, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
 
+## Array Types
+
+<Info>
+**Turso Extension**: Array types are a Turso-specific feature not available in SQLite. Array columns work only with STRICT tables.
+</Info>
+
+Array columns store ordered collections of values. Declare them by appending `[]` to any base type name:
+
+```sql
+CREATE TABLE sensors (
+    id INTEGER PRIMARY KEY,
+    readings REAL[],
+    labels TEXT[],
+    flags INTEGER[]
+) STRICT;
+```
+
+Multi-dimensional arrays are supported with multiple bracket pairs:
+
+```sql
+CREATE TABLE matrices (
+    id INTEGER PRIMARY KEY,
+    data INTEGER[][]
+) STRICT;
+```
+
+Arrays can be inserted using the `ARRAY[...]` constructor or as JSON text:
+
+```sql
+INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], '["a","b"]', '[0, 1, 1]');
+```
+
+Arrays are displayed as JSON arrays on output. Element types are validated against the declared base type — for example, an `INTEGER[]` column rejects non-numeric text elements.
+
+For the full set of array functions, operators, and subscript syntax, see [Array Functions](/docs/sql-reference/functions/array).
+
 ### Inspecting Types
 
 List all available types (built-in and custom):
@@ -204,5 +240,6 @@ SELECT NULL IS NULL;    -- 1 (use IS to test for NULL)
 
 - [CREATE TABLE](/docs/sql-reference/statements/create-table) for column definitions and constraints
 - [CREATE TYPE](/docs/sql-reference/statements/create-type) for custom type definitions
+- [Array Functions](/docs/sql-reference/functions/array) for array construction, manipulation, and operators
 - [Expressions](/docs/sql-reference/expressions) for CAST expressions and type conversions
 - [Compatibility](/docs/sql-reference/compatibility) for differences from SQLite

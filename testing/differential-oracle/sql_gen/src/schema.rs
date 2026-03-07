@@ -12,6 +12,29 @@ pub enum DataType {
     Text,
     Blob,
     Null,
+    IntegerArray,
+    RealArray,
+    TextArray,
+}
+
+impl DataType {
+    /// Returns true if this is an array type.
+    pub fn is_array(&self) -> bool {
+        matches!(
+            self,
+            DataType::IntegerArray | DataType::RealArray | DataType::TextArray
+        )
+    }
+
+    /// Returns the element type for array types, or None for scalars.
+    pub fn array_element_type(&self) -> Option<DataType> {
+        match self {
+            DataType::IntegerArray => Some(DataType::Integer),
+            DataType::RealArray => Some(DataType::Real),
+            DataType::TextArray => Some(DataType::Text),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for DataType {
@@ -22,6 +45,9 @@ impl fmt::Display for DataType {
             DataType::Text => write!(f, "TEXT"),
             DataType::Blob => write!(f, "BLOB"),
             DataType::Null => write!(f, "NULL"),
+            DataType::IntegerArray => write!(f, "INTEGER[]"),
+            DataType::RealArray => write!(f, "REAL[]"),
+            DataType::TextArray => write!(f, "TEXT[]"),
         }
     }
 }
@@ -151,7 +177,12 @@ impl Table {
     pub fn filterable_columns(&self) -> impl Iterator<Item = &ColumnDef> {
         self.columns
             .iter()
-            .filter(|c| c.data_type != DataType::Blob)
+            .filter(|c| c.data_type != DataType::Blob && !c.data_type.is_array())
+    }
+
+    /// Returns only array-typed columns.
+    pub fn array_columns(&self) -> impl Iterator<Item = &ColumnDef> {
+        self.columns.iter().filter(|c| c.data_type.is_array())
     }
 
     /// Returns columns with a specific data type.
