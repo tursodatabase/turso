@@ -1,4 +1,5 @@
 use super::TranslateCtx;
+use crate::translate::insert::halt_desc_and_on_error;
 use crate::{
     ast,
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -1199,7 +1200,7 @@ fn emit_update_insns<'a>(
                         target_pc: skip_row_label,
                     });
                 }
-                ResolveType::Abort | ResolveType::Fail | ResolveType::Rollback => {
+                ResolveType::Fail | ResolveType::Rollback | ResolveType::Abort => {
                     // Halt with UNIQUE constraint error
                     let column_names = index.columns.iter().enumerate().fold(
                         String::with_capacity(50),
@@ -1213,10 +1214,15 @@ fn emit_update_insns<'a>(
                             accum
                         },
                     );
+                    let (description, on_error) = halt_desc_and_on_error(
+                        &column_names,
+                        idx_conflict,
+                        program.has_statement_conflict,
+                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description: column_names,
-                        on_error: None,
+                        description,
+                        on_error,
                         description_reg: None,
                     });
                 }
@@ -1270,9 +1276,9 @@ fn emit_update_insns<'a>(
                         target_pc: skip_row_label,
                     });
                 }
-                ResolveType::Abort | ResolveType::Fail | ResolveType::Rollback => {
+                ResolveType::Fail | ResolveType::Rollback | ResolveType::Abort => {
                     // Halt with PRIMARY KEY constraint error
-                    let description = if let Some(idx) = rowid_alias_index {
+                    let raw_desc = if let Some(idx) = rowid_alias_index {
                         String::from(table_name)
                             + "."
                             + target_table
@@ -1286,10 +1292,15 @@ fn emit_update_insns<'a>(
                     } else {
                         String::from(table_name) + ".rowid"
                     };
+                    let (description, on_error) = halt_desc_and_on_error(
+                        &raw_desc,
+                        pk_conflict,
+                        program.has_statement_conflict,
+                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description,
-                        on_error: None,
+                        on_error,
                         description_reg: None,
                     });
                 }
@@ -1843,7 +1854,7 @@ fn emit_update_insns<'a>(
                     program.preassign_label_to_next_insn(continue_label);
                 }
                 _ => {
-                    // Default ABORT behavior
+                    // ABORT/FAIL/ROLLBACK behavior
                     let column_names = index.columns.iter().enumerate().fold(
                         String::with_capacity(50),
                         |mut accum, (idx, col)| {
@@ -1856,11 +1867,15 @@ fn emit_update_insns<'a>(
                             accum
                         },
                     );
-
+                    let (description, on_error) = halt_desc_and_on_error(
+                        &column_names,
+                        idx_conflict,
+                        program.has_statement_conflict,
+                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                        description: column_names,
-                        on_error: None,
+                        description,
+                        on_error,
                         description_reg: None,
                     });
                 }
@@ -1978,8 +1993,8 @@ fn emit_update_insns<'a>(
                     });
                 }
                 _ => {
-                    // Default ABORT behavior
-                    let description = if let Some(idx) = rowid_alias_index {
+                    // ABORT/FAIL/ROLLBACK behavior
+                    let raw_desc = if let Some(idx) = rowid_alias_index {
                         String::from(table_name)
                             + "."
                             + target_table
@@ -1993,11 +2008,15 @@ fn emit_update_insns<'a>(
                     } else {
                         String::from(table_name) + ".rowid"
                     };
-
+                    let (description, on_error) = halt_desc_and_on_error(
+                        &raw_desc,
+                        pk_conflict,
+                        program.has_statement_conflict,
+                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description,
-                        on_error: None,
+                        on_error,
                         description_reg: None,
                     });
                 }

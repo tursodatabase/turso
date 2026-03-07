@@ -2443,15 +2443,16 @@ fn emit_pk_uniqueness_check(
             });
             break 'emit_halt;
         }
-        let mut description =
-            String::with_capacity(ctx.table.name.len() + rowid_column_name.len() + 2);
-        description.push_str(ctx.table.name.as_str());
-        description.push('.');
-        description.push_str(rowid_column_name);
+        let raw_desc = format!("{}.{}", ctx.table.name, rowid_column_name);
+        let (description, on_error) = halt_desc_and_on_error(
+            &raw_desc,
+            preflight.effective_on_conflict,
+            program.has_statement_conflict,
+        );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description,
-            on_error: None,
+            on_error,
             description_reg: None,
         });
     }
@@ -2612,10 +2613,16 @@ fn emit_unique_index_check(
         }
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
+        let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+        let (description, on_error) = halt_desc_and_on_error(
+            &raw_desc,
+            preflight.effective_on_conflict,
+            program.has_statement_conflict,
+        );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_UNIQUE,
-            description: format_unique_violation_desc(ctx.table.name.as_str(), index),
-            on_error: None,
+            description,
+            on_error,
             description_reg: None,
         });
 
@@ -2651,10 +2658,16 @@ fn emit_unique_index_check(
             });
         } else {
             // ABORT/FAIL/ROLLBACK: halt on conflict.
+            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+            let (description, on_error) = halt_desc_and_on_error(
+                &raw_desc,
+                preflight.effective_on_conflict,
+                program.has_statement_conflict,
+            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description: format_unique_violation_desc(ctx.table.name.as_str(), index),
-                on_error: None,
+                description,
+                on_error,
                 description_reg: None,
             });
         }
@@ -2936,6 +2949,27 @@ fn ensure_sequence_initialized(
 /// Build the UNIQUE constraint error description to match sqlite
 /// single column: `t.c1`
 /// multi-column:  `t.(k, c1)`
+/// For constraint-level FAIL/ROLLBACK ON CONFLICT, pre-format the description
+/// and set on_error so the VM's halt() produces Raise(rt, msg) with correct semantics.
+/// `has_statement_conflict` should be true when the statement has its own OR clause
+/// (e.g. INSERT OR FAIL), in which case program.resolve_type already handles it.
+pub(crate) fn halt_desc_and_on_error(
+    raw_desc: &str,
+    effective: ResolveType,
+    has_statement_conflict: bool,
+) -> (String, Option<ResolveType>) {
+    if has_statement_conflict {
+        return (raw_desc.to_string(), None);
+    }
+    match effective {
+        ResolveType::Fail | ResolveType::Rollback => (
+            format!("UNIQUE constraint failed: {raw_desc} (19)"),
+            Some(effective),
+        ),
+        _ => (raw_desc.to_string(), None),
+    }
+}
+
 pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
     if index.columns.len() == 1 {
         let mut s = String::with_capacity(table_name.len() + 1 + index.columns[0].name.len());
