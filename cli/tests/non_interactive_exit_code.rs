@@ -256,7 +256,6 @@ SELECT msg FROM log;\n";
 
     let dot_read = format!(".read {}", sql_path.display());
     let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
-        .arg("--experimental-triggers")
         .arg(":memory:")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
