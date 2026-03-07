@@ -2801,6 +2801,18 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             .zip(unique_sets[j].columns.iter())
                             .all(|((a_name, _), (b_name, _))| a_name == b_name)
                     {
+                        // SQLite rejects duplicate constraints on the same columns when both
+                        // specify ON CONFLICT with different resolve types.
+                        if let (Some(a), Some(b)) = (
+                            unique_sets[i].conflict_clause,
+                            unique_sets[j].conflict_clause,
+                        ) {
+                            if a != b {
+                                crate::bail_parse_error!(
+                                    "conflicting ON CONFLICT clauses specified"
+                                );
+                            }
+                        }
                         unique_sets.remove(j);
                     } else {
                         j += 1;
@@ -3807,6 +3819,44 @@ mod tests {
         assert!(
             matches!(error, LimboError::ParseError(e) if e.contains("table \"t1\" has more than one primary key"))
         );
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_conflicting_on_conflict_unique_rejected() -> Result<()> {
+        let sql =
+            r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT IGNORE);"#;
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("conflicting ON CONFLICT clauses"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_conflicting_on_conflict_composite_unique_rejected() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a, b, UNIQUE(a, b) ON CONFLICT FAIL, UNIQUE(a, b) ON CONFLICT IGNORE);"#;
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("conflicting ON CONFLICT clauses"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_same_on_conflict_unique_allowed() -> Result<()> {
+        let sql =
+            r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT FAIL);"#;
+        assert!(BTreeTable::from_sql(sql, 0).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_one_on_conflict_unique_allowed() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a));"#;
+        assert!(BTreeTable::from_sql(sql, 0).is_ok());
         Ok(())
     }
 
