@@ -1894,3 +1894,80 @@ fn test_update_or_rollback_in_autocommit(tmp_db: TempDatabase) {
         ]
     );
 }
+
+/// UPDATE OR REPLACE falls back to ABORT for CHECK constraint violations.
+/// When a multi-row UPDATE hits a CHECK violation after already modifying some
+/// rows, the statement journal must roll back the partial writes.
+#[turso_macros::test]
+fn test_update_or_replace_check_stmt_rollback(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    // v > 0: subtracting 15 succeeds for rows with v=20,30 but fails for v=10.
+    // Row ordering means id=1 (v=10) is updated first, so the CHECK fires after
+    // 0 successful writes — make the failing row last instead.
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK(v > 0))")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 30), (2, 20), (3, 5)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+
+    // Subtract 15: row 1 (30→15 ok), row 2 (20→5 ok), row 3 (5→-10 CHECK fail).
+    let result = conn.execute("UPDATE OR REPLACE t SET v = v - 15");
+    assert!(
+        result.is_err(),
+        "UPDATE OR REPLACE should fail on CHECK violation"
+    );
+
+    // All rows should be unchanged — the statement journal must have rolled back.
+    let stmt = conn.query("SELECT v FROM t ORDER BY id").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(30)],
+            vec![Value::from_i64(20)],
+            vec![Value::from_i64(5)],
+        ],
+        "Partial writes should be rolled back after CHECK violation"
+    );
+
+    conn.execute("COMMIT").unwrap();
+}
+
+/// UPDATE OR REPLACE falls back to ABORT for NOT NULL constraint violations
+/// (when the column has no default). Same rollback requirements as CHECK.
+#[turso_macros::test]
+fn test_update_or_replace_notnull_stmt_rollback(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    // CASE expression makes only the last row NULL, so earlier rows are
+    // successfully updated before the NOT NULL violation fires.
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+
+    let result =
+        conn.execute("UPDATE OR REPLACE t SET v = CASE WHEN id = 3 THEN NULL ELSE 'modified' END");
+    assert!(
+        result.is_err(),
+        "UPDATE OR REPLACE should fail on NOT NULL violation"
+    );
+
+    let stmt = conn.query("SELECT v FROM t ORDER BY id").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Text("one".into())],
+            vec![Value::Text("two".into())],
+            vec![Value::Text("three".into())],
+        ],
+        "Partial writes should be rolled back after NOT NULL violation"
+    );
+
+    conn.execute("COMMIT").unwrap();
+}
