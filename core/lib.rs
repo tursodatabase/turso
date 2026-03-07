@@ -1205,8 +1205,9 @@ impl Database {
         pager.set_schema_cookie(None);
 
         if open_mv_store {
+            // todo(v): pass required encryption ctx to enable encryption with mvcc
             let mv_store =
-                journal_mode::open_mv_store(self.io.clone(), &self.path, self.open_flags)?;
+                journal_mode::open_mv_store(self.io.clone(), &self.path, self.open_flags, None)?;
             self.mv_store.store(Some(mv_store));
         }
 
