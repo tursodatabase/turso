@@ -40,6 +40,27 @@ fn table_has_fks(
             || resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(table_name)))
 }
 
+/// Determine whether a DML statement may abort mid-execution.
+///
+/// REPLACE falls back to ABORT for NOT NULL (without default) and CHECK
+/// constraints, so even REPLACE statements can abort in those cases.
+fn compute_may_abort(
+    has_triggers: bool,
+    has_fks: bool,
+    has_abort_resolution: bool,
+    is_replace: bool,
+    has_notnull: bool,
+    has_check: bool,
+    has_unique: bool,
+) -> bool {
+    let has_constraint_that_aborts = has_notnull || has_check || has_unique;
+    let replace_can_abort = is_replace && (has_notnull || has_check);
+    has_triggers
+        || has_fks
+        || (has_abort_resolution && has_constraint_that_aborts)
+        || replace_can_abort
+}
+
 /// Context for INSERT statement journal flag analysis.
 pub(crate) struct InsertJournalCtx {
     pub inserting_multiple_rows: bool,
@@ -67,13 +88,15 @@ pub(crate) fn set_insert_stmt_journal_flags(program: &mut ProgramBuilder, ctx: &
         program.set_multi_write(false);
     }
 
-    let has_constraint_that_aborts = ctx.notnull_col_exists || ctx.has_check || ctx.has_unique;
-    // REPLACE falls back to ABORT for NOT NULL (without default) and CHECK constraints.
-    let replace_can_abort = ctx.is_replace && (ctx.notnull_col_exists || ctx.has_check);
-    let may_abort = ctx.has_triggers
-        || ctx.has_fks
-        || (ctx.has_abort_resolution && has_constraint_that_aborts)
-        || replace_can_abort;
+    let may_abort = compute_may_abort(
+        ctx.has_triggers,
+        ctx.has_fks,
+        ctx.has_abort_resolution,
+        ctx.is_replace,
+        ctx.notnull_col_exists,
+        ctx.has_check,
+        ctx.has_unique,
+    );
     if !may_abort {
         program.set_may_abort(false);
     }
@@ -132,23 +155,28 @@ pub(crate) fn set_update_stmt_journal_flags(
         .or_conflict
         .unwrap_or(turso_parser::ast::ResolveType::Abort);
     let has_abort_resolution = matches!(or_conflict, turso_parser::ast::ResolveType::Abort);
-    let may_abort = has_triggers
-        || has_fks
-        || (has_abort_resolution && {
-            let has_notnull_cols = plan.set_clauses.iter().any(|(col_idx, _)| {
-                if *col_idx == crate::schema::ROWID_SENTINEL {
-                    return false;
-                }
-                btree_table
-                    .columns
-                    .get(*col_idx)
-                    .is_some_and(|c| c.notnull() && !c.is_rowid_alias())
-            });
-            let has_check = !btree_table.check_constraints.is_empty();
-            let has_unique = !btree_table.unique_sets.is_empty()
-                || plan.indexes_to_update.iter().any(|idx| idx.unique);
-            has_notnull_cols || has_check || has_unique
-        });
+    let has_notnull_cols = plan.set_clauses.iter().any(|(col_idx, _)| {
+        if *col_idx == crate::schema::ROWID_SENTINEL {
+            return false;
+        }
+        btree_table
+            .columns
+            .get(*col_idx)
+            .is_some_and(|c| c.notnull() && !c.is_rowid_alias())
+    });
+    let has_check = !btree_table.check_constraints.is_empty();
+    let has_unique =
+        !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
+
+    let may_abort = compute_may_abort(
+        has_triggers,
+        has_fks,
+        has_abort_resolution,
+        is_replace,
+        has_notnull_cols,
+        has_check,
+        has_unique,
+    );
     if !may_abort {
         program.set_may_abort(false);
     }
