@@ -185,7 +185,11 @@ mod tests {
                 panic!(
                     "MISMATCH!\n{}\nQuery: {query}\nTable: {table_ddl}\nIndex: {index_ddl}\nSeed: {seed}\nIteration: {iter}\n\
                     Turso ({} rows): {:?}\nSQLite ({} rows): {:?}",
-                    e, limbo_rows.len(), limbo_rows, sqlite_rows.len(), sqlite_rows
+                    e,
+                    limbo_rows.len(),
+                    limbo_rows,
+                    sqlite_rows.len(),
+                    sqlite_rows
                 );
             }
 
@@ -347,7 +351,11 @@ mod tests {
                 panic!(
                     "MISMATCH!\n{}\nQuery: {query}\nTable: {table_ddl}\nIndex: {index_ddl}\nCol collation: {col_collation}\nIdx collation: {idx_collation}\nSeed: {seed}\nIteration: {iter}\n\
                     Turso ({} rows): {:?}\nSQLite ({} rows): {:?}",
-                    e, limbo_rows.len(), limbo_rows, sqlite_rows.len(), sqlite_rows
+                    e,
+                    limbo_rows.len(),
+                    limbo_rows,
+                    sqlite_rows.len(),
+                    sqlite_rows
                 );
             }
         }

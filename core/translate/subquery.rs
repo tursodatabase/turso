@@ -579,6 +579,7 @@ fn get_subquery_parser<'a>(
                     unique: false,
                     where_clause: None,
                     index_method: None,
+                    on_conflict: None,
                 });
 
                 let cursor_id =
@@ -1318,6 +1319,7 @@ fn emit_materialized_cte(
         unique_sets: vec![],
         foreign_keys: vec![],
         check_constraints: vec![],
+        pk_conflict_clause: None,
     });
 
     // Allocate cursor for the ephemeral table

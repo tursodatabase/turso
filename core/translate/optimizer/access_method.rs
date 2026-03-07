@@ -1255,6 +1255,7 @@ fn find_best_access_method_for_subquery(
         where_clause: None,
         has_rowid: true,
         index_method: None,
+        on_conflict: None,
     });
 
     // Estimate cost: materialization (one scan of subquery) + index seeks

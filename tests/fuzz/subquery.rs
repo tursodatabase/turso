@@ -281,7 +281,9 @@ mod subquery_tests {
                     let v1 = rng.random_range(1..10);
                     let v2 = rng.random_range(1..10);
                     let v3 = rng.random_range(1..10);
-                    format!("SELECT * FROM (SELECT {v1} x {op} SELECT {v2} {op} SELECT {v3}) ORDER BY 1")
+                    format!(
+                        "SELECT * FROM (SELECT {v1} x {op} SELECT {v2} {op} SELECT {v3}) ORDER BY 1"
+                    )
                 }
                 2 => {
                     // Nested FROM subqueries
