@@ -774,6 +774,37 @@ expect {
     123.46
 }
 
+test round-half-away-from-zero-positive-tie {
+    SELECT round(2.25, 1);
+}
+expect {
+    2.3
+}
+
+test round-half-away-from-zero-negative-tie {
+    SELECT round(-2.25, 1);
+}
+expect {
+    -2.3
+}
+
+test round-negative-small-value-rounds-to-positive-zero {
+    SELECT round(-0.04, 1);
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test round-large-precision-is-clamped {
+    SELECT round(123.456, 4294967297);
+}
+expect {
+    123.456
+}
+
 test round-float-with-text-precision {
     SELECT round(123.5, '1');
 }
