@@ -210,6 +210,7 @@ fn update_pragma(
             // For JournalMode, when setting a value, we use the opcode
             let mode_str = match value {
                 Expr::Name(name) => name.as_str().to_string(),
+                Expr::Literal(Literal::Keyword(ref kw)) => kw.clone(),
                 _ => parse_string(&value)?,
             };
 
