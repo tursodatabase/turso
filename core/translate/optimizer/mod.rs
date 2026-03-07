@@ -694,8 +694,7 @@ fn first_update_safety_reason(
         // is required regardless of whether a secondary index is in use.
         let updates_rowid_key = btree_table.has_rowid
             && plan.set_clauses.iter().any(|(idx, _)| {
-                *idx == ROWID_SENTINEL
-                    || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
+                *idx == ROWID_SENTINEL || btree_table.columns[*idx].is_rowid_alias()
             });
         if updates_rowid_key {
             break 'requires Some(DmlSafetyReason::KeyMutation);
