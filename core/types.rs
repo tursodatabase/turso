@@ -1680,6 +1680,7 @@ impl<'a> ValueRef<'a> {
         }
     }
 
+    #[inline]
     pub fn to_owned(&self) -> Value {
         match self {
             ValueRef::Null => Value::Null,

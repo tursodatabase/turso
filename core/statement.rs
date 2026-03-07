@@ -228,10 +228,12 @@ impl Statement {
         res
     }
 
+    #[inline]
     pub fn step(&mut self) -> Result<StepResult> {
         self._step(None)
     }
 
+    #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
     }
