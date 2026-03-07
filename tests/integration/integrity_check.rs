@@ -6,7 +6,11 @@
 //! NOTE: Corruption tests are disabled when the "checksum" feature is enabled,
 //! because checksums will detect byte-level corruption before integrity_check runs.
 
+#[cfg(not(feature = "checksum"))]
+use crate::common::limbo_exec_rows;
 use crate::common::TempDatabase;
+#[cfg(not(feature = "checksum"))]
+use rusqlite::types::Value as SqlValue;
 #[cfg(not(feature = "checksum"))]
 use std::fs::OpenOptions;
 #[cfg(not(feature = "checksum"))]
@@ -522,6 +526,128 @@ fn test_integrity_check_index_entry_count_mismatch(db: TempDatabase) {
         Err(panic_msg) => {
             panic!(
                 "Expected integrity_check to return IndexEntryCountMismatch error, but it panicked: {panic_msg}"
+            );
+        }
+    }
+}
+
+// =============================================================================
+// ERROR CASE TESTS: RowidNotAtEndOfRecord
+// =============================================================================
+
+/// Test detection of RowidNotAtEndOfRecord error
+/// Corrupts an index record by swapping serial types so rowid is not the last column
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_integrity_check_rowid_not_at_end_of_record(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table with an index and a single row (rowid 2 to avoid const-int serial types)
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_name ON t1(name);").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (2, 'aa');").unwrap();
+
+    checkpoint_database(&conn);
+
+    let root_page = {
+        let rows = limbo_exec_rows(
+            &conn,
+            "SELECT rootpage FROM sqlite_master WHERE type='index' AND name='idx_name'",
+        );
+        assert_eq!(rows.len(), 1, "Expected exactly one sqlite_master row");
+        match &rows[0][0] {
+            SqlValue::Integer(value) => *value as usize,
+            other => panic!("Expected integer rootpage, got: {other:?}"),
+        }
+    };
+    assert!(root_page > 1, "Expected index root page > 1");
+
+    let result = run_integrity_check(&conn);
+    assert_eq!(result, "ok", "Database should be valid before corruption");
+
+    drop(conn);
+
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+
+        let file_size = file.metadata().unwrap().len();
+        let page_offset = (root_page - 1) * PAGE_SIZE;
+        if file_size < (page_offset + PAGE_SIZE) as u64 {
+            panic!("Database should have page {}", root_page);
+        }
+
+        // Read index root page
+        let mut page3 = [0u8; PAGE_SIZE];
+        file.seek(SeekFrom::Start(page_offset as u64)).unwrap();
+        file.read_exact(&mut page3).unwrap();
+
+        let page_type = page3[0];
+        let cell_count = read_u16_be(&page3, 3);
+
+        // Root page must be a leaf index page with at least one cell
+        assert_eq!(page_type, 0x0a, "Expected leaf index page");
+        assert!(cell_count >= 1, "Expected at least one index entry");
+
+        // Get first cell pointer
+        let cell_ptr = read_u16_be(&page3, 8) as usize;
+        assert!(cell_ptr + 4 < PAGE_SIZE, "Cell pointer out of bounds");
+
+        // Cell format for leaf index page:
+        // - payload_size (varint)
+        // - payload (record)
+        //
+        // Record format for index (name TEXT, rowid INTEGER):
+        // - header_size (varint)
+        // - serial_type for name
+        // - serial_type for rowid
+        //
+        // For small values:
+        // cell_ptr + 0: payload_size varint
+        // cell_ptr + 1: header_size varint (value 3 means 3 bytes of header)
+        // cell_ptr + 2: type for name
+        // cell_ptr + 3: type for rowid <-- swap to make rowid not last
+        let payload_size = page3[cell_ptr] as usize;
+        assert!(payload_size < 0x80, "Expected 1-byte payload size varint");
+        let payload_start = cell_ptr + 1;
+        let header_size = page3[payload_start];
+        assert_eq!(header_size, 3, "Expected 2-column header");
+
+        let serial_type_name = page3[payload_start + 1];
+        let serial_type_rowid = page3[payload_start + 2];
+        assert!(serial_type_name >= 13, "Expected first column to be TEXT");
+        assert_eq!(
+            serial_type_rowid, 1,
+            "Expected rowid to use 1-byte integer serial type"
+        );
+
+        // Swap serial types so rowid is no longer last
+        page3.swap(payload_start + 1, payload_start + 2);
+
+        // Write corrupted page back
+        file.seek(SeekFrom::Start(page_offset as u64)).unwrap();
+        file.write_all(&page3).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    let result = run_integrity_check_catching_panic(&conn);
+    match result {
+        Ok(msg) => {
+            assert!(
+                msg.contains("rowid not at end of record"),
+                "Expected 'rowid not at end of record' error, got: {msg}"
+            );
+        }
+        Err(panic_msg) => {
+            panic!(
+                "Expected integrity_check to return RowidNotAtEndOfRecord error, but it panicked: {panic_msg}"
             );
         }
     }
