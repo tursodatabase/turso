@@ -8,6 +8,7 @@ mod test_vacuum;
 mod test_write_path;
 
 mod encryption;
+mod test_attach;
 mod test_expr_index;
 mod test_multi_thread;
 mod test_page1;
