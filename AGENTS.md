@@ -62,6 +62,8 @@ limbo/
 2. **SQLite compatibility.** Compare bytecode with `EXPLAIN`
 3. **Every change needs a test.** Must fail without change, pass with it
 4. **Assert invariants.** Don't silently fail. Don't hedge with if-statements
+5. **Own your regressions.** If tests fail after your change, they are your regressions. Debug them directly. Never stash/revert to "check if they fail on main" — that wastes time and is categorically banned.
+6. **Validate your hypotheses.**: If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
 
 ## CI Note
 
