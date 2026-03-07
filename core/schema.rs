@@ -157,6 +157,8 @@ pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 /// Format an `ast::Type` as the declared type string, preserving parenthesized
 /// size parameters exactly as written (e.g. `VARCHAR(100)`, `DECIMAL(10,2)`).
 /// SQLite stores and reports the full declared type including parameters.
+/// Note: only the base `name` part (without size) is used for type registry
+/// lookups and affinity determination; the full string is for display only.
 fn ast_type_to_str(t: &ast::Type) -> String {
     match &t.size {
         None => t.name.clone(),
@@ -2139,9 +2141,9 @@ impl BTreeTable {
                 sql.push_str(column_name);
             }
 
-            if !column.ty_str.is_empty() {
+            if !column.declared_type.is_empty() {
                 sql.push(' ');
-                sql.push_str(&column.ty_str);
+                sql.push_str(&column.declared_type);
             }
             if column.notnull() {
                 sql.push_str(" NOT NULL");
@@ -2534,6 +2536,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
                 let ty_str = col_type
                     .as_ref()
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                let declared_type = col_type
+                    .as_ref()
                     .map(|t| ast_type_to_str(t))
                     .unwrap_or_default();
 
@@ -2728,6 +2734,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     },
                 );
                 col.ty_params = ty_params;
+                col.declared_type = declared_type;
                 cols.push(col);
             }
 
@@ -2961,7 +2968,11 @@ impl ResolvedFkRef {
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: Option<String>,
+    /// Base type name used for type registry lookup, affinity, and internal logic (e.g. "numeric").
     pub ty_str: String,
+    /// Full declared type string as written in CREATE TABLE, including size params (e.g. "numeric(10,2)").
+    /// Used only for PRAGMA table_info display. Equals ty_str when no size params are present.
+    pub declared_type: String,
     pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     pub generated: Option<Box<Expr>>,
@@ -3094,7 +3105,8 @@ impl Column {
         }
         Self {
             name,
-            ty_str,
+            ty_str: ty_str.clone(),
+            declared_type: ty_str,
             ty_params: Vec::new(),
             default,
             generated,
@@ -3234,6 +3246,11 @@ impl TryFrom<&ColumnDefinition> for Column {
         let ty_str = value
             .col_type
             .as_ref()
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        let declared_type = value
+            .col_type
+            .as_ref()
             .map(|t| ast_type_to_str(t))
             .unwrap_or_default();
 
@@ -3267,6 +3284,7 @@ impl TryFrom<&ColumnDefinition> for Column {
             },
         );
         col.ty_params = ty_params;
+        col.declared_type = declared_type;
         Ok(col)
     }
 }
