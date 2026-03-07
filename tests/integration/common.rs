@@ -63,6 +63,9 @@ impl IO for TestIo {
     fn remove_file(&self, path: &str) -> turso_core::Result<()> {
         self.io.remove_file(path)
     }
+    fn rename_file(&self, from: &str, to: &str) -> turso_core::Result<()> {
+        self.io.rename_file(from, to)
+    }
     fn cancel(&self, c: &[turso_core::Completion]) -> turso_core::Result<()> {
         self.io.cancel(c)
     }

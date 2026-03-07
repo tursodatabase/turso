@@ -524,6 +524,11 @@ impl IO for UringIO {
         Ok(())
     }
 
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        std::fs::rename(from, to).map_err(|e| io_error(e, "rename_file"))?;
+        Ok(())
+    }
+
     /// Drain calls `run_once` in a loop until the ring is empty.
     /// To prevent mutex churn of checking if ring.empty() on each iteration, we violate DRY
     fn drain(&self) -> Result<()> {

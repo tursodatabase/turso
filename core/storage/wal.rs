@@ -60,6 +60,8 @@ pub struct CheckpointResult {
     pub wal_truncate_sent: bool,
     /// Whether WAL sync I/O has been submitted after truncation
     pub wal_sync_sent: bool,
+    /// True when sealed WAL checkpoint completed (pager should sync DB then cleanup)
+    pub sealed_complete: bool,
 }
 
 impl Drop for CheckpointResult {
@@ -83,6 +85,7 @@ impl CheckpointResult {
             db_truncate_sent: false,
             wal_truncate_sent: false,
             wal_sync_sent: false,
+            sealed_complete: false,
         }
     }
 
@@ -436,6 +439,34 @@ pub trait Wal: Debug + Send + Sync {
 
     #[cfg(debug_assertions)]
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Find a frame in the sealed WAL, if one exists.
+    fn find_frame_sealed(&self, page_id: u64) -> Result<Option<u64>> {
+        let _ = page_id;
+        Ok(None)
+    }
+
+    /// Read a frame from the sealed WAL.
+    fn read_frame_sealed(
+        &self,
+        frame_id: u64,
+        page: PageRef,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Completion> {
+        let _ = (frame_id, page, buffer_pool);
+        unreachable!("sealed WAL read on non-WalFile")
+    }
+
+    /// Whether a sealed WAL is currently being backfilled.
+    fn has_sealed_wal(&self) -> bool {
+        false
+    }
+
+    /// Delete the sealed WAL file and clear sealed state.
+    /// Called by pager AFTER DB file is synced.
+    fn cleanup_sealed_wal(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +480,10 @@ pub enum CheckpointState {
     Finalize {
         checkpoint_result: Option<CheckpointResult>,
     },
+    /// Seal the WAL: snapshot frame_cache, swap files, reset state, release locks
+    Seal,
+    /// Backfill sealed WAL frames to DB file (no locks held)
+    BackfillProcessing,
 }
 
 /// IOV_MAX is 1024 on most systems, lets use 512 to be safe
@@ -841,6 +876,10 @@ pub struct WalFileShared {
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
     /// backfilling.
     pub epoch: AtomicU32,
+    /// Path to the WAL file (e.g. "test.db-wal")
+    pub wal_path: String,
+    /// Sealed WAL being backfilled. None when no checkpoint in progress.
+    pub sealed: Option<SealedWal>,
 }
 
 impl fmt::Debug for WalFileShared {
@@ -853,6 +892,7 @@ impl fmt::Debug for WalFileShared {
             .field("nbackfills", &self.nbackfills)
             .field("frame_cache", &self.frame_cache)
             .field("last_checksum", &self.last_checksum)
+            .field("wal_path", &self.wal_path)
             // Excluding `file`, `read_locks`, and `write_lock`
             .finish()
     }
@@ -944,6 +984,29 @@ impl Drop for CheckpointLocks {
                 guard.checkpoint_lock.unlock();
             }
         }
+    }
+}
+
+/// A sealed (frozen) WAL being backfilled to the DB file. Read-only.
+pub struct SealedWal {
+    /// File handle to the sealed WAL (renamed from db-wal to db-wal-sealed)
+    pub file: Arc<dyn File>,
+    /// page_id -> latest frame_id (flattened from frame_cache at seal time)
+    pub frame_cache: FxHashMap<u64, u64>,
+    /// Page size (needed for frame_offset calculation)
+    pub page_size: u32,
+}
+
+impl SealedWal {
+    pub fn frame_offset(&self, frame_id: u64) -> u64 {
+        turso_assert_greater_than!(frame_id, 0, "Frame ID must be 1-based");
+        let page_offset =
+            (frame_id - 1) * (self.page_size + WAL_FRAME_HEADER_SIZE as u32) as u64;
+        WAL_HEADER_SIZE as u64 + page_offset
+    }
+
+    pub fn find_frame(&self, page_id: u64) -> Option<u64> {
+        self.frame_cache.get(&page_id).copied()
     }
 }
 
@@ -1431,6 +1494,74 @@ impl Wal for WalFile {
         )
     }
 
+    fn find_frame_sealed(&self, page_id: u64) -> Result<Option<u64>> {
+        self.with_shared(|shared| {
+            Ok(shared.sealed.as_ref().and_then(|s| s.find_frame(page_id)))
+        })
+    }
+
+    fn read_frame_sealed(
+        &self,
+        frame_id: u64,
+        page: PageRef,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Completion> {
+        let (offset, file) = self.with_shared(|shared| {
+            let sealed = shared.sealed.as_ref().expect("sealed WAL must exist");
+            (sealed.frame_offset(frame_id), sealed.file.clone())
+        });
+        page.set_locked();
+        let frame = page.clone();
+        let page_idx = page.get().id;
+        let shared_file = self.shared.clone();
+        let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            let Ok((buf, bytes_read)) = res else {
+                page.clear_locked();
+                page.clear_wal_tag();
+                return None;
+            };
+            let buf_len = buf.len();
+            if bytes_read != buf_len as i32 {
+                page.clear_locked();
+                page.clear_wal_tag();
+                return Some(CompletionError::ShortReadWalFrame {
+                    offset,
+                    expected: buf_len,
+                    actual: bytes_read as usize,
+                });
+            }
+            finish_read_page(page.get().id, buf, frame.clone());
+            let epoch = shared_file.read().epoch.load(Ordering::Acquire);
+            frame.set_wal_tag(frame_id, epoch);
+            None
+        });
+        let c = begin_read_wal_frame(
+            file.as_ref(),
+            offset + WAL_FRAME_HEADER_SIZE as u64,
+            buffer_pool,
+            complete,
+            page_idx,
+            &self.io_ctx.read(),
+        )?;
+        Ok(c)
+    }
+
+    fn has_sealed_wal(&self) -> bool {
+        self.with_shared(|shared| shared.sealed.is_some())
+    }
+
+    fn cleanup_sealed_wal(&self) -> Result<()> {
+        let sealed_path = self.with_shared(|shared| {
+            let wal_path = &shared.wal_path;
+            format!("{wal_path}-sealed")
+        });
+        self.io.remove_file(&sealed_path)?;
+        self.with_shared_mut_dangerous(|shared| {
+            shared.sealed = None;
+        });
+        Ok(())
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     // todo(sivukhin): change API to accept Buffer or some other owned type
     // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
@@ -1627,6 +1758,10 @@ impl Wal for WalFile {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn should_checkpoint(&self) -> bool {
+        // Block auto-checkpoint while sealed WAL is being backfilled.
+        if self.with_shared(|s| s.sealed.is_some()) {
+            return false;
+        }
         self.with_shared(|shared| {
             let frame_id = shared.max_frame.load(Ordering::Acquire) as usize;
             let nbackfills = shared.nbackfills.load(Ordering::Acquire) as usize;
@@ -2299,6 +2434,45 @@ impl WalFile {
                             max_frame, nbackfills, 0,
                         )));
                     }
+
+                    // --- Sealed WAL: resume or seal ---
+                    if matches!(mode, CheckpointMode::Truncate { .. }) {
+                        let has_sealed = self.with_shared(|s| s.sealed.is_some());
+
+                        if has_sealed {
+                            // Resume backfill from a previous failed attempt.
+                            let pages = self.with_shared(|shared| {
+                                let sealed = shared.sealed.as_ref().unwrap();
+                                let mut pages: Vec<_> = sealed.frame_cache.iter()
+                                    .map(|(&page_id, &frame_id)| (page_id, frame_id))
+                                    .collect();
+                                pages.sort_unstable_by_key(|&(_, frame_id)| frame_id);
+                                pages
+                            });
+                            let backfill_max = pages.last().map(|&(_, f)| f).unwrap_or(0);
+                            let mut oc = self.ongoing_checkpoint.write();
+                            oc.pages_to_checkpoint = pages;
+                            oc.current_page = 0;
+                            oc.min_frame = 1;
+                            oc.max_frame = backfill_max;
+                            oc.inflight_writes.clear();
+                            oc.inflight_reads.clear();
+                            oc.pending_writes.clear();
+                            oc.time = self.io.current_time_monotonic();
+                            oc.state = CheckpointState::BackfillProcessing;
+                            continue;
+                        }
+
+                        if needs_backfill {
+                            self.ongoing_checkpoint.write().state = CheckpointState::Seal;
+                            continue;
+                        }
+
+                        // !needs_backfill && !has_sealed: fall through to existing
+                        // restart_log + truncate path (no I/O to defer)
+                    }
+                    // --- End sealed WAL routing ---
+
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode)?;
                     let mut max_frame = self.determine_max_safe_checkpoint_frame();
@@ -2578,6 +2752,216 @@ impl WalFile {
                     self.ongoing_checkpoint.write().state = CheckpointState::Start;
                     return Ok(IOResult::Done(checkpoint_result));
                 }
+                CheckpointState::Seal => {
+                    // Phase 1: Seal the WAL
+
+                    // 1. Acquire all locks (checkpoint_lock + write_lock + read_locks[0])
+                    self.acquire_proper_checkpoint_guard(mode)?;
+
+                    // 2. Acquire read_locks[1..4] exclusively
+                    self.with_shared(|shared| {
+                        for idx in 1..shared.read_locks.len() {
+                            let lock = &shared.read_locks[idx];
+                            if !lock.write() {
+                                for j in 1..idx {
+                                    shared.read_locks[j].unlock();
+                                }
+                                return Err(LimboError::Busy);
+                            }
+                            lock.set_value_exclusive(READMARK_NOT_USED);
+                        }
+                        Ok(())
+                    })?;
+
+                    // At this point: ALL locks held. No readers, no writers.
+
+                    // Steps 3-10 wrapped in closure for read_lock cleanup on error.
+                    let seal_result = (|| -> Result<(FxHashMap<u64, u64>, u32)> {
+
+                    // 3. Check upper_bound constraint
+                    let max_frame = self.with_shared(|s| s.max_frame.load(Ordering::Acquire));
+                    if let CheckpointMode::Truncate {
+                        upper_bound_inclusive: Some(upper_bound),
+                    } = mode
+                    {
+                        if max_frame > upper_bound {
+                            Self::unlock_after_restart(&self.shared, None);
+                            let _ = self.checkpoint_guard.write().take();
+                            return Err(LimboError::Busy);
+                        }
+                    }
+
+                    // 4. Snapshot frame_cache BEFORE restart_wal_header clears it
+                    let nbackfills = self.with_shared(|s| s.nbackfills.load(Ordering::Acquire));
+                    let sealed_frame_cache: FxHashMap<u64, u64> =
+                        self.with_shared(|shared| {
+                            let fc = shared.frame_cache.lock();
+                            fc.iter()
+                                .filter_map(|(&page_id, frames)| {
+                                    frames.last().copied()
+                                        .filter(|&f| f > nbackfills)
+                                        .map(|f| (page_id, f))
+                                })
+                                .collect()
+                        });
+
+                    // 5. Get WAL path and page_size
+                    let (wal_path, page_size) = self.with_shared(|shared| {
+                        (shared.wal_path.clone(), shared.wal_header.lock().page_size)
+                    });
+                    let sealed_wal_path = format!("{wal_path}-sealed");
+
+                    // 6. Rename db-wal → db-wal-sealed
+                    self.io.rename_file(&wal_path, &sealed_wal_path)?;
+
+                    // 7. Open fresh WAL file
+                    let new_file = self.io.open_file(
+                        &wal_path,
+                        crate::OpenFlags::Create,
+                        false,
+                    )?;
+
+                    // 8. Atomically: take old file, set new file, set sealed,
+                    //    call restart_wal_header (clears frame_cache, resets state)
+                    self.with_shared_mut_dangerous(|shared| {
+                        let old_file = shared.file.take().expect("WAL file must exist");
+                        shared.file = Some(new_file);
+                        shared.sealed = Some(SealedWal {
+                            file: old_file,
+                            frame_cache: sealed_frame_cache.clone(),
+                            page_size,
+                        });
+                        shared.restart_wal_header(&self.io);
+                    });
+
+                    // 9. Update per-connection state
+                    let cksm = self.with_shared(|shared| shared.last_checksum);
+                    *self.last_checksum.write() = cksm;
+                    self.max_frame.store(0, Ordering::Release);
+                    self.min_frame.store(0, Ordering::Release);
+                    self.checkpoint_seq.fetch_add(1, Ordering::Release);
+
+                    // 10. Increment epoch to invalidate cached pages
+                    self.increment_checkpoint_epoch();
+
+                    Ok((sealed_frame_cache, page_size))
+                    })(); // end of seal_result closure
+
+                    // Handle seal_result: cleanup read_locks on error
+                    let (sealed_frame_cache, _page_size) = match seal_result {
+                        Ok(result) => result,
+                        Err(e) => {
+                            Self::unlock_after_restart(&self.shared, Some(&e));
+                            return Err(e);
+                        }
+                    };
+
+                    // 11. Release read_locks[1..4]
+                    Self::unlock_after_restart(&self.shared, None);
+
+                    // 12. Release checkpoint_guard (checkpoint_lock + write_lock + read_locks[0])
+                    let _ = self.checkpoint_guard.write().take();
+
+                    // === All locks released. Writers and readers can proceed. ===
+
+                    // 13. Build pages_to_checkpoint sorted by frame_id for read locality
+                    let mut pages: Vec<(u64, u64)> =
+                        sealed_frame_cache.into_iter().collect();
+                    pages.sort_unstable_by_key(|&(_, frame_id)| frame_id);
+                    let backfill_max = pages.last().map(|&(_, f)| f).unwrap_or(0);
+
+                    let mut oc = self.ongoing_checkpoint.write();
+                    oc.pages_to_checkpoint = pages;
+                    oc.current_page = 0;
+                    oc.min_frame = 1;
+                    oc.max_frame = backfill_max;
+                    oc.inflight_writes.clear();
+                    oc.inflight_reads.clear();
+                    oc.pending_writes.clear();
+                    oc.time = self.io.current_time_monotonic();
+                    oc.state = CheckpointState::BackfillProcessing;
+                }
+                CheckpointState::BackfillProcessing => {
+                    let mut nr_completions = 0;
+                    let mut group = CompletionGroup::new(|_| {});
+                    let mut ongoing_chkpt = self.ongoing_checkpoint.write();
+
+                    if ongoing_chkpt.process_inflight_writes() {
+                        tracing::trace!("Sealed backfill: completed a write batch");
+                    }
+                    if ongoing_chkpt.process_pending_reads()? {
+                        tracing::trace!("Sealed backfill: drained reads into batch");
+                    }
+                    if let Some(e) = ongoing_chkpt.first_write_error() {
+                        mark_unlikely();
+                        let to_cancel: Vec<Completion> = ongoing_chkpt
+                            .inflight_reads
+                            .iter()
+                            .map(|r| r.completion.clone())
+                            .collect();
+                        pager.io.cancel(&to_cancel)?;
+                        pager.io.drain()?;
+                        return Err(LimboError::CompletionError(e));
+                    }
+
+                    // Issue reads from SEALED WAL (no page cache check)
+                    while ongoing_chkpt.should_issue_reads() {
+                        let (page_id, target_frame) =
+                            ongoing_chkpt.pages_to_checkpoint
+                                [ongoing_chkpt.current_page as usize];
+                        let inflight = self.issue_sealed_wal_read_into_buffer(
+                            page_id as usize,
+                            target_frame,
+                        )?;
+                        group.add(&inflight.completion);
+                        nr_completions += 1;
+                        ongoing_chkpt.inflight_reads.push(inflight);
+                        ongoing_chkpt.current_page += 1;
+                    }
+
+                    // Flush write batch to DB file
+                    let should_flush =
+                        ongoing_chkpt.inflight_writes.len() < MAX_INFLIGHT_WRITES
+                            && ongoing_chkpt.should_flush_batch();
+                    if should_flush {
+                        let batch_map = ongoing_chkpt.pending_writes.take();
+                        if !batch_map.is_empty() {
+                            let new_write = InflightWriteBatch::new();
+                            for c in write_pages_vectored(
+                                pager,
+                                batch_map,
+                                new_write.done.clone(),
+                                new_write.err.clone(),
+                            )? {
+                                group.add(&c);
+                                nr_completions += 1;
+                            }
+                            ongoing_chkpt.inflight_writes.push(new_write);
+                        }
+                    }
+
+                    if nr_completions > 0 {
+                        io_yield_one!(group.build());
+                    } else if ongoing_chkpt.complete() {
+                        // All backfill I/O complete. Clean up and return.
+                        let backfilled = ongoing_chkpt.max_frame;
+                        ongoing_chkpt.inflight_writes.clear();
+                        ongoing_chkpt.pending_writes.clear();
+                        ongoing_chkpt.pages_to_checkpoint.clear();
+                        ongoing_chkpt.current_page = 0;
+                        ongoing_chkpt.state = CheckpointState::Start;
+
+                        let mut result = CheckpointResult::new(0, 0, backfilled);
+                        result.sealed_complete = true;
+                        return Ok(IOResult::Done(result));
+                    } else {
+                        mark_unlikely();
+                        return Err(LimboError::InternalError(
+                            "sealed backfill stuck: no completions but not complete"
+                                .into(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -2854,6 +3238,51 @@ impl WalFile {
         })
     }
 
+    fn issue_sealed_wal_read_into_buffer(
+        &self,
+        page_id: usize,
+        frame_id: u64,
+    ) -> Result<InflightRead> {
+        let (file, offset) = self.with_shared(|shared| {
+            let sealed = shared.sealed.as_ref().expect("sealed WAL must exist");
+            (sealed.file.clone(), sealed.frame_offset(frame_id))
+        });
+        let buf_slot = Arc::new(SpinLock::new(None));
+        tracing::debug!(
+            "Issuing sealed WAL read: page_id={}, frame_id={}, offset={}",
+            page_id, frame_id, offset
+        );
+        let complete = {
+            let buf_slot = buf_slot.clone();
+            Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                let Ok((buf, read)) = res else {
+                    return None;
+                };
+                let buf_len = buf.len();
+                turso_assert!(
+                    read == buf_len as i32,
+                    "read bytes does not match expected buffer length",
+                    { "read": read, "expected": buf_len, "frame_id": frame_id }
+                );
+                *buf_slot.lock() = Some(buf);
+                None
+            })
+        };
+        let c = begin_read_wal_frame(
+            file.as_ref(),
+            offset + WAL_FRAME_HEADER_SIZE as u64,
+            self.buffer_pool.clone(),
+            complete,
+            page_id,
+            &self.io_ctx.read(),
+        )?;
+        Ok(InflightRead {
+            completion: c,
+            page_id,
+            buf: buf_slot,
+        })
+    }
+
     /// Check if database changed since this connection's last read transaction.
     fn db_changed(&self, shared: &WalFileShared) -> bool {
         let shared_max = shared.max_frame.load(Ordering::Acquire);
@@ -2923,7 +3352,7 @@ impl WalFileShared {
             }
             Err(e) => return Err(e),
         };
-        let wal_file_shared = sqlite3_ondisk::build_shared_wal(&file, io)?;
+        let wal_file_shared = sqlite3_ondisk::build_shared_wal(&file, io, path)?;
         turso_assert!(
             wal_file_shared
                 .try_read()
@@ -2961,12 +3390,14 @@ impl WalFileShared {
             loaded: AtomicBool::new(true),
             initialized: AtomicBool::new(false),
             epoch: AtomicU32::new(0),
+            wal_path: String::new(),
+            sealed: None,
         };
         Arc::new(RwLock::new(shared))
     }
 
     #[cfg(test)]
-    pub(super) fn new_shared(file: Arc<dyn File>) -> Result<Arc<RwLock<WalFileShared>>> {
+    pub(super) fn new_shared(file: Arc<dyn File>, path: &str) -> Result<Arc<RwLock<WalFileShared>>> {
         let wal_header = WalHeader::new();
         let read_locks = array::from_fn(|_| TursoRwLock::new());
         // slot zero is always zero as it signifies that reads can be done from the db file
@@ -2993,6 +3424,8 @@ impl WalFileShared {
             loaded: AtomicBool::new(true),
             initialized: AtomicBool::new(false),
             epoch: AtomicU32::new(0),
+            wal_path: path.to_string(),
+            sealed: None,
         };
         Ok(Arc::new(RwLock::new(shared)))
     }

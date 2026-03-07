@@ -227,6 +227,8 @@ pub trait IO: Clock + Send + Sync {
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
 
+    fn rename_file(&self, from: &str, to: &str) -> Result<()>;
+
     fn step(&self) -> Result<()> {
         Ok(())
     }

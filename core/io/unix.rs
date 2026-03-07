@@ -121,6 +121,11 @@ impl IO for UnixIO {
         Ok(())
     }
 
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        std::fs::rename(from, to).map_err(|e| io_error(e, "rename_file"))?;
+        Ok(())
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         Ok(())

@@ -45,6 +45,13 @@ impl IO for VfsMod {
         Ok(())
     }
 
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        std::fs::rename(from, to).map_err(|e| {
+            LimboError::ExtensionError(format!("rename_file failed: {e}"))
+        })?;
+        Ok(())
+    }
+
     fn step(&self) -> Result<()> {
         if self.ctx.is_null() {
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
