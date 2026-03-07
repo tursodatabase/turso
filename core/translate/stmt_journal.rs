@@ -85,7 +85,7 @@ pub(crate) fn set_update_stmt_journal_flags(
     plan: &UpdatePlan,
     resolver: &Resolver,
     connection: &crate::sync::Arc<crate::Connection>,
-) {
+) -> Result<()> {
     // When an ephemeral table is used (key mutation / Halloween protection),
     // the actual target table is in the ephemeral_plan's table_references.
     let table_refs = plan
@@ -94,10 +94,10 @@ pub(crate) fn set_update_stmt_journal_flags(
         .map(|ep| &ep.table_references)
         .unwrap_or(&plan.table_references);
     let Some(target_table) = table_refs.joined_tables().first() else {
-        return;
+        crate::bail_parse_error!("UPDATE should have one target table");
     };
     let Some(btree_table) = target_table.btree() else {
-        return; // Virtual table — keep conservative defaults.
+        return Ok(()); // Virtual table — keep conservative defaults.
     };
     let database_id = target_table.database_id;
 
@@ -152,6 +152,7 @@ pub(crate) fn set_update_stmt_journal_flags(
     if !may_abort {
         program.set_may_abort(false);
     }
+    Ok(())
 }
 
 /// Set multi_write / may_abort for DELETE statements.
@@ -166,9 +167,8 @@ pub(crate) fn set_delete_stmt_journal_flags(
         crate::bail_parse_error!("DELETE should have one target table");
     };
     let Some(btree_table) = target_table.btree() else {
-        crate::bail_parse_error!("DELETE target table should be a btree table");
+        return Ok(()); // Virtual table — keep conservative defaults.
     };
-
     let has_triggers = plan.safety.reasons.contains(&DmlSafetyReason::Trigger);
     let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
 

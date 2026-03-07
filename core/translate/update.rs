@@ -99,7 +99,7 @@ pub fn translate_update(
             update_plan,
             resolver,
             connection,
-        );
+        )?;
     }
 
     let opts = ProgramBuilderOpts {
