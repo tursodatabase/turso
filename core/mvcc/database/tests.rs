@@ -6461,6 +6461,48 @@ fn test_mvcc_same_primary_key_concurrent() {
         .expect_err("duplicate key - first committer wins");
 }
 
+/// What this test checks: AUTOINCREMENT inserts in concurrent MVCC transactions can proceed
+/// without failing due to sqlite_sequence write-write conflicts.
+/// Why this matters: sqlite_sequence is shared metadata for a table and should not serialize
+/// otherwise-disjoint row inserts in optimistic concurrent write mode.
+#[test]
+fn test_mvcc_autoincrement_concurrent_inserts_do_not_conflict_on_sqlite_sequence() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)")
+        .unwrap();
+
+    // Seed sqlite_sequence so concurrent writers both perform updates to the
+    // same sqlite_sequence row.
+    conn1
+        .execute("INSERT INTO t(payload) VALUES ('seed')")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+
+    conn1
+        .execute("INSERT INTO t(payload) VALUES ('c1')")
+        .unwrap();
+    conn2
+        .execute("INSERT INTO t(payload) VALUES ('c2')")
+        .unwrap();
+
+    conn1.execute("COMMIT").unwrap();
+    conn2
+        .execute("COMMIT")
+        .expect("AUTOINCREMENT concurrent commit should not fail on sqlite_sequence conflict");
+
+    let rows = get_rows(&conn1, "SELECT id, payload FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1].to_string(), "seed");
+    assert_eq!(rows[1][1].to_string(), "c1");
+    assert_eq!(rows[2][1].to_string(), "c2");
+}
+
 // ─── End-to-end GC + dual cursor tests ───────────────────────────────────
 
 /// After checkpoint + GC, checkpointed current versions are removed from
@@ -7391,4 +7433,59 @@ fn test_autoincrement_no_reuse_after_delete_and_restart() {
          sqlite_sequence had {seq_count} duplicate rows; \
          init_autoincrement picked the stale one (seq=1 instead of seq=2)."
     );
+}
+
+/// UPDATE on a rowid alias must not advance AUTOINCREMENT state.
+/// Only INSERTs (implicit or explicit rowid) should move sqlite_sequence.
+#[test]
+#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
+fn test_autoincrement_update_rowid_does_not_advance_sequence() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    conn.execute("INSERT INTO t(b) VALUES ('seed')").unwrap();
+    conn.execute("UPDATE OR IGNORE t SET a = 30 WHERE a = 1")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE a = 30").unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('after_delete')")
+        .unwrap();
+
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    let seq_rows = get_rows(&conn, "SELECT seq FROM sqlite_sequence WHERE name = 't'");
+    assert_eq!(seq_rows.len(), 1);
+    assert_eq!(seq_rows[0][0].as_int().unwrap(), 2);
+}
+
+/// AUTOINCREMENT must still account for the current table max rowid after UPDATE.
+#[test]
+#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
+fn test_autoincrement_uses_current_max_rowid_after_update() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    conn.execute("INSERT INTO t(b) VALUES ('seed')").unwrap();
+    conn.execute("UPDATE OR IGNORE t SET a = 30 WHERE a = 1")
+        .unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('after_update')")
+        .unwrap();
+
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 30);
+    assert_eq!(rows[1][0].as_int().unwrap(), 31);
+
+    let seq_rows = get_rows(&conn, "SELECT seq FROM sqlite_sequence WHERE name = 't'");
+    assert_eq!(seq_rows.len(), 1);
+    assert_eq!(seq_rows[0][0].as_int().unwrap(), 31);
 }
