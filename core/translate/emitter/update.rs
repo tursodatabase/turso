@@ -1559,58 +1559,11 @@ fn emit_update_insns<'a>(
         let mut skip_delete_label = None;
         let mut skip_insert_label = None;
 
-        // Handle deletion for partial indexes
-        if let Some(old_satisfied) = old_satisfies_where {
-            skip_delete_label = Some(program.allocate_label());
-            // If the old values don't satisfy the WHERE clause, skip the delete
-            program.emit_insn(Insn::IfNot {
-                reg: old_satisfied,
-                target_pc: skip_delete_label.unwrap(),
-                jump_if_null: true,
-            });
-        }
-
-        // Delete old index entry
-        let num_regs = index.columns.len() + 1;
-        let delete_start_reg = program.alloc_registers(num_regs);
-        for (reg_offset, column_index) in index.columns.iter().enumerate() {
-            emit_index_column_value_old_image(
-                program,
-                &t_ctx.resolver,
-                table_references,
-                target_table_cursor_id,
-                column_index,
-                delete_start_reg + reg_offset,
-            )?;
-        }
-        program.emit_insn(Insn::RowId {
-            cursor_id: target_table_cursor_id,
-            dest: delete_start_reg + num_regs - 1,
-        });
-        program.emit_insn(Insn::IdxDelete {
-            start_reg: delete_start_reg,
-            num_regs,
-            cursor_id: *idx_cursor_id,
-            raise_error_if_no_matching_entry: true,
-        });
-
-        // Resolve delete skip label if it exists
-        if let Some(label) = skip_delete_label {
-            program.resolve_label(label, program.offset());
-        }
-
-        // Check if we should insert into partial index
-        if let Some(new_satisfied) = new_satisfies_where {
-            skip_insert_label = Some(program.allocate_label());
-            // If the new values don't satisfy the WHERE clause, skip the idx insert
-            program.emit_insn(Insn::IfNot {
-                reg: new_satisfied,
-                target_pc: skip_insert_label.unwrap(),
-                jump_if_null: true,
-            });
-        }
-
-        // Build new index entry
+        // Build new index entry FIRST (needed for unique constraint check before
+        // any modifications). Matches SQLite's codegen order: constraint checks
+        // precede IdxDelete so that a failing constraint does not leave the index
+        // in an inconsistent state (see update.c sqlite3GenerateConstraintChecks
+        // before sqlite3GenerateRowIndexDelete).
         let num_cols = index.columns.len();
         let idx_start_reg = program.alloc_registers(num_cols + 1);
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
@@ -1664,9 +1617,22 @@ fn emit_update_insns<'a>(
             affinity_str: None,
         });
 
-        // Handle unique constraint
+        // Handle unique constraint BEFORE IdxDelete (matches SQLite order).
+        // If the constraint check fails (Halt/Ignore/Replace), the old index
+        // entry is still intact — no statement journal needed for rollback.
         if index.unique {
             let constraint_check = program.allocate_label();
+
+            // For partial indexes, skip the constraint check if new values don't
+            // satisfy the WHERE clause (no insert → no conflict possible).
+            if let Some(new_satisfied) = new_satisfies_where {
+                program.emit_insn(Insn::IfNot {
+                    reg: new_satisfied,
+                    target_pc: constraint_check,
+                    jump_if_null: true,
+                });
+            }
+
             // check if the record already exists in the index for unique indexes and abort if so
             program.emit_insn(Insn::NoConflict {
                 cursor_id: *idx_cursor_id,
@@ -1841,7 +1807,56 @@ fn emit_update_insns<'a>(
             program.preassign_label_to_next_insn(constraint_check);
         }
 
-        // Insert the index entry
+        // Delete old index entry (AFTER constraint check passes)
+        if let Some(old_satisfied) = old_satisfies_where {
+            skip_delete_label = Some(program.allocate_label());
+            // If the old values don't satisfy the WHERE clause, skip the delete
+            program.emit_insn(Insn::IfNot {
+                reg: old_satisfied,
+                target_pc: skip_delete_label.unwrap(),
+                jump_if_null: true,
+            });
+        }
+
+        let num_regs = index.columns.len() + 1;
+        let delete_start_reg = program.alloc_registers(num_regs);
+        for (reg_offset, column_index) in index.columns.iter().enumerate() {
+            emit_index_column_value_old_image(
+                program,
+                &t_ctx.resolver,
+                table_references,
+                target_table_cursor_id,
+                column_index,
+                delete_start_reg + reg_offset,
+            )?;
+        }
+        program.emit_insn(Insn::RowId {
+            cursor_id: target_table_cursor_id,
+            dest: delete_start_reg + num_regs - 1,
+        });
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: delete_start_reg,
+            num_regs,
+            cursor_id: *idx_cursor_id,
+            raise_error_if_no_matching_entry: true,
+        });
+
+        // Resolve delete skip label if it exists
+        if let Some(label) = skip_delete_label {
+            program.resolve_label(label, program.offset());
+        }
+
+        // Insert the new index entry
+        if let Some(new_satisfied) = new_satisfies_where {
+            skip_insert_label = Some(program.allocate_label());
+            // If the new values don't satisfy the WHERE clause, skip the idx insert
+            program.emit_insn(Insn::IfNot {
+                reg: new_satisfied,
+                target_pc: skip_insert_label.unwrap(),
+                jump_if_null: true,
+            });
+        }
+
         program.emit_insn(Insn::IdxInsert {
             cursor_id: *idx_cursor_id,
             record_reg: *record_reg,

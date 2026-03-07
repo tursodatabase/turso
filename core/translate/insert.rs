@@ -464,7 +464,8 @@ pub fn translate_insert(
         .collect()
     });
 
-    if !relevant_before_triggers.is_empty() {
+    let has_before_triggers = !relevant_before_triggers.is_empty();
+    if has_before_triggers {
         // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
         let new_registers: Vec<usize> = insertion
             .col_mappings
@@ -790,7 +791,8 @@ pub fn translate_insert(
         )
         .collect()
     });
-    if !relevant_after_triggers.is_empty() {
+    let has_after_triggers = !relevant_after_triggers.is_empty();
+    if has_after_triggers {
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
         let key_reg = insertion.key_register();
@@ -946,7 +948,25 @@ pub fn translate_insert(
 
     emit_epilogue(program, resolver, &ctx, inserting_multiple_rows)?;
 
-    program.set_needs_stmt_subtransactions(true);
+    super::stmt_journal::set_insert_stmt_journal_flags(
+        program,
+        &super::stmt_journal::InsertJournalCtx {
+            inserting_multiple_rows,
+            has_triggers: has_before_triggers || has_after_triggers,
+            has_fks,
+            is_replace: matches!(ctx.on_conflict, ResolveType::Replace),
+            has_upsert,
+            has_autoincrement: btree_table.has_autoincrement,
+            has_abort_resolution: matches!(ctx.on_conflict, ResolveType::Abort),
+            notnull_col_exists: insertion
+                .col_mappings
+                .iter()
+                .any(|m| m.column.notnull() && !m.column.is_rowid_alias()),
+            has_check: !ctx.table.check_constraints.is_empty(),
+            has_unique: !constraints.constraints_to_check.is_empty(),
+        },
+    );
+
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
