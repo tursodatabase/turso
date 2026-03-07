@@ -228,7 +228,7 @@ test window-rewrite-multiple-windows-arithmetic-regression {
     age,
     SUM(age) OVER (PARTITION BY city) AS city_total,
     SUM(age) OVER () AS grand_total,
-    age * 100.0 / SUM(age) OVER () AS pct_of_total
+    round(age * 100.0 / SUM(age) OVER (), 15) AS pct_of_total
     FROM users
     ORDER BY id
     LIMIT 5;
