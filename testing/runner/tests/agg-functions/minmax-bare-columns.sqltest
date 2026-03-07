@@ -1,0 +1,180 @@
+@database :memory:
+
+@cross-check-integrity
+test bare_columns_follow_max_row_ungrouped {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES
+        (1,10,'first'),
+        (2,30,'second'),
+        (3,20,'third');
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    2|second|30
+}
+
+@cross-check-integrity
+test bare_columns_follow_min_row_ungrouped {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES
+        (1,10,'first'),
+        (2,30,'second'),
+        (3,20,'third');
+    SELECT id, name, MIN(val) FROM t;
+}
+expect {
+    1|first|10
+}
+
+@cross-check-integrity
+test row_dependent_expression_follows_max_row {
+    CREATE TABLE t(id INT, val INT);
+    INSERT INTO t VALUES
+        (1,10),
+        (2,30),
+        (3,20);
+    SELECT id + 1, MAX(val) FROM t;
+}
+expect {
+    3|30
+}
+
+@cross-check-integrity
+test mixed_expression_with_aggregate_uses_max_row {
+    CREATE TABLE t(id INT, val INT);
+    INSERT INTO t VALUES
+        (1,10),
+        (2,30),
+        (3,20);
+    SELECT id + MAX(val) FROM t;
+}
+expect {
+    32
+}
+
+@cross-check-integrity
+test mixed_expression_with_aggregate_uses_max_row_per_group {
+    CREATE TABLE t(g TEXT, id INT, val INT);
+    INSERT INTO t VALUES
+        ('a', 1, 10),
+        ('a', 2, 30),
+        ('a', 3, 20),
+        ('b', 4,  5),
+        ('b', 5, 40);
+    SELECT g, id + MAX(val) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    a|32
+    b|45
+}
+
+@cross-check-integrity
+test bare_columns_follow_max_row_grouped {
+    CREATE TABLE t(g TEXT, id INT, val INT, name TEXT);
+    INSERT INTO t VALUES
+        ('a', 1, 10, 'a10'),
+        ('a', 2, 30, 'a30'),
+        ('a', 3, 20, 'a20'),
+        ('b', 4,  5, 'b5'),
+        ('b', 5, 40, 'b40');
+    SELECT g, id, name, MAX(val) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    a|2|a30|30
+    b|5|b40|40
+}
+
+@cross-check-integrity
+test bare_columns_follow_single_max_even_with_other_aggregates {
+    CREATE TABLE t(id INT, val INT);
+    INSERT INTO t VALUES
+        (1,10),
+        (2,30),
+        (3,20);
+    SELECT id, MAX(val), COUNT(*) FROM t;
+}
+expect {
+    2|30|3
+}
+
+@cross-check-integrity
+test grouped_bare_columns_follow_single_max_even_with_other_aggregates {
+    CREATE TABLE t(g TEXT, id INT, val INT);
+    INSERT INTO t VALUES
+        ('a', 1, 10),
+        ('a', 2, 30),
+        ('a', 3, 20),
+        ('b', 9,  1),
+        ('b', 7,  5);
+    SELECT g, id, MAX(val), SUM(val) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    a|2|30|60
+    b|7|5|6
+}
+
+@cross-check-integrity
+test order_by_bare_column_follows_max_row_even_if_not_selected {
+    CREATE TABLE t(g TEXT, id INT, val INT);
+    INSERT INTO t VALUES
+        ('a', 1, 10),
+        ('a', 9, 30),
+        ('b', 2,  5),
+        ('b', 3, 40);
+    SELECT MAX(val) FROM t GROUP BY g ORDER BY id;
+}
+expect {
+    40
+    30
+}
+
+@cross-check-integrity
+test having_bare_column_follows_max_row_even_if_not_selected {
+    CREATE TABLE t(id INT, val INT);
+    INSERT INTO t VALUES
+        (-1, 10),
+        ( 2, 30);
+    SELECT MAX(val) FROM t HAVING id > 0;
+}
+expect {
+    30
+}
+
+@cross-check-integrity
+test having_bare_column_filters_by_max_row_even_if_first_row_matches {
+    CREATE TABLE t(id INT, val INT);
+    INSERT INTO t VALUES
+        ( 2, 10),
+        (-1, 30);
+    SELECT MAX(val) FROM t HAVING id > 0;
+}
+expect {
+}
+
+@cross-check-integrity
+test bare_columns_all_null_max_choose_last_row {
+    CREATE TABLE t(id INT, val INT, name TEXT);
+    INSERT INTO t VALUES
+        (1, NULL, 'first'),
+        (2, NULL, 'second'),
+        (3, NULL, 'third');
+    SELECT id, name, MAX(val) FROM t;
+}
+expect {
+    3|third|
+}
+
+@cross-check-integrity
+test bare_columns_all_null_min_grouped_choose_last_row_per_group {
+    CREATE TABLE t(g TEXT, id INT, val INT, name TEXT);
+    INSERT INTO t VALUES
+        ('a', 1, NULL, 'a1'),
+        ('a', 2, NULL, 'a2'),
+        ('b', 3, NULL, 'b3'),
+        ('b', 4, NULL, 'b4');
+    SELECT g, id, name, MIN(val) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    a|2|a2|
+    b|4|b4|
+}

@@ -2336,6 +2336,8 @@ fn emit_loop_source<'a>(
             let start_reg = t_ctx
                 .reg_agg_start
                 .expect("aggregate registers must be initialized");
+            let minmax_agg_idx = plan.single_minmax_for_bare_result_columns();
+            let reg_minmax_not_updated = minmax_agg_idx.map(|_| program.alloc_register());
 
             // In planner.rs, we have collected all aggregates from the SELECT clause, including ones where the aggregate is embedded inside
             // a more complex expression. Some examples: length(sum(x)), sum(x) + avg(y), sum(x) + 1, etc.
@@ -2349,6 +2351,11 @@ fn emit_loop_source<'a>(
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
+                    if Some(i) == minmax_agg_idx {
+                        reg_minmax_not_updated
+                    } else {
+                        None
+                    },
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -2360,11 +2367,28 @@ fn emit_loop_source<'a>(
 
             let label_emit_nonagg_only_once = if let Some(flag) = t_ctx.reg_nonagg_emit_once_flag {
                 let if_label = program.allocate_label();
-                program.emit_insn(Insn::If {
-                    reg: flag,
-                    target_pc: if_label,
-                    jump_if_null: false,
-                });
+                if let Some(reg) = reg_minmax_not_updated {
+                    let label_eval = program.allocate_label();
+                    // First row always evaluates non-aggregate columns (flag == 0).
+                    program.emit_insn(Insn::IfNot {
+                        reg: flag,
+                        target_pc: label_eval,
+                        jump_if_null: false,
+                    });
+                    // For subsequent rows, skip unless MIN/MAX accumulator changed this row.
+                    program.emit_insn(Insn::If {
+                        reg,
+                        target_pc: if_label,
+                        jump_if_null: false,
+                    });
+                    program.resolve_label(label_eval, program.offset());
+                } else {
+                    program.emit_insn(Insn::If {
+                        reg: flag,
+                        target_pc: if_label,
+                        jump_if_null: false,
+                    });
+                }
                 Some(if_label)
             } else {
                 None
@@ -2395,18 +2419,26 @@ fn emit_loop_source<'a>(
                 )?;
             }
 
-            // For result columns that contain aggregates but also reference
-            // non-aggregate columns (e.g. CASE WHEN SUM(1) THEN a ELSE b END),
-            // pre-read those column references while the cursor is still valid.
-            // They are cached in expr_to_reg_cache so that when the full
-            // expression is evaluated after AggFinal, translate_expr finds
-            // the cached values instead of reading from the exhausted cursor.
-            for rc in plan
-                .result_columns
-                .iter()
-                .filter(|rc| rc.contains_aggregates)
-            {
-                walk_expr(&rc.expr, &mut |expr: &'a Expr| -> Result<WalkControl> {
+            // For post-aggregation expressions that may reference row data
+            // (e.g. CASE WHEN SUM(1) THEN a ELSE b END), pre-read those column
+            // references while the cursor is still valid. They are cached in
+            // expr_to_reg_cache so that when expressions are evaluated after
+            // AggFinal, translate_expr finds cached values instead of reading
+            // from an exhausted cursor.
+            let minmax_cache_skip_label = if let Some(reg) = reg_minmax_not_updated {
+                let label_skip = program.allocate_label();
+                program.emit_insn(Insn::If {
+                    reg,
+                    target_pc: label_skip,
+                    jump_if_null: false,
+                });
+                Some(label_skip)
+            } else {
+                None
+            };
+
+            let mut cache_row_refs_from_expr = |root_expr: &'a Expr| -> Result<()> {
+                walk_expr(root_expr, &mut |expr: &'a Expr| -> Result<WalkControl> {
                     match expr {
                         Expr::Column { .. } | Expr::RowId { .. } => {
                             let reg = program.alloc_register();
@@ -2432,6 +2464,35 @@ fn emit_loop_source<'a>(
                         }
                     }
                 })?;
+                Ok(())
+            };
+
+            // Result expressions containing aggregates are always evaluated
+            // after AggFinal and may require row-data cache entries.
+            for rc in plan
+                .result_columns
+                .iter()
+                .filter(|rc| rc.contains_aggregates)
+            {
+                cache_row_refs_from_expr(&rc.expr)?;
+            }
+
+            // HAVING (without GROUP BY expressions) is also evaluated after
+            // aggregation. For the MIN/MAX bare-column special case, it must
+            // observe row values from the chosen MIN/MAX row.
+            if reg_minmax_not_updated.is_some() {
+                if let Some(group_by) = &plan.group_by {
+                    if group_by.exprs.is_empty() {
+                        if let Some(having) = &group_by.having {
+                            for expr in having {
+                                cache_row_refs_from_expr(expr)?;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(label_skip) = minmax_cache_skip_label {
+                program.resolve_label(label_skip, program.offset());
             }
 
             if let Some(label) = label_emit_nonagg_only_once {

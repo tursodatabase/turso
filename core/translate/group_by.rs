@@ -508,6 +508,8 @@ pub fn group_by_process_single_group(
         .as_ref()
         .expect("group by metadata not found");
     program.preassign_label_to_next_insn(labels.label_sort_loop_start);
+    let minmax_agg_idx = plan.single_minmax_for_bare_result_columns();
+    let reg_minmax_not_updated = minmax_agg_idx.map(|_| program.alloc_register());
     let groups_start_reg = match &row_source {
         GroupByRowSource::Sorter {
             sort_cursor,
@@ -629,6 +631,11 @@ pub fn group_by_process_single_group(
             agg_arg_source,
             agg_result_reg,
             &t_ctx.resolver,
+            if Some(i) == minmax_agg_idx {
+                reg_minmax_not_updated
+            } else {
+                None
+            },
         )?;
         if let Distinctness::Distinct { ctx } = &agg.distinctness {
             let ctx = ctx
@@ -645,11 +652,29 @@ pub fn group_by_process_single_group(
         program.offset(),
         "don't emit group columns if continuing existing group",
     );
-    program.emit_insn(Insn::If {
-        target_pc: labels.label_acc_indicator_set_flag_true,
-        reg: registers.reg_data_in_acc_flag,
-        jump_if_null: false,
-    });
+    if let Some(reg) = reg_minmax_not_updated {
+        let label_emit_nonagg = program.allocate_label();
+        // First row in group always captures non-aggregate expressions.
+        program.emit_insn(Insn::IfNot {
+            target_pc: label_emit_nonagg,
+            reg: registers.reg_data_in_acc_flag,
+            jump_if_null: false,
+        });
+        // For subsequent rows, only refresh non-aggregate expressions when
+        // MIN/MAX accumulator changed in this row.
+        program.emit_insn(Insn::If {
+            target_pc: labels.label_acc_indicator_set_flag_true,
+            reg,
+            jump_if_null: false,
+        });
+        program.resolve_label(label_emit_nonagg, program.offset());
+    } else {
+        program.emit_insn(Insn::If {
+            target_pc: labels.label_acc_indicator_set_flag_true,
+            reg: registers.reg_data_in_acc_flag,
+            jump_if_null: false,
+        });
+    }
 
     // Read non-aggregate columns from the current row
     match row_source {

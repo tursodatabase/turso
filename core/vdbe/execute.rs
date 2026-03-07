@@ -4453,7 +4453,7 @@ fn update_agg_payload(
     payload: &mut [Value],
     collation: CollationSeq,
     comparator: &Option<crate::vdbe::sorter::SortComparator>,
-) -> Result<()> {
+) -> Result<bool> {
     match func {
         AggFunc::Count => {
             // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
@@ -4481,7 +4481,7 @@ fn update_agg_payload(
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
             let [sum_val, r_err_val, count_val, ..] = payload else {
@@ -4611,11 +4611,14 @@ fn update_agg_payload(
         }
         AggFunc::Min | AggFunc::Max => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                // Match SQLite behavior for all-NULL groups: when the accumulator
+                // is still NULL, treat this as selecting the current row so bare
+                // columns follow the last row visited.
+                return Ok(matches!(payload[0], Value::Null));
             }
             if matches!(payload[0], Value::Null) {
                 payload[0] = arg;
-                return Ok(());
+                return Ok(true);
             }
             use std::cmp::Ordering;
             // Use custom type comparator if available, otherwise fall back to collation
@@ -4633,11 +4636,13 @@ fn update_agg_payload(
             };
             if should_update {
                 payload[0] = arg;
+                return Ok(true);
             }
+            return Ok(false);
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let delimiter = maybe_arg2.unwrap_or_else(|| Value::build_text(","));
             let acc = &mut payload[0];
@@ -4695,7 +4700,7 @@ fn update_agg_payload(
             vec.append(&mut data);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Convert the intermediate aggregate state in `payload` into the final result value.
@@ -4883,6 +4888,7 @@ pub fn op_agg_step(
                 _ => None,
             };
             let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
+            let minmax_not_updated_reg = state.minmax_not_updated_reg;
 
             // Now get mutable borrow on payload
             let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
@@ -4892,7 +4898,13 @@ pub fn op_agg_step(
                 );
             };
             let payload = agg.payload_mut();
-            update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
+            let minmax_updated =
+                update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
+            if matches!(func, AggFunc::Min | AggFunc::Max) && !minmax_updated {
+                if let Some(reg_idx) = minmax_not_updated_reg {
+                    state.registers[reg_idx] = Register::Value(Value::from_i64(1));
+                }
+            }
         }
     };
 
@@ -9278,6 +9290,7 @@ pub fn op_coll_seq(
 
     // Set the current collation sequence for use by subsequent functions
     state.current_collation = Some(*collation);
+    state.minmax_not_updated_reg = *reg;
 
     // If P1 is not zero, initialize that register to 0
     if let Some(reg_idx) = reg {

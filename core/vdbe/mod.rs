@@ -369,6 +369,9 @@ pub struct ProgramState {
     seek_state: OpSeekState,
     /// Current collation sequence set by OP_CollSeq instruction
     current_collation: Option<CollationSeq>,
+    /// Optional register used by MIN/MAX aggregate stepping to indicate that
+    /// the current row did not replace the accumulator value.
+    minmax_not_updated_reg: Option<usize>,
     op_column_state: OpColumnState,
     op_row_id_state: OpRowIdState,
     op_transaction_state: OpTransactionState,
@@ -473,6 +476,7 @@ impl ProgramState {
             distinct_key_values: Vec::new(),
             seek_state: OpSeekState::Start,
             current_collation: None,
+            minmax_not_updated_reg: None,
             op_column_state: OpColumnState::Start,
             op_row_id_state: OpRowIdState::Start,
             op_transaction_state: OpTransactionState::Start,
@@ -578,6 +582,7 @@ impl ProgramState {
         self.op_no_conflict_state = OpNoConflictState::Start;
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
+        self.minmax_not_updated_reg = None;
         self.op_column_state = OpColumnState::Start;
         self.op_row_id_state = OpRowIdState::Start;
         self.commit_state = CommitState::Ready;

@@ -11,7 +11,7 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::{as_binary_components, get_expr_affinity},
+        expr::{as_binary_components, get_expr_affinity, walk_expr, WalkControl},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -503,6 +503,78 @@ impl SelectPlan {
 
     pub fn agg_args_count(&self) -> usize {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
+    }
+
+    fn has_row_dependent_post_agg_expr_outside_aggregates(&self) -> bool {
+        let expr_depends_on_row = |root_expr: &ast::Expr| {
+            let mut depends_on_input_row = false;
+            walk_expr(root_expr, &mut |expr| -> Result<WalkControl> {
+                match expr {
+                    ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                        if self
+                            .table_references
+                            .find_joined_table_by_internal_id(*table)
+                            .is_some()
+                        {
+                            depends_on_input_row = true;
+                        }
+                        Ok(WalkControl::SkipChildren)
+                    }
+                    _ => {
+                        if self.aggregates.iter().any(|a| a.original_expr == *expr) {
+                            return Ok(WalkControl::SkipChildren);
+                        }
+                        Ok(WalkControl::Continue)
+                    }
+                }
+            })
+            .expect("walking post-aggregate expression should be infallible");
+            depends_on_input_row
+        };
+
+        if self
+            .result_columns
+            .iter()
+            .any(|rc| expr_depends_on_row(&rc.expr))
+        {
+            return true;
+        }
+        if self
+            .order_by
+            .iter()
+            .any(|(expr, _)| expr_depends_on_row(expr.as_ref()))
+        {
+            return true;
+        }
+        if let Some(group_by) = &self.group_by {
+            if let Some(having) = &group_by.having {
+                return having.iter().any(expr_depends_on_row);
+            }
+        }
+        false
+    }
+
+    /// Returns the aggregate index when this SELECT qualifies for SQLite's
+    /// bare-column MIN/MAX row-selection behavior.
+    ///
+    /// For a query with exactly one MIN() or MAX() aggregate and at least one
+    /// post-aggregation expression that depends on the input row (outside
+    /// aggregate arguments), SQLite takes that expression's source row from the
+    /// same input row that provides the MIN/MAX value.
+    pub fn single_minmax_for_bare_result_columns(&self) -> Option<usize> {
+        if !self.has_row_dependent_post_agg_expr_outside_aggregates() {
+            return None;
+        }
+        let mut minmax_idx = None;
+        for (idx, agg) in self.aggregates.iter().enumerate() {
+            if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
+                if minmax_idx.is_some() {
+                    return None;
+                }
+                minmax_idx = Some(idx);
+            }
+        }
+        minmax_idx
     }
 
     /// Whether this query or any of its subqueries reference columns from the outer query.
