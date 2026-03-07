@@ -393,7 +393,8 @@ mod raise_tests {
             let sqlite_log = sqlite_exec_rows(&sqlite_conn, "SELECT count(*) FROM log");
             let limbo_log = limbo_exec_rows(&limbo_conn, "SELECT count(*) FROM log");
             assert_eq!(
-                limbo_log, sqlite_log,
+                limbo_log,
+                sqlite_log,
                 "RAISE({}) trigger body rollback mismatch in round {round}\nseed: {seed}\ndml: {dml}\ntrigger: {trigger_sql}",
                 raise_type.sql()
             );
@@ -402,7 +403,8 @@ mod raise_tests {
             let sqlite_t = sqlite_exec_rows(&sqlite_conn, "SELECT x, y FROM t ORDER BY x, y");
             let limbo_t = limbo_exec_rows(&limbo_conn, "SELECT x, y FROM t ORDER BY x, y");
             assert_eq!(
-                limbo_t, sqlite_t,
+                limbo_t,
+                sqlite_t,
                 "RAISE({}) main table mismatch in round {round}\nseed: {seed}\ndml: {dml}\ntrigger: {trigger_sql}",
                 raise_type.sql()
             );
