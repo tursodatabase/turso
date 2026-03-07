@@ -4340,8 +4340,17 @@ pub fn op_decr_jump_zero(
 }
 
 fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
-    let s = acc.as_float();
+    // NaN from Inf + (-Inf) is sticky: once acc is Null, it stays Null.
+    // See https://sqlite.org/lang_aggfunc.html ("result is NULL").
+    if matches!(acc, Value::Null) {
+        return;
+    }
+    let s = acc.to_float_or_zero();
     let t = s + r;
+    if t.is_nan() {
+        *acc = Value::Null;
+        return;
+    }
     // When t is infinite, the KBN correction computes inf - inf = NaN,
     // which is meaningless. Skip compensation in that case.
     if t.is_finite() {
@@ -4490,7 +4499,10 @@ fn update_agg_payload(
                     "Avg: payload too short".to_string(),
                 ));
             };
-            let r_err = r_err_val.as_float();
+            if matches!(*sum_val, Value::Null) {
+                return Ok(());
+            }
+            let r_err = r_err_val.to_float_or_zero();
             let Value::Numeric(Numeric::Integer(count)) = count_val else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
@@ -4513,7 +4525,7 @@ fn update_agg_payload(
                 _ => unreachable!(),
             };
             // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
-            let s = sum_val.as_float();
+            let s = sum_val.to_float_or_zero();
             let t = s + val;
             // When t is infinite, the KBN correction computes inf - inf = NaN,
             // which is meaningless. Skip compensation in that case.
@@ -4536,7 +4548,7 @@ fn update_agg_payload(
                     "Sum/Total: payload too short".to_string(),
                 ));
             };
-            let r_err_f = r_err_val.as_float();
+            let r_err_f = r_err_val.to_float_or_zero();
             let Value::Numeric(Numeric::Integer(approx_i)) = approx_val else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
@@ -4554,6 +4566,9 @@ fn update_agg_payload(
                 approx: *approx_i != 0,
                 ovrfl: *ovrfl_i != 0,
             };
+            if matches!(*acc, Value::Null) && sum_state.approx {
+                return Ok(());
+            }
             match arg {
                 Value::Null => {}
                 Value::Numeric(Numeric::Integer(i)) => match acc {
@@ -4721,12 +4736,12 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
         AggFunc::Avg => {
             // Payload: [sum, r_err, count]
-            let sum = payload[0].as_float();
-            let r_err = payload[1].as_float();
             let count = payload[2].as_int().unwrap_or(0);
-            if count == 0 {
+            if count == 0 || matches!(&payload[0], Value::Null) {
                 Value::Null
             } else {
+                let sum = payload[0].to_float_or_zero();
+                let r_err = payload[1].to_float_or_zero();
                 // Apply KBN compensation before dividing
                 Value::from_f64((sum + r_err) / count as f64)
             }
@@ -4735,24 +4750,21 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             let acc = &payload[0];
             let approx = payload[2].as_int().unwrap_or(0) != 0;
             let ovrfl = payload[3].as_int().unwrap_or(0) != 0;
-            let r_err = payload[1].as_float();
+            let r_err = payload[1].to_float_or_zero();
             match acc {
-                Value::Null => {
-                    if approx {
-                        Value::from_f64(0.0)
-                    } else {
-                        Value::Null
-                    }
-                }
+                Value::Null => Value::Null,
                 Value::Numeric(Numeric::Integer(i)) if !approx && !ovrfl => Value::from_i64(*i),
-                _ => Value::from_f64(acc.as_float() + r_err),
+                Value::Numeric(Numeric::Float(f)) => Value::from_f64(f64::from(*f) + r_err),
+                _ => Value::from_f64(acc.to_float_or_zero() + r_err),
             }
         }
         AggFunc::Total => {
             // Payload: [acc, r_err, approx, ovrfl]
             let acc = &payload[0];
-            let r_err = payload[1].as_float();
+            let approx = payload[2].as_int().unwrap_or(0) != 0;
+            let r_err = payload[1].to_float_or_zero();
             match acc {
+                Value::Null if approx => Value::Null,
                 Value::Null => Value::from_f64(0.0),
                 Value::Numeric(Numeric::Integer(i)) => Value::from_f64(*i as f64 + r_err),
                 Value::Numeric(Numeric::Float(f)) => Value::from_f64(f64::from(*f) + r_err),
