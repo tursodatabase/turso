@@ -20,6 +20,29 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
     Ok(())
 }
 
+/// Run a nested helper statement on the same connection.
+///
+/// This mimics internal helper execution paths (e.g. ParseSchema) that run with
+/// `connection.is_nested_stmt() == true` and without statement subtransactions.
+fn run_nested_helper_statement(conn: &Arc<turso_core::Connection>) -> anyhow::Result<()> {
+    conn.start_nested();
+    let nested_result = (|| -> anyhow::Result<()> {
+        let mut nested = conn.prepare("SELECT name FROM aux.sqlite_schema LIMIT 1")?;
+        loop {
+            match nested.step()? {
+                StepResult::Row => {}
+                StepResult::Done => break,
+                StepResult::IO => nested._io().step()?,
+                StepResult::Busy => continue,
+                StepResult::Interrupt => anyhow::bail!("nested helper statement was interrupted"),
+            }
+        }
+        Ok(())
+    })();
+    conn.end_nested();
+    nested_result
+}
+
 /// CREATE TABLE on an attached MVCC database must not deadlock.
 /// op_parse_schema must release the database_schemas lock before executing the
 /// nested statement that reads sqlite_schema, since reprepare() also acquires
@@ -545,6 +568,44 @@ fn test_stmt_rollback_on_attached_mvcc_db_with_index(tmp_db: TempDatabase) -> an
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM aux.parent");
     assert_eq!(rows, vec![(1,)]);
 
+    Ok(())
+}
+
+/// A nested helper statement on the same connection must not release/rollback
+/// an existing attached MVCC savepoint owned by the parent context.
+#[turso_macros::test]
+fn test_nested_helper_keeps_attached_mvcc_stmt_savepoint(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let aux_path = tmp_db.path.with_extension("aux_nested_stmt_sp.db");
+    create_mvcc_db(&tmp_db.io, &aux_path)?;
+
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE aux.docs(id INTEGER PRIMARY KEY, body TEXT)")?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO aux.docs(id, body) VALUES (0, 'base')")?;
+    conn.execute("SAVEPOINT sp1")?;
+    conn.execute("INSERT INTO aux.docs(id, body) VALUES (1, 'hello')")?;
+
+    // Nested helper statements run with subtransactions disabled.
+    // They must not consume savepoints opened by their parent context.
+    run_nested_helper_statement(&conn)?;
+
+    conn.execute("INSERT INTO aux.docs(id, body) VALUES (2, 'world')")?;
+    conn.execute("ROLLBACK TO sp1")?;
+    conn.execute("RELEASE sp1")?;
+    conn.execute("COMMIT")?;
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, body FROM aux.docs ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![(0, "base".to_string())],
+        "ROLLBACK TO sp1 should keep only pre-savepoint row"
+    );
     Ok(())
 }
 

@@ -1567,4 +1567,14 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         let _ = self.search_result.pop_front();
         Ok(IOResult::Done(!self.search_result.is_empty()))
     }
+
+    fn rollback(&mut self) -> Result<()> {
+        // B-Tree changes are reverted by statement/transaction savepoint rollback.
+        // Here we only reset cursor-local state machines and buffers.
+        self.insert_state = VectorSparseInvertedIndexInsertState::Init;
+        self.delete_state = VectorSparseInvertedIndexDeleteState::Init;
+        self.search_state = VectorSparseInvertedIndexSearchState::Init;
+        self.search_result.clear();
+        Ok(())
+    }
 }

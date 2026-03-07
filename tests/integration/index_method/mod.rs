@@ -649,6 +649,44 @@ fn test_fts_sql_queries(tmp_db: TempDatabase) {
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
+fn test_fts_duplicate_insert_rollback_clears_pending_state(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts (body)")
+        .unwrap();
+
+    let count_rows = || {
+        let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM docs");
+        match &rows[0][0] {
+            rusqlite::types::Value::Integer(v) => *v,
+            other => panic!("expected integer count, got {other:?}"),
+        }
+    };
+    let fts_rows = || limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(body, 'hello')");
+
+    // Autocommit mode: statement must fail without panicking and roll back fully.
+    let result = conn.execute("INSERT INTO docs(id, body) VALUES (1, 'hello'), (1, 'dup')");
+    assert!(result.is_err());
+    assert_eq!(count_rows(), 0);
+    assert!(fts_rows().is_empty());
+
+    // Explicit transaction: statement-level rollback must also clear pending FTS state.
+    conn.execute("BEGIN").unwrap();
+    let result = conn.execute("INSERT INTO docs(id, body) VALUES (1, 'hello'), (1, 'dup')");
+    assert!(result.is_err());
+    assert_eq!(count_rows(), 0);
+    assert!(fts_rows().is_empty());
+    conn.execute("COMMIT").unwrap();
+
+    assert_eq!(count_rows(), 0);
+    assert!(fts_rows().is_empty());
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
 fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();

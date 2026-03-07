@@ -2281,6 +2281,17 @@ pub(crate) fn index_method_pre_commit_all(
     Ok(())
 }
 
+/// Discard statement-local pending state on all index method cursors.
+pub(crate) fn index_method_rollback_all(state: &mut ProgramState) -> crate::Result<()> {
+    for cursor_opt in state.cursors.iter_mut().flatten() {
+        let Cursor::IndexMethod(cursor) = cursor_opt else {
+            continue;
+        };
+        cursor.rollback()?;
+    }
+    Ok(())
+}
+
 /// Rollback all virtual tables that are part of the current transaction.
 fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
@@ -2745,6 +2756,9 @@ pub fn op_transaction_inner(
                         // Attached MVCC DB: open an MvStore savepoint.
                         if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
                             mv_store.begin_savepoint(tx_id);
+                            if !state.attached_mvcc_savepoint_dbs.contains(db) {
+                                state.attached_mvcc_savepoint_dbs.push(*db);
+                            }
                         }
                     } else {
                         // Attached WAL DB: open a pager savepoint for statement rollback.
