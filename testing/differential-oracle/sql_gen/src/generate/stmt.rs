@@ -479,35 +479,27 @@ fn generate_update_sets<C: Capabilities>(
             let array_expr = match variant {
                 0 => {
                     // array_append(col, <literal>)
-                    let elem_type = col_data_type.array_element_type().unwrap_or(DataType::Integer);
+                    let elem_type = col_data_type
+                        .array_element_type()
+                        .unwrap_or(DataType::Integer);
                     let lit = generate_literal(ctx, elem_type, generator.policy());
                     let lit_expr = Expr::literal(ctx, lit);
-                    Expr::function_call(
-                        ctx,
-                        "ARRAY_APPEND".to_string(),
-                        vec![col_ref, lit_expr],
-                    )
+                    Expr::function_call(ctx, "ARRAY_APPEND".to_string(), vec![col_ref, lit_expr])
                 }
                 1 => {
                     // array_remove(col, <literal>)
-                    let elem_type = col_data_type.array_element_type().unwrap_or(DataType::Integer);
+                    let elem_type = col_data_type
+                        .array_element_type()
+                        .unwrap_or(DataType::Integer);
                     let lit = generate_literal(ctx, elem_type, generator.policy());
                     let lit_expr = Expr::literal(ctx, lit);
-                    Expr::function_call(
-                        ctx,
-                        "ARRAY_REMOVE".to_string(),
-                        vec![col_ref, lit_expr],
-                    )
+                    Expr::function_call(ctx, "ARRAY_REMOVE".to_string(), vec![col_ref, lit_expr])
                 }
                 _ => {
                     // array_cat(col, <array_literal>)
                     let lit = generate_literal(ctx, col_data_type, generator.policy());
                     let lit_expr = Expr::literal(ctx, lit);
-                    Expr::function_call(
-                        ctx,
-                        "ARRAY_CAT".to_string(),
-                        vec![col_ref, lit_expr],
-                    )
+                    Expr::function_call(ctx, "ARRAY_CAT".to_string(), vec![col_ref, lit_expr])
                 }
             };
             sets.push((col_name, array_expr));
@@ -720,8 +712,7 @@ pub fn generate_create_table<C: Capabilities>(
 
     // Force STRICT when any column has an array type (arrays require STRICT tables).
     let has_array_column = columns.iter().any(|c| c.data_type.is_array());
-    let strict =
-        has_array_column || ctx.gen_bool_with_prob(create_table_config.strict_probability);
+    let strict = has_array_column || ctx.gen_bool_with_prob(create_table_config.strict_probability);
 
     // STRICT tables don't allow untyped (Null) columns — convert to Integer.
     if strict {

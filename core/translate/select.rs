@@ -1066,9 +1066,7 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
                 }
             }
             Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!(
-                    "Array and Subscript are desugared into function calls by the parser"
-                )
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
             Expr::Column { .. }
             | Expr::DoublyQualified(_, _, _)

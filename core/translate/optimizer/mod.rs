@@ -2316,9 +2316,7 @@ impl Optimizable for ast::Expr {
             Expr::Variable(..) => false,
             Expr::Register(..) => false, // Register values can be null
             Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!(
-                    "Array and Subscript are desugared into function calls by the parser"
-                )
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
         }
     }
@@ -2398,9 +2396,7 @@ impl Optimizable for ast::Expr {
             Expr::Variable(_) => true,
             Expr::Register(_) => false,
             Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!(
-                    "Array and Subscript are desugared into function calls by the parser"
-                )
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
         }
     }

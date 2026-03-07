@@ -83,7 +83,9 @@ fn main() -> Result<()> {
         .with_array_support()
         .with_max_expr_depth(3)
         .with_max_subquery_depth(1)
-        .with_function_config(sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]));
+        .with_function_config(
+            sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
+        );
 
     // Panic capture context
     let panic_context: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -92,7 +94,10 @@ fn main() -> Result<()> {
     let mut stats = FuzzerStats::default();
 
     // Phase 1: Create tables with array columns
-    tracing::info!("Phase 1: Creating {} tables with array columns", args.tables);
+    tracing::info!(
+        "Phase 1: Creating {} tables with array columns",
+        args.tables
+    );
     let create_table_policy = policy.clone().with_stmt_weights(StmtWeights {
         create_table: 100,
         select: 0,
@@ -138,10 +143,7 @@ fn main() -> Result<()> {
             .context("Failed to introspect schema after CREATE TABLE")?;
     }
 
-    tracing::info!(
-        "Schema: {} tables created",
-        schema.tables.len(),
-    );
+    tracing::info!("Schema: {} tables created", schema.tables.len(),);
 
     // Phase 2: Generate and execute statements
     tracing::info!("Phase 2: Executing {} statements", args.statements);
@@ -170,9 +172,8 @@ fn main() -> Result<()> {
             *ctx_clone.lock() = Some(format!("{info}\n{bt}"));
         }));
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_turso(&conn, &sql)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute_turso(&conn, &sql)));
 
         std::panic::set_hook(prev_hook);
 
@@ -307,8 +308,7 @@ fn run_consistency_checks(
             );
             let insert_sql =
                 format!("INSERT INTO \"{test_table}\" (id, arr) VALUES (1, ARRAY[1,2,3])");
-            let select_sql =
-                format!("SELECT array_length(arr) FROM \"{test_table}\" WHERE id = 1");
+            let select_sql = format!("SELECT array_length(arr) FROM \"{test_table}\" WHERE id = 1");
             let drop_sql = format!("DROP TABLE IF EXISTS \"{test_table}\"");
 
             // Best-effort: ignore errors from CREATE/INSERT (table may already exist, etc.)
@@ -504,7 +504,11 @@ fn write_sql_file(out_dir: &std::path::Path, statements: &[String]) -> Result<()
     for sql in statements {
         writeln!(file, "{sql};")?;
     }
-    tracing::info!("Wrote {} statements to {}", statements.len(), path.display());
+    tracing::info!(
+        "Wrote {} statements to {}",
+        statements.len(),
+        path.display()
+    );
     Ok(())
 }
 

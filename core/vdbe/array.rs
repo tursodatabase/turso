@@ -29,182 +29,14 @@ pub(crate) fn array_values_from_any(arr: &Value) -> Option<Vec<Value>> {
     }
 }
 
-/// Parse a text array literal into a Vec<Value>.
-/// Accepts both PG format `{1, hello, NULL}` and JSON format `[1, "hello", null]`.
-/// Handles integers, floats, strings, null, and booleans (mapped to 0/1).
+/// Parse a text array literal in PG format `{1, hello, NULL}` into a Vec<Value>.
+/// Handles integers, floats, strings (quoted and unquoted), and NULL.
 pub(crate) fn parse_text_array(text: &str) -> Option<Vec<Value>> {
     let text = text.trim();
     if text.starts_with('{') && text.ends_with('}') {
         return parse_pg_text_array(text);
     }
-    if !text.starts_with('[') || !text.ends_with(']') {
-        return None;
-    }
-    let inner = text[1..text.len() - 1].trim();
-    if inner.is_empty() {
-        return Some(Vec::new());
-    }
-    let bytes = inner.as_bytes();
-    let mut pos = 0;
-    let mut elements = Vec::new();
-
-    loop {
-        // Skip whitespace
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if pos >= bytes.len() {
-            break;
-        }
-
-        match bytes[pos] {
-            b'"' => {
-                pos += 1;
-                let mut s = String::new();
-                loop {
-                    if pos >= bytes.len() {
-                        return None;
-                    }
-                    match bytes[pos] {
-                        b'\\' => {
-                            pos += 1;
-                            if pos >= bytes.len() {
-                                return None;
-                            }
-                            match bytes[pos] {
-                                b'"' => s.push('"'),
-                                b'\\' => s.push('\\'),
-                                b'/' => s.push('/'),
-                                b'n' => s.push('\n'),
-                                b't' => s.push('\t'),
-                                b'r' => s.push('\r'),
-                                b'b' => s.push('\x08'),
-                                b'f' => s.push('\x0c'),
-                                b'u' => {
-                                    // \uXXXX unicode escape
-                                    if pos + 4 >= bytes.len() {
-                                        return None;
-                                    }
-                                    let hex_bytes = bytes.get(pos + 1..pos + 5)?;
-                                    let hex = std::str::from_utf8(hex_bytes).ok()?;
-                                    let code_point = u16::from_str_radix(hex, 16).ok()?;
-                                    // Handle UTF-16 surrogate pairs
-                                    if (0xD800..=0xDBFF).contains(&code_point) {
-                                        // High surrogate, expect \uXXXX low surrogate
-                                        if pos + 10 >= bytes.len()
-                                            || bytes[pos + 5] != b'\\'
-                                            || bytes[pos + 6] != b'u'
-                                        {
-                                            return None;
-                                        }
-                                        let low_hex_bytes = bytes.get(pos + 7..pos + 11)?;
-                                        let low_hex = std::str::from_utf8(low_hex_bytes).ok()?;
-                                        let low = u16::from_str_radix(low_hex, 16).ok()?;
-                                        if !(0xDC00..=0xDFFF).contains(&low) {
-                                            return None;
-                                        }
-                                        let cp = 0x10000
-                                            + ((code_point as u32 - 0xD800) << 10)
-                                            + (low as u32 - 0xDC00);
-                                        s.push(char::from_u32(cp)?);
-                                        pos += 6; // skip past low surrogate's \uXXXX (6 extra chars)
-                                    } else if (0xDC00..=0xDFFF).contains(&code_point) {
-                                        // Lone low surrogate is invalid
-                                        return None;
-                                    } else {
-                                        s.push(char::from_u32(code_point as u32)?);
-                                    }
-                                    pos += 4; // skip past the 4 hex digits
-                                }
-                                _ => return None,
-                            }
-                        }
-                        b'"' => {
-                            pos += 1;
-                            break;
-                        }
-                        _ => {
-                            // Handle multi-byte UTF-8 correctly by decoding the
-                            // full character from the byte slice.
-                            let remaining = &inner[pos..];
-                            let ch = remaining.chars().next().unwrap_or('\u{FFFD}');
-                            s.push(ch);
-                            pos += ch.len_utf8();
-                            continue; // skip the pos += 1 below
-                        }
-                    }
-                    pos += 1;
-                }
-                elements.push(Value::build_text(s));
-            }
-            b'n' => {
-                if bytes[pos..].starts_with(b"null") {
-                    pos += 4;
-                    elements.push(Value::Null);
-                } else {
-                    return None;
-                }
-            }
-            b't' => {
-                if bytes[pos..].starts_with(b"true") {
-                    pos += 4;
-                    elements.push(Value::from_i64(1));
-                } else {
-                    return None;
-                }
-            }
-            b'f' => {
-                if bytes[pos..].starts_with(b"false") {
-                    pos += 5;
-                    elements.push(Value::from_i64(0));
-                } else {
-                    return None;
-                }
-            }
-            c if c.is_ascii_digit() || c == b'-' => {
-                let start = pos;
-                let mut is_float = false;
-                if bytes[pos] == b'-' {
-                    pos += 1;
-                }
-                while pos < bytes.len()
-                    && (bytes[pos].is_ascii_digit()
-                        || bytes[pos] == b'.'
-                        || bytes[pos] == b'e'
-                        || bytes[pos] == b'E'
-                        || bytes[pos] == b'+'
-                        || bytes[pos] == b'-')
-                {
-                    if bytes[pos] == b'.' || bytes[pos] == b'e' || bytes[pos] == b'E' {
-                        is_float = true;
-                    }
-                    pos += 1;
-                }
-                let num_str = &inner[start..pos];
-                if is_float {
-                    elements.push(Value::from_f64(num_str.parse::<f64>().ok()?));
-                } else {
-                    elements.push(Value::from_i64(num_str.parse::<i64>().ok()?));
-                }
-            }
-            _ => return None,
-        }
-
-        // Skip whitespace
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if pos >= bytes.len() {
-            break;
-        }
-        if bytes[pos] == b',' {
-            pos += 1;
-        } else if pos < bytes.len() {
-            return None;
-        }
-    }
-
-    Some(elements)
+    None
 }
 
 /// Parse a PG-style text array like `{1, hello, NULL, 3.14}` into a Vec<Value>.
@@ -277,6 +109,9 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
             } else if let Ok(i) = token.parse::<i64>() {
                 elements.push(Value::from_i64(i));
             } else if let Ok(f) = token.parse::<f64>() {
+                if !f.is_finite() {
+                    return None; // reject Infinity and NaN
+                }
                 elements.push(Value::from_f64(f));
             } else {
                 elements.push(Value::build_text(token.to_string()));
@@ -292,6 +127,14 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
         }
         if bytes[pos] == b',' {
             pos += 1;
+            // Reject trailing commas: after consuming ',' there must be another element
+            let mut peek = pos;
+            while peek < bytes.len() && bytes[peek].is_ascii_whitespace() {
+                peek += 1;
+            }
+            if peek >= bytes.len() {
+                return None; // trailing comma
+            }
         } else if pos < bytes.len() {
             return None;
         }
@@ -334,6 +177,8 @@ fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
         }
         crate::ValueRef::Numeric(Numeric::Float(f)) => {
             let fval: f64 = (*f).into();
+            // Normalize -0.0 to 0.0 for display
+            let fval = if fval == 0.0 { 0.0 } else { fval };
             if fval.fract() == 0.0 && fval.is_finite() {
                 let _ = write!(result, "{fval:.1}");
             } else {
@@ -359,7 +204,12 @@ fn write_pg_text_element(result: &mut String, s: &str) {
     let needs_quoting = s.is_empty()
         || s.eq_ignore_ascii_case("null")
         || s.contains(|c: char| {
-            c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' || c.is_whitespace()
+            c == ','
+                || c == '{'
+                || c == '}'
+                || c == '"'
+                || c == '\\'
+                || c.is_whitespace()
                 || c.is_control()
         });
     if needs_quoting {
@@ -745,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_parse_text_array_multibyte_utf8() {
-        let input = r#"["café","naïve","über"]"#;
+        let input = r#"{"café","naïve","über"}"#;
         let result = parse_text_array(input).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], Value::build_text("café"));
@@ -755,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_parse_text_array_emoji() {
-        let input = r#"["hello 🌍","test 🚀"]"#;
+        let input = r#"{"hello 🌍","test 🚀"}"#;
         let result = parse_text_array(input).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], Value::build_text("hello 🌍"));
@@ -764,7 +614,7 @@ mod tests {
 
     #[test]
     fn test_parse_text_array_cjk() {
-        let input = r#"["你好","世界"]"#;
+        let input = r#"{"你好","世界"}"#;
         let result = parse_text_array(input).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], Value::build_text("你好"));
@@ -831,14 +681,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_text_array_malformed_unicode_escape() {
-        // A malformed \u escape followed by multi-byte UTF-8 chars should be rejected
-        let input = "[\"\\u\u{4e09}\u{4e09}\"]";
-        let result = parse_text_array(input);
-        assert!(
-            result.is_none(),
-            "Malformed \\u escape with multi-byte chars should return None, got {result:?}"
-        );
+    fn test_parse_text_array_rejects_json_format() {
+        // JSON [1,2,3] format is no longer accepted — only PG {1,2,3}
+        assert!(parse_text_array("[1,2,3]").is_none());
+        assert!(parse_text_array(r#"["hello"]"#).is_none());
+    }
+
+    #[test]
+    fn test_parse_text_array_rejects_trailing_comma() {
+        assert!(parse_text_array("{1,2,}").is_none());
+        assert!(parse_text_array("{1, 2, }").is_none());
+    }
+
+    #[test]
+    fn test_parse_text_array_rejects_infinity() {
+        assert!(parse_text_array("{1e309}").is_none());
+        assert!(parse_text_array("{-1e309}").is_none());
     }
 
     #[test]
