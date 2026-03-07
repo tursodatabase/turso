@@ -20,7 +20,7 @@ use crate::translate::expression_index::{
 };
 use crate::translate::optimizer::TakeOwnership;
 use crate::translate::plan::{Operation, ResultSetColumn, Search};
-use crate::translate::planner::parse_row_id;
+use crate::translate::planner::{parse_row_id, ROWID_STRS};
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::CursorKey;
@@ -5001,19 +5001,6 @@ pub fn bind_and_rewrite_expr<'a>(
                                     col.is_rowid_alias(),
                                 ));
                             }
-                        // only if we haven't found a match, check for explicit rowid reference
-                        } else if let Table::BTree(btree) = &joined_table.table {
-                            if let Some(row_id_expr) = parse_row_id(
-                                &normalized_id,
-                                referenced_tables.joined_tables()[0].internal_id,
-                                || referenced_tables.joined_tables().len() != 1,
-                            )? {
-                                if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", id.as_str());
-                                }
-                                *expr = row_id_expr;
-                                return Ok(WalkControl::Continue);
-                            }
                         }
                     }
 
@@ -5062,6 +5049,33 @@ pub fn bind_and_rewrite_expr<'a>(
                         };
                         referenced_tables.mark_column_used(table_id, col_idx);
                         return Ok(WalkControl::Continue);
+                    }
+
+                    if ROWID_STRS
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&normalized_id))
+                    {
+                        let mut rowid_table = None;
+                        for joined_table in referenced_tables.joined_tables().iter() {
+                            let Table::BTree(btree) = &joined_table.table else {
+                                continue;
+                            };
+                            if !btree.has_rowid {
+                                continue;
+                            }
+                            if rowid_table.is_some() {
+                                crate::bail_parse_error!("ROWID is ambiguous");
+                            }
+                            rowid_table =
+                                Some((joined_table.internal_id, joined_table.database_id));
+                        }
+                        if let Some((table_id, database_id)) = rowid_table {
+                            *expr = Expr::RowId {
+                                database: (database_id != 0).then_some(database_id),
+                                table: table_id,
+                            };
+                            return Ok(WalkControl::Continue);
+                        }
                     }
 
                     if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
