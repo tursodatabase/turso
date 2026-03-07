@@ -582,3 +582,121 @@ test update-rollback-terminates-transaction {
 expect error {
     UNIQUE constraint failed
 }
+
+# ==============================================================================
+# DDL validation: reject improper ON CONFLICT definitions
+# ==============================================================================
+
+# ---- Conflicting ON CONFLICT on same UNIQUE columns ----
+# Column-level UNIQUE ON CONFLICT X + table-level UNIQUE(same_col) ON CONFLICT Y
+# must be rejected when X != Y.
+
+test ddl-reject-conflicting-unique-on-conflict {
+    CREATE TABLE t_bad1(a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT IGNORE);
+}
+expect error {
+    conflicting ON CONFLICT clauses
+}
+
+test ddl-reject-conflicting-unique-on-conflict-replace-rollback {
+    CREATE TABLE t_bad2(a UNIQUE ON CONFLICT REPLACE, b, UNIQUE(a) ON CONFLICT ROLLBACK);
+}
+expect error {
+    conflicting ON CONFLICT clauses
+}
+
+# ---- Conflicting ON CONFLICT on composite UNIQUE ----
+
+test ddl-reject-conflicting-composite-unique {
+    CREATE TABLE t_bad3(a, b, UNIQUE(a, b) ON CONFLICT FAIL, UNIQUE(a, b) ON CONFLICT IGNORE);
+}
+expect error {
+    conflicting ON CONFLICT clauses
+}
+
+# ---- Same ON CONFLICT clause on duplicate UNIQUE: allowed ----
+
+test ddl-allow-same-on-conflict-unique {
+    CREATE TABLE t_ok1(a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT FAIL);
+    INSERT INTO t_ok1 VALUES(1, 'x');
+    SELECT * FROM t_ok1;
+}
+expect {
+    1|x
+}
+
+# ---- Only one has ON CONFLICT: allowed ----
+
+test ddl-allow-one-on-conflict-unique {
+    CREATE TABLE t_ok2(a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a));
+    INSERT INTO t_ok2 VALUES(1, 'x');
+    SELECT * FROM t_ok2;
+}
+expect {
+    1|x
+}
+
+test ddl-allow-one-on-conflict-unique-reversed {
+    CREATE TABLE t_ok3(a UNIQUE, b, UNIQUE(a) ON CONFLICT FAIL);
+    INSERT INTO t_ok3 VALUES(1, 'x');
+    SELECT * FROM t_ok3;
+}
+expect {
+    1|x
+}
+
+# ---- Different columns: allowed even with different ON CONFLICT ----
+
+test ddl-allow-different-cols-different-on-conflict {
+    CREATE TABLE t_ok4(a UNIQUE ON CONFLICT FAIL, b UNIQUE ON CONFLICT IGNORE);
+    INSERT INTO t_ok4 VALUES(1, 2);
+    SELECT * FROM t_ok4;
+}
+expect {
+    1|2
+}
+
+# ---- Different column order on composite: allowed (creates separate indexes) ----
+
+test ddl-allow-different-order-composite {
+    CREATE TABLE t_ok5(a, b, UNIQUE(a, b) ON CONFLICT FAIL, UNIQUE(b, a) ON CONFLICT IGNORE);
+    INSERT INTO t_ok5 VALUES(1, 2);
+    SELECT * FROM t_ok5;
+}
+expect {
+    1|2
+}
+
+# ---- Multiple PRIMARY KEY always rejected ----
+
+test ddl-reject-multiple-pk-column-and-table {
+    CREATE TABLE t_bad4(a PRIMARY KEY, b, PRIMARY KEY(a));
+}
+expect error {
+    more than one primary key
+}
+
+test ddl-reject-multiple-pk-columns {
+    CREATE TABLE t_bad5(a PRIMARY KEY, b PRIMARY KEY);
+}
+expect error {
+    more than one primary key
+}
+
+test ddl-reject-multiple-pk-table-level {
+    CREATE TABLE t_bad6(a, b, PRIMARY KEY(a), PRIMARY KEY(b));
+}
+expect error {
+    more than one primary key
+}
+
+# ---- NOT NULL ON CONFLICT + PRIMARY KEY ON CONFLICT on same column: allowed ----
+
+test ddl-allow-notnull-and-pk-on-conflict {
+    CREATE TABLE t_ok6(a NOT NULL ON CONFLICT FAIL PRIMARY KEY ON CONFLICT IGNORE);
+    INSERT INTO t_ok6 VALUES(1);
+    SELECT * FROM t_ok6;
+}
+expect {
+    1
+}
