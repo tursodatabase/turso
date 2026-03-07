@@ -397,8 +397,9 @@ pub struct ProgramState {
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
     uses_subjournal: bool,
-    /// Whether begin_statement was called (foreign key bookkeeping is active), even if
-    /// pager savepoint was skipped (e.g. autocommit mode).
+    /// Whether this statement is an active write inside an explicit transaction.
+    pub(crate) is_active_write: bool,
+    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
@@ -489,6 +490,7 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             uses_subjournal: false,
+            is_active_write: false,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
@@ -602,6 +604,7 @@ impl ProgramState {
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
         self.uses_subjournal = false;
+        self.is_active_write = false;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
@@ -683,8 +686,11 @@ impl ProgramState {
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
-        // If begin_statement was never called, nothing to clean up.
-        // Mirrors SQLite's guard: `if( p->db->nStatement && p->iStatement )`.
+        if self.is_active_write {
+            connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            self.is_active_write = false;
+        }
+        // If begin_statement was never called, no savepoint/FK cleanup needed.
         if !self.has_stmt_transaction {
             return Ok(());
         }

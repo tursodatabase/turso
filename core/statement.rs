@@ -676,6 +676,16 @@ impl Statement {
                 );
             }
         }
+        // Safety net: if end_statement wasn't reached (e.g. statement dropped
+        // mid-execution), ensure n_active_writes is decremented before reset
+        // clears the flag.
+        if self.state.is_active_write {
+            self.program
+                .connection
+                .n_active_writes
+                .fetch_sub(1, Ordering::SeqCst);
+            self.state.is_active_write = false;
+        }
         self.state.reset(max_registers, max_cursors);
         self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
