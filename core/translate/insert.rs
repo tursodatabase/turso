@@ -384,6 +384,7 @@ pub fn translate_insert(
         database_id,
         connection,
     )?;
+    program.has_statement_conflict = on_conflict.is_some();
 
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.
