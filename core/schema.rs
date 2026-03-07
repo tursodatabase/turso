@@ -3847,8 +3847,7 @@ mod tests {
 
     #[test]
     pub fn test_same_on_conflict_unique_allowed() -> Result<()> {
-        let sql =
-            r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT FAIL);"#;
+        let sql = r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT FAIL);"#;
         assert!(BTreeTable::from_sql(sql, 0).is_ok());
         Ok(())
     }
