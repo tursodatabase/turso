@@ -239,6 +239,55 @@ fn piped_stdin_runtime_error_returns_nonzero() {
     assert_eq!(status.code(), Some(1));
 }
 
+/// C1: .read handles multi-line CREATE TRIGGER correctly
+#[test]
+fn dot_read_handles_trigger_statements() {
+    let sql = "\
+CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);\n\
+CREATE TABLE log(msg TEXT);\n\
+CREATE TRIGGER tr1 AFTER INSERT ON t BEGIN\n\
+    INSERT INTO log VALUES ('inserted ' || NEW.val);\n\
+END;\n\
+INSERT INTO t VALUES (1, 'hello');\n\
+SELECT msg FROM log;\n";
+
+    let sql_path = std::env::temp_dir().join("limbo_test_dot_read_trigger.sql");
+    std::fs::write(&sql_path, sql).expect("failed to write sql file");
+
+    let dot_read = format!(".read {}", sql_path.display());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run tursodb");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(dot_read.as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    std::fs::remove_file(&sql_path).ok();
+
+    assert!(
+        !stderr.contains("unexpected end of file"),
+        "trigger should not produce parse errors, stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no such column"),
+        "NEW.val should be resolved inside trigger, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("inserted hello"),
+        "trigger should fire and insert into log, stdout: {stdout}"
+    );
+}
+
 /// B12: Empty piped stdin returns 0
 #[test]
 fn piped_stdin_empty_returns_zero() {
