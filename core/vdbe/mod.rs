@@ -52,21 +52,19 @@ use crate::{
         hash_table::HashTable,
         metrics::StatementMetrics,
     },
-    CipherMode, ValueRef,
+    ValueRef,
 };
 use smallvec::SmallVec;
 
+#[cfg(feature = "json")]
+use crate::json::JsonCacheCell;
+use crate::sync::RwLock;
 use crate::{
     storage::pager::Pager,
     translate::plan::ResultSetColumn,
     types::{AggContext, Cursor, ImmutableRecord, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
-
-use crate::connection::AttachedDatabasesFingerprint;
-#[cfg(feature = "json")]
-use crate::json::JsonCacheCell;
-use crate::sync::RwLock;
 use crate::{
     AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, SyncMode, TransactionState,
 };
@@ -899,61 +897,32 @@ pub struct Program {
 /// # Adding New Fields
 ///
 /// If you add a new setting to `Connection` that affects statement compilation or execution,
-/// you MUST add a corresponding field here and update `from_connection()`. See the doc
-/// comment on `Connection` in `connection.rs` for the authoritative list of tracked fields.
-///
-/// Fields that affect compilation include (but are not limited to):
-/// - PRAGMA settings that change query semantics (foreign_keys, query_only, etc.)
-/// - Registered functions/virtual tables (tracked via syms_generation)
-/// - Attached databases (tracked via fingerprint)
-/// - Storage settings (page_size, cache_size, encryption, sync_mode, etc.)
+/// When adding a new connection setting that affects query compilation, you MUST call
+/// `bump_prepare_context_generation()` in its setter so that prepared statements know
+/// they need to be reprepared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareContext {
+    /// Identity check: the prepared statement must belong to the same database.
     database_ptr: usize,
-    foreign_keys: bool,
-    query_only: bool,
-    capture_data_changes: Option<CaptureDataChangesInfo>,
-    syms_generation: u64,
-    attached_databases_fingerprint: AttachedDatabasesFingerprint,
-    busy_timeout_ms: u64,
-    cache_size: i32,
-    spill_enabled: bool,
-    page_size: u32,
-    sync_mode: SyncMode,
-    data_sync_retry: bool,
-    encryption_key_set: bool,
-    encryption_cipher: CipherMode,
-    mvcc_checkpoint_threshold: Option<i64>,
+    /// Generation counter snapshot taken at prepare time. Compared against the
+    /// connection's current generation to detect setting changes (pragmas,
+    /// attach/detach, extension registration, etc.) without rebuilding the full
+    /// context on every step.
+    generation: u64,
 }
 
 impl PrepareContext {
     pub fn from_connection(connection: &Connection) -> Self {
-        let pager = connection.get_pager();
         Self {
             database_ptr: connection.database_ptr(),
-            foreign_keys: connection.foreign_keys_enabled(),
-            query_only: connection.get_query_only(),
-            capture_data_changes: connection.get_capture_data_changes_info().clone(),
-            syms_generation: connection.syms_generation(),
-            attached_databases_fingerprint: connection.attached_databases_fingerprint(),
-            busy_timeout_ms: connection.get_busy_timeout().as_millis() as u64,
-            cache_size: connection.get_cache_size(),
-            spill_enabled: pager.get_spill_enabled(),
-            page_size: connection.get_page_size().get(),
-            sync_mode: connection.get_sync_mode(),
-            data_sync_retry: connection.get_data_sync_retry(),
-            encryption_key_set: connection.encryption_key.read().is_some(),
-            encryption_cipher: connection.encryption_cipher_mode.get(),
-            mvcc_checkpoint_threshold: connection
-                .db
-                .mvcc_enabled()
-                .then(|| connection.mvcc_checkpoint_threshold())
-                .and_then(|res| res.ok()),
+            generation: connection.prepare_context_generation(),
         }
     }
 
+    #[inline]
     pub fn matches_connection(&self, connection: &Connection) -> bool {
-        self == &Self::from_connection(connection)
+        self.database_ptr == connection.database_ptr()
+            && self.generation == connection.prepare_context_generation()
     }
 }
 
