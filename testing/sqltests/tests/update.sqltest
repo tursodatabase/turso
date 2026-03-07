@@ -608,6 +608,55 @@ expect {
     5|test
 }
 
+# Repro: avoid skipped-row behavior when UPDATE changes INTEGER PRIMARY KEY
+# through an index scan.
+@cross-check-integrity
+test update-integer-primary-key-index-scan-updates-all-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER, u TEXT UNIQUE);
+    CREATE INDEX idx_x ON t(x);
+
+    INSERT INTO t VALUES
+    (1,1,'a'),
+    (2,1,'b'),
+    (3,1,'c'),
+    (4,2,'d');
+
+    UPDATE t SET id = id + 10 WHERE x = 1;
+    SELECT * FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    4|2|d
+    11|1|a
+    12|1|b
+    13|1|c
+    ok
+}
+
+# Same repro as above using the rowid alias.
+@cross-check-integrity
+test update-rowid-alias-index-scan-updates-all-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER, u TEXT UNIQUE);
+    CREATE INDEX idx_x ON t(x);
+
+    INSERT INTO t VALUES
+    (1,1,'a'),
+    (2,1,'b'),
+    (3,1,'c'),
+    (4,2,'d');
+
+    UPDATE t SET rowid = rowid + 10 WHERE x = 1;
+    SELECT * FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    4|2|d
+    11|1|a
+    12|1|b
+    13|1|c
+    ok
+}
+
 # https://github.com/tursodatabase/turso/issues/3678
 @cross-check-integrity
 test update-alias-visibility-in-where-clause {
@@ -1018,4 +1067,3 @@ expect {
     1|2
     2|1
 }
-
