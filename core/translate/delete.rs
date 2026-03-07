@@ -114,6 +114,13 @@ pub fn translate_delete(
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
     };
+    super::stmt_journal::set_delete_stmt_journal_flags(
+        program,
+        delete,
+        resolver,
+        connection,
+        database_id,
+    )?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: estimate_num_instructions(delete),

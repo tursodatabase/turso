@@ -10,6 +10,7 @@ mod mvcc;
 mod pragma;
 mod query_processing;
 mod statement_reset;
+mod stmt_journal;
 mod storage;
 mod trigger;
 mod wal;

@@ -34,6 +34,7 @@ pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
+pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod trigger;

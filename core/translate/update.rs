@@ -92,6 +92,16 @@ pub fn translate_update(
     }
 
     optimize_plan(program, &mut plan, resolver)?;
+
+    if let Plan::Update(ref update_plan) = plan {
+        super::stmt_journal::set_update_stmt_journal_flags(
+            program,
+            update_plan,
+            resolver,
+            connection,
+        );
+    }
+
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
