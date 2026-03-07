@@ -92,6 +92,8 @@ pub struct QueryOpts {
     pub update: UpdateOpts,
     #[garde(dive)]
     pub alter_table: AlterTableOpts,
+    #[garde(dive)]
+    pub create_index: CreateIndexOpts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
@@ -200,13 +202,28 @@ impl Default for InsertOpts {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpdateOpts {
     #[garde(skip)]
     pub padding_size: Option<usize>,
     #[garde(skip)]
     pub force_late_failure: bool,
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub expr_index_update_prob: f64,
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub expr_index_predicate_prob: f64,
+}
+
+impl Default for UpdateOpts {
+    fn default() -> Self {
+        Self {
+            padding_size: None,
+            force_late_failure: false,
+            expr_index_update_prob: 0.3,
+            expr_index_predicate_prob: 0.75,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
@@ -221,6 +238,24 @@ impl Default for AlterTableOpts {
     fn default() -> Self {
         Self {
             alter_column: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(deny_unknown_fields, default)]
+pub struct CreateIndexOpts {
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub expr_term_prob: f64,
+    #[garde(range(min = 0, max = 10))]
+    pub max_expr_terms: usize,
+}
+
+impl Default for CreateIndexOpts {
+    fn default() -> Self {
+        Self {
+            expr_term_prob: 0.15,
+            max_expr_terms: 2,
         }
     }
 }
