@@ -6353,6 +6353,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_decimal"
+version = "0.5.0-pre.16"
+dependencies = [
+ "mimalloc",
+ "turso_ext",
+]
+
+[[package]]
 name = "turso_ext"
 version = "0.5.0-pre.20"
 dependencies = [
