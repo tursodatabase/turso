@@ -1363,6 +1363,70 @@ expect {
     2|20
 }
 
+test matview-union-all-same-table-overlap-maintenance {
+    CREATE TABLE t(a);
+    CREATE MATERIALIZED VIEW mv AS
+    SELECT * FROM t
+    UNION ALL
+    SELECT * FROM t;
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT a FROM mv ORDER BY a;
+}
+expect {
+    1
+    1
+    2
+    2
+    3
+    3
+}
+
+test matview-union-all-same-table-overlap-delete-maintenance {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    CREATE MATERIALIZED VIEW mv AS
+    SELECT a FROM t
+    UNION ALL
+    SELECT a FROM t;
+    SELECT a FROM mv ORDER BY a;
+    DELETE FROM t WHERE id = 2;
+    SELECT a FROM mv ORDER BY a;
+}
+expect {
+    1
+    1
+    2
+    2
+    3
+    3
+    1
+    1
+    3
+    3
+}
+
+test matview-union-all-same-table-overlap-update-maintenance {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2);
+    CREATE MATERIALIZED VIEW mv AS
+    SELECT a FROM t
+    UNION ALL
+    SELECT a FROM t;
+    SELECT a FROM mv ORDER BY a;
+    UPDATE t SET a = 5 WHERE id = 2;
+    SELECT a FROM mv ORDER BY a;
+}
+expect {
+    1
+    1
+    2
+    2
+    1
+    1
+    5
+    5
+}
+
 # Test UNION ALL preserves all rows in count
 test matview-union-all-row-count {
     CREATE TABLE data(id INTEGER PRIMARY KEY, num INTEGER);
@@ -2499,4 +2563,3 @@ expect {
     3|40
     4|60
 }
-
