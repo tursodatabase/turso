@@ -128,6 +128,11 @@ impl Statement {
         self.state.execution_state
     }
 
+    /// Current statement-level metrics (rows read, VM steps, etc.).
+    pub fn metrics(&self) -> &vdbe::metrics::StatementMetrics {
+        &self.state.metrics
+    }
+
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
         self.program.connection.mv_store()
     }
@@ -177,11 +182,13 @@ impl Statement {
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
-            let mut conn_metrics = self.program.connection.metrics.write();
-            conn_metrics.record_statement(self.state.metrics.clone());
+            self.program
+                .connection
+                .metrics
+                .write()
+                .record_statement(&self.state.metrics);
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
-            drop(conn_metrics);
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
             let sql = self.program.sql.trim_start();
