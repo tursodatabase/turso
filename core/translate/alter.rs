@@ -94,6 +94,10 @@ fn default_requires_empty_table(expr: &ast::Expr) -> bool {
     }
 }
 
+fn escape_sql_string_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 fn emit_rename_sqlite_sequence_entry(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -680,13 +684,14 @@ pub fn translate_alter_table(
 
             btree.columns.remove(dropped_index);
 
-            let sql = btree.to_sql().replace('\'', "''");
+            let escaped_sql = escape_sql_string_literal(&btree.to_sql());
+            let escaped_table_name = escape_sql_string_literal(table_name);
 
             let stmt = format!(
                 r#"
                     UPDATE {qualified_schema_table}
-                    SET sql = '{sql}'
-                    WHERE name = '{table_name}' COLLATE NOCASE AND type = 'table'
+                    SET sql = '{escaped_sql}'
+                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
                 "#,
             );
 
@@ -945,21 +950,14 @@ pub fn translate_alter_table(
                 }
             }
 
-            let sql = btree.to_sql();
-            let mut escaped = String::with_capacity(sql.len());
-
-            for ch in sql.chars() {
-                match ch {
-                    '\'' => escaped.push_str("''"),
-                    ch => escaped.push(ch),
-                }
-            }
+            let escaped_sql = escape_sql_string_literal(&btree.to_sql());
+            let escaped_table_name = escape_sql_string_literal(table_name);
 
             let stmt = format!(
                 r#"
                     UPDATE {qualified_schema_table}
-                    SET sql = '{escaped}'
-                    WHERE name = '{table_name}' COLLATE NOCASE AND type = 'table'
+                    SET sql = '{escaped_sql}'
+                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
                 "#,
             );
 
