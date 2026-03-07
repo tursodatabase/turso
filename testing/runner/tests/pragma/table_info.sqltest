@@ -1,0 +1,46 @@
+@database :memory:
+
+# ============================================================================
+# Issue #5762: PRAGMA table_info should preserve full type strings including
+# parenthesized parameters (e.g. VARCHAR(100), DECIMAL(10,2)).
+# Per SQLite docs: the "type" column reports the declared type of the column.
+# ============================================================================
+
+test pragma-table-info-type-with-single-param {
+    CREATE TABLE t_type_param (a VARCHAR(100), b CHAR(50), c FLOAT(24));
+    PRAGMA table_info(t_type_param)
+}
+expect {
+    0|a|VARCHAR(100)|0||0
+    1|b|CHAR(50)|0||0
+    2|c|FLOAT(24)|0||0
+}
+
+test pragma-table-info-type-with-two-params {
+    CREATE TABLE t_type_param2 (a DECIMAL(10,2), b NUMERIC(5,3));
+    PRAGMA table_info(t_type_param2)
+}
+expect {
+    0|a|DECIMAL(10,2)|0||0
+    1|b|NUMERIC(5,3)|0||0
+}
+
+test pragma-table-info-type-nvarchar {
+    CREATE TABLE t_nvarchar (a NVARCHAR(200));
+    PRAGMA table_info(t_nvarchar)
+}
+expect {
+    0|a|NVARCHAR(200)|0||0
+}
+
+test pragma-table-info-type-no-params-unchanged {
+    CREATE TABLE t_no_params (a INTEGER, b TEXT, c REAL, d BLOB);
+    PRAGMA table_info(t_no_params)
+}
+expect {
+    0|a|INTEGER|0||0
+    1|b|TEXT|0||0
+    2|c|REAL|0||0
+    3|d|BLOB|0||0
+}
+

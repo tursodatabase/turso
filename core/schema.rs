@@ -154,6 +154,17 @@ pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 
+/// Format an `ast::Type` as the declared type string, preserving parenthesized
+/// size parameters exactly as written (e.g. `VARCHAR(100)`, `DECIMAL(10,2)`).
+/// SQLite stores and reports the full declared type including parameters.
+fn ast_type_to_str(t: &ast::Type) -> String {
+    match &t.size {
+        None => t.name.clone(),
+        Some(ast::TypeSize::MaxSize(expr)) => format!("{}({})", t.name, expr),
+        Some(ast::TypeSize::TypeSize(e1, e2)) => format!("{}({},{})", t.name, e1, e2),
+    }
+}
+
 /// Quote a SQL identifier with double quotes if it needs quoting.
 /// Quotes when the name contains non-alphanumeric characters (except underscore),
 /// starts with a digit, or is empty. Simple names like "test_uint" are left unquoted.
@@ -2523,8 +2534,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
                 let ty_str = col_type
                     .as_ref()
-                    .cloned()
-                    .map(|ast::Type { name, .. }| name)
+                    .map(|t| ast_type_to_str(t))
                     .unwrap_or_default();
 
                 let ty_params: Vec<Box<Expr>> = match col_type {
@@ -3224,7 +3234,7 @@ impl TryFrom<&ColumnDefinition> for Column {
         let ty_str = value
             .col_type
             .as_ref()
-            .map(|t| t.name.to_string())
+            .map(|t| ast_type_to_str(t))
             .unwrap_or_default();
 
         let ty_params: Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
