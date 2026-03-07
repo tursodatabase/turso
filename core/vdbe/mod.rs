@@ -1849,6 +1849,8 @@ impl Program {
                     match effective_resolve {
                         ResolveType::Rollback => {
                             self.rollback_current_txn(pager);
+                            // All deferred FK violations are undone by the full rollback.
+                            self.connection.clear_deferred_foreign_key_violations();
                         }
                         ResolveType::Fail => {
                             // FAIL: Don't rollback the transaction.
