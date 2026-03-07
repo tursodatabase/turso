@@ -314,20 +314,6 @@ fn update_pragma(
                 ));
             }
 
-            let is_empty = is_database_empty(resolver.schema(), &pager)?;
-            tracing::debug!(
-                "Checking if database is empty for auto_vacuum pragma: {}",
-                is_empty
-            );
-
-            if !is_empty {
-                // SQLite's behavior is to silently ignore this pragma if the database is not empty.
-                tracing::debug!(
-                    "Attempted to set auto_vacuum, database is not empty so we are ignoring pragma."
-                );
-                return Ok(TransactionMode::None);
-            }
-
             let auto_vacuum_mode = match value {
                 Expr::Name(name) => {
                     let name = name.as_str().as_bytes();
@@ -348,41 +334,64 @@ fn update_pragma(
                     ));
                 }
             };
-            match auto_vacuum_mode {
-                0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, pager)?,
-                1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, pager)?,
-                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, pager)?,
-                _ => {
-                    return Err(LimboError::InvalidArgument(
-                        "invalid auto vacuum mode".to_string(),
-                    ));
-                }
+
+            let is_empty = is_database_empty(resolver.schema());
+            tracing::debug!(
+                "Checking if database is empty for auto_vacuum pragma: {}",
+                is_empty
+            );
+            if !is_empty {
+                // Match SQLite behavior: ignore mode changes for non-empty databases.
+                tracing::debug!(
+                    "Attempted to set auto_vacuum, database is not empty so we are ignoring pragma."
+                );
+                return Ok(TransactionMode::None);
             }
-            let largest_root_page_number_reg = program.alloc_register();
-            program.emit_insn(Insn::ReadCookie {
-                db: database_id,
-                dest: largest_root_page_number_reg,
-                cookie: Cookie::LargestRootPageNumber,
-            });
-            let set_cookie_label = program.allocate_label();
-            program.emit_insn(Insn::If {
-                reg: largest_root_page_number_reg,
-                target_pc: set_cookie_label,
-                jump_if_null: false,
-            });
-            program.emit_insn(Insn::Halt {
-                err_code: 0,
-                description: "Early halt because auto vacuum mode is not enabled".to_string(),
-                on_error: None,
-            });
-            program.resolve_label(set_cookie_label, program.offset());
-            program.emit_insn(Insn::SetCookie {
-                db: database_id,
-                cookie: Cookie::IncrementalVacuum,
-                value: auto_vacuum_mode - 1,
-                p5: 0,
-            });
-            Ok(TransactionMode::None)
+
+            let (auto_vacuum_mode, largest_root_page_number, set_incremental_vacuum_cookie) =
+                match auto_vacuum_mode {
+                    0 => (AutoVacuumMode::None, 0, None),
+                    1 => (AutoVacuumMode::Full, 1, Some(0)),
+                    2 => (AutoVacuumMode::Incremental, 1, Some(1)),
+                    _ => {
+                        return Err(LimboError::InvalidArgument(
+                            "invalid auto vacuum mode".to_string(),
+                        ));
+                    }
+                };
+
+            update_auto_vacuum_mode(auto_vacuum_mode, largest_root_page_number, pager)?;
+
+            if let Some(incr_vacuum_cookie_value) = set_incremental_vacuum_cookie {
+                let largest_root_page_number_reg = program.alloc_register();
+                program.emit_insn(Insn::ReadCookie {
+                    db: database_id,
+                    dest: largest_root_page_number_reg,
+                    cookie: Cookie::LargestRootPageNumber,
+                });
+                let set_cookie_label = program.allocate_label();
+                program.emit_insn(Insn::If {
+                    reg: largest_root_page_number_reg,
+                    target_pc: set_cookie_label,
+                    jump_if_null: false,
+                });
+                program.emit_insn(Insn::Halt {
+                    err_code: 0,
+                    description: "Early halt because database is not auto-vacuum capable"
+                        .to_string(),
+                    on_error: None,
+                });
+                program.resolve_label(set_cookie_label, program.offset());
+                program.emit_insn(Insn::SetCookie {
+                    db: database_id,
+                    cookie: Cookie::IncrementalVacuum,
+                    value: incr_vacuum_cookie_value,
+                    p5: 0,
+                });
+                Ok(TransactionMode::Write)
+            } else {
+                Ok(TransactionMode::None)
+            }
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
@@ -1458,29 +1467,14 @@ fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate
     Ok(())
 }
 
-fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool> {
-    if schema.tables.len() > 1 {
-        return Ok(false);
-    }
-    if let Some(table_arc) = schema.tables.values().next() {
-        let table_name = match table_arc.as_ref() {
-            crate::schema::Table::BTree(tbl) => &tbl.name,
-            crate::schema::Table::Virtual(tbl) => &tbl.name,
-            crate::schema::Table::FromClauseSubquery(tbl) => &tbl.name,
+fn is_database_empty(schema: &Schema) -> bool {
+    for table_arc in schema.tables.values() {
+        let crate::schema::Table::BTree(tbl) = table_arc.as_ref() else {
+            continue;
         };
-
-        if table_name != "sqlite_schema" {
-            return Ok(false);
+        if tbl.name != "sqlite_schema" {
+            return false;
         }
     }
-
-    let db_size_result = pager
-        .io
-        .block(|| pager.with_header(|header| header.database_size.get()));
-
-    match db_size_result {
-        Err(_) => Ok(true),
-        Ok(0 | 1) => Ok(true),
-        Ok(_) => Ok(false),
-    }
+    true
 }

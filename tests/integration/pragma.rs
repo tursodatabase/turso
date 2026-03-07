@@ -2,7 +2,7 @@ use crate::common::{limbo_exec_rows, TempDatabase};
 use rusqlite::types::Value as RValue;
 #[cfg(not(target_vendor = "apple"))]
 use turso_core::LimboError;
-use turso_core::{Numeric, StepResult, Value};
+use turso_core::{DatabaseOpts, Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
 fn test_pragma_module_list_returns_list(db: TempDatabase) {
@@ -389,6 +389,90 @@ fn test_pragma_cache_size_min_value(db: TempDatabase) {
         panic!("expected integer value");
     };
     assert_eq!(*value, 200);
+}
+
+#[turso_macros::test]
+fn test_pragma_auto_vacuum_explain_uses_transaction(_db: TempDatabase) {
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_autovacuum(true))
+        .build();
+    let conn = db.connect_limbo();
+
+    let rows = limbo_exec_rows(&conn, "EXPLAIN PRAGMA auto_vacuum=full");
+    let opcodes: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let RValue::Text(opcode) = &row[1] else {
+                panic!("expected opcode text in column 1, got {:?}", row[1]);
+            };
+            opcode.clone()
+        })
+        .collect();
+
+    assert!(
+        opcodes.iter().any(|opcode| opcode == "Transaction"),
+        "expected EXPLAIN output to include Transaction opcode for PRAGMA auto_vacuum=full, got {opcodes:?}"
+    );
+    assert!(
+        opcodes.iter().any(|opcode| opcode == "ReadCookie"),
+        "expected EXPLAIN output to include ReadCookie opcode for PRAGMA auto_vacuum=full, got {opcodes:?}"
+    );
+    assert!(
+        opcodes.iter().any(|opcode| opcode == "SetCookie"),
+        "expected EXPLAIN output to include SetCookie opcode for PRAGMA auto_vacuum=full, got {opcodes:?}"
+    );
+}
+
+#[turso_macros::test]
+fn test_pragma_auto_vacuum_non_empty_is_ignored(_db: TempDatabase) {
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_autovacuum(true))
+        .build();
+    let conn = db.connect_limbo();
+
+    conn.execute("PRAGMA auto_vacuum=none").unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("PRAGMA auto_vacuum=full").unwrap();
+
+    let mut rows = conn.query("PRAGMA auto_vacuum").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value");
+    };
+    assert_eq!(
+        *value, 0,
+        "auto_vacuum=full must be ignored for non-empty databases"
+    );
+}
+
+#[turso_macros::test]
+fn test_pragma_auto_vacuum_explain_non_empty_omits_transaction(_db: TempDatabase) {
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_autovacuum(true))
+        .build();
+    let conn = db.connect_limbo();
+
+    conn.execute("PRAGMA auto_vacuum=none").unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+
+    let rows = limbo_exec_rows(&conn, "EXPLAIN PRAGMA auto_vacuum=full");
+    let opcodes: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let RValue::Text(opcode) = &row[1] else {
+                panic!("expected opcode text in column 1, got {:?}", row[1]);
+            };
+            opcode.clone()
+        })
+        .collect();
+
+    assert!(
+        !opcodes.iter().any(|opcode| opcode == "Transaction"),
+        "non-empty database should not emit Transaction for PRAGMA auto_vacuum=full, got {opcodes:?}"
+    );
 }
 
 #[turso_macros::test]
