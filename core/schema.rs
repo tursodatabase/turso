@@ -154,6 +154,19 @@ pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 
+/// Format an `ast::Type` as the declared type string, preserving parenthesized
+/// size parameters exactly as written (e.g. `VARCHAR(100)`, `DECIMAL(10,2)`).
+/// SQLite stores and reports the full declared type including parameters.
+/// Note: only the base `name` part (without size) is used for type registry
+/// lookups and affinity determination; the full string is for display only.
+fn ast_type_to_str(t: &ast::Type) -> String {
+    match &t.size {
+        None => t.name.clone(),
+        Some(ast::TypeSize::MaxSize(expr)) => format!("{}({})", t.name, expr),
+        Some(ast::TypeSize::TypeSize(e1, e2)) => format!("{}({},{})", t.name, e1, e2),
+    }
+}
+
 /// Quote a SQL identifier with double quotes if it needs quoting.
 /// Quotes when the name contains non-alphanumeric characters (except underscore),
 /// starts with a digit, or is empty. Simple names like "test_uint" are left unquoted.
@@ -1092,7 +1105,13 @@ impl Schema {
             let mut pk_index_added = false;
             for unique_set in &table.unique_sets {
                 if unique_set.is_primary_key {
-                    assert!(table.primary_key_columns.len() == unique_set.columns.len(), "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns", unique_set.columns.len(), table.name, table.primary_key_columns.len());
+                    assert!(
+                        table.primary_key_columns.len() == unique_set.columns.len(),
+                        "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns",
+                        unique_set.columns.len(),
+                        table.name,
+                        table.primary_key_columns.len()
+                    );
                     // Add composite primary key index
                     assert!(
                         !pk_index_added,
@@ -1166,7 +1185,11 @@ impl Schema {
             // In MVCC mode during recovery, not all automatic index schema rows might be visible yet
             // during incremental schema reparsing, so we may have extra entries
             if !mvcc_enabled {
-                assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+                assert!(
+                    automatic_indexes.is_empty(),
+                    "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain",
+                    automatic_indexes.len()
+                );
             }
         }
         Ok(())
@@ -1312,7 +1335,9 @@ impl Schema {
                                     // This will cause populate_materialized_views to skip this view
                                     tracing::warn!(
                                         "Skipping materialized view '{}' - has version {} but current version is {}. DROP and recreate the view to use it.",
-                                        view_name, stored_version, DBSP_CIRCUIT_VERSION
+                                        view_name,
+                                        stored_version,
+                                        DBSP_CIRCUIT_VERSION
                                     );
                                     // We can't track incompatible views here since we're in handle_schema_row
                                     // which doesn't have mutable access to self
@@ -2128,9 +2153,9 @@ impl BTreeTable {
                 sql.push_str(column_name);
             }
 
-            if !column.ty_str.is_empty() {
+            if !column.declared_type.is_empty() {
                 sql.push(' ');
-                sql.push_str(&column.ty_str);
+                sql.push_str(&column.declared_type);
             }
             if column.notnull() {
                 sql.push_str(" NOT NULL");
@@ -2523,9 +2548,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
                 let ty_str = col_type
                     .as_ref()
-                    .cloned()
-                    .map(|ast::Type { name, .. }| name)
+                    .map(|t| t.name.clone())
                     .unwrap_or_default();
+                let declared_type = col_type.as_ref().map(ast_type_to_str).unwrap_or_default();
 
                 let ty_params: Vec<Box<Expr>> = match col_type {
                     Some(ast::Type {
@@ -2718,6 +2743,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     },
                 );
                 col.ty_params = ty_params;
+                col.declared_type = declared_type;
                 cols.push(col);
             }
 
@@ -2951,7 +2977,11 @@ impl ResolvedFkRef {
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: Option<String>,
+    /// Base type name used for type registry lookup, affinity, and internal logic (e.g. "numeric").
     pub ty_str: String,
+    /// Full declared type string as written in CREATE TABLE, including size params (e.g. "numeric(10,2)").
+    /// Used only for PRAGMA table_info display. Equals ty_str when no size params are present.
+    pub declared_type: String,
     pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     pub generated: Option<Box<Expr>>,
@@ -3084,7 +3114,8 @@ impl Column {
         }
         Self {
             name,
-            ty_str,
+            ty_str: ty_str.clone(),
+            declared_type: ty_str,
             ty_params: Vec::new(),
             default,
             generated,
@@ -3224,7 +3255,12 @@ impl TryFrom<&ColumnDefinition> for Column {
         let ty_str = value
             .col_type
             .as_ref()
-            .map(|t| t.name.to_string())
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        let declared_type = value
+            .col_type
+            .as_ref()
+            .map(ast_type_to_str)
             .unwrap_or_default();
 
         let ty_params: Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
@@ -3257,6 +3293,7 @@ impl TryFrom<&ColumnDefinition> for Column {
             },
         );
         col.ty_params = ty_params;
+        col.declared_type = declared_type;
         Ok(col)
     }
 }
