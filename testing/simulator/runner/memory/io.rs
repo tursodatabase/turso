@@ -310,4 +310,12 @@ impl IO for MemorySimIO {
         self.files.borrow_mut().shift_remove(path);
         Ok(())
     }
+
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        let mut files = self.files.borrow_mut();
+        if let Some(file) = files.shift_remove(from) {
+            files.insert(to.to_string(), file);
+        }
+        Ok(())
+    }
 }

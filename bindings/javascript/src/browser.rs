@@ -155,6 +155,10 @@ impl IO for Opfs {
     fn remove_file(&self, _: &str) -> turso_core::Result<()> {
         Ok(())
     }
+
+    fn rename_file(&self, _from: &str, _to: &str) -> turso_core::Result<()> {
+        Ok(())
+    }
 }
 
 impl File for OpfsFile {
