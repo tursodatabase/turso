@@ -104,6 +104,7 @@ pub struct Connection {
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
+    pub(super) strict_queries: AtomicBool,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -1832,6 +1833,14 @@ impl Connection {
 
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
+    }
+
+    pub fn get_strict_queries(&self) -> bool {
+        self.strict_queries.load(Ordering::SeqCst)
+    }
+
+    pub fn set_strict_queries(&self, value: bool) {
+        self.strict_queries.store(value, Ordering::SeqCst);
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {

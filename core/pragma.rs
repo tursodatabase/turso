@@ -154,6 +154,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
             &["query_only"],
         ),
+        StrictQueries => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["strict_queries"],
+        ),
         FreelistCount => Pragma::new(PragmaFlags::Result0, &["freelist_count"]),
         EncryptionKey => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::SchemaReq | PragmaFlags::NoColumns1,

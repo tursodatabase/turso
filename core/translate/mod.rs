@@ -260,6 +260,11 @@ pub fn translate_inner(
             if !order_by.is_empty() {
                 bail_parse_error!("ORDER BY clause is not supported in DELETE");
             }
+            if where_clause.is_none() && connection.get_strict_queries() {
+                bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when strict_queries is enabled"
+                );
+            }
             translate_delete(
                 &tbl_name,
                 resolver,
@@ -331,7 +336,14 @@ pub fn translate_inner(
                 connection,
             )?;
         }
-        ast::Stmt::Update(update) => translate_update(update, resolver, program, connection)?,
+        ast::Stmt::Update(update) => {
+            if update.where_clause.is_none() && connection.get_strict_queries() {
+                bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when strict_queries is enabled"
+                );
+            }
+            translate_update(update, resolver, program, connection)?
+        }
         ast::Stmt::Vacuum { name, into } => {
             vacuum::translate_vacuum(program, name.as_ref(), into.as_deref())?
         }
