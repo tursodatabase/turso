@@ -12183,6 +12183,11 @@ fn op_journal_mode_inner(
 
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
+                    if program.connection.db.locking_mode.is_shared() {
+                        return Err(LimboError::InternalError(
+                            "cannot enable MVCC in shared locking mode (SharedReads or SharedWrites). MVCC and multi-process WAL coordination are incompatible.".to_string(),
+                        ));
+                    }
                     if program.connection.get_capture_data_changes_info().is_some() {
                         return Err(LimboError::InternalError(
                             "cannot enable MVCC while CDC is active".to_string(),

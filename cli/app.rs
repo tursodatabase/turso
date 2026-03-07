@@ -92,6 +92,11 @@ pub struct Opts {
     pub experimental_attach: bool,
     #[clap(
         long,
+        help = "Enable experimental shared access (multi-process) feature"
+    )]
+    pub experimental_shared_access: bool,
+    #[clap(
+        long,
         help = "Enable unsafe testing features (e.g. sqlite_dbpage writes)"
     )]
     pub unsafe_testing: bool,
@@ -218,9 +223,19 @@ impl Limbo {
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
             .with_attach(opts.experimental_attach)
+            .with_shared_access(opts.experimental_shared_access)
             .with_unsafe_testing(opts.unsafe_testing);
 
-        let (io, conn) = if db_file.contains([':', '?', '&', '#']) {
+        // Normalize path?key=val to file:path?key=val so query parameters
+        // are parsed as URI options (e.g. ?locking=shared_reads) instead of
+        // being treated as part of the filename.
+        let db_file = if !db_file.starts_with("file:") && db_file.contains('?') {
+            format!("file:{db_file}")
+        } else {
+            db_file
+        };
+
+        let (io, conn) = if db_file.starts_with("file:") {
             Connection::from_uri(&db_file, db_opts)?
         } else {
             let flags = if opts.readonly {
