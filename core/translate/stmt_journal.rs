@@ -67,10 +67,13 @@ pub(crate) fn set_insert_stmt_journal_flags(program: &mut ProgramBuilder, ctx: &
         program.set_multi_write(false);
     }
 
+    let has_constraint_that_aborts = ctx.notnull_col_exists || ctx.has_check || ctx.has_unique;
+    // REPLACE falls back to ABORT for NOT NULL (without default) and CHECK constraints.
+    let replace_can_abort = ctx.is_replace && (ctx.notnull_col_exists || ctx.has_check);
     let may_abort = ctx.has_triggers
         || ctx.has_fks
-        || (ctx.has_abort_resolution
-            && (ctx.notnull_col_exists || ctx.has_check || ctx.has_unique));
+        || (ctx.has_abort_resolution && has_constraint_that_aborts)
+        || replace_can_abort;
     if !may_abort {
         program.set_may_abort(false);
     }
@@ -108,11 +111,20 @@ pub(crate) fn set_update_stmt_journal_flags(
         .as_ref()
         .is_some_and(|c| matches!(c, turso_parser::ast::ResolveType::Replace));
 
+    // Partial unique indexes can't be preflighted (their WHERE predicate isn't evaluated
+    // until the per-index loop), so the loop may interleave constraint checks with mutations
+    // from non-partial indexes. When this can happen, keep multi_write=true so the statement
+    // journal protects against orphan index entries on abort.
+    let has_partial_unique = plan
+        .indexes_to_update
+        .iter()
+        .any(|idx| idx.unique && idx.where_clause.is_some());
+
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
     let is_single_row =
         plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !is_replace && !has_fks {
+    if is_single_row && !has_triggers && !is_replace && !has_fks && !has_partial_unique {
         program.set_multi_write(false);
     }
 

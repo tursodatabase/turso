@@ -1075,18 +1075,23 @@ fn emit_update_insns<'a>(
 
     // For IGNORE, FAIL, and ROLLBACK modes, we need to do a preflight check for unique
     // constraint violations BEFORE deleting any old index entries. This ensures that:
-    // - IGNORE: We can skip the row without corrupting it by partially deleting index entries
-    // - FAIL/ROLLBACK: We can halt without partial state (index deleted but not re-inserted)
-    // Note: ABORT is not included because the NotExists instruction used for rowid conflict
-    // checking repositions the table cursor, which would corrupt subsequent Column reads.
-    // ABORT halts the entire operation anyway, so preflight checking isn't strictly needed.
+    // Preflight: check ALL unique constraints and rowid conflicts BEFORE any index mutations.
+    // Without this, the per-index loop would interleave constraint checks with IdxDelete/IdxInsert,
+    // leaving orphan index entries if a later constraint fails.
+    // REPLACE is excluded because it handles conflicts by deleting conflicting rows inline.
     if matches!(
         or_conflict,
-        ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback
+        ResolveType::Abort | ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback
     ) {
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
         for (index, (idx_cursor_id, _record_reg)) in indexes_to_update.iter().zip(index_cursors) {
             if !index.unique {
+                continue;
+            }
+            // Skip partial indexes in preflight — the predicate evaluation needed to
+            // determine if the new values satisfy the WHERE clause is done in the
+            // per-index loop below. Partial index conflicts are handled there.
+            if index.where_clause.is_some() {
                 continue;
             }
 
@@ -1160,7 +1165,7 @@ fn emit_update_insns<'a>(
                         target_pc: skip_row_label,
                     });
                 }
-                ResolveType::Fail | ResolveType::Rollback => {
+                ResolveType::Abort | ResolveType::Fail | ResolveType::Rollback => {
                     // Halt with UNIQUE constraint error
                     let column_names = index.columns.iter().enumerate().fold(
                         String::with_capacity(50),
@@ -1180,7 +1185,9 @@ fn emit_update_insns<'a>(
                         on_error: None,
                     });
                 }
-                _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
+                _ => unreachable!(
+                    "Only ABORT, IGNORE, FAIL, and ROLLBACK should reach preflight check"
+                ),
             }
 
             program.preassign_label_to_next_insn(no_conflict_label);
@@ -1215,7 +1222,7 @@ fn emit_update_insns<'a>(
                         target_pc: skip_row_label,
                     });
                 }
-                ResolveType::Fail | ResolveType::Rollback => {
+                ResolveType::Abort | ResolveType::Fail | ResolveType::Rollback => {
                     // Halt with PRIMARY KEY constraint error
                     let description = if let Some(idx) = rowid_alias_index {
                         String::from(table_name)
@@ -1237,7 +1244,9 @@ fn emit_update_insns<'a>(
                         on_error: None,
                     });
                 }
-                _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
+                _ => unreachable!(
+                    "Only ABORT, IGNORE, FAIL, and ROLLBACK should reach preflight check"
+                ),
             }
 
             program.preassign_label_to_next_insn(no_rowid_conflict_label);
