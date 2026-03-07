@@ -1421,6 +1421,15 @@ pub fn open_loop(
                             _ => unreachable!("Subquery table with unexpected query destination"),
                         }
                     }
+                    (Scan::RecursiveCte { cursor_id }, Table::RecursiveCte(_)) => {
+                        // For recursive CTE, the cursor is already opened externally.
+                        // Emit Rewind to start iterating from the beginning of the queue.
+                        program.emit_insn(Insn::Rewind {
+                            cursor_id: *cursor_id,
+                            pc_if_empty: loop_end,
+                        });
+                        program.preassign_label_to_next_insn(loop_start);
+                    }
                     _ => unreachable!(
                         "{:?} scan cannot be used with {:?} table",
                         scan, table.table
@@ -2660,6 +2669,13 @@ pub fn close_loop<'a>(
                                 target_pc: loop_labels.loop_start,
                             });
                         }
+                    }
+                    Scan::RecursiveCte { cursor_id } => {
+                        // Iterate through the ephemeral queue cursor
+                        program.emit_insn(Insn::Next {
+                            cursor_id: *cursor_id,
+                            pc_if_next: loop_labels.loop_start,
+                        });
                     }
                 }
                 program.preassign_label_to_next_insn(loop_labels.loop_end);

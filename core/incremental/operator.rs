@@ -15,11 +15,12 @@ use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::numeric::Numeric;
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
-use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::types::IOResult;
 use crate::Result;
+use std::any::Any;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 /// Struct to hold both table and index cursors for DBSP state operations
 pub struct DbspStateCursors {
@@ -227,7 +228,7 @@ pub enum QueryOperator {
 /// Base trait for incremental operators
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
-pub trait IncrementalOperator: Debug + Send {
+pub trait IncrementalOperator: Debug + Send + Any {
     /// Evaluate the operator with a state, without modifying internal state
     /// This is used during query execution to compute results
     /// May need to read from storage to get current state (e.g., for aggregates)
@@ -256,6 +257,12 @@ pub trait IncrementalOperator: Debug + Send {
 
     /// Set computation tracker
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
+
+    /// Downcast to Any
+    fn as_any(&self) -> &dyn Any;
+
+    /// Downcast to Any (mutable)
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 #[cfg(test)]
