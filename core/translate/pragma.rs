@@ -200,6 +200,7 @@ fn update_pragma(
         PragmaName::CacheSpill => {
             let enabled = parse_pragma_enabled(&value);
             connection.get_pager().set_spill_enabled(enabled);
+            connection.bump_prepare_context_generation();
             Ok(TransactionMode::None)
         }
         PragmaName::Encoding => {

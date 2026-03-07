@@ -1263,7 +1263,6 @@ impl Database {
             last_change: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
             syms: parking_lot::RwLock::new(SymbolTable::new()),
-            syms_generation: AtomicU64::new(0),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
@@ -1291,6 +1290,7 @@ impl Database {
             fk_deferred_violations: AtomicIsize::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
+            prepare_context_generation: AtomicU64::new(0),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
