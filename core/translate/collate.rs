@@ -277,6 +277,7 @@ mod tests {
         let cast_ty = Some(turso_parser::ast::Type {
             name: "TEXT".to_string(),
             size: None,
+            size_text: None,
         });
         let expr_cast = Expr::cast(
             Expr::Column {

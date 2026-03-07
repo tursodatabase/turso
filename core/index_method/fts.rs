@@ -1528,6 +1528,7 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
                     col_type: Some(ast::Type {
                         name: "TEXT".to_string(),
                         size: None,
+                        size_text: None,
                     }),
                     constraints: vec![NOTNULL_CONSTRAINT],
                 },
@@ -1536,6 +1537,7 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
                     col_type: Some(ast::Type {
                         name: "INTEGER".to_string(),
                         size: None,
+                        size_text: None,
                     }),
                     constraints: vec![NOTNULL_CONSTRAINT],
                 },
@@ -1544,6 +1546,7 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
                     col_type: Some(ast::Type {
                         name: "BLOB".to_string(),
                         size: None,
+                        size_text: None,
                     }),
                     constraints: vec![NOTNULL_CONSTRAINT],
                 },

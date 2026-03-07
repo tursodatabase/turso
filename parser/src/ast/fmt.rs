@@ -69,7 +69,7 @@ impl<T: Write> TokenStream for WriteTokenStream<'_, T> {
     fn append(&mut self, ty: TokenType, value: Option<&str>) -> fmt::Result {
         if !self.spaced {
             match ty {
-                TK_COMMA | TK_SEMI | TK_RP | TK_DOT => {}
+                TK_COMMA | TK_SEMI | TK_RP | TK_DOT | TK_NONE => {}
                 _ => {
                     self.write.write_char(' ')?;
                     self.spaced = true;
@@ -2276,9 +2276,13 @@ impl ToTokens for Type {
             None => s.append(TK_ID, Some(&self.name)),
             Some(ref size) => {
                 s.append(TK_ID, Some(&self.name))?; // TODO check there is no forbidden chars
-                s.append(TK_LP, None)?;
-                size.to_tokens(s, context)?;
-                s.append(TK_RP, None)
+                if let Some(ref size_text) = self.size_text {
+                    s.append(TK_NONE, Some(size_text))
+                } else {
+                    s.append(TK_LP, None)?;
+                    size.to_tokens(s, context)?;
+                    s.append(TK_RP, None)
+                }
             }
         }
     }
