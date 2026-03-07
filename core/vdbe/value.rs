@@ -487,8 +487,10 @@ impl Value {
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
                 if let Some(text) = value.cast_text() {
+                    // Use character count to accurately resolve negative offsets in UTF-8 strings
+                    let char_count = text.chars().count();
                     let (mut start, mut end) =
-                        calculate_postions(start, text.len(), length_value.as_ref());
+                        calculate_postions(start, char_count, length_value.as_ref());
 
                     // https://github.com/sqlite/sqlite/blob/a248d84f/src/func.c#L417
                     let s = text.as_str();
