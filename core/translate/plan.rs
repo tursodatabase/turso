@@ -6,7 +6,7 @@ use turso_parser::ast::{
 };
 
 use crate::{
-    function::AggFunc,
+    function::{AggFunc, WindowFunc},
     schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -2225,10 +2225,16 @@ impl Window {
 }
 
 #[derive(Debug, Clone)]
+pub enum WindowFunctionKind {
+    Agg(AggFunc),
+    Window(WindowFunc),
+}
+
+#[derive(Debug, Clone)]
 pub struct WindowFunction {
-    /// The resolved function. Currently, only regular aggregate functions are supported.
-    /// In the future, more specialized window functions such as `RANK()`, `ROW_NUMBER()`, etc. will be added.
-    pub func: AggFunc,
+    /// The resolved function. Aggregate window functions and specialized window
+    /// functions such as ROW_NUMBER() are supported.
+    pub func: WindowFunctionKind,
     /// The expression from which the function was resolved.
     pub original_expr: Expr,
 }

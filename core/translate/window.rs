@@ -1,3 +1,4 @@
+use crate::function::WindowFunc;
 use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
@@ -7,7 +8,7 @@ use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::order_by::order_by_sorter_insert;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    SelectPlan, TableReferences, Window,
+    SelectPlan, TableReferences, Window, WindowFunctionKind,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
@@ -449,11 +450,12 @@ pub struct WindowRegisters {
     pub rowid: usize,
     /// Start of the register array storing partition key values for the current partition.
     pub partition_start: Option<usize>,
-    /// Start of the register array storing accumulator states for each window function
-    /// (populated by `AggStep` during aggregation).
+    /// Start of the register array storing per-function state for window functions.
+    /// Aggregates use `AggStep` to populate their state.
     pub acc_start: usize,
-    /// Start of the register array storing current accumulator results for each window function
-    /// (populated by `AggValue` when computing results without clearing accumulators).
+    /// Start of the register array storing per-function outputs. Aggregate windows
+    /// populate these via `AggValue`; window-only functions like ROW_NUMBER()
+    /// keep their running state here.
     pub acc_result_start: usize,
     /// Stores the address to which control returns after all buffered rows are flushed.
     pub flush_buffer_return_offset: usize,
@@ -512,7 +514,6 @@ pub fn init_window<'a>(
         .unwrap_or(window.partition_by.len());
     let order_by_len = window.order_by.len();
     let window_function_count = window.functions.len();
-
     // An ephemeral table used to buffer rows for the current frame
     let buffer_table = Arc::new(BTreeTable {
         root_page: 0,
@@ -815,6 +816,11 @@ fn emit_reset_state_if_new_partition(
         dest: registers.acc_start,
         dest_end: Some(registers.acc_start + window.functions.len() - 1),
     });
+    for (i, func) in window.functions.iter().enumerate() {
+        if matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)) {
+            program.emit_int(0, registers.acc_result_start + i);
+        }
+    }
 
     program.preassign_label_to_next_insn(label_skip_reset_state);
 }
@@ -942,6 +948,9 @@ fn emit_aggregation_step(
     registers: &WindowRegisters,
 ) -> crate::Result<()> {
     for (i, func) in window.functions.iter().enumerate() {
+        let WindowFunctionKind::Agg(agg_func) = &func.func else {
+            continue;
+        };
         // The aggregation step is performed incrementally as each row from the subquery is
         // processed. Therefore, we don’t need to access the buffer table and can obtain argument
         // values directly by evaluating the expressions that reference the subquery result columns.
@@ -957,7 +966,7 @@ fn emit_aggregation_step(
         translate_aggregation_step(
             program,
             &plan.table_references,
-            AggArgumentSource::new_from_expression(&func.func, &args, &Distinctness::NonDistinct),
+            AggArgumentSource::new_from_expression(agg_func, &args, &Distinctness::NonDistinct),
             reg_acc_start,
             resolver,
         )?;
@@ -1043,15 +1052,26 @@ fn emit_return_buffered_rows(
     } = t_ctx.meta_window.as_ref().expect("missing window metadata");
 
     for (i, func) in window.functions.iter().enumerate() {
-        program.emit_insn(Insn::AggValue {
-            acc_reg: registers.acc_start + i,
-            dest_reg: registers.acc_result_start + i,
-            func: func.func.clone(),
-        });
+        if let WindowFunctionKind::Agg(agg_func) = &func.func {
+            program.emit_insn(Insn::AggValue {
+                acc_reg: registers.acc_start + i,
+                dest_reg: registers.acc_result_start + i,
+                func: agg_func.clone(),
+            });
+        }
     }
 
     let label_skip_returning_row = program.allocate_label();
     let label_loop_start = program.allocate_label();
+    let reg_one = window
+        .functions
+        .iter()
+        .any(|func| matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)))
+        .then(|| {
+            let reg = program.alloc_register();
+            program.emit_int(1, reg);
+            reg
+        });
     program.preassign_label_to_next_insn(label_loop_start);
 
     // Propagate subquery result column values to the outer query (if any) or directly to
@@ -1060,6 +1080,17 @@ fn emit_return_buffered_rows(
     for (i, (_, col_idx)) in expressions_referencing_subquery.iter().enumerate() {
         let reg_result = registers.result_columns_start + i;
         program.emit_column_or_rowid(cursors.buffer_read, *col_idx, reg_result);
+    }
+    for (i, func) in window.functions.iter().enumerate() {
+        if let WindowFunctionKind::Window(WindowFunc::RowNumber) = &func.func {
+            let reg_one = reg_one.expect("row_number must allocate reg_one");
+            let reg_row_number = registers.acc_result_start + i;
+            program.emit_insn(Insn::Add {
+                lhs: reg_row_number,
+                rhs: reg_one,
+                dest: reg_row_number,
+            });
+        }
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 

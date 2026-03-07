@@ -29,18 +29,17 @@ setup schema {
     CREATE INDEX idx_sales_region ON sales(region);
 }
 
-# TODO: Uncomment when ROW_NUMBER() is implemented
-# # 1. ROW_NUMBER() - Basic window function for row numbering
-# @setup schema
-# snapshot row-number-basic {
-#     SELECT
-#         emp_id,
-#         name,
-#         department,
-#         salary,
-#         ROW_NUMBER() OVER (ORDER BY salary DESC) AS salary_rank
-#     FROM employees;
-# }
+# 1. ROW_NUMBER() - Basic window function for row numbering
+@setup schema
+snapshot row-number-basic {
+    SELECT
+        emp_id,
+        name,
+        department,
+        salary,
+        ROW_NUMBER() OVER (ORDER BY salary DESC) AS salary_rank
+    FROM employees;
+}
 
 # TODO: Uncomment when RANK() is implemented
 # # 2. RANK() - Ranking with gaps for tied values
@@ -110,19 +109,18 @@ setup schema {
 #     FROM employees;
 # }
 
-# TODO: Uncomment when ROW_NUMBER() is implemented
-# # 7. Window with ORDER BY - Sorted windows
-# @setup schema
-# snapshot window-order-by {
-#     SELECT
-#         sale_id,
-#         emp_id,
-#         sale_date,
-#         amount,
-#         region,
-#         ROW_NUMBER() OVER (ORDER BY sale_date ASC, amount DESC) AS sale_order
-#     FROM sales;
-# }
+# 7. Window with ORDER BY - Sorted windows
+@setup schema
+snapshot window-order-by {
+    SELECT
+        sale_id,
+        emp_id,
+        sale_date,
+        amount,
+        region,
+        ROW_NUMBER() OVER (ORDER BY sale_date ASC, amount DESC) AS sale_order
+    FROM sales;
+}
 
 # TODO: Uncomment when custom frame specifications are supported
 # # 8a. Frame clause - ROWS BETWEEN
@@ -175,24 +173,23 @@ snapshot running-total {
     FROM sales;
 }
 
-# TODO: Uncomment when ROW_NUMBER() is implemented
-# # 10. Multiple windows - Different partitions in one query
-# @setup schema
-# snapshot multiple-windows {
-#     SELECT
-#         e.emp_id,
-#         e.name,
-#         e.department,
-#         e.salary,
-#         s.amount,
-#         s.region,
-#         ROW_NUMBER() OVER (PARTITION BY e.department ORDER BY e.salary DESC) AS dept_rank,
-#         ROW_NUMBER() OVER (PARTITION BY s.region ORDER BY s.amount DESC) AS region_rank,
-#         SUM(s.amount) OVER (PARTITION BY e.department) AS dept_total_sales,
-#         AVG(e.salary) OVER (PARTITION BY s.region) AS region_avg_salary
-#     FROM employees e
-#     JOIN sales s ON e.emp_id = s.emp_id;
-# }
+# 10. Multiple windows - Different partitions in one query
+@setup schema
+snapshot multiple-windows {
+    SELECT
+        e.emp_id,
+        e.name,
+        e.department,
+        e.salary,
+        s.amount,
+        s.region,
+        ROW_NUMBER() OVER (PARTITION BY e.department ORDER BY e.salary DESC) AS dept_rank,
+        ROW_NUMBER() OVER (PARTITION BY s.region ORDER BY s.amount DESC) AS region_rank,
+        SUM(s.amount) OVER (PARTITION BY e.department) AS dept_total_sales,
+        AVG(e.salary) OVER (PARTITION BY s.region) AS region_avg_salary
+    FROM employees e
+    JOIN sales s ON e.emp_id = s.emp_id;
+}
 
 # Additional useful window function patterns
 
@@ -273,41 +270,39 @@ snapshot percent-of-total {
 #     WHERE salary > 50000;
 # }
 
-# TODO: Uncomment when ROW_NUMBER() is implemented
-# # Window with GROUP BY (window over grouped results)
-# @setup schema
-# snapshot window-over-grouped {
-#     SELECT
-#         department,
-#         COUNT(*) AS emp_count,
-#         SUM(salary) AS total_salary,
-#         ROW_NUMBER() OVER (ORDER BY SUM(salary) DESC) AS dept_salary_rank
-#     FROM employees
-#     GROUP BY department;
-# }
+# Window with GROUP BY (window over grouped results)
+@setup schema
+snapshot window-over-grouped {
+    SELECT
+        department,
+        COUNT(*) AS emp_count,
+        SUM(salary) AS total_salary,
+        ROW_NUMBER() OVER (ORDER BY SUM(salary) DESC) AS dept_salary_rank
+    FROM employees
+    GROUP BY department;
+}
 
-# TODO: Uncomment when ROW_NUMBER() is implemented
-# # Complex window with subquery
-# @setup schema
-# snapshot window-with-subquery {
-#     SELECT
-#         emp_id,
-#         name,
-#         department,
-#         salary,
-#         dept_avg,
-#         salary - dept_avg AS diff_from_avg,
-#         ROW_NUMBER() OVER (ORDER BY salary - dept_avg DESC) AS rank_by_diff
-#     FROM (
-#         SELECT
-#             emp_id,
-#             name,
-#             department,
-#             salary,
-#             AVG(salary) OVER (PARTITION BY department) AS dept_avg
-#         FROM employees
-#     );
-# }
+# Complex window with subquery
+@setup schema
+snapshot window-with-subquery {
+    SELECT
+        emp_id,
+        name,
+        department,
+        salary,
+        dept_avg,
+        salary - dept_avg AS diff_from_avg,
+        ROW_NUMBER() OVER (ORDER BY salary - dept_avg DESC) AS rank_by_diff
+    FROM (
+        SELECT
+            emp_id,
+            name,
+            department,
+            salary,
+            AVG(salary) OVER (PARTITION BY department) AS dept_avg
+        FROM employees
+    );
+}
 
 # TODO: Uncomment when LAG and LEAD are implemented
 # # LEAD/LAG with default values
